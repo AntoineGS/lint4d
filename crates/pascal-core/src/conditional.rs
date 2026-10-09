@@ -1172,6 +1172,10 @@ pub fn analyze_with_include_callback_context(
 /// Internal source-backed extension of the same directive interpreter. The
 /// session owns admission, lexical declarations, and unavailable-fact reasons.
 pub(crate) trait SourceOrder {
+    fn output_budget(
+        &mut self,
+        action: &mut dyn FnMut(&mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason>,
+    ) -> Result<(), ()>;
     fn next_directive(&mut self, source: &str, cursor: usize) -> Result<SourceOrderStep, ()>;
     fn activity(&self) -> Truth;
     fn admit_directive(&mut self, body_bytes: usize) -> bool;
@@ -1189,7 +1193,53 @@ pub(crate) trait SourceOrder {
 
 pub(crate) struct SourceOrderStep {
     pub text_end: usize,
-    pub directive: Option<ConditionalDirective>,
+    pub directive: Option<AdmittedOwned<ConditionalDirective>>,
+}
+
+fn output_action<T>(
+    order: &mut dyn SourceOrder,
+    action: impl FnOnce(&mut CompileTimeBudget<'_>) -> Result<T, IncompleteReason>,
+) -> Result<T, ()> {
+    let mut action = Some(action);
+    let mut result = None;
+    order.output_budget(&mut |budget| {
+        result = Some(action.take().expect("one output action")(budget)?);
+        Ok(())
+    })?;
+    Ok(result.expect("completed output action"))
+}
+
+/// Reserve replacement backing at its full live peak. Retire only the named
+/// prior slot invoice after Vec reallocation; removal never refunds live capacity.
+pub(crate) fn output_slot<T>(
+    values: &mut Vec<T>,
+    slots: &mut usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    if values.len() == values.capacity() {
+        let count = values
+            .len()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let replacement = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(IncompleteReason::MalformedSource)?;
+        budget.charge(1, *slots, replacement)?;
+        values.reserve_exact(count - values.len());
+        budget.release(std::mem::replace(slots, replacement));
+    }
+    Ok(())
+}
+
+pub(crate) fn empty_output() -> ConditionalAnalysis {
+    ConditionalAnalysis {
+        projected_source: String::new(),
+        directives: Vec::new(),
+        inactive_spans: Vec::new(),
+        unknown_spans: Vec::new(),
+        complete: true,
+    }
 }
 
 pub(crate) fn analyze_with_source_order(
@@ -1197,7 +1247,7 @@ pub(crate) fn analyze_with_source_order(
     context: &ConditionalContext,
     cancel: &dyn CancellationToken,
     order: &mut dyn SourceOrder,
-) -> ConditionalAnalysis {
+) -> Result<AdmittedOwned<ConditionalAnalysis>, ()> {
     // Lex only as far as the next directive. An include callback can change the
     // lexical continuation before the parent resumes (including opening a
     // literal/comment). Prelexing the whole physical parent is not sound.
@@ -1205,10 +1255,9 @@ pub(crate) fn analyze_with_source_order(
     let environment = ConditionalEnvironment::default();
     let mut complete = true;
     let mut cursor = 0;
-    let mut directives = Vec::new();
-    let mut inactive_spans = Vec::new();
-    let mut unknown_spans = Vec::new();
-    let mut masks = Vec::new();
+    let mut output = output_action(order, |budget| budget.admit_owned(0, 0, 0, empty_output))?;
+    let mut masks = output_action(order, |budget| budget.admit_owned(0, 0, 0, Vec::new))?;
+    let (mut directive_slots, mut inactive_slots, mut unknown_slots, mut mask_slots) = (0, 0, 0, 0);
     loop {
         if cancel.is_cancelled() {
             complete = false;
@@ -1224,24 +1273,41 @@ pub(crate) fn analyze_with_source_order(
         let end = next.text_end;
         let active = order.activity();
         order.feed(cursor..end, active);
-        add_activity_span(
-            &mut inactive_spans,
-            &mut unknown_spans,
-            cursor,
-            end,
-            order.activity(),
-        );
+        let activity = order.activity();
+        output_action(order, |budget| {
+            output.with_budget_mut(budget, |output, budget| {
+                if cursor < end {
+                    match activity {
+                        Truth::False => {
+                            output_slot(&mut output.inactive_spans, &mut inactive_slots, budget)?
+                        }
+                        Truth::Unknown => {
+                            output_slot(&mut output.unknown_spans, &mut unknown_slots, budget)?
+                        }
+                        Truth::True => {}
+                    }
+                }
+                add_activity_span(
+                    &mut output.inactive_spans,
+                    &mut output.unknown_spans,
+                    cursor,
+                    end,
+                    activity,
+                );
+                Ok(())
+            })?
+        })?;
         let Some(mut directive) = next.directive else {
             break;
         };
-        directive.activity = order.activity();
+        directive.value_mut().activity = order.activity();
         order.directive(&directive);
         if matches!(
             directive.kind,
             DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
         ) && !is_else_directive(&directive.body)
         {
-            directive.condition = Some(order.condition(
+            directive.value_mut().condition = Some(order.condition(
                 &directive.body,
                 directive.start,
                 &environment,
@@ -1249,16 +1315,30 @@ pub(crate) fn analyze_with_source_order(
             ));
         }
         cursor = directive.end;
-        masks.push(directive.start..directive.end);
-        directives.push(directive);
+        let range = directive.start..directive.end;
+        output_action(order, |budget| {
+            masks.with_budget_mut(budget, |masks, budget| {
+                output_slot(masks, &mut mask_slots, budget)?;
+                masks.push(range.clone());
+                Ok(())
+            })?
+        })?;
+        output_action(order, |budget| {
+            output.with_budget_mut(budget, |output, budget| {
+                output_slot(&mut output.directives, &mut directive_slots, budget)
+            })??;
+            output.move_field(directive, budget, |output, directive| {
+                output.directives.push(directive)
+            })
+        })?;
     }
-    ConditionalAnalysis {
-        projected_source: project_source(source, &inactive_spans, &masks),
-        directives,
-        inactive_spans,
-        unknown_spans,
-        complete,
-    }
+    output_action(order, |budget| {
+        output.grow(budget, 1, source.len(), source.len(), |output| {
+            output.projected_source = project_source(source, &output.inactive_spans, &masks);
+            output.complete = complete;
+        })
+    })?;
+    Ok(output)
 }
 
 /// The same physical directive lexical rules as `lex_directives_inner`, but

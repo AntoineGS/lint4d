@@ -255,12 +255,12 @@ pub type CompileTimeAnalysis = AdmittedOwned<CompileTimeOutput>;
 
 #[derive(Debug)]
 struct SessionOutput {
-    root: ConditionalAnalysis,
-    occurrences: Vec<OccurrenceAnalysis>,
-    includes: Vec<IncludeOccurrence>,
+    root: AdmittedOwned<ConditionalAnalysis>,
+    occurrences: AdmittedOwned<Vec<OccurrenceAnalysis>>,
+    includes: AdmittedOwned<Vec<IncludeOccurrence>>,
     facts: Option<AdmittedOwned<CompileTimeState>>,
-    header: Fact<VerifiedUnitHeader>,
-    reasons: Vec<IncompleteReason>,
+    header: AdmittedOwned<Fact<VerifiedUnitHeader>>,
+    reasons: AdmittedOwned<Vec<IncompleteReason>>,
     observations: AdmittedOwned<Vec<ResolutionObservation>>,
     warnings: AdmittedOwned<Vec<String>>,
     directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
@@ -344,11 +344,24 @@ impl ProviderSession {
 }
 
 fn publish_analysis(
-    mut analysis: AdmittedOwned<SessionOutput>,
+    compilation: AdmittedOwned<SessionOutput>,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
+    // SessionOutput consists solely of independently owned fields. Admit its
+    // temporary receiving carrier before consuming the compilation wrapper;
+    // move those owners themselves, not the opaque compilation reservation.
+    // Dead frames/text/coordinator invoices die before destination publication.
+    let mut receiving = budget
+        .admit_owned(0, 0, 0, || None)
+        .map_err(|r| resolver_error(r, budget))?;
+    let scratch = compilation
+        .map_value(budget, |fields| {
+            *receiving.value_mut() = Some(fields);
+        })
+        .map_err(|r| resolver_error(r, budget))?;
+    drop(scratch);
+    let analysis = receiving.value_mut().as_mut().expect("moved output owners");
     let facts = analysis
-        .value_mut()
         .facts
         .take()
         .expect("unpublished facts owner")
@@ -359,59 +372,36 @@ fn publish_analysis(
         .and_then(|v| v.into_shared(budget))
         .and_then(|v| v.into_arc(budget))
         .map_err(|r| resolver_error(r, budget))?;
-    let mut payload = conditional_output_payload(&analysis.root)?;
-    for o in &analysis.occurrences {
-        payload = payload
-            .checked_add(
-                size_of::<OccurrenceAnalysis>()
-                    + crate::resolver::loaded_source_metadata_retained(&o.source)
-                    + conditional_output_payload(&o.analysis)?,
-            )
-            .ok_or_else(|| ResolverError::InvalidRequest("occurrence output overflow".into()))?;
-    }
-    for i in &analysis.includes {
-        payload = payload
-            .checked_add(
-                size_of::<IncludeOccurrence>()
-                    + i.directive.source.as_str().len()
-                    + i.fragments.len() * size_of::<SourceAnchor>(),
-            )
-            .ok_or_else(|| ResolverError::InvalidRequest("include output overflow".into()))?;
-        for f in &i.fragments {
-            payload += f.source.as_str().len();
-        }
-        match &i.target {
-            Resolution::Found(s) => payload += crate::resolver::loaded_source_metadata_retained(s),
-            Resolution::Unavailable { reason } => payload += reason.len(),
-            Resolution::Ambiguous { candidates } | Resolution::Incomplete { candidates, .. } => {
-                for c in candidates {
-                    payload += size_of::<crate::ResolutionCandidate>()
-                        + c.path.as_os_str().len()
-                        + c.declared_name.as_ref().map_or(0, String::len);
-                }
-            }
-        }
-    }
-    payload += analysis.reasons.len() * size_of::<IncompleteReason>();
-    for r in &analysis.reasons {
-        if let IncompleteReason::RequiredSource { source, reason } = r {
-            payload += source.as_str().len() + reason.len();
-        }
-    }
     let mut output = budget
-        .admit_owned(1, payload, payload, || CompileTimeOutput {
-            root: analysis.root.clone(),
-            occurrences: analysis.occurrences.clone(),
-            includes: analysis.includes.clone(),
+        .admit_owned(1, 0, 0, || CompileTimeOutput {
+            root: conditional::empty_output(),
+            occurrences: Vec::new(),
+            includes: Vec::new(),
             facts,
-            header: analysis.header.clone(),
-            reasons: analysis.reasons.clone(),
+            header: Fact::Unknown(UnknownReason::HeaderNotAnalyzed),
+            reasons: Vec::new(),
             observations: Vec::new(),
             warnings: Vec::new(),
             directive_fragments: Vec::new(),
             budget: view,
         })
         .map_err(|r| resolver_error(r, budget))?;
+    macro_rules! transfer {
+        ($field:ident, $empty:expr) => {{
+            let empty = budget
+                .admit_owned(0, 0, 0, $empty)
+                .map_err(|r| resolver_error(r, budget))?;
+            let field = std::mem::replace(&mut analysis.$field, empty);
+            output
+                .move_field(field, budget, |output, field| output.$field = field)
+                .map_err(|r| resolver_error(r, budget))?;
+        }};
+    }
+    transfer!(root, conditional::empty_output);
+    transfer!(occurrences, Vec::new);
+    transfer!(includes, Vec::new);
+    transfer!(header, || Fact::Unknown(UnknownReason::HeaderNotAnalyzed));
+    transfer!(reasons, Vec::new);
     // The side buffers already have independent construction/return owners.
     // Replace their internal slots with admitted empty carriers, then move the
     // actual vectors and their exact minted credits into the published fields.
@@ -424,13 +414,9 @@ fn publish_analysis(
     let empty_fragments = budget
         .admit_owned(0, 0, 0, Vec::new)
         .map_err(|r| resolver_error(r, budget))?;
-    let observations =
-        std::mem::replace(&mut analysis.value_mut().observations, empty_observations);
-    let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
-    let fragments = std::mem::replace(
-        &mut analysis.value_mut().directive_fragments,
-        empty_fragments,
-    );
+    let observations = std::mem::replace(&mut analysis.observations, empty_observations);
+    let warnings = std::mem::replace(&mut analysis.warnings, empty_warnings);
+    let fragments = std::mem::replace(&mut analysis.directive_fragments, empty_fragments);
     output
         .move_field(observations, budget, |output, observations| {
             output.observations = observations
@@ -460,6 +446,57 @@ fn conditional_output_payload(a: &ConditionalAnalysis) -> Result<usize, Resolver
             .ok_or_else(|| ResolverError::InvalidRequest("conditional output overflow".into()))?;
     }
     Ok(payload)
+}
+
+fn failed_projection(
+    analysis: &mut AdmittedOwned<ConditionalAnalysis>,
+    text: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    analysis
+        .with_budget_mut(budget, |analysis, budget| {
+            // Original projection owns a source-sized backing. Reset it in place;
+            // retained range capacities remain live even when their lengths clear.
+            budget.charge(1, text.len(), 0)?;
+            analysis.complete = false;
+            analysis.inactive_spans.clear();
+            analysis.unknown_spans.clear();
+            if !text.is_empty() {
+                if analysis.unknown_spans.capacity() == 0 {
+                    budget.charge(1, 0, size_of::<Range<usize>>())?;
+                    analysis.unknown_spans.reserve_exact(1);
+                }
+                analysis.unknown_spans.push(0..text.len());
+            }
+            analysis.projected_source.clear();
+            analysis.projected_source.push_str(text);
+            Ok(())
+        })
+        .map_err(|r| resolver_error(r, budget))?
+        .map_err(|r| resolver_error(r, budget))
+}
+
+fn resolution_output_payload(result: &Resolution<LoadedSource>) -> usize {
+    match result {
+        Resolution::Found(source) => crate::resolver::loaded_source_metadata_retained(source),
+        Resolution::Unavailable { reason } => reason.len(),
+        Resolution::Ambiguous { candidates } | Resolution::Incomplete { candidates, .. } => {
+            let reason = if let Resolution::Incomplete { reason, .. } = result {
+                reason.len()
+            } else {
+                0
+            };
+            reason
+                + candidates
+                    .iter()
+                    .map(|c| {
+                        size_of::<crate::ResolutionCandidate>()
+                            + c.path.as_os_str().len()
+                            + c.declared_name.as_ref().map_or(0, String::len)
+                    })
+                    .sum::<usize>()
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -534,23 +571,12 @@ fn analyze_source_with_providers_inner(
             .charge(1, metadata, metadata.saturating_mul(2))
             .map_err(|r| resolver_error(r, budget))?;
     }
-    // Reserve root projection, lexer/output scratch and source identity copies
-    // before the existing lexer's allocations. Its original directive/depth/
-    // environment limits remain enforced by the shared interpreter.
-    let reserve = bytes
-        .len()
-        .checked_mul(4)
-        .and_then(|n| {
-            n.checked_add(
-                size_of::<CompileTimeAnalysis>()
-                    + size_of::<OccurrenceAnalysis>()
-                    + root.id.as_str().len()
-                    + root.path.as_os_str().len(),
-            )
-        })
-        .ok_or_else(|| ResolverError::InvalidRequest("root admission overflow".into()))?;
+    // Root/source metadata has already crossed the root-first admission. Text
+    // feeds borrow its existing shared backing; only the active identity slot
+    // is new scratch. Public projection backing is independently constructed.
+    let reserve = size_of::<crate::SourceId>() + root.id.as_str().len();
     budget
-        .charge(1, bytes.len(), reserve)
+        .charge(1, root.id.as_str().len(), reserve)
         .map_err(|r| resolver_error(r, &budget))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| ResolverError::InvalidRequest("root coordinate text is not UTF-8".into()))?;
@@ -628,13 +654,15 @@ fn analyze_source_with_providers_inner(
         .map_err(|r| resolver_error(r, budget))?;
     let mut session = RootSession {
         root: root.clone(),
-        text: text.to_owned(),
         resolver,
         cancel,
         context,
         occurrence: root_occurrence,
         active_sources: vec![root.id.clone()],
-        occurrences: Vec::new(),
+        occurrences: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
+        occurrence_slots: 0,
         observations: budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?,
@@ -651,9 +679,15 @@ fn analyze_source_with_providers_inner(
         directive_fragment_slots: 0,
         current_directive: 0,
         state,
+        reasons: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
+        reason_slots: 0,
+        includes: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
+        include_slots: 0,
         budget,
-        reasons: Vec::new(),
-        includes: Vec::new(),
         fatal: None,
         current: vec![first],
         frames: Vec::new(),
@@ -661,7 +695,18 @@ fn analyze_source_with_providers_inner(
         providers,
         physical_paths: vec![(root_occurrence, root.path.clone())],
     };
-    let mut analysis = conditional::analyze_with_source_order(text, context, cancel, &mut session);
+    let result = conditional::analyze_with_source_order(text, context, cancel, &mut session);
+    let mut analysis = result.map_err(|()| {
+        session.resource_error.take().unwrap_or_else(|| {
+            resolver_error(
+                session
+                    .fatal
+                    .take()
+                    .unwrap_or(IncompleteReason::MalformedSource),
+                session.budget,
+            )
+        })
+    })?;
     if let Some(error) = session.resource_error.take() {
         return Err(error);
     }
@@ -767,40 +812,28 @@ fn analyze_source_with_providers_inner(
         return Err(resolver_error(reason, &session.budget));
     }
     if !session.reasons.is_empty() {
-        analysis.complete = false;
-        analysis.inactive_spans.clear();
-        analysis.unknown_spans.clear();
-        if !text.is_empty() {
-            analysis.unknown_spans.push(0..text.len());
-        }
-        // A failed typed admission cannot publish an apparently safe projection.
-        analysis.projected_source = text.to_owned();
+        failed_projection(&mut analysis, text, session.budget)?;
     }
     // Complete output cloning is admitted before allocation. Source byte/text
     // Arcs are shared; source identity/path metadata and analysis are copied.
-    let mut payload = analysis.projected_source.len()
-        + analysis.inactive_spans.len() * size_of::<Range<usize>>()
-        + analysis.unknown_spans.len() * size_of::<Range<usize>>()
-        + root.id.as_str().len()
-        + root.path.as_os_str().len();
-    for d in &analysis.directives {
-        payload = payload
-            .checked_add(size_of::<ConditionalDirective>() + d.body.len())
-            .ok_or_else(|| ResolverError::InvalidRequest("output admission overflow".into()))?;
-    }
-    session
+    let payload = conditional_output_payload(&analysis)? - size_of::<ConditionalAnalysis>()
+        + crate::resolver::loaded_source_metadata_retained(root);
+    let mut occurrence = session
         .budget
-        .charge(analysis.directives.len() + 1, payload, payload)
-        .map_err(|r| resolver_error(r, &session.budget))?;
-    let mut occurrence = OccurrenceAnalysis {
-        id: root_occurrence,
-        source: root.clone(),
-        analysis: analysis.clone(),
-    };
+        .admit_owned(analysis.directives.len() + 1, payload, payload, || {
+            OccurrenceAnalysis {
+                id: root_occurrence,
+                source: root.clone(),
+                analysis: (*analysis).clone(),
+            }
+        })
+        .map_err(|r| resolver_error(r, session.budget))?;
     // Projection only: finalized logical directives mask their actual physical
     // fragments, including child fragments whose EOF preceded the terminator.
     // No parser, evaluator or read decision is run again.
-    for occurrence in std::iter::once(&mut occurrence).chain(session.occurrences.iter_mut()) {
+    for occurrence in
+        std::iter::once(occurrence.value_mut()).chain(session.occurrences.value_mut().iter_mut())
+    {
         if !occurrence.analysis.complete {
             continue;
         }
@@ -841,12 +874,27 @@ fn analyze_source_with_providers_inner(
     Ok(SessionOutput {
         root: analysis,
         occurrences: {
-            session.occurrences.insert(0, occurrence);
+            session
+                .occurrences
+                .with_budget_mut(session.budget, |values, budget| {
+                    conditional::output_slot(values, &mut session.occurrence_slots, budget)
+                })
+                .map_err(|r| resolver_error(r, session.budget))?
+                .map_err(|r| resolver_error(r, session.budget))?;
+            session
+                .occurrences
+                .move_field(occurrence, session.budget, |values, occurrence| {
+                    values.insert(0, occurrence)
+                })
+                .map_err(|r| resolver_error(r, session.budget))?;
             session.occurrences
         },
         includes: session.includes,
         facts: Some(session.state),
-        header: Fact::Unknown(UnknownReason::HeaderNotAnalyzed),
+        header: session
+            .budget
+            .admit_owned(0, 0, 0, || Fact::Unknown(UnknownReason::HeaderNotAnalyzed))
+            .map_err(|r| resolver_error(r, session.budget))?,
         reasons: session.reasons,
         observations: session.observations,
         warnings: session.warnings,
@@ -976,13 +1024,13 @@ pub(crate) fn resolver_error(
 
 struct RootSession<'a, 'b> {
     root: LoadedSource,
-    text: String,
     resolver: &'a mut dyn CompileTimeResolver,
     cancel: &'a dyn CancellationToken,
     context: &'a ConditionalContext,
     occurrence: OccurrenceId,
     active_sources: Vec<crate::SourceId>,
-    occurrences: Vec<OccurrenceAnalysis>,
+    occurrences: AdmittedOwned<Vec<OccurrenceAnalysis>>,
+    occurrence_slots: usize,
     observations: AdmittedOwned<Vec<ResolutionObservation>>,
     warnings: AdmittedOwned<Vec<String>>,
     scanner: conditional::DirectiveScanner,
@@ -993,8 +1041,10 @@ struct RootSession<'a, 'b> {
     current_directive: usize,
     state: AdmittedOwned<CompileTimeState>,
     budget: &'a mut CompileTimeBudget<'b>,
-    reasons: Vec<IncompleteReason>,
-    includes: Vec<IncludeOccurrence>,
+    reasons: AdmittedOwned<Vec<IncompleteReason>>,
+    reason_slots: usize,
+    includes: AdmittedOwned<Vec<IncludeOccurrence>>,
+    include_slots: usize,
     fatal: Option<IncompleteReason>,
     current: Vec<AdmittedOwned<ReachablePath>>,
     frames: Vec<ReachableFrame>,
@@ -1803,43 +1853,6 @@ impl RootSession<'_, '_> {
         }
         append_observations(&mut self.observations, &observations, self.budget)?;
         append_warnings(&mut self.warnings, &warnings, self.budget)?;
-        match &result {
-            Resolution::Found(source) => {
-                self.budget
-                    .charge(
-                        1,
-                        source.id.as_str().len() + source.path.as_os_str().len(),
-                        source.id.as_str().len() + source.path.as_os_str().len(),
-                    )
-                    .map_err(|r| resolver_error(r, &self.budget))?;
-            }
-            Resolution::Unavailable { reason } => {
-                self.budget
-                    .charge(1, reason.len(), reason.len())
-                    .map_err(|r| resolver_error(r, &self.budget))?;
-            }
-            Resolution::Ambiguous { candidates } | Resolution::Incomplete { candidates, .. } => {
-                self.budget
-                    .charge(
-                        candidates.len(),
-                        0,
-                        candidates.len() * size_of::<crate::ResolutionCandidate>(),
-                    )
-                    .map_err(|r| resolver_error(r, &self.budget))?;
-                for candidate in candidates {
-                    let n = candidate.path.as_os_str().len()
-                        + candidate.declared_name.as_ref().map_or(0, String::len);
-                    self.budget
-                        .charge(1, n, n)
-                        .map_err(|r| resolver_error(r, &self.budget))?;
-                }
-                if let Resolution::Incomplete { reason, .. } = &result {
-                    self.budget
-                        .charge(1, reason.len(), reason.len())
-                        .map_err(|r| resolver_error(r, &self.budget))?;
-                }
-            }
-        }
         if let Resolution::Found(child) = &result {
             if self.active_sources.contains(&child.id) {
                 result = Resolution::Incomplete {
@@ -1854,48 +1867,56 @@ impl RootSession<'_, '_> {
             .iter()
             .map(|a| std::mem::size_of::<SourceAnchor>() + a.source.as_str().len())
             .sum::<usize>();
-        self.budget
-            .charge(
-                mapping.fragments.len(),
-                0,
-                fragments_bytes + anchor.source.as_str().len(),
+        let target_payload = resolution_output_payload(&result);
+        let include = self
+            .budget
+            .admit_owned(
+                mapping.fragments.len() + 1,
+                fragments_bytes + anchor.source.as_str().len() + target_payload,
+                fragments_bytes + anchor.source.as_str().len() + target_payload,
+                || IncludeOccurrence {
+                    owner,
+                    directive: anchor.clone(),
+                    fragments: mapping.fragments.clone(),
+                    target: result.clone(),
+                    child: None,
+                },
             )
-            .map_err(|r| resolver_error(r, &self.budget))?;
-        self.includes.push(IncludeOccurrence {
-            owner,
-            directive: anchor.clone(),
-            fragments: mapping.fragments.clone(),
-            target: result,
-            child: None,
-        });
+            .map_err(|r| resolver_error(r, self.budget))?;
+        drop(result);
+        self.includes
+            .with_budget_mut(self.budget, |values, budget| {
+                conditional::output_slot(values, &mut self.include_slots, budget)
+            })
+            .map_err(|r| resolver_error(r, self.budget))?
+            .map_err(|r| resolver_error(r, self.budget))?;
+        self.includes
+            .move_field(include, self.budget, |values, include| values.push(include))
+            .map_err(|r| resolver_error(r, self.budget))?;
         match &self.includes[index].target {
             Resolution::Found(child) => {
-                let bytes = child.analysis_bytes();
+                // The child output source metadata is copied once into its
+                // own carrier, then moves with the child conditional output.
                 let metadata = crate::resolver::loaded_source_metadata_retained(child);
-                self.budget
-                    .charge(1, metadata, metadata)
-                    .map_err(|r| resolver_error(r, &self.budget))?;
-                let reserve = bytes
-                    .len()
-                    .checked_mul(4)
-                    .and_then(|n| {
-                        n.checked_add(
-                            size_of::<OccurrenceAnalysis>()
-                                + child.id.as_str().len()
-                                + child.path.as_os_str().len(),
-                        )
+                let mut output = self
+                    .budget
+                    .admit_owned(1, metadata, metadata, || OccurrenceAnalysis {
+                        id: OccurrenceId(self.providers.next_occurrence),
+                        source: child.clone(),
+                        analysis: conditional::empty_output(),
                     })
-                    .ok_or_else(|| {
-                        ResolverError::InvalidRequest("include admission overflow".into())
-                    })?;
+                    .map_err(|r| resolver_error(r, self.budget))?;
                 self.budget
-                    .charge(1, bytes.len(), reserve)
+                    .charge(
+                        1,
+                        metadata + child.id.as_str().len(),
+                        metadata + child.id.as_str().len() + size_of::<crate::SourceId>(),
+                    )
                     .map_err(|r| resolver_error(r, &self.budget))?;
-                let text = std::str::from_utf8(&bytes)
-                    .map_err(|_| {
-                        ResolverError::InvalidRequest("include coordinate text is not UTF-8".into())
-                    })?
-                    .to_owned();
+                let bytes = output.source.analysis_bytes();
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    ResolverError::InvalidRequest("include coordinate text is not UTF-8".into())
+                })?;
                 let child = child.clone();
                 let occurrence = OccurrenceId(self.providers.next_occurrence);
                 self.budget
@@ -1913,37 +1934,48 @@ impl RootSession<'_, '_> {
                     .next_occurrence
                     .checked_add(1)
                     .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
-                self.includes[index].child = Some(occurrence);
+                self.includes.value_mut()[index].child = Some(occurrence);
                 let parent = std::mem::replace(&mut self.root, child);
-                let parent_text = std::mem::replace(&mut self.text, text.clone());
                 let parent_occurrence = std::mem::replace(&mut self.occurrence, occurrence);
                 self.active_sources.push(self.root.id.clone());
-                let mut analysis =
+                let result =
                     conditional::analyze_with_source_order(&text, self.context, self.cancel, self);
+                let mut analysis = result.map_err(|()| {
+                    self.resource_error.take().unwrap_or_else(|| {
+                        resolver_error(
+                            self.fatal
+                                .take()
+                                .unwrap_or(IncompleteReason::MalformedSource),
+                            self.budget,
+                        )
+                    })
+                })?;
                 if !analysis.complete {
                     self.record(IncompleteReason::MalformedSource);
                 }
                 if !self.reasons.is_empty() {
-                    analysis.complete = false;
-                    analysis.inactive_spans.clear();
-                    analysis.unknown_spans = if text.is_empty() {
-                        vec![]
-                    } else {
-                        vec![0..text.len()]
-                    };
-                    analysis.projected_source = text.clone();
+                    failed_projection(&mut analysis, &text, self.budget)?;
                 }
                 // Only physical coordinates change. Typed paths, scopes, lexer,
                 // scalar history, settings and conditional frames stay alive.
                 let source = std::mem::replace(&mut self.root, parent);
-                self.text = parent_text;
+                drop(source);
                 self.occurrence = parent_occurrence;
                 self.active_sources.pop();
-                self.occurrences.push(OccurrenceAnalysis {
-                    id: occurrence,
-                    source,
-                    analysis,
-                });
+                output
+                    .move_field(analysis, self.budget, |output, analysis| {
+                        output.analysis = analysis
+                    })
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                self.occurrences
+                    .with_budget_mut(self.budget, |values, budget| {
+                        conditional::output_slot(values, &mut self.occurrence_slots, budget)
+                    })
+                    .map_err(|r| resolver_error(r, self.budget))?
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                self.occurrences
+                    .move_field(output, self.budget, |values, output| values.push(output))
+                    .map_err(|r| resolver_error(r, self.budget))?;
             }
             failed => {
                 let reason = match failed {
@@ -2108,16 +2140,21 @@ impl RootSession<'_, '_> {
             }
             _ => 0,
         };
-        if let Err(reason) = self.budget.charge(
-            self.reasons.len() + 1,
-            dynamic,
-            size_of::<IncompleteReason>() + dynamic,
-        ) {
+        let result = self
+            .reasons
+            .with_budget_mut(self.budget, |reasons, budget| {
+                budget.charge(reasons.len() + 1, 0, 0)?;
+                if !reasons.contains(&reason) {
+                    conditional::output_slot(reasons, &mut self.reason_slots, budget)?;
+                    budget.charge(1, dynamic, dynamic)?;
+                    reasons.push(reason.clone());
+                }
+                Ok(())
+            })
+            .and_then(|r| r);
+        if let Err(reason) = result {
             self.fatal = Some(reason);
             return;
-        }
-        if !self.reasons.contains(&reason) {
-            self.reasons.push(reason.clone());
         }
         if self.state.failure.is_none() {
             if let Err(reason) = self.state.grow(self.budget, 1, dynamic, dynamic, |state| {
@@ -2273,6 +2310,14 @@ fn evaluate_path_condition(
 }
 
 impl SourceOrder for RootSession<'_, '_> {
+    fn output_budget(
+        &mut self,
+        action: &mut dyn FnMut(&mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason>,
+    ) -> Result<(), ()> {
+        action(self.budget).map_err(|reason| {
+            self.fatal = Some(reason);
+        })
+    }
     fn next_directive(
         &mut self,
         source: &str,
@@ -2431,12 +2476,14 @@ impl SourceOrder for RootSession<'_, '_> {
         // The source-order ConditionalAnalysis needs its own body String. This
         // is a real independent copy, not a second invoice for emitted metadata.
         let physical = &self.directive_fragments[self.current_directive].directive;
-        self.budget
-            .charge(1, physical.body.len(), physical.body.len())
+        let directive = self
+            .budget
+            .admit_owned(1, physical.body.len(), physical.body.len(), || {
+                physical.clone()
+            })
             .map_err(|r| {
                 self.fatal = Some(r);
             })?;
-        let directive = physical.clone();
         Ok(conditional::SourceOrderStep {
             text_end: next.text_end,
             directive: Some(directive),
@@ -2461,15 +2508,11 @@ impl SourceOrder for RootSession<'_, '_> {
         if self.fatal.is_some() {
             return false;
         }
-        // Interpreter directive/mask/activity slots and conservative frame/key
-        // controls. Scanner body/anchor payload and physical Vec backing have
-        // their own receipts; the one independent source-order body copy is
-        // admitted separately immediately before cloning it.
-        let retained = 3 * size_of::<ConditionalDirective>()
-            + 8 * size_of::<Range<usize>>()
-            + 4 * size_of::<String>()
-            + size_of::<ConditionalEnvironment>();
-        match self.budget.charge(1, body_bytes, retained) {
+        // Classification work is cumulative. Actual scanner/output bodies,
+        // directive/mask/activity slots and conditional frames are now admitted
+        // at their independent constructors; no conservative output shadow
+        // reservation belongs to dead compilation scratch.
+        match self.budget.charge(1, body_bytes, 0) {
             Ok(()) => true,
             Err(reason) => {
                 self.fatal = Some(reason);
@@ -2496,13 +2539,15 @@ impl SourceOrder for RootSession<'_, '_> {
             return;
         }
         let mut failure = None;
+        let bytes = self.root.analysis_bytes();
+        let text = std::str::from_utf8(&bytes).expect("validated physical source");
         for path in &mut self.current {
             if let Err(reason) = path.feed_owned(
                 SourceFragment {
                     source: &self.root.id,
                     occurrence: self.occurrence,
                     physical_start: range.start,
-                    text: &self.text[range.clone()],
+                    text: &text[range.clone()],
                 },
                 Truth::True,
                 &mut self.budget,
@@ -2858,6 +2903,238 @@ mod tests {
     }
 
     #[test]
+    fn actual_output_publication_cancellation_covers_every_field_handoff() {
+        struct CancelAt(std::cell::Cell<usize>, usize);
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= self.1
+            }
+        }
+        let root =
+            graph_source("unit T; interface {$H+} type R=record X:Byte; end; implementation end.");
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut providers = ProviderSession::new(&mut budget).unwrap();
+        let mut cancelled_count = 0;
+        let mut completed_calls = None;
+        for allowed in 0..64 {
+            let before = observer.budget_snapshot();
+            let analysis = analyze_source_with_providers(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoGraphCallbacks,
+                &mut budget,
+                &NoCancellation,
+                &mut providers,
+                false,
+                OccurrenceId(0),
+            )
+            .unwrap();
+            let cancel = CancelAt(std::cell::Cell::new(0), allowed);
+            let mut cancelled = observer.store_budget(CompileTimeLimits::default(), &cancel);
+            let result = publish_analysis(analysis, &mut cancelled);
+            let success = result.is_ok();
+            match result {
+                Ok(output) => drop(output),
+                Err(ResolverError::Cancelled) => cancelled_count += 1,
+                Err(error) => panic!("unexpected handoff error: {error:?}"),
+            }
+            let after = observer.budget_snapshot();
+            assert_eq!(
+                after.retained_bytes, before.retained_bytes,
+                "actual final output field cancellation {allowed}"
+            );
+            assert!(after.work >= before.work);
+            assert!(after.byte_work >= before.byte_work);
+            if success {
+                completed_calls = Some(cancel.0.get());
+                break;
+            }
+        }
+        assert_eq!(
+            Some(cancelled_count),
+            completed_calls,
+            "every actual admission poll is exercised through the first successful publication"
+        );
+        assert!(cancelled_count > 0);
+        drop(providers);
+        drop(budget);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn actual_child_output_and_failed_include_buffers_move_with_source_credits() {
+        struct Includes {
+            child: LoadedSource,
+        }
+        impl CompileTimeResolver for Includes {
+            fn include(
+                &mut self,
+                request: IncludeResolveRequest<'_>,
+                budget: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                let result = if request.requested_name == "child.inc" {
+                    let backing = ProviderSource::admit_cached_backing(&self.child, budget)?;
+                    let mut child = self.child.clone();
+                    child.compile_time_backing = Some(backing);
+                    Resolution::Found(
+                        child
+                            .admitted_copy(budget)
+                            .expect("admitted fixture source envelope"),
+                    )
+                } else {
+                    Resolution::Unavailable {
+                        reason: "missing child fixture".into(),
+                    }
+                };
+                Ok(ResolutionOutcome {
+                    result,
+                    observations: vec![],
+                    warnings: vec![],
+                })
+            }
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("no provider");
+            }
+        }
+        let root =
+            graph_source("unit T; interface {$I child.inc}{$I absent.inc} implementation end.");
+        let mut child = graph_source("type R=record X:Byte; end; {$H+}");
+        child.id = SourceId::new("child.inc");
+        child.path = "child.inc".into();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut providers = ProviderSession::new(&mut budget).unwrap();
+        let analysis = analyze_source_with_providers(
+            &root,
+            &ConditionalContext::default(),
+            &mut Includes { child },
+            &mut budget,
+            &NoCancellation,
+            &mut providers,
+            false,
+            OccurrenceId(0),
+        )
+        .unwrap();
+        assert_eq!(analysis.occurrences.len(), 2);
+        assert_eq!(analysis.includes.len(), 2);
+        let occurrences_ptr = analysis.occurrences.as_ptr();
+        let child_text_ptr = analysis.occurrences[1].analysis.projected_source.as_ptr();
+        let child_body_ptr = analysis.occurrences[1].analysis.directives[0].body.as_ptr();
+        let includes_ptr = analysis.includes.as_ptr();
+        let anchors_ptr = analysis.includes[0].fragments.as_ptr();
+        let reasons_ptr = analysis.reasons.as_ptr();
+        let reason_text_ptr = match &analysis.reasons[0] {
+            IncompleteReason::RequiredSource { reason, .. } => reason.as_ptr(),
+            _ => panic!("required source reason"),
+        };
+        let missing_ptr = match &analysis.includes[1].target {
+            Resolution::Unavailable { reason } => reason.as_ptr(),
+            _ => panic!("unavailable target"),
+        };
+        let source_ptr = analysis.occurrences[1].source.bytes.as_ptr();
+        let source_id_ptr = analysis.occurrences[1].source.id.as_str().as_ptr();
+        let source_path_ptr = analysis.occurrences[1]
+            .source
+            .path
+            .as_os_str()
+            .as_encoded_bytes()
+            .as_ptr();
+        let unknown_ptr = analysis.root.unknown_spans.as_ptr();
+        let before = budget.snapshot();
+        let output = publish_analysis(analysis, &mut budget).unwrap();
+        assert_eq!(
+            budget.snapshot().byte_work,
+            before.byte_work,
+            "no final child/root/include/reason copy invoice"
+        );
+        assert_eq!(output.occurrences.as_ptr(), occurrences_ptr);
+        assert_eq!(
+            output.occurrences[1].analysis.projected_source.as_ptr(),
+            child_text_ptr
+        );
+        assert_eq!(
+            output.occurrences[1].analysis.directives[0].body.as_ptr(),
+            child_body_ptr
+        );
+        assert_eq!(output.includes.as_ptr(), includes_ptr);
+        assert_eq!(output.includes[0].fragments.as_ptr(), anchors_ptr);
+        assert_eq!(output.reasons.as_ptr(), reasons_ptr);
+        match &output.reasons[0] {
+            IncompleteReason::RequiredSource { reason, .. } => {
+                assert_eq!(reason.as_ptr(), reason_text_ptr)
+            }
+            _ => unreachable!(),
+        }
+        match &output.includes[1].target {
+            Resolution::Unavailable { reason } => assert_eq!(reason.as_ptr(), missing_ptr),
+            _ => unreachable!(),
+        }
+        assert_eq!(output.occurrences[1].source.bytes.as_ptr(), source_ptr);
+        assert_eq!(
+            output.occurrences[1].source.id.as_str().as_ptr(),
+            source_id_ptr
+        );
+        assert_eq!(
+            output.occurrences[1]
+                .source
+                .path
+                .as_os_str()
+                .as_encoded_bytes()
+                .as_ptr(),
+            source_path_ptr
+        );
+        assert_eq!(output.root.unknown_spans.as_ptr(), unknown_ptr);
+        let shared = output.into_shared(&mut budget).unwrap();
+        let last = shared.try_clone(&mut budget).unwrap();
+        drop(providers);
+        drop(budget);
+        drop(shared);
+        assert_eq!(last.includes[0].child, Some(last.occurrences[1].id));
+        assert_eq!(last.occurrences[1].source.id, SourceId::new("child.inc"));
+        let physical = last
+            .directive_fragments
+            .iter()
+            .find(|d| d.directive.body == "H+")
+            .unwrap();
+        assert_eq!(physical.completion, last.occurrences[1].id);
+        assert_eq!(
+            physical.body_fragments[0].source,
+            SourceId::new("child.inc")
+        );
+        assert_eq!(
+            physical.body_fragments[0].occurrence,
+            last.occurrences[1].id
+        );
+        assert!(!last.root.complete);
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        drop(last);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
     fn actual_branch_facts_collapse_and_promotion_move_every_captured_backing() {
         let root = graph_source(
             "unit T; interface {$IF MISSING}{$DEFINE A}{$ELSE}{$UNDEF A}{$ENDIF}{$DEFINE COMMON} type R=record X:Byte; end; implementation end.",
@@ -3122,6 +3399,12 @@ mod tests {
         let scopes_ptr = analysis.facts().scopes.as_ptr();
         let declarations_ptr = analysis.facts().declarations.as_ptr();
         let scalar_history_ptr = analysis.facts().scalar_history.as_ptr();
+        let root_text_ptr = analysis.root.projected_source.as_ptr();
+        let root_directives_ptr = analysis.root.directives.as_ptr();
+        let root_body_ptr = analysis.root.directives[0].body.as_ptr();
+        let occurrences_ptr = analysis.occurrences.as_ptr();
+        let occurrence_text_ptr = analysis.occurrences[0].analysis.projected_source.as_ptr();
+        let occurrence_body_ptr = analysis.occurrences[0].analysis.directives[0].body.as_ptr();
         struct CancelAt(std::cell::Cell<usize>, usize);
         impl CancellationToken for CancelAt {
             fn is_cancelled(&self) -> bool {
@@ -3166,22 +3449,24 @@ mod tests {
             assert!(after.work >= before.work);
             assert!(after.byte_work >= before.byte_work);
         }
-        let remaining_output_copy = conditional_output_payload(&analysis.root).unwrap()
-            + analysis
-                .occurrences
-                .iter()
-                .map(|o| {
-                    size_of::<OccurrenceAnalysis>()
-                        + crate::resolver::loaded_source_metadata_retained(&o.source)
-                        + conditional_output_payload(&o.analysis).unwrap()
-                })
-                .sum::<usize>();
         let before_publication = budget.snapshot();
         let output = publish_analysis(analysis, &mut budget).unwrap();
         assert_eq!(
             budget.snapshot().byte_work - before_publication.byte_work,
-            remaining_output_copy,
-            "facts promotion moves existing backing and credits without a graph copy invoice"
+            0,
+            "publication moves all actual public output buffers without a payload copy/traversal invoice"
+        );
+        assert_eq!(output.root.projected_source.as_ptr(), root_text_ptr);
+        assert_eq!(output.root.directives.as_ptr(), root_directives_ptr);
+        assert_eq!(output.root.directives[0].body.as_ptr(), root_body_ptr);
+        assert_eq!(output.occurrences.as_ptr(), occurrences_ptr);
+        assert_eq!(
+            output.occurrences[0].analysis.projected_source.as_ptr(),
+            occurrence_text_ptr
+        );
+        assert_eq!(
+            output.occurrences[0].analysis.directives[0].body.as_ptr(),
+            occurrence_body_ptr
         );
         assert_eq!(output.facts.scopes.as_ptr(), scopes_ptr);
         assert_eq!(output.facts.declarations.as_ptr(), declarations_ptr);

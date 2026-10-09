@@ -5078,19 +5078,13 @@ impl<S: SourceStore> UnitResolver<S> {
             self.record_candidate(&path, Some(&entry), true, cancel)
                 .map_err(resolver_report_store_error)?;
         }
-        if let Some(mut budget) = self.store_budget(cancel) {
+        let prepared_cache = if let Some(mut budget) = self.store_budget(cancel) {
             let cached = loaded.admitted_copy(&mut budget)?;
             let key = loaded_cache_key(&loaded.id, &mut budget)?;
-            let root = self
-                .compile_time_store
-                .as_ref()
-                .expect("store call")
-                .clone();
-            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            cache.insert_loaded(key, cached, &mut budget)?;
+            Some((key, cached))
         } else {
-            self.loaded.insert(loaded.id.clone(), loaded.clone());
-        }
+            None
+        };
         let mut sizing_budget = self.store_budget(cancel);
         if let Some(budget) = sizing_budget.as_mut() {
             budget
@@ -5160,6 +5154,23 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         })
         .map_err(resolver_report_store_error)?;
+        // Reports are truthful evidence of the performed read even if later
+        // cache admission refuses. Complete all leaf report callbacks before
+        // the irreversible pair commit; prepared originals move only once.
+        if let Some((key, cached)) = prepared_cache {
+            let mut budget = self.store_budget(cancel).expect("prepared typed cache");
+            let root = self
+                .compile_time_store
+                .as_ref()
+                .expect("store call")
+                .clone();
+            root.view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_loaded(key, cached, &mut budget)?;
+        } else {
+            self.loaded.insert(loaded.id.clone(), loaded.clone());
+        }
         Ok(loaded)
     }
 
@@ -11037,7 +11048,6 @@ mod tests {
         for panic in [false, true] {
             let mut completed = false;
             let mut refused = 0;
-            let mut published_before_refusal = false;
             for stop in 0..700 {
                 let (dir, _, mut resolver) = physical_report_resolver();
                 let mut budget =
@@ -11116,6 +11126,18 @@ mod tests {
                 };
                 {
                     let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    if failure {
+                        assert_eq!(
+                            cache.loaded.len(),
+                            3,
+                            "failed leaf must not publish new loaded pair at poll {stop}, panic={panic}"
+                        );
+                        assert_eq!(
+                            cache.loaded.capacity(),
+                            cap,
+                            "failed leaf must preserve original backing"
+                        );
+                    }
                     for (id, pointer) in keys {
                         let (key, value) = cache.loaded.get_key_value(&id).unwrap();
                         assert_eq!(key.0.as_str().as_ptr(), pointer);
@@ -11129,9 +11151,6 @@ mod tests {
                     } else {
                         assert_eq!(cache.loaded.len(), 4);
                         assert!(cache.loaded.capacity() > cap);
-                        if failure {
-                            published_before_refusal = true;
-                        }
                     }
                 }
                 let spent = budget.snapshot();
@@ -11158,10 +11177,6 @@ mod tests {
             }
             assert!(completed);
             assert!(refused > 20);
-            assert!(
-                published_before_refusal,
-                "inherited cache-before-report publication gap is explicit, not falsely certified transactional"
-            );
         }
         let (dir, _, mut resolver) = physical_report_resolver();
         let p = dir.path().join("Other.pas");
@@ -11255,6 +11270,348 @@ mod tests {
         assert_eq!(foreign.snapshot().work, before.work);
         assert_eq!(foreign.snapshot().byte_work, before.byte_work);
         assert!(source.bytes.starts_with(b"unit Other"));
+    }
+
+    #[test]
+    fn loaded_publication_replacement_every_leaf_unwind_cancel_preserves_prior_then_retries() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stopped = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stopped && self.panic {
+                    panic!("replacement leaf report/cache unwind")
+                }
+                stopped
+            }
+        }
+        for panic in [true, false] {
+            let mut finished = false;
+            let mut refused = 0;
+            let mut failure_after_report = 0;
+            for stop in 0..700 {
+                let (dir, _, mut resolver) = physical_report_resolver();
+                let path = dir.path().join("Other.pas");
+                let entry = resolver.context.path_entry_for(&path).unwrap();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let old = call
+                    .load_candidate_with_limit(
+                        &path,
+                        &entry,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &NoCancellation,
+                    )
+                    .unwrap();
+                let root = call.compile_time_store.as_ref().unwrap().clone();
+                let (key_pointer, cap) = {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        cache
+                            .loaded
+                            .get_key_value(&old.id)
+                            .unwrap()
+                            .0
+                            .0
+                            .as_str()
+                            .as_ptr(),
+                        cache.loaded.capacity(),
+                    )
+                };
+                fs::write(
+                    &path,
+                    "unit Other; interface {changed physical version} implementation end.",
+                )
+                .unwrap();
+                let before = budget.snapshot();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.load_candidate_with_limit(
+                        &path,
+                        &entry,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        },
+                    )
+                }));
+                let loaded = match result {
+                    Err(_) => {
+                        assert!(panic);
+                        refused += 1;
+                        None
+                    }
+                    Ok(Err(SourceStoreError::Cancelled)) => {
+                        assert!(!panic);
+                        refused += 1;
+                        None
+                    }
+                    Ok(Ok(source)) => {
+                        finished = true;
+                        Some(source)
+                    }
+                    Ok(Err(error)) => panic!("unexpected leaf {stop}: {error:?}"),
+                };
+                if loaded.is_none() {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(cache.loaded.len(), 1);
+                    assert_eq!(cache.loaded.capacity(), cap);
+                    let (key, value) = cache.loaded.get_key_value(&old.id).unwrap();
+                    assert_eq!(
+                        key.0.as_str().as_ptr(),
+                        key_pointer,
+                        "failed replacement leaf must preserve original key at poll {stop}, panic={panic}"
+                    );
+                    assert_eq!(value.bytes.as_ptr(), old.bytes.as_ptr());
+                    assert_eq!(
+                        value.revision, old.revision,
+                        "failed replacement leaf must not publish revised source"
+                    );
+                    drop(cache);
+                    if call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {revision,..} if revision!=&old.revision)) {failure_after_report+=1;}
+                }
+                assert!(budget.snapshot().work >= before.work);
+                assert!(budget.snapshot().byte_work >= before.byte_work);
+                let new = loaded.unwrap_or_else(|| {
+                    call.load_candidate_with_limit(
+                        &path,
+                        &entry,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &NoCancellation,
+                    )
+                    .unwrap()
+                });
+                assert_ne!(new.revision, old.revision);
+                assert_ne!(new.bytes.as_ptr(), old.bytes.as_ptr());
+                {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    let (key, value) = cache.loaded.get_key_value(&new.id).unwrap();
+                    assert_ne!(key.0.as_str().as_ptr(), key_pointer);
+                    assert_eq!(value.bytes.as_ptr(), new.bytes.as_ptr());
+                    assert_eq!(value.revision, new.revision);
+                    assert_eq!(cache.loaded.capacity(), cap);
+                }
+                assert!(call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {revision,..} if revision==&new.revision)));
+                let spent = budget.snapshot();
+                drop(call);
+                drop(resolver);
+                drop(root);
+                drop(budget);
+                assert!(old.bytes.starts_with(b"unit Other"));
+                assert!(
+                    new.bytes
+                        .windows(b"changed physical version".len())
+                        .any(|w| w == b"changed physical version")
+                );
+                drop(old);
+                drop(new);
+                assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+                assert_eq!(observer.budget_snapshot().work, spent.work);
+                assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+                if finished {
+                    break;
+                }
+            }
+            assert!(finished);
+            assert!(refused > 20);
+            assert!(
+                failure_after_report > 0,
+                "sweep reaches completed report then precommit failure, without revised cache pair"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_publication_actual_report_prepared_work_and_peak_refusals_do_not_commit() {
+        use crate::compile_time::{BudgetSnapshot, CompileTimeLimits};
+        struct Trace<'a> {
+            owner: &'a AdmittedShared<()>,
+            samples: std::cell::RefCell<Vec<BudgetSnapshot>>,
+        }
+        impl CancellationToken for Trace<'_> {
+            fn is_cancelled(&self) -> bool {
+                self.samples.borrow_mut().push(self.owner.budget_snapshot());
+                false
+            }
+        }
+        fn run(
+            growth: bool,
+            limits: CompileTimeLimits,
+            refusal: bool,
+            report_ready: bool,
+        ) -> (usize, usize) {
+            let (dir, _, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let mut held = Vec::new();
+            for i in 0..3 {
+                let path = dir.path().join(format!("Prior{i}.pas"));
+                fs::write(
+                    &path,
+                    format!("unit Prior{i}; interface implementation end."),
+                )
+                .unwrap();
+                let entry = call.context.path_entry_for(&path).unwrap();
+                held.push(
+                    call.load_candidate_with_limit(
+                        &path,
+                        &entry,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &NoCancellation,
+                    )
+                    .unwrap(),
+                );
+            }
+            let root = call.compile_time_store.as_ref().unwrap().clone();
+            let keys = {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(cache.loaded.len(), cache.loaded.capacity());
+                cache
+                    .loaded
+                    .keys()
+                    .map(|k| ((*k.0).clone(), k.0.as_str().as_ptr()))
+                    .collect::<Vec<_>>()
+            };
+            let path = dir
+                .path()
+                .join(if growth { "Next.pas" } else { "Prior0.pas" });
+            fs::write(
+                &path,
+                "unit NewVersion; interface {changed version} implementation end.",
+            )
+            .unwrap();
+            let entry = call.context.path_entry_for(&path).unwrap();
+            let before = budget.snapshot();
+            let trace = Trace {
+                owner: &observer,
+                samples: Default::default(),
+            };
+            let result =
+                call.load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &trace);
+            let last = *trace.samples.borrow().last().unwrap();
+            let receiving = if growth {
+                8 * (std::mem::size_of::<(OwnedLoadedKey, LoadedSource)>() + 1)
+                    + 16
+                    + std::mem::size_of::<AdmittedOwned<()>>()
+            } else {
+                0
+            };
+            let peak = (last.retained_bytes + receiving).max(
+                trace
+                    .samples
+                    .borrow()
+                    .iter()
+                    .map(|s| s.retained_bytes)
+                    .max()
+                    .unwrap(),
+            );
+            if refusal {
+                assert!(
+                    matches!(result, Err(SourceStoreError::RootLimit { .. })),
+                    "actual report-prepared receiving/work refusal: {result:?}"
+                );
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(cache.loaded.len(), 3);
+                assert_eq!(cache.loaded.capacity(), 3);
+                for (id, pointer) in keys {
+                    let (key, value) = cache.loaded.get_key_value(&id).unwrap();
+                    assert_eq!(key.0.as_str().as_ptr(), pointer);
+                    let old = held.iter().find(|s| s.id == id).unwrap();
+                    assert_eq!(value.bytes.as_ptr(), old.bytes.as_ptr());
+                    assert_eq!(value.revision, old.revision);
+                }
+            } else {
+                let source = result.unwrap();
+                assert!(
+                    source
+                        .bytes
+                        .windows(b"changed version".len())
+                        .any(|w| w == b"changed version")
+                );
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                assert_eq!(
+                    cache.loaded.get(&source.id).unwrap().bytes.as_ptr(),
+                    source.bytes.as_ptr()
+                );
+                drop(cache);
+                held.push(source);
+            }
+            assert_eq!(call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {path:p,revision:SourceRevision::Disk {stamp,..},..} if p==&path && stamp.bytes==b"unit NewVersion; interface {changed version} implementation end.".len() as u64)),report_ready,"completed read evidence survives cache refusal; refused report copy does not fabricate a report");
+            assert!(budget.snapshot().work > before.work);
+            assert!(budget.snapshot().byte_work > before.byte_work);
+            let spent = budget.snapshot();
+            drop(call);
+            drop(resolver);
+            drop(root);
+            drop(budget);
+            drop(held);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            (spent.work, peak)
+        }
+        for growth in [false, true] {
+            let (work, peak) = run(growth, CompileTimeLimits::default(), false, true);
+            run(
+                growth,
+                CompileTimeLimits {
+                    max_work: work - 1,
+                    ..Default::default()
+                },
+                true,
+                true,
+            );
+            if !growth {
+                // Replacement's final cache charge is three work units; the
+                // immediately preceding payload-copy admission is one unit.
+                run(
+                    false,
+                    CompileTimeLimits {
+                        max_work: work - 4,
+                        ..Default::default()
+                    },
+                    true,
+                    false,
+                );
+            }
+            if growth {
+                run(
+                    growth,
+                    CompileTimeLimits {
+                        max_retained_bytes: peak - 1,
+                        ..Default::default()
+                    },
+                    true,
+                    true,
+                );
+            }
+        }
     }
 
     #[test]

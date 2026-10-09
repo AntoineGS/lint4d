@@ -3138,11 +3138,11 @@ impl<S: SourceStore> UnitResolver<S> {
                         // its unmigrated result invoice. Borrow the new match
                         // owner and admit this independent receiving copy;
                         // never extract paths and refund live plain metadata.
-                        let bytes = paths.iter().try_fold(0usize, |sum, path| {
-                            sum.checked_add(path.as_os_str().len()).ok_or_else(|| {
-                                ResolverError::InvalidRequest("case result path overflow".into())
-                            })
-                        })?;
+                        let bytes = case_result_payload_size(
+                            &paths,
+                            self.store_budget(cancel).as_mut(),
+                            cancel,
+                        )?;
                         let retained = paths
                             .len()
                             .checked_mul(std::mem::size_of::<ResolutionCandidate>())
@@ -4689,24 +4689,7 @@ impl<S: SourceStore> UnitResolver<S> {
             let index_bytes = count
                 .checked_mul(std::mem::size_of::<usize>())
                 .ok_or_else(overflow)?;
-            let mut sort_bytes = wanted
-                .as_os_str()
-                .len()
-                .checked_mul(8)
-                .and_then(|n| n.checked_add(32))
-                .ok_or_else(overflow)?;
-            for candidate in listing.files.iter().chain(listing.directories.iter()) {
-                sort_bytes = sort_bytes
-                    .checked_add(
-                        candidate
-                            .as_os_str()
-                            .len()
-                            .checked_mul(8)
-                            .and_then(|n| n.checked_add(32))
-                            .ok_or_else(overflow)?,
-                    )
-                    .ok_or_else(overflow)?;
-            }
+            let mut sort_bytes = case_sort_sizing(&listing, wanted, &mut budget, cancel)?;
             sort_bytes = sort_bytes
                 .checked_add(index_bytes.checked_mul(2).ok_or_else(overflow)?)
                 .ok_or_else(overflow)?;
@@ -6469,6 +6452,63 @@ fn copy_case_path(
         .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
+fn case_sort_sizing(
+    listing: &DirectoryListing,
+    wanted: &std::ffi::OsStr,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<usize, ResolverError> {
+    let overflow = || ResolverError::InvalidRequest("case sorting sizing overflow".into());
+    let count = listing
+        .files
+        .len()
+        .checked_add(listing.directories.len())
+        .ok_or_else(overflow)?;
+    budget
+        .charge(count, 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    let mut bytes = wanted
+        .len()
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(32))
+        .ok_or_else(overflow)?;
+    for candidate in listing.files.iter().chain(listing.directories.iter()) {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        bytes = bytes
+            .checked_add(
+                candidate
+                    .as_os_str()
+                    .len()
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(32))
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+    }
+    Ok(bytes)
+}
+
+fn case_result_payload_size(
+    paths: &[PathBuf],
+    budget: Option<&mut CompileTimeBudget<'_>>,
+    cancel: &dyn CancellationToken,
+) -> Result<usize, ResolverError> {
+    if let Some(budget) = budget {
+        budget
+            .charge(paths.len(), 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    }
+    paths.iter().try_fold(0usize, |sum, path| {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        sum.checked_add(path.as_os_str().len())
+            .ok_or_else(|| ResolverError::InvalidRequest("case result path overflow".into()))
+    })
+}
+
 fn copy_case_paths(
     listing: &DirectoryListing,
     matches: &[usize],
@@ -6487,7 +6527,13 @@ fn copy_case_paths(
         .len()
         .checked_mul(std::mem::size_of::<PathBuf>())
         .ok_or_else(overflow)?;
+    budget
+        .charge(matches.len(), 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
     let payload = matches.iter().try_fold(0usize, |sum, index| {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
         sum.checked_add(at(*index).as_os_str().len())
             .ok_or_else(overflow)
     })?;
@@ -6517,8 +6563,29 @@ fn relative_components_owned(
 ) -> Result<Option<AdmittedOwned<Vec<std::ffi::OsString>>>, ResolverError> {
     let overflow =
         || ResolverError::InvalidRequest("case relative-component construction overflow".into());
-    let base_count = base.components().count();
-    let path_count = path.components().count();
+    // Path bytes are O(1) to inspect and bound the component-count traversal.
+    // Count scans are separate from the later descriptor construction walks.
+    let scan_bound = base
+        .as_os_str()
+        .len()
+        .checked_add(path.as_os_str().len())
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(overflow)?;
+    budget
+        .charge(scan_bound, 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    let count_components = |path: &Path| -> Result<usize, ResolverError> {
+        let mut count = 0usize;
+        for _ in path.components() {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            count = count.checked_add(1).ok_or_else(overflow)?;
+        }
+        Ok(count)
+    };
+    let base_count = count_components(base)?;
+    let path_count = count_components(path)?;
     let component_bytes = |count: usize| {
         count
             .checked_mul(std::mem::size_of::<Component<'_>>())
@@ -6581,13 +6648,20 @@ fn relative_components_owned(
         }
     }
     let count = path_count - base_count;
-    let payload =
-        path_components[base_count..]
-            .iter()
-            .try_fold(0usize, |sum, part| match part {
+    budget
+        .charge(count, 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    let payload = path_components[base_count..]
+        .iter()
+        .try_fold(0usize, |sum, part| {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            match part {
                 Component::Normal(name) => sum.checked_add(name.len()).ok_or_else(overflow),
                 _ => Ok(sum),
-            })?;
+            }
+        })?;
     let retained = count
         .checked_mul(std::mem::size_of::<std::ffi::OsString>())
         .and_then(|n| n.checked_add(payload))
@@ -7690,8 +7764,224 @@ mod tests {
         ));
         assert_eq!(listing.files.as_ptr(), pointer);
         assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
-        assert_eq!(budget.snapshot().work, before.work);
+        let sizing_work =
+            dir.path().as_os_str().len() + dir.path().join("value.inc").as_os_str().len() + 2 + 1;
+        assert_eq!(
+            budget.snapshot().work,
+            before.work + sizing_work,
+            "component counting and match payload sizing remain spent on later retention refusal"
+        );
         assert_eq!(budget.snapshot().byte_work, before.byte_work);
+    }
+
+    #[test]
+    fn case_match_f1_payload_sizing_retained_refusal_spends_scan_work() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        assert!(matches!(
+            copy_case_paths(&listing, &[0], &mut budget, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            budget.snapshot().work,
+            before.work + 1,
+            "payload sizing is spent before receiving retention refusal"
+        );
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert!(!listing.files.is_empty());
+    }
+
+    #[test]
+    fn case_match_f1_component_count_polls_before_retained_refusal() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Cancel;
+        impl CancellationToken for Cancel {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        budget.constrain_retained(0).unwrap();
+        assert!(
+            matches!(
+                relative_components_owned(
+                    Path::new("/one"),
+                    Path::new("/one/two/three"),
+                    &mut budget,
+                    &Cancel
+                ),
+                Err(ResolverError::Cancelled)
+            ),
+            "cancellation must interrupt the admitted count scan before construction"
+        );
+        assert!(budget.snapshot().work > 0);
+        assert_eq!(budget.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn case_match_f1_exhausted_work_refuses_before_preflight_body() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Probe(std::sync::atomic::AtomicUsize);
+        impl CancellationToken for Probe {
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut root = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut root).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let pointer = listing.files.as_ptr();
+        let mut limits = CompileTimeLimits::default();
+        limits.max_work = 0;
+        let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+        let probe = Probe(0.into());
+        assert!(matches!(
+            case_sort_sizing(
+                &listing,
+                std::ffi::OsStr::new("value.inc"),
+                &mut budget,
+                &probe
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            relative_components_owned(
+                dir.path(),
+                &dir.path().join("value.inc"),
+                &mut budget,
+                &probe
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        // An invalid index is a sentinel: preflight work refusal must precede
+        // any receiving-payload index access, not merely copying the vector.
+        assert!(matches!(
+            copy_case_paths(&listing, &[usize::MAX], &mut budget, &probe),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            case_result_payload_size(&listing.files, Some(&mut budget), &probe),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            probe.0.load(Ordering::Relaxed),
+            0,
+            "no scan-body cancellation poll/index/path access before work admission"
+        );
+        assert_eq!(budget.snapshot().work, 0);
+        assert_eq!(budget.snapshot().retained_bytes, 0);
+        assert_eq!(listing.files.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn case_match_f1_long_preflights_poll_and_spend_work_without_copying() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        for index in 0..20 {
+            fs::write(dir.path().join(format!("extra{index}.inc")), "{extra}").unwrap();
+        }
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let pointer = listing.files.as_ptr();
+        let before = budget.snapshot();
+        let poll = || Poll {
+            calls: 0.into(),
+            stop: 5,
+        };
+        assert!(matches!(
+            case_sort_sizing(
+                &listing,
+                std::ffi::OsStr::new("value.inc"),
+                &mut budget,
+                &poll()
+            ),
+            Err(ResolverError::Cancelled)
+        ));
+        assert_eq!(
+            budget.snapshot().work,
+            before.work + listing.files.len() + listing.directories.len()
+        );
+        let work = budget.snapshot().work;
+        let path = dir.path().join("a/b/c/d/e/f/g/h/i/j");
+        assert!(matches!(
+            relative_components_owned(dir.path(), &path, &mut budget, &poll()),
+            Err(ResolverError::Cancelled)
+        ));
+        assert_eq!(
+            budget.snapshot().work,
+            work + dir.path().as_os_str().len() + path.as_os_str().len() + 2
+        );
+        let work = budget.snapshot().work;
+        let matches = (0..listing.files.len()).collect::<Vec<_>>();
+        assert!(matches!(
+            copy_case_paths(&listing, &matches, &mut budget, &poll()),
+            Err(ResolverError::Cancelled)
+        ));
+        assert_eq!(budget.snapshot().work, work + matches.len());
+        let work = budget.snapshot().work;
+        assert!(matches!(
+            case_result_payload_size(&listing.files, Some(&mut budget), &poll()),
+            Err(ResolverError::Cancelled)
+        ));
+        assert_eq!(budget.snapshot().work, work + listing.files.len());
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert_eq!(budget.snapshot().byte_work, before.byte_work);
+        assert_eq!(listing.files.as_ptr(), pointer);
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let bytes = case_sort_sizing(
+            &listing,
+            std::ffi::OsStr::new("value.inc"),
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        assert!(budget.admit_owned(1, bytes, bytes, || ()).is_err());
+        assert_eq!(
+            budget.snapshot().work,
+            before.work + listing.files.len() + listing.directories.len(),
+            "sort construction refusal cannot unspend sizing"
+        );
+        let before = budget.snapshot();
+        let bytes =
+            case_result_payload_size(&listing.files, Some(&mut budget), &NoCancellation).unwrap();
+        assert!(
+            budget
+                .admit_owned(listing.files.len(), bytes, bytes, || ())
+                .is_err()
+        );
+        assert_eq!(
+            budget.snapshot().work,
+            before.work + listing.files.len(),
+            "plain receiving construction refuses only after its sizing charge"
+        );
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
     }
 
     #[cfg(unix)]

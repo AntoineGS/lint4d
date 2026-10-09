@@ -383,7 +383,7 @@ fn option_evidence_runtime_checks_changed_restore_stays_unverified() {
 #[test]
 fn phase_b_reachable_failures_pending_and_depth_do_not_publish_precise_facts() {
     let mut f = Fixture::new(
-        "unit T; interface {$IF Mystery}type R=packed record X:Byte;{$ELSE}type R=Byte;{$ENDIF} implementation end.",
+        "unit T; interface {$IF X}type R=packed record X:Byte;{$ELSE}type R=Byte;{$ENDIF} implementation end.",
         context(LayoutPlatform::Win32),
     );
     f.limits.max_pending_bytes = 8;
@@ -930,11 +930,9 @@ fn root_session_limits_and_cancellation_never_publish_a_precise_result() {
     assert_eq!(maximum, 0);
     assert_eq!(
         observed,
-        f.root.analysis_bytes().len() * 4
-            + std::mem::size_of::<CompileTimeAnalysis>()
-            + std::mem::size_of::<OccurrenceAnalysis>()
+        2 * (std::mem::size_of::<pascal_core::LoadedSource>()
             + f.root.id.as_str().len()
-            + f.root.path.as_os_str().len()
+            + f.root.path.as_os_str().len())
     );
     struct Cancel;
     impl pascal_core::CancellationToken for Cancel {

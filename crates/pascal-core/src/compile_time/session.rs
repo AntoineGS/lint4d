@@ -60,6 +60,18 @@ pub struct IncludeOccurrence {
     pub directive: SourceAnchor,
     pub target: Resolution<LoadedSource>,
     pub child: Option<OccurrenceId>,
+    /// Exact physical delimiter/body fragments; `directive` names the opener.
+    pub fragments: Vec<SourceAnchor>,
+}
+
+/// A logical directive may span several physical source/occurrence fragments.
+/// The legacy directive range names only its completing physical fragment.
+#[derive(Debug, Clone)]
+pub struct DirectiveFragments {
+    pub completion: OccurrenceId,
+    pub directive: ConditionalDirective,
+    pub fragments: Vec<SourceAnchor>,
+    pub body_fragments: Vec<SourceAnchor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +91,9 @@ pub struct CompileTimeAnalysis {
     pub reasons: Vec<IncompleteReason>,
     pub observations: Vec<ResolutionObservation>,
     pub warnings: Vec<String>,
+    pub directive_fragments: Vec<DirectiveFragments>,
+    /// Admitted session storage and cumulative work (not allocator telemetry).
+    pub budget: BudgetSnapshot,
 }
 
 /// Analyze one root with the shared conditional interpreter and lexical binder.
@@ -91,8 +106,25 @@ pub fn analyze_source(
     limits: CompileTimeLimits,
     cancel: &dyn CancellationToken,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
-    let bytes = root.analysis_bytes();
     let mut budget = CompileTimeBudget::new(limits, cancel);
+    analyze_source_in_session(root, context, resolver, &mut budget, cancel)
+}
+
+/// Generic resolver roots use their remaining aggregate admission and inspect
+/// this same budget on success AND failure. Children never create a new budget.
+pub(crate) fn analyze_source_in_session(
+    root: &LoadedSource,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
+    mut budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<CompileTimeAnalysis, ResolverError> {
+    let limits = budget.limits();
+    let bytes = root.analysis_bytes();
+    let metadata = crate::resolver::loaded_source_metadata_retained(root);
+    budget
+        .charge(1, metadata, metadata.saturating_mul(2))
+        .map_err(|r| resolver_error(r, budget))?;
     // Reserve root projection, lexer/output scratch and source identity copies
     // before the existing lexer's allocations. Its original directive/depth/
     // environment limits remain enforced by the shared interpreter.
@@ -180,6 +212,8 @@ pub fn analyze_source(
         scanner: conditional::DirectiveScanner::default(),
         resource_error: None,
         directive_count: 0,
+        directive_fragments: Vec::new(),
+        current_directive: 0,
         state,
         budget,
         reasons: Vec::new(),
@@ -301,11 +335,49 @@ pub fn analyze_source(
         .budget
         .charge(analysis.directives.len() + 1, payload, payload)
         .map_err(|r| resolver_error(r, &session.budget))?;
-    let occurrence = OccurrenceAnalysis {
+    let mut occurrence = OccurrenceAnalysis {
         id: OccurrenceId(0),
         source: root.clone(),
         analysis: analysis.clone(),
     };
+    // Projection only: finalized logical directives mask their actual physical
+    // fragments, including child fragments whose EOF preceded the terminator.
+    // No parser, evaluator or read decision is run again.
+    for occurrence in std::iter::once(&mut occurrence).chain(session.occurrences.iter_mut()) {
+        if !occurrence.analysis.complete {
+            continue;
+        }
+        session
+            .budget
+            .charge(1, occurrence.analysis.projected_source.len(), 0)
+            .map_err(|r| resolver_error(r, &session.budget))?;
+        let mut bytes = std::mem::take(&mut occurrence.analysis.projected_source).into_bytes();
+        for directive in &session.directive_fragments {
+            session
+                .budget
+                .charge(1, 0, 0)
+                .map_err(|r| resolver_error(r, &session.budget))?;
+            for anchor in &directive.fragments {
+                session
+                    .budget
+                    .charge(1, 0, 0)
+                    .map_err(|r| resolver_error(r, &session.budget))?;
+                if anchor.occurrence == occurrence.id {
+                    session
+                        .budget
+                        .charge(1, anchor.range.len(), 0)
+                        .map_err(|r| resolver_error(r, &session.budget))?;
+                    for byte in &mut bytes[anchor.range.clone()] {
+                        if !matches!(*byte, b'\n' | b'\r') {
+                            *byte = b' ';
+                        }
+                    }
+                }
+            }
+        }
+        occurrence.analysis.projected_source =
+            String::from_utf8(bytes).expect("complete physical fragments preserve UTF-8 masking");
+    }
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
     }
@@ -321,6 +393,8 @@ pub fn analyze_source(
         reasons: session.reasons,
         observations: session.observations,
         warnings: session.warnings,
+        directive_fragments: session.directive_fragments,
+        budget: session.budget.snapshot(),
     })
 }
 
@@ -380,7 +454,7 @@ pub(crate) fn resolver_error(
     }
 }
 
-struct RootSession<'a> {
+struct RootSession<'a, 'b> {
     root: LoadedSource,
     text: String,
     resolver: &'a mut dyn CompileTimeResolver,
@@ -395,8 +469,10 @@ struct RootSession<'a> {
     scanner: conditional::DirectiveScanner,
     resource_error: Option<ResolverError>,
     directive_count: usize,
+    directive_fragments: Vec<DirectiveFragments>,
+    current_directive: usize,
     state: CompileTimeState,
-    budget: CompileTimeBudget<'a>,
+    budget: &'a mut CompileTimeBudget<'b>,
     reasons: Vec<IncompleteReason>,
     includes: Vec<IncludeOccurrence>,
     fatal: Option<IncompleteReason>,
@@ -416,10 +492,27 @@ struct ReachableFrame {
     has_else: bool,
 }
 
-impl RootSession<'_> {
+impl RootSession<'_, '_> {
     fn walk_include(&mut self, directive: &ConditionalDirective) -> Result<(), ResolverError> {
         // A reachable hypothetical path is not an authorization to read bytes.
         let name = crate::resolver::include_name(&directive.body);
+        self.budget
+            .charge(self.occurrences.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, &self.budget))?;
+        let mapping = &self.directive_fragments[self.current_directive];
+        let anchor = mapping.fragments.first().expect("include delimiter");
+        let owner = anchor.occurrence;
+        let source = if owner == self.occurrence {
+            &self.root
+        } else {
+            &self
+                .occurrences
+                .iter()
+                .find(|o| o.id == owner)
+                .expect("completed physical opener")
+                .source
+        };
+        let including_path = &source.path;
         self.budget
             .charge(
                 1,
@@ -447,8 +540,8 @@ impl RootSession<'_> {
         } else if let Some(name) = name.as_deref() {
             self.resolver.include(
                 IncludeResolveRequest {
-                    including_path: &self.root.path,
-                    byte_range: directive.start..directive.end,
+                    including_path,
+                    byte_range: anchor.range.clone(),
                     requested_name: name,
                     legacy_route: None,
                 },
@@ -533,19 +626,32 @@ impl RootSession<'_> {
             }
         }
         let index = self.includes.len();
+        let fragments_bytes = mapping
+            .fragments
+            .iter()
+            .map(|a| std::mem::size_of::<SourceAnchor>() + a.source.as_str().len())
+            .sum::<usize>();
+        self.budget
+            .charge(
+                mapping.fragments.len(),
+                0,
+                fragments_bytes + anchor.source.as_str().len(),
+            )
+            .map_err(|r| resolver_error(r, &self.budget))?;
         self.includes.push(IncludeOccurrence {
-            owner: self.occurrence,
-            directive: SourceAnchor {
-                source: self.root.id.clone(),
-                occurrence: self.occurrence,
-                range: directive.start..directive.end,
-            },
+            owner,
+            directive: anchor.clone(),
+            fragments: mapping.fragments.clone(),
             target: result,
             child: None,
         });
         match &self.includes[index].target {
             Resolution::Found(child) => {
                 let bytes = child.analysis_bytes();
+                let metadata = crate::resolver::loaded_source_metadata_retained(child);
+                self.budget
+                    .charge(1, metadata, metadata)
+                    .map_err(|r| resolver_error(r, &self.budget))?;
                 let reserve = bytes
                     .len()
                     .checked_mul(4)
@@ -647,9 +753,7 @@ impl RootSession<'_> {
         let mut decisions = Vec::new();
         for path in &self.current {
             let condition = evaluate_path_condition(
-                &self.root,
-                self.occurrence,
-                &self.text,
+                &self.directive_fragments[self.current_directive].body_fragments,
                 &path,
                 directive,
                 &mut self.budget,
@@ -808,9 +912,7 @@ impl ReachablePath {
 }
 
 fn evaluate_path_condition(
-    root: &LoadedSource,
-    occurrence: OccurrenceId,
-    text: &str,
+    body_fragments: &[SourceAnchor],
     path: &ReachablePath,
     directive: &ConditionalDirective,
     budget: &mut CompileTimeBudget<'_>,
@@ -826,16 +928,24 @@ fn evaluate_path_condition(
             if let ExpressionQuery::SizeOf { argument, range } = &query {
                 let before = budget.snapshot().retained_bytes;
                 let mapped = (|| {
-                    let anchor = argument_anchor(
-                        root,
-                        occurrence,
-                        text,
-                        &directive.body,
-                        directive.start,
-                        range.clone(),
-                        budget,
-                    )?;
-                    if text.get(anchor.range.clone()) != Some(*argument) {
+                    let expression = conditional::condition_expression(&directive.body)
+                        .ok_or(IncompleteReason::MalformedSource)?;
+                    if expression.get(range.clone()) != Some(*argument) {
+                        return Err(IncompleteReason::MalformedSource);
+                    }
+                    let offset = expression.as_ptr() as usize - directive.body.as_ptr() as usize;
+                    let wanted = offset + range.start..offset + range.end;
+                    let mut logical = 0;
+                    let mut covered = 0;
+                    for anchor in body_fragments {
+                        budget.charge(1, 0, 0)?;
+                        let end = logical + anchor.range.len();
+                        covered += end
+                            .min(wanted.end)
+                            .saturating_sub(logical.max(wanted.start));
+                        logical = end;
+                    }
+                    if covered != range.len() {
                         return Err(IncompleteReason::MalformedSource);
                     }
                     Ok(())
@@ -848,15 +958,56 @@ fn evaluate_path_condition(
     )
 }
 
-impl SourceOrder for RootSession<'_> {
+impl SourceOrder for RootSession<'_, '_> {
     fn next_directive(
         &mut self,
         source: &str,
         cursor: usize,
-    ) -> Result<Option<ConditionalDirective>, ()> {
-        let next = self.scanner.next(source, cursor, self.cancel)?;
-        let Some((range, body)) = next else {
-            return Ok(None);
+    ) -> Result<conditional::SourceOrderStep, ()> {
+        let next = match self.scanner.next(
+            source,
+            cursor,
+            &self.root.id,
+            self.occurrence,
+            &mut self.budget,
+            self.cancel,
+        ) {
+            Ok(next) => next,
+            Err(reason) => {
+                self.record(reason);
+                return Err(());
+            }
+        };
+        for (anchor, text) in next.deferred {
+            if self.reasons.is_empty() {
+                for path in &mut self.current {
+                    if let Err(reason) = path.state_mut().feed(
+                        SourceFragment {
+                            source: &anchor.source,
+                            occurrence: anchor.occurrence,
+                            physical_start: anchor.range.start,
+                            text: &text,
+                        },
+                        Truth::True,
+                        &mut self.budget,
+                    ) {
+                        self.record(reason);
+                        return Err(());
+                    }
+                }
+            }
+            self.budget.release(
+                std::mem::size_of::<(SourceAnchor, String)>()
+                    + text.len()
+                    + std::mem::size_of::<SourceAnchor>()
+                    + anchor.source.as_str().len(),
+            );
+        }
+        let Some(scanned) = next.directive else {
+            return Ok(conditional::SourceOrderStep {
+                text_end: next.text_end,
+                directive: None,
+            });
         };
         if self.directive_count >= conditional::MAX_DIRECTIVES {
             self.record(IncompleteReason::Limit {
@@ -866,10 +1017,10 @@ impl SourceOrder for RootSession<'_> {
             return Err(());
         }
         self.directive_count += 1;
-        if !self.admit_directive(body.len()) {
+        if !self.admit_directive(scanned.body.len()) {
             return Err(());
         }
-        let kind = conditional::directive_kind(body);
+        let kind = conditional::directive_kind(&scanned.body);
         if kind == DirectiveKind::Include {
             match self.resolver.admit_include(&mut self.budget, self.cancel) {
                 Ok(true) => {}
@@ -886,14 +1037,31 @@ impl SourceOrder for RootSession<'_> {
                 }
             }
         }
-        Ok(Some(ConditionalDirective {
+        let directive = ConditionalDirective {
             kind,
-            body: body.to_owned(),
-            start: range.start,
-            end: range.end,
+            body: scanned.body,
+            start: scanned.range.start,
+            end: scanned.range.end,
             activity: Truth::Unknown,
             condition: None,
-        }))
+        };
+        self.budget
+            .charge(1, 0, std::mem::size_of::<DirectiveFragments>())
+            .map_err(|r| {
+                self.fatal = Some(r);
+            })?;
+        self.current_directive = self.directive_fragments.len();
+        self.directive_fragments.reserve_exact(1);
+        self.directive_fragments.push(DirectiveFragments {
+            completion: self.occurrence,
+            directive: directive.clone(),
+            fragments: scanned.fragments,
+            body_fragments: scanned.body_fragments,
+        });
+        Ok(conditional::SourceOrderStep {
+            text_end: next.text_end,
+            directive: Some(directive),
+        })
     }
     fn activity(&self) -> Truth {
         if !self.reasons.is_empty() || self.fatal.is_some() {
@@ -985,6 +1153,9 @@ impl SourceOrder for RootSession<'_> {
     }
 
     fn directive(&mut self, directive: &ConditionalDirective) {
+        self.directive_fragments[self.current_directive]
+            .directive
+            .activity = directive.activity;
         if self.fatal.is_some() || !self.reasons.is_empty() {
             return;
         }
@@ -996,6 +1167,15 @@ impl SourceOrder for RootSession<'_> {
         ) {
             if let Err(reason) = self.transition(directive) {
                 self.record(reason);
+            }
+            if matches!(
+                directive.kind,
+                DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+            ) && !layout_body_key(&directive.body).eq_ignore_ascii_case("ELSE")
+            {
+                self.directive_fragments[self.current_directive]
+                    .directive
+                    .condition = Some(self.last_condition);
             }
             return;
         }
@@ -1186,6 +1366,7 @@ fn layout_body_key(body: &str) -> &str {
     &body[..end]
 }
 
+#[cfg(test)]
 fn argument_anchor(
     root: &LoadedSource,
     occurrence: OccurrenceId,

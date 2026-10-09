@@ -54,6 +54,11 @@ pub struct ResolverLimits {
     pub max_package_catalogue_entries: usize,
     pub max_package_catalogues: usize,
     pub max_resolution_warnings: usize,
+    /// Aggregate compile-time scratch plus published outputs over this resolver.
+    /// Published outputs remain reserved until the request-local resolver drops.
+    pub max_compile_time_retained_bytes: usize,
+    pub max_compile_time_work: usize,
+    pub max_compile_time_byte_work: usize,
 }
 
 impl Default for ResolverLimits {
@@ -72,6 +77,9 @@ impl Default for ResolverLimits {
             max_package_catalogue_entries: 524_288,
             max_package_catalogues: 64,
             max_resolution_warnings: 256,
+            max_compile_time_retained_bytes: 1_048_576,
+            max_compile_time_work: 1_000_000,
+            max_compile_time_byte_work: 16_777_216,
         }
     }
 }
@@ -405,17 +413,92 @@ pub struct UnitResolver<S> {
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
     stop_when_incomplete: bool,
-    conditional_analyses: HashMap<
-        (SourceId, u64),
-        (
-            crate::conditional::ConditionalAnalysis,
-            Vec<ResolvedInclude>,
-        ),
-    >,
     compile_time_route: Option<LegacyRoute>,
+    compile_time_accounting: crate::compile_time::BudgetSnapshot,
 }
 
 impl<S: SourceStore> UnitResolver<S> {
+    /// Cumulative admitted work and live scratch/published-output reservations.
+    /// Temporary projections refund storage, never work or byte work. The
+    /// resolver cannot observe callers dropping outputs, so their reservations
+    /// conservatively last for this resolver's request-local lifetime.
+    pub fn compile_time_usage(&self) -> crate::compile_time::BudgetSnapshot {
+        self.compile_time_accounting
+    }
+
+    fn charge_compile_time(
+        &mut self,
+        work: usize,
+        bytes: usize,
+        retained: usize,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        self.check_cancel(cancel)?;
+        let admit = |current: usize, amount: usize, maximum: usize, limit| {
+            let observed = current.checked_add(amount).unwrap_or(usize::MAX);
+            if observed > maximum {
+                Err(ResolverError::LimitExceeded {
+                    limit,
+                    observed,
+                    maximum,
+                })
+            } else {
+                Ok(observed)
+            }
+        };
+        let c = self.compile_time_accounting;
+        let result: Result<_, ResolverError> = (|| {
+            Ok(crate::compile_time::BudgetSnapshot {
+                work: admit(
+                    c.work,
+                    work,
+                    self.limits.max_compile_time_work,
+                    "max_compile_time_work",
+                )?,
+                byte_work: admit(
+                    c.byte_work,
+                    bytes,
+                    self.limits.max_compile_time_byte_work,
+                    "max_compile_time_byte_work",
+                )?,
+                retained_bytes: admit(
+                    c.retained_bytes,
+                    retained,
+                    self.limits.max_compile_time_retained_bytes,
+                    "max_compile_time_retained_bytes",
+                )?,
+            })
+        })();
+        match result {
+            Ok(counters) => {
+                self.compile_time_accounting = counters;
+                Ok(())
+            }
+            Err(error) => {
+                self.mark_incomplete(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn release_compile_time(&mut self, bytes: usize) {
+        self.compile_time_accounting.retained_bytes = self
+            .compile_time_accounting
+            .retained_bytes
+            .saturating_sub(bytes);
+    }
+
+    fn effective_root_route(&self, source: &LoadedSource) -> Option<LegacyRoute> {
+        // A public ID is not a proof of path/revision or legacy authority.
+        let inherited = if matches!(source.revision, SourceRevision::Overlay { .. }) {
+            self.legacy_routes
+                .get(&source.id)
+                .filter(|route| path_equivalent(&route.source_path, &source.path))
+        } else {
+            None
+        };
+        self.legacy_route_for_source(source, inherited)
+    }
     /// One typed textual-include session, borrowing this request-local resolver
     /// throughout. Source classification belongs to the root, not child paths.
     pub fn analyze_compile_time(
@@ -424,29 +507,71 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<crate::compile_time::CompileTimeAnalysis, ResolverError> {
         self.check_cancel(cancel)?;
+        // No conditional-decision cache: every root derives its actual context,
+        // route and dependency observations. Keep same-root repeated includes
+        // reusable, but revalidate payloads and negative directory observations
+        // on the next root operation without resetting resource counters.
+        self.loaded.retain(|id, _| !self.include_seen.contains(id));
+        self.include_seen.clear();
+        self.directories.clear();
         let context = self.context.conditional_context_for(&root.path);
-        let mut decoded;
-        let root = if root.decoded_text.is_none() && std::str::from_utf8(&root.bytes).is_err() {
-            decoded = root.clone();
+        let decode_reserve =
+            if root.decoded_text.is_none() && std::str::from_utf8(&root.bytes).is_err() {
+                loaded_source_retained(root).saturating_add(root.bytes.len().saturating_mul(3))
+            } else {
+                0
+            };
+        self.charge_compile_time(1, 0, decode_reserve, cancel)?;
+        let decoded = if decode_reserve > 0 {
+            let mut decoded = root.clone();
             decoded.decoded_text = Some(source_text(root).into());
-            &decoded
+            Some(decoded)
         } else {
-            root
+            None
         };
-        let route = self
-            .legacy_routes
-            .get(&root.id)
-            .cloned()
-            .or_else(|| self.legacy_route_for_source(root, None));
+        let root = decoded.as_ref().unwrap_or(root);
+        let route = self.effective_root_route(root);
         let previous = std::mem::replace(&mut self.compile_time_route, route);
-        let result = crate::compile_time::analyze_source(
+        let defaults = crate::compile_time::CompileTimeLimits::default();
+        let limits = crate::compile_time::CompileTimeLimits {
+            max_work: defaults.max_work.min(
+                self.limits
+                    .max_compile_time_work
+                    .saturating_sub(self.compile_time_accounting.work),
+            ),
+            max_byte_work: defaults.max_byte_work.min(
+                self.limits
+                    .max_compile_time_byte_work
+                    .saturating_sub(self.compile_time_accounting.byte_work),
+            ),
+            max_retained_bytes: defaults.max_retained_bytes.min(
+                self.limits
+                    .max_compile_time_retained_bytes
+                    .saturating_sub(self.compile_time_accounting.retained_bytes),
+            ),
+            ..defaults
+        };
+        let mut budget = crate::compile_time::CompileTimeBudget::new(limits, cancel);
+        let result = crate::compile_time::analyze_source_in_session(
             root,
             &context,
             self,
-            crate::compile_time::CompileTimeLimits::default(),
+            &mut budget,
             cancel,
         );
         self.compile_time_route = previous;
+        // Record already-performed work even when cancellation/error ends the
+        // session. Failed-session storage has been dropped, never published.
+        let usage = budget.snapshot();
+        self.compile_time_accounting.work += usage.work;
+        self.compile_time_accounting.byte_work += usage.byte_work;
+        if result.is_ok() {
+            self.compile_time_accounting.retained_bytes += usage.retained_bytes;
+        } else if let Err(error) = &result {
+            self.mark_incomplete(error.to_string());
+        }
+        drop(decoded);
+        self.release_compile_time(decode_reserve);
         result
     }
 
@@ -454,85 +579,187 @@ impl<S: SourceStore> UnitResolver<S> {
         &mut self,
         source: &LoadedSource,
         text: &str,
+        retain_includes: bool,
         cancel: &dyn CancellationToken,
-    ) -> Result<crate::conditional::ConditionalAnalysis, ResolverError> {
-        let key = (source.id.clone(), content_hash_bytes(text.as_bytes()));
-        if let Some((analysis, _)) = self.conditional_analyses.get(&key) {
-            return Ok(analysis.clone());
-        }
-        let context = self.context.conditional_context_for(&source.path);
-        let lexical = crate::conditional::analyze_with_context_and_cancel(text, &context, cancel);
-        // Preserve legacy root-only entrypoints, but do not use their scalar
-        // projection to make any include-dependent import/read decision.
-        if !lexical
-            .directives
-            .iter()
-            .any(|d| d.kind == crate::conditional::DirectiveKind::Include)
-        {
-            return Ok(lexical);
-        }
-        let mut root = source.clone();
-        root.decoded_text = Some(text.into());
-        let mut analysis = self.analyze_compile_time(&root, cancel)?;
-        let unsupported = analysis.occurrences.iter().any(|o| {
-            o.analysis.directives.iter().any(|d| {
-                d.potentially_active() && d.kind == crate::conditional::DirectiveKind::Other
-            })
-        });
-        if unsupported {
-            analysis.root.complete = false;
-            self.mark_incomplete(format!(
-                "source {} contains an unsupported active directive",
-                source.path.display()
-            ));
-        }
-        let mut includes = Vec::new();
-        for occurrence in &analysis.occurrences {
-            for directive in occurrence
-                .analysis
-                .directives
-                .iter()
-                .filter(|d| d.kind == crate::conditional::DirectiveKind::Include)
-            {
-                let Some(name) = include_name(&directive.body) else {
-                    continue;
-                };
-                let target = analysis.includes.iter().find(|i| {
-                    i.owner == occurrence.id
-                        && i.directive.range == (directive.start..directive.end)
+    ) -> Result<SourceOrderProjection, ResolverError> {
+        let retained_before = self.compile_time_accounting.retained_bytes;
+        let result = (|| {
+            self.charge_compile_time(text.len().saturating_mul(8), text.len(), 0, cancel)?;
+            let (has_includes, directives) =
+                crate::conditional::source_directive_shape(text, cancel);
+            if !has_includes {
+                let context = self.context.conditional_context_for(&source.path);
+                let mut context_bytes = 0usize;
+                context
+                    .visit_recovery_payload(&mut |n| {
+                        context_bytes = context_bytes.saturating_add(n);
+                        Ok(())
+                    })
+                    .expect("infallible size visitor");
+                let entries =
+                    context.defines.len() + context.options.len() + context.constants.len();
+                let reserve =
+                    text.len()
+                        .saturating_mul(4)
+                        .saturating_add((directives + 1).saturating_mul(
+                            4 * (std::mem::size_of::<crate::conditional::ConditionalDirective>()
+                                + 4 * std::mem::size_of::<Range<usize>>()
+                                + context_bytes
+                                + entries * 64),
+                        ));
+                self.charge_compile_time(
+                    entries.saturating_mul(directives + 1),
+                    context_bytes,
+                    reserve,
+                    cancel,
+                )?;
+                let mut lexical =
+                    crate::conditional::analyze_with_context_and_cancel(text, &context, cancel);
+                let unsupported = retain_includes
+                    && lexical.directives.iter().any(|d| {
+                        d.potentially_active() && d.kind == crate::conditional::DirectiveKind::Other
+                    });
+                if unsupported {
+                    lexical.complete = false;
+                    self.mark_incomplete(format!(
+                        "source {} contains an unsupported active directive",
+                        source.path.display()
+                    ));
+                }
+                let bytes = conditional_analysis_retained(&lexical);
+                if bytes > reserve {
+                    self.charge_compile_time(1, 0, bytes - reserve, cancel)?;
+                } else {
+                    self.release_compile_time(reserve - bytes);
+                }
+                let includes = retain_includes.then(|| IncludeWalkResult {
+                    includes: vec![],
+                    complete: lexical.complete && lexical.unknown_spans.is_empty(),
                 });
-                let target = match target.map(|i| &i.target) {
-                    Some(Resolution::Found(source)) if !unsupported => {
-                        ResolutionTarget::Found(source.id.clone())
-                    }
-                    Some(Resolution::Ambiguous { .. }) => ResolutionTarget::Ambiguous,
-                    Some(Resolution::Unavailable { .. })
-                        if directive.activity == crate::conditional::Truth::False =>
-                    {
-                        ResolutionTarget::Unavailable
-                    }
-                    None if directive.activity == crate::conditional::Truth::False => {
-                        ResolutionTarget::Unavailable
-                    }
-                    _ => ResolutionTarget::Incomplete,
-                };
-                includes.push(ResolvedInclude {
-                    including_source_id: occurrence.source.id.clone(),
-                    byte_range: directive.start..directive.end,
-                    requested_name: name,
-                    target,
+                return Ok(SourceOrderProjection {
+                    root: lexical,
+                    retained: bytes,
+                    includes,
                 });
             }
+            let scratch = loaded_source_retained(source).saturating_add(text.len());
+            self.charge_compile_time(1, text.len(), scratch, cancel)?;
+            let mut root = source.clone();
+            root.decoded_text = Some(text.into());
+            let result = self.analyze_compile_time(&root, cancel);
+            drop(root);
+            self.release_compile_time(scratch);
+            let mut analysis = result?;
+            let unsupported = analysis.occurrences.iter().any(|o| {
+                o.analysis.directives.iter().any(|d| {
+                    d.potentially_active() && d.kind == crate::conditional::DirectiveKind::Other
+                })
+            });
+            if unsupported {
+                analysis.root.complete = false;
+                self.mark_incomplete(format!(
+                    "source {} contains an unsupported active directive",
+                    source.path.display()
+                ));
+            }
+            let includes = if retain_includes {
+                let count = analysis
+                    .directive_fragments
+                    .iter()
+                    .filter(|m| m.directive.kind == crate::conditional::DirectiveKind::Include)
+                    .count();
+                self.charge_compile_time(
+                    analysis.directive_fragments.len(),
+                    0,
+                    count * std::mem::size_of::<ResolvedInclude>(),
+                    cancel,
+                )?;
+                let mut includes = Vec::with_capacity(count);
+                for mapping in analysis
+                    .directive_fragments
+                    .iter()
+                    .filter(|m| m.directive.kind == crate::conditional::DirectiveKind::Include)
+                {
+                    let directive = &mapping.directive;
+                    let anchor = mapping
+                        .fragments
+                        .first()
+                        .expect("directive physical opener");
+                    self.charge_compile_time(
+                        analysis.includes.len() + 1,
+                        directive.body.len(),
+                        directive.body.len(),
+                        cancel,
+                    )?;
+                    let Some(name) = include_name(&directive.body) else {
+                        self.release_compile_time(directive.body.len());
+                        continue;
+                    };
+                    self.release_compile_time(directive.body.len() - name.len());
+                    let target = analysis.includes.iter().find(|i| i.directive == *anchor);
+                    let target_bytes = match target.map(|i| &i.target) {
+                        Some(Resolution::Found(source)) if !unsupported => source.id.as_str().len(),
+                        _ => 0,
+                    };
+                    self.charge_compile_time(
+                        1,
+                        0,
+                        anchor.source.as_str().len() + target_bytes,
+                        cancel,
+                    )?;
+                    let target = match target.map(|i| &i.target) {
+                        Some(Resolution::Found(source)) if !unsupported => {
+                            ResolutionTarget::Found(source.id.clone())
+                        }
+                        Some(Resolution::Ambiguous { .. }) => ResolutionTarget::Ambiguous,
+                        Some(Resolution::Unavailable { .. })
+                            if directive.activity == crate::conditional::Truth::False =>
+                        {
+                            ResolutionTarget::Unavailable
+                        }
+                        None if directive.activity == crate::conditional::Truth::False => {
+                            ResolutionTarget::Unavailable
+                        }
+                        _ => ResolutionTarget::Incomplete,
+                    };
+                    includes.push(ResolvedInclude {
+                        including_source_id: anchor.source.clone(),
+                        byte_range: anchor.range.clone(),
+                        requested_name: name,
+                        target,
+                    });
+                }
+                Some(IncludeWalkResult {
+                    includes,
+                    complete: analysis.root.complete && analysis.root.unknown_spans.is_empty(),
+                })
+            } else {
+                None
+            };
+            if !analysis.root.complete {
+                self.mark_incomplete(format!(
+                    "conditional analysis is incomplete for {}",
+                    source.path.display()
+                ));
+            }
+            let bytes = conditional_analysis_retained(&analysis.root);
+            // Transfer the existing immutable projection; no root clone or cache
+            // insertion. Drop the graphs/occurrences and refund their reservation.
+            if bytes > analysis.budget.retained_bytes {
+                self.charge_compile_time(1, 0, bytes - analysis.budget.retained_bytes, cancel)?;
+            } else {
+                self.release_compile_time(analysis.budget.retained_bytes - bytes);
+            }
+            Ok(SourceOrderProjection {
+                root: analysis.root,
+                retained: bytes,
+                includes,
+            })
+        })();
+        if result.is_err() {
+            self.compile_time_accounting.retained_bytes = retained_before;
         }
-        if !analysis.root.complete {
-            self.mark_incomplete(format!(
-                "conditional analysis is incomplete for {}",
-                source.path.display()
-            ));
-        }
-        self.conditional_analyses
-            .insert(key, (analysis.root.clone(), includes));
-        Ok(analysis.root)
+        result
     }
 
     pub fn new(
@@ -613,8 +840,8 @@ impl<S: SourceStore> UnitResolver<S> {
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
-            conditional_analyses: HashMap::new(),
             compile_time_route: None,
+            compile_time_accounting: Default::default(),
         }
     }
 
@@ -745,8 +972,10 @@ impl<S: SourceStore> UnitResolver<S> {
             &text,
             require_byte_preserving_coordinates,
             None,
+            false,
             cancel,
         )
+        .map(|(resolved, _)| resolved)
     }
 
     /// Resolve imports whose ranges were produced from a caller-owned decoded
@@ -761,7 +990,8 @@ impl<S: SourceStore> UnitResolver<S> {
         text: &str,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedImports, ResolverError> {
-        self.resolve_imports_inner(importer, sites, text, false, None, cancel)
+        self.resolve_imports_inner(importer, sites, text, false, None, false, cancel)
+            .map(|(resolved, _)| resolved)
     }
 
     /// Resolve imports while withholding browsing-only source fallback for
@@ -780,7 +1010,8 @@ impl<S: SourceStore> UnitResolver<S> {
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect::<HashSet<_>>();
-        self.resolve_imports_inner(importer, sites, text, false, Some(&names), cancel)
+        self.resolve_imports_inner(importer, sites, text, false, Some(&names), false, cancel)
+            .map(|(resolved, _)| resolved)
     }
 
     fn resolve_imports_inner(
@@ -790,13 +1021,49 @@ impl<S: SourceStore> UnitResolver<S> {
         text: &str,
         require_byte_preserving_coordinates: bool,
         validated_compiled_names: Option<&HashSet<String>>,
+        retain_includes: bool,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(ResolvedImports, Option<IncludeWalkResult>), ResolverError> {
+        let before = self.compile_time_accounting.retained_bytes;
+        let projection =
+            self.source_order_analysis(&importer.source, text, retain_includes, cancel)?;
+        let result = self.resolve_imports_admitted(
+            importer,
+            sites,
+            text,
+            require_byte_preserving_coordinates,
+            validated_compiled_names,
+            &projection.root,
+            cancel,
+        );
+        self.release_compile_time(projection.retained);
+        if result.is_err() {
+            self.compile_time_accounting.retained_bytes = before;
+        }
+        result.map(|resolved| (resolved, projection.includes))
+    }
+
+    fn resolve_imports_admitted(
+        &mut self,
+        importer: &ResolvedUnit,
+        sites: &[ImportSite],
+        text: &str,
+        require_byte_preserving_coordinates: bool,
+        validated_compiled_names: Option<&HashSet<String>>,
+        analysis: &crate::conditional::ConditionalAnalysis,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedImports, ResolverError> {
+        let payload = std::mem::size_of::<ResolvedImports>()
+            + sites.len() * std::mem::size_of::<ResolvedImport>()
+            + sites
+                .iter()
+                .map(|s| s.requested_name.len() + importer.source.id.as_str().len())
+                .sum::<usize>();
+        self.charge_compile_time(sites.len() + 1, 0, payload, cancel)?;
         let mut bindings = Vec::with_capacity(sites.len());
         let mut dependencies = Vec::new();
         let mut dependency_ids = HashSet::new();
         let mut complete = true;
-        let analysis = self.source_order_analysis(&importer.source, text, cancel)?;
         self.check_cancel(cancel)?;
         if (require_byte_preserving_coordinates && text.len() != importer.source.bytes.len())
             || !analysis.complete
@@ -815,11 +1082,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         for site in sites {
             self.check_cancel(cancel)?;
-            let importer_route = self
-                .legacy_routes
-                .get(&importer.source.id)
-                .cloned()
-                .or_else(|| self.legacy_route_for_source(&importer.source, None));
+            let importer_route = self.effective_root_route(&importer.source);
             let key = UnitCacheKey::new(
                 &importer.source.path,
                 &site.requested_name,
@@ -873,8 +1136,26 @@ impl<S: SourceStore> UnitResolver<S> {
                         cancel,
                     )?
                 };
+            let lookup_bytes = aliased_name_ref(&self.context, &site.requested_name).len();
+            let declared_bytes = match &outcome {
+                Resolution::Found(unit) => unit.declared_name.len(),
+                _ => 0,
+            };
+            self.charge_compile_time(
+                1,
+                0,
+                8 * std::mem::size_of::<String>()
+                    + 4 * (site.requested_name.len() + lookup_bytes + declared_bytes),
+                cancel,
+            )?;
             let (target, authorized_qualifiers) = match outcome {
                 Resolution::Found(unit) => {
+                    self.charge_compile_time(
+                        1,
+                        0,
+                        unit.source.id.as_str().len().saturating_mul(4),
+                        cancel,
+                    )?;
                     let target = unit.source.id.clone();
                     let dependency_allowed = self.project_unit_ids.as_ref().is_none_or(|ids| {
                         ids.contains(&target)
@@ -894,6 +1175,20 @@ impl<S: SourceStore> UnitResolver<S> {
                             ),
                         )
                     } else {
+                        let new_dependency = !dependency_ids.contains(&target)
+                            && self
+                                .project_unit_ids
+                                .as_ref()
+                                .is_none_or(|ids| !ids.contains(&target));
+                        if new_dependency {
+                            let bytes = loaded_source_retained(&unit.source)
+                                + unit.requested_name.len()
+                                + unit.declared_name.len()
+                                + 2 * std::mem::size_of::<ResolvedUnit>()
+                                + 8 * std::mem::size_of::<SourceId>();
+                            self.charge_compile_time(1, 0, bytes, cancel)?;
+                            dependencies.reserve_exact(1);
+                        }
                         if self.project_unit_ids.is_none() && dependency_ids.insert(target.clone())
                         {
                             dependencies.push(unit.clone());
@@ -1064,8 +1359,13 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedProject, ResolverError> {
         let previous_project_unit_ids = self.project_unit_ids.take();
+        let before = self.compile_time_accounting.retained_bytes;
         let result = self.resolve_project_inner(root, sites, cancel);
         self.project_unit_ids = previous_project_unit_ids;
+        if result.is_err() {
+            self.project_includes = Vec::new();
+            self.compile_time_accounting.retained_bytes = before;
+        }
         result
     }
 
@@ -1076,6 +1376,15 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedProject, ResolverError> {
         self.check_cancel(cancel)?;
+        self.charge_compile_time(
+            1,
+            0,
+            loaded_source_retained(&root.source)
+                + root.requested_name.len()
+                + root.declared_name.len()
+                + std::mem::size_of::<ResolvedUnit>(),
+            cancel,
+        )?;
         let root_sites = if sites.is_empty() {
             self.source_metadata(&root.source).imports.clone()
         } else {
@@ -1093,9 +1402,32 @@ impl<S: SourceStore> UnitResolver<S> {
             if self.stop_when_incomplete && !complete {
                 break;
             }
-            let resolved = self.resolve_imports(&importer, &importer_sites, cancel)?;
+            let text = source_text(&importer.source);
+            let (resolved, include_result) = self.resolve_imports_inner(
+                &importer,
+                &importer_sites,
+                &text,
+                importer.source.decoded_text.is_none(),
+                None,
+                true,
+                cancel,
+            )?;
             complete &= resolved.complete;
+            let binding_storage =
+                resolved.bindings.capacity() * std::mem::size_of::<ResolvedImport>();
+            let additional =
+                (imports.len() + resolved.bindings.len()).saturating_sub(imports.capacity());
+            self.charge_compile_time(
+                resolved.bindings.len(),
+                0,
+                additional * std::mem::size_of::<ResolvedImport>(),
+                cancel,
+            )?;
+            if additional > 0 {
+                imports.reserve_exact(resolved.bindings.len());
+            }
             imports.extend(resolved.bindings);
+            self.release_compile_time(binding_storage + std::mem::size_of::<ResolvedImports>());
             for dependency in resolved.dependencies {
                 if loaded_ids.insert(dependency.source.id.clone()) {
                     let dependency_sites = self.source_metadata(&dependency.source).imports.clone();
@@ -1103,46 +1435,14 @@ impl<S: SourceStore> UnitResolver<S> {
                     queue.push_back((dependency, dependency_sites));
                 }
             }
-            let source_key = (
-                importer.source.id.clone(),
-                content_hash_bytes(source_text(&importer.source).as_bytes()),
-            );
-            if let Some((_, includes)) = self.conditional_analyses.get(&source_key) {
-                for include in includes {
-                    if let ResolutionTarget::Found(id) = &include.target
-                        && let Some(source) = self.loaded.get(id)
-                        && !include_sources.iter().any(|s: &LoadedSource| s.id == *id)
-                    {
-                        include_sources.push(source.clone());
-                    }
-                }
-                self.project_includes.extend(includes.iter().cloned());
-                continue;
+            if let Some(include_result) = include_result {
+                self.append_include_result(
+                    include_result,
+                    &mut complete,
+                    &mut include_sources,
+                    cancel,
+                )?;
             }
-            let include_route = self.legacy_routes.get(&importer.source.id).cloned();
-            // Includes inherit the importing source's context; the include
-            // path itself is not independently classified.
-            let conditional_context = self.context.conditional_context_for(&importer.source.path);
-            let mut conditional_environment =
-                match crate::conditional::ConditionalEnvironment::try_from_context(
-                    &conditional_context,
-                ) {
-                    Some(environment) => environment,
-                    None => {
-                        complete = false;
-                        crate::conditional::ConditionalEnvironment::default()
-                    }
-                };
-            let include_result = self.resolve_includes_for_source(
-                &importer.source,
-                &mut conditional_environment,
-                include_route.as_ref(),
-                cancel,
-                0,
-                &mut HashSet::new(),
-            )?;
-            complete &= include_result.complete;
-            self.append_include_result(include_result, &mut complete, &mut include_sources);
         }
 
         let includes = self.take_project_includes();
@@ -2710,287 +3010,6 @@ impl<S: SourceStore> UnitResolver<S> {
         roots
     }
 
-    fn resolve_includes_for_source(
-        &mut self,
-        source: &LoadedSource,
-        environment: &mut crate::conditional::ConditionalEnvironment,
-        legacy_route: Option<&LegacyRoute>,
-        cancel: &dyn CancellationToken,
-        depth: usize,
-        active: &mut HashSet<SourceId>,
-    ) -> Result<IncludeWalkResult, ResolverError> {
-        self.check_cancel(cancel)?;
-        if depth > self.limits.max_include_depth {
-            self.mark_incomplete(format!(
-                "include depth limit ({}) reached",
-                self.limits.max_include_depth
-            ));
-            return Ok(IncludeWalkResult {
-                includes: Vec::new(),
-                complete: false,
-            });
-        }
-        if !active.insert(source.id.clone()) {
-            self.mark_incomplete(format!("include cycle at {}", source.path.display()));
-            return Ok(IncludeWalkResult {
-                includes: Vec::new(),
-                complete: false,
-            });
-        }
-        let text = source_text(source);
-        let lexical_analysis = crate::conditional::analyze_with_cancel(&text, &[], cancel);
-        let include_directives = lexical_analysis
-            .directives
-            .iter()
-            .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
-            .collect::<Vec<_>>();
-        let remaining_directives = self
-            .limits
-            .max_include_directives
-            .saturating_sub(self.include_directives);
-        let admitted_directives = include_directives.len().min(remaining_directives);
-        self.include_directives = self.include_directives.saturating_add(admitted_directives);
-        let directive_budget_exhausted = admitted_directives < include_directives.len();
-        self.check_cancel(cancel)?;
-        if source.decoded_text.is_none() && text.len() != source.bytes.len() {
-            active.remove(&source.id);
-            let reason = format!(
-                "source encoding is not byte-offset preserving for {}",
-                source.path.display()
-            );
-            self.mark_incomplete(reason);
-            let emitted_sites = include_directives
-                .iter()
-                .take(admitted_directives)
-                .filter_map(|directive| {
-                    include_name(&directive.body).map(|name| (directive.start..directive.end, name))
-                })
-                .collect::<Vec<_>>();
-            if directive_budget_exhausted {
-                self.mark_incomplete(format!(
-                    "include directive limit ({}) reached",
-                    self.limits.max_include_directives
-                ));
-            }
-            let result = IncludeWalkResult {
-                includes: emitted_sites
-                    .into_iter()
-                    .map(|site| ResolvedInclude {
-                        including_source_id: source.id.clone(),
-                        byte_range: site.0,
-                        requested_name: site.1,
-                        target: ResolutionTarget::Incomplete,
-                    })
-                    .collect(),
-                complete: false,
-            };
-            return Ok(result);
-        }
-        let mut active_results =
-            HashMap::<usize, (ResolutionTarget<SourceId>, Vec<ResolvedInclude>)>::new();
-        let mut callback_error = None;
-        let analysis = crate::conditional::analyze_with_include_callback(
-            &text,
-            environment,
-            cancel,
-            &mut |directive, environment| {
-                let mut transition = crate::conditional::IncludeTransition {
-                    complete: false,
-                    environment_known: false,
-                };
-                if callback_error.is_some() {
-                    return transition;
-                }
-                let Some(ordinal) = include_directives
-                    .iter()
-                    .position(|candidate| candidate.start == directive.start)
-                else {
-                    callback_error = Some(ResolverError::InvalidRequest(
-                        "conditional include occurrence was not admitted".to_string(),
-                    ));
-                    return transition;
-                };
-                if ordinal >= admitted_directives {
-                    return transition;
-                }
-                let Some(name) = include_name(&directive.body) else {
-                    self.mark_incomplete(
-                        "active include has no statically known file name".to_string(),
-                    );
-                    active_results
-                        .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
-                    return transition;
-                };
-                let outcome = match self.resolve_include_result(
-                    IncludeResolveRequest {
-                        including_path: &source.path,
-                        byte_range: directive.start..directive.end,
-                        requested_name: &name,
-                        legacy_route,
-                    },
-                    cancel,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        callback_error = Some(error);
-                        return transition;
-                    }
-                };
-                match outcome {
-                    Resolution::Found(child) => {
-                        if active.contains(&child.id) {
-                            self.mark_incomplete(format!(
-                                "include cycle at {}",
-                                child.path.display()
-                            ));
-                            active_results.insert(
-                                directive.start,
-                                (ResolutionTarget::Incomplete, Vec::new()),
-                            );
-                            return transition;
-                        }
-                        let nested = match self.resolve_includes_for_source(
-                            &child,
-                            environment,
-                            legacy_route,
-                            cancel,
-                            depth + 1,
-                            active,
-                        ) {
-                            Ok(nested) => nested,
-                            Err(error) => {
-                                callback_error = Some(error);
-                                return transition;
-                            }
-                        };
-                        let complete = nested.complete;
-                        active_results.insert(
-                            directive.start,
-                            (ResolutionTarget::Found(child.id), nested.includes),
-                        );
-                        transition.complete = complete;
-                        transition.environment_known = complete;
-                    }
-                    Resolution::Unavailable { .. } => {
-                        self.mark_incomplete(format!("active include {name} was not found"));
-                        active_results
-                            .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
-                    }
-                    Resolution::Ambiguous { .. } => {
-                        self.mark_incomplete(format!("active include {name} was ambiguous"));
-                        active_results
-                            .insert(directive.start, (ResolutionTarget::Ambiguous, Vec::new()));
-                    }
-                    Resolution::Incomplete { .. } => {
-                        active_results
-                            .insert(directive.start, (ResolutionTarget::Incomplete, Vec::new()));
-                    }
-                }
-                transition
-            },
-        );
-        if let Some(error) = callback_error {
-            active.remove(&source.id);
-            return Err(error);
-        }
-        self.check_cancel(cancel)?;
-        let mut result = IncludeWalkResult {
-            includes: Vec::new(),
-            complete: analysis.complete
-                && analysis.unknown_spans.is_empty()
-                && !directive_budget_exhausted,
-        };
-        if !analysis.complete {
-            self.mark_incomplete(format!(
-                "conditional analysis is incomplete for {}",
-                source.path.display()
-            ));
-        }
-        if !analysis.unknown_spans.is_empty() {
-            self.mark_incomplete(format!(
-                "source {} contains unknown conditional activity",
-                source.path.display()
-            ));
-        }
-        if directive_budget_exhausted {
-            self.mark_incomplete(format!(
-                "include directive limit ({}) reached",
-                self.limits.max_include_directives
-            ));
-        }
-        let unsupported_active = analysis.directives.iter().any(|directive| {
-            directive.activity != crate::conditional::Truth::False
-                && directive.kind == crate::conditional::DirectiveKind::Other
-        });
-        if unsupported_active {
-            result.complete = false;
-            self.mark_incomplete(format!(
-                "source {} contains an unsupported active directive",
-                source.path.display()
-            ));
-        }
-        for directive in analysis
-            .directives
-            .iter()
-            .filter(|directive| directive.kind == crate::conditional::DirectiveKind::Include)
-        {
-            let Some(ordinal) = include_directives
-                .iter()
-                .position(|candidate| candidate.start == directive.start)
-            else {
-                result.complete = false;
-                continue;
-            };
-            if ordinal >= admitted_directives {
-                break;
-            }
-            let Some(name) = include_name(&directive.body) else {
-                if directive.potentially_active() {
-                    result.complete = false;
-                    self.mark_incomplete(
-                        "active include has no statically known file name".to_string(),
-                    );
-                }
-                continue;
-            };
-            if directive.activity == crate::conditional::Truth::False {
-                result.includes.push(ResolvedInclude {
-                    including_source_id: source.id.clone(),
-                    byte_range: directive.start..directive.end,
-                    requested_name: name,
-                    target: ResolutionTarget::Unavailable,
-                });
-                continue;
-            }
-            let Some((mut target, nested)) = active_results.remove(&directive.start) else {
-                result.complete = false;
-                self.mark_incomplete(format!("include {name} has unknown conditional activity"));
-                result.includes.push(ResolvedInclude {
-                    including_source_id: source.id.clone(),
-                    byte_range: directive.start..directive.end,
-                    requested_name: name,
-                    target: ResolutionTarget::Incomplete,
-                });
-                continue;
-            };
-            if unsupported_active {
-                target = ResolutionTarget::Incomplete;
-            }
-            if !matches!(target, ResolutionTarget::Found(_)) {
-                result.complete = false;
-            }
-            result.includes.extend(nested);
-            result.includes.push(ResolvedInclude {
-                including_source_id: source.id.clone(),
-                byte_range: directive.start..directive.end,
-                requested_name: name,
-                target,
-            });
-        }
-        active.remove(&source.id);
-        Ok(result)
-    }
-
     // Project include bindings are kept in a session-local queue so the public
     // project result can retain source payloads without changing the simple
     // direct include outcome API.
@@ -2999,17 +3018,45 @@ impl<S: SourceStore> UnitResolver<S> {
         result: IncludeWalkResult,
         complete: &mut bool,
         include_sources: &mut Vec<LoadedSource>,
-    ) {
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
         *complete &= result.complete;
+        let old_vector_bytes = result.includes.capacity() * std::mem::size_of::<ResolvedInclude>();
+        let additional = (self.project_includes.len() + result.includes.len())
+            .saturating_sub(self.project_includes.capacity());
+        self.charge_compile_time(
+            result.includes.len(),
+            0,
+            additional * std::mem::size_of::<ResolvedInclude>(),
+            cancel,
+        )?;
+        if additional > 0 {
+            self.project_includes.reserve_exact(result.includes.len());
+        }
         for include in result.includes {
             if let ResolutionTarget::Found(id) = &include.target
-                && let Some(source) = self.loaded.get(id).cloned()
+                && let Some(source) = self.loaded.get(id)
                 && !include_sources.iter().any(|existing| existing.id == *id)
             {
+                let bytes = loaded_source_retained(&source);
+                self.charge_compile_time(
+                    include_sources.len() + 1,
+                    0,
+                    bytes + std::mem::size_of::<LoadedSource>(),
+                    cancel,
+                )?;
+                let source = self
+                    .loaded
+                    .get(id)
+                    .expect("admitted loaded include")
+                    .clone();
+                include_sources.reserve_exact(1);
                 include_sources.push(source);
             }
             self.project_includes.push(include);
         }
+        self.release_compile_time(old_vector_bytes);
+        Ok(())
     }
 
     fn record_observation(&mut self, observation: ResolutionObservation) {
@@ -3078,18 +3125,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         let route = request
             .legacy_route
             .cloned()
-            .or_else(|| self.compile_time_route.clone())
-            .or_else(|| {
-                self.loaded
-                    .values()
-                    .find(|s| path_equivalent(&s.path, request.including_path))
-                    .and_then(|s| {
-                        self.legacy_routes
-                            .get(&s.id)
-                            .cloned()
-                            .or_else(|| self.legacy_route_for_source(s, None))
-                    })
-            });
+            .or_else(|| self.compile_time_route.clone());
         // The store's bounded payload read supplements the shared typed budget.
         // Do not reset any resolver counters or construct a child resolver.
         let source_limit = self.limits.max_source_bytes;
@@ -3098,7 +3134,12 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
             .max_retained_bytes
             .saturating_sub(budget.snapshot().retained_bytes)
             / 4;
-        self.limits.max_source_bytes = source_limit.min(remaining);
+        let remaining_bytes = budget
+            .limits()
+            .max_byte_work
+            .saturating_sub(budget.snapshot().byte_work)
+            / 4;
+        self.limits.max_source_bytes = source_limit.min(remaining).min(remaining_bytes);
         let outcome = self.try_resolve_include(
             IncludeResolveRequest {
                 legacy_route: route.as_ref(),
@@ -3263,6 +3304,62 @@ enum CaseInsensitiveLookup {
 struct IncludeWalkResult {
     includes: Vec<ResolvedInclude>,
     complete: bool,
+}
+
+struct SourceOrderProjection {
+    root: crate::conditional::ConditionalAnalysis,
+    retained: usize,
+    includes: Option<IncludeWalkResult>,
+}
+
+fn conditional_analysis_retained(analysis: &crate::conditional::ConditionalAnalysis) -> usize {
+    use std::mem::size_of;
+    size_of::<crate::conditional::ConditionalAnalysis>()
+        .saturating_add(analysis.projected_source.capacity())
+        .saturating_add(
+            (analysis.inactive_spans.capacity() + analysis.unknown_spans.capacity())
+                * size_of::<Range<usize>>(),
+        )
+        .saturating_add(
+            analysis.directives.capacity() * size_of::<crate::conditional::ConditionalDirective>(),
+        )
+        .saturating_add(
+            analysis
+                .directives
+                .iter()
+                .map(|d| d.body.capacity())
+                .sum::<usize>(),
+        )
+}
+
+pub(crate) fn loaded_source_metadata_retained(source: &LoadedSource) -> usize {
+    let mut bytes = std::mem::size_of::<LoadedSource>()
+        + source.id.as_str().len()
+        + source.path.as_os_str().len();
+    if let SourceRevision::Disk {
+        read_policy,
+        path_entry,
+        ..
+    } = &source.revision
+    {
+        let mut count = |n| {
+            bytes = bytes.saturating_add(n);
+            Ok(())
+        };
+        read_policy
+            .visit_recovery_payload(&mut count)
+            .expect("infallible size visitor");
+        path_entry
+            .visit_recovery_payload(&mut count)
+            .expect("infallible size visitor");
+    }
+    bytes
+}
+
+fn loaded_source_retained(source: &LoadedSource) -> usize {
+    loaded_source_metadata_retained(source)
+        .saturating_add(source.bytes.len())
+        .saturating_add(source.decoded_text.as_ref().map_or(0, |text| text.len()))
 }
 
 #[derive(Debug, Clone)]
@@ -3459,11 +3556,15 @@ fn analysis_contains_range(spans: &[Range<usize>], range: &Range<usize>) -> bool
 }
 
 fn aliased_name(context: &ProjectContext, requested: &str) -> String {
+    aliased_name_ref(context, requested).to_owned()
+}
+
+fn aliased_name_ref<'a>(context: &'a ProjectContext, requested: &'a str) -> &'a str {
     context
         .unit_aliases
         .iter()
         .find(|(alias, _)| alias.eq_ignore_ascii_case(requested))
-        .map_or_else(|| requested.to_string(), |(_, target)| target.clone())
+        .map_or(requested, |(_, target)| target.as_str())
 }
 
 fn filename_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {

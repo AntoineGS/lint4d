@@ -1171,11 +1171,7 @@ pub fn analyze_with_include_callback_context(
 /// Internal source-backed extension of the same directive interpreter. The
 /// session owns admission, lexical declarations, and unavailable-fact reasons.
 pub(crate) trait SourceOrder {
-    fn next_directive(
-        &mut self,
-        source: &str,
-        cursor: usize,
-    ) -> Result<Option<ConditionalDirective>, ()>;
+    fn next_directive(&mut self, source: &str, cursor: usize) -> Result<SourceOrderStep, ()>;
     fn activity(&self) -> Truth;
     fn admit_directive(&mut self, body_bytes: usize) -> bool;
     fn admit_environment(&mut self, environment: &ConditionalEnvironment) -> bool;
@@ -1188,6 +1184,11 @@ pub(crate) trait SourceOrder {
         complete: &mut bool,
     ) -> Truth;
     fn directive(&mut self, directive: &ConditionalDirective);
+}
+
+pub(crate) struct SourceOrderStep {
+    pub text_end: usize,
+    pub directive: Option<ConditionalDirective>,
 }
 
 pub(crate) fn analyze_with_source_order(
@@ -1219,7 +1220,7 @@ pub(crate) fn analyze_with_source_order(
                 break;
             }
         };
-        let end = next.as_ref().map_or(source.len(), |d| d.start);
+        let end = next.text_end;
         let active = order.activity();
         order.feed(cursor..end, active);
         add_activity_span(
@@ -1229,7 +1230,9 @@ pub(crate) fn analyze_with_source_order(
             end,
             order.activity(),
         );
-        let Some(mut directive) = next else { break };
+        let Some(mut directive) = next.directive else {
+            break;
+        };
         directive.activity = order.activity();
         order.directive(&directive);
         if matches!(
@@ -1262,6 +1265,9 @@ pub(crate) fn analyze_with_source_order(
 #[derive(Default)]
 pub(crate) struct DirectiveScanner {
     mode: DirectiveLex,
+    pending: String,
+    fragments: Vec<crate::compile_time::SourceAnchor>,
+    prefix: usize,
 }
 #[derive(Default)]
 enum DirectiveLex {
@@ -1269,6 +1275,11 @@ enum DirectiveLex {
     Normal,
     Slash,
     Paren,
+    BraceOpen,
+    StarOpen,
+    DirectiveBrace,
+    DirectiveParen,
+    DirectiveStar,
     Brace,
     Line,
     StarComment,
@@ -1276,30 +1287,44 @@ enum DirectiveLex {
     String,
     Quote,
 }
+
+pub(crate) struct ScannedDirective {
+    pub range: Range<usize>,
+    pub body: String,
+    pub fragments: Vec<crate::compile_time::SourceAnchor>,
+    pub body_fragments: Vec<crate::compile_time::SourceAnchor>,
+}
+pub(crate) struct ScannerStep {
+    pub text_end: usize,
+    pub directive: Option<ScannedDirective>,
+    pub deferred: Vec<(crate::compile_time::SourceAnchor, String)>,
+}
 impl DirectiveScanner {
     pub(crate) fn complete(&self) -> bool {
         matches!(
             self.mode,
-            DirectiveLex::Normal
-                | DirectiveLex::Slash
-                | DirectiveLex::Paren
-                | DirectiveLex::Line
-                | DirectiveLex::Quote
+            DirectiveLex::Normal | DirectiveLex::Slash | DirectiveLex::Line | DirectiveLex::Quote
         )
     }
-    pub(crate) fn next<'a>(
+    pub(crate) fn next(
         &mut self,
-        source: &'a str,
+        source: &str,
         cursor: usize,
+        id: &crate::SourceId,
+        occurrence: crate::compile_time::OccurrenceId,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
-    ) -> Result<Option<(Range<usize>, &'a str)>, ()> {
+    ) -> Result<ScannerStep, crate::compile_time::IncompleteReason> {
+        use crate::compile_time::IncompleteReason;
         let bytes = source.as_bytes();
         use DirectiveLex::*;
         let mut i = cursor;
+        let mut deferred = Vec::new();
         while i < bytes.len() {
             if cancel.is_cancelled() {
-                return Err(());
+                return Err(IncompleteReason::Cancelled);
             }
+            budget.charge(1, 1, 0)?;
             let b = bytes[i];
             match self.mode {
                 Slash => {
@@ -1309,10 +1334,69 @@ impl DirectiveScanner {
                     }
                 }
                 Paren => {
-                    self.mode = if b == b'*' { StarComment } else { Normal };
-                    if b != b'*' {
+                    if b == b'*' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.mode = StarOpen;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.mode = Normal;
                         continue;
                     }
+                }
+                BraceOpen => {
+                    if b == b'$' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.prefix = 2;
+                        self.mode = DirectiveBrace;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.mode = Brace;
+                        continue;
+                    }
+                }
+                StarOpen => {
+                    if b == b'$' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.prefix = 3;
+                        self.mode = DirectiveParen;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.mode = StarComment;
+                        continue;
+                    }
+                }
+                DirectiveBrace | DirectiveParen | DirectiveStar => {
+                    let len = source[i..]
+                        .chars()
+                        .next()
+                        .expect("byte in UTF-8 source")
+                        .len_utf8();
+                    let closed = matches!(self.mode, DirectiveBrace) && b == b'}'
+                        || matches!(self.mode, DirectiveStar) && b == b')';
+                    let suffix = if matches!(self.mode, DirectiveBrace) {
+                        1
+                    } else {
+                        2
+                    };
+                    self.append(source, i..i + len, id, occurrence, budget)?;
+                    i += len;
+                    if closed {
+                        let directive = self.finish(suffix, budget)?;
+                        self.mode = Normal;
+                        return Ok(ScannerStep {
+                            text_end: directive.range.start,
+                            directive: Some(directive),
+                            deferred,
+                        });
+                    }
+                    if !matches!(self.mode, DirectiveBrace) {
+                        self.mode = if b == b'*' {
+                            DirectiveStar
+                        } else {
+                            DirectiveParen
+                        };
+                    }
+                    continue;
                 }
                 Brace => {
                     if b == b'}' {
@@ -1342,7 +1426,7 @@ impl DirectiveScanner {
                     if b == b'\'' {
                         self.mode = Quote;
                     } else if b == b'\n' {
-                        return Err(());
+                        return Err(IncompleteReason::MalformedSource);
                     }
                 }
                 Quote => {
@@ -1352,22 +1436,13 @@ impl DirectiveScanner {
                     }
                 }
                 Normal => {
-                    let (prefix, suffix) = if bytes.get(i..i + 2) == Some(b"{$") {
-                        (2, b"}".as_slice())
-                    } else if bytes.get(i..i + 3) == Some(b"(*$") {
-                        (3, b"*)".as_slice())
-                    } else {
-                        (0, b"".as_slice())
-                    };
-                    if prefix != 0 {
-                        let close = find_sequence(bytes, i + prefix, suffix).ok_or(())?;
-                        let body = &source[i + prefix..close];
-                        return Ok(Some((i..close + suffix.len(), body)));
+                    if matches!(b, b'{' | b'(') {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
                     }
                     self.mode = match b {
                         b'/' => Slash,
                         b'(' => Paren,
-                        b'{' => Brace,
+                        b'{' => BraceOpen,
                         b'\'' => String,
                         _ => Normal,
                     };
@@ -1379,7 +1454,148 @@ impl DirectiveScanner {
             }
             i += 1;
         }
-        Ok(None)
+        let text_end = if self.pending.is_empty() {
+            source.len()
+        } else {
+            self.fragments
+                .last()
+                .filter(|a| a.occurrence == occurrence)
+                .map_or(cursor, |a| a.range.start)
+        };
+        Ok(ScannerStep {
+            text_end,
+            directive: None,
+            deferred,
+        })
+    }
+
+    fn append(
+        &mut self,
+        source: &str,
+        range: Range<usize>,
+        id: &crate::SourceId,
+        occurrence: crate::compile_time::OccurrenceId,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        use crate::compile_time::{IncompleteReason, SourceAnchor};
+        let maximum = budget.limits().max_pending_bytes;
+        if self.pending.len().saturating_add(range.len()) > maximum {
+            return Err(IncompleteReason::Limit {
+                name: "max_pending_bytes",
+                maximum,
+            });
+        }
+        budget.charge(1, range.len(), 0)?;
+        let needed = self.pending.len() + range.len();
+        if needed > self.pending.capacity() {
+            let capacity = self
+                .pending
+                .capacity()
+                .max(8)
+                .saturating_mul(2)
+                .min(maximum)
+                .max(needed);
+            budget.charge(1, self.pending.len(), capacity - self.pending.capacity())?;
+            self.pending.reserve_exact(capacity - self.pending.len());
+        }
+        if let Some(last) = self
+            .fragments
+            .last_mut()
+            .filter(|a| a.source == *id && a.occurrence == occurrence && a.range.end == range.start)
+        {
+            last.range.end = range.end;
+        } else {
+            budget.charge(
+                1,
+                id.as_str().len(),
+                std::mem::size_of::<SourceAnchor>() + id.as_str().len(),
+            )?;
+            self.fragments.reserve_exact(1);
+            self.fragments.push(SourceAnchor {
+                source: id.clone(),
+                occurrence,
+                range: range.clone(),
+            });
+        }
+        self.pending.push_str(&source[range]);
+        Ok(())
+    }
+
+    fn flush_prefix(
+        &mut self,
+        current: crate::compile_time::OccurrenceId,
+        deferred: &mut Vec<(crate::compile_time::SourceAnchor, String)>,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        let mut offset = 0;
+        for anchor in std::mem::take(&mut self.fragments) {
+            let end = offset + anchor.range.len();
+            if anchor.occurrence != current {
+                budget.charge(
+                    1,
+                    anchor.range.len(),
+                    std::mem::size_of::<(crate::compile_time::SourceAnchor, String)>()
+                        + anchor.range.len(),
+                )?;
+                deferred.reserve_exact(1);
+                deferred.push((anchor, self.pending[offset..end].to_owned()));
+            } else {
+                budget.release(
+                    std::mem::size_of::<crate::compile_time::SourceAnchor>()
+                        + anchor.source.as_str().len(),
+                );
+            }
+            offset = end;
+        }
+        budget.release(self.pending.capacity());
+        self.pending = String::new();
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        suffix: usize,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<ScannedDirective, crate::compile_time::IncompleteReason> {
+        use crate::compile_time::SourceAnchor;
+        let body_end = self.pending.len() - suffix;
+        let mut logical = 0;
+        let mut body_fragments = Vec::new();
+        for anchor in &self.fragments {
+            let end = logical + anchor.range.len();
+            let a = logical.max(self.prefix);
+            let b = end.min(body_end);
+            if a < b {
+                budget.charge(
+                    1,
+                    anchor.source.as_str().len(),
+                    std::mem::size_of::<SourceAnchor>() + anchor.source.as_str().len(),
+                )?;
+                body_fragments.reserve_exact(1);
+                body_fragments.push(SourceAnchor {
+                    source: anchor.source.clone(),
+                    occurrence: anchor.occurrence,
+                    range: anchor.range.start + a - logical..anchor.range.start + b - logical,
+                });
+            }
+            logical = end;
+        }
+        budget.charge(1, body_end - self.prefix, body_end - self.prefix)?;
+        let body = self.pending[self.prefix..body_end].to_owned();
+        let range = self
+            .fragments
+            .last()
+            .expect("directive delimiter")
+            .range
+            .clone();
+        budget.release(self.pending.capacity());
+        self.pending = String::new();
+        Ok(ScannedDirective {
+            range,
+            body,
+            fragments: std::mem::take(&mut self.fragments),
+            body_fragments,
+        })
     }
 }
 
@@ -2704,6 +2920,56 @@ fn project_source(source: &str, inactive: &[Range<usize>], directives: &[Range<u
 
 fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexResult {
     lex_directives_inner(source, cancel, None)
+}
+
+/// Allocation-free root classification/admission shape. This performs no
+/// conditional evaluation and cannot authorize a child. Actual include roots
+/// are interpreted only by the shared source-order session.
+pub(crate) fn source_directive_shape(
+    source: &str,
+    cancel: &dyn CancellationToken,
+) -> (bool, usize) {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+    let mut includes = false;
+    while i < bytes.len() && count < MAX_DIRECTIVES {
+        if cancel.is_cancelled() {
+            break;
+        }
+        match bytes[i] {
+            b'\'' => {
+                let Some(next) = skip_string(bytes, i) else {
+                    break;
+                };
+                i = next;
+            }
+            b'"' => i = skip_assembler_string(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => i = skip_line_comment(bytes, i),
+            b'{' => {
+                let Some(close) = find_byte(bytes, i + 1, b'}') else {
+                    break;
+                };
+                if bytes.get(i + 1) == Some(&b'$') {
+                    count += 1;
+                    includes |= directive_kind(&source[i + 2..close]) == DirectiveKind::Include;
+                }
+                i = close + 1;
+            }
+            b'(' if bytes.get(i + 1) == Some(&b'*') => {
+                let Some(close) = find_sequence(bytes, i + 2, b"*)") else {
+                    break;
+                };
+                if bytes.get(i + 2) == Some(&b'$') {
+                    count += 1;
+                    includes |= directive_kind(&source[i + 3..close]) == DirectiveKind::Include;
+                }
+                i = close + 2;
+            }
+            _ => i += 1,
+        }
+    }
+    (includes, count)
 }
 
 fn lex_directives_inner(

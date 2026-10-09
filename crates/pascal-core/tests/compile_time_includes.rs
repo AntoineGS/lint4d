@@ -5,6 +5,136 @@ use pascal_project::LayoutPlatform;
 use support::{Fixture, activity, context};
 
 #[test]
+fn fix_i1_split_brace_opening_never_reads_forbidden() {
+    split_directive_no_read("{", "$IF false}", "{$ENDIF}");
+}
+
+#[test]
+fn fix_i1_split_paren_opening_never_reads_forbidden() {
+    split_directive_no_read("(", "*$IF false*)", "(*$ENDIF*)");
+}
+
+#[test]
+fn fix_i1_split_body_is_pending_not_failed() {
+    split_directive_no_read("{$IF fal", "se}", "{$ENDIF}");
+}
+
+#[test]
+fn fix_i1_split_closing_is_pending_not_failed() {
+    split_directive_no_read("(*$IF false*", ")", "(*$ENDIF*)");
+}
+
+#[test]
+fn fix_i1_split_two_byte_opening_never_reads_forbidden() {
+    split_directive_no_read("(*", "$IF false*)", "(*$ENDIF*)");
+}
+
+#[test]
+fn fix_i1_body_operands_and_include_requests_keep_disjoint_physical_fragments() {
+    let text = "unit T; interface {$I prefix.inc}Byte)=1}{$I chosen.inc}{$ELSE}{$I forbidden.inc}{$ENDIF} implementation end.";
+    let mut f = Fixture::new(text, context(LayoutPlatform::Win32));
+    f.include("prefix.inc", "{$IF SizeOf(");
+    f.include("chosen.inc", "{chosen}");
+    f.deny_include("forbidden.inc");
+    let a = f.analyze().unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(f.read_names(), vec!["prefix.inc", "chosen.inc"]);
+    let mapping = a
+        .directive_fragments
+        .iter()
+        .find(|m| m.directive.body.starts_with("IF SizeOf"))
+        .unwrap();
+    assert_eq!(mapping.fragments.len(), 2);
+    assert_ne!(
+        mapping.fragments[0].occurrence,
+        mapping.fragments[1].occurrence
+    );
+    let mapped = mapping
+        .body_fragments
+        .iter()
+        .map(|anchor| {
+            let source = &a
+                .occurrences
+                .iter()
+                .find(|o| o.id == anchor.occurrence)
+                .unwrap()
+                .source;
+            source.decoded_text.as_ref().unwrap()[anchor.range.clone()].to_owned()
+        })
+        .collect::<String>();
+    assert_eq!(mapped, "IF SizeOf(Byte)=1");
+    assert_eq!(mapping.fragments[0].range, 0.."{$IF SizeOf(".len());
+    assert_eq!(
+        mapping.fragments[1].range.start,
+        text.find("Byte)=1}").unwrap()
+    );
+    let mut f = Fixture::new(
+        "unit T; interface {$I prefix.inc}sen.inc} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("prefix.inc", "{$I cho");
+    f.include("chosen.inc", "{chosen}");
+    let a = f.analyze().unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(f.read_names(), vec!["prefix.inc", "chosen.inc"]);
+    assert_eq!(
+        f.requests[1].0,
+        std::path::PathBuf::from("/fixture/prefix.inc")
+    );
+    assert_eq!(f.requests[1].1, 0.."{$I cho".len());
+    assert_eq!(a.includes[1].fragments.len(), 2);
+}
+
+#[test]
+fn fix_i1_root_finish_rejects_unfinished_directive_and_pending_limit() {
+    for child in ["{", "(*", "{$IF true", "(*$IF true*"] {
+        let mut f = Fixture::new(
+            "unit T; interface {$I prefix.inc}",
+            context(LayoutPlatform::Win32),
+        );
+        f.include("prefix.inc", child);
+        let a = f.analyze().unwrap();
+        assert!(!a.root.complete, "{child}");
+        assert_eq!(f.read_names(), vec!["prefix.inc"]);
+    }
+    let mut f = Fixture::new(
+        "unit T; interface {$I prefix.inc}} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("prefix.inc", &format!("{{$IF {}", "x".repeat(200)));
+    f.limits.max_pending_bytes = 64;
+    let a = f.analyze().unwrap();
+    assert!(!a.root.complete);
+    assert!(a.reasons.iter().any(|r| matches!(
+        r,
+        pascal_core::compile_time::IncompleteReason::Limit {
+            name: "max_pending_bytes",
+            ..
+        }
+    )));
+}
+
+fn split_directive_no_read(child: &str, tail: &str, close: &str) {
+    let text = format!(
+        "unit T; interface {{$I prefix.inc}}{tail}{{$I forbidden.inc}}{close} implementation end."
+    );
+    let mut f = Fixture::new(&text, context(LayoutPlatform::Win32));
+    f.include("prefix.inc", child);
+    f.deny_include("forbidden.inc");
+    let a = f.analyze().unwrap();
+    assert_eq!(
+        f.read_names(),
+        vec!["prefix.inc"],
+        "must refuse before any forbidden capability invocation: {child:?}"
+    );
+    assert!(
+        a.root.complete,
+        "valid logical stream {child:?}: {:?}",
+        a.reasons
+    );
+}
+
+#[test]
 fn generic_resolver_uses_source_order_and_retains_observations() {
     use pascal_core::{
         FilesystemSourceStore, NoCancellation, ResolutionObservation, ResolverLimits, UnitResolver,
@@ -584,14 +714,14 @@ fn nested_occurrences_share_definition_and_byte_work_limits() {
         context(LayoutPlatform::Win32),
     );
     one.include("body.inc", &comment);
-    one.limits.max_byte_work = 10000;
+    one.limits.max_byte_work = 12000;
     assert!(one.analyze().unwrap().root.complete);
     let mut many = Fixture::new(
         "unit T; interface {$I body.inc}{$I body.inc}{$I body.inc} implementation end.",
         context(LayoutPlatform::Win32),
     );
     many.include("body.inc", &comment);
-    many.limits.max_byte_work = 10000;
+    many.limits.max_byte_work = 12000;
     assert!(matches!(
         many.analyze(),
         Err(pascal_core::ResolverError::LimitExceeded {
@@ -641,4 +771,386 @@ fn record_scope_and_name_tokens_continue_through_child_eof() {
         assert!(a.root.complete, "{operand}: {:?}", a.reasons);
         assert_eq!(f.read_names(), vec!["fragment.inc", "chosen.inc"]);
     }
+}
+
+#[test]
+fn fix_i2_same_id_and_text_different_physical_root_reselects_imports() {
+    use pascal_core::{
+        FilesystemSourceStore, ImportSection, ImportSite, NoCancellation, ResolutionObservation,
+        ResolutionTarget, ResolvedUnit, UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("A");
+    let b = dir.path().join("B");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let text = "unit T; interface const N={$I value.inc}; {$IF N=7} uses Chosen; {$ELSE} uses Other; {$ENDIF} implementation end.";
+    for (path, value) in [(&a, "7"), (&b, "8")] {
+        std::fs::write(path.join("T.pas"), text).unwrap();
+        std::fs::write(path.join("value.inc"), value).unwrap();
+        for name in ["Chosen", "Other"] {
+            std::fs::write(
+                path.join(format!("{name}.pas")),
+                format!("unit {name}; interface implementation end."),
+            )
+            .unwrap();
+        }
+    }
+    let mut ctx = ProjectContext::discover(
+        &a.join("T.pas"),
+        &[dir.path().into()],
+        &ProjectOptions::default(),
+    )
+    .unwrap();
+    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        Default::default(),
+    );
+    let sites = ["Chosen", "Other"].map(|name| {
+        let start = text.find(name).unwrap();
+        ImportSite {
+            requested_name: name.into(),
+            byte_range: start..start + name.len(),
+            section: ImportSection::Interface,
+        }
+    });
+    let mut source = support::loaded("same-id.pas", text);
+    for (path, selected) in [(&a, 0), (&b, 1)] {
+        source.path = path.join("T.pas");
+        let importer = ResolvedUnit {
+            requested_name: "T".into(),
+            declared_name: "T".into(),
+            source: source.clone(),
+        };
+        let result = resolver
+            .resolve_imports_with_text(&importer, &sites, text, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(result.bindings[selected].target, ResolutionTarget::Found(_)),
+            "root {} must choose {}",
+            path.display(),
+            sites[selected].requested_name
+        );
+        assert_eq!(
+            result.bindings[1 - selected].target,
+            ResolutionTarget::Unavailable
+        );
+    }
+    let payloads = resolver
+        .report()
+        .observations
+        .into_iter()
+        .filter_map(|o| match o {
+            ResolutionObservation::Payload { path, .. }
+                if path.extension().is_some_and(|e| e == "inc") =>
+            {
+                Some(path)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(payloads, vec![a.join("value.inc"), b.join("value.inc")]);
+}
+
+#[test]
+fn fix_i2_changed_root_revision_revalidates_dependency_payload() {
+    use pascal_core::{
+        FilesystemSourceStore, ImportSection, ImportSite, NoCancellation, ResolutionObservation,
+        ResolutionTarget, ResolvedUnit, SourceRevision, UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("T.pas");
+    let text = "unit T; interface const N={$I value.inc}; {$IF N=7} uses Chosen; {$ELSE} uses Other; {$ENDIF} implementation end.";
+    std::fs::write(&path, text).unwrap();
+    for name in ["Chosen", "Other"] {
+        std::fs::write(
+            dir.path().join(format!("{name}.pas")),
+            format!("unit {name}; interface implementation end."),
+        )
+        .unwrap();
+    }
+    let mut ctx =
+        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        Default::default(),
+    );
+    let sites = ["Chosen", "Other"].map(|name| {
+        let start = text.find(name).unwrap();
+        ImportSite {
+            requested_name: name.into(),
+            byte_range: start..start + name.len(),
+            section: ImportSection::Interface,
+        }
+    });
+    let mut source = support::loaded("same-id.pas", text);
+    source.path = path;
+    for (version, value, selected) in [(1, "7", 0), (2, "8", 1)] {
+        source.revision = SourceRevision::Overlay {
+            version,
+            content_hash: pascal_project::content_hash_bytes(text.as_bytes()),
+        };
+        std::fs::write(dir.path().join("value.inc"), value).unwrap();
+        let importer = ResolvedUnit {
+            requested_name: "T".into(),
+            declared_name: "T".into(),
+            source: source.clone(),
+        };
+        let result = resolver
+            .resolve_imports_with_text(&importer, &sites, text, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(result.bindings[selected].target, ResolutionTarget::Found(_)),
+            "revision {version} must revalidate the include"
+        );
+        assert_eq!(
+            result.bindings[1 - selected].target,
+            ResolutionTarget::Unavailable
+        );
+    }
+    let revisions = resolver
+        .report()
+        .observations
+        .into_iter()
+        .filter_map(|o| match o {
+            ResolutionObservation::Payload { path, revision, .. }
+                if path.extension().is_some_and(|e| e == "inc") =>
+            {
+                Some(revision)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(revisions.len(), 2);
+    assert_ne!(revisions[0], revisions[1]);
+}
+
+#[test]
+fn fix_i3_small_aggregate_budget_refuses_before_child_payload() {
+    use pascal_core::{
+        FilesystemSourceStore, NoCancellation, ResolutionObservation, ResolvedUnit, ResolverLimits,
+        UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("T.pas");
+    let text = "unit T; interface {$I value.inc} implementation end.";
+    std::fs::write(&path, text).unwrap();
+    std::fs::write(dir.path().join("value.inc"), "type R=Byte;").unwrap();
+    let mut ctx =
+        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_retained_bytes: 1024,
+            ..Default::default()
+        },
+    );
+    let mut source = support::loaded("T.pas", text);
+    source.path = path;
+    let importer = ResolvedUnit {
+        requested_name: "T".into(),
+        declared_name: "T".into(),
+        source,
+    };
+    assert!(matches!(
+        resolver.resolve_imports_with_text(&importer, &[], text, &NoCancellation),
+        Err(pascal_core::ResolverError::LimitExceeded { .. })
+    ));
+    assert!(!resolver.report().observations.iter().any(|o| matches!(o,ResolutionObservation::Payload {path,..} if path.extension().is_some_and(|e| e=="inc"))));
+    assert_eq!(resolver.compile_time_usage().retained_bytes, 0);
+    let report = resolver.report();
+    assert!(!report.complete);
+    assert_eq!(report.observations, []);
+    assert!(
+        report
+            .incomplete_reasons
+            .iter()
+            .any(|r| r.contains("max_retained_bytes")
+                || r.contains("max_compile_time_retained_bytes"))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn fix_i2_same_id_text_and_path_do_not_replay_a_revoked_legacy_route() {
+    use pascal_core::{
+        FilesystemSourceStore, NoCancellation, ResolutionObservation, ResolvedUnit, SourceKind,
+        SourceRevision, UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectPathEntry, ProjectPathProvenance};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("T.pas");
+    let text = "unit T; interface {$I Link.inc} implementation end.";
+    std::fs::write(&path, text).unwrap();
+    std::fs::write(root.join("actual.inc"), "{body}").unwrap();
+    std::os::unix::fs::symlink(root.join("actual.inc"), root.join("Link.inc")).unwrap();
+    let ctx = ProjectContext {
+        discovery_complete: true,
+        search_paths: vec![root.into()],
+        search_path_entries: vec![ProjectPathEntry::legacy(root.into())],
+        conditional_context: context(LayoutPlatform::Win32),
+        ..Default::default()
+    };
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![],
+        FilesystemSourceStore::new(),
+        Default::default(),
+    );
+    let mut source = resolver
+        .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+        .unwrap();
+    let importer = ResolvedUnit {
+        requested_name: "T".into(),
+        declared_name: "T".into(),
+        source: source.clone(),
+    };
+    assert!(
+        resolver
+            .resolve_imports_with_text(&importer, &[], text, &NoCancellation)
+            .unwrap()
+            .complete
+    );
+    let before = resolver.report().observations.len();
+    let SourceRevision::Disk { path_entry, .. } = &mut source.revision else {
+        panic!("disk fixture")
+    };
+    path_entry.provenance = ProjectPathProvenance::Configured;
+    let importer = ResolvedUnit { source, ..importer };
+    assert!(
+        !resolver
+            .resolve_imports_with_text(&importer, &[], text, &NoCancellation)
+            .unwrap()
+            .complete,
+        "same text must not retain old symlink authority"
+    );
+    let report = resolver.report();
+    assert_eq!(report.observations.iter().filter(|o| matches!(o,ResolutionObservation::Payload {path,..} if path==&root.join("Link.inc"))).count(),1);
+    // Revoked route leaves no authorized include directory: refusal precedes
+    // candidate and payload capabilities, rather than replaying old success.
+    assert_eq!(report.observations[before..], []);
+    assert!(!report.complete);
+}
+
+#[test]
+fn fix_i3_versions_replace_temporary_projection_and_share_work() {
+    use pascal_core::{
+        FilesystemSourceStore, NoCancellation, ResolvedImports, ResolvedUnit, ResolverLimits,
+        UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("T.pas");
+    let base = "unit T; interface {$I value.inc} implementation end.";
+    std::fs::write(&path, base).unwrap();
+    std::fs::write(dir.path().join("value.inc"), "{body}").unwrap();
+    let mut ctx =
+        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_retained_bytes: 64000,
+            ..Default::default()
+        },
+    );
+    let mut previous = 0;
+    for version in 1..=10 {
+        let text = format!("{base}{}", " ".repeat(version));
+        let mut source = support::loaded("T.pas", &text);
+        source.path = path.clone();
+        let importer = ResolvedUnit {
+            requested_name: "T".into(),
+            declared_name: "T".into(),
+            source,
+        };
+        assert!(
+            resolver
+                .resolve_imports_with_text(&importer, &[], &text, &NoCancellation)
+                .unwrap()
+                .complete
+        );
+        let usage = resolver.compile_time_usage();
+        assert!(
+            usage.work > previous,
+            "work cannot reset or be bypassed by replay"
+        );
+        previous = usage.work;
+        assert!(
+            usage.retained_bytes <= version * std::mem::size_of::<ResolvedImports>(),
+            "obsolete analysis versions must not accumulate: {usage:?}"
+        );
+    }
+}
+
+#[test]
+fn fix_i3_repeated_project_outputs_are_admitted_not_free_replays() {
+    use pascal_core::{
+        FilesystemSourceStore, NoCancellation, ResolverLimits, UnitResolveRequest, UnitResolver,
+    };
+    use pascal_project::{ProjectContext, ProjectOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("T.pas");
+    let text = "unit T; interface {$I value.inc} implementation end.";
+    std::fs::write(&path, text).unwrap();
+    std::fs::write(dir.path().join("value.inc"), "type R=Byte;").unwrap();
+    let mut ctx =
+        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_retained_bytes: 64000,
+            ..Default::default()
+        },
+    );
+    let mut refused = false;
+    for n in 0..128 {
+        match resolver.resolve_project(
+            UnitResolveRequest {
+                requested_name: "T",
+                importer_path: &path,
+                legacy_route: None,
+            },
+            &[],
+            &NoCancellation,
+        ) {
+            Ok(project) => {
+                assert!(project.complete);
+                assert_eq!(project.includes.len(), 1);
+                assert_eq!(project.include_sources.len(), 1);
+                if n == 0 {
+                    assert!(resolver.compile_time_usage().retained_bytes > 0);
+                }
+            }
+            Err(pascal_core::ResolverError::LimitExceeded { .. }) => {
+                assert!(n > 0, "initial admitted projection should fit");
+                refused = true;
+                break;
+            }
+            other => panic!("unexpected projection result {other:?}"),
+        }
+    }
+    assert!(
+        refused,
+        "new request outputs cannot bypass aggregate retained admission via a free replay"
+    );
+    assert!(resolver.compile_time_usage().retained_bytes <= 64000);
 }

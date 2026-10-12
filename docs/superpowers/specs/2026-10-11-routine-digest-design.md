@@ -1,8 +1,7 @@
 # l4d-7mw.1: per-routine control-flow digests for agents
 
 - Date: 2026-10-11
-- Status: design approved in conversation section by section on 2026-10-09..11;
-  written spec awaiting user review
+- Status: written spec approved by the user on 2026-10-11
 - Issue: l4d-7mw.1 (epic l4d-7mw)
 - Blocked by: l4d-z6w, l4d-wzt, l4d-d8d
 

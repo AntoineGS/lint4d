@@ -209,8 +209,11 @@ For each local variable assigned from a constructor:
    statement again yields `Escapes (re-created at L…)`.
 3. Any other assignment to the variable in the routine yields
    `Unknown (reassigned at L…)`.
-4. Assignment to `Result`, to a field, or no free at all yields
-   `NotFreedHere`.
+4. Assignment to `Result` yields `NotFreedHere (returned as Result)`. A
+   non-local target (field, global or parameter) with no free in the routine
+   yields `NotFreedHere (assigned to a non-local)`; a local with no free
+   yields `NotFreedHere (no free found)`. A non-local that is freed in the
+   routine gets the normal path verdict.
 5. Parse errors in the routine yield `Unknown (parse errors)` for every
    verdict; a hidden directive block (6.5) between a creation and its free
    yields `Unknown (hidden directive block at L…)`.
@@ -222,6 +225,8 @@ For each local variable assigned from a constructor:
 Transaction verdicts (listed only; the `transaction` rule covers them),
 interprocedural effects (l4d-7mw.3), receiver resolution, directories and
 `--project`.
+
+`goto`, `Break` and `Continue` produce no fact line.
 
 ### 6.5 Degradation
 
@@ -261,7 +266,7 @@ its directive rewrite preserves byte offsets, so line numbers match the file.
   selector matching nothing. `1` is not used. A failed match prints the 10
   closest routine names to stderr.
 - `--max-lines N` (default 300) bounds text per routine. Past it, the deepest
-  subtrees collapse to `L4430-4441 … (12 lines, calls aQry.Next, existingSkus.Add)`.
+  subtrees collapse to `L4430-4441 while not aQry.Eof … (12 lines, calls aQry.Next, existingSkus.Add)`, keeping the head text.
   The header and `objects:` line are never collapsed. JSON, `--all` and the
   index are not bounded.
 - No new budgets beyond lint's 256-level tree-depth guard.

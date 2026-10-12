@@ -1,6 +1,7 @@
 pub mod cfg;
 pub mod config;
 pub mod dcu;
+pub mod digest;
 pub mod discovery;
 pub mod engine;
 pub mod fix;

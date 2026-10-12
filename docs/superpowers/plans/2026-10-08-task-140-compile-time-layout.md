@@ -30,6 +30,20 @@ worktree on 2026-10-08; branch `task-140-compile-time-layout`.
 - No new runtime dependencies, full navigation-index extraction, arbitrary Delphi execution, DCU layout inference, or unbounded provider scans.
 - The additional limits introduced below supplement, rather than bypass, existing source/include/recovery budgets.
 - User approved this plan and selected subagent-driven execution in a worktree on 2026-10-08. Writing the plan alone did not authorize execution; that later user approval does.
+- User approved the cwd platform-internal scratch exception on 2026-10-09. Native receiving buffers and every implementation-controlled path/metadata allocation remain pre-admitted; native internal temporary memory/work is not a total-process resource guarantee. Relative-route behavior and authorization remain unchanged.
+
+### Task 9 continuation: approved cwd boundary amendment
+
+This continues the existing Task 9, not a new native path-recovery subsystem.
+The user approved the exception rather than a custom native backend. Preserve
+the selected subagent/worktree execution and all existing review gates.
+
+- [x] Investigate the actual relative-route/cwd allocation blocker and obtain user approval of the narrow native scratch exception.
+- [x] Record the approved exception in the spec, Backlog and execution ledger.
+- [ ] Implement a private admitted cwd receiver using native caller buffers, checked retry/growth, independent lossless path conversion, and distinct native-error versus budget/cancellation results. No new runtime dependency or source-open mechanism.
+- [ ] Test actual cwd equality and non-Unicode/long/error behavior in isolated child processes, original allocation/last-owner/refusal/cancellation behavior, and unchanged relative-route capability. Platform-specific evidence must be labeled honestly.
+- [ ] Independently review original receiver/conversion ownership, FFI safety, exact cwd semantics and the documented exception before integrating fallback canonical-route construction.
+- [ ] Finish actual fallback group/canonical comparison/entry ownership using the admitted constructor; no guessed removal of opaque invoices. Remaining full Task 9 obligations are unchanged.
 
 ## Review Focus
 

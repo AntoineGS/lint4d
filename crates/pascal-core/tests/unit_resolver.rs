@@ -2464,6 +2464,7 @@ fn mid_load_cancellation_is_returned_as_a_typed_error() {
         path: PathBuf::from("/workspace/Main.pas"),
         bytes: Arc::from(&b""[..]),
         decoded_text: None,
+        compile_time_backing: None,
         revision: SourceRevision::Overlay {
             version: 1,
             content_hash: 0,
@@ -2594,6 +2595,62 @@ fn library_source_keeps_unknown_project_define_activity_incomplete() {
     );
 }
 
+#[test]
+fn compile_time_unit_capability_uses_selected_library_context() {
+    let mut context = fixture_context();
+    context.project_file = Some("/workspace/App.dproj".into());
+    context.project_source_roots = vec!["/workspace".into()];
+    context.search_paths.push("/sdk/lib".into());
+    context
+        .search_path_entries
+        .push(ProjectPathEntry::legacy("/sdk/lib".into()));
+    context.conditional_context = support_context();
+    context.library_conditional_context =
+        support_context().with_absent_define(ConditionalFact::False);
+    let mut store = MemoryStore::default();
+    store.add("/sdk/lib/Types.pas", "unit Types; interface {$IFDEF PRIVATE} type Export=Byte; {$ELSE} type Export=Int64; {$ENDIF} implementation end.");
+    store.add("/workspace/Main.pas", "unit Main; interface uses Types; {$DEFINE PRIVATE} {$IF SizeOf(Types.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.");
+    let mut resolver = UnitResolver::new(
+        context,
+        vec!["/workspace".into()],
+        store,
+        ResolverLimits::default(),
+    );
+    let root = resolver
+        .load_source(
+            Path::new("/workspace/Main.pas"),
+            None,
+            SourceKind::Unit,
+            &NoCancellation,
+        )
+        .unwrap();
+    let a = resolver
+        .analyze_compile_time(&root, &NoCancellation)
+        .unwrap();
+    assert_eq!(
+        a.root
+            .directives
+            .iter()
+            .find(|d| d.body == "DEFINE HIT")
+            .unwrap()
+            .activity,
+        pascal_core::conditional::Truth::True
+    );
+}
+
+fn support_context() -> ConditionalContext {
+    ConditionalContext::default()
+        .with_compiler_version(CompilerVersion::new(37, 0))
+        .with_layout(pascal_project::LayoutContext {
+            platform: Some(pascal_project::LayoutPlatform::Win32),
+            defaults: pascal_project::LayoutSettings {
+                long_strings: ConditionalFact::True,
+                real_compatibility: ConditionalFact::False,
+                ..Default::default()
+            },
+        })
+}
+
 fn fixture_context() -> ProjectContext {
     let root = PathBuf::from("/workspace");
     let entry = ProjectPathEntry {
@@ -2700,6 +2757,50 @@ impl MemoryStore {
 }
 
 impl SourceStore for MemoryStore {
+    fn list_directory_admitted(
+        &mut self,
+        request: DirectoryRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::compile_time::AdmittedOwned<DirectoryListing>, SourceStoreError> {
+        // Known, pre-existing fixture keys give a before-copy upper bound.
+        let payload = self
+            .sources
+            .keys()
+            .map(|p| p.len() + 2 * std::mem::size_of::<PathBuf>())
+            .sum::<usize>()
+            + 3 * request.directory.as_os_str().len();
+        budget
+            .admit_owned(1, payload, payload, || {
+                self.list_directory(request, cancel).unwrap()
+            })
+            .map_err(|_| SourceStoreError::AdmissionUnavailable)
+    }
+    fn overlay_candidates_admitted(
+        &self,
+        _roots: &[PathBuf],
+        _names: &[String],
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::compile_time::AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
+        budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|_| SourceStoreError::AdmissionUnavailable)
+    }
+    fn load_admitted(
+        &mut self,
+        request: SourceRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        let payload = self.sources.values().map(Vec::len).sum::<usize>()
+            + self.sources.keys().map(|p| p.len()).sum::<usize>()
+            + 4 * request.path.as_os_str().len()
+            + std::mem::size_of::<LoadedSource>();
+        LoadedSource::admit_construction(budget, payload, 2 * payload, || {
+            self.load(request, cancel)
+        })
+    }
     fn list_directory(
         &mut self,
         request: DirectoryRequest<'_>,
@@ -2743,6 +2844,7 @@ impl SourceStore for MemoryStore {
             path: request.path.to_path_buf(),
             bytes: Arc::<[u8]>::from(bytes),
             decoded_text: None,
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 0,

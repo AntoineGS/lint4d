@@ -1,12 +1,20 @@
 //! Bounded, reference-derived Delphi compile-time storage facts.
 //!
-//! This module does not bind names or analyze declarations. Callers must prove
-//! intrinsic identity before using the closed scalar registry and must charge
-//! the shared request budget before processing or retaining source payloads.
+//! Declaration ingestion and lexical queries share a request-wide budget.
+//! Intrinsic layout remains separate from parsing and name binding.
+mod arrays;
+mod bindings;
 mod budget;
+mod declarations;
 mod model;
+mod operands;
+mod records;
 mod scalars;
+mod session;
 
-pub use budget::{CompileTimeBudget, CompileTimeLimits};
+pub use budget::{AdmittedOwned, AdmittedShared, CompileTimeBudget, CompileTimeLimits};
+pub use declarations::CompileTimeState;
 pub use model::*;
+pub use operands::{SizeOfOperand, parse_sizeof_operand};
 pub use scalars::{BuiltinType, builtin_layout};
+pub use session::*;

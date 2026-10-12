@@ -309,6 +309,25 @@ array dimensions, provider queries, and retained facts as well as include bytes
 and directives. Charge work and retained bytes before scanning, allocation,
 cloning, or provider reads; do not repeatedly parse an ever-growing prefix.
 
+### Platform-internal scratch exception (user-approved 2026-10-09)
+
+Platform-internal temporary scratch used to obtain the current working directory
+is outside the request budget. All buffers controlled by this implementation,
+including native-call receiving buffers, growth peaks, decoded paths, lexical
+normalization, and resolver metadata, remain subject to admission before allocation
+and traversal. This exception does not allow calling `std::env::current_dir` and
+attaching a receipt to its already allocated returned `PathBuf`.
+
+Preserve existing relative-route authorization, long-path and non-Unicode behavior.
+Do not replace cwd with `PWD`, cache a stale cwd, impose a rooted-only restriction,
+or use a guessed maximum pathname length. Native calls are opaque operations:
+admit each attempt and poll cancellation before and after it; cancellation inside
+the platform routine is not guaranteed. Do not claim a bound on total process
+memory or on the platform routine's internal work. Genuine native errors retain
+the existing lexical `"."` fallback; budget refusal/cancellation must not use that
+fallback. This approval does not waive parser/provider/source/include limits,
+receiving ownership, cache publication, or security review requirements.
+
 All size multiplication, field-offset addition, alignment rounding, and conversion
 to expression integers use checked arithmetic. Overflow, unsupported ordinal
 bounds, and exhausted limits never produce a wrapped known size. Cancellation

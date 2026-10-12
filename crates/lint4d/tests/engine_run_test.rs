@@ -162,6 +162,10 @@ fn prepared_include_diagnostic_falls_back_without_publishing_a_fake_location() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            pascal_project::ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -170,6 +174,7 @@ fn prepared_include_diagnostic_falls_back_without_publishing_a_fake_location() {
                 path: PathBuf::from("/workspace/App.pas"),
                 bytes: Arc::from(source.to_vec()),
                 decoded_text: None,
+                compile_time_backing: None,
                 revision: SourceRevision::Overlay {
                     version: 1,
                     content_hash: 1,
@@ -189,6 +194,7 @@ fn prepared_include_diagnostic_falls_back_without_publishing_a_fake_location() {
             path: PathBuf::from("/workspace/decls.inc"),
             bytes: Arc::from(include.to_vec()),
             decoded_text: None,
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 1,
@@ -240,6 +246,10 @@ fn prepared_include_diagnostic_scope_uses_original_coordinates() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            pascal_project::ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "Main".to_string(),
             declared_name: "Main".to_string(),
@@ -248,6 +258,7 @@ fn prepared_include_diagnostic_scope_uses_original_coordinates() {
                 path: PathBuf::from("/workspace/Main.pas"),
                 bytes: Arc::from(source.to_vec()),
                 decoded_text: None,
+                compile_time_backing: None,
                 revision: SourceRevision::Overlay {
                     version: 1,
                     content_hash: 1,
@@ -267,6 +278,7 @@ fn prepared_include_diagnostic_scope_uses_original_coordinates() {
             path: PathBuf::from("/workspace/pad.inc"),
             bytes: Arc::from(pad.to_vec()),
             decoded_text: None,
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 2,

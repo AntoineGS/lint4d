@@ -291,6 +291,91 @@ impl PartialEq for ReadPolicy {
 impl Eq for ReadPolicy {}
 
 impl ReadPolicy {
+    /// Owned storage copied by `Clone`. The authorization-file table and the
+    /// compiled matcher are shared Arc backing, not copied parser/cache payload.
+    /// Recovery traversal remains separate and still refuses opaque matcher data.
+    pub fn visit_owned_clone_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.visit_owned_clone_payload_with_preflight(&mut |_, bytes| match bytes {
+            Some(bytes) => visit(bytes),
+            None => Ok(()),
+        })
+    }
+
+    /// Read-only clone sizing with work events before each input-sized group.
+    /// `None` requests admission of `work` visits; `Some(bytes)` is a payload
+    /// sizing event already covered by that group's preflight. Shared matcher/
+    /// authorization-file backing remains excluded exactly as in the plain visitor.
+    pub fn visit_owned_clone_payload_with_preflight(
+        &self,
+        visit: &mut dyn FnMut(usize, Option<usize>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let overflow = || "read policy clone sizing overflow".to_string();
+        let roots = self
+            .configured_roots
+            .len()
+            .checked_add(self.mapped_roots.len())
+            .ok_or_else(overflow)?;
+        let work = roots
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(self.exclusions.len()))
+            .and_then(|n| n.checked_add(self.exclusion_bases.len()))
+            .and_then(|n| n.checked_add(3))
+            .ok_or_else(overflow)?;
+        visit(work, None)?;
+        visit(
+            0,
+            Some(
+                roots
+                    .checked_mul(std::mem::size_of::<AuthorizedReadRoot>())
+                    .ok_or_else(overflow)?,
+            ),
+        )?;
+        for root in self.configured_roots.iter().chain(&self.mapped_roots) {
+            visit(root.pattern_exclusion_bases.len(), None)?;
+            visit(0, Some(root.path.as_os_str().len()))?;
+            visit(
+                0,
+                Some(
+                    root.pattern_exclusion_bases
+                        .len()
+                        .checked_mul(std::mem::size_of::<PathBuf>())
+                        .ok_or_else(overflow)?,
+                ),
+            )?;
+            for base in &root.pattern_exclusion_bases {
+                visit(0, Some(base.as_os_str().len()))?;
+            }
+        }
+        visit(
+            0,
+            Some(
+                self.exclusions
+                    .len()
+                    .checked_mul(std::mem::size_of::<String>())
+                    .ok_or_else(overflow)?,
+            ),
+        )?;
+        for pattern in &self.exclusions {
+            visit(0, Some(pattern.len()))?;
+        }
+        visit(
+            0,
+            Some(
+                self.exclusion_bases
+                    .len()
+                    .checked_mul(std::mem::size_of::<PathBuf>())
+                    .ok_or_else(overflow)?,
+            ),
+        )?;
+        for base in &self.exclusion_bases {
+            visit(0, Some(base.as_os_str().len()))?;
+        }
+        Ok(())
+    }
+
     pub fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

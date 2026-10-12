@@ -411,3 +411,34 @@ fn labels_are_cut_at_fifty_characters() {
     let expected: String = condition.chars().take(50).collect();
     assert_eq!(tree.lines().next().unwrap(), format!("L6 if {expected}…"));
 }
+
+#[test]
+fn a_bare_except_body_keeps_an_empty_if_before_its_else() {
+    assert_eq!(
+        tree_of("  try\n    Bar;\n  except\n    if A then\n      X := 1\n    else\n      Touch;\n  end;\n"),
+        "L6 try
+  L7 calls Bar
+L8 except
+  L9 if A
+  L12 else
+    L12 calls Touch
+"
+    );
+}
+
+#[test]
+fn a_call_hidden_by_the_label_cut_keeps_an_otherwise_empty_if() {
+    let tree = tree_of(
+        "  if (AAAAAAAAAA = 1) and (BBBBBBBBBB = 2) and (CCCCCCCCCC = 3) and Ready(X) then\n    Y := 1;\n",
+    );
+    assert!(tree.starts_with("L6 if (AAAAAAAAAA"), "{tree}");
+    assert!(tree.trim_end().ends_with("… [calls Ready]"), "{tree}");
+    assert_eq!(tree.lines().count(), 1, "{tree}");
+}
+
+#[test]
+fn json_omits_frequent_calls_when_empty() {
+    let file = digest(wrap("  Bar;\n").as_bytes());
+    let p = routine(&file, "P");
+    assert!(!render::render_json("t.pas", &[p]).contains("frequent_calls"));
+}

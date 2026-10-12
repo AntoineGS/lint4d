@@ -316,6 +316,12 @@ fn prune(nodes: Vec<Raw>) -> Vec<DigestNode> {
 fn prune_handlers(children: Vec<Raw>) -> (Vec<DigestNode>, bool) {
     let mut kept = Vec::new();
     let mut content = false;
+    let mut rest: Vec<Raw> = Vec::new();
+    let flush = |rest: &mut Vec<Raw>, kept: &mut Vec<DigestNode>, content: &mut bool| {
+        let nodes = prune(std::mem::take(rest));
+        *content |= !nodes.is_empty();
+        kept.extend(nodes);
+    };
     for child in children {
         match child {
             Raw::Control {
@@ -326,6 +332,7 @@ fn prune_handlers(children: Vec<Raw>) -> (Vec<DigestNode>, bool) {
                 children,
                 ..
             } => {
+                flush(&mut rest, &mut kept, &mut content);
                 let children = prune(children);
                 content |= !children.is_empty();
                 kept.push(DigestNode::Control {
@@ -336,13 +343,10 @@ fn prune_handlers(children: Vec<Raw>) -> (Vec<DigestNode>, bool) {
                     children,
                 });
             }
-            other => {
-                let nodes = prune(vec![other]);
-                content |= !nodes.is_empty();
-                kept.extend(nodes);
-            }
+            other => rest.push(other),
         }
     }
+    flush(&mut rest, &mut kept, &mut content);
     (kept, content)
 }
 

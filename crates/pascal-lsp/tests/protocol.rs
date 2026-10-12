@@ -4498,6 +4498,89 @@ fn call_hierarchy_omits_named_references_and_ambiguous_overloads() {
 }
 
 #[test]
+fn call_hierarchy_includes_parameterless_call_statements() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("BareCalls.pas");
+    let source = "unit BareCalls;\ninterface\ntype\n  TProc = procedure;\n  TItem = class\n  private\n    FCount: Integer;\n  public\n    procedure Post;\n    property Count: Integer read FCount;\n  end;\nprocedure Touch;\nprocedure Caller(Item: TItem; Callback: TProc);\nimplementation\nprocedure Touch;\nbegin end;\nprocedure TItem.Post;\nbegin end;\nprocedure Caller(Item: TItem; Callback: TProc);\nvar Total: Integer;\nbegin\n  Touch;\n  if Total = 0 then Item.Post;\n  Callback;\n  Total := Item.Count;\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("bare-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 1)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "caller prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("caller item")[0].clone();
+    let outgoing_id = RequestId::from("bare-caller-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(outgoing.error.is_none(), "outgoing failed: {outgoing:?}");
+    let outgoing = outgoing.result.expect("outgoing");
+    let mut edges: Vec<_> = outgoing
+        .as_array()
+        .expect("outgoing array")
+        .iter()
+        .map(|call| {
+            (
+                call["to"]["name"]
+                    .as_str()
+                    .expect("callee name")
+                    .to_string(),
+                call["fromRanges"][0]["start"]["line"].as_u64(),
+                call["fromRanges"][0]["start"]["character"].as_u64(),
+                call["fromRanges"][0]["end"]["character"].as_u64(),
+            )
+        })
+        .collect();
+    edges.sort();
+    assert_eq!(
+        edges,
+        [
+            ("Post".to_string(), Some(22), Some(20), Some(29)),
+            ("Touch".to_string(), Some(21), Some(2), Some(7)),
+        ],
+        "bare procedure and parameterless method statements are calls; a procedural variable and a property read are not: {outgoing}"
+    );
+
+    let touch_id = RequestId::from("bare-touch-prepare".to_string());
+    server.send_request(
+        touch_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Touch", 1)
+        }),
+    );
+    let touch = server.response(&touch_id);
+    assert!(touch.error.is_none(), "touch prepare failed: {touch:?}");
+    let touch_item = touch.result.expect("touch item")[0].clone();
+    let incoming_id = RequestId::from("bare-touch-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": touch_item}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(incoming.error.is_none(), "incoming failed: {incoming:?}");
+    let incoming = incoming.result.expect("incoming");
+    assert_eq!(incoming.as_array().expect("incoming array").len(), 1);
+    assert_eq!(incoming[0]["from"]["name"], "Caller");
+    assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], 21);
+    server.shutdown();
+}
+
+#[test]
 fn call_hierarchy_keeps_uniquely_selected_overloads_as_distinct_items() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("OverloadCalls.pas");

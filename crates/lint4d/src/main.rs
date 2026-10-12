@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{CommandFactory, Parser};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use lint4d::cfg::{CfgSnapshotOptions, CfgSnapshotStatus, to_cfg_project_snapshot};
 use lint4d::config::Config;
 use lint4d::config::baseline::Baseline;
@@ -154,8 +154,55 @@ version = 1
 "#;
 
 #[derive(Parser)]
-#[command(name = "lint4d", version, about = "An open-source Delphi linter")]
+#[command(
+    name = "lint4d",
+    version,
+    about = "An open-source Delphi linter",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    lint: LintArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Summarise routines (control flow, object lifetimes, transactions, calls) for coding agents
+    Digest(DigestArgs),
+}
+
+#[derive(Args)]
+struct DigestArgs {
+    /// Pascal source file
+    file: PathBuf,
+
+    /// Digest routines with this qualified or last-component name
+    #[arg(long, conflicts_with_all = ["line", "all"])]
+    routine: Option<String>,
+
+    /// Digest the innermost routine containing this 1-based line
+    #[arg(long, conflicts_with = "all")]
+    line: Option<usize>,
+
+    /// Digest every routine
+    #[arg(long)]
+    all: bool,
+
+    /// Output format: text or json
+    #[arg(long, default_value = "text")]
+    format: String,
+
+    /// Text lines per routine before the deepest blocks collapse
+    #[arg(long, default_value_t = 300)]
+    max_lines: usize,
+}
+
+/// Arguments of the default lint command.
+#[derive(Args)]
+struct LintArgs {
     /// Files or directories to lint
     paths: Vec<PathBuf>,
 
@@ -241,7 +288,11 @@ fn exit_err(msg: &str, code: i32) -> ! {
 }
 
 fn real_main() {
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
+    if let Some(Command::Digest(args)) = cli.command {
+        process::exit(run_digest(&args));
+    }
+    let mut cli = cli.lint;
 
     // --init: create default config and exit
     if cli.init {
@@ -303,9 +354,71 @@ fn real_main() {
     );
 }
 
+/// `lint4d digest`: exit 0 on success, 2 on any error. Never reads config.
+fn run_digest(args: &DigestArgs) -> i32 {
+    use lint4d::digest::select::{Selector, select};
+    use lint4d::digest::{digest_source, render};
+
+    if args.format != "text" && args.format != "json" {
+        eprintln!(
+            "lint4d: invalid --format value: '{}' (expected 'text' or 'json')",
+            args.format
+        );
+        return EXIT_ERROR;
+    }
+    let source = match fs::read(&args.file) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("lint4d: cannot read {}: {error}", args.file.display());
+            return EXIT_ERROR;
+        }
+    };
+    let file = match digest_source(&args.file, &source) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("lint4d: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    let selector = match (&args.routine, args.line) {
+        (Some(name), _) => Selector::Routine(name.clone()),
+        (None, Some(line)) => Selector::Line(line),
+        (None, None) if args.all => Selector::All,
+        (None, None) => Selector::Index,
+    };
+    let chosen = match select(&file, &selector) {
+        Ok(chosen) => chosen,
+        Err(error) => {
+            eprintln!("lint4d: {}", error.message);
+            if !error.suggestions.is_empty() {
+                eprintln!("closest routines:");
+                for suggestion in &error.suggestions {
+                    eprintln!("  {suggestion}");
+                }
+            }
+            return EXIT_ERROR;
+        }
+    };
+    let output = if args.format == "json" {
+        render::render_json(&file.path, &chosen)
+    } else if matches!(selector, Selector::Index) {
+        render::render_index(&file)
+    } else {
+        let name = render::file_name(&file.path);
+        let limit = (!matches!(selector, Selector::All)).then_some(args.max_lines);
+        chosen
+            .iter()
+            .map(|routine| render::render_routine(routine, &name, limit))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print!("{output}");
+    EXIT_OK
+}
+
 /// Validates CLI arguments and returns the parsed severity threshold.
 /// Exits with EXIT_ERROR if any argument is invalid.
-fn validate_cli(cli: &Cli) -> Severity {
+fn validate_cli(cli: &LintArgs) -> Severity {
     // Require at least one path (or --project)
     if cli.paths.is_empty() && cli.project.is_none() {
         let mut cmd = Cli::command();
@@ -355,7 +468,7 @@ fn validate_cli(cli: &Cli) -> Severity {
 }
 
 /// Resolves DCU paths and builds a ProjectContext if any DCU directories are found.
-fn resolve_dcu_context(cli: &Cli, config: &Config) -> Option<lint4d::dcu::ProjectContext> {
+fn resolve_dcu_context(cli: &LintArgs, config: &Config) -> Option<lint4d::dcu::ProjectContext> {
     // MSBuild auto-discovery: only attempt if --project is provided
     let discovered_paths = if cli.dcu_paths.is_empty() && config.dcu_paths().is_empty() {
         if let Some(project) = cli.project.as_ref() {
@@ -402,7 +515,7 @@ fn resolve_dcu_context(cli: &Cli, config: &Config) -> Option<lint4d::dcu::Projec
 
 /// Discovers source files to lint, either from a .dproj file or via glob discovery.
 /// Exits with EXIT_ERROR on failure.
-fn discover_source_files(cli: &Cli, config: &Config) -> Vec<FileInfo> {
+fn discover_source_files(cli: &LintArgs, config: &Config) -> Vec<FileInfo> {
     if let Some(ref project_path) = cli.project {
         match parse_dproj(project_path) {
             Ok(f) => f,
@@ -537,7 +650,11 @@ fn resolver_import_sites(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impo
 
 /// Discover source-project metadata once. Each worker still creates its own
 /// resolver/store session, so no mutable resolver state crosses Rayon tasks.
-fn resolve_source_project(cli: &Cli, config: &Config, files: &[FileInfo]) -> Option<SourceProject> {
+fn resolve_source_project(
+    cli: &LintArgs,
+    config: &Config,
+    files: &[FileInfo],
+) -> Option<SourceProject> {
     let project_file = cli.project.as_ref()?;
     let project_file = lexical_absolute(project_file);
     let root = project_file.parent()?.to_path_buf();
@@ -634,7 +751,7 @@ fn lexical_absolute(path: &Path) -> PathBuf {
 
 /// Runs the parallel lint pipeline: lints files, applies baseline, formats output, exits.
 fn run_lint_pipeline(
-    cli: &Cli,
+    cli: &LintArgs,
     config: &Config,
     cwd: &Path,
     files: Vec<FileInfo>,

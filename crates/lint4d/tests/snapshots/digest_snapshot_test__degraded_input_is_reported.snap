@@ -1,0 +1,17 @@
+---
+source: crates/lint4d/tests/digest_snapshot_test.rs
+expression: text
+---
+degraded.pas  2 routines
+L4-13   10  Hidden  ?
+L14-17   4  Broken
+
+Hidden  degraded.pas:4-13 (10 lines)
+! hidden directive block at L9
+objects: L TStringList L8 unknown (hidden directive block at L9)
+L8 new TStringList -> L
+L12 free L
+
+Broken  degraded.pas:14-17 (4 lines)
+! parse errors at L16
+L16 calls Foo

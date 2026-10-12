@@ -1,0 +1,382 @@
+---
+source: crates/lint4d/tests/digest_snapshot_test.rs
+expression: "render::render_json(&file.path, &routines)"
+---
+{
+  "path": "lifecycle.pas",
+  "routines": [
+    {
+      "name": "Foo",
+      "start_line": 4,
+      "end_line": 24,
+      "byte_range": {
+        "start": 41,
+        "end": 381
+      },
+      "objects": [
+        {
+          "var": "L",
+          "class": "TStringList",
+          "line": 9,
+          "verdict": {
+            "status": "freed_all_paths"
+          }
+        }
+      ],
+      "body": [
+        {
+          "node": "fact",
+          "line": 8,
+          "fact": {
+            "kind": "calls",
+            "calls": [
+              {
+                "name": "Log",
+                "count": 2
+              },
+              {
+                "name": "Prepare",
+                "count": 1
+              }
+            ]
+          }
+        },
+        {
+          "node": "fact",
+          "line": 9,
+          "fact": {
+            "kind": "new",
+            "class": "TStringList",
+            "target": "L"
+          }
+        },
+        {
+          "node": "control",
+          "kind": "try",
+          "line": 10,
+          "end_line": 20,
+          "label": "",
+          "children": [
+            {
+              "node": "control",
+              "kind": "case",
+              "line": 11,
+              "end_line": 16,
+              "label": "A",
+              "children": [
+                {
+                  "node": "control",
+                  "kind": "arm",
+                  "line": 12,
+                  "end_line": 12,
+                  "label": "1",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 12,
+                      "fact": {
+                        "kind": "calls",
+                        "calls": [
+                          {
+                            "name": "Bar",
+                            "count": 1
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "node": "control",
+                  "kind": "arm",
+                  "line": 13,
+                  "end_line": 13,
+                  "label": "2",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 13,
+                      "fact": {
+                        "kind": "calls",
+                        "calls": [
+                          {
+                            "name": "Baz",
+                            "count": 1
+                          },
+                          {
+                            "name": "Qux",
+                            "count": 1
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "node": "control",
+                  "kind": "arm",
+                  "line": 14,
+                  "end_line": 15,
+                  "label": "else",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 15,
+                      "fact": {
+                        "kind": "raise",
+                        "text": "Exception.Create('bad')"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "node": "control",
+              "kind": "if",
+              "line": 17,
+              "end_line": 18,
+              "label": "A > 0",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 18,
+                  "fact": {
+                    "kind": "exit",
+                    "runs_finally": 22
+                  }
+                }
+              ]
+            },
+            {
+              "node": "fact",
+              "line": 19,
+              "fact": {
+                "kind": "tx",
+                "op": "start",
+                "receiver": "DB",
+                "method": "StartTransaction"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "finally",
+          "line": 21,
+          "end_line": 23,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 22,
+              "fact": {
+                "kind": "free",
+                "var": "L"
+              }
+            }
+          ]
+        }
+      ],
+      "degraded": []
+    },
+    {
+      "name": "W",
+      "start_line": 25,
+      "end_line": 41,
+      "byte_range": {
+        "start": 382,
+        "end": 597
+      },
+      "objects": [
+        {
+          "var": "L",
+          "class": "TStringList",
+          "line": 30,
+          "verdict": {
+            "status": "escapes",
+            "via": [
+              {
+                "line": 31,
+                "how": "exception"
+              }
+            ],
+            "more": false
+          }
+        }
+      ],
+      "body": [
+        {
+          "node": "control",
+          "kind": "try",
+          "line": 29,
+          "end_line": 36,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 30,
+              "fact": {
+                "kind": "new",
+                "class": "TStringList",
+                "target": "L"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 31,
+              "fact": {
+                "kind": "calls",
+                "calls": [
+                  {
+                    "name": "Db.Open",
+                    "count": 1
+                  }
+                ]
+              }
+            },
+            {
+              "node": "control",
+              "kind": "try",
+              "line": 32,
+              "end_line": 33,
+              "label": "",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 33,
+                  "fact": {
+                    "kind": "calls",
+                    "calls": [
+                      {
+                        "name": "L.Add",
+                        "count": 1
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "node": "control",
+              "kind": "finally",
+              "line": 34,
+              "end_line": 36,
+              "label": "",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 35,
+                  "fact": {
+                    "kind": "free",
+                    "var": "L"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "except",
+          "line": 37,
+          "end_line": 40,
+          "label": "",
+          "children": [
+            {
+              "node": "control",
+              "kind": "on",
+              "line": 38,
+              "end_line": 39,
+              "label": "E: Exception",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 39,
+                  "fact": {
+                    "kind": "calls",
+                    "calls": [
+                      {
+                        "name": "Log",
+                        "count": 1
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "degraded": []
+    },
+    {
+      "name": "F",
+      "start_line": 42,
+      "end_line": 49,
+      "byte_range": {
+        "start": 598,
+        "end": 716
+      },
+      "objects": [
+        {
+          "var": "Result",
+          "class": "TList",
+          "line": 46,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "result"
+          }
+        },
+        {
+          "var": "FItems",
+          "class": "TList",
+          "line": 47,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "non_local"
+          }
+        },
+        {
+          "var": "L",
+          "class": "TList",
+          "line": 48,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "never_freed"
+          }
+        }
+      ],
+      "body": [
+        {
+          "node": "fact",
+          "line": 46,
+          "fact": {
+            "kind": "new",
+            "class": "TList",
+            "target": "Result"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 47,
+          "fact": {
+            "kind": "new",
+            "class": "TList",
+            "target": "FItems"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 48,
+          "fact": {
+            "kind": "new",
+            "class": "TList",
+            "target": "L"
+          }
+        }
+      ],
+      "degraded": []
+    }
+  ]
+}

@@ -2,8 +2,179 @@
 
 pub mod model;
 pub mod render;
+pub mod tree;
 
 pub use model::*;
+
+use std::ops::Range;
+use std::path::Path;
+
+use cfg_pascal::build_file_cfgs;
+use cfg_pascal::cfg_core::Cfg;
+use pascal_core::FileInfo;
+use pascal_core::directive_fragment_rewrite::DirectivePatch;
+use pascal_core::parser::{node_text, parse_file_with_parser_source};
+use tree_sitter::Node;
+
+/// Parse `source` the way lint does and digest every routine.
+///
+/// Byte offsets of the rewritten parser source equal the original ones, so
+/// line numbers refer to the file as written.
+pub fn digest_source(path: &Path, source: &[u8]) -> Result<FileDigest, String> {
+    let parsed = parse_file_with_parser_source(&FileInfo::new(path.to_path_buf()), source)?;
+    let text = parsed.parser_source.as_slice();
+    let lines = LineIndex::new(source);
+    let hidden: Vec<Range<usize>> = parsed
+        .patches
+        .iter()
+        .filter_map(|patch| match patch {
+            DirectivePatch::OpaqueBlock(block) => Some(block.start..block.end),
+            DirectivePatch::Markers(_) => None,
+        })
+        .collect();
+    let root = parsed.tree.root_node();
+    let routines = build_file_cfgs(&parsed.tree, text)
+        .iter()
+        .map(|cfg| digest_routine(root, cfg, text, &lines, &hidden))
+        .collect();
+    Ok(FileDigest {
+        path: path.display().to_string(),
+        routines,
+    })
+}
+
+fn digest_routine(
+    root: Node<'_>,
+    cfg: &Cfg,
+    text: &[u8],
+    lines: &LineIndex,
+    hidden: &[Range<usize>],
+) -> RoutineDigest {
+    let range = cfg.byte_range.clone();
+    let scope = scope_node(root, &range);
+    let mut degraded = Vec::new();
+    let errors = scope
+        .map(|node| error_lines(node, lines))
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        degraded.push(Degradation::ParseErrors { lines: errors });
+    }
+    let (body, stats) = match scope {
+        Some(node) => tree::build(node, cfg, text, lines),
+        None => (Vec::new(), tree::Stats::default()),
+    };
+    if stats.conditional_regions > 0 {
+        degraded.push(Degradation::Conditional {
+            regions: stats.conditional_regions,
+        });
+    }
+    let hidden: Vec<Range<usize>> = hidden
+        .iter()
+        .filter(|block| range.start <= block.start && block.end <= range.end)
+        .cloned()
+        .collect();
+    degraded.extend(hidden.iter().map(|block| Degradation::HiddenDirective {
+        line: lines.line(block.start),
+    }));
+    if stats.lambdas > 0 {
+        degraded.push(Degradation::AnonymousMethods);
+    }
+    RoutineDigest {
+        name: cfg.proc_name.clone(),
+        start_line: lines.line(range.start),
+        end_line: lines.line(range.end.saturating_sub(1).max(range.start)),
+        byte_range: range,
+        objects: Vec::new(),
+        body,
+        degraded,
+    }
+}
+
+/// The node whose byte range is exactly the CFG's routine range: a
+/// `defProc`, a program `block`, or an `initialization`/`finalization` section.
+fn scope_node<'t>(root: Node<'t>, range: &Range<usize>) -> Option<Node<'t>> {
+    let mut node = root.descendant_for_byte_range(range.start, range.end)?;
+    loop {
+        if node.byte_range() == *range {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// Lines of the first five ERROR/MISSING nodes inside `scope`.
+fn error_lines(scope: Node<'_>, lines: &LineIndex) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            let line = lines.line(node.start_byte());
+            if !found.contains(&line) {
+                found.push(line);
+            }
+            continue;
+        }
+        if node.has_error() {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+    found.sort_unstable();
+    found.truncate(5);
+    found
+}
+
+/// Named children that are not extras (comments).
+pub fn named_children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect()
+}
+
+pub fn field_children<'t>(node: Node<'t>, field: &str) -> Vec<Node<'t>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor).collect()
+}
+
+/// Keyword tokens such as `kBegin`, `kElse` are named nodes in this grammar.
+pub fn is_keyword(node: Node<'_>) -> bool {
+    let kind = node.kind().as_bytes();
+    kind.len() > 1 && kind[0] == b'k' && kind[1].is_ascii_uppercase()
+}
+
+/// `Exit;` or `Exit(value);`.
+pub fn is_exit_statement(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "statement" {
+        return false;
+    }
+    let children = named_children(node);
+    let [child] = children.as_slice() else {
+        return false;
+    };
+    let callee = match child.kind() {
+        "identifier" => *child,
+        "exprCall" => match child.child_by_field_name("entity") {
+            Some(entity) if entity.kind() == "identifier" => entity,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    node_text(callee, source).eq_ignore_ascii_case("exit")
+}
+
+/// Display text of an assignment target; an inline `var X` yields `X`.
+pub fn target_name(lhs: Node<'_>, source: &[u8]) -> String {
+    let node = if lhs.kind() == "varAssignDef" {
+        named_children(lhs)
+            .into_iter()
+            .find(|child| child.kind() == "identifier")
+            .unwrap_or(lhs)
+    } else {
+        lhs
+    };
+    normalize(&node_text(node, source))
+}
 
 /// 1-based line lookup over source bytes. CRLF and LF both end at `\n`.
 pub struct LineIndex {

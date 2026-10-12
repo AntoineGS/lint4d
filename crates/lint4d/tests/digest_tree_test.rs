@@ -426,13 +426,6 @@ fn a_call_hidden_by_the_label_cut_keeps_an_otherwise_empty_if() {
 }
 
 #[test]
-fn json_omits_frequent_calls_when_empty() {
-    let file = digest(wrap("  Bar;\n").as_bytes());
-    let p = routine(&file, "P");
-    assert!(!render::render_json("t.pas", &[p]).contains("frequent_calls"));
-}
-
-#[test]
 fn single_child_chains_fold_onto_one_line() {
     assert_eq!(
         tree_of("  if A then\n    Bar\n  else\n    Baz;\n"),
@@ -533,4 +526,11 @@ end.
             "limit {limit} hid the raise:\n{text}"
         );
     }
+}
+
+#[test]
+fn json_always_has_frequent_calls() {
+    let file = digest(wrap("  Bar;\n").as_bytes());
+    let p = routine(&file, "P");
+    assert!(render::render_json("t.pas", &[p]).contains("\"frequent_calls\": []"));
 }

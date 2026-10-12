@@ -20,7 +20,8 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
           "line": 5,
           "verdict": {
             "status": "freed_all_paths"
-          }
+          },
+          "verify_lines": null
         },
         {
           "var": "B",
@@ -60,7 +61,8 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
           "verdict": {
             "status": "not_freed_here",
             "why": "result"
-          }
+          },
+          "verify_lines": null
         },
         {
           "var": "FItems",
@@ -69,7 +71,8 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
           "verdict": {
             "status": "not_freed_here",
             "why": "non_local"
-          }
+          },
+          "verify_lines": null
         },
         {
           "var": "C",
@@ -265,7 +268,7 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
           "node": "control",
           "kind": "if",
           "line": 35,
-          "end_line": 38,
+          "end_line": 36,
           "label": "A > 0",
           "children": [
             {
@@ -274,22 +277,22 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
               "fact": {
                 "kind": "re_raise"
               }
-            },
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "else",
+          "line": 37,
+          "end_line": 38,
+          "label": "",
+          "children": [
             {
-              "node": "control",
-              "kind": "else",
-              "line": 37,
-              "end_line": 38,
-              "label": "",
-              "children": [
-                {
-                  "node": "fact",
-                  "line": 38,
-                  "fact": {
-                    "kind": "re_raise"
-                  }
-                }
-              ]
+              "node": "fact",
+              "line": 38,
+              "fact": {
+                "kind": "re_raise"
+              }
             }
           ]
         },
@@ -407,7 +410,7 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
           "node": "control",
           "kind": "try",
           "line": 54,
-          "end_line": 70,
+          "end_line": 55,
           "label": "",
           "children": [
             {
@@ -416,24 +419,56 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
               "fact": {
                 "kind": "re_raise"
               }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "finally",
+          "line": 56,
+          "end_line": 58,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 57,
+              "fact": {
+                "kind": "re_raise"
+              }
             },
             {
+              "node": "fact",
+              "line": 58,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "except",
+          "line": 59,
+          "end_line": 69,
+          "label": "",
+          "children": [
+            {
               "node": "control",
-              "kind": "finally",
-              "line": 56,
-              "end_line": 58,
-              "label": "",
+              "kind": "on",
+              "line": 60,
+              "end_line": 62,
+              "label": "E: EAbort",
               "children": [
                 {
                   "node": "fact",
-                  "line": 57,
+                  "line": 61,
                   "fact": {
                     "kind": "re_raise"
                   }
                 },
                 {
                   "node": "fact",
-                  "line": 58,
+                  "line": 62,
                   "fact": {
                     "kind": "re_raise"
                   }
@@ -442,56 +477,24 @@ expression: "render_json(\"src/All.pas\", &[&routine])"
             },
             {
               "node": "control",
-              "kind": "except",
-              "line": 59,
-              "end_line": 69,
+              "kind": "except_else",
+              "line": 63,
+              "end_line": 65,
               "label": "",
               "children": [
                 {
-                  "node": "control",
-                  "kind": "on",
-                  "line": 60,
-                  "end_line": 62,
-                  "label": "E: EAbort",
-                  "children": [
-                    {
-                      "node": "fact",
-                      "line": 61,
-                      "fact": {
-                        "kind": "re_raise"
-                      }
-                    },
-                    {
-                      "node": "fact",
-                      "line": 62,
-                      "fact": {
-                        "kind": "re_raise"
-                      }
-                    }
-                  ]
+                  "node": "fact",
+                  "line": 64,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
                 },
                 {
-                  "node": "control",
-                  "kind": "except_else",
-                  "line": 63,
-                  "end_line": 65,
-                  "label": "",
-                  "children": [
-                    {
-                      "node": "fact",
-                      "line": 64,
-                      "fact": {
-                        "kind": "re_raise"
-                      }
-                    },
-                    {
-                      "node": "fact",
-                      "line": 65,
-                      "fact": {
-                        "kind": "re_raise"
-                      }
-                    }
-                  ]
+                  "node": "fact",
+                  "line": 65,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
                 }
               ]
             }

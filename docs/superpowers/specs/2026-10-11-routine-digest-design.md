@@ -166,7 +166,8 @@ constructor. Verdicts that are leads rather than facts carry the lines to read,
 - `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …) — verify
   L4399-4410`: up to three escape points ordered by line, then `…`;
   `re-created` for a creation reached again before its free. The range spans the
-  creation and every listed escape (a loop can escape above the creation).
+  creation and every escape, including those behind `…` and those above the
+  creation (a loop back edge).
 - `not freed in this routine (returned as Result: caller owns)` and
   `(assigned to a non-local: owner frees)`: ownership moves elsewhere; no range
 - `not freed in this routine (no free found: leak candidate) — verify L9-40`:
@@ -196,9 +197,10 @@ object is NOT freed on all paths), `?` (some verdict is unknown).
 ### 5.3 JSON
 
 `--format json` serializes the data model of section 6 with lines and byte
-ranges. Text is the default. Each object verdict carries `verify_lines`, a
-`[first, last]` pair, exactly when the text shows `— verify`; it is omitted
-otherwise. The notices and the footer are text only. The JSON contract is
+ranges. Text is the default. Every field is always present: each object verdict
+carries `verify_lines`, a `[first, last]` pair exactly when the text shows
+`— verify` and `null` otherwise, and `frequent_calls` is an empty array when
+nothing is hoisted. The notices and the footer are text only. The JSON contract is
 pinned by an insta snapshot of one routine holding every variant.
 
 ## 6. Data model and analysis
@@ -213,11 +215,12 @@ Node           = Control { kind, line, label, children }   // if/else/case/arm/l
 Fact           = New { class, target } | Free { var } | Tx { op, receiver, method }
                | Raise { text } | ReRaise | Exit { runs_finally: Option<line> }
                | Calls(Vec<(name, count)>) | Nested { name } | Lambda { calls }
-ObjectVerdict  { var, class, line, verdict, verify_lines: Option<[line, line]> }
+ObjectVerdict  { var, class, line, verdict, verify_lines: Option<[line, line]> }  // null in JSON when absent
 Verdict        = FreedAllPaths | Escapes(Vec<Escape>) | NotFreedHere { why } | Unknown { why }
 ```
 
-`frequent_calls` is skipped in JSON when empty. The index and the text and JSON renderers are pure functions of
+JSON always serialises `frequent_calls` and `verify_lines` (`[]` / `null` when
+absent). The index and the text and JSON renderers are pure functions of
 `FileDigest`.
 
 ### 6.2 Tree (`digest/tree.rs`)

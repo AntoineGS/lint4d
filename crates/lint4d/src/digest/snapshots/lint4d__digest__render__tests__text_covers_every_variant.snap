@@ -24,9 +24,8 @@ L31 calls One, Two ×3
 L32 nested routine Inner
 L33 anonymous method
 L34 anonymous method calls Cb ×2
-L35 if A > 0
-  L36 re-raise
-  L37 else → L38 re-raise
+L35 if A > 0 → L36 re-raise
+L37 else → L38 re-raise
 L39 case N
   1: L41 re-raise
   else: L43 re-raise
@@ -41,16 +40,16 @@ L51 repeat until Done
   L53 re-raise
 L54 try
   L55 re-raise
-  L56 finally
-    L57 re-raise
-    L58 re-raise
-  L59 except
-    L60 on E: EAbort
-      L61 re-raise
-      L62 re-raise
-    L63 else
-      L64 re-raise
-      L65 re-raise
+L56 finally
+  L57 re-raise
+  L58 re-raise
+L59 except
+  L60 on E: EAbort
+    L61 re-raise
+    L62 re-raise
+  L63 else
+    L64 re-raise
+    L65 re-raise
 L71 with Obj
   L72 re-raise
   L73 re-raise

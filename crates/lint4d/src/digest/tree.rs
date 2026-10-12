@@ -79,28 +79,6 @@ enum Raw {
     },
 }
 
-impl From<DigestNode> for Raw {
-    fn from(node: DigestNode) -> Self {
-        match node {
-            DigestNode::Fact { line, fact } => Raw::Fact { line, fact },
-            DigestNode::Control {
-                kind,
-                line,
-                end_line,
-                label,
-                children,
-            } => Raw::Control {
-                kind,
-                line,
-                end_line,
-                label,
-                label_calls: false,
-                children: children.into_iter().map(Raw::from).collect(),
-            },
-        }
-    }
-}
-
 /// Calls in three or more separate `Calls` runs move to the routine header.
 fn hoist_frequent_calls(nodes: &mut Vec<Raw>) -> Vec<CallCount> {
     let mut seen: Vec<(String, usize, usize)> = Vec::new();
@@ -363,9 +341,9 @@ impl Seq {
         add_call(calls, name);
     }
 
-    fn push(&mut self, node: impl Into<Raw>) {
+    fn push(&mut self, node: Raw) {
         self.flush();
-        self.out.push(node.into());
+        self.out.push(node);
     }
 
     fn flush(&mut self) {

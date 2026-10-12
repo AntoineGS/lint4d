@@ -19,7 +19,6 @@ pub struct RoutineDigest {
     pub byte_range: Range<usize>,
     pub objects: Vec<ObjectVerdict>,
     /// Calls found in three or more separate runs, removed from those runs.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub frequent_calls: Vec<CallCount>,
     pub body: Vec<DigestNode>,
     pub degraded: Vec<Degradation>,
@@ -137,7 +136,6 @@ pub struct ObjectVerdict {
     pub verdict: Verdict,
     /// First and last line to read to confirm or refute the verdict; absent
     /// when the verdict needs no checking.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_lines: Option<[usize; 2]>,
 }
 

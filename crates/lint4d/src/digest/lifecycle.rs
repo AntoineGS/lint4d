@@ -52,12 +52,12 @@ pub fn verdicts(
         .iter()
         .map(|creation| {
             let line = lines.line(creation.range.start);
-            let (verdict, reference) = verdict(creation, &facts, &locals, cfg, lines, context);
+            let (verdict, span) = verdict(creation, &facts, &locals, cfg, lines, context);
             ObjectVerdict {
                 var: creation.target.clone(),
                 class: creation.class.clone(),
                 line,
-                verify_lines: verify_lines(&verdict, line, reference, context.end_line),
+                verify_lines: verify_lines(&verdict, line, span, context.end_line),
                 verdict,
             }
         })
@@ -65,24 +65,18 @@ pub fn verdicts(
 }
 
 /// The lines to read to confirm a verdict that is not a proven fact.
-/// `reference` is the line an unknown verdict names, when it names one.
+/// `span` is the lines the verdict itself names: every escape (also those
+/// the verdict lists as `…`), or the line an unknown verdict points at.
 fn verify_lines(
     verdict: &Verdict,
     line: usize,
-    reference: Option<usize>,
+    span: Option<[usize; 2]>,
     end_line: usize,
 ) -> Option<[usize; 2]> {
+    let join = |[first, last]: [usize; 2]| [line.min(first), line.max(last)];
     match verdict {
-        Verdict::Escapes { via, .. } => {
-            let lines = via.iter().map(|escape| escape.line).chain([line]);
-            let first = lines.clone().min().unwrap_or(line);
-            let last = lines.max().unwrap_or(line);
-            Some([first, last])
-        }
-        Verdict::Unknown { .. } => Some(match reference {
-            Some(reference) => [line.min(reference), line.max(reference)],
-            None => [line, end_line],
-        }),
+        Verdict::Escapes { .. } => Some(join(span.unwrap_or([line, line]))),
+        Verdict::Unknown { .. } => Some(span.map_or([line, end_line], join)),
         Verdict::NotFreedHere {
             why: NotFreedReason::NeverFreed,
         } => Some([line, end_line]),
@@ -342,10 +336,13 @@ fn verdict(
     cfg: &Cfg,
     lines: &LineIndex,
     context: &Context<'_>,
-) -> (Verdict, Option<usize>) {
+) -> (Verdict, Option<[usize; 2]>) {
     if context.parse_errors {
         let why = "parse errors".to_string();
-        return (Verdict::Unknown { why }, context.first_error_line);
+        return (
+            Verdict::Unknown { why },
+            context.first_error_line.map(|line| [line, line]),
+        );
     }
     if creation.key == "result" {
         let why = NotFreedReason::Result;
@@ -372,7 +369,7 @@ fn verdict(
     }) {
         let line = lines.line(range.start);
         let why = format!("reassigned at L{line}");
-        return (Verdict::Unknown { why }, Some(line));
+        return (Verdict::Unknown { why }, Some([line, line]));
     }
     if let Some((_, range)) = facts
         .with_names
@@ -381,12 +378,12 @@ fn verdict(
     {
         let line = lines.line(range.start);
         let why = format!("named inside with at L{line}");
-        return (Verdict::Unknown { why }, Some(line));
+        return (Verdict::Unknown { why }, Some([line, line]));
     }
     if let Some(block) = context.hidden.iter().min_by_key(|block| block.start) {
         let line = lines.line(block.start);
         let why = format!("hidden directive block at L{line}");
-        return (Verdict::Unknown { why }, Some(line));
+        return (Verdict::Unknown { why }, Some([line, line]));
     }
     if frees.is_empty() {
         let why = if locals.contains(&creation.key) {
@@ -407,8 +404,7 @@ fn verdict(
         .filter(|guard| guard.key == creation.key)
         .map(|guard| (guard, locals.contains(&guard.key)))
         .collect();
-    let verdict = escapes(cfg, creation, &free_blocks, &facts.exits, &guards, lines);
-    (verdict, None)
+    escapes(cfg, creation, &free_blocks, &facts.exits, &guards, lines)
 }
 
 /// Whether a path from the creation reaches `range` without passing a free.
@@ -497,7 +493,7 @@ fn escapes(
     exits: &[Range<usize>],
     guards: &[(&Guard, bool)],
     lines: &LineIndex,
-) -> Verdict {
+) -> (Verdict, Option<[usize; 2]>) {
     let mut found: Vec<Escape> = Vec::new();
     for start in cfg.blocks_for_stmt(creation.range.clone()) {
         if cfg
@@ -562,9 +558,19 @@ fn escapes(
     found.sort();
     found.dedup();
     if found.is_empty() {
-        return Verdict::FreedAllPaths;
+        return (Verdict::FreedAllPaths, None);
     }
+    let first = found
+        .iter()
+        .map(|escape| escape.line)
+        .min()
+        .unwrap_or_default();
+    let last = found
+        .iter()
+        .map(|escape| escape.line)
+        .max()
+        .unwrap_or_default();
     let more = found.len() > MAX_ESCAPES;
     found.truncate(MAX_ESCAPES);
-    Verdict::Escapes { via: found, more }
+    (Verdict::Escapes { via: found, more }, Some([first, last]))
 }

@@ -742,3 +742,38 @@ end;
     assert_eq!(objects[0].line, 10);
     assert_eq!(objects[0].verify_lines, Some([7, 10]));
 }
+
+#[test]
+fn verify_range_reaches_escapes_behind_the_ellipsis() {
+    let body = "procedure Foo(a: Integer);
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  if a = 1 then
+    Log('x');
+  if a = 2 then
+    Log('y');
+  if a = 3 then
+    Log('z');
+  DoA;
+  DoB;
+  DoC;
+  DoD;
+  DoE;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Foo");
+    let Verdict::Escapes { via, more } = &objects[0].verdict else {
+        panic!("expected escapes, got {:?}", objects[0].verdict);
+    };
+    assert!(more);
+    assert_eq!(via.len(), 3);
+    let verify = objects[0].verify_lines.expect("verify_lines");
+    assert!(
+        verify[1] > via.iter().map(|e| e.line).max().unwrap(),
+        "{verify:?} {via:?}"
+    );
+    assert_eq!(verify, [8, 19]);
+}

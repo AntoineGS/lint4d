@@ -27,7 +27,8 @@ raises, exits and calls, each with its source line.
 - `--max-lines N` (default 300) applies to `--routine` and `--line` text output
   only; `--all`, the index and `--format json` are never collapsed. A collapsed
   block reads `L4430-4441 while not aQry.Eof … (12 lines, calls …)`: the head
-  text, then the line count, then `calls …` only when the subtree has calls.
+  text, then the line count, then `calls …` only when the subtree has calls
+  (hoisted `frequent calls` are not listed).
 
 ## Reading a digest
 
@@ -35,9 +36,11 @@ raises, exits and calls, each with its source line.
   `— verify L…-…` names the lines to read; the digest does not prove it.
 - The digest compacts output: a `frequent calls:` line after `objects:` lists
   calls found in three or more separate runs, with total counts, and removes
-  them from those runs; runs and controls with no fact are omitted; a chain of
+  them from those runs; runs and controls with no fact and no call are omitted; a chain of
   single-child controls with one fact reads on one line joined by ` → `
   (`L463 if … → L465 calls …`); long labels and raise text end in `…`.
+- Escape and `verify` lines can fall in code the body omits (factless
+  controls, hoisted calls): read the source range.
 - Verdict lines carry their own interpretation (`— verify L…` ranges,
   ownership notes such as `caller owns`); read them literally.
 - A final `note:` line says calls are names only. Digest or read the callee

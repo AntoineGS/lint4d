@@ -480,12 +480,15 @@ fn chains_ending_in_several_children_or_an_unfoldable_control_stay_nested() {
 }
 
 #[test]
-fn collapsed_controls_are_not_folded_into_a_chain() {
+fn a_folded_chain_is_not_collapsed() {
     let source = wrap("  if A then\n    if B then\n      Bar;\n");
     let file = digest(source.as_bytes());
     let p = routine(&file, "P");
     let text = render::render_routine(p, "t.pas", Some(1));
-    assert!(text.contains("L6-8 if A … (3 lines, calls Bar)"), "{text}");
+    assert!(
+        text.contains("L6 if A → L7 if B → L8 calls Bar"),
+        "a folded chain is one line already: {text}"
+    );
 }
 
 #[test]
@@ -494,4 +497,40 @@ fn raise_text_is_cut_at_fifty_characters() {
     let tree = tree_of(&format!("  raise {text};\n"));
     let expected: String = text.chars().take(50).collect();
     assert_eq!(tree, format!("L6 raise {expected}…\n"));
+}
+
+#[test]
+fn max_lines_keeps_a_folded_chain_visible() {
+    let source = "unit D;
+interface
+implementation
+
+procedure Qux(a: Integer);
+begin
+  if a > 0 then
+  begin
+    if a > 1 then
+      raise Exception.Create('boom');
+    if a > 2 then
+    begin
+      One;
+      raise E;
+      Three;
+      Four := 2;
+      Five;
+    end;
+  end;
+end;
+
+end.
+";
+    let file = digest(source.as_bytes());
+    let q = routine(&file, "Qux");
+    for limit in 4..=8 {
+        let text = render::render_routine(q, "D.pas", Some(limit));
+        assert!(
+            text.contains("raise Exception.Create('boom')"),
+            "limit {limit} hid the raise:\n{text}"
+        );
+    }
 }

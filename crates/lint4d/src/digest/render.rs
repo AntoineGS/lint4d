@@ -149,7 +149,9 @@ fn max_depth(nodes: &[DigestNode], depth: usize) -> usize {
     nodes
         .iter()
         .filter_map(|node| match node {
-            DigestNode::Control { children, .. } if !children.is_empty() => {
+            DigestNode::Control { children, .. }
+                if !children.is_empty() && fold_chain(node).is_none() =>
+            {
                 Some(max_depth(children, depth + 1).max(depth))
             }
             _ => None,
@@ -172,7 +174,9 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
                 label,
                 children,
             } => {
-                if depth >= collapse_at && !children.is_empty() {
+                if let Some(folded) = fold_chain(node) {
+                    out.push(format!("{indent}{folded}"));
+                } else if depth >= collapse_at && !children.is_empty() {
                     let lines = end_line + 1 - line;
                     out.push(format!(
                         "{indent}L{line}-{end_line} {} … ({lines} line{}{})",
@@ -180,8 +184,6 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
                         if lines == 1 { "" } else { "s" },
                         calls_suffix(children)
                     ));
-                } else if let Some(folded) = fold_chain(node, depth, collapse_at) {
-                    out.push(format!("{indent}{folded}"));
                 } else if *kind == ControlKind::Arm {
                     out.push(format!("{indent}{label}:"));
                     render_nodes(children, depth + 1, collapse_at, out);
@@ -208,12 +210,11 @@ fn foldable(kind: ControlKind) -> bool {
 }
 
 /// One line for a chain of single-child controls ending in a single fact.
-/// A link that `--max-lines` would collapse ends the attempt.
-fn fold_chain(node: &DigestNode, depth: usize, collapse_at: usize) -> Option<String> {
+/// It is one line already, so `--max-lines` never collapses it.
+fn fold_chain(node: &DigestNode) -> Option<String> {
     let mut prefix = String::new();
     let mut parts: Vec<String> = Vec::new();
     let mut current = node;
-    let mut level = depth;
     loop {
         match current {
             DigestNode::Fact { line, fact } => {
@@ -227,7 +228,7 @@ fn fold_chain(node: &DigestNode, depth: usize, collapse_at: usize) -> Option<Str
                 children,
                 ..
             } => {
-                if !foldable(*kind) || level >= collapse_at {
+                if !foldable(*kind) {
                     return None;
                 }
                 let [only] = children.as_slice() else {
@@ -239,7 +240,6 @@ fn fold_chain(node: &DigestNode, depth: usize, collapse_at: usize) -> Option<Str
                     parts.push(format!("L{line} {}", head_text(*kind, label)));
                 }
                 current = only;
-                level += 1;
             }
         }
     }

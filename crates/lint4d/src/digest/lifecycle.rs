@@ -70,8 +70,20 @@ struct Facts {
     /// Frees, assignments and creations inside a `with` body, where a name
     /// may denote a member of the `with` subject instead of the local.
     with_names: Vec<(String, Range<usize>)>,
+    /// Assignments of `nil`, by range.
+    nil_assignments: HashSet<Range<usize>>,
+    /// `if`/`while` conditions that test one variable against nil.
+    guards: Vec<Guard>,
     exits: Vec<Range<usize>>,
     inline_vars: HashSet<String>,
+}
+
+/// A condition such as `Assigned(L)` or `L = nil`: the variable, the
+/// condition's range, and whether it holds when the variable is non-nil.
+struct Guard {
+    key: String,
+    condition: Range<usize>,
+    non_nil_when_true: bool,
 }
 
 impl Facts {
@@ -99,6 +111,17 @@ impl Facts {
                 "assignment" => self.assignment(node, text),
                 "statement" if !opaque && is_exit_statement(node, text) => {
                     self.exits.push(node.byte_range())
+                }
+                "if" | "ifElse" | "while" if !opaque && !in_with => {
+                    if let Some(condition) = node.child_by_field_name("condition")
+                        && let Some((var, non_nil_when_true)) = nil_guard(condition, text)
+                    {
+                        self.guards.push(Guard {
+                            key: key(&var),
+                            condition: condition.byte_range(),
+                            non_nil_when_true,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -141,6 +164,12 @@ impl Facts {
 
     fn assignment(&mut self, node: Node<'_>, text: &[u8]) {
         if let Some(key) = self.creation(node, text) {
+            if node
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.kind() == "kNil")
+            {
+                self.nil_assignments.insert(node.byte_range());
+            }
             self.assignments.push((key, node.byte_range()));
         }
     }
@@ -170,6 +199,65 @@ impl Facts {
 
 fn key(name: &str) -> String {
     normalize(name).to_ascii_lowercase()
+}
+
+/// A condition that is exactly `Assigned(X)`, `X = nil`, `X <> nil` (either
+/// operand order), possibly negated or parenthesized: the variable and
+/// whether the condition holds when it is non-nil.
+fn nil_guard(condition: Node<'_>, text: &[u8]) -> Option<(String, bool)> {
+    let variable = |node: Node<'_>| {
+        let node = if node.kind() == "exprParens" {
+            only_child(node)?
+        } else {
+            node
+        };
+        (node.kind() == "identifier").then(|| node_text(node, text).to_string())
+    };
+    match condition.kind() {
+        "exprParens" => nil_guard(only_child(condition)?, text),
+        "exprUnary" => {
+            let operator = condition.child_by_field_name("operator")?;
+            if operator.kind() != "kNot" {
+                return None;
+            }
+            let (var, non_nil_when_true) =
+                nil_guard(condition.child_by_field_name("operand")?, text)?;
+            Some((var, !non_nil_when_true))
+        }
+        "exprCall" => {
+            let entity = condition.child_by_field_name("entity")?;
+            if entity.kind() != "identifier"
+                || !node_text(entity, text).eq_ignore_ascii_case("assigned")
+            {
+                return None;
+            }
+            Some((
+                variable(only_child(condition.child_by_field_name("args")?)?)?,
+                true,
+            ))
+        }
+        "exprBinary" => {
+            let non_nil_when_true = match condition.child_by_field_name("operator")?.kind() {
+                "kNeq" => true,
+                "kEq" => false,
+                _ => return None,
+            };
+            let lhs = condition.child_by_field_name("lhs")?;
+            let rhs = condition.child_by_field_name("rhs")?;
+            let var = match (lhs.kind(), rhs.kind()) {
+                (_, "kNil") => variable(lhs)?,
+                ("kNil", _) => variable(rhs)?,
+                _ => return None,
+            };
+            Some((var, non_nil_when_true))
+        }
+        _ => None,
+    }
+}
+
+fn only_child(node: Node<'_>) -> Option<Node<'_>> {
+    let children = named_children(node);
+    (children.len() == 1).then(|| children[0])
 }
 
 fn freed_var(node: Node<'_>, text: &[u8]) -> Option<String> {
@@ -230,11 +318,25 @@ fn verdict(
             why: NotFreedReason::Result,
         };
     }
-    if let Some((_, range)) = facts
-        .assignments
+    let frees: Vec<&Range<usize>> = facts
+        .frees
         .iter()
-        .find(|(key, range)| *key == creation.key && *range != creation.range)
-    {
+        .filter(|(key, _)| *key == creation.key)
+        .map(|(_, range)| range)
+        .collect();
+    let free_blocks: HashSet<BlockId> = frees
+        .iter()
+        .flat_map(|range| cfg.blocks_for_stmt((*range).clone()))
+        .collect();
+    // `L := nil` cannot lose the object when no path from the creation
+    // reaches it without a free (initialization before a `try`, or clearing
+    // after the free).
+    if let Some((_, range)) = facts.assignments.iter().find(|(key, range)| {
+        *key == creation.key
+            && *range != creation.range
+            && !(facts.nil_assignments.contains(range)
+                && !reachable_from_creation(cfg, creation, &free_blocks, range))
+    }) {
         return Verdict::Unknown {
             why: format!("reassigned at L{}", lines.line(range.start)),
         };
@@ -253,12 +355,6 @@ fn verdict(
             why: format!("hidden directive block at L{}", lines.line(block.start)),
         };
     }
-    let frees: Vec<&Range<usize>> = facts
-        .frees
-        .iter()
-        .filter(|(key, _)| *key == creation.key)
-        .map(|(_, range)| range)
-        .collect();
     if frees.is_empty() {
         let why = if locals.contains(&creation.key) {
             NotFreedReason::NeverFreed
@@ -272,11 +368,90 @@ fn verdict(
             why: "creation not in CFG".to_string(),
         };
     }
-    let free_blocks: HashSet<BlockId> = frees
+    // A nil test of a local only reads a variable, so it cannot raise.
+    let guards: Vec<(&Guard, bool)> = facts
+        .guards
         .iter()
-        .flat_map(|range| cfg.blocks_for_stmt((*range).clone()))
+        .filter(|guard| guard.key == creation.key)
+        .map(|guard| (guard, locals.contains(&guard.key)))
         .collect();
-    escapes(cfg, creation, &free_blocks, &facts.exits, lines)
+    escapes(cfg, creation, &free_blocks, &facts.exits, &guards, lines)
+}
+
+/// Whether a path from the creation reaches `range` without passing a free.
+/// Exceptions raised by the creating statement are ignored (nothing was
+/// created). An unknown position counts as reachable.
+fn reachable_from_creation(
+    cfg: &Cfg,
+    creation: &Creation,
+    free_blocks: &HashSet<BlockId>,
+    range: &Range<usize>,
+) -> bool {
+    let starts = cfg.blocks_for_stmt(creation.range.clone());
+    let targets = cfg.blocks_for_stmt(range.clone());
+    if starts.is_empty() || targets.is_empty() {
+        return true;
+    }
+    starts.iter().any(|&start| {
+        targets.iter().any(|&target| {
+            (target == start && range.start > creation.range.start)
+                || cfg
+                    .path_avoiding(start, target, free_blocks, &[EdgeKind::ExceptionThrow])
+                    .is_some()
+        })
+    })
+}
+
+/// Edges out of `block` that are never taken when it ends with a guard on
+/// the created variable: after the creation the variable is non-nil (other
+/// assignments make the verdict unknown), so the nil branch is infeasible,
+/// and a guard on a local (`true` in `guards`) cannot raise.
+fn infeasible_edges(cfg: &Cfg, block: BlockId, guards: &[(&Guard, bool)]) -> Vec<EdgeKind> {
+    let Some(stmt) = cfg.graph[block.index()].stmts.last() else {
+        return Vec::new();
+    };
+    let Some((guard, local)) = guards.iter().find(|(guard, _)| {
+        stmt.byte_range.start <= guard.condition.start && guard.condition.end <= stmt.byte_range.end
+    }) else {
+        return Vec::new();
+    };
+    let mut edges = vec![if guard.non_nil_when_true {
+        EdgeKind::ConditionalFalse
+    } else {
+        EdgeKind::ConditionalTrue
+    }];
+    if *local {
+        edges.push(EdgeKind::ExceptionThrow);
+    }
+    edges
+}
+
+/// Whether Exit is reachable from `from` without entering a free or taking
+/// an infeasible guard branch.
+fn reaches_exit_avoiding(
+    cfg: &Cfg,
+    from: BlockId,
+    free_blocks: &HashSet<BlockId>,
+    guards: &[(&Guard, bool)],
+) -> bool {
+    let mut seen = HashSet::from([from]);
+    let mut queue = VecDeque::from([from]);
+    while let Some(block) = queue.pop_front() {
+        let infeasible = infeasible_edges(cfg, block, guards);
+        for edge in cfg.graph.edges(block.index()) {
+            let target = BlockId::from(edge.target());
+            if free_blocks.contains(&target) || infeasible.contains(edge.weight()) {
+                continue;
+            }
+            if target == cfg.exit {
+                return true;
+            }
+            if seen.insert(target) {
+                queue.push_back(target);
+            }
+        }
+    }
+    false
 }
 
 /// Every statement where a path from the creation leaves the routine
@@ -287,6 +462,7 @@ fn escapes(
     creation: &Creation,
     free_blocks: &HashSet<BlockId>,
     exits: &[Range<usize>],
+    guards: &[(&Guard, bool)],
     lines: &LineIndex,
 ) -> Verdict {
     let mut found: Vec<Escape> = Vec::new();
@@ -314,17 +490,16 @@ fn escapes(
                     exit.start <= stmt.byte_range.start && stmt.byte_range.end <= exit.end
                 })
             });
+            let infeasible = infeasible_edges(cfg, block, guards);
             let mut reaches_exit = false;
             for edge in cfg.graph.edges(block.index()) {
                 let target = BlockId::from(edge.target());
-                if free_blocks.contains(&target) {
+                if free_blocks.contains(&target) || infeasible.contains(edge.weight()) {
                     continue;
                 }
                 if *edge.weight() == EdgeKind::ExceptionThrow {
                     let leaves = target == cfg.exit
-                        || cfg
-                            .path_avoiding(target, cfg.exit, free_blocks, &[])
-                            .is_some();
+                        || reaches_exit_avoiding(cfg, target, free_blocks, guards);
                     if block != start && leaves {
                         found.push(Escape {
                             line: last_line(),

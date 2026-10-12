@@ -612,6 +612,10 @@ fn analyze_return_nil(cfg: &Cfg, source: &[u8]) -> bool {
 
         for edge in graph.edges_directed(block_id.index(), Direction::Outgoing) {
             let successor = BlockId::from(edge.target());
+            // A raising path leaves the function without returning a value
+            if successor == exit && *edge.weight() == cfg_core::EdgeKind::ExceptionThrow {
+                continue;
+            }
             let existing = block_result_state.get(&successor);
 
             // Conservative: Result is safe only if ALL paths agree

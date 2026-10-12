@@ -186,6 +186,24 @@ fn unchecked_nil_passes_safe_function_return() {
 }
 
 #[test]
+fn unchecked_nil_passes_function_return_after_raising_statement() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/good_function_return_after_call.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "A statement before Result := must not make the function may-return-nil: {:?}",
+        matches
+    );
+}
+
+#[test]
 fn unchecked_nil_flags_nil_function_return() {
     let project = project_with_tobject();
     let diagnostics = lint_nil_check(

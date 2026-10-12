@@ -2345,7 +2345,8 @@ fn label_name_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     direct_child(node, "identifier").or_else(|| direct_child(node, "labelNumber"))
 }
 
-/// Start a fresh block for an executable statement when the current block already holds one, so its exceptional edge covers only that statement.
+/// Start a fresh block for an executable statement when the current block
+/// already holds one, so its exceptional edge covers only that statement.
 fn prepare_statement_block(ctx: &mut BuildContext<'_>, current: BlockId) -> BlockId {
     if !ctx.block_has_executable_stmt.contains(&current) {
         return current;

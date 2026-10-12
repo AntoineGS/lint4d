@@ -53,8 +53,9 @@ pub fn render_index(file: &FileDigest) -> String {
 }
 
 /// Header, degradation lines, objects line, then the body. With
-/// `max_lines`, the deepest control subtrees collapse until the output fits;
-/// the header lines are never collapsed.
+/// `max_lines`, the deepest control subtrees collapse on a best-effort basis;
+/// collapsing stops at the top level, so the output can still exceed
+/// `max_lines`. The header lines are never collapsed.
 pub fn render_routine(
     routine: &RoutineDigest,
     file_name: &str,

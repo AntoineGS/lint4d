@@ -73,7 +73,7 @@ fn digest_routine(
     }
     let hidden: Vec<Range<usize>> = hidden
         .iter()
-        .filter(|block| range.start <= block.start && block.end <= range.end)
+        .filter(|block| block.start < range.end && range.start < block.end)
         .cloned()
         .collect();
     degraded.extend(hidden.iter().map(|block| Degradation::HiddenDirective {

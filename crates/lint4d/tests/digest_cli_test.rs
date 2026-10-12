@@ -165,3 +165,30 @@ fn a_directory_named_digest_is_still_linted_with_a_path_prefix() {
         .assert()
         .code(0);
 }
+
+#[test]
+fn a_directory_named_help_is_still_linted() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("help")).unwrap();
+    fs::write(
+        dir.path().join("help/Clean.pas"),
+        "unit Clean;\n\ninterface\n\nimplementation\n\nend.\n",
+    )
+    .unwrap();
+    Command::cargo_bin("lint4d")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("help")
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn the_help_flag_still_prints_usage() {
+    Command::cargo_bin("lint4d")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Usage"));
+}

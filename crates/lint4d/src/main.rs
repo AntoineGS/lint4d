@@ -158,7 +158,8 @@ version = 1
     name = "lint4d",
     version,
     about = "An open-source Delphi linter",
-    args_conflicts_with_subcommands = true
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]

@@ -35,8 +35,9 @@ raises, exits and calls, each with its source line.
 - `NOT freed on all paths (escapes via L… exception)` and `unknown (…)` are
   leads: verify them in the source before calling them bugs.
 - `unknown (hidden directive block at L…)`: the routine contains a
-  `{$IF}…{$IFEND}` block the parser had to blank out, so verdicts for objects
-  it frees cannot be proven; read that block yourself.
+  `{$IF}…{$IFEND}` block the parser had to blank out, so object verdicts other
+  than `returned as Result` cannot be proven and are reported `unknown`; read
+  that block yourself.
 - `not freed in this routine (returned as Result)` and `(assigned to a
   non-local)` describe ownership transfer, not leaks. `(no free found)` on a
   local object is a leak candidate to verify.

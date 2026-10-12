@@ -180,6 +180,7 @@ impl Cfg {
     }
 
     /// True if every path from `from` to exit enters a block of `through`.
+    /// Vacuously true when exit is unreachable from `from`.
     pub fn must_pass_through_any(&self, from: BlockId, through: &HashSet<BlockId>) -> bool {
         if from == self.exit {
             return through.contains(&from);

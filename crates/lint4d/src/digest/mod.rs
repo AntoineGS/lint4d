@@ -1,5 +1,6 @@
 //! Per-routine control-flow digests for coding agents (l4d-7mw.1).
 
+pub mod lifecycle;
 pub mod model;
 pub mod render;
 pub mod tree;
@@ -56,7 +57,8 @@ fn digest_routine(
     let errors = scope
         .map(|node| error_lines(node, lines))
         .unwrap_or_default();
-    if !errors.is_empty() {
+    let parse_errors = !errors.is_empty();
+    if parse_errors {
         degraded.push(Degradation::ParseErrors { lines: errors });
     }
     let (body, stats) = match scope {
@@ -76,6 +78,13 @@ fn digest_routine(
     degraded.extend(hidden.iter().map(|block| Degradation::HiddenDirective {
         line: lines.line(block.start),
     }));
+    let context = lifecycle::Context {
+        parse_errors,
+        hidden: &hidden,
+    };
+    let objects = scope
+        .map(|node| lifecycle::verdicts(node, cfg, text, lines, &context))
+        .unwrap_or_default();
     if stats.lambdas > 0 {
         degraded.push(Degradation::AnonymousMethods);
     }
@@ -84,7 +93,7 @@ fn digest_routine(
         start_line: lines.line(range.start),
         end_line: lines.line(range.end.saturating_sub(1).max(range.start)),
         byte_range: range,
-        objects: Vec::new(),
+        objects,
         body,
         degraded,
     }

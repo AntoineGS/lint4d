@@ -370,3 +370,24 @@ fn unchecked_nil_treats_every_call_to_an_unanalyzable_function_alike() {
         "A second call to an external function or to disagreeing overloads must not be flagged when the first is not: {lines:?}"
     );
 }
+
+#[test]
+fn unchecked_nil_selects_overloads_by_argument_count() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/bad_overload_selected_by_arity.pas",
+        &project,
+    );
+    let lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .map(|d| d.line)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![36, 40],
+        "GetObject('key', 1) and GetDefault(1) select the nil-returning overload \
+         (GetDefault's default comes from its interface declaration); \
+         GetDefault(1, 2) matches both overloads and stays unanalyzable"
+    );
+}

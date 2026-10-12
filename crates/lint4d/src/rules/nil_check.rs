@@ -400,8 +400,9 @@ fn process_statement(
                 // Check if RHS is a function call that can return nil
                 let func_name = extract_function_name(rhs_trimmed);
                 if let Some(ref fname) = func_name {
+                    let argc = call_argument_count(rhs_trimmed, fname.len());
                     if let Some(true) =
-                        can_function_return_nil(fname, root, source, all_cfgs, unit_name)
+                        can_function_return_nil(fname, argc, root, source, all_cfgs, unit_name)
                     {
                         state.insert(var.clone(), false); // Function can return nil
                     } else {
@@ -506,15 +507,52 @@ fn extract_function_name(rhs: &str) -> Option<String> {
     }
 }
 
-/// Analyze whether a function defined in the current file can return nil.
+/// The number of arguments of the call starting with a `name_len`-byte name:
+/// 0 without parentheses, `None` when the argument list is not balanced.
+fn call_argument_count(call: &str, name_len: usize) -> Option<usize> {
+    let rest = call.get(name_len..)?.trim_start();
+    let Some(args) = rest.strip_prefix('(') else {
+        return Some(0);
+    };
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut commas = 0;
+    let mut empty = true;
+    for character in args.chars() {
+        if in_string {
+            in_string = character != '\'';
+            continue;
+        }
+        match character {
+            '\'' => in_string = true,
+            '(' | '[' => depth += 1,
+            ')' if depth == 0 => return Some(if empty { 0 } else { commas + 1 }),
+            ')' | ']' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+        if !character.is_whitespace() {
+            empty = false;
+        }
+    }
+    None
+}
+
+/// Analyze whether a function defined in the current file can return nil
+/// when called with `argc` arguments (`None`: unknown, every overload is a
+/// candidate).
 fn can_function_return_nil(
     func_name: &str,
+    argc: Option<usize>,
     root: Node,
     source: &[u8],
     cfgs: &HashMap<ProcId, Cfg>,
     unit_name: &str,
 ) -> Option<bool> {
-    let func_lower = func_name.to_lowercase();
+    let func_lower = match argc {
+        Some(argc) => format!("{}/{argc}", func_name.to_lowercase()),
+        None => func_name.to_lowercase(),
+    };
 
     let cached = FN_RETURN_CACHE.with(|cache| cache.borrow().get(&func_lower).copied());
     if let Some(result) = cached {
@@ -524,13 +562,14 @@ fn can_function_return_nil(
     // Insert sentinel to break recursion (assume can return nil)
     FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower.clone(), Some(true)));
 
-    let result = function_return_nil_uncached(func_name, root, source, cfgs, unit_name);
+    let result = function_return_nil_uncached(func_name, argc, root, source, cfgs, unit_name);
     FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower, result));
     result
 }
 
 fn function_return_nil_uncached(
     func_name: &str,
+    argc: Option<usize>,
     root: Node,
     source: &[u8],
     cfgs: &HashMap<ProcId, Cfg>,
@@ -538,8 +577,10 @@ fn function_return_nil_uncached(
 ) -> Option<bool> {
     // Find the function's CFGs by matching proc name (case-insensitive)
     // qualified_name may be just "FuncName" or "TClass.MethodName".
-    // The call is resolved by name only, so every overload is a candidate and
-    // the answer is known only when all of them agree.
+    // Overloads are selected by argument count, as dcc's first filter does;
+    // the answer is known only when every remaining candidate agrees.
+    let mut declarations = Vec::new();
+    collect_decl_procs(root, func_name, source, &mut declarations);
     let mut result = None;
     for (pid, cfg) in cfgs {
         // Only consider functions from the same unit
@@ -551,6 +592,14 @@ fn function_return_nil_uncached(
 
         // Verify it's a function (has return type) by checking the AST
         let def_proc = find_def_proc_at(root, cfg.byte_range.start)?;
+        if let Some(argc) = argc {
+            let arity = def_proc
+                .child_by_field_name("header")
+                .map(|header| declared_arity(header, &declarations, source))?;
+            if !arity.accepts(argc) {
+                continue;
+            }
+        }
         if !is_function_def(def_proc, source) {
             return None; // Procedures don't have return values
         }
@@ -562,6 +611,132 @@ fn function_return_nil_uncached(
         result = Some(can_return_nil);
     }
     result
+}
+
+/// Parameter counts of a routine declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Arity {
+    /// Parameters without a default value.
+    required: usize,
+    total: usize,
+    varargs: bool,
+}
+
+impl Arity {
+    fn of(header: Node) -> Arity {
+        let mut arity = Arity {
+            required: 0,
+            total: 0,
+            varargs: false,
+        };
+        let mut cursor = header.walk();
+        for attribute in header.children_by_field_name("attribute", &mut cursor) {
+            let mut attribute_cursor = attribute.walk();
+            arity.varargs |= attribute
+                .children(&mut attribute_cursor)
+                .any(|child| child.kind() == "kVarargs");
+        }
+        let Some(args) = header.child_by_field_name("args") else {
+            return arity;
+        };
+        let mut args_cursor = args.walk();
+        for arg in args
+            .named_children(&mut args_cursor)
+            .filter(|arg| arg.kind() == K::DECL_ARG)
+        {
+            let mut name_cursor = arg.walk();
+            let names = arg
+                .children_by_field_name("name", &mut name_cursor)
+                .filter(|name| name.kind() == K::IDENTIFIER)
+                .count();
+            arity.total += names;
+            if arg.child_by_field_name("defaultValue").is_none() {
+                arity.required += names;
+            }
+        }
+        arity
+    }
+
+    fn accepts(self, argc: usize) -> bool {
+        self.required <= argc && (self.varargs || argc <= self.total)
+    }
+}
+
+/// Every routine declaration (`declProc`) named `name` in the file.
+fn collect_decl_procs<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    source: &[u8],
+    found: &mut Vec<Node<'tree>>,
+) {
+    if node.kind() == K::DECL_PROC
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|ident| node_text(ident, source).eq_ignore_ascii_case(name))
+    {
+        found.push(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_decl_procs(child, name, source, found);
+    }
+}
+
+/// The arity of a routine definition's header. Default values are often
+/// written only in the interface or forward declaration, so the required
+/// count is the smallest among same-named declarations with the same
+/// parameter types, or, when none has them, with the same parameter count:
+/// a looser bound only keeps more candidates.
+fn declared_arity(header: Node, declarations: &[Node], source: &[u8]) -> Arity {
+    let mut arity = Arity::of(header);
+    let types = parameter_types(header, source);
+    let same_types: Vec<_> = declarations
+        .iter()
+        .filter(|declaration| parameter_types(**declaration, source) == types)
+        .collect();
+    let matching: Vec<_> = if same_types.len() > 1 {
+        same_types
+    } else {
+        declarations.iter().collect()
+    };
+    for declaration in matching {
+        let other = Arity::of(*declaration);
+        if other.total == arity.total {
+            arity.required = arity.required.min(other.required);
+            arity.varargs |= other.varargs;
+        }
+    }
+    arity
+}
+
+/// Each parameter's type text, lowercased without whitespace.
+fn parameter_types(header: Node, source: &[u8]) -> Vec<String> {
+    let mut types = Vec::new();
+    let Some(args) = header.child_by_field_name("args") else {
+        return types;
+    };
+    let mut args_cursor = args.walk();
+    for arg in args
+        .named_children(&mut args_cursor)
+        .filter(|arg| arg.kind() == K::DECL_ARG)
+    {
+        let type_text: String = arg
+            .child_by_field_name("type")
+            .map(|node| node_text(node, source))
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        let mut name_cursor = arg.walk();
+        for _ in arg
+            .children_by_field_name("name", &mut name_cursor)
+            .filter(|name| name.kind() == K::IDENTIFIER)
+        {
+            types.push(type_text.clone());
+        }
+    }
+    types
 }
 
 /// Check if a `defProc` is a function (has a return type).

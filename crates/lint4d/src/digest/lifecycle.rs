@@ -67,6 +67,9 @@ struct Facts {
     creations: Vec<Creation>,
     assignments: Vec<(String, Range<usize>)>,
     frees: Vec<(String, Range<usize>)>,
+    /// Frees, assignments and creations inside a `with` body, where a name
+    /// may denote a member of the `with` subject instead of the local.
+    with_names: Vec<(String, Range<usize>)>,
     exits: Vec<Range<usize>>,
     inline_vars: HashSet<String>,
 }
@@ -84,11 +87,14 @@ impl Facts {
     /// Walk `root`. Inside lambdas and nested routines (`opaque`) only
     /// assignments are recorded: they can reassign a captured variable, but
     /// their creations, frees and exits are not on this routine's paths.
+    /// Inside a `with` body, frees and assignments are recorded only as
+    /// ambiguous names.
     fn walk(&mut self, root: Node<'_>, opaque: bool, text: &[u8]) {
-        let mut stack = vec![(root, opaque)];
-        while let Some((node, opaque)) = stack.pop() {
+        let mut stack = vec![(root, opaque, false)];
+        while let Some((node, opaque, in_with)) = stack.pop() {
             let opaque = opaque || matches!(node.kind(), "lambda" | "defProc");
             match node.kind() {
+                "assignment" if in_with => self.with_name(node, text),
                 "assignment" if opaque => self.reassignment(node, text),
                 "assignment" => self.assignment(node, text),
                 "statement" if !opaque && is_exit_statement(node, text) => {
@@ -97,11 +103,32 @@ impl Facts {
                 _ => {}
             }
             if !opaque && let Some(var) = freed_var(node, text) {
-                self.frees.push((key(&var), node.byte_range()));
+                let names = if in_with {
+                    &mut self.with_names
+                } else {
+                    &mut self.frees
+                };
+                names.push((key(&var), node.byte_range()));
             }
+            let with_body = (node.kind() == "with")
+                .then(|| node.child_by_field_name("body"))
+                .flatten();
             let mut cursor = node.walk();
             let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-            stack.extend(children.into_iter().rev().map(|child| (child, opaque)));
+            stack.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, opaque, in_with || Some(child) == with_body)),
+            );
+        }
+    }
+
+    /// An assignment inside a `with` body: a creation is still listed, but
+    /// its verdict is unknown.
+    fn with_name(&mut self, node: Node<'_>, text: &[u8]) {
+        if let Some(key) = self.creation(node, text) {
+            self.with_names.push((key, node.byte_range()));
         }
     }
 
@@ -113,9 +140,14 @@ impl Facts {
     }
 
     fn assignment(&mut self, node: Node<'_>, text: &[u8]) {
-        let Some(lhs) = node.child_by_field_name("lhs") else {
-            return;
-        };
+        if let Some(key) = self.creation(node, text) {
+            self.assignments.push((key, node.byte_range()));
+        }
+    }
+
+    /// Records a constructor assignment as a creation; returns the target key.
+    fn creation(&mut self, node: Node<'_>, text: &[u8]) -> Option<String> {
+        let lhs = node.child_by_field_name("lhs")?;
         let target = target_name(lhs, text);
         let key = key(&target);
         if lhs.kind() == "varAssignDef" {
@@ -132,7 +164,7 @@ impl Facts {
                 range: node.byte_range(),
             });
         }
-        self.assignments.push((key, node.byte_range()));
+        Some(key)
     }
 }
 
@@ -205,6 +237,15 @@ fn verdict(
     {
         return Verdict::Unknown {
             why: format!("reassigned at L{}", lines.line(range.start)),
+        };
+    }
+    if let Some((_, range)) = facts
+        .with_names
+        .iter()
+        .find(|(key, _)| *key == creation.key)
+    {
+        return Verdict::Unknown {
+            why: format!("named inside with at L{}", lines.line(range.start)),
         };
     }
     if let Some(block) = context.hidden.iter().min_by_key(|block| block.start) {

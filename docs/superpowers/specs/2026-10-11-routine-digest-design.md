@@ -217,6 +217,9 @@ For each local variable assigned from a constructor:
 5. Parse errors in the routine yield `Unknown (parse errors)` for every
    verdict; a hidden directive block (6.5) between a creation and its free
    yields `Unknown (hidden directive block at L…)`.
+6. A creation, assignment or free of the variable inside a `with` body yields
+   `Unknown (named inside with at L…)`: the name may denote a member of the
+   `with` subject (l4d-pwvv). Such a free never joins F.
 
 `Exit { runs_finally }` records the first `finally` on the exit's path.
 

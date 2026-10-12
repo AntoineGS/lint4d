@@ -405,3 +405,63 @@ end;
         }
     );
 }
+
+#[test]
+fn free_inside_with_body_is_unknown() {
+    let body = "procedure Wi;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    with Obj do
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wi"),
+        Verdict::Unknown {
+            why: "named inside with at L13".into()
+        }
+    );
+}
+
+#[test]
+fn creation_inside_with_body_is_unknown() {
+    let body = "procedure Wc;
+var
+  L: TStringList;
+begin
+  with Obj do
+    L := TStringList.Create;
+  L.Free;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wc"),
+        Verdict::Unknown {
+            why: "named inside with at L9".into()
+        }
+    );
+}
+
+#[test]
+fn with_subject_is_not_ambiguous() {
+    let body = "procedure Ws;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    with L do
+      Add('x');
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Ws"), Verdict::FreedAllPaths);
+}

@@ -247,9 +247,13 @@ end;
 
 fn escapes_of(body: &str, routine: &str) -> Vec<Escape> {
     match verdict(body, routine) {
-        Verdict::Escapes { via, .. } => via,
-        other => panic!("expected escapes, got {other:?}"),
+        Verdict::Escapes { via, more: false } => via,
+        other => panic!("expected complete escapes, got {other:?}"),
     }
+}
+
+fn esc(line: usize, how: EscapeKind) -> Escape {
+    Escape { line, how }
 }
 
 #[test]
@@ -263,12 +267,18 @@ begin
     L.Free;
 end;
 ";
-    assert!(!escapes_of(body, "Q").is_empty());
+    assert_eq!(
+        escapes_of(body, "Q"),
+        vec![
+            esc(9, EscapeKind::Exception),
+            esc(11, EscapeKind::FallsOffEnd)
+        ]
+    );
 }
 
 #[test]
 fn exit_before_free_escapes() {
-    let body = "procedure X(A: Boolean);
+    let body = "procedure E(A: Boolean);
 var
   L: TStringList;
 begin
@@ -278,7 +288,10 @@ begin
   L.Free;
 end;
 ";
-    assert!(!escapes_of(body, "X").is_empty());
+    assert_eq!(
+        escapes_of(body, "E"),
+        vec![esc(9, EscapeKind::Exception), esc(10, EscapeKind::Exit)]
+    );
 }
 
 #[test]
@@ -295,5 +308,100 @@ begin
   end;
 end;
 ";
-    assert!(!escapes_of(body, "Y").is_empty());
+    assert_eq!(
+        escapes_of(body, "Y"),
+        vec![esc(14, EscapeKind::FallsOffEnd)]
+    );
+}
+
+#[test]
+fn hidden_block_before_creation_in_a_loop_is_unknown() {
+    let body = "procedure P(N: Integer);
+var I: Integer;
+begin
+  for I := 0 to N do
+  begin
+    {$IF DEFINED(X)}
+    rappel: developper en 32 bits pour plus de stabilite
+    {$IFEND}
+    FreeAndNil(FObj);
+    FObj := TFoo.Create;
+  end;
+  FreeAndNil(FObj);
+end;
+";
+    assert_eq!(
+        verdict(body, "P"),
+        Verdict::Unknown {
+            why: "hidden directive block at L9".into()
+        }
+    );
+}
+
+#[test]
+fn hidden_block_wins_over_never_freed() {
+    let body = "procedure H;
+var
+  L: TStringList;
+begin
+  {$IF DEFINED(X)}
+  rappel: developper en 32 bits pour plus de stabilite
+  {$IFEND}
+  L := TStringList.Create;
+end;
+";
+    assert_eq!(
+        verdict(body, "H"),
+        Verdict::Unknown {
+            why: "hidden directive block at L8".into()
+        }
+    );
+}
+
+#[test]
+fn assignment_in_lambda_is_a_reassignment() {
+    let body = "procedure Lm;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Run(procedure begin L := nil; end);
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(
+        verdict(body, "Lm"),
+        Verdict::Unknown {
+            why: "reassigned at L10".into()
+        }
+    );
+}
+
+#[test]
+fn assignment_in_nested_routine_is_a_reassignment() {
+    let body = "procedure Nr;
+var
+  L: TStringList;
+  procedure Reset;
+  begin
+    L := nil;
+  end;
+begin
+  L := TStringList.Create;
+  try
+    Reset;
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(
+        verdict(body, "Nr"),
+        Verdict::Unknown {
+            why: "reassigned at L9".into()
+        }
+    );
 }

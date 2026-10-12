@@ -1,11 +1,12 @@
 //! Object lifecycle verdicts from CFG paths (spec §6.3).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 
 use cfg_pascal::calls::{CallKind, classify_call};
-use cfg_pascal::cfg_core::{BlockId, Cfg, EdgeKind, PathEdge};
+use cfg_pascal::cfg_core::{BlockId, Cfg, EdgeKind};
 use pascal_core::parser::node_text;
+use petgraph::visit::EdgeRef;
 use tree_sitter::Node;
 
 use super::model::{Escape, EscapeKind, NotFreedReason, ObjectVerdict, Verdict};
@@ -35,7 +36,12 @@ pub fn verdicts(
     let Some(body) = body else {
         return Vec::new();
     };
-    let facts = Facts::collect(body, text);
+    let nested: Vec<Node<'_>> = if scope.kind() == "defProc" {
+        field_children(scope, "local")
+    } else {
+        Vec::new()
+    };
+    let facts = Facts::collect(body, &nested, text);
     let locals = local_names(scope, &facts, text);
     facts
         .creations
@@ -66,24 +72,44 @@ struct Facts {
 }
 
 impl Facts {
-    fn collect(body: Node<'_>, text: &[u8]) -> Self {
+    fn collect(body: Node<'_>, nested: &[Node<'_>], text: &[u8]) -> Self {
         let mut facts = Self::default();
-        let mut stack = vec![body];
-        while let Some(node) = stack.pop() {
+        facts.walk(body, false, text);
+        for node in nested {
+            facts.walk(*node, true, text);
+        }
+        facts
+    }
+
+    /// Walk `root`. Inside lambdas and nested routines (`opaque`) only
+    /// assignments are recorded: they can reassign a captured variable, but
+    /// their creations, frees and exits are not on this routine's paths.
+    fn walk(&mut self, root: Node<'_>, opaque: bool, text: &[u8]) {
+        let mut stack = vec![(root, opaque)];
+        while let Some((node, opaque)) = stack.pop() {
+            let opaque = opaque || matches!(node.kind(), "lambda" | "defProc");
             match node.kind() {
-                "lambda" | "defProc" => continue,
-                "assignment" => facts.assignment(node, text),
-                "statement" if is_exit_statement(node, text) => facts.exits.push(node.byte_range()),
+                "assignment" if opaque => self.reassignment(node, text),
+                "assignment" => self.assignment(node, text),
+                "statement" if !opaque && is_exit_statement(node, text) => {
+                    self.exits.push(node.byte_range())
+                }
                 _ => {}
             }
-            if let Some(var) = freed_var(node, text) {
-                facts.frees.push((key(&var), node.byte_range()));
+            if !opaque && let Some(var) = freed_var(node, text) {
+                self.frees.push((key(&var), node.byte_range()));
             }
             let mut cursor = node.walk();
             let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-            stack.extend(children.into_iter().rev());
+            stack.extend(children.into_iter().rev().map(|child| (child, opaque)));
         }
-        facts
+    }
+
+    fn reassignment(&mut self, node: Node<'_>, text: &[u8]) {
+        if let Some(lhs) = node.child_by_field_name("lhs") {
+            self.assignments
+                .push((key(&target_name(lhs, text)), node.byte_range()));
+        }
     }
 
     fn assignment(&mut self, node: Node<'_>, text: &[u8]) {
@@ -181,6 +207,11 @@ fn verdict(
             why: format!("reassigned at L{}", lines.line(range.start)),
         };
     }
+    if let Some(block) = context.hidden.iter().min_by_key(|block| block.start) {
+        return Verdict::Unknown {
+            why: format!("hidden directive block at L{}", lines.line(block.start)),
+        };
+    }
     let frees: Vec<&Range<usize>> = facts
         .frees
         .iter()
@@ -195,13 +226,9 @@ fn verdict(
         };
         return Verdict::NotFreedHere { why };
     }
-    if let Some(block) = context
-        .hidden
-        .iter()
-        .find(|block| block.start > creation.range.start)
-    {
+    if cfg.blocks_for_stmt(creation.range.clone()).is_empty() {
         return Verdict::Unknown {
-            why: format!("hidden directive block at L{}", lines.line(block.start)),
+            why: "creation not in CFG".to_string(),
         };
     }
     let free_blocks: HashSet<BlockId> = frees
@@ -211,8 +238,9 @@ fn verdict(
     escapes(cfg, creation, &free_blocks, &facts.exits, lines)
 }
 
-/// Walk forward from the creation without entering a free; ignore
-/// exceptions raised by the creating statement itself (nothing to free yet).
+/// Every statement where a path from the creation leaves the routine
+/// without entering a free. Exceptions raised by the creating statement
+/// itself are ignored (nothing to free yet).
 fn escapes(
     cfg: &Cfg,
     creation: &Creation,
@@ -231,19 +259,54 @@ fn escapes(
                 how: EscapeKind::ReCreated,
             });
         }
-        let mut avoid = free_blocks.clone();
-        for _ in 0..=MAX_ESCAPES {
-            let Some(path) =
-                cfg.path_avoiding(start, cfg.exit, &avoid, &[EdgeKind::ExceptionThrow])
-            else {
-                break;
+        let mut seen = HashSet::from([start]);
+        let mut queue = VecDeque::from([start]);
+        while let Some(block) = queue.pop_front() {
+            let last_line = || {
+                cfg.graph[block.index()].stmts.last().map_or_else(
+                    || lines.line(cfg.byte_range.end.saturating_sub(1)),
+                    |stmt| lines.line(stmt.byte_range.start),
+                )
             };
-            let (block, escape) = escape_point(cfg, &path, exits, lines);
-            if !found.contains(&escape) {
-                found.push(escape);
+            let holds_exit = cfg.graph[block.index()].stmts.iter().any(|stmt| {
+                exits.iter().any(|exit| {
+                    exit.start <= stmt.byte_range.start && stmt.byte_range.end <= exit.end
+                })
+            });
+            let mut reaches_exit = false;
+            for edge in cfg.graph.edges(block.index()) {
+                let target = BlockId::from(edge.target());
+                if free_blocks.contains(&target) {
+                    continue;
+                }
+                if *edge.weight() == EdgeKind::ExceptionThrow {
+                    let leaves = target == cfg.exit
+                        || cfg
+                            .path_avoiding(target, cfg.exit, free_blocks, &[])
+                            .is_some();
+                    if block != start && leaves {
+                        found.push(Escape {
+                            line: last_line(),
+                            how: EscapeKind::Exception,
+                        });
+                    }
+                    continue;
+                }
+                reaches_exit |= target == cfg.exit;
+                if seen.insert(target) {
+                    queue.push_back(target);
+                }
             }
-            if block == start || !avoid.insert(block) {
-                break;
+            if reaches_exit {
+                let how = if holds_exit {
+                    EscapeKind::Exit
+                } else {
+                    EscapeKind::FallsOffEnd
+                };
+                found.push(Escape {
+                    line: last_line(),
+                    how,
+                });
             }
         }
     }
@@ -255,70 +318,4 @@ fn escapes(
     let more = found.len() > MAX_ESCAPES;
     found.truncate(MAX_ESCAPES);
     Verdict::Escapes { via: found, more }
-}
-
-/// Where `path` leaves for good: the first exception edge, else an `Exit`
-/// statement, else the last statement before the routine ends.
-fn escape_point(
-    cfg: &Cfg,
-    path: &[PathEdge],
-    exits: &[Range<usize>],
-    lines: &LineIndex,
-) -> (BlockId, Escape) {
-    let has_stmts = |block: &BlockId| !cfg.graph[block.index()].stmts.is_empty();
-    let last_line = |block: BlockId| {
-        cfg.graph[block.index()]
-            .stmts
-            .last()
-            .map_or(0, |stmt| lines.line(stmt.byte_range.start))
-    };
-    if let Some(index) = path
-        .iter()
-        .position(|edge| edge.kind == EdgeKind::ExceptionThrow)
-        && let Some(block) = path[..=index]
-            .iter()
-            .rev()
-            .map(|edge| edge.from)
-            .find(has_stmts)
-    {
-        return (
-            block,
-            Escape {
-                line: last_line(block),
-                how: EscapeKind::Exception,
-            },
-        );
-    }
-    let is_exit = |block: &BlockId| {
-        cfg.graph[block.index()].stmts.iter().any(|stmt| {
-            exits
-                .iter()
-                .any(|exit| exit.start <= stmt.byte_range.start && stmt.byte_range.end <= exit.end)
-        })
-    };
-    if let Some(block) = path.iter().map(|edge| edge.from).find(is_exit) {
-        return (
-            block,
-            Escape {
-                line: last_line(block),
-                how: EscapeKind::Exit,
-            },
-        );
-    }
-    match path.iter().rev().map(|edge| edge.from).find(has_stmts) {
-        Some(block) => (
-            block,
-            Escape {
-                line: last_line(block),
-                how: EscapeKind::FallsOffEnd,
-            },
-        ),
-        None => (
-            path[0].from,
-            Escape {
-                line: lines.line(cfg.byte_range.end.saturating_sub(1)),
-                how: EscapeKind::FallsOffEnd,
-            },
-        ),
-    }
 }

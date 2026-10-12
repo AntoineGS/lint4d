@@ -37173,6 +37173,84 @@ fn ambiguous_rename_batches_invalidate_and_reject_open_overlays() {
 }
 
 #[test]
+fn ambiguous_rename_batches_do_not_hide_existing_endpoints() {
+    // TASK-132: a chain (A -> B, B -> C) or a cycle (A -> C, C -> A) is
+    // ambiguous, but the endpoint that exists on disk afterwards must stay
+    // resolvable.
+    for ambiguous_kind in ["chain", "cycle"] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let first = root.join("first").join("Provider.pas");
+        let second = root.join("second").join("Provider.pas");
+        let destination = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let consumer_text = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TDiskThing;\nimplementation\nend.\n";
+        let disk_provider =
+            "unit Provider;\ninterface\ntype TDiskThing = class end;\nimplementation\nend.\n";
+        let other_provider =
+            "unit Provider;\ninterface\ntype TOtherThing = class end;\nimplementation\nend.\n";
+        fs::create_dir_all(first.parent().unwrap()).expect("first directory");
+        fs::create_dir_all(second.parent().unwrap()).expect("second directory");
+        write_file(&first, disk_provider);
+        if ambiguous_kind == "cycle" {
+            write_file(&destination, other_provider);
+        }
+        write_file(&consumer, consumer_text);
+        write_file(
+            &root.join("Main.pas"),
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(&root);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_text}}),
+        );
+
+        let files = if ambiguous_kind == "chain" {
+            fs::rename(&first, &destination).expect("client-owned physical move");
+            json!([
+                {"oldUri":uri(&first),"newUri":uri(&second)},
+                {"oldUri":uri(&second),"newUri":uri(&destination)},
+            ])
+        } else {
+            write_file(&first, other_provider);
+            write_file(&destination, disk_provider);
+            json!([
+                {"oldUri":uri(&first),"newUri":uri(&destination)},
+                {"oldUri":uri(&destination),"newUri":uri(&first)},
+            ])
+        };
+        server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .expect("ambiguous rename must request pull diagnostic refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+        let definition_id =
+            RequestId::from(format!("ambiguous-{ambiguous_kind}-existing-endpoint"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_text, "TDiskThing", 0),
+        );
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(
+            locations.len(),
+            1,
+            "ambiguous {ambiguous_kind}: the existing endpoint must resolve: {locations:?}"
+        );
+        assert_eq!(locations[0]["uri"], uri(&destination).to_string());
+        server.shutdown();
+    }
+}
+
+#[test]
 #[cfg(feature = "test-support")]
 fn file_operation_batches_bound_uri_bytes_and_discard_on_entry_overflow() {
     let root = tempfile::tempdir().expect("temporary workspace");

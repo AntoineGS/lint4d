@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use lint4d::digest::{Degradation, FileDigest, RoutineDigest, digest_source, render};
+use lint4d::digest::{CallCount, Degradation, FileDigest, RoutineDigest, digest_source, render};
 
 fn digest(source: &[u8]) -> FileDigest {
     digest_source(Path::new("t.pas"), source).expect("digest")
@@ -181,9 +181,7 @@ fn long_conditions_are_truncated_and_list_hidden_calls() {
     let tree = render::render_tree(&routine(&file, "P").body);
     let first = tree.lines().next().unwrap();
     assert!(
-        first.starts_with(
-            "L6 if (SomeVeryLongVariableName > 0) and (AnotherVeryLongVariableName < 10)"
-        ),
+        first.starts_with("L6 if (SomeVeryLongVariableName > 0) and (AnotherVeryLon…"),
         "{tree}"
     );
     assert!(first.ends_with("… [calls IsReady]"), "{tree}");
@@ -202,4 +200,214 @@ fn empty_and_forward_routines() {
         render::render_routine(empty, "t.pas", None),
         "Empty  t.pas:5-7 (3 lines)\n"
     );
+}
+
+fn wrap(body: &str) -> String {
+    format!("unit T;\ninterface\nimplementation\nprocedure P;\nbegin\n{body}end;\nend.\n")
+}
+
+fn tree_of(body: &str) -> String {
+    let file = digest(wrap(body).as_bytes());
+    render::render_tree(&routine(&file, "P").body)
+}
+
+#[test]
+fn a_call_in_three_runs_is_hoisted_with_its_total_count() {
+    let source = wrap(
+        "  Log('a'); Foo;
+  if A then
+    Bar;
+  Log('b');
+  if B then
+    Baz;
+  Log('c'); Log('d');
+",
+    );
+    let file = digest(source.as_bytes());
+    let p = routine(&file, "P");
+    assert_eq!(
+        p.frequent_calls,
+        vec![CallCount {
+            name: "Log".into(),
+            count: 4
+        }]
+    );
+    assert_eq!(
+        render::render_tree(&p.body),
+        "L6 calls Foo
+L7 if A
+  L8 calls Bar
+L10 if B
+  L11 calls Baz
+"
+    );
+}
+
+#[test]
+fn a_call_in_two_runs_stays_in_place() {
+    let source = wrap(
+        "  Log('a'); Foo;
+  if A then
+    Bar;
+  Log('b'); Log('c');
+",
+    );
+    let file = digest(source.as_bytes());
+    let p = routine(&file, "P");
+    assert!(p.frequent_calls.is_empty());
+    assert_eq!(
+        render::render_tree(&p.body),
+        "L6 calls Log, Foo
+L7 if A
+  L8 calls Bar
+L9 calls Log ×2
+"
+    );
+}
+
+#[test]
+fn lambda_calls_are_not_hoisted() {
+    let source = wrap(
+        "  Q1(procedure begin Ping; end);
+  Q2(procedure begin Ping; end);
+  Q3(procedure begin Ping; end);
+",
+    );
+    let file = digest(source.as_bytes());
+    let p = routine(&file, "P");
+    assert!(p.frequent_calls.is_empty());
+    assert_eq!(
+        render::render_tree(&p.body)
+            .matches("anonymous method calls Ping")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn hoisted_calls_render_after_the_objects_line() {
+    let source = wrap("  Log('a');\n  if A then\n    Log('b');\n  if B then\n    Log('c');\n");
+    let file = digest(source.as_bytes());
+    let p = routine(&file, "P");
+    let text = render::render_routine(p, "t.pas", None);
+    assert!(
+        text.lines().nth(1) == Some("frequent calls: Log ×3"),
+        "{text}"
+    );
+    assert!(!text.contains("calls Log\n"), "{text}");
+    let json = render::render_json("t.pas", &[p]);
+    assert!(json.contains("\"frequent_calls\""), "{json}");
+}
+
+#[test]
+fn a_factless_if_is_dropped_and_a_call_in_its_condition_is_not() {
+    assert_eq!(
+        tree_of("  if A then\n    X := 1;\n  Bar;\n"),
+        "L8 calls Bar\n"
+    );
+    assert_eq!(
+        tree_of("  if Check(X) then\n    Y := 1;\n"),
+        "L6 if Check(X)\n"
+    );
+}
+
+#[test]
+fn an_empty_if_stays_before_a_kept_else_and_an_empty_else_goes() {
+    assert_eq!(
+        tree_of("  if A then\n    X := 1\n  else\n    Bar;\n"),
+        "L6 if A
+L9 else
+  L9 calls Bar
+"
+    );
+    assert_eq!(
+        tree_of("  if A then\n    Bar\n  else\n    X := 1;\n"),
+        "L6 if A
+  L7 calls Bar
+"
+    );
+}
+
+#[test]
+fn empty_loops_nested_in_empty_ifs_vanish() {
+    assert_eq!(
+        tree_of("  if A then\n    for var I := 0 to 3 do\n      X := I;\n"),
+        ""
+    );
+}
+
+#[test]
+fn a_factless_try_is_dropped() {
+    assert_eq!(tree_of("  try\n    X := 1;\n  except\n  end;\n"), "");
+    assert_eq!(
+        tree_of("  try\n    X := 1;\n  finally\n    Y := 2;\n  end;\n"),
+        ""
+    );
+}
+
+#[test]
+fn a_kept_try_keeps_its_empty_handlers() {
+    assert_eq!(
+        tree_of("  try\n    Bar;\n  except\n    on E: Exception do\n      X := 1;\n  end;\n"),
+        "L6 try
+  L7 calls Bar
+L8 except
+  L9 on E: Exception
+"
+    );
+    assert_eq!(
+        tree_of("  try\n    Bar;\n  except\n  end;\n"),
+        "L6 try
+  L7 calls Bar
+L8 except
+"
+    );
+}
+
+#[test]
+fn empty_case_arms_are_dropped_and_an_empty_case_goes() {
+    assert_eq!(
+        tree_of("  case A of\n    1: X := 1;\n    2: Bar;\n  else\n    Y := 2;\n  end;\n"),
+        "L6 case A
+  2: L8 calls Bar
+"
+    );
+    assert_eq!(
+        tree_of("  case A of\n    1: X := 1;\n  else\n    Y := 2;\n  end;\n"),
+        ""
+    );
+    assert_eq!(
+        tree_of("  case Pick(A) of\n    1: X := 1;\n  end;\n"),
+        "L6 case Pick(A)\n"
+    );
+}
+
+#[test]
+fn dropping_empty_controls_leaves_the_markers_alone() {
+    let source = wrap(
+        "  if A then
+    X := 1;
+  try
+    X := 2;
+  except
+  end;
+  DB.StartTransaction;
+  if B then
+    Exit;
+  raise Exception.Create('x');
+",
+    );
+    let file = digest(source.as_bytes());
+    let markers = routine(&file, "P").markers();
+    assert!(markers.tx);
+    assert_eq!((markers.raises, markers.exits), (1, 1));
+}
+
+#[test]
+fn labels_are_cut_at_fifty_characters() {
+    let condition =
+        "(AAAAAAAAAA = 1) and (BBBBBBBBBB = 2) and (CCCCCCCCCC = 3) and (DDDDDDDDDD = 4)";
+    let tree = tree_of(&format!("  if {condition} then\n    Bar;\n"));
+    let expected: String = condition.chars().take(50).collect();
+    assert_eq!(tree.lines().next().unwrap(), format!("L6 if {expected}…"));
 }

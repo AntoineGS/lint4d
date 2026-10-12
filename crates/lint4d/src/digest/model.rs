@@ -18,6 +18,9 @@ pub struct RoutineDigest {
     pub end_line: usize,
     pub byte_range: Range<usize>,
     pub objects: Vec<ObjectVerdict>,
+    /// Calls found in three or more separate runs, removed from those runs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frequent_calls: Vec<CallCount>,
     pub body: Vec<DigestNode>,
     pub degraded: Vec<Degradation>,
 }

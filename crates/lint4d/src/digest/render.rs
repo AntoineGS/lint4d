@@ -52,7 +52,7 @@ pub fn render_index(file: &FileDigest) -> String {
     out
 }
 
-/// Header, degradation lines, objects line, then the body. With
+/// Header, degradation lines, objects line, frequent calls line, then the body. With
 /// `max_lines`, the deepest control subtrees collapse on a best-effort basis;
 /// collapsing stops at the top level, so the output can still exceed
 /// `max_lines`. The header lines are never collapsed.
@@ -77,6 +77,17 @@ pub fn render_routine(
     if !routine.objects.is_empty() {
         let objects: Vec<String> = routine.objects.iter().map(object_text).collect();
         head.push(format!("objects: {}", objects.join("; ")));
+    }
+    if !routine.frequent_calls.is_empty() {
+        head.push(format!(
+            "frequent calls: {}",
+            routine
+                .frequent_calls
+                .iter()
+                .map(|call| format!("{} ×{}", call.name, call.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let mut body = Vec::new();
     render_nodes(&routine.body, 0, usize::MAX, &mut body);
@@ -344,6 +355,7 @@ mod tests {
             start_line: 10,
             end_line: 30,
             byte_range: 0..100,
+            frequent_calls: Vec::new(),
             objects: vec![
                 ObjectVerdict {
                     var: "L".into(),

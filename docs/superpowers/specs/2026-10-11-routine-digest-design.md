@@ -90,22 +90,20 @@ Each is its own issue, test-first.
 ## 5. Output format
 
 Line numbers are absolute and 1-based (`L2417`). Indentation is nesting.
-Conditions and `case` labels are truncated to about 70 characters with `…`.
+Conditions and `case` labels are truncated to about 50 characters with `…`.
 
 ### 5.1 Routine digest
 
 ```
 TBusinessObject.WriteToDB  BusinessObject.pas:2333-2574 (242 lines)
 objects: params TParams L2417 freed on all paths; fieldsMessages TStringList L2455 freed on all paths
-L2351 calls LogToConsoleBOF, GetBofSync, aBofSync.BeginWrite
+frequent calls: LogToConsoleBOF ×9, RefreshDBStatus ×3
+L2351 calls GetBofSync, aBofSync.BeginWrite
 L2356 try
   L2358 if checkAndClipStringFieldsToMaxCapacityIfNecessary
     L2360 for i := 0 to Fields.Count - 1
-      L2364 if (aBOField.isInitialized) and (not aBOField.isReadOnly) and (not aBOFie…
+      L2364 if (aBOField.isInitialized) and (not aBOField.isReadO…
         …
-  L2385 if aBOUpdateKind = boukUnknown
-    L2387 if DBStatus = dsUnknown
-      L2388 calls RefreshDBStatus
   L2417 new TParams -> params
   L2418 try
     L2419 case aBOUpdateKind
@@ -131,6 +129,24 @@ Fact lines:
 - `nested routine <Name>`, `anonymous method calls …`
 
 Runs with no facts and no calls (assignments only) are omitted.
+
+A call name found in three or more separate runs of one routine is removed
+from those runs and listed once, with its total count, on a `frequent calls:`
+line after `objects:` (before the body): `frequent calls: LogToConsoleBOF ×9,
+GetBofSync ×3`. The count is always shown, names keep first-use order, runs
+left empty disappear, and calls inside anonymous methods are not counted. The
+line is omitted when nothing qualifies.
+
+A control with no fact anywhere below it and no call in its own condition or
+label is omitted, bottom-up (an `if` whose only child was such a `for` goes
+too). Exceptions: an `if` stays when the `else` right after it is kept; an
+empty `else` is dropped; empty `case` arms are dropped, and a `case` with no
+arm left goes unless its selector holds a call; a `try` is dropped only when
+its body and every `finally`, `except`, `on` and `else` handler are empty, and
+a kept `try` keeps all its handlers, so an empty `except` that swallows
+exceptions stays visible; likewise a kept `{$IF}` keeps all its branches, and
+`asm` blocks are always kept. Routine-index markers count facts only, so this
+does not change them.
 
 The `objects:` line holds one verdict per local variable assigned from a
 constructor:
@@ -165,7 +181,7 @@ ranges. Text is the default.
 
 ```rust
 FileDigest     { path, routines: Vec<RoutineDigest> }
-RoutineDigest  { name, lines, bytes, objects: Vec<ObjectVerdict>, body: Vec<Node>, degraded: Vec<Degradation> }
+RoutineDigest  { name, lines, bytes, objects: Vec<ObjectVerdict>, frequent_calls: Vec<(name, count)>, body: Vec<Node>, degraded: Vec<Degradation> }
 Node           = Control { kind, line, label, children }   // if/else/case/arm/loop/try/finally/except/on/with/$IFDEF
                | Fact { line, fact }
 Fact           = New { class, target } | Free { var } | Tx { op, receiver, method }
@@ -175,7 +191,7 @@ ObjectVerdict  { var, class, line, verdict }
 Verdict        = FreedAllPaths | Escapes(Vec<Escape>) | NotFreedHere { why } | Unknown { why }
 ```
 
-The index and the text and JSON renderers are pure functions of
+`frequent_calls` is skipped in JSON when empty. The index and the text and JSON renderers are pure functions of
 `FileDigest`.
 
 ### 6.2 Tree (`digest/tree.rs`)

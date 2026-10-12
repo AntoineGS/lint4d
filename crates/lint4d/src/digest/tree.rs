@@ -14,7 +14,7 @@ use super::{
     target_name, truncate,
 };
 
-const LABEL_WIDTH: usize = 70;
+const LABEL_WIDTH: usize = 50;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -27,7 +27,7 @@ pub fn build(
     cfg: &Cfg,
     text: &[u8],
     lines: &LineIndex,
-) -> (Vec<DigestNode>, Stats) {
+) -> (Vec<DigestNode>, Vec<CallCount>, Stats) {
     let mut builder = Builder {
         cfg,
         text,
@@ -41,7 +41,7 @@ pub fn build(
                 .child_by_field_name("header")
                 .and_then(|header| header.child_by_field_name("name"));
             if let (true, Some(name)) = (local.kind() == "defProc", name) {
-                seq.push(DigestNode::Fact {
+                seq.push(Raw::Fact {
                     line: lines.line(local.start_byte()),
                     fact: Fact::Nested {
                         name: format!("{}.{}", cfg.proc_name, node_text(name, text)),
@@ -56,13 +56,300 @@ pub fn build(
     if let Some(body) = body {
         builder.item(body, &mut seq);
     }
-    (seq.finish(), builder.stats)
+    let mut raw = seq.finish();
+    let frequent = hoist_frequent_calls(&mut raw);
+    (prune(raw), frequent, builder.stats)
+}
+
+/// A node as built, before empty controls are dropped. `label_calls` records
+/// that the control's own label contains a call or a fact; it is not part of
+/// the serialised model.
+enum Raw {
+    Control {
+        kind: ControlKind,
+        line: usize,
+        end_line: usize,
+        label: String,
+        label_calls: bool,
+        children: Vec<Raw>,
+    },
+    Fact {
+        line: usize,
+        fact: Fact,
+    },
+}
+
+impl From<DigestNode> for Raw {
+    fn from(node: DigestNode) -> Self {
+        match node {
+            DigestNode::Fact { line, fact } => Raw::Fact { line, fact },
+            DigestNode::Control {
+                kind,
+                line,
+                end_line,
+                label,
+                children,
+            } => Raw::Control {
+                kind,
+                line,
+                end_line,
+                label,
+                label_calls: false,
+                children: children.into_iter().map(Raw::from).collect(),
+            },
+        }
+    }
+}
+
+/// Calls in three or more separate `Calls` runs move to the routine header.
+fn hoist_frequent_calls(nodes: &mut Vec<Raw>) -> Vec<CallCount> {
+    let mut seen: Vec<(String, usize, usize)> = Vec::new();
+    count_runs(nodes, &mut seen);
+    let frequent: Vec<CallCount> = seen
+        .into_iter()
+        .filter(|(_, runs, _)| *runs >= 3)
+        .map(|(name, _, count)| CallCount { name, count })
+        .collect();
+    if !frequent.is_empty() {
+        remove_calls(nodes, &frequent);
+    }
+    frequent
+}
+
+fn count_runs(nodes: &[Raw], seen: &mut Vec<(String, usize, usize)>) {
+    for node in nodes {
+        match node {
+            Raw::Control { children, .. } => count_runs(children, seen),
+            Raw::Fact {
+                fact: Fact::Calls { calls },
+                ..
+            } => {
+                for call in calls {
+                    match seen.iter_mut().find(|(name, ..)| *name == call.name) {
+                        Some((_, runs, count)) => {
+                            *runs += 1;
+                            *count += call.count;
+                        }
+                        None => seen.push((call.name.clone(), 1, call.count)),
+                    }
+                }
+            }
+            Raw::Fact { .. } => {}
+        }
+    }
+}
+
+fn remove_calls(nodes: &mut Vec<Raw>, hoisted: &[CallCount]) {
+    for node in nodes.iter_mut() {
+        match node {
+            Raw::Control { children, .. } => remove_calls(children, hoisted),
+            Raw::Fact {
+                fact: Fact::Calls { calls },
+                ..
+            } => calls.retain(|call| !hoisted.iter().any(|h| h.name == call.name)),
+            Raw::Fact { .. } => {}
+        }
+    }
+    nodes.retain(|node| {
+        !matches!(
+            node,
+            Raw::Fact {
+                fact: Fact::Calls { calls },
+                ..
+            } if calls.is_empty()
+        )
+    });
+}
+
+/// Drops controls with no fact below them and no call in their own label.
+/// Siblings that belong together keep each other: an `if` before a kept
+/// `else`, every handler of a kept `try`, every branch of a kept conditional.
+fn prune(nodes: Vec<Raw>) -> Vec<DigestNode> {
+    let mut out = Vec::new();
+    let mut iter = nodes.into_iter().peekable();
+    while let Some(node) = iter.next() {
+        let (kind, line, end_line, label, label_calls, children) = match node {
+            Raw::Fact { line, fact } => {
+                out.push(DigestNode::Fact { line, fact });
+                continue;
+            }
+            Raw::Control {
+                kind,
+                line,
+                end_line,
+                label,
+                label_calls,
+                children,
+            } => (kind, line, end_line, label, label_calls, children),
+        };
+        let control = |label, children| DigestNode::Control {
+            kind,
+            line,
+            end_line,
+            label,
+            children,
+        };
+        match kind {
+            ControlKind::Try => {
+                let mut group = vec![(kind, line, end_line, label, prune(children))];
+                let mut except = None;
+                while let Some(Raw::Control {
+                    kind: ControlKind::Finally | ControlKind::Except,
+                    ..
+                }) = iter.peek()
+                {
+                    let Some(Raw::Control {
+                        kind,
+                        line,
+                        end_line,
+                        label,
+                        children,
+                        ..
+                    }) = iter.next()
+                    else {
+                        unreachable!()
+                    };
+                    if kind == ControlKind::Except {
+                        let (kept, content) = prune_handlers(children);
+                        except = Some(content);
+                        group.push((kind, line, end_line, label, kept));
+                    } else {
+                        group.push((kind, line, end_line, label, prune(children)));
+                    }
+                }
+                let content = except.unwrap_or(false)
+                    || group
+                        .iter()
+                        .any(|(kind, .., kids)| *kind != ControlKind::Except && !kids.is_empty());
+                if content {
+                    out.extend(
+                        group
+                            .into_iter()
+                            .map(
+                                |(kind, line, end_line, label, children)| DigestNode::Control {
+                                    kind,
+                                    line,
+                                    end_line,
+                                    label,
+                                    children,
+                                },
+                            ),
+                    );
+                }
+            }
+            ControlKind::If => {
+                let children = prune(children);
+                let else_node = match iter.peek() {
+                    Some(Raw::Control {
+                        kind: ControlKind::Else,
+                        ..
+                    }) => iter.next(),
+                    _ => None,
+                };
+                let else_node = else_node.and_then(|node| match node {
+                    Raw::Control {
+                        kind,
+                        line,
+                        end_line,
+                        label,
+                        children,
+                        ..
+                    } => {
+                        let children = prune(children);
+                        (!children.is_empty()).then_some(DigestNode::Control {
+                            kind,
+                            line,
+                            end_line,
+                            label,
+                            children,
+                        })
+                    }
+                    Raw::Fact { .. } => None,
+                });
+                if !children.is_empty() || label_calls || else_node.is_some() {
+                    out.push(control(label, children));
+                }
+                out.extend(else_node);
+            }
+            ControlKind::Asm => out.push(control(label, Vec::new())),
+            ControlKind::Conditional => {
+                let branches: Vec<DigestNode> = children
+                    .into_iter()
+                    .filter_map(|branch| match branch {
+                        Raw::Control {
+                            kind,
+                            line,
+                            end_line,
+                            label,
+                            children,
+                            ..
+                        } => Some(DigestNode::Control {
+                            kind,
+                            line,
+                            end_line,
+                            label,
+                            children: prune(children),
+                        }),
+                        Raw::Fact { .. } => None,
+                    })
+                    .collect();
+                let content = branches.iter().any(|branch| {
+                    matches!(branch, DigestNode::Control { children, .. } if !children.is_empty())
+                });
+                if content {
+                    out.push(control(label, branches));
+                }
+            }
+            _ => {
+                let children = prune(children);
+                if !children.is_empty() || label_calls {
+                    out.push(control(label, children));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Children of an `except`: every handler stays, but the second value says
+/// whether anything inside carries content.
+fn prune_handlers(children: Vec<Raw>) -> (Vec<DigestNode>, bool) {
+    let mut kept = Vec::new();
+    let mut content = false;
+    for child in children {
+        match child {
+            Raw::Control {
+                kind: kind @ (ControlKind::On | ControlKind::ExceptElse),
+                line,
+                end_line,
+                label,
+                children,
+                ..
+            } => {
+                let children = prune(children);
+                content |= !children.is_empty();
+                kept.push(DigestNode::Control {
+                    kind,
+                    line,
+                    end_line,
+                    label,
+                    children,
+                });
+            }
+            other => {
+                let nodes = prune(vec![other]);
+                content |= !nodes.is_empty();
+                kept.extend(nodes);
+            }
+        }
+    }
+    (kept, content)
 }
 
 /// Statements in source order; consecutive calls merge into one `Calls` fact.
 #[derive(Default)]
 struct Seq {
-    out: Vec<DigestNode>,
+    out: Vec<Raw>,
     run: Option<(usize, Vec<CallCount>)>,
 }
 
@@ -72,21 +359,21 @@ impl Seq {
         add_call(calls, name);
     }
 
-    fn push(&mut self, node: DigestNode) {
+    fn push(&mut self, node: impl Into<Raw>) {
         self.flush();
-        self.out.push(node);
+        self.out.push(node.into());
     }
 
     fn flush(&mut self) {
         if let Some((line, calls)) = self.run.take() {
-            self.out.push(DigestNode::Fact {
+            self.out.push(Raw::Fact {
                 line,
                 fact: Fact::Calls { calls },
             });
         }
     }
 
-    fn finish(mut self) -> Vec<DigestNode> {
+    fn finish(mut self) -> Vec<Raw> {
         self.flush();
         self.out
     }
@@ -126,38 +413,54 @@ impl Builder<'_> {
                     ControlKind::For
                 };
                 let label = self.header(node);
-                let children = self.child_seq(node.child_by_field_name("body"));
-                seq.push(self.control(kind, node.start_byte(), node.end_byte(), label, children));
+                let body = node.child_by_field_name("body");
+                let head: Vec<Node<'_>> = named_children(node)
+                    .into_iter()
+                    .filter(|child| Some(*child) != body && !is_keyword(*child))
+                    .collect();
+                let label_calls = self.label_has_items(&head);
+                let children = self.child_seq(body);
+                let mut control =
+                    self.control(kind, node.start_byte(), node.end_byte(), label, children);
+                set_label_calls(&mut control, label_calls);
+                seq.push(control);
             }
             "repeat" => {
-                let label = node
-                    .child_by_field_name("condition")
+                let condition = node.child_by_field_name("condition");
+                let label = condition
                     .map(|condition| self.condition_label(condition))
                     .unwrap_or_default();
+                let label_calls = self.label_has_items(&condition.into_iter().collect::<Vec<_>>());
                 let children = self.nodes_seq(&field_children(node, "body"));
-                seq.push(self.control(
+                let mut control = self.control(
                     ControlKind::Repeat,
                     node.start_byte(),
                     node.end_byte(),
                     label,
                     children,
-                ));
+                );
+                set_label_calls(&mut control, label_calls);
+                seq.push(control);
             }
             "case" => self.case_node(node, seq),
             "try" => self.try_node(node, seq),
             "with" => {
-                let entities: Vec<String> = field_children(node, "entity")
-                    .into_iter()
-                    .map(|entity| self.short(entity, LABEL_WIDTH))
+                let entity_nodes = field_children(node, "entity");
+                let entities: Vec<String> = entity_nodes
+                    .iter()
+                    .map(|entity| self.short(*entity, LABEL_WIDTH))
                     .collect();
+                let label_calls = self.label_has_items(&entity_nodes);
                 let children = self.child_seq(node.child_by_field_name("body"));
-                seq.push(self.control(
+                let mut control = self.control(
                     ControlKind::With,
                     node.start_byte(),
                     node.end_byte(),
                     entities.join(", "),
                     children,
-                ));
+                );
+                set_label_calls(&mut control, label_calls);
+                seq.push(control);
             }
             "ppBlock" => self.conditional(node, seq),
             "asm" => seq.push(self.control(
@@ -174,13 +477,13 @@ impl Builder<'_> {
                     },
                     None => Fact::ReRaise,
                 };
-                seq.push(DigestNode::Fact { line, fact });
+                seq.push(Raw::Fact { line, fact });
             }
             "statement" if is_exit_statement(node, self.text) => {
                 let fact = Fact::Exit {
                     runs_finally: self.runs_finally(node),
                 };
-                seq.push(DigestNode::Fact { line, fact });
+                seq.push(Raw::Fact { line, fact });
             }
             _ => self.simple(node, seq),
         }
@@ -192,18 +495,31 @@ impl Builder<'_> {
         start: usize,
         end: usize,
         label: String,
-        children: Vec<DigestNode>,
-    ) -> DigestNode {
-        DigestNode::Control {
+        children: Vec<Raw>,
+    ) -> Raw {
+        Raw::Control {
             kind,
             line: self.lines.line(start),
             end_line: self.lines.line(end.saturating_sub(1).max(start)),
             label,
+            label_calls: false,
             children,
         }
     }
 
-    fn child_seq(&mut self, node: Option<Node<'_>>) -> Vec<DigestNode> {
+    /// Whether the given label nodes hold a call or a fact. A lambda there
+    /// does not count towards the routine's anonymous-method degradation.
+    fn label_has_items(&mut self, nodes: &[Node<'_>]) -> bool {
+        let lambdas = self.stats.lambdas;
+        let mut found = false;
+        for node in nodes {
+            self.scan(*node, &mut |_, _| found = true);
+        }
+        self.stats.lambdas = lambdas;
+        found
+    }
+
+    fn child_seq(&mut self, node: Option<Node<'_>>) -> Vec<Raw> {
         let mut seq = Seq::default();
         if let Some(node) = node {
             self.item(node, &mut seq);
@@ -211,7 +527,7 @@ impl Builder<'_> {
         seq.finish()
     }
 
-    fn nodes_seq(&mut self, nodes: &[Node<'_>]) -> Vec<DigestNode> {
+    fn nodes_seq(&mut self, nodes: &[Node<'_>]) -> Vec<Raw> {
         let mut seq = Seq::default();
         for node in nodes {
             self.item(*node, &mut seq);
@@ -258,20 +574,23 @@ impl Builder<'_> {
     }
 
     fn if_node(&mut self, node: Node<'_>, seq: &mut Seq) {
-        let label = node
-            .child_by_field_name("condition")
+        let condition = node.child_by_field_name("condition");
+        let label = condition
             .map(|condition| self.condition_label(condition))
             .unwrap_or_default();
+        let label_calls = self.label_has_items(&condition.into_iter().collect::<Vec<_>>());
         let then = node.child_by_field_name("then");
         let then_end = then.map_or(node.end_byte(), |then| then.end_byte());
         let children = self.child_seq(then);
-        seq.push(self.control(
+        let mut control = self.control(
             ControlKind::If,
             node.start_byte(),
             then_end,
             label,
             children,
-        ));
+        );
+        set_label_calls(&mut control, label_calls);
+        seq.push(control);
         if let Some(other) = node.child_by_field_name("else") {
             let children = self.child_seq(Some(other));
             seq.push(self.control(
@@ -286,6 +605,7 @@ impl Builder<'_> {
 
     fn case_node(&mut self, node: Node<'_>, seq: &mut Seq) {
         let mut selector = String::new();
+        let mut selector_node = None;
         let mut arms = Vec::new();
         let mut else_start = None;
         let mut else_nodes = Vec::new();
@@ -308,7 +628,10 @@ impl Builder<'_> {
                 "kElse" | "kOtherwise" => else_start = Some(child.start_byte()),
                 _ if is_keyword(child) => {}
                 _ if else_start.is_some() => else_nodes.push(child),
-                _ if selector.is_empty() && arms.is_empty() => selector = self.short(child, 50),
+                _ if selector.is_empty() && arms.is_empty() => {
+                    selector = self.short(child, 50);
+                    selector_node = Some(child);
+                }
                 _ => {}
             }
         }
@@ -317,13 +640,16 @@ impl Builder<'_> {
             let children = self.nodes_seq(&else_nodes);
             arms.push(self.control(ControlKind::Arm, start, end, "else".to_string(), children));
         }
-        seq.push(self.control(
+        let label_calls = self.label_has_items(&selector_node.into_iter().collect::<Vec<_>>());
+        let mut control = self.control(
             ControlKind::Case,
             node.start_byte(),
             node.end_byte(),
             selector,
             arms,
-        ));
+        );
+        set_label_calls(&mut control, label_calls);
+        seq.push(control);
     }
 
     /// A `caseLabel` node includes the trailing `:`; the renderer adds its own.
@@ -441,7 +767,7 @@ impl Builder<'_> {
         ));
     }
 
-    fn branch(&mut self, directive: Node<'_>, nodes: &[Node<'_>]) -> DigestNode {
+    fn branch(&mut self, directive: Node<'_>, nodes: &[Node<'_>]) -> Raw {
         let end = nodes
             .last()
             .map_or(directive.end_byte(), |last| last.end_byte());
@@ -485,7 +811,7 @@ impl Builder<'_> {
     fn simple(&mut self, node: Node<'_>, seq: &mut Seq) {
         self.scan(node, &mut |line, item| match item {
             Item::Call(name) => seq.call(line, name),
-            Item::Fact(fact) => seq.push(DigestNode::Fact { line, fact }),
+            Item::Fact(fact) => seq.push(Raw::Fact { line, fact }),
         });
     }
 
@@ -584,6 +910,12 @@ impl Builder<'_> {
                 Item::Call(name)
             }
         })
+    }
+}
+
+fn set_label_calls(control: &mut Raw, calls: bool) {
+    if let Raw::Control { label_calls, .. } = control {
+        *label_calls = calls;
     }
 }
 

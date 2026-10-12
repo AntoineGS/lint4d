@@ -62,9 +62,9 @@ fn digest_routine(
     if parse_errors {
         degraded.push(Degradation::ParseErrors { lines: errors });
     }
-    let (body, stats) = match scope {
+    let (body, frequent_calls, stats) = match scope {
         Some(node) => tree::build(node, cfg, text, lines),
-        None => (Vec::new(), tree::Stats::default()),
+        None => (Vec::new(), Vec::new(), tree::Stats::default()),
     };
     if stats.conditional_regions > 0 {
         degraded.push(Degradation::Conditional {
@@ -95,6 +95,7 @@ fn digest_routine(
         end_line: lines.line(range.end.saturating_sub(1).max(range.start)),
         byte_range: range,
         objects,
+        frequent_calls,
         body,
         degraded,
     }

@@ -31,6 +31,14 @@ treat the copies as one source region: `Cfg::blocks_for_stmt(range)` returns
 every block holding the innermost statement that contains `range`, and
 `Cfg::path_avoiding` / `Cfg::must_pass_through_any` accept the resulting set.
 
+## Exception edges
+
+Every executable statement, condition and loop header may raise. Each ends
+its basic block and has an `ExceptionThrow` edge to the nearest enclosing
+handler (a typed or bare `except` dispatch, or a `finally` copy) or, when no
+handler encloses it, to the routine's Exit. "Can this routine raise to its
+caller" is therefore answered by an `ExceptionThrow` edge into Exit.
+
 ## Project snapshot API
 
 Project-aware builds never discover files or infer imports from spelling. The

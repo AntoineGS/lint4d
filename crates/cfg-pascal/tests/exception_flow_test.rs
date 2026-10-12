@@ -1676,7 +1676,7 @@ end.
 }
 
 #[test]
-fn implicit_exceptions_attach_to_protected_statements_and_conditions_only() {
+fn implicit_exceptions_reach_the_nearest_handler_or_exit() {
     let source = br#"
 unit ImplicitExceptions;
 interface
@@ -1733,11 +1733,14 @@ end.
     let loop_body = block_with_stmt(cfg, &source, "statement", "LoopBodyCall");
     let after_loop = block_with_stmt(cfg, &source, "statement", "AfterProtectedCall");
 
+    let before_successors = successors(cfg, before);
     assert!(
-        !successors(cfg, before)
-            .iter()
-            .any(|(_, kind)| *kind == EdgeKind::ExceptionThrow),
+        !before_successors.contains(&(handler, EdgeKind::ExceptionThrow)),
         "unprotected code before try must not enter the inner handler"
+    );
+    assert!(
+        before_successors.contains(&(cfg.exit, EdgeKind::ExceptionThrow)),
+        "unprotected code before try propagates to Exit"
     );
     for protected_block in [
         condition,
@@ -1913,6 +1916,45 @@ end.
         assert!(
             successors(cfg, cleanup).contains(&(handler, EdgeKind::ExceptionThrow)),
             "constructor evaluation exceptions must survive cleanup to the outer handler"
+        );
+    }
+}
+
+#[test]
+fn unprotected_statements_propagate_exceptions_to_exit() {
+    let source = br#"
+unit Unprotected;
+interface
+implementation
+
+procedure Straight;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  L.Add('x');
+  if L.Count > 0 then
+    L.Clear;
+  L.Free;
+end;
+
+end.
+"#
+    .to_vec();
+    let tree = parse_clean(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+    let cfg = cfg_for(&cfgs, "Straight");
+
+    let create = block_with_stmt(cfg, &source, "assignment", "TStringList.Create");
+    let add = block_with_stmt(cfg, &source, "statement", "L.Add");
+    let condition = block_with_stmt(cfg, &source, "if", "if L.Count");
+    let free = block_with_stmt(cfg, &source, "statement", "L.Free");
+    assert_ne!(create, add, "each statement that may raise ends its block");
+    assert_ne!(add, free);
+    for block in [create, add, condition, free] {
+        assert!(
+            successors(cfg, block).contains(&(cfg.exit, EdgeKind::ExceptionThrow)),
+            "unprotected block {block:?} must propagate exceptions to Exit"
         );
     }
 }

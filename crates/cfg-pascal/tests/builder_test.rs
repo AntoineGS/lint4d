@@ -37,16 +37,17 @@ fn linear_proc_has_entry_body_exit() {
 
     let cfg = find_cfg_by_name(&cfgs, "SimpleLinear");
 
-    // entry -> body -> exit = 3 blocks, 2 edges
+    // entry -> X := 1 -> X := X + 1 -> exit, each statement with an
+    // exception edge to exit = 4 blocks, 5 edges
     assert_eq!(
         cfg.graph.node_count(),
-        3,
-        "SimpleLinear should have 3 blocks (entry, body, exit)"
+        4,
+        "SimpleLinear should have 4 blocks"
     );
     assert_eq!(
         cfg.graph.edge_count(),
-        2,
-        "SimpleLinear should have 2 edges"
+        5,
+        "SimpleLinear should have 5 edges"
     );
 
     // Verify block kinds
@@ -55,21 +56,15 @@ fn linear_proc_has_entry_body_exit() {
     assert_eq!(*entry_kind, BasicBlockKind::Entry);
     assert_eq!(*exit_kind, BasicBlockKind::Exit);
 
-    // Body block should have statements
-    let body_block_idx = cfg
+    // Each statement sits in its own block
+    let statement_count: usize = cfg
         .graph
         .node_indices()
-        .find(|&idx| {
-            let b = &cfg.graph[idx];
-            b.kind == BasicBlockKind::Normal && !b.stmts.is_empty()
-        })
-        .expect("should have a normal block with statements");
-    let body = &cfg.graph[body_block_idx];
-    assert!(
-        body.stmts.len() >= 2,
-        "body should have at least 2 statements, got {}",
-        body.stmts.len()
-    );
+        .map(|idx| &cfg.graph[idx])
+        .filter(|b| b.kind == BasicBlockKind::Normal)
+        .map(|b| b.stmts.len())
+        .sum();
+    assert_eq!(statement_count, 2, "both statements should be present");
 
     // Entry is reachable to exit
     assert!(cfg.is_reachable(cfg.entry, cfg.exit));

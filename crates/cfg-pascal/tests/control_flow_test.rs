@@ -268,10 +268,16 @@ end.
 
     let exit_stmt = block_with_stmt(cfg, &source, "statement", "Exit(Value)");
     let result_assignment = block_with_stmt(cfg, &source, "assignment", "Result := 1");
-    assert_eq!(
-        successors(cfg, exit_stmt),
-        vec![(cfg.exit, EdgeKind::Normal)],
+    let exit_successors = successors(cfg, exit_stmt);
+    assert!(
+        exit_successors.contains(&(cfg.exit, EdgeKind::Normal)),
         "Exit(value) wrapped in a statement node must terminate the function"
+    );
+    assert!(
+        exit_successors
+            .iter()
+            .all(|(target, _)| *target == cfg.exit),
+        "Exit(value) only leaves to Exit: {exit_successors:?}"
     );
     assert!(!can_reach(cfg, exit_stmt, result_assignment));
 }

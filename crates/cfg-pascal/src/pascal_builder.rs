@@ -335,7 +335,10 @@ fn build_scope_cfg(
         active_finalizer_suspended_transfer: None,
         next_exception_dispatch_id: 0,
         exception_dispatch_stack: Vec::new(),
-        implicit_exception_depth: 0,
+        // Every executable statement may raise (l4d-d8d): unprotected
+        // statements propagate to Exit exactly as protected ones reach
+        // their handler.
+        implicit_exception_depth: 1,
         handled_exception_stack: Vec::new(),
         block_has_executable_stmt: HashSet::new(),
         label_scopes,
@@ -588,10 +591,10 @@ struct BuildContext<'a> {
     next_exception_dispatch_id: usize,
     /// The active handler contexts that can receive unknown exceptions.
     exception_dispatch_stack: Vec<ExceptionDispatchId>,
-    /// Nonzero while walking a try body, handler, or finally body.  This is
-    /// intentionally independent from `cleanup_scopes`: handlers/finalizers
-    /// may throw outward even though the scope whose handler they belong to
-    /// is no longer an active catch target.
+    /// Number of active exception-modelling scopes. The routine walk starts
+    /// at 1, so every executable statement ends its block and has an
+    /// exceptional edge to the nearest handler, or to Exit when none
+    /// encloses it. Try bodies, handlers and finally bodies add a level.
     implicit_exception_depth: usize,
     /// Facts for the exception currently handled by each nested handler body.
     handled_exception_stack: Vec<ExceptionTypeFact>,
@@ -1072,7 +1075,7 @@ fn walk_field_children(
 /// Handle an `ifElse` node (if/then/else).
 fn handle_if_else(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Flow {
     let condition_block = prepare_condition_block(ctx, node, current);
-    let mut transfers = implicit_exception_transfers(ctx, condition_block);
+    let mut transfers = implicit_exception_transfers(condition_block);
 
     let then_block = new_block(ctx, BasicBlockKind::Normal);
     let else_block = new_block(ctx, BasicBlockKind::Normal);
@@ -1094,7 +1097,7 @@ fn handle_if_else(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> F
 /// Handle an `if` node (if/then without else).
 fn handle_if_only(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Flow {
     let condition_block = prepare_condition_block(ctx, node, current);
-    let mut transfers = implicit_exception_transfers(ctx, condition_block);
+    let mut transfers = implicit_exception_transfers(condition_block);
 
     let then_block = new_block(ctx, BasicBlockKind::Normal);
     let join = new_block(ctx, BasicBlockKind::Normal);
@@ -1144,7 +1147,7 @@ fn handle_for_or_while(ctx: &mut BuildContext<'_>, node: Node, current: BlockId)
 
     ctx.builder.add_edge(current, cond_block, EdgeKind::Normal);
     add_loop_header_stmt(ctx, cond_block, node);
-    let mut transfers = implicit_exception_transfers(ctx, cond_block);
+    let mut transfers = implicit_exception_transfers(cond_block);
 
     ctx.builder
         .add_edge(cond_block, body_block, EdgeKind::ConditionalTrue);
@@ -1212,7 +1215,7 @@ fn handle_repeat(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Fl
         ctx.builder.add_edge(body_end, cond_block, EdgeKind::Normal);
     }
 
-    let mut transfers = implicit_exception_transfers(ctx, cond_block);
+    let mut transfers = implicit_exception_transfers(cond_block);
     for transfer in body_flow.transfers {
         if transfer.kind == TransferKind::Break && transfer.target == Some(after_block) {
             ctx.builder.add_edge(
@@ -1254,7 +1257,7 @@ fn handle_case(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Flow
             node.start_byte()..selector.end_byte(),
         );
     }
-    let mut transfers = implicit_exception_transfers(ctx, selector_block);
+    let mut transfers = implicit_exception_transfers(selector_block);
     let mut normal_ends = Vec::new();
 
     let mut cursor = node.walk();
@@ -1317,7 +1320,7 @@ fn handle_with(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Flow
             node.start_byte()..entity.end_byte(),
         );
     }
-    let mut transfers = implicit_exception_transfers(ctx, context_block);
+    let mut transfers = implicit_exception_transfers(context_block);
 
     let body_block = new_block(ctx, BasicBlockKind::Normal);
     ctx.builder
@@ -1455,9 +1458,7 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
             };
             let mut transfers = Vec::new();
             if raise_may_throw_during_evaluation(child, ctx.source) {
-                if ctx.implicit_exception_depth > 0 {
-                    transfers.push(PendingTransfer::exception(statement_block));
-                }
+                transfers.push(PendingTransfer::exception(statement_block));
                 let successful_raise = new_block(ctx, BasicBlockKind::Normal);
                 ctx.builder
                     .add_edge(statement_block, successful_raise, EdgeKind::Normal);
@@ -1483,7 +1484,7 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
             add_stmt_ref(ctx, statement_block, child);
             let mut transfers = vec![PendingTransfer::exit(statement_block)];
             if exit_has_argument(child, ctx.source) {
-                transfers.extend(implicit_exception_transfers(ctx, statement_block));
+                transfers.extend(implicit_exception_transfers(statement_block));
             }
             Flow {
                 normal: None,
@@ -1557,7 +1558,7 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
             add_stmt_ref(ctx, statement_block, child);
             Flow {
                 normal: Some(statement_block),
-                transfers: implicit_exception_transfers(ctx, statement_block),
+                transfers: implicit_exception_transfers(statement_block),
             }
         }
     }
@@ -2344,10 +2345,9 @@ fn label_name_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     direct_child(node, "identifier").or_else(|| direct_child(node, "labelNumber"))
 }
 
-/// Use a fresh protected block after an existing statement. Unprotected
-/// straight-line code remains coalesced into the historical body block.
+/// Start a fresh block for an executable statement when the current block already holds one, so its exceptional edge covers only that statement.
 fn prepare_statement_block(ctx: &mut BuildContext<'_>, current: BlockId) -> BlockId {
-    if ctx.implicit_exception_depth == 0 || !ctx.block_has_executable_stmt.contains(&current) {
+    if !ctx.block_has_executable_stmt.contains(&current) {
         return current;
     }
 
@@ -2356,12 +2356,8 @@ fn prepare_statement_block(ctx: &mut BuildContext<'_>, current: BlockId) -> Bloc
     next
 }
 
-fn implicit_exception_transfers(ctx: &BuildContext<'_>, source: BlockId) -> Vec<PendingTransfer> {
-    if ctx.implicit_exception_depth == 0 {
-        Vec::new()
-    } else {
-        vec![PendingTransfer::exception(source)]
-    }
+fn implicit_exception_transfers(source: BlockId) -> Vec<PendingTransfer> {
+    vec![PendingTransfer::exception(source)]
 }
 
 /// Add a source-level statement reference and remember that the block is no

@@ -2113,22 +2113,24 @@ pub fn project_candidates_with_work_budget_and_deleted_paths(
     work_budget: Option<&dyn ProjectWorkBudget>,
     deleted_paths: &[PathBuf],
 ) -> Result<ProjectCandidates, String> {
-    check_project_scan_cancel(cancel)?;
-    if let Some(work_budget) = work_budget {
-        work_budget.check_cancelled()?;
-    }
-    let mut warnings = Vec::new();
-    let absolute_file = absolute_lexical(file)?;
-    let file_path = discovery_file_path(&absolute_file, &mut warnings);
-    let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
-    let relevant_root = relevant_workspace_root(&file_path, &roots);
-    find_project_candidates(
-        &file_path,
-        relevant_root.as_deref(),
-        cancel,
-        work_budget,
-        deleted_paths,
-    )
+    with_path_resolution_cancel(cancel, || {
+        check_project_scan_cancel(cancel)?;
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+        }
+        let mut warnings = Vec::new();
+        let absolute_file = absolute_lexical(file)?;
+        let file_path = discovery_file_path(&absolute_file, &mut warnings);
+        let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
+        let relevant_root = relevant_workspace_root(&file_path, &roots);
+        find_project_candidates(
+            &file_path,
+            relevant_root.as_deref(),
+            cancel,
+            work_budget,
+            deleted_paths,
+        )
+    })
 }
 
 pub fn discover_with_selections(
@@ -10186,6 +10188,34 @@ mod tests {
         fn charge_file_bytes(&self, _amount: usize) -> Result<(), String> {
             self.tick()
         }
+    }
+
+    #[test]
+    fn project_candidate_path_resolution_sees_the_cancel_token() {
+        // TASK-101: a token set after the entry check must stop the
+        // case-insensitive walk that resolves the source file's spelling.
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().to_path_buf();
+        fs::write(root.join("Unit1.pas"), b"unit Unit1;\nend.\n").expect("unit");
+        let requested = root.join("UNIT1.PAS");
+        let cancel = AtomicBool::new(false);
+        let budget = FlagSettingBudget {
+            calls: Cell::new(0),
+            set_on_call: 1,
+            cancel: &cancel,
+        };
+
+        let (result, read_dirs) = with_path_resolution_read_dir_count(|| {
+            super::project_candidates_with_work_budget(
+                &requested,
+                std::slice::from_ref(&root),
+                Some(&cancel),
+                Some(&budget),
+            )
+        });
+
+        assert!(result.is_err(), "cancelled request returned {result:?}");
+        assert_eq!(read_dirs, 0, "a cancelled walk must not list directories");
     }
 
     #[test]

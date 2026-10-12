@@ -746,9 +746,11 @@ end.
     let normal_tail = normal_tail_cleanups[0];
     let exit_tail = exit_tail_cleanups[0];
 
-    assert!(work_blocks
-        .iter()
-        .any(|work| can_reach_non_exception(cfg, *work, normal_inner)));
+    assert!(
+        work_blocks
+            .iter()
+            .any(|work| can_reach_non_exception(cfg, *work, normal_inner))
+    );
     assert!(can_reach_non_exception(cfg, normal_inner, normal_tail));
     assert!(can_reach_non_exception(cfg, normal_tail, after_try));
     assert!(can_reach_non_exception(cfg, exit_stmt, exit_inner));
@@ -765,9 +767,11 @@ end.
             .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &[after_try]) }),
         "normal completion must not reach the Exit continuation"
     );
-    assert!(work_blocks
-        .iter()
-        .all(|work| !can_reach_non_exception(cfg, *work, exit_inner)));
+    assert!(
+        work_blocks
+            .iter()
+            .all(|work| !can_reach_non_exception(cfg, *work, exit_inner))
+    );
     assert!(!can_reach_non_exception(cfg, exit_stmt, normal_inner));
     assert!(!successors(cfg, normal_inner).contains(&(exit_tail, EdgeKind::FinallyExit)));
     assert!(!successors(cfg, exit_inner).contains(&(normal_tail, EdgeKind::FinallyExit)));
@@ -829,18 +833,22 @@ end.
     assert_eq!(normal_deep_cleanups.len(), 1);
     assert_eq!(exit_deep_cleanups.len(), 1);
     assert_ne!(normal_deep_cleanups[0], exit_deep_cleanups[0]);
-    assert!(work_blocks
-        .iter()
-        .any(|work| { can_reach_non_exception(cfg, *work, normal_deep_cleanups[0]) }));
+    assert!(
+        work_blocks
+            .iter()
+            .any(|work| { can_reach_non_exception(cfg, *work, normal_deep_cleanups[0]) })
+    );
     assert!(can_reach_non_exception(
         cfg,
         exit_stmt,
         exit_deep_cleanups[0]
     ));
     assert!(!can_reach_non_exception(cfg, exit_stmt, after_try));
-    assert!(work_blocks
-        .iter()
-        .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &[after_try]) }));
+    assert!(
+        work_blocks
+            .iter()
+            .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &[after_try]) })
+    );
 }
 
 #[test]
@@ -900,21 +908,31 @@ end.
     });
     let fresh_exit = exits[1];
 
-    assert!(inner_work
-        .iter()
-        .any(|work| can_reach_non_exception(cfg, *work, tail_cleanup[0])));
-    assert!(inner_work
-        .iter()
-        .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &tail_cleanup) }));
-    assert!(deep_cleanup
-        .iter()
-        .any(|cleanup| can_reach_non_exception(cfg, fresh_exit, *cleanup)));
-    assert!(!tail_cleanup
-        .iter()
-        .any(|tail| can_reach(cfg, fresh_exit, *tail)));
-    assert!(inner_tail
-        .iter()
-        .any(|tail| can_reach_non_exception(cfg, fresh_exit, *tail)));
+    assert!(
+        inner_work
+            .iter()
+            .any(|work| can_reach_non_exception(cfg, *work, tail_cleanup[0]))
+    );
+    assert!(
+        inner_work
+            .iter()
+            .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &tail_cleanup) })
+    );
+    assert!(
+        deep_cleanup
+            .iter()
+            .any(|cleanup| can_reach_non_exception(cfg, fresh_exit, *cleanup))
+    );
+    assert!(
+        !tail_cleanup
+            .iter()
+            .any(|tail| can_reach(cfg, fresh_exit, *tail))
+    );
+    assert!(
+        inner_tail
+            .iter()
+            .any(|tail| can_reach_non_exception(cfg, fresh_exit, *tail))
+    );
 }
 
 #[test]
@@ -963,21 +981,31 @@ end.
     assert!(!inner_tail.is_empty());
     assert!(!tail_cleanup.is_empty());
 
-    assert!(inner_work
-        .iter()
-        .any(|work| can_reach_non_exception(cfg, *work, tail_cleanup[0])));
-    assert!(inner_work
-        .iter()
-        .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &tail_cleanup) }));
-    assert!(deep_cleanup
-        .iter()
-        .any(|cleanup| can_reach(cfg, fresh_raise, *cleanup)));
-    assert!(!tail_cleanup
-        .iter()
-        .any(|tail| can_reach(cfg, fresh_raise, *tail)));
-    assert!(inner_tail
-        .iter()
-        .any(|tail| can_reach(cfg, fresh_raise, *tail)));
+    assert!(
+        inner_work
+            .iter()
+            .any(|work| can_reach_non_exception(cfg, *work, tail_cleanup[0]))
+    );
+    assert!(
+        inner_work
+            .iter()
+            .all(|work| { !can_reach_non_exception_avoiding(cfg, *work, cfg.exit, &tail_cleanup) })
+    );
+    assert!(
+        deep_cleanup
+            .iter()
+            .any(|cleanup| can_reach(cfg, fresh_raise, *cleanup))
+    );
+    assert!(
+        !tail_cleanup
+            .iter()
+            .any(|tail| can_reach(cfg, fresh_raise, *tail))
+    );
+    assert!(
+        inner_tail
+            .iter()
+            .any(|tail| can_reach(cfg, fresh_raise, *tail))
+    );
 }
 
 #[test]
@@ -1249,9 +1277,11 @@ end.
     assert_local_catch(normal_cfg);
     let normal_work = blocks_with_stmt(normal_cfg, &source, "statement", "Work");
     let after_normal = block_with_stmt(normal_cfg, &source, "statement", "AfterNormal");
-    assert!(normal_work
-        .iter()
-        .any(|work| can_reach(normal_cfg, *work, after_normal)));
+    assert!(
+        normal_work
+            .iter()
+            .any(|work| can_reach(normal_cfg, *work, after_normal))
+    );
 
     let exit_cfg = cfg_for(&cfgs, "ExitCaught");
     assert_local_catch(exit_cfg);
@@ -1401,9 +1431,11 @@ end.
         successors(cfg, inner_cleanup).contains(&(after_loop, EdgeKind::FinallyExit)),
         "Break must leave the inner finalizer at the loop target"
     );
-    assert!(successors(cfg, break_stmt)
-        .iter()
-        .any(|(target, kind)| *target == inner_cleanup && *kind == EdgeKind::FinallyEntry));
+    assert!(
+        successors(cfg, break_stmt)
+            .iter()
+            .any(|(target, kind)| *target == inner_cleanup && *kind == EdgeKind::FinallyEntry)
+    );
     assert!(
         successors(cfg, inner_cleanup)
             .iter()
@@ -1448,15 +1480,18 @@ end.
     let inner_cleanup = block_with_stmt(cfg, &source, "statement", "InnerCleanup");
     let outer_cleanups = blocks_with_stmt(cfg, &source, "statement", "OuterCleanup");
 
-    assert!(successors(cfg, continue_stmt)
-        .iter()
-        .any(|(target, kind)| *target == inner_cleanup && *kind == EdgeKind::FinallyEntry));
+    assert!(
+        successors(cfg, continue_stmt)
+            .iter()
+            .any(|(target, kind)| *target == inner_cleanup && *kind == EdgeKind::FinallyEntry)
+    );
     assert!(successors(cfg, inner_cleanup).contains(&(condition, EdgeKind::FinallyExit)));
-    assert!(successors(cfg, inner_cleanup)
-        .iter()
-        .all(
-            |(target, kind)| !(*kind == EdgeKind::FinallyEntry && outer_cleanups.contains(target))
-        ));
+    assert!(
+        successors(cfg, inner_cleanup)
+            .iter()
+            .all(|(target, kind)| !(*kind == EdgeKind::FinallyEntry
+                && outer_cleanups.contains(target)))
+    );
 }
 
 #[test]
@@ -1586,8 +1621,10 @@ end.
     let repeat_condition = blocks_containing_text(repeat_cfg, &source, "RepeatConditionCall");
     assert_eq!(repeat_condition.len(), 1);
     let repeat_condition = repeat_condition[0];
-    assert!(successors(repeat_cfg, repeat_condition)
-        .contains(&(repeat_handler, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(repeat_cfg, repeat_condition)
+            .contains(&(repeat_handler, EdgeKind::ExceptionThrow))
+    );
     assert!(
         successors(repeat_cfg, repeat_body).contains(&(repeat_handler, EdgeKind::ExceptionThrow))
     );
@@ -1597,9 +1634,11 @@ end.
         .filter_map(|stmt| std::str::from_utf8(&source[stmt.byte_range.clone()]).ok())
         .filter(|text| text.contains("RepeatConditionCall"))
         .collect();
-    assert!(repeat_condition_texts
-        .iter()
-        .all(|text| !text.contains("RepeatBodyCall")));
+    assert!(
+        repeat_condition_texts
+            .iter()
+            .all(|text| !text.contains("RepeatBodyCall"))
+    );
 }
 
 #[test]

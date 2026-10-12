@@ -1,6 +1,6 @@
 use crate::summary::*;
-use petgraph::graph::DiGraph;
 use petgraph::Direction;
+use petgraph::graph::DiGraph;
 use std::collections::HashMap;
 
 #[derive(Debug)]

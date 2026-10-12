@@ -94,7 +94,7 @@ pub(super) fn incoming(
     let mut result_budget = ResultBudget::default();
     for (uri, document) in &index.documents {
         let root = document.tree.root_node();
-        scan_calls(root, &mut budget, cancel, &mut |call| {
+        scan_calls(root, &mut budget, cancel, &mut |call, entity| {
             let span = Span::from_node(call);
             if document.conditionals.is_unknown_at(span.start)
                 || document.has_parser_recovery_near(span)
@@ -108,7 +108,7 @@ pub(super) fn incoming(
                 return Ok(());
             }
             let Some((callee_uri, callee)) =
-                resolve_call(index, uri, document, call, cancel, &mut binding_budget)?
+                resolve_call(index, uri, document, entity, cancel, &mut binding_budget)?
             else {
                 return Ok(());
             };
@@ -121,9 +121,6 @@ pub(super) fn incoming(
             {
                 return Ok(());
             }
-            let entity = call
-                .child_by_field_name("entity")
-                .ok_or_else(|| "call has no entity".to_string())?;
             let Some(range) = byte_range(&document.source, entity.start_byte(), entity.end_byte())
             else {
                 return Ok(());
@@ -188,7 +185,7 @@ pub(super) fn outgoing(
         document.tree.root_node(),
         &mut budget,
         cancel,
-        &mut |call| {
+        &mut |call, entity| {
             let span = Span::from_node(call);
             if !caller.declaration_span.contains(span)
                 || document.conditionals.is_unknown_at(span.start)
@@ -207,7 +204,7 @@ pub(super) fn outgoing(
                 index,
                 &caller_uri,
                 document,
-                call,
+                entity,
                 cancel,
                 &mut binding_budget,
             )?
@@ -221,9 +218,6 @@ pub(super) fn outgoing(
                 .documents
                 .get(&callee_uri)
                 .ok_or_else(|| "resolved call target source is unavailable".to_string())?;
-            let entity = call
-                .child_by_field_name("entity")
-                .ok_or_else(|| "call has no entity".to_string())?;
             let Some(range) = byte_range(&document.source, entity.start_byte(), entity.end_byte())
             else {
                 return Ok(());
@@ -356,14 +350,11 @@ fn resolve_call<'a>(
     index: &'a NavigationIndex,
     uri: &Url,
     document: &super::ParsedDocument,
-    call: Node<'_>,
+    entity: Node<'_>,
     cancel: &AtomicBool,
     binding_budget: &mut super::AssistanceBudget,
 ) -> Result<Option<(Url, &'a Symbol)>, String> {
     check_cancel(cancel)?;
-    let Some(entity) = call.child_by_field_name("entity") else {
-        return Ok(None);
-    };
     if !is_direct_callee_entity(entity) {
         return Ok(None);
     }
@@ -427,11 +418,16 @@ fn containing_caller(document: &super::ParsedDocument, span: Span) -> Option<(us
         })
 }
 
+/// Visits each call site with its callee designator: an `exprCall` and its
+/// entity, or a statement that is only a name or member access (`Touch;`,
+/// `Obj.Post;`). dcc rejects any expression statement that is not a call, so
+/// such a statement always calls; resolution decides whether the target is a
+/// routine or, say, a procedural variable.
 fn scan_calls(
     node: Node<'_>,
     budget: &mut ScanBudget,
     cancel: &AtomicBool,
-    visit: &mut impl FnMut(Node<'_>) -> Result<(), String>,
+    visit: &mut impl FnMut(Node<'_>, Node<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
@@ -440,12 +436,17 @@ fn scan_calls(
         if budget.visits > MAX_NODE_VISITS {
             return Err("call hierarchy AST scan work limit exceeded".to_string());
         }
-        if node.kind() == "exprCall" {
+        let entity = match node.kind() {
+            "exprCall" => node.child_by_field_name("entity"),
+            "statement" => bare_call_entity(node),
+            _ => None,
+        };
+        if let Some(entity) = entity {
             budget.calls += 1;
             if budget.calls > MAX_CALLS {
                 return Err("call hierarchy call limit exceeded".to_string());
             }
-            visit(node)?;
+            visit(node, entity)?;
         }
         for index in (0..node.child_count()).rev() {
             if let Some(child) = node.child(index) {
@@ -454,6 +455,16 @@ fn scan_calls(
         }
     }
     Ok(())
+}
+
+fn bare_call_entity(statement: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = statement.walk();
+    let mut children = statement
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let entity = children.next()?;
+    (children.next().is_none() && matches!(entity.kind(), "identifier" | "exprDot"))
+        .then_some(entity)
 }
 
 #[derive(Default)]

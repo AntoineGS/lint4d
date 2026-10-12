@@ -405,3 +405,159 @@ end;
         }
     );
 }
+
+#[test]
+fn free_inside_with_body_is_unknown() {
+    let body = "procedure Wi;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    with Obj do
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wi"),
+        Verdict::Unknown {
+            why: "named inside with at L13".into()
+        }
+    );
+}
+
+#[test]
+fn creation_inside_with_body_is_unknown() {
+    let body = "procedure Wc;
+var
+  L: TStringList;
+begin
+  with Obj do
+    L := TStringList.Create;
+  L.Free;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wc"),
+        Verdict::Unknown {
+            why: "named inside with at L9".into()
+        }
+    );
+}
+
+#[test]
+fn with_subject_is_not_ambiguous() {
+    let body = "procedure Ws;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    with L do
+      Add('x');
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Ws"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_initialization_before_creation_is_not_a_reassignment() {
+    let body = "procedure Ni;
+var
+  L: TStringList;
+begin
+  L := nil;
+  try
+    L := TStringList.Create;
+    Work;
+  finally
+    L.Free;
+  end;
+  L := nil;
+end;
+";
+    assert_eq!(verdict(body, "Ni"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_assignment_reachable_from_the_creation_is_a_reassignment() {
+    let body = "procedure Nr2;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  L := nil;
+  L.Free;
+end;
+";
+    assert_eq!(
+        verdict(body, "Nr2"),
+        Verdict::Unknown {
+            why: "reassigned at L9".into()
+        }
+    );
+}
+
+#[test]
+fn assigned_guarded_free_covers_the_nil_path() {
+    let body = "procedure Ag;
+var
+  L: TStringList;
+begin
+  L := nil;
+  try
+    L := TStringList.Create;
+    Work;
+  finally
+    if Assigned(L) then
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Ag"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_comparison_guarded_free_covers_the_nil_path() {
+    let body = "procedure Nc;
+var
+  M: TStringList;
+begin
+  M := TStringList.Create;
+  try
+    Work;
+  finally
+    if not (M = nil) then
+      M.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Nc"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn guard_on_another_variable_does_not_cover_the_free() {
+    let body = "procedure Go(M: TObject);
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    if Assigned(M) then
+      L.Free;
+  end;
+end;
+";
+    assert!(
+        matches!(verdict(body, "Go"), Verdict::Escapes { .. }),
+        "the false branch of Assigned(M) skips the free of L"
+    );
+}

@@ -70,3 +70,30 @@ fn bare_except_passes_with_on_clause() {
         .collect();
     assert!(matches.is_empty());
 }
+
+fn lint_source(source: &str) -> Vec<lint4d::engine::Diagnostic> {
+    let file = FileInfo::new(PathBuf::from("x.pas"));
+    let config = "version = 1".parse::<Config>().unwrap();
+    run_lint(&file, source.as_bytes(), &config)
+}
+
+#[test]
+fn raise_in_destructor_reports_bare_reraise_outside_try_except() {
+    let source = "unit X;\ninterface\ntype\n  TFoo = class\n    destructor Destroy; override;\n  end;\nimplementation\ndestructor TFoo.Destroy;\nbegin\n  try\n    Cleanup;\n  finally\n    Release;\n  end;\n  raise;\nend;\nend.\n";
+    let lines: Vec<_> = lint_source(source)
+        .iter()
+        .filter(|d| d.rule_id == "raise-in-destructor")
+        .map(|d| (d.line, d.column))
+        .collect();
+    assert_eq!(lines, [(15, 3)]);
+}
+
+#[test]
+fn raise_in_destructor_skips_bare_reraise_inside_except() {
+    let source = "unit X;\ninterface\ntype\n  TFoo = class\n    destructor Destroy; override;\n  end;\nimplementation\ndestructor TFoo.Destroy;\nbegin\n  try\n    Cleanup;\n  except\n    Log;\n    raise;\n  end;\nend;\nend.\n";
+    let matches: Vec<_> = lint_source(source)
+        .into_iter()
+        .filter(|d| d.rule_id == "raise-in-destructor")
+        .collect();
+    assert!(matches.is_empty(), "{matches:?}");
+}

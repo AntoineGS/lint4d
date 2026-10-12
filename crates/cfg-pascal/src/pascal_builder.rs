@@ -7,9 +7,9 @@ use cfg_core::{BasicBlockKind, BlockId, Cfg, CfgBuildSink, DefaultCfgBuilder, Ed
 use tree_sitter::Node;
 
 use crate::constructs::{
-    exit_has_argument, is_break_call, is_continue_call, is_exit_call, node_text,
-    raise_may_throw_during_evaluation, raised_exception_type, Flow, LabelBindingId, LoopFrame,
-    PendingTransfer, ScopeId, TransferKind,
+    Flow, LabelBindingId, LoopFrame, PendingTransfer, ScopeId, TransferKind, exit_has_argument,
+    is_break_call, is_continue_call, is_exit_call, node_text, raise_may_throw_during_evaluation,
+    raised_exception_type,
 };
 use crate::exception_types::{ExceptionTypeFact, ExceptionTypeIndex, TypeMatch, UnitKey};
 use crate::project::{ProjectBuildError, ProjectSnapshot, ProjectUnitId};
@@ -246,10 +246,9 @@ fn direct_named_child<'tree, const N: usize>(
     kinds: [&str; N],
 ) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let child = node
-        .named_children(&mut cursor)
-        .find(|child| kinds.contains(&child.kind()));
-    child
+
+    node.named_children(&mut cursor)
+        .find(|child| kinds.contains(&child.kind()))
 }
 
 fn extract_module_name(module: Node, source: &[u8]) -> Option<String> {
@@ -486,10 +485,10 @@ fn proc_header<'tree>(def_proc: Node<'tree>) -> Option<Node<'tree>> {
     }
 
     let mut cursor = def_proc.walk();
-    let header = def_proc
+
+    def_proc
         .children(&mut cursor)
-        .find(|child| child.kind() == "declProc");
-    header
+        .find(|child| child.kind() == "declProc")
 }
 
 /// Extract the complete lexical procedure/function name from a `defProc` node.
@@ -766,10 +765,10 @@ fn preprocessor_path(
     let mut path = Vec::new();
     let mut binding = Some(start);
     while let Some(candidate) = binding {
-        if let Some(source) = ctx.preprocessor_binding_sources.get(&candidate) {
-            if let Some(info) = ctx.preprocessor_branch_info.get(source) {
-                path.push((info.group, info.index));
-            }
+        if let Some(source) = ctx.preprocessor_binding_sources.get(&candidate)
+            && let Some(info) = ctx.preprocessor_branch_info.get(source)
+        {
+            path.push((info.group, info.index));
         }
         binding = parent_label_binding(ctx, candidate);
     }
@@ -1342,14 +1341,14 @@ fn handle_with(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) -> Flow
 
 fn case_selector<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let selector = node.named_children(&mut cursor).find(|child| {
+
+    node.named_children(&mut cursor).find(|child| {
         !child.is_extra()
             && !matches!(
                 child.kind(),
                 "caseCase" | "kCase" | "kOf" | "kElse" | "kOtherwise" | "kEnd"
             )
-    });
-    selector
+    })
 }
 
 fn case_default_children<'tree>(node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
@@ -1877,11 +1876,11 @@ fn handle_try_finally(ctx: &mut BuildContext<'_>, node: Node, current: BlockId) 
     let mut output = Flow::default();
     let mut groups = Vec::new();
     for input in inputs {
-        if let FinalizerInput::Transfer(transfer) = &input {
-            if !transfer.leaves_scope(scope_id) {
-                output.transfers.push(transfer.clone());
-                continue;
-            }
+        if let FinalizerInput::Transfer(transfer) = &input
+            && !transfer.leaves_scope(scope_id)
+        {
+            output.transfers.push(transfer.clone());
+            continue;
         }
 
         let key = match &input {
@@ -2066,8 +2065,8 @@ fn node_contains_goto(node: Node) -> bool {
     }
 
     let mut cursor = node.walk();
-    let result = node.named_children(&mut cursor).any(node_contains_goto);
-    result
+
+    node.named_children(&mut cursor).any(node_contains_goto)
 }
 
 /// Handle a `try..except` block.
@@ -2335,10 +2334,9 @@ fn add_repeat_header_stmts(ctx: &mut BuildContext<'_>, block: BlockId, node: Nod
 
 fn direct_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let child = node
-        .children(&mut cursor)
-        .find(|child| child.kind() == kind);
-    child
+
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
 fn label_name_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {

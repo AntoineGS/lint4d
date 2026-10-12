@@ -2,9 +2,9 @@ use std::process::Command;
 
 use cfg_core::{BlockId, Cfg, EdgeKind};
 use cfg_pascal::{
-    build_file_cfgs_in_project, prepare_source, ImportBinding, ImportTarget, IncludeBinding,
-    PreparationEnvironment, PrepareSourceOptions, PreparedSource, ProjectSnapshot, ProjectSourceId,
-    ProjectUnitId, ProjectUnitInput, SourceSegmentKind, SourceSnapshot, UsesSite,
+    ImportBinding, ImportTarget, IncludeBinding, PreparationEnvironment, PrepareSourceOptions,
+    PreparedSource, ProjectSnapshot, ProjectSourceId, ProjectUnitId, ProjectUnitInput,
+    SourceSegmentKind, SourceSnapshot, UsesSite, build_file_cfgs_in_project, prepare_source,
 };
 
 fn source(id: &str, bytes: &[u8]) -> SourceSnapshot {
@@ -360,10 +360,12 @@ fn include_eof_keyword_gets_a_separator_before_parent_expression() {
         .windows(included.len())
         .position(|window| window == included)
         .expect("included keyword");
-    assert!(prepared
-        .bytes()
-        .get(raise_start + included.len())
-        .is_some_and(u8::is_ascii_whitespace));
+    assert!(
+        prepared
+            .bytes()
+            .get(raise_start + included.len())
+            .is_some_and(u8::is_ascii_whitespace)
+    );
     assert!(prepared.tree().root_node().to_sexp().contains("kRaise"));
 }
 
@@ -514,10 +516,12 @@ end.
             "missing active text {text:?}"
         );
     }
-    assert!(!prepared
-        .bytes()
-        .windows(b"MustNotAppear".len())
-        .any(|window| window == b"MustNotAppear"));
+    assert!(
+        !prepared
+            .bytes()
+            .windows(b"MustNotAppear".len())
+            .any(|window| window == b"MustNotAppear")
+    );
 }
 
 #[test]
@@ -548,14 +552,18 @@ end.
         options,
     )
     .expect("include expansion is textual for conditional nesting");
-    assert!(prepared
-        .bytes()
-        .windows(b"Included".len())
-        .any(|w| w == b"Included"));
-    assert!(prepared
-        .bytes()
-        .windows(b"RootInside".len())
-        .any(|w| w == b"RootInside"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"Included".len())
+            .any(|w| w == b"Included")
+    );
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"RootInside".len())
+            .any(|w| w == b"RootInside")
+    );
 }
 
 #[test]
@@ -781,14 +789,18 @@ end.
         options(),
     )
     .expect("balanced quoted include paths are supported");
-    assert!(quoted
-        .bytes()
-        .windows(b"Selected;".len())
-        .any(|w| w == b"Selected;"));
-    assert!(quoted
-        .bytes()
-        .windows(b"Other;".len())
-        .any(|w| w == b"Other;"));
+    assert!(
+        quoted
+            .bytes()
+            .windows(b"Selected;".len())
+            .any(|w| w == b"Selected;")
+    );
+    assert!(
+        quoted
+            .bytes()
+            .windows(b"Other;".len())
+            .any(|w| w == b"Other;")
+    );
 }
 
 #[test]
@@ -1159,10 +1171,12 @@ end.
         b"Inner".as_slice(),
         b"OuterAfter".as_slice(),
     ] {
-        assert!(prepared
-            .bytes()
-            .windows(text.len())
-            .any(|window| window == text));
+        assert!(
+            prepared
+                .bytes()
+                .windows(text.len())
+                .any(|window| window == text)
+        );
     }
     let inner_start = prepared
         .bytes()
@@ -1172,10 +1186,12 @@ end.
     let mapped = prepared.map_range(inner_start..inner_start + 5).unwrap();
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0].original.as_ref().unwrap().source_id, inner_id);
-    assert!(mapped[0]
-        .expansion_id
-        .as_str()
-        .contains("include-1/include-2"));
+    assert!(
+        mapped[0]
+            .expansion_id
+            .as_str()
+            .contains("include-1/include-2")
+    );
 }
 
 #[test]
@@ -1278,14 +1294,18 @@ end.
     )
     .expect("complete conditional preparation");
 
-    assert!(prepared
-        .bytes()
-        .windows(b"Keep".len())
-        .any(|w| w == b"Keep"));
-    assert!(!prepared
-        .bytes()
-        .windows(b"Drop".len())
-        .any(|w| w == b"Drop"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"Keep".len())
+            .any(|w| w == b"Keep")
+    );
+    assert!(
+        !prepared
+            .bytes()
+            .windows(b"Drop".len())
+            .any(|w| w == b"Drop")
+    );
     assert!(prepared.bytes().windows(b"{$".len()).all(|w| w != b"{$"));
     assert_eq!(prepared.bytes().len(), bytes.len());
 
@@ -1331,14 +1351,18 @@ end.
     )
     .expect("parenthesized boolean condition");
 
-    assert!(prepared
-        .bytes()
-        .windows(b"Keep".len())
-        .any(|w| w == b"Keep"));
-    assert!(!prepared
-        .bytes()
-        .windows(b"Drop".len())
-        .any(|w| w == b"Drop"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"Keep".len())
+            .any(|w| w == b"Keep")
+    );
+    assert!(
+        !prepared
+            .bytes()
+            .windows(b"Drop".len())
+            .any(|w| w == b"Drop")
+    );
 }
 
 #[test]
@@ -1383,10 +1407,12 @@ end.
         ),
     )
     .expect("complete environment treats absent symbols as false");
-    assert!(!complete
-        .bytes()
-        .windows(b"External".len())
-        .any(|window| window == b"External"));
+    assert!(
+        !complete
+            .bytes()
+            .windows(b"External".len())
+            .any(|window| window == b"External")
+    );
 }
 
 #[test]
@@ -1418,10 +1444,12 @@ end.
     )
     .expect("short-circuiting conditions are known");
 
-    assert!(prepared
-        .bytes()
-        .windows(b"KeepOr".len())
-        .any(|w| w == b"KeepOr"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"KeepOr".len())
+            .any(|w| w == b"KeepOr")
+    );
     for text in [b"DropAnd".as_slice(), b"DropElse".as_slice()] {
         assert!(!prepared.bytes().windows(text.len()).any(|w| w == text));
     }
@@ -1440,10 +1468,12 @@ fn long_boolean_chains_are_evaluated_without_recursive_ast_walks() {
 
     let prepared = prepare_source(&root_id, &[source(root_id.as_str(), &bytes)], &[], options)
         .expect("a long bounded boolean chain should evaluate successfully");
-    assert!(prepared
-        .bytes()
-        .windows(b"Keep".len())
-        .any(|w| w == b"Keep"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"Keep".len())
+            .any(|w| w == b"Keep")
+    );
 }
 
 #[test]
@@ -1463,10 +1493,12 @@ fn large_flat_boolean_chain_is_stack_safe_under_default_limits_in_a_subprocess()
                     options(),
                 )
                 .expect("default limits should not abort on a flat boolean chain");
-                assert!(prepared
-                    .bytes()
-                    .windows(b"Keep".len())
-                    .any(|w| w == b"Keep"));
+                assert!(
+                    prepared
+                        .bytes()
+                        .windows(b"Keep".len())
+                        .any(|w| w == b"Keep")
+                );
             })
             .expect("spawn small-stack probe")
             .join();
@@ -1543,22 +1575,30 @@ end.
     )
     .expect("source-order symbol mutations");
 
-    assert!(prepared
-        .bytes()
-        .windows(b"const First = 1".len())
-        .any(|w| w == b"const First = 1"));
-    assert!(prepared
-        .bytes()
-        .windows(b"const Second = 2".len())
-        .any(|w| w == b"const Second = 2"));
-    assert!(!prepared
-        .bytes()
-        .windows(b"const First = 2".len())
-        .any(|w| w == b"const First = 2"));
-    assert!(!prepared
-        .bytes()
-        .windows(b"const Second = 1".len())
-        .any(|w| w == b"const Second = 1"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"const First = 1".len())
+            .any(|w| w == b"const First = 1")
+    );
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"const Second = 2".len())
+            .any(|w| w == b"const Second = 2")
+    );
+    assert!(
+        !prepared
+            .bytes()
+            .windows(b"const First = 2".len())
+            .any(|w| w == b"const First = 2")
+    );
+    assert!(
+        !prepared
+            .bytes()
+            .windows(b"const Second = 1".len())
+            .any(|w| w == b"const Second = 1")
+    );
 }
 
 #[test]
@@ -1599,20 +1639,28 @@ end.
     )
     .expect("only real directives are executed");
 
-    assert!(prepared
-        .bytes()
-        .windows(b"StringBrace = '{$IFDEF NOT_A_DIRECTIVE}'".len())
-        .any(|window| window == b"StringBrace = '{$IFDEF NOT_A_DIRECTIVE}'"));
-    assert!(prepared
-        .bytes()
-        .windows(b"StringParen = '(*$IFDEF NOT_A_DIRECTIVE*)'".len())
-        .any(|window| window == b"StringParen = '(*$IFDEF NOT_A_DIRECTIVE*)'"));
-    assert!(prepared
-        .bytes()
-        .windows(b"Keep;".len())
-        .any(|w| w == b"Keep;"));
-    assert!(prepared
-        .bytes()
-        .windows(b"KeepCommentStyle;".len())
-        .any(|w| w == b"KeepCommentStyle;"));
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"StringBrace = '{$IFDEF NOT_A_DIRECTIVE}'".len())
+            .any(|window| window == b"StringBrace = '{$IFDEF NOT_A_DIRECTIVE}'")
+    );
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"StringParen = '(*$IFDEF NOT_A_DIRECTIVE*)'".len())
+            .any(|window| window == b"StringParen = '(*$IFDEF NOT_A_DIRECTIVE*)'")
+    );
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"Keep;".len())
+            .any(|w| w == b"Keep;")
+    );
+    assert!(
+        prepared
+            .bytes()
+            .windows(b"KeepCommentStyle;".len())
+            .any(|w| w == b"KeepCommentStyle;")
+    );
 }

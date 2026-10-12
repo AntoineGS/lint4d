@@ -369,14 +369,8 @@ fn check_destructor_raises(def_proc: Node, source: &[u8], ctx: &mut LintContext)
 
 /// Recursively scan for raise statements, skipping try..except subtrees.
 fn find_unguarded_raises(node: Node, class_name: &str, method_name: &str, ctx: &mut LintContext) {
-    // Normal raise statement
+    // `raise X` and bare `raise;` both parse as raise nodes
     if node.kind() == K::RAISE {
-        report_raise(node, class_name, method_name, ctx);
-        return;
-    }
-
-    // Bare re-raise: ERROR node with a single kRaise child
-    if node.is_error() && is_bare_raise(node) {
         report_raise(node, class_name, method_name, ctx);
         return;
     }
@@ -398,16 +392,6 @@ fn try_has_except(node: Node) -> bool {
     node.children_by_field_name("except", &mut node.walk())
         .next()
         .is_some()
-}
-
-/// Check if an ERROR node represents a bare `raise;`.
-fn is_bare_raise(node: Node) -> bool {
-    if node.child_count() == 1
-        && let Some(child) = node.child(0)
-    {
-        return child.kind() == K::K_RAISE;
-    }
-    false
 }
 
 fn report_raise(node: Node, class_name: &str, method_name: &str, ctx: &mut LintContext) {

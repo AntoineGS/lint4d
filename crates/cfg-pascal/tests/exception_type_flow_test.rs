@@ -430,10 +430,14 @@ end.
     let shadowed_cfg = cfg_for(&cfgs, "ShadowedValue");
     let shadowed_raise = block_with_stmt(shadowed_cfg, &source, "raise", "raise TBaseError.Create");
     let shadowed_handler = block_with_stmt(shadowed_cfg, &source, "statement", "HandleShadowed");
-    assert!(successors(shadowed_cfg, shadowed_raise)
-        .contains(&(shadowed_handler, EdgeKind::ExceptionThrow)));
-    assert!(successors(shadowed_cfg, shadowed_raise)
-        .contains(&(shadowed_cfg.exit, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(shadowed_cfg, shadowed_raise)
+            .contains(&(shadowed_handler, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(shadowed_cfg, shadowed_raise)
+            .contains(&(shadowed_cfg.exit, EdgeKind::ExceptionThrow))
+    );
 
     let unknown_cfg = cfg_for(&cfgs, "UnknownEarly");
     let unknown_raise = block_with_stmt(unknown_cfg, &source, "raise", "raise TChildError.Create");
@@ -473,10 +477,14 @@ end.
         "statement",
         "HandleClassFunction",
     );
-    assert!(successors(class_function_cfg, class_function_raise)
-        .contains(&(class_function_handler, EdgeKind::ExceptionThrow)));
-    assert!(successors(class_function_cfg, class_function_raise)
-        .contains(&(class_function_cfg.exit, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(class_function_cfg, class_function_raise)
+            .contains(&(class_function_handler, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(class_function_cfg, class_function_raise)
+            .contains(&(class_function_cfg.exit, EdgeKind::ExceptionThrow))
+    );
 }
 
 #[test]

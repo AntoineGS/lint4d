@@ -206,9 +206,15 @@ For each local variable assigned from a constructor:
 2. Walk forward from the creating statement, never entering F. Reaching Exit
    yields `Escapes`, reporting the statement where each path leaves (source of
    an exception edge, an `exit`, or falling off the end). Reaching the creating
-   statement again yields `Escapes (re-created at L…)`.
+   statement again yields `Escapes (re-created at L…)`. The variable is
+   non-nil after the creation, so the walk never takes the nil branch of an
+   `if`/`while` condition that is exactly a nil test of it (`Assigned(L)`,
+   `L <> nil`, `L = nil`, negated or parenthesized), and such a test of a
+   local raises no exception (l4d-rqmx).
 3. Any other assignment to the variable in the routine yields
-   `Unknown (reassigned at L…)`.
+   `Unknown (reassigned at L…)`, except `L := nil` where no path from the
+   creation reaches it without a free: initialization before the `try`, or
+   clearing after the free (l4d-rqmx).
 4. Assignment to `Result` yields `NotFreedHere (returned as Result)`. A
    non-local target (field, global or parameter) with no free in the routine
    yields `NotFreedHere (assigned to a non-local)`; a local with no free
@@ -217,6 +223,9 @@ For each local variable assigned from a constructor:
 5. Parse errors in the routine yield `Unknown (parse errors)` for every
    verdict; a hidden directive block (6.5) between a creation and its free
    yields `Unknown (hidden directive block at L…)`.
+6. A creation, assignment or free of the variable inside a `with` body yields
+   `Unknown (named inside with at L…)`: the name may denote a member of the
+   `with` subject (l4d-pwvv). Such a free never joins F.
 
 `Exit { runs_finally }` records the first `finally` on the exit's path.
 

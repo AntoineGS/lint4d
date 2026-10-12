@@ -1359,16 +1359,21 @@ against the current indexed source before either edge request is evaluated;
 client-supplied item text is never used as a binding.
 
 The current conservative edge subset walks AST `exprCall` nodes (calls with
-explicit argument parentheses), resolves each call through existing
+explicit argument parentheses) and statements that consist only of a name or
+member access (`Touch;`, `Item.Post;`: dcc rejects any expression statement
+that is not a call), resolves each call through existing
 definition/overload navigation, and groups edges by exact source routine
-identity. From-ranges cover only the callee designator and use LSP UTF-16
-positions. The selected-project workspace snapshot permits proven cross-unit
+identity. A bare statement yields an edge only when it resolves to a routine,
+so a procedural-variable call has none; parameterless calls inside
+expressions (`X := Item.Next`) are not counted, because syntax alone cannot
+tell them from property or field reads. From-ranges cover only the callee
+designator and use LSP UTF-16 positions. The selected-project workspace snapshot permits proven cross-unit
 calls. Calls inside a nested local routine belong to that routine, not its
 enclosing routine. Ambiguous/unresolved calls, unknown callers,
 parser-recovery/unknown conditional sites, and routines marked
 virtual/dynamic/override are omitted.
-Bare procedure statements without an `exprCall` node, indirect/function-value
-calls, dynamic dispatch, and other unsupported call forms are not counted.
+Indirect/function-value calls, dynamic dispatch, and other unsupported call
+forms are not counted.
 
 AST scanning is bounded to 200,000 visited nodes and 4,096 call expressions
 per request, and a conservative 2 MiB result-construction budget is reserved

@@ -13818,21 +13818,46 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
     Ok(())
 }
 
+/// An ambiguous rename batch (an endpoint reused, a chain or a cycle) cannot
+/// be replayed pair by pair, so every endpoint's open overlay is rejected and
+/// derived state is invalidated. Old endpoints are recorded as Deleted and
+/// new ones as Created. An endpoint that is both (a chain or a cycle) has no
+/// reliable final state in the batch; the disk, which the notification
+/// follows, decides.
 fn invalidate_ambiguous_file_notification(
     workspace: &mut Workspace,
     budget: Option<&ReconciliationBudget>,
+    events: Vec<(Url, FileChange)>,
     endpoints: impl IntoIterator<Item = Url>,
     push_diagnostics_supported: bool,
 ) -> DiagnosticNotificationEffect {
     let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
     let budget = budget.unwrap_or(&fallback_budget);
+    let mut old_endpoints = HashSet::new();
+    let mut new_endpoints = HashSet::new();
+    for (uri, kind) in events {
+        match kind {
+            FileChange::Deleted => old_endpoints.insert(uri),
+            _ => new_endpoints.insert(uri),
+        };
+    }
+    for uri in &old_endpoints {
+        let recreated =
+            new_endpoints.contains(uri) && uri.to_file_path().is_ok_and(|path| path.exists());
+        if !recreated {
+            budget.record_file_event(uri.clone(), FileChange::Deleted);
+        }
+    }
+    for uri in &new_endpoints {
+        let gone =
+            old_endpoints.contains(uri) && !uri.to_file_path().is_ok_and(|path| path.exists());
+        if !gone {
+            budget.record_file_event(uri.clone(), FileChange::Created);
+        }
+    }
     let mut unique_endpoints = HashSet::new();
     for uri in endpoints {
         if unique_endpoints.insert(uri.clone()) {
-            // For an ambiguous event, no endpoint is allowed to retain a
-            // positive disk observation. Recovery keeps these as tombstones
-            // until a later verified file event supersedes them.
-            budget.record_file_event(uri.clone(), FileChange::Deleted);
             budget.record_rename_endpoint(uri);
         }
     }
@@ -14559,6 +14584,7 @@ fn handle_notification_with_control_inner(
                 return Ok(invalidate_ambiguous_file_notification(
                     workspace,
                     budget,
+                    recovery_events,
                     recoverable_endpoints,
                     push_diagnostics_supported,
                 ));

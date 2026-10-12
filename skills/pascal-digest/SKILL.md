@@ -38,6 +38,9 @@ raises, exits and calls, each with its source line.
   `{$IF}…{$IFEND}` block the parser had to blank out, so object verdicts other
   than `returned as Result` cannot be proven and are reported `unknown`; read
   that block yourself.
+- `unknown (named inside with at L…)`: the variable is created, assigned or
+  freed inside a `with` body, where the name may be a member of the `with`
+  subject; read that statement yourself.
 - `not freed in this routine (returned as Result)` and `(assigned to a
   non-local)` describe ownership transfer, not leaks. `(no free found)` on a
   local object is a leak candidate to verify.

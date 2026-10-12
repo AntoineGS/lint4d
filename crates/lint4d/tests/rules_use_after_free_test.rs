@@ -254,3 +254,18 @@ fn use_after_free_flags_double_free_in_forward_declared_overload() {
         "Forward declarations have no body; both definitions get a CFG"
     );
 }
+
+#[test]
+fn use_after_free_allows_nil_checks_after_freeandnil() {
+    let lines = use_after_free_line_numbers(
+        "tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas",
+    );
+    assert!(lines.is_empty(), "unexpected use-after-free at {lines:?}");
+}
+
+#[test]
+fn use_after_free_flags_nil_checks_of_dangling_references() {
+    let lines =
+        use_after_free_line_numbers("tests/fixtures/use_after_free/bad_nil_checks_after_free.pas");
+    assert_eq!(lines, [11, 23, 35]);
+}

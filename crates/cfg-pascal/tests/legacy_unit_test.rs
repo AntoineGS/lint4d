@@ -82,9 +82,11 @@ end.
         initialization.byte_range,
         section_start..section_start + section_text.len()
     );
-    assert!(successors(initialization, init)
-        .iter()
-        .any(|(target, kind)| *target == initialization.exit && *kind == EdgeKind::Normal));
+    assert!(
+        successors(initialization, init)
+            .iter()
+            .any(|(target, kind)| *target == initialization.exit && *kind == EdgeKind::Normal)
+    );
 
     let explicit_source = br#"
 unit ExplicitSections;

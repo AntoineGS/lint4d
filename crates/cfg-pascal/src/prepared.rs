@@ -12,10 +12,10 @@ use std::{borrow::Borrow, collections::HashMap, fmt, ops::Range, sync::Arc};
 use tree_sitter::{Parser, Tree};
 
 use crate::{
+    ProjectSourceId,
     source_map::{
         ExpansionId, MappedSourceSpan, SourceMap, SourceMapError, SourceMapSegment, SourceSnapshot,
     },
-    ProjectSourceId,
 };
 
 /// Caller-supplied fidelity assertion for a prepared projection.

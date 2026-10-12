@@ -4498,6 +4498,89 @@ fn call_hierarchy_omits_named_references_and_ambiguous_overloads() {
 }
 
 #[test]
+fn call_hierarchy_includes_parameterless_call_statements() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("BareCalls.pas");
+    let source = "unit BareCalls;\ninterface\ntype\n  TProc = procedure;\n  TItem = class\n  private\n    FCount: Integer;\n  public\n    procedure Post;\n    property Count: Integer read FCount;\n  end;\nprocedure Touch;\nprocedure Caller(Item: TItem; Callback: TProc);\nimplementation\nprocedure Touch;\nbegin end;\nprocedure TItem.Post;\nbegin end;\nprocedure Caller(Item: TItem; Callback: TProc);\nvar Total: Integer;\nbegin\n  Touch;\n  if Total = 0 then Item.Post;\n  Callback;\n  Total := Item.Count;\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("bare-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 1)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "caller prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("caller item")[0].clone();
+    let outgoing_id = RequestId::from("bare-caller-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(outgoing.error.is_none(), "outgoing failed: {outgoing:?}");
+    let outgoing = outgoing.result.expect("outgoing");
+    let mut edges: Vec<_> = outgoing
+        .as_array()
+        .expect("outgoing array")
+        .iter()
+        .map(|call| {
+            (
+                call["to"]["name"]
+                    .as_str()
+                    .expect("callee name")
+                    .to_string(),
+                call["fromRanges"][0]["start"]["line"].as_u64(),
+                call["fromRanges"][0]["start"]["character"].as_u64(),
+                call["fromRanges"][0]["end"]["character"].as_u64(),
+            )
+        })
+        .collect();
+    edges.sort();
+    assert_eq!(
+        edges,
+        [
+            ("Post".to_string(), Some(22), Some(20), Some(29)),
+            ("Touch".to_string(), Some(21), Some(2), Some(7)),
+        ],
+        "bare procedure and parameterless method statements are calls; a procedural variable and a property read are not: {outgoing}"
+    );
+
+    let touch_id = RequestId::from("bare-touch-prepare".to_string());
+    server.send_request(
+        touch_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Touch", 1)
+        }),
+    );
+    let touch = server.response(&touch_id);
+    assert!(touch.error.is_none(), "touch prepare failed: {touch:?}");
+    let touch_item = touch.result.expect("touch item")[0].clone();
+    let incoming_id = RequestId::from("bare-touch-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": touch_item}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(incoming.error.is_none(), "incoming failed: {incoming:?}");
+    let incoming = incoming.result.expect("incoming");
+    assert_eq!(incoming.as_array().expect("incoming array").len(), 1);
+    assert_eq!(incoming[0]["from"]["name"], "Caller");
+    assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], 21);
+    server.shutdown();
+}
+
+#[test]
 fn call_hierarchy_keeps_uniquely_selected_overloads_as_distinct_items() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("OverloadCalls.pas");
@@ -37168,6 +37251,84 @@ fn ambiguous_rename_batches_invalidate_and_reject_open_overlays() {
             disk_locations.is_empty(),
             "ambiguous {ambiguous_kind} must stay fail-closed rather than partially transfer disk or overlay identity: {disk_locations:?}"
         );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn ambiguous_rename_batches_do_not_hide_existing_endpoints() {
+    // TASK-132: a chain (A -> B, B -> C) or a cycle (A -> C, C -> A) is
+    // ambiguous, but the endpoint that exists on disk afterwards must stay
+    // resolvable.
+    for ambiguous_kind in ["chain", "cycle"] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let first = root.join("first").join("Provider.pas");
+        let second = root.join("second").join("Provider.pas");
+        let destination = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let consumer_text = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TDiskThing;\nimplementation\nend.\n";
+        let disk_provider =
+            "unit Provider;\ninterface\ntype TDiskThing = class end;\nimplementation\nend.\n";
+        let other_provider =
+            "unit Provider;\ninterface\ntype TOtherThing = class end;\nimplementation\nend.\n";
+        fs::create_dir_all(first.parent().unwrap()).expect("first directory");
+        fs::create_dir_all(second.parent().unwrap()).expect("second directory");
+        write_file(&first, disk_provider);
+        if ambiguous_kind == "cycle" {
+            write_file(&destination, other_provider);
+        }
+        write_file(&consumer, consumer_text);
+        write_file(
+            &root.join("Main.pas"),
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(&root);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_text}}),
+        );
+
+        let files = if ambiguous_kind == "chain" {
+            fs::rename(&first, &destination).expect("client-owned physical move");
+            json!([
+                {"oldUri":uri(&first),"newUri":uri(&second)},
+                {"oldUri":uri(&second),"newUri":uri(&destination)},
+            ])
+        } else {
+            write_file(&first, other_provider);
+            write_file(&destination, disk_provider);
+            json!([
+                {"oldUri":uri(&first),"newUri":uri(&destination)},
+                {"oldUri":uri(&destination),"newUri":uri(&first)},
+            ])
+        };
+        server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .expect("ambiguous rename must request pull diagnostic refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+        let definition_id =
+            RequestId::from(format!("ambiguous-{ambiguous_kind}-existing-endpoint"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_text, "TDiskThing", 0),
+        );
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(
+            locations.len(),
+            1,
+            "ambiguous {ambiguous_kind}: the existing endpoint must resolve: {locations:?}"
+        );
+        assert_eq!(locations[0]["uri"], uri(&destination).to_string());
         server.shutdown();
     }
 }

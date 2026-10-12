@@ -8,6 +8,13 @@ pub enum DcuError {
     UnsupportedVersion {
         magic: u32,
     },
+    /// A known compiler version for a target this reader does not decode
+    /// (bits 13-15 of the magic; 0 is Win32 and 1 is Win64).
+    UnsupportedPlatform {
+        magic: u32,
+        version: crate::dcu::DcuVersion,
+        target_code: u8,
+    },
     /// The size dword at offset 4 differs from the input length.
     SizeMismatch {
         declared: u32,
@@ -35,6 +42,14 @@ impl fmt::Display for DcuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnexpectedEof { context } => write!(f, "unexpected EOF: {context}"),
+            Self::UnsupportedPlatform {
+                magic,
+                version,
+                target_code,
+            } => write!(
+                f,
+                "unsupported DCU target {target_code} for {version:?}: magic 0x{magic:08X}"
+            ),
             Self::SizeMismatch { declared, actual } => write!(
                 f,
                 "DCU size field says {declared} bytes but the input has {actual}"

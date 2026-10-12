@@ -5,69 +5,62 @@ use crate::dcu::{DcuPlatform, DcuVersion};
 use DcuPlatform::{Win32, Win64};
 use DcuVersion::*;
 
-/// Magic-number lookup table: (raw LE u32, version, platform).
-/// 17 Win32 entries + 14 Win64 entries = 31 total (D2010 and XE have no Win64).
-static MAGIC_TABLE: &[(u32, DcuVersion, DcuPlatform)] = &[
-    // D2010
-    (0x1500_0045, D2010, Win32),
-    // XE
-    (0x1600_034B, DXE, Win32),
-    // XE2
-    (0x1700_034B, DXE2, Win32),
-    (0x1700_234B, DXE2, Win64),
-    // XE3
-    (0x1800_034B, DXE3, Win32),
-    (0x1800_234B, DXE3, Win64),
-    // XE4
-    (0x1900_034B, DXE4, Win32),
-    (0x1900_234B, DXE4, Win64),
-    // XE5
-    (0x1A00_034B, DXE5, Win32),
-    (0x1A00_234B, DXE5, Win64),
-    // XE6
-    (0x1B00_034D, DXE6, Win32),
-    (0x1B00_234D, DXE6, Win64),
-    // XE7
-    (0x1C00_034D, DXE7, Win32),
-    (0x1C00_234D, DXE7, Win64),
-    // XE8
-    (0x1D00_034D, DXE8, Win32),
-    (0x1D00_234D, DXE8, Win64),
-    // 10 Seattle
-    (0x1E00_034D, D10S, Win32),
-    (0x1E00_234D, D10S, Win64),
-    // 10.1 Berlin
-    (0x1F00_034D, D101B, Win32),
-    (0x1F00_234D, D101B, Win64),
-    // 10.2 Tokyo
-    (0x2000_034D, D102T, Win32),
-    (0x2000_234D, D102T, Win64),
-    // 10.3 Rio
-    (0x2100_034D, D103R, Win32),
-    (0x2100_234D, D103R, Win64),
-    // 10.4 Sydney
-    (0x2200_034D, D104S, Win32),
-    (0x2200_234D, D104S, Win64),
-    // 11 Alexandria
-    (0x2300_034D, D11A, Win32),
-    (0x2300_234D, D11A, Win64),
-    // 12 Athens
-    (0x2400_034D, D12A, Win32),
-    (0x2400_234D, D12A, Win64),
-    // 13
-    (0x2500_034D, D13, Win32),
-    (0x2500_234D, D13, Win64),
+/// Version signatures: (version byte, version, signature byte, code in bits
+/// 8-12, Win64 compiler exists).
+static VERSIONS: &[(u8, DcuVersion, u8, u8, bool)] = &[
+    (0x15, D2010, 0x45, 0x00, false),
+    (0x16, DXE, 0x4B, 0x03, false),
+    (0x17, DXE2, 0x4B, 0x03, true),
+    (0x18, DXE3, 0x4B, 0x03, true),
+    (0x19, DXE4, 0x4B, 0x03, true),
+    (0x1A, DXE5, 0x4B, 0x03, true),
+    (0x1B, DXE6, 0x4D, 0x03, true),
+    (0x1C, DXE7, 0x4D, 0x03, true),
+    (0x1D, DXE8, 0x4D, 0x03, true),
+    (0x1E, D10S, 0x4D, 0x03, true),
+    (0x1F, D101B, 0x4D, 0x03, true),
+    (0x20, D102T, 0x4D, 0x03, true),
+    (0x21, D103R, 0x4D, 0x03, true),
+    (0x22, D104S, 0x4D, 0x03, true),
+    (0x23, D11A, 0x4D, 0x03, true),
+    (0x24, D12A, 0x4D, 0x03, true),
+    (0x25, D13, 0x4D, 0x03, true),
 ];
 
+/// Decode the magic as dcc 13's unit reader (`FUN_00806170`) does: it
+/// accepts `(magic & 0xff801fff) == 0x2500004d | (k << 8)` with `k` 3, or 0
+/// under one compiler option, so bits 16-22 are free and bits 13-15 are a
+/// target code. Code 0 is Win32 and 1 is Win64; dcc gives codes 1 and 4
+/// 8-byte pointers and sets another flag for 0 and 2. The other codes are
+/// other targets this reader does not decode.
 pub fn parse_magic(data: &[u8]) -> Result<(DcuVersion, DcuPlatform), DcuError> {
     let mut reader = DcuReader::new(data, DcuVersion::D13);
     let magic = reader.read_u32()?;
-    for &(m, ver, plat) in MAGIC_TABLE {
-        if m == magic {
-            return Ok((ver, plat));
-        }
+    let version_byte = (magic >> 24) as u8;
+    let signature = magic as u8;
+    let code = ((magic >> 8) & 0x1F) as u8;
+    let target_code = ((magic >> 13) & 0x7) as u8;
+    let Some(&(_, version, _, _, has_win64)) =
+        VERSIONS
+            .iter()
+            .find(|&&(byte, version, expected, expected_code, _)| {
+                byte == version_byte
+                    && magic & 0x0080_0000 == 0
+                    && signature == expected
+                    && (code == expected_code || (version == D13 && code == 0))
+            })
+    else {
+        return Err(DcuError::UnsupportedVersion { magic });
+    };
+    match target_code {
+        0 => Ok((version, Win32)),
+        1 if has_win64 => Ok((version, Win64)),
+        _ => Err(DcuError::UnsupportedPlatform {
+            magic,
+            version,
+            target_code,
+        }),
     }
-    Err(DcuError::UnsupportedVersion { magic })
 }
 
 /// Parsed DCU unit header containing identity and version information.

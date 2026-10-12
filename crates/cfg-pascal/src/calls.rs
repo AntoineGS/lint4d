@@ -202,12 +202,15 @@ pub fn lookup_transaction_method(method_name: &str) -> Vec<&'static TransactionM
 /// - `exprDot` (bare) with RHS `"Destroy"` → `Destroy`
 /// - `exprCall` with a plain `identifier` entity → `FunctionCall`
 /// - `exprCall` with a dotted entity → `MethodCall`
+/// - `statement` whose only child is an `identifier` (`Touch;`) → `FunctionCall`,
+///   except `Exit`, `Break`, `Continue`
 ///
 /// Returns `None` if the node is not a recognisable call form.
 pub fn classify_call(node: Node, source: &[u8]) -> Option<CallKind> {
     match node.kind() {
         "exprCall" => classify_expr_call(node, source),
         "exprDot" => classify_bare_expr_dot(node, source),
+        "statement" => classify_bare_identifier_statement(node, source),
         _ => None,
     }
 }
@@ -277,6 +280,27 @@ fn classify_bare_expr_dot(node: Node, source: &[u8]) -> Option<CallKind> {
     }
     // Any other dot expression is a method call or property access.
     Some(CallKind::MethodCall { receiver, method })
+}
+
+/// Classify `Touch;`: a statement whose only child is an identifier is a
+/// parameterless call. `Exit`, `Break` and `Continue` are control transfers.
+fn classify_bare_identifier_statement(node: Node, source: &[u8]) -> Option<CallKind> {
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let child = children.next()?;
+    if children.next().is_some() || child.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(child, source);
+    if ["exit", "break", "continue"]
+        .iter()
+        .any(|word| name.eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    Some(CallKind::FunctionCall { name })
 }
 
 /// Extract the text of the first positional argument inside an `exprCall`.
@@ -420,24 +444,45 @@ mod tests {
     fn classifies_function_call() {
         let source = b"program T; begin DoWork; end.";
         let tree = parse(source);
+        assert_eq!(
+            first_classified(&tree, source),
+            Some(CallKind::FunctionCall {
+                name: "DoWork".to_string()
+            }),
+            "a parameterless call statement is a FunctionCall"
+        );
+    }
 
-        // DoWork is a bare identifier — walk looking for a FunctionCall.
-        fn find_function_call(node: Node, source: &[u8]) -> Option<CallKind> {
-            if let Some(k @ CallKind::FunctionCall { .. }) = classify_call(node, source) {
-                return Some(k);
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if let Some(k) = find_function_call(child, source) {
-                    return Some(k);
-                }
-            }
-            None
+    #[test]
+    fn parameterless_call_inside_if_is_classified() {
+        let source = b"program T; begin if X then Touch; end.";
+        let tree = parse(source);
+        assert_eq!(
+            first_classified(&tree, source),
+            Some(CallKind::FunctionCall {
+                name: "Touch".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn exit_break_continue_statements_are_not_calls() {
+        for word in ["Exit", "exit", "Break", "Continue"] {
+            let source = format!("program T; begin {word}; end.");
+            let tree = parse(source.as_bytes());
+            assert_eq!(
+                first_classified(&tree, source.as_bytes()),
+                None,
+                "{word} is a control transfer, not a call"
+            );
         }
+    }
 
-        // A bare identifier is not an exprCall; classify_call won't fire, which
-        // is correct behaviour — we just verify no spurious classification fires.
-        let _ = find_function_call(tree.root_node(), source);
+    #[test]
+    fn inherited_statement_is_not_a_function_call() {
+        let source = b"program T; begin inherited; end.";
+        let tree = parse(source);
+        assert_eq!(first_classified(&tree, source), None);
     }
 
     #[test]

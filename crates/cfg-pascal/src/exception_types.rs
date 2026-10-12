@@ -6,7 +6,7 @@ use std::{
 use tree_sitter::Node;
 
 use crate::prepared::{is_preprocessor_kind, is_preprocessor_node};
-use crate::project::{import_site_spans, ImportTarget, ProjectSnapshot, ProjectUnitId};
+use crate::project::{ImportTarget, ProjectSnapshot, ProjectUnitId, import_site_spans};
 
 /// Stable identity for a class type in one project snapshot.
 ///
@@ -645,7 +645,7 @@ impl ExceptionTypeIndex {
         &'a self,
         unit_key: &UnitKey,
         offset: usize,
-    ) -> impl Iterator<Item = &'a ImportSelection> + 'a {
+    ) -> impl Iterator<Item = &'a ImportSelection> + 'a + use<'a> {
         let unit_key = unit_key.clone();
         self.imports.iter().filter(move |import| {
             import.importer == unit_key
@@ -781,16 +781,16 @@ impl ExceptionTypeIndex {
             if self.has_binding(unit_key, scope, name, offset) {
                 return true;
             }
-            if let Some(type_id) = self.class_type_for_scope(unit_key, scope) {
-                if !matches!(
+            if let Some(type_id) = self.class_type_for_scope(unit_key, scope)
+                && !matches!(
                     self.lookup_class_member(type_id, name, unit_key, offset, &mut HashMap::new(),),
                     Lookup::Absent
-                ) {
-                    return true;
-                }
+                )
+            {
+                return true;
             }
-            if let Some(owner_type) = unit.scopes[scope.0].owner_type {
-                if !matches!(
+            if let Some(owner_type) = unit.scopes[scope.0].owner_type
+                && !matches!(
                     self.lookup_class_member(
                         owner_type,
                         name,
@@ -799,9 +799,9 @@ impl ExceptionTypeIndex {
                         &mut HashMap::new(),
                     ),
                     Lookup::Absent
-                ) {
-                    return true;
-                }
+                )
+            {
+                return true;
             }
             current = unit.scopes[scope.0].parent;
         }
@@ -1594,15 +1594,15 @@ impl UnitTypeIndex {
                 routine.start_byte(),
                 BindingKind::Value,
             );
-            if let Some(parts) = name_parts(name_node, source) {
-                if let Some(result_name) = parts.last() {
-                    self.add_binding(
-                        routine_scope,
-                        result_name.clone(),
-                        routine.start_byte(),
-                        BindingKind::Value,
-                    );
-                }
+            if let Some(parts) = name_parts(name_node, source)
+                && let Some(result_name) = parts.last()
+            {
+                self.add_binding(
+                    routine_scope,
+                    result_name.clone(),
+                    routine.start_byte(),
+                    BindingKind::Value,
+                );
             }
         }
 
@@ -1685,19 +1685,19 @@ impl UnitTypeIndex {
         let handler_scope =
             self.new_scope(Some(enclosing_scope), body.start_byte(), handler.end_byte());
 
-        if let Some(variable) = handler.child_by_field_name("variable") {
-            if variable.kind() == "identifier" {
-                self.add_binding(
-                    handler_scope,
-                    canonical(node_text(variable, source)),
-                    body.start_byte(),
-                    if conditional {
-                        BindingKind::Unsupported
-                    } else {
-                        BindingKind::Value
-                    },
-                );
-            }
+        if let Some(variable) = handler.child_by_field_name("variable")
+            && variable.kind() == "identifier"
+        {
+            self.add_binding(
+                handler_scope,
+                canonical(node_text(variable, source)),
+                body.start_byte(),
+                if conditional {
+                    BindingKind::Unsupported
+                } else {
+                    BindingKind::Value
+                },
+            );
         }
 
         let mut cursor = body.walk();
@@ -1821,10 +1821,9 @@ impl UnitTypeIndex {
             return true;
         }
         let mut cursor = node.walk();
-        let result = node
-            .named_children(&mut cursor)
-            .any(|child| self.has_generic_syntax(child));
-        result
+
+        node.named_children(&mut cursor)
+            .any(|child| self.has_generic_syntax(child))
     }
 }
 
@@ -1876,10 +1875,9 @@ fn contains_preprocessor_directive(node: Node, source: &[u8]) -> bool {
         return true;
     }
     let mut cursor = node.walk();
-    let result = node
-        .children(&mut cursor)
-        .any(|child| contains_preprocessor_directive(child, source));
-    result
+
+    node.children(&mut cursor)
+        .any(|child| contains_preprocessor_directive(child, source))
 }
 
 fn constructor_parts(node: Node, source: &[u8]) -> Option<Vec<String>> {
@@ -1889,15 +1887,14 @@ fn constructor_parts(node: Node, source: &[u8]) -> Option<Vec<String>> {
         "exprDot" => constructor_parts_from_entity(exception, source),
         "exprParens" => {
             let mut cursor = exception.walk();
-            let parts =
-                exception
-                    .named_children(&mut cursor)
-                    .find_map(|child| match child.kind() {
-                        "exprCall" => constructor_call_parts(child, source),
-                        "exprDot" => constructor_parts_from_entity(child, source),
-                        _ => None,
-                    });
-            parts
+
+            exception
+                .named_children(&mut cursor)
+                .find_map(|child| match child.kind() {
+                    "exprCall" => constructor_call_parts(child, source),
+                    "exprDot" => constructor_parts_from_entity(child, source),
+                    _ => None,
+                })
         }
         _ => None,
     }
@@ -1971,14 +1968,14 @@ fn visibility_of_section(node: Node) -> Visibility {
                     Visibility::StrictPrivate
                 } else {
                     Visibility::Private
-                }
+                };
             }
             "kProtected" => {
                 return if strict {
                     Visibility::StrictProtected
                 } else {
                     Visibility::Protected
-                }
+                };
             }
             "kPublic" => return Visibility::Public,
             "kPublished" => return Visibility::Published,
@@ -2039,10 +2036,9 @@ fn direct_named_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree
 
 fn direct_named_child_any<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
-    let result = node
-        .named_children(&mut cursor)
-        .find(|child| kinds.contains(&child.kind()));
-    result
+
+    node.named_children(&mut cursor)
+        .find(|child| kinds.contains(&child.kind()))
 }
 
 fn first_identifier<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -2050,8 +2046,8 @@ fn first_identifier<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
         return Some(node);
     }
     let mut cursor = node.walk();
-    let result = node.named_children(&mut cursor).find_map(first_identifier);
-    result
+
+    node.named_children(&mut cursor).find_map(first_identifier)
 }
 
 fn node_text(node: Node, source: &[u8]) -> String {

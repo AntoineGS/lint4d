@@ -376,8 +376,10 @@ end.
     let inner_child = block_with_exact_stmt(cfg, &source, "statement", "HandleInnerChild;");
     let outer_base = block_with_exact_stmt(cfg, &source, "statement", "HandleOuterBase;");
 
-    assert!(!successors(cfg, successful_raise_block(cfg, initial_raise))
-        .contains(&(inner_child, EdgeKind::ExceptionThrow)));
+    assert!(
+        !successors(cfg, successful_raise_block(cfg, initial_raise))
+            .contains(&(inner_child, EdgeKind::ExceptionThrow))
+    );
     let handler_success = successful_raise_block(cfg, handler_raise);
     assert_eq!(
         successors(cfg, handler_success),

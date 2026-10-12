@@ -149,9 +149,11 @@ end.
         vec![(while_condition, EdgeKind::Normal)],
         "Continue in an unbraced if branch must restart its loop"
     );
-    assert!(!successors(continue_cfg, continue_stmt)
-        .iter()
-        .any(|(target, _)| *target == while_after));
+    assert!(
+        !successors(continue_cfg, continue_stmt)
+            .iter()
+            .any(|(target, _)| *target == while_after)
+    );
 
     let nested_cfg = cfg_for(&cfgs, "NestedBranchBreak");
     let nested_break = block_with_stmt(nested_cfg, &source, "statement", "Break");
@@ -163,9 +165,11 @@ end.
         vec![(inner_after, EdgeKind::Normal)],
         "nested unbraced Break must target the innermost loop"
     );
-    assert!(!successors(nested_cfg, nested_break)
-        .iter()
-        .any(|(target, _)| *target == inner_condition));
+    assert!(
+        !successors(nested_cfg, nested_break)
+            .iter()
+            .any(|(target, _)| *target == inner_condition)
+    );
     assert!(can_reach(nested_cfg, inner_after, outer_condition));
 }
 

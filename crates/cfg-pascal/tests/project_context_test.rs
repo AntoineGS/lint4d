@@ -2,9 +2,9 @@ use std::{fmt::Write as _, ops::Range};
 
 use cfg_core::{BasicBlockKind, BlockId, Cfg, EdgeKind};
 use cfg_pascal::{
-    build_file_cfgs, build_file_cfgs_in_project, ImportBinding, ImportTarget, ProjectBuildError,
-    ProjectSnapshot, ProjectSnapshotError, ProjectSourceId, ProjectUnitId, ProjectUnitInput,
-    UsesSite,
+    ImportBinding, ImportTarget, ProjectBuildError, ProjectSnapshot, ProjectSnapshotError,
+    ProjectSourceId, ProjectUnitId, ProjectUnitInput, UsesSite, build_file_cfgs,
+    build_file_cfgs_in_project,
 };
 use tree_sitter::{Node, Parser, Tree};
 
@@ -700,12 +700,18 @@ end.
         "statement",
         "IncompleteHandler",
     );
-    assert!(successors(unavailable_cfg, unavailable_successful)
-        .contains(&(unavailable_low, EdgeKind::ExceptionThrow)));
-    assert!(successors(unavailable_cfg, unavailable_successful)
-        .contains(&(unavailable_incomplete, EdgeKind::ExceptionThrow)));
-    assert!(successors(unavailable_cfg, unavailable_successful)
-        .contains(&(unavailable_cfg.exit, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(unavailable_cfg, unavailable_successful)
+            .contains(&(unavailable_low, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(unavailable_cfg, unavailable_successful)
+            .contains(&(unavailable_incomplete, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(unavailable_cfg, unavailable_successful)
+            .contains(&(unavailable_cfg.exit, EdgeKind::ExceptionThrow))
+    );
 }
 
 #[test]
@@ -860,12 +866,18 @@ end.
     let private_successful = successful_raise_block(private_cfg, private_raise);
     let private_handler = block_with_stmt(private_cfg, &source, "statement", "PrivateHandler");
     let public_handler = block_with_stmt(private_cfg, &source, "statement", "PublicHandler");
-    assert!(successors(private_cfg, private_successful)
-        .contains(&(private_handler, EdgeKind::ExceptionThrow)));
-    assert!(successors(private_cfg, private_successful)
-        .contains(&(public_handler, EdgeKind::ExceptionThrow)));
-    assert!(successors(private_cfg, private_successful)
-        .contains(&(private_cfg.exit, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(private_cfg, private_successful)
+            .contains(&(private_handler, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(private_cfg, private_successful)
+            .contains(&(public_handler, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(private_cfg, private_successful)
+            .contains(&(private_cfg.exit, EdgeKind::ExceptionThrow))
+    );
 
     let public_cfg = cfg_for(&cfgs, "PublicP");
     let public_raise = block_with_stmt(
@@ -881,8 +893,10 @@ end.
         successors(public_cfg, public_successful),
         vec![(public_handler, EdgeKind::ExceptionThrow)]
     );
-    assert!(!successors(public_cfg, public_successful)
-        .contains(&(private_handler, EdgeKind::ExceptionThrow)));
+    assert!(
+        !successors(public_cfg, public_successful)
+            .contains(&(private_handler, EdgeKind::ExceptionThrow))
+    );
 
     let function_cfg = cfg_for(&cfgs, "FunctionP");
     let function_raise = block_with_stmt(
@@ -894,12 +908,18 @@ end.
     let function_successful = successful_raise_block(function_cfg, function_raise);
     let function_handler = block_with_stmt(function_cfg, &source, "statement", "FunctionHandler");
     let function_public = block_with_stmt(function_cfg, &source, "statement", "PublicHandler");
-    assert!(successors(function_cfg, function_successful)
-        .contains(&(function_handler, EdgeKind::ExceptionThrow)));
-    assert!(successors(function_cfg, function_successful)
-        .contains(&(function_public, EdgeKind::ExceptionThrow)));
-    assert!(successors(function_cfg, function_successful)
-        .contains(&(function_cfg.exit, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(function_cfg, function_successful)
+            .contains(&(function_handler, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(function_cfg, function_successful)
+            .contains(&(function_public, EdgeKind::ExceptionThrow))
+    );
+    assert!(
+        successors(function_cfg, function_successful)
+            .contains(&(function_cfg.exit, EdgeKind::ExceptionThrow))
+    );
 }
 
 #[test]
@@ -1121,9 +1141,11 @@ end.
     let handler = block_with_stmt(cfg, &source, "statement", "Handle");
     let other = block_with_stmt(cfg, &source, "statement", "Other");
 
-    assert!(cleanups
-        .iter()
-        .any(|cleanup| can_reach(cfg, successful, *cleanup)));
+    assert!(
+        cleanups
+            .iter()
+            .any(|cleanup| can_reach(cfg, successful, *cleanup))
+    );
     assert!(can_reach(cfg, successful, handler));
     // Cleanup statements may themselves throw, so an unresolved alternative
     // can still reach the second typed handler. The known imported fact must

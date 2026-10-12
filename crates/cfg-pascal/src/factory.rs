@@ -256,17 +256,17 @@ fn scan_result_assignments(
     has_direct_constructor: &mut bool,
     result_callees: &mut Vec<String>,
 ) {
-    if node.kind() == "assignment" {
-        if let Some(lhs) = node.child_by_field_name("lhs") {
-            let lhs_text = node_text(lhs, source);
-            if lhs_text.eq_ignore_ascii_case("result") {
-                if let Some(rhs) = node.child_by_field_name("rhs") {
-                    if is_constructor_call(rhs, source) {
-                        *has_direct_constructor = true;
-                    } else if let Some(callee) = extract_callee_name(rhs, source) {
-                        result_callees.push(callee.to_lowercase());
-                    }
-                }
+    if node.kind() == "assignment"
+        && let Some(lhs) = node.child_by_field_name("lhs")
+    {
+        let lhs_text = node_text(lhs, source);
+        if lhs_text.eq_ignore_ascii_case("result")
+            && let Some(rhs) = node.child_by_field_name("rhs")
+        {
+            if is_constructor_call(rhs, source) {
+                *has_direct_constructor = true;
+            } else if let Some(callee) = extract_callee_name(rhs, source) {
+                result_callees.push(callee.to_lowercase());
             }
         }
     }

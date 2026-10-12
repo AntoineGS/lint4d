@@ -59,6 +59,7 @@ fn digest_routine(
         .map(|node| error_lines(node, lines))
         .unwrap_or_default();
     let parse_errors = !errors.is_empty();
+    let first_error_line = errors.first().copied();
     if parse_errors {
         degraded.push(Degradation::ParseErrors { lines: errors });
     }
@@ -79,9 +80,12 @@ fn digest_routine(
     degraded.extend(hidden.iter().map(|block| Degradation::HiddenDirective {
         line: lines.line(block.start),
     }));
+    let end_line = lines.line(range.end.saturating_sub(1).max(range.start));
     let context = lifecycle::Context {
         parse_errors,
         hidden: &hidden,
+        first_error_line,
+        end_line,
     };
     let objects = scope
         .map(|node| lifecycle::verdicts(node, cfg, text, lines, &context))
@@ -92,7 +96,7 @@ fn digest_routine(
     RoutineDigest {
         name: cfg.proc_name.clone(),
         start_line: lines.line(range.start),
-        end_line: lines.line(range.end.saturating_sub(1).max(range.start)),
+        end_line,
         byte_range: range,
         objects,
         frequent_calls,

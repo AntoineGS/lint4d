@@ -19,6 +19,10 @@ pub struct Context<'a> {
     pub parse_errors: bool,
     /// Opaque `{$IF}…{$IFEND}` blocks inside the routine, blanked by the parser rewrite.
     pub hidden: &'a [Range<usize>],
+    /// First parse-error line inside the routine, when there is one.
+    pub first_error_line: Option<usize>,
+    /// Last line of the routine.
+    pub end_line: usize,
 }
 
 pub fn verdicts(
@@ -46,13 +50,42 @@ pub fn verdicts(
     facts
         .creations
         .iter()
-        .map(|creation| ObjectVerdict {
-            var: creation.target.clone(),
-            class: creation.class.clone(),
-            line: lines.line(creation.range.start),
-            verdict: verdict(creation, &facts, &locals, cfg, lines, context),
+        .map(|creation| {
+            let line = lines.line(creation.range.start);
+            let (verdict, reference) = verdict(creation, &facts, &locals, cfg, lines, context);
+            ObjectVerdict {
+                var: creation.target.clone(),
+                class: creation.class.clone(),
+                line,
+                verify_lines: verify_lines(&verdict, line, reference, context.end_line),
+                verdict,
+            }
         })
         .collect()
+}
+
+/// The lines to read to confirm a verdict that is not a proven fact.
+/// `reference` is the line an unknown verdict names, when it names one.
+fn verify_lines(
+    verdict: &Verdict,
+    line: usize,
+    reference: Option<usize>,
+    end_line: usize,
+) -> Option<[usize; 2]> {
+    match verdict {
+        Verdict::Escapes { via, .. } => {
+            let last = via.iter().map(|escape| escape.line).max().unwrap_or(line);
+            Some([line, last.max(line)])
+        }
+        Verdict::Unknown { .. } => Some(match reference {
+            Some(reference) => [line.min(reference), line.max(reference)],
+            None => [line, end_line],
+        }),
+        Verdict::NotFreedHere {
+            why: NotFreedReason::NeverFreed,
+        } => Some([line, end_line]),
+        Verdict::FreedAllPaths | Verdict::NotFreedHere { .. } => None,
+    }
 }
 
 struct Creation {
@@ -307,16 +340,14 @@ fn verdict(
     cfg: &Cfg,
     lines: &LineIndex,
     context: &Context<'_>,
-) -> Verdict {
+) -> (Verdict, Option<usize>) {
     if context.parse_errors {
-        return Verdict::Unknown {
-            why: "parse errors".to_string(),
-        };
+        let why = "parse errors".to_string();
+        return (Verdict::Unknown { why }, context.first_error_line);
     }
     if creation.key == "result" {
-        return Verdict::NotFreedHere {
-            why: NotFreedReason::Result,
-        };
+        let why = NotFreedReason::Result;
+        return (Verdict::NotFreedHere { why }, None);
     }
     let frees: Vec<&Range<usize>> = facts
         .frees
@@ -337,23 +368,23 @@ fn verdict(
             && !(facts.nil_assignments.contains(range)
                 && !reachable_from_creation(cfg, creation, &free_blocks, range))
     }) {
-        return Verdict::Unknown {
-            why: format!("reassigned at L{}", lines.line(range.start)),
-        };
+        let line = lines.line(range.start);
+        let why = format!("reassigned at L{line}");
+        return (Verdict::Unknown { why }, Some(line));
     }
     if let Some((_, range)) = facts
         .with_names
         .iter()
         .find(|(key, _)| *key == creation.key)
     {
-        return Verdict::Unknown {
-            why: format!("named inside with at L{}", lines.line(range.start)),
-        };
+        let line = lines.line(range.start);
+        let why = format!("named inside with at L{line}");
+        return (Verdict::Unknown { why }, Some(line));
     }
     if let Some(block) = context.hidden.iter().min_by_key(|block| block.start) {
-        return Verdict::Unknown {
-            why: format!("hidden directive block at L{}", lines.line(block.start)),
-        };
+        let line = lines.line(block.start);
+        let why = format!("hidden directive block at L{line}");
+        return (Verdict::Unknown { why }, Some(line));
     }
     if frees.is_empty() {
         let why = if locals.contains(&creation.key) {
@@ -361,12 +392,11 @@ fn verdict(
         } else {
             NotFreedReason::NonLocal
         };
-        return Verdict::NotFreedHere { why };
+        return (Verdict::NotFreedHere { why }, None);
     }
     if cfg.blocks_for_stmt(creation.range.clone()).is_empty() {
-        return Verdict::Unknown {
-            why: "creation not in CFG".to_string(),
-        };
+        let why = "creation not in CFG".to_string();
+        return (Verdict::Unknown { why }, None);
     }
     // A nil test of a local only reads a variable, so it cannot raise.
     let guards: Vec<(&Guard, bool)> = facts
@@ -375,7 +405,8 @@ fn verdict(
         .filter(|guard| guard.key == creation.key)
         .map(|guard| (guard, locals.contains(&guard.key)))
         .collect();
-    escapes(cfg, creation, &free_blocks, &facts.exits, &guards, lines)
+    let verdict = escapes(cfg, creation, &free_blocks, &facts.exits, &guards, lines);
+    (verdict, None)
 }
 
 /// Whether a path from the creation reaches `range` without passing a free.

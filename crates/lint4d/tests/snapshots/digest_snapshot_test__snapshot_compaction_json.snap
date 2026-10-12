@@ -21,7 +21,11 @@ expression: "render::render_json(&file.path, &routines)"
           "verdict": {
             "status": "not_freed_here",
             "why": "never_freed"
-          }
+          },
+          "verify_lines": [
+            33,
+            38
+          ]
         }
       ],
       "frequent_calls": [

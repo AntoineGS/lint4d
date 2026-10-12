@@ -56,7 +56,7 @@ fn degraded_input_is_reported() {
     let text = all_text("degraded.pas");
     assert!(text.contains("! hidden directive block at L9"), "{text}");
     assert!(
-        text.contains("L TStringList L8 unknown (hidden directive block at L9)"),
+        text.contains("L TStringList L8 unknown (hidden directive block at L9) — verify L8-9"),
         "{text}"
     );
     let file = digest("degraded.pas");

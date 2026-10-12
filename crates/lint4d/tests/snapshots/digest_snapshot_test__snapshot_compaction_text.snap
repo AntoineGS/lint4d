@@ -6,7 +6,7 @@ compaction.pas  1 routine
 L4-38  35  Compact
 
 Compact  compaction.pas:4-38 (35 lines)
-objects: Q TQuery L33 not freed in this routine (no free found)
+objects: Q TQuery L33 not freed in this routine (no free found: leak candidate) — verify L33-38
 frequent calls: Log ×3
 L8 calls Open
 L15 if Ready(A)
@@ -19,3 +19,4 @@ L32 try
   L33 new TQuery -> Q
   L34 calls Save
 L35 except
+note: calls are names only; callees not analysed

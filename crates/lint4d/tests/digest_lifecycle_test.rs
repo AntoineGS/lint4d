@@ -19,10 +19,21 @@ fn verdict(body: &str, routine: &str) -> Verdict {
 }
 
 fn object(var: &str, class: &str, line: usize, verdict: Verdict) -> ObjectVerdict {
+    object_v(var, class, line, verdict, None)
+}
+
+fn object_v(
+    var: &str,
+    class: &str,
+    line: usize,
+    verdict: Verdict,
+    verify_lines: Option<[usize; 2]>,
+) -> ObjectVerdict {
     ObjectVerdict {
         var: var.into(),
         class: class.into(),
         line,
+        verify_lines,
         verdict,
     }
 }
@@ -208,13 +219,14 @@ end;
                     why: NotFreedReason::NonLocal
                 }
             ),
-            object(
+            object_v(
                 "L",
                 "TList",
                 10,
                 Verdict::NotFreedHere {
                     why: NotFreedReason::NeverFreed
-                }
+                },
+                Some([10, 11])
             ),
         ]
     );
@@ -560,4 +572,143 @@ end;
         matches!(verdict(body, "Go"), Verdict::Escapes { .. }),
         "the false branch of Assigned(M) skips the free of L"
     );
+}
+
+fn verify_lines(body: &str, routine: &str) -> Vec<Option<[usize; 2]>> {
+    objects(body, routine)
+        .into_iter()
+        .map(|o| o.verify_lines)
+        .collect()
+}
+
+#[test]
+fn escapes_verify_from_creation_to_last_escape() {
+    let body = "procedure W;
+var
+  L: TStringList;
+begin
+  try
+    L := TStringList.Create;
+    Db.Open;
+    try
+      L.Add('x');
+    finally
+      L.Free;
+    end;
+  except
+    on E: Exception do
+      Log(E.Message);
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "W"), vec![Some([9, 10])]);
+}
+
+#[test]
+fn reassigned_verifies_from_creation_to_reassignment() {
+    let body = "procedure R;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    L := nil;
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "R"), vec![Some([8, 10])]);
+}
+
+#[test]
+fn reference_before_creation_is_ordered() {
+    let body = "procedure H;
+var
+  L: TStringList;
+begin
+  {$IF DEFINED(X)}
+  rappel: developper en 32 bits pour plus de stabilite
+  {$IFEND}
+  L := TStringList.Create;
+end;
+";
+    assert_eq!(verify_lines(body, "H"), vec![Some([8, 11])]);
+}
+
+#[test]
+fn named_inside_with_verifies_to_the_with_line() {
+    let body = "procedure Wi;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    with Obj do
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "Wi"), vec![Some([8, 13])]);
+}
+
+#[test]
+fn parse_errors_verify_to_the_first_error_line() {
+    let body = "procedure Pe;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  Foo(;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Pe");
+    assert_eq!(objects.len(), 1);
+    assert_eq!(
+        objects[0].verdict,
+        Verdict::Unknown {
+            why: "parse errors".into()
+        }
+    );
+    assert_eq!(objects[0].verify_lines, Some([8, 9]));
+}
+
+#[test]
+fn never_freed_verifies_to_the_routine_end() {
+    let body = "procedure Nf;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  Work;
+end;
+";
+    assert_eq!(verify_lines(body, "Nf"), vec![Some([8, 10])]);
+}
+
+#[test]
+fn result_non_local_and_freed_have_no_verify_lines() {
+    let body = "function F: TList;
+begin
+  Result := TList.Create;
+  FItems := TList.Create;
+end;
+";
+    assert_eq!(verify_lines(body, "F"), vec![None, None]);
+    let freed = "procedure Ok;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(freed, "Ok"), vec![None]);
 }

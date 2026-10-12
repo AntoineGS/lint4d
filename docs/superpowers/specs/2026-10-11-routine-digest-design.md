@@ -116,6 +116,7 @@ L2356 try
     L2505 free params
 L2570 finally
   L2571 calls aBofSync.EndWrite
+note: calls are names only; callees not analysed
 ```
 
 Fact lines:
@@ -158,15 +159,28 @@ exceptions stays visible; likewise a kept `{$IF}` keeps all its branches, and
 does not change them.
 
 The `objects:` line holds one verdict per local variable assigned from a
-constructor:
+constructor. Verdicts that are leads rather than facts carry the lines to read,
+`— verify L4399-4402` (`L4399` when both ends are the same line):
 
 - `freed on all paths`
-- `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …)`: up to
-  three escape points ordered by line, then `…`; `re-created at L…` for a
-  creation reached again before its free
-- `not freed in this routine`: assigned to `Result`, a field, or never freed;
-  a description, not a leak claim
-- `unknown (<reason>)`
+- `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …) — verify
+  L4399-4410`: up to three escape points ordered by line, then `…`;
+  `re-created` for a creation reached again before its free. The range runs from
+  the creation to the last listed escape.
+- `not freed in this routine (returned as Result: caller owns)` and
+  `(assigned to a non-local: owner frees)`: ownership moves elsewhere; no range
+- `not freed in this routine (no free found: leak candidate) — verify L9-40`:
+  a local never freed; the range runs from the creation to the routine end
+- `unknown (<reason>) — verify L9-12`: the range joins the creation and the line
+  the reason names (reassignment, `with`, hidden directive block, first parse
+  error); with no such line (`creation not in CFG`, parse errors without a
+  line) it runs from the creation to the routine end
+
+When the routine has an `objects:` line and any call (a `calls` fact, a
+`frequent calls:` line or an anonymous method with calls), the last line is
+`note: calls are names only; callees not analysed`. The header, degradation,
+`objects:` and `frequent calls:` lines and this footer are never collapsed by
+`--max-lines`; the footer counts toward its budget.
 
 ### 5.2 Routine index
 
@@ -182,7 +196,10 @@ object is NOT freed on all paths), `?` (some verdict is unknown).
 ### 5.3 JSON
 
 `--format json` serializes the data model of section 6 with lines and byte
-ranges. Text is the default.
+ranges. Text is the default. Each object verdict carries `verify_lines`, a
+`[first, last]` pair, exactly when the text shows `— verify`; it is omitted
+otherwise. The notices and the footer are text only. The JSON contract is
+pinned by an insta snapshot of one routine holding every variant.
 
 ## 6. Data model and analysis
 
@@ -196,7 +213,7 @@ Node           = Control { kind, line, label, children }   // if/else/case/arm/l
 Fact           = New { class, target } | Free { var } | Tx { op, receiver, method }
                | Raise { text } | ReRaise | Exit { runs_finally: Option<line> }
                | Calls(Vec<(name, count)>) | Nested { name } | Lambda { calls }
-ObjectVerdict  { var, class, line, verdict }
+ObjectVerdict  { var, class, line, verdict, verify_lines: Option<[line, line]> }
 Verdict        = FreedAllPaths | Escapes(Vec<Escape>) | NotFreedHere { why } | Unknown { why }
 ```
 

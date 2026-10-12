@@ -1,0 +1,600 @@
+---
+source: crates/lint4d/src/digest/render.rs
+expression: "render_json(\"src/All.pas\", &[&routine])"
+---
+{
+  "path": "src/All.pas",
+  "routines": [
+    {
+      "name": "TAll.Every",
+      "start_line": 1,
+      "end_line": 90,
+      "byte_range": {
+        "start": 0,
+        "end": 900
+      },
+      "objects": [
+        {
+          "var": "A",
+          "class": "TObj",
+          "line": 5,
+          "verdict": {
+            "status": "freed_all_paths"
+          }
+        },
+        {
+          "var": "B",
+          "class": "TObj",
+          "line": 6,
+          "verdict": {
+            "status": "escapes",
+            "via": [
+              {
+                "line": 10,
+                "how": "exception"
+              },
+              {
+                "line": 15,
+                "how": "exit"
+              },
+              {
+                "line": 18,
+                "how": "falls_off_end"
+              },
+              {
+                "line": 20,
+                "how": "re_created"
+              }
+            ],
+            "more": true
+          },
+          "verify_lines": [
+            6,
+            20
+          ]
+        },
+        {
+          "var": "Result",
+          "class": "TObj",
+          "line": 7,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "result"
+          }
+        },
+        {
+          "var": "FItems",
+          "class": "TObj",
+          "line": 8,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "non_local"
+          }
+        },
+        {
+          "var": "C",
+          "class": "TObj",
+          "line": 9,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "never_freed"
+          },
+          "verify_lines": [
+            9,
+            90
+          ]
+        },
+        {
+          "var": "D",
+          "class": "TObj",
+          "line": 10,
+          "verdict": {
+            "status": "unknown",
+            "why": "reassigned at L12"
+          },
+          "verify_lines": [
+            10,
+            12
+          ]
+        },
+        {
+          "var": "E",
+          "class": "TObj",
+          "line": 11,
+          "verdict": {
+            "status": "unknown",
+            "why": "creation not in CFG"
+          },
+          "verify_lines": [
+            11,
+            90
+          ]
+        }
+      ],
+      "frequent_calls": [
+        {
+          "name": "Log",
+          "count": 4
+        }
+      ],
+      "body": [
+        {
+          "node": "fact",
+          "line": 20,
+          "fact": {
+            "kind": "new",
+            "class": "TObj",
+            "target": "A"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 21,
+          "fact": {
+            "kind": "new",
+            "class": "TObj",
+            "target": null
+          }
+        },
+        {
+          "node": "fact",
+          "line": 22,
+          "fact": {
+            "kind": "free",
+            "var": "A"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 23,
+          "fact": {
+            "kind": "tx",
+            "op": "start",
+            "receiver": "Db",
+            "method": "StartTransaction"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 24,
+          "fact": {
+            "kind": "tx",
+            "op": "commit",
+            "receiver": "Db",
+            "method": "Commit"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 25,
+          "fact": {
+            "kind": "tx",
+            "op": "rollback",
+            "receiver": "Db",
+            "method": "Rollback"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 26,
+          "fact": {
+            "kind": "tx",
+            "op": "in_transaction",
+            "receiver": "Db",
+            "method": "InTransaction"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 27,
+          "fact": {
+            "kind": "raise",
+            "text": "Exception.Create('x')"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 28,
+          "fact": {
+            "kind": "re_raise"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 29,
+          "fact": {
+            "kind": "exit",
+            "runs_finally": null
+          }
+        },
+        {
+          "node": "fact",
+          "line": 30,
+          "fact": {
+            "kind": "exit",
+            "runs_finally": 60
+          }
+        },
+        {
+          "node": "fact",
+          "line": 31,
+          "fact": {
+            "kind": "calls",
+            "calls": [
+              {
+                "name": "One",
+                "count": 1
+              },
+              {
+                "name": "Two",
+                "count": 3
+              }
+            ]
+          }
+        },
+        {
+          "node": "fact",
+          "line": 32,
+          "fact": {
+            "kind": "nested",
+            "name": "Inner"
+          }
+        },
+        {
+          "node": "fact",
+          "line": 33,
+          "fact": {
+            "kind": "lambda",
+            "calls": []
+          }
+        },
+        {
+          "node": "fact",
+          "line": 34,
+          "fact": {
+            "kind": "lambda",
+            "calls": [
+              {
+                "name": "Cb",
+                "count": 2
+              }
+            ]
+          }
+        },
+        {
+          "node": "control",
+          "kind": "if",
+          "line": 35,
+          "end_line": 38,
+          "label": "A > 0",
+          "children": [
+            {
+              "node": "fact",
+              "line": 36,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "control",
+              "kind": "else",
+              "line": 37,
+              "end_line": 38,
+              "label": "",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 38,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "case",
+          "line": 39,
+          "end_line": 44,
+          "label": "N",
+          "children": [
+            {
+              "node": "control",
+              "kind": "arm",
+              "line": 40,
+              "end_line": 41,
+              "label": "1",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 41,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
+                }
+              ]
+            },
+            {
+              "node": "control",
+              "kind": "arm",
+              "line": 42,
+              "end_line": 44,
+              "label": "else",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 43,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "for",
+          "line": 45,
+          "end_line": 47,
+          "label": "for I := 0 to 3",
+          "children": [
+            {
+              "node": "fact",
+              "line": 46,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 47,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "while",
+          "line": 48,
+          "end_line": 50,
+          "label": "while X",
+          "children": [
+            {
+              "node": "fact",
+              "line": 49,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 50,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "repeat",
+          "line": 51,
+          "end_line": 53,
+          "label": "Done",
+          "children": [
+            {
+              "node": "fact",
+              "line": 52,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 53,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "try",
+          "line": 54,
+          "end_line": 70,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 55,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "control",
+              "kind": "finally",
+              "line": 56,
+              "end_line": 58,
+              "label": "",
+              "children": [
+                {
+                  "node": "fact",
+                  "line": 57,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
+                },
+                {
+                  "node": "fact",
+                  "line": 58,
+                  "fact": {
+                    "kind": "re_raise"
+                  }
+                }
+              ]
+            },
+            {
+              "node": "control",
+              "kind": "except",
+              "line": 59,
+              "end_line": 69,
+              "label": "",
+              "children": [
+                {
+                  "node": "control",
+                  "kind": "on",
+                  "line": 60,
+                  "end_line": 62,
+                  "label": "E: EAbort",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 61,
+                      "fact": {
+                        "kind": "re_raise"
+                      }
+                    },
+                    {
+                      "node": "fact",
+                      "line": 62,
+                      "fact": {
+                        "kind": "re_raise"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "node": "control",
+                  "kind": "except_else",
+                  "line": 63,
+                  "end_line": 65,
+                  "label": "",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 64,
+                      "fact": {
+                        "kind": "re_raise"
+                      }
+                    },
+                    {
+                      "node": "fact",
+                      "line": 65,
+                      "fact": {
+                        "kind": "re_raise"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "with",
+          "line": 71,
+          "end_line": 73,
+          "label": "Obj",
+          "children": [
+            {
+              "node": "fact",
+              "line": 72,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 73,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "conditional",
+          "line": 74,
+          "end_line": 76,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 75,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 76,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "branch",
+          "line": 77,
+          "end_line": 79,
+          "label": "{$IF X}",
+          "children": [
+            {
+              "node": "fact",
+              "line": 78,
+              "fact": {
+                "kind": "re_raise"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 79,
+              "fact": {
+                "kind": "re_raise"
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "asm",
+          "line": 80,
+          "end_line": 82,
+          "label": "",
+          "children": []
+        }
+      ],
+      "degraded": [
+        {
+          "kind": "parse_errors",
+          "lines": [
+            3,
+            4
+          ]
+        },
+        {
+          "kind": "conditional",
+          "regions": 2
+        },
+        {
+          "kind": "hidden_directive",
+          "line": 12
+        },
+        {
+          "kind": "anonymous_methods"
+        }
+      ]
+    }
+  ]
+}

@@ -202,7 +202,11 @@ expression: "render::render_json(&file.path, &routines)"
               }
             ],
             "more": false
-          }
+          },
+          "verify_lines": [
+            30,
+            31
+          ]
         }
       ],
       "body": [
@@ -344,7 +348,11 @@ expression: "render::render_json(&file.path, &routines)"
           "verdict": {
             "status": "not_freed_here",
             "why": "never_freed"
-          }
+          },
+          "verify_lines": [
+            48,
+            49
+          ]
         }
       ],
       "body": [

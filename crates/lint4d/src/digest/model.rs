@@ -135,6 +135,10 @@ pub struct ObjectVerdict {
     pub class: String,
     pub line: usize,
     pub verdict: Verdict,
+    /// First and last line to read to confirm or refute the verdict; absent
+    /// when the verdict needs no checking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_lines: Option<[usize; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

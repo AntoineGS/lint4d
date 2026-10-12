@@ -352,3 +352,21 @@ fn unchecked_nil_treats_call_to_disagreeing_overloads_as_unanalyzable() {
         matches
     );
 }
+
+#[test]
+fn unchecked_nil_treats_every_call_to_an_unanalyzable_function_alike() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/good_repeated_unanalyzable_calls.pas",
+        &project,
+    );
+    let lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .map(|d| d.line)
+        .collect();
+    assert!(
+        lines.is_empty(),
+        "A second call to an external function or to disagreeing overloads must not be flagged when the first is not: {lines:?}"
+    );
+}

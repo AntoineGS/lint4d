@@ -22,7 +22,9 @@ use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 // ─── Thread-local cache ───────────────────────────────────────────────────────
 
 thread_local! {
-    static FN_RETURN_CACHE: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+    /// Per-function answer of `can_function_return_nil`, `None` meaning
+    /// unanalyzable, so every call to a function gets the same answer.
+    static FN_RETURN_CACHE: RefCell<HashMap<String, Option<bool>>> = RefCell::new(HashMap::new());
 }
 
 // ─── Rule definition ─────────────────────────────────────────────────────────
@@ -514,15 +516,26 @@ fn can_function_return_nil(
 ) -> Option<bool> {
     let func_lower = func_name.to_lowercase();
 
-    // Check cache
     let cached = FN_RETURN_CACHE.with(|cache| cache.borrow().get(&func_lower).copied());
     if let Some(result) = cached {
-        return Some(result);
+        return result;
     }
 
     // Insert sentinel to break recursion (assume can return nil)
-    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower.clone(), true));
+    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower.clone(), Some(true)));
 
+    let result = function_return_nil_uncached(func_name, root, source, cfgs, unit_name);
+    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower, result));
+    result
+}
+
+fn function_return_nil_uncached(
+    func_name: &str,
+    root: Node,
+    source: &[u8],
+    cfgs: &HashMap<ProcId, Cfg>,
+    unit_name: &str,
+) -> Option<bool> {
     // Find the function's CFGs by matching proc name (case-insensitive)
     // qualified_name may be just "FuncName" or "TClass.MethodName".
     // The call is resolved by name only, so every overload is a candidate and
@@ -548,12 +561,7 @@ fn can_function_return_nil(
         }
         result = Some(can_return_nil);
     }
-    let result = result?;
-
-    // Update cache
-    FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower, result));
-
-    Some(result)
+    result
 }
 
 /// Check if a `defProc` is a function (has a return type).

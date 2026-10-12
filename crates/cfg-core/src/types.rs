@@ -2,7 +2,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use std::ops::Range;
 
 /// Opaque handle to a basic block within a CFG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub(crate) NodeIndex);
 
 impl BlockId {

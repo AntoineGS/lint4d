@@ -21,6 +21,16 @@ recognition and CFG semantic precision are therefore documented separately.
 | Delphi conditional expressions (`if ... then ... else ...`) | Yes | The enclosing expression-bearing statement is currently atomic in the CFG. The graph does not create branch blocks or claim that both expression arms execute; exception behavior is conservatively attributed to the containing statement. Expression-level side effects and branch-specific source references are not modeled yet. |
 | Malformed or incremental trees | Tree-sitter can represent them | Callers must pass a syntax tree and source bytes from the same snapshot. The builder uses conservative fallbacks for unsupported or incomplete nodes; it does not fabricate compiler semantics. |
 
+## Statement copies
+
+A `finally` body is built once per continuation that runs it: normal
+completion, exception propagation, and each `Exit`, `Break`, `Continue` or
+`goto` that leaves the protected region. Each copy is a separate
+`FinallyHandler` block holding the same statement references. Consumers must
+treat the copies as one source region: `Cfg::blocks_for_stmt(range)` returns
+every block holding the innermost statement that contains `range`, and
+`Cfg::path_avoiding` / `Cfg::must_pass_through_any` accept the resulting set.
+
 ## Project snapshot API
 
 Project-aware builds never discover files or infer imports from spelling. The

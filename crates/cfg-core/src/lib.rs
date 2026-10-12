@@ -9,5 +9,6 @@ pub mod types;
 pub use builder::*;
 pub use call_graph::*;
 pub use compute::*;
+pub use query::PathEdge;
 pub use summary::*;
 pub use types::*;

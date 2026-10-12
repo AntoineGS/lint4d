@@ -8,6 +8,11 @@ pub enum DcuError {
     UnsupportedVersion {
         magic: u32,
     },
+    /// The size dword at offset 4 differs from the input length.
+    SizeMismatch {
+        declared: u32,
+        actual: usize,
+    },
     UnknownTag {
         tag: u8,
         offset: usize,
@@ -30,6 +35,10 @@ impl fmt::Display for DcuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnexpectedEof { context } => write!(f, "unexpected EOF: {context}"),
+            Self::SizeMismatch { declared, actual } => write!(
+                f,
+                "DCU size field says {declared} bytes but the input has {actual}"
+            ),
             Self::UnsupportedVersion { magic } => {
                 write!(f, "unsupported DCU version: magic 0x{magic:08X}")
             }

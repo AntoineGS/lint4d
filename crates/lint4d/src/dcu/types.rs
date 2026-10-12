@@ -1,7 +1,7 @@
 use crate::dcu::DcuUnit;
 use crate::dcu::const_add_info::skip_decl_const_add_info;
 use crate::dcu::decl_parser::{read_decl_list_into_for_provider, read_decl_list_into_with_exports};
-use crate::dcu::header::{parse_unit_header, parse_unit_header_for_provider};
+use crate::dcu::header::{parse_unit_header_for_provider, parse_unit_header_tolerant};
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
 
@@ -96,7 +96,7 @@ pub fn parse_dcu_for_provider(
 pub fn parse_dcu_with_exported_type_indices(
     data: &[u8],
 ) -> Result<(DcuUnit, Vec<usize>), DcuError> {
-    let header = parse_unit_header(data)?;
+    let header = parse_unit_header_tolerant(data)?;
     let mut reader = DcuReader::new(data, header.version);
     reader.set_position(header.body_offset);
 
@@ -241,6 +241,7 @@ fn skip_import_records(reader: &mut DcuReader) -> Result<(), DcuError> {
 mod provider_strictness_tests {
     use super::*;
     use crate::dcu::decl_parser::read_decl_list_into;
+    use crate::dcu::header::parse_unit_header;
 
     fn root_terminator_offset(data: &[u8]) -> usize {
         let header = parse_unit_header(data).expect("fixture header");

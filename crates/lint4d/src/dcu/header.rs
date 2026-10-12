@@ -76,9 +76,9 @@ pub struct UnitHeader {
     pub platform: DcuPlatform,
     /// The fully-qualified unit name (e.g. `Lint4dFixture.Classes`).
     pub name: String,
-    /// Raw flags value from the header.
+    /// Feature word of the 0xFE header record.
     pub flags: u32,
-    /// Unit file stamp (changes when the unit is recompiled).
+    /// File size recorded in the header (equal to the input length).
     pub stamp: u32,
     /// Byte offset where the unit body begins.
     pub body_offset: usize,
@@ -86,21 +86,16 @@ pub struct UnitHeader {
 
 /// Parse the unit header from a raw DCU byte slice.
 ///
-/// Layout (D2010+):
+/// Layout (D2010+), as read by dcc's `FUN_00806170` (`dcc_UNITRDWR.c`):
 /// ```text
 /// [0..4]   magic          (u32 LE)
-/// [4..8]   file_size      (u32 LE)
-/// [8..12]  file_time      (u32 LE)
-/// [12..16] file_stamp     (u32 LE)
-/// [16]     header_byte_1  (raw byte)
-/// [17]     header_byte_2  (raw byte, D7+)
-/// [18..]   unit_name_pfx  (read_name: namespace prefix)
-/// [+]      L1             (uindex, D2009+)
-/// [+]      L2             (uindex, D2009+)
-/// [+]      flags          (read_index, signed)
-/// [+]      flags1         (uindex, D2006+)
-/// [+]      unit_prior     (uindex, D3+)
-/// [+]      ...            (version-dependent extra fields)
+/// [4..8]   file_size      (u32 LE, must equal the input length)
+/// [8..16]  two dwords     (stored by the compiler, unused here)
+/// [16]     name           (read_name, empty in every observed unit)
+/// [+]      unit index     (uindex, 1)
+/// [+]      unit name      (read_name: the namespace prefix, e.g. `Lint4dFixture`)
+/// [+]      records        0xFE feature word (uindex)
+///                         0x96 unit header (three uindex)
 /// [+]      drSrc tag      (0x70)
 /// [+]      source_file    (read_name, includes ".pas")
 /// ```
@@ -110,7 +105,16 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     let (version, platform) = parse_magic(data)?;
     let mut reader = DcuReader::new(data, version);
 
-    parse_unit_header_with_reader(version, platform, &mut reader)
+    parse_unit_header_with_reader(version, platform, &mut reader, true)
+}
+
+/// [`parse_unit_header`] without the size check, for the tolerant lint
+/// parser that keeps the declarations of a truncated unit.
+pub(crate) fn parse_unit_header_tolerant(data: &[u8]) -> Result<UnitHeader, DcuError> {
+    let (version, platform) = parse_magic(data)?;
+    let mut reader = DcuReader::new(data, version);
+
+    parse_unit_header_with_reader(version, platform, &mut reader, false)
 }
 
 pub(crate) fn parse_unit_header_for_provider(
@@ -120,7 +124,7 @@ pub(crate) fn parse_unit_header_for_provider(
 ) -> Result<(UnitHeader, DcuReader<'_>), DcuError> {
     let (version, platform) = parse_magic(data)?;
     let mut reader = DcuReader::new_for_provider(data, version, max_records, max_decoded_bytes);
-    let header = parse_unit_header_with_reader(version, platform, &mut reader)?;
+    let header = parse_unit_header_with_reader(version, platform, &mut reader, true)?;
     Ok((header, reader))
 }
 
@@ -128,35 +132,40 @@ fn parse_unit_header_with_reader(
     version: DcuVersion,
     platform: DcuPlatform,
     reader: &mut DcuReader<'_>,
+    check_size: bool,
 ) -> Result<UnitHeader, DcuError> {
     // Skip magic (4 bytes already parsed by parse_magic).
     reader.skip(4)?;
 
-    // Read file_size (called "stamp" historically).
+    // dcc rejects a unit whose size field differs from the bytes it was given.
     let stamp = reader.read_u32()?;
+    if check_size && stamp as usize != reader.len() {
+        return Err(DcuError::SizeMismatch {
+            declared: stamp,
+            actual: reader.len(),
+        });
+    }
 
-    // Skip file_time (4) + file_stamp (4) + header_byte_1 (1) + header_byte_2 (1).
-    reader.skip(10)?;
-
-    // Read namespace prefix (D2005+; always present for D2010+).
+    reader.skip(8)?;
+    reader.charge_decoded_record()?;
+    let _name = reader.read_name()?;
+    let _unit_index = reader.read_uindex()?;
     reader.charge_decoded_record()?;
     let _namespace = reader.read_name()?;
 
-    // D2009+ intermediate fields (always present for D2010+).
-    let _l1 = reader.read_uindex()?;
-    let _l2 = reader.read_uindex()?;
-
-    // drUnitFlags: Flags (signed index) + Flags1 (D2006+) + FUnitPrior (D3+).
-    let _flags_val = reader.read_index()?;
-    let _flags1 = reader.read_uindex()?;
-    let _unit_prior = reader.read_uindex()?;
-
-    // Scan forward to the first drSrc tag (0x70) which holds the source filename.
-    // Between drUnitFlags and drSrc there may be version-dependent extra fields.
+    // Tagged records up to drSrc (0x70), which holds the source filename.
+    let mut flags = 0;
     loop {
-        let b = reader.read_byte()?;
-        if b == 0x70 {
-            break;
+        let offset = reader.position();
+        match reader.read_byte()? {
+            0xFE => flags = reader.read_uindex()?,
+            0x96 => {
+                for _ in 0..3 {
+                    reader.read_uindex()?;
+                }
+            }
+            0x70 => break,
+            tag => return Err(DcuError::UnknownTag { tag, offset }),
         }
     }
 
@@ -175,7 +184,7 @@ fn parse_unit_header_with_reader(
         version,
         platform,
         name,
-        flags: 0,
+        flags,
         stamp,
         body_offset: reader.position(),
     })

@@ -85,6 +85,18 @@ Fail the process only on errors (ignore warnings and hints):
 lint4d --fail-on error src/
 ```
 
+Summarise routines for coding agents (control flow, object lifetimes,
+transactions, calls, each with its line):
+
+```sh
+lint4d digest MyUnit.pas                      # routine index
+lint4d digest MyUnit.pas --line 2417          # routine containing a line
+lint4d digest MyUnit.pas --routine TFoo.Save  # by name (all overloads)
+```
+
+`digest` is a subcommand; to lint a directory literally named `digest`, write
+`lint4d ./digest`. See `skills/pascal-digest/SKILL.md` for the agent skill.
+
 ### fmt4d
 
 Format a single file or directory:

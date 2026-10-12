@@ -3,6 +3,7 @@
 pub mod lifecycle;
 pub mod model;
 pub mod render;
+pub mod select;
 pub mod tree;
 
 pub use model::*;

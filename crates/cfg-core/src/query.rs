@@ -181,6 +181,9 @@ impl Cfg {
 
     /// True if every path from `from` to exit enters a block of `through`.
     pub fn must_pass_through_any(&self, from: BlockId, through: &HashSet<BlockId>) -> bool {
+        if from == self.exit {
+            return through.contains(&from);
+        }
         through.contains(&from) || self.path_avoiding(from, self.exit, through, &[]).is_none()
     }
 }
@@ -392,6 +395,13 @@ mod tests {
         let (cfg, entry, then_blk, else_blk, _join, _exit) = build_diamond_cfg();
         assert!(cfg.must_pass_through_any(entry, &set(&[then_blk, else_blk])));
         assert!(!cfg.must_pass_through_any(entry, &set(&[then_blk])));
+    }
+
+    #[test]
+    fn must_pass_through_any_at_exit_requires_membership() {
+        let (cfg, _entry, a, _bb, exit) = build_linear_cfg();
+        assert!(!cfg.must_pass_through_any(exit, &set(&[a])));
+        assert!(cfg.must_pass_through_any(exit, &set(&[exit])));
     }
 
     #[test]

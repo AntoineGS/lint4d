@@ -90,7 +90,7 @@ Each is its own issue, test-first.
 ## 5. Output format
 
 Line numbers are absolute and 1-based (`L2417`). Indentation is nesting.
-Conditions and `case` labels are truncated to about 50 characters with `…`.
+Conditions and `case` labels are truncated to about 50 characters with `…`; so is the text after `raise`.
 
 ### 5.1 Routine digest
 
@@ -110,7 +110,7 @@ L2356 try
       boukUpdate: L2420 calls GenerateUpdateSQL
       boukInsert: L2421 calls GenerateInsertSQL
       boukDelete: L2422 calls GenerateDeleteSQL
-      else: L2424 raise EBOException.Create('Unknown operation to perform to w…
+      else: L2424 raise EBOException.Create('Unknown operation to perform …
     …
   L2504 finally
     L2505 free params
@@ -136,6 +136,15 @@ line after `objects:` (before the body): `frequent calls: LogToConsoleBOF ×9,
 GetBofSync ×3`. The count is always shown, names keep first-use order, runs
 left empty disappear, and calls inside anonymous methods are not counted. The
 line is omitted when nothing qualifies.
+
+In the text output, a chain of single-child controls (`if`, `else`, `case`
+arm, `for`, `while`, `with`, `on`) that ends in one fact renders on one line,
+joined by ` → ` with every line number kept: `L463 if aDataset is TIBQuery →
+L465 calls TIBQuery(aDataset).ExecSQL`, or `hoExecSQL: L463 if … → L465 calls
+…` for an arm. A chain ending in a control with several children, or passing
+through `try`, `case`, `repeat`, `{$IF}` or `asm`, is not folded, and a
+control that `--max-lines` collapses renders its collapse line instead. JSON
+and the model are not affected.
 
 A control with no fact anywhere below it and no call in its own condition or
 label is omitted, bottom-up (an `if` whose only child was such a `for` goes

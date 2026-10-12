@@ -10,19 +10,14 @@ Outer  constructs.pas:4-34 (31 lines)
 ! conditional code: 1 {$IF…} regions, all branches shown
 ! anonymous methods not analysed
 L5 nested routine Outer.Inner
-L10 for var I := 0 to A
-  L11 calls Inner
-L12 while Items.Count > 0
-  L13 calls Items.Delete
-L14 with TBOField(Fields[0])
-  L15 calls Clear
+L10 for var I := 0 to A → L11 calls Inner
+L12 while Items.Count > 0 → L13 calls Items.Delete
+L14 with TBOField(Fields[0]) → L15 calls Clear
 L16 try
   L17 calls inherited
 L18 except
-  L19 on E: EAbort
-    L20 re-raise
-  L21 on E: Exception
-    L22 calls Log
+  L19 on E: EAbort → L20 re-raise
+  L21 on E: Exception → L22 calls Log
 L24 conditional
   L24 {$IFDEF DEBUG}
     L25 calls Trace
@@ -30,11 +25,8 @@ L24 conditional
     L27 calls Trace
 L29 calls TThread.Queue
 L29 anonymous method calls Ping
-L30 if A = 1
-  L31 calls Bar
-L32 else
-  L32 if A = 2
-    L33 calls Baz
+L30 if A = 1 → L31 calls Bar
+L32 else → L32 if A = 2 → L33 calls Baz
 
 Outer.Inner  constructs.pas:5-8 (4 lines)
 L7 calls Bar

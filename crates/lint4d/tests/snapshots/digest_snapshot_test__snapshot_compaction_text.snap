@@ -1,0 +1,21 @@
+---
+source: crates/lint4d/tests/digest_snapshot_test.rs
+expression: "all_text(\"compaction.pas\")"
+---
+compaction.pas  1 routine
+L4-38  35  Compact
+
+Compact  compaction.pas:4-38 (35 lines)
+objects: Q TQuery L33 not freed in this routine (no free found)
+frequent calls: Log ×3
+L8 calls Open
+L15 if Ready(A)
+L17 if (SomeVeryLongVariableName > 0) and (AnotherVeryLon… [calls IsReady]
+L19 if A = 1 → L20 calls Items.Clear
+L22 else → L22 calls Items.Sort
+L23 case A
+  2: L25 if Items.Count > 0 → L25 calls Items.Delete
+L32 try
+  L33 new TQuery -> Q
+  L34 calls Save
+L35 except

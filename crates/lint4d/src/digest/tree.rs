@@ -477,7 +477,7 @@ impl Builder<'_> {
             "raise" => {
                 let fact = match node.child_by_field_name("exception") {
                     Some(exception) => Fact::Raise {
-                        text: self.short(exception, 60),
+                        text: self.short(exception, LABEL_WIDTH),
                     },
                     None => Fact::ReRaise,
                 };

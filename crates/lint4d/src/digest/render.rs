@@ -160,13 +160,11 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
                         if lines == 1 { "" } else { "s" },
                         calls_suffix(children)
                     ));
+                } else if let Some(folded) = fold_chain(node, depth, collapse_at) {
+                    out.push(format!("{indent}{folded}"));
                 } else if *kind == ControlKind::Arm {
-                    if let [DigestNode::Fact { line, fact }] = children.as_slice() {
-                        out.push(format!("{indent}{label}: L{line} {}", fact_text(fact)));
-                    } else {
-                        out.push(format!("{indent}{label}:"));
-                        render_nodes(children, depth + 1, collapse_at, out);
-                    }
+                    out.push(format!("{indent}{label}:"));
+                    render_nodes(children, depth + 1, collapse_at, out);
                 } else {
                     out.push(format!("{indent}L{line} {}", head_text(*kind, label)));
                     render_nodes(children, depth + 1, collapse_at, out);
@@ -174,6 +172,58 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
             }
         }
     }
+}
+
+fn foldable(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::If
+            | ControlKind::Else
+            | ControlKind::Arm
+            | ControlKind::For
+            | ControlKind::While
+            | ControlKind::With
+            | ControlKind::On
+    )
+}
+
+/// One line for a chain of single-child controls ending in a single fact.
+/// A link that `--max-lines` would collapse ends the attempt.
+fn fold_chain(node: &DigestNode, depth: usize, collapse_at: usize) -> Option<String> {
+    let mut prefix = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node;
+    let mut level = depth;
+    loop {
+        match current {
+            DigestNode::Fact { line, fact } => {
+                parts.push(format!("L{line} {}", fact_text(fact)));
+                break;
+            }
+            DigestNode::Control {
+                kind,
+                line,
+                label,
+                children,
+                ..
+            } => {
+                if !foldable(*kind) || level >= collapse_at {
+                    return None;
+                }
+                let [only] = children.as_slice() else {
+                    return None;
+                };
+                if *kind == ControlKind::Arm {
+                    prefix = format!("{label}: ");
+                } else {
+                    parts.push(format!("L{line} {}", head_text(*kind, label)));
+                }
+                current = only;
+                level += 1;
+            }
+        }
+    }
+    Some(format!("{prefix}{}", parts.join(" → ")))
 }
 
 fn calls_suffix(nodes: &[DigestNode]) -> String {

@@ -52,8 +52,7 @@ L10 try
     1: L12 calls Bar
     2: L13 calls Baz, Qux
     else: L15 raise Exception.Create('bad')
-  L17 if A > 0
-    L18 exit (runs finally L22)
+  L17 if A > 0 → L18 exit (runs finally L22)
   L19 tx start DB.StartTransaction
 L21 finally
   L22 free L
@@ -112,19 +111,14 @@ fn loops_handlers_conditionals_and_lambdas() {
     assert_eq!(
         render::render_tree(&outer.body),
         "L5 nested routine Outer.Inner
-L10 for var I := 0 to A
-  L11 calls Inner
-L12 while Items.Count > 0
-  L13 calls Items.Delete
-L14 with TBOField(Fields[0])
-  L15 calls Clear
+L10 for var I := 0 to A → L11 calls Inner
+L12 while Items.Count > 0 → L13 calls Items.Delete
+L14 with TBOField(Fields[0]) → L15 calls Clear
 L16 try
   L17 calls inherited
 L18 except
-  L19 on E: EAbort
-    L20 re-raise
-  L21 on E: Exception
-    L22 calls Log
+  L19 on E: EAbort → L20 re-raise
+  L21 on E: Exception → L22 calls Log
 L24 conditional
   L24 {$IFDEF DEBUG}
     L25 calls Trace
@@ -132,11 +126,8 @@ L24 conditional
     L27 calls Trace
 L29 calls TThread.Queue
 L29 anonymous method calls Ping
-L30 if A = 1
-  L31 calls Bar
-L32 else
-  L32 if A = 2
-    L33 calls Baz
+L30 if A = 1 → L31 calls Bar
+L32 else → L32 if A = 2 → L33 calls Baz
 "
     );
     assert_eq!(
@@ -161,7 +152,7 @@ fn latin1_condition_is_decoded() {
     let file = digest(&source);
     assert_eq!(
         render::render_tree(&routine(&file, "P").body),
-        "L6 if S = '\u{e9}t'\n  L7 calls Bar\n"
+        "L6 if S = '\u{e9}t' → L7 calls Bar\n"
     );
 }
 
@@ -184,7 +175,7 @@ fn long_conditions_are_truncated_and_list_hidden_calls() {
         first.starts_with("L6 if (SomeVeryLongVariableName > 0) and (AnotherVeryLon…"),
         "{tree}"
     );
-    assert!(first.ends_with("… [calls IsReady]"), "{tree}");
+    assert!(first.contains("… [calls IsReady]"), "{tree}");
 }
 
 #[test]
@@ -235,10 +226,8 @@ fn a_call_in_three_runs_is_hoisted_with_its_total_count() {
     assert_eq!(
         render::render_tree(&p.body),
         "L6 calls Foo
-L7 if A
-  L8 calls Bar
-L10 if B
-  L11 calls Baz
+L7 if A → L8 calls Bar
+L10 if B → L11 calls Baz
 "
     );
 }
@@ -258,8 +247,7 @@ fn a_call_in_two_runs_stays_in_place() {
     assert_eq!(
         render::render_tree(&p.body),
         "L6 calls Log, Foo
-L7 if A
-  L8 calls Bar
+L7 if A → L8 calls Bar
 L9 calls Log ×2
 "
     );
@@ -316,15 +304,12 @@ fn an_empty_if_stays_before_a_kept_else_and_an_empty_else_goes() {
     assert_eq!(
         tree_of("  if A then\n    X := 1\n  else\n    Bar;\n"),
         "L6 if A
-L9 else
-  L9 calls Bar
+L9 else → L9 calls Bar
 "
     );
     assert_eq!(
         tree_of("  if A then\n    Bar\n  else\n    X := 1;\n"),
-        "L6 if A
-  L7 calls Bar
-"
+        "L6 if A → L7 calls Bar\n"
     );
 }
 
@@ -409,19 +394,23 @@ fn labels_are_cut_at_fifty_characters() {
         "(AAAAAAAAAA = 1) and (BBBBBBBBBB = 2) and (CCCCCCCCCC = 3) and (DDDDDDDDDD = 4)";
     let tree = tree_of(&format!("  if {condition} then\n    Bar;\n"));
     let expected: String = condition.chars().take(50).collect();
-    assert_eq!(tree.lines().next().unwrap(), format!("L6 if {expected}…"));
+    assert_eq!(
+        tree.lines().next().unwrap(),
+        format!("L6 if {expected}… → L7 calls Bar")
+    );
 }
 
 #[test]
 fn a_bare_except_body_keeps_an_empty_if_before_its_else() {
     assert_eq!(
-        tree_of("  try\n    Bar;\n  except\n    if A then\n      X := 1\n    else\n      Touch;\n  end;\n"),
+        tree_of(
+            "  try\n    Bar;\n  except\n    if A then\n      X := 1\n    else\n      Touch;\n  end;\n"
+        ),
         "L6 try
   L7 calls Bar
 L8 except
   L9 if A
-  L12 else
-    L12 calls Touch
+  L12 else → L12 calls Touch
 "
     );
 }
@@ -441,4 +430,68 @@ fn json_omits_frequent_calls_when_empty() {
     let file = digest(wrap("  Bar;\n").as_bytes());
     let p = routine(&file, "P");
     assert!(!render::render_json("t.pas", &[p]).contains("frequent_calls"));
+}
+
+#[test]
+fn single_child_chains_fold_onto_one_line() {
+    assert_eq!(
+        tree_of("  if A then\n    Bar\n  else\n    Baz;\n"),
+        "L6 if A → L7 calls Bar
+L9 else → L9 calls Baz
+"
+    );
+    assert_eq!(
+        tree_of("  if A then\n    for var I := 0 to 3 do\n      with X do\n        Bar;\n"),
+        "L6 if A → L7 for var I := 0 to 3 → L8 with X → L9 calls Bar\n"
+    );
+    assert_eq!(
+        tree_of(
+            "  case A of\n    1: if B then Bar;\n    2: Baz;\n    3: begin Bar; Baz; end;\n  end;\n"
+        ),
+        "L6 case A
+  1: L7 if B → L7 calls Bar
+  2: L8 calls Baz
+  3: L9 calls Bar, Baz
+"
+    );
+}
+
+#[test]
+fn chains_ending_in_several_children_or_an_unfoldable_control_stay_nested() {
+    assert_eq!(
+        tree_of(
+            "  if A then\n    for var I := 0 to 3 do\n    begin\n      Bar;\n      DB.Commit;\n    end;\n"
+        ),
+        "L6 if A
+  L7 for var I := 0 to 3
+    L9 calls Bar
+    L10 tx commit DB.Commit
+"
+    );
+    assert_eq!(
+        tree_of("  if A then\n    try\n      Bar;\n    finally\n      Baz;\n    end;\n"),
+        "L6 if A
+  L7 try
+    L8 calls Bar
+  L9 finally
+    L10 calls Baz
+"
+    );
+}
+
+#[test]
+fn collapsed_controls_are_not_folded_into_a_chain() {
+    let source = wrap("  if A then\n    if B then\n      Bar;\n");
+    let file = digest(source.as_bytes());
+    let p = routine(&file, "P");
+    let text = render::render_routine(p, "t.pas", Some(1));
+    assert!(text.contains("L6-8 if A … (3 lines, calls Bar)"), "{text}");
+}
+
+#[test]
+fn raise_text_is_cut_at_fifty_characters() {
+    let text = "Exception.Create('AAAAAAAAAA BBBBBBBBBB CCCCCCCCCC DDDDDDDDDD EEEEEEEEEE')";
+    let tree = tree_of(&format!("  raise {text};\n"));
+    let expected: String = text.chars().take(50).collect();
+    assert_eq!(tree, format!("L6 raise {expected}…\n"));
 }

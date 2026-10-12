@@ -35,6 +35,18 @@ fn snapshot_lifecycle_json() {
 }
 
 #[test]
+fn snapshot_compaction_text() {
+    insta::assert_snapshot!(all_text("compaction.pas"));
+}
+
+#[test]
+fn snapshot_compaction_json() {
+    let file = digest("compaction.pas");
+    let routines: Vec<_> = file.routines.iter().collect();
+    insta::assert_snapshot!(render::render_json(&file.path, &routines));
+}
+
+#[test]
 fn snapshot_constructs_text() {
     insta::assert_snapshot!(all_text("constructs.pas"));
 }
@@ -80,9 +92,11 @@ L21 calls Finish
     );
 }
 
-/// The fact text after `Lnnn `, also behind an inline arm label (`1: L12 …`).
+/// The fact text after `Lnnn `, also behind an inline arm label (`1: L12 …`)
+/// and at the end of a folded chain (`L5 if A → L6 …`).
 fn fact_text(line: &str) -> Option<&str> {
     let line = line.trim_start();
+    let line = line.rsplit_once(" → ").map_or(line, |(_, last)| last);
     let line = match line.find(": L") {
         Some(index) if !line.starts_with('L') => &line[index + 2..],
         _ => line,

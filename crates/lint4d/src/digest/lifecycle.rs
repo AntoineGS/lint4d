@@ -74,8 +74,10 @@ fn verify_lines(
 ) -> Option<[usize; 2]> {
     match verdict {
         Verdict::Escapes { via, .. } => {
-            let last = via.iter().map(|escape| escape.line).max().unwrap_or(line);
-            Some([line, last.max(line)])
+            let lines = via.iter().map(|escape| escape.line).chain([line]);
+            let first = lines.clone().min().unwrap_or(line);
+            let last = lines.max().unwrap_or(line);
+            Some([first, last])
         }
         Verdict::Unknown { .. } => Some(match reference {
             Some(reference) => [line.min(reference), line.max(reference)],

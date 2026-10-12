@@ -33,11 +33,13 @@ raises, exits and calls, each with its source line.
 
 - Read only the source lines the digest points to. A verdict with
   `— verify L…-…` names the lines to read; the digest does not prove it.
-- Output changes to expect: a `frequent calls:` line after `objects:` lists
+- The digest compacts output: a `frequent calls:` line after `objects:` lists
   calls found in three or more separate runs, with total counts, and removes
   them from those runs; runs and controls with no fact are omitted; a chain of
   single-child controls with one fact reads on one line joined by ` → `
   (`L463 if … → L465 calls …`); long labels and raise text end in `…`.
+- Verdict lines carry their own interpretation (`— verify L…` ranges,
+  ownership notes such as `caller owns`); read them literally.
 - A final `note:` line says calls are names only. Digest or read the callee
   when its effect matters.
 - `unknown (hidden directive block at L…)`: the routine contains a

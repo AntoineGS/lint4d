@@ -712,3 +712,33 @@ end;
 ";
     assert_eq!(verify_lines(freed, "Ok"), vec![None]);
 }
+
+#[test]
+fn escape_before_the_creation_widens_the_verify_range() {
+    let body = "procedure Lp;
+var L: TStringList;
+begin
+  while More do
+  begin
+    Db.Open;
+    L := TStringList.Create;
+  end;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Lp");
+    assert_eq!(objects.len(), 1);
+    let Verdict::Escapes { via, .. } = &objects[0].verdict else {
+        panic!("expected escapes, got {:?}", objects[0].verdict);
+    };
+    assert_eq!(
+        via,
+        &vec![
+            esc(7, EscapeKind::Exception),
+            esc(9, EscapeKind::Exception),
+            esc(10, EscapeKind::ReCreated)
+        ]
+    );
+    assert_eq!(objects[0].line, 10);
+    assert_eq!(objects[0].verify_lines, Some([7, 10]));
+}

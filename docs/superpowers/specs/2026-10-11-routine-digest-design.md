@@ -165,8 +165,8 @@ constructor. Verdicts that are leads rather than facts carry the lines to read,
 - `freed on all paths`
 - `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …) — verify
   L4399-4410`: up to three escape points ordered by line, then `…`;
-  `re-created` for a creation reached again before its free. The range runs from
-  the creation to the last listed escape.
+  `re-created` for a creation reached again before its free. The range spans the
+  creation and every listed escape (a loop can escape above the creation).
 - `not freed in this routine (returned as Result: caller owns)` and
   `(assigned to a non-local: owner frees)`: ownership moves elsewhere; no range
 - `not freed in this routine (no free found: leak candidate) — verify L9-40`:

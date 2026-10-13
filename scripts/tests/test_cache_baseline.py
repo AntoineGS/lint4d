@@ -1,5 +1,6 @@
 """Unit tests for scripts/cache_baseline.py (stdlib only, no package install)."""
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "cache_baseline.py"
 _spec = importlib.util.spec_from_file_location("cache_baseline", SCRIPT)
@@ -432,6 +434,22 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(window["after"], after)
         self.assertNotIn("reset", json.dumps(window).lower())
 
+    def test_ok_sample_needs_real_result(self):
+        for result in (
+            {},
+            None,
+            {"count": None, "fingerprint": None, "expectedCount": None,
+             "expectedFingerprint": None},
+            {"count": 3, "fingerprint": "f" * 64, "expectedCount": 4,
+             "expectedFingerprint": "f" * 64},
+            {"count": 4, "fingerprint": "f" * 64, "expectedCount": 4,
+             "expectedFingerprint": "e" * 64},
+        ):
+            sample = self.good()
+            sample["result"] = result
+            with self.assertRaises(ValueError, msg=result):
+                baseline.validate_sample(sample)
+
     def test_write_sample_is_one_bounded_json_line(self):
         stream = io.StringIO()
         baseline.write_sample(stream, self.good())
@@ -516,6 +534,10 @@ class SessionTests(TempCase):
         info = session.close()
         self.assertFalse(info["orderlyShutdown"])
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "killpg"),
+        "needs /proc and POSIX process groups to observe the grandchild",
+    )
     def test_wrapper_timeout_reaps_whole_group(self):
         script = self.tmp / "fake_child.py"
         script.write_text(FAKE_CHILD, encoding="utf-8")
@@ -534,6 +556,26 @@ class SessionTests(TempCase):
         grandchild = int(pid_file.read_text(encoding="ascii"))
         self.assertTrue(pid_gone(grandchild, threading.Event()))
         session.close()
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "POSIX process groups only")
+    def test_group_is_signalled_only_while_leader_is_unreaped(self):
+        calls = []
+        real = os.killpg
+
+        def checked(pid, sig):
+            calls.append((pid, sig, session._proc.returncode))
+            return real(pid, sig)
+
+        session = self.fake("ok", new_session=True)
+        session.initialize(self.tmp, {})
+        with mock.patch.object(os, "killpg", checked):
+            session.close()
+            self.assertTrue(calls)
+            self.assertTrue(all(code is None for _, _, code in calls), calls)
+            calls.clear()
+            session._signal(True)
+            session._signal(False)
+        self.assertEqual(calls, [])
 
     def test_unexpected_apply_edit_is_rejected(self):
         session = self.fake("apply_edit")
@@ -584,6 +626,34 @@ class SessionTests(TempCase):
         session.initialize(self.tmp, {})
         info = session.close()
         self.assertIsNone(info["metrics"])
+
+
+class ScenarioCleanupTests(TempCase):
+    def test_two_sessions_closes_first_when_second_start_fails(self):
+        root = self.tmp / "subject"
+        root.mkdir()
+        target = root / "a.pas"
+        target.write_text("unit a;", encoding="utf-8")
+        subject = baseline.Subject(root, {}, target, 0, 0, [], {"digest": "d"},
+                                   {"kind": "synthetic", "label": "t"})
+        args = argparse.Namespace(samples=1, timeout_seconds=5, profiling="off")
+        ctx = baseline.Context(args, {"path": "x"})
+        modes = iter(["ok", "garbage"])
+        opened = []
+
+        def open_session():
+            session = self.fake(next(modes))
+            opened.append(session)
+            return session
+
+        ctx.open_session = open_session
+        samples = baseline.scenario_two_sessions(
+            ctx, lambda: baseline._SubjectScope(lambda _tmp: subject)
+        )
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([s["outcome"] for s in samples], ["invalid"])
+        for session in opened:
+            self.assertIsNotNone(session.returncode())
 
 
 class CliTests(TempCase):

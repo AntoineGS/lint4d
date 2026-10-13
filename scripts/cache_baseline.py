@@ -414,9 +414,17 @@ def validate_sample(sample):
             raise ValueError("an ok sample needs a timing")
         if sample.get("protocolError") is not None:
             raise ValueError("an ok sample cannot contain a protocol error")
-        result = sample.get("result") or {}
-        if result.get("fingerprint") != result.get("expectedFingerprint"):
+        result = sample.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("an ok sample needs a result")
+        fingerprint = result.get("fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("an ok sample needs a result fingerprint")
+        if fingerprint != result.get("expectedFingerprint"):
             raise ValueError("an ok sample must match its expected result")
+        count = result.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or count != result.get("expectedCount"):
+            raise ValueError("an ok sample must match its expected result count")
     elif nanos is not None:
         raise ValueError("an invalid sample cannot carry a timing")
     if sample.get("releaseGateStatus") != "not_evaluated":
@@ -540,7 +548,7 @@ class LspSession:
             self._time_file = name
             argv = [gnu_time, "-o", name, "-f", TIME_FORMAT] + argv
             new_session = True
-        self._own_group = bool(new_session)
+        self._own_group = bool(new_session) and hasattr(os, "killpg")
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -612,28 +620,54 @@ class LspSession:
     # child lifetime -------------------------------------------------
 
     def returncode(self):
-        return self._proc.poll()
+        return self._proc.returncode
 
-    def _signal(self, sig):
-        if self._proc.poll() is not None and not self._own_group:
+    def _exited(self):
+        """True once the leader exited; a group leader is not reaped here."""
+        if self._proc.returncode is not None:
+            return True
+        if self._own_group and hasattr(os, "waitid"):
+            return os.waitid(os.P_PID, self._proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        return self._proc.poll() is not None
+
+    def _wait_exit(self, timeout):
+        deadline = time.monotonic() + timeout
+        while not self._exited():
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("child", timeout)
+            self._stop.wait(0.01)
+
+    def _signal(self, force):
+        """Signal the owned child (or its group) only while the leader is unreaped.
+
+        An unreaped leader keeps its pid, and so the process group id, reserved;
+        after the leader is reaped the id could belong to an unrelated group.
+        """
+        if self._proc.returncode is not None:
             return
         try:
             if self._own_group:
-                os.killpg(self._proc.pid, sig)
+                os.killpg(self._proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif force:
+                self._proc.kill()
             else:
-                self._proc.send_signal(sig)
+                self._proc.terminate()
         except (ProcessLookupError, PermissionError):
             pass
 
+    def _reap(self):
+        """Kill any remaining group members while the leader is still unreaped, then reap."""
+        if self._own_group:
+            self._signal(True)
+        self._proc.wait()
+
     def _abort(self):
-        self._signal(signal.SIGTERM)
+        self._signal(False)
         try:
-            self._proc.wait(KILL_GRACE_SECONDS)
+            self._wait_exit(KILL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            self._signal(signal.SIGKILL)
-            self._proc.wait()
-        if self._own_group:  # make sure no group member outlives the wrapper
-            self._signal(signal.SIGKILL)
+            self._signal(True)
+        self._reap()
         self._stop.set()
 
     def _fail(self, error):
@@ -727,8 +761,8 @@ class LspSession:
     def close(self):
         if self._closed_info is not None:
             return self._closed_info
-        orderly = False
-        if self._proc.poll() is None and not self._stop.is_set():
+        shutdown_ok = False
+        if not self._exited() and not self._stop.is_set():
             try:
                 response, _ = self.request("shutdown", None)
                 if "error" not in response:
@@ -737,14 +771,15 @@ class LspSession:
                         self._proc.stdin.close()
                     except OSError:
                         pass
-                    self._proc.wait(self._timeout)
-                    orderly = self._proc.returncode == 0
+                    self._wait_exit(self._timeout)
+                    shutdown_ok = True
             except (RunInvalid, subprocess.TimeoutExpired):
                 pass
-        if self._proc.poll() is None:
+        if self._proc.returncode is None and not self._exited():
             self._abort()
-        elif self._own_group:
-            self._signal(signal.SIGKILL)
+        else:
+            self._reap()
+        orderly = shutdown_ok and self._proc.returncode == 0
         self._stop.set()
         for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
             try:
@@ -1181,7 +1216,8 @@ def scenario_two_sessions(ctx, subject_maker):
         for index in range(ctx.args.samples):
             sessions, outputs = [], [None, None]
             try:
-                sessions = [start(ctx, subject), start(ctx, subject)]
+                for _ in range(2):
+                    sessions.append(start(ctx, subject))
             except RunInvalid as error:
                 for session in sessions:
                     session.close()

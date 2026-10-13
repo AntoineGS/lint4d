@@ -2372,6 +2372,17 @@ their recursive analysis pipelines. Navigation uses iterative tree walks. LSP
 headers are capped at 8 KiB and message bodies at 8 MiB. The stdio endpoint is
 intended for a trusted local editor, not network exposure.
 
+## Analysis metrics (opt-in profiling)
+
+Setting `PASCAL_LSP_ANALYSIS_METRICS=1` in the server environment enables
+bounded process-lifetime operation counters (parser invocations, document
+preparations, payload reads and hashes, project-stamp probes). At shutdown the
+server prints a single `pascal-lsp analysis-metrics {...}` line to stderr with
+aggregate numbers only, never paths or source text. It is off by default and
+changes no protocol output. See [`docs/cache-benchmarking.md`](../../docs/cache-benchmarking.md)
+for the benchmark runner, the recorded phase-1 baselines and the counters'
+known coverage gaps.
+
 ## Tests
 
 ```sh

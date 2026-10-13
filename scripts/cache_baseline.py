@@ -397,6 +397,67 @@ def make_sample(
     return sample
 
 
+def _validate_snapshot(snapshot):
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != SCHEMA:
+        raise ValueError("counter snapshot has an unsupported schema")
+    if not isinstance(snapshot.get("saturated"), bool):
+        raise ValueError("counter snapshot needs a boolean saturated flag")
+    if not isinstance(snapshot.get("countScope"), str) or not snapshot["countScope"]:
+        raise ValueError("counter snapshot needs a count scope")
+    counters = snapshot.get("counters")
+    if not isinstance(counters, dict):
+        raise ValueError("counter snapshot needs counters")
+    for name, count in counters.items():
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("counter %r must be a non-negative integer" % name)
+
+
+def _counter_snapshots(counters_entry):
+    """Every raw snapshot carried by an available counters entry."""
+    value = counters_entry.get("value") or {}
+    snapshots = []
+    if "lifetime" in value:
+        snapshots.append(value["lifetime"])
+    window = value.get("window")
+    if window is not None:
+        snapshots.extend((window.get("before"), window.get("after")))
+    return snapshots
+
+
+GATES = ("parse_count", "complete_query", "storage")
+
+
+def gate_status(sample, gate):
+    """Whether a valid sample carries the measurement a later gate needs.
+
+    This never evaluates a release target (`releaseGateStatus` stays
+    `not_evaluated`); it only says if the evidence could be used for one.
+    """
+    if gate not in GATES:
+        raise ValueError("unknown gate %r" % gate)
+    validate_sample(sample)
+    if sample["outcome"] != "ok":
+        return {"satisfied": False, "reason": "sample is invalid"}
+    if gate == "parse_count":
+        entry = sample["counters"]
+        if not entry["available"]:
+            return {"satisfied": False, "reason": "counters unavailable: %s" % entry["reason"]}
+        snapshots = _counter_snapshots(entry)
+        if not snapshots:
+            return {"satisfied": False, "reason": "no counter snapshot recorded"}
+        if any(snapshot["saturated"] for snapshot in snapshots):
+            return {"satisfied": False, "reason": "counter snapshot saturated"}
+    elif gate == "complete_query":
+        entry = sample["coverage"]
+        if not entry["available"]:
+            return {"satisfied": False, "reason": "coverage unavailable: %s" % entry["reason"]}
+    else:
+        entry = sample["storage"]
+        if not entry["available"]:
+            return {"satisfied": False, "reason": "storage unavailable: %s" % entry["reason"]}
+    return {"satisfied": True, "reason": None}
+
+
 def validate_sample(sample):
     if not isinstance(sample, dict):
         raise ValueError("sample must be an object")
@@ -438,6 +499,12 @@ def validate_sample(sample):
                 raise ValueError("available entry %r has no value" % field)
         elif entry.get("value") is not None or not entry.get("reason"):
             raise ValueError("unavailable entry %r needs a null value and a reason" % field)
+    for field in ("fixture", "binary", "input"):
+        if not isinstance(sample.get(field), dict) or not sample[field]:
+            raise ValueError("sample needs a %s identity" % field)
+    if sample["counters"]["available"]:
+        for snapshot in _counter_snapshots(sample["counters"]):
+            _validate_snapshot(snapshot)
 
 
 def write_sample(stream, sample):

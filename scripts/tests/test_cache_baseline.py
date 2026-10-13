@@ -450,6 +450,81 @@ class SampleTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=result):
                 baseline.validate_sample(sample)
 
+    def with_counters(self, snapshot, scope="lifetime"):
+        sample = self.good()
+        sample["counters"] = baseline.available({scope: snapshot})
+        return sample
+
+    @staticmethod
+    def snapshot(saturated=False, **overrides):
+        counters = {"coreParserInvocations": 3, "projectStampProbes": 1}
+        counters.update(overrides)
+        return {"schema": 1, "counters": counters, "saturated": saturated,
+                "countScope": "process_lifetime", "orderlyShutdown": True}
+
+    def test_saturated_snapshot_cannot_satisfy_parse_gate(self):
+        clean = self.with_counters(self.snapshot())
+        baseline.validate_sample(clean)
+        self.assertTrue(baseline.gate_status(clean, "parse_count")["satisfied"])
+        saturated = self.with_counters(self.snapshot(saturated=True))
+        baseline.validate_sample(saturated)  # a valid timing sample...
+        status = baseline.gate_status(saturated, "parse_count")
+        self.assertFalse(status["satisfied"])  # ...that cannot pass the gate
+        self.assertIn("saturated", status["reason"])
+        for bad in (
+            self.snapshot(coreParserInvocations=-1),
+            self.snapshot(saturated="no"),
+            {"schema": 2, "counters": {}, "saturated": False},
+        ):
+            with self.assertRaises(ValueError, msg=bad):
+                baseline.validate_sample(self.with_counters(bad))
+
+    def test_unknown_coverage_cannot_satisfy_complete_query_gate(self):
+        sample = self.good()
+        baseline.validate_sample(sample)
+        self.assertFalse(sample["coverage"]["available"])
+        status = baseline.gate_status(sample, "complete_query")
+        self.assertFalse(status["satisfied"])
+        self.assertIn("coverage", status["reason"])
+        sample["coverage"] = baseline.available({"complete": True})
+        self.assertTrue(baseline.gate_status(sample, "complete_query")["satisfied"])
+        invalid = self.good()
+        invalid.update(outcome="invalid", requestNanos=None, reason="boom")
+        invalid["coverage"] = baseline.available({"complete": True})
+        self.assertFalse(baseline.gate_status(invalid, "complete_query")["satisfied"])
+
+    def test_unimplemented_storage_is_unavailable(self):
+        sample = self.good()
+        self.assertEqual(sample["storage"]["reason"], "persistence_not_implemented")
+        self.assertIsNone(sample["storage"]["value"])
+        self.assertFalse(baseline.gate_status(sample, "storage")["satisfied"])
+        zero = self.good()
+        zero["storage"] = {"value": 0, "available": False, "reason": "x"}
+        with self.assertRaises(ValueError):
+            baseline.validate_sample(zero)
+        with self.assertRaises(ValueError):
+            baseline.gate_status(sample, "no_such_gate")
+
+    def test_sample_records_fixture_binary_and_counter_scope(self):
+        sample = self.with_counters(self.snapshot())
+        self.assertEqual(sample["fixture"]["digest"], "d" * 64)
+        self.assertEqual(sample["binary"]["sha256"], "0" * 64)
+        self.assertIn("profiling", sample["binary"])
+        self.assertIn("testServer", sample["binary"])
+        self.assertEqual(sample["input"]["kind"], "synthetic")
+        self.assertEqual(sample["counters"]["value"]["lifetime"]["countScope"],
+                         "process_lifetime")
+        # counters without a recorded scope cannot be interpreted
+        snapshot = self.snapshot()
+        del snapshot["countScope"]
+        with self.assertRaises(ValueError):
+            baseline.validate_sample(self.with_counters(snapshot))
+        for field in ("fixture", "binary", "input"):
+            broken = self.good()
+            broken[field] = None
+            with self.assertRaises(ValueError, msg=field):
+                baseline.validate_sample(broken)
+
     def test_write_sample_is_one_bounded_json_line(self):
         stream = io.StringIO()
         baseline.write_sample(stream, self.good())

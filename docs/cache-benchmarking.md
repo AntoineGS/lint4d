@@ -2,8 +2,8 @@
 
 `scripts/cache_baseline.py` is a Python-stdlib runner that drives `pascal-lsp --stdio`
 over JSON-RPC and writes one schema-1 JSON sample per line. Phase 1 measures only:
-no persistent cache exists yet, so nothing here reports a cache win. Task 5 extends
-this guide with the recorded baselines and acceptance targets.
+no persistent cache exists yet, so nothing here reports a cache win. The last sections
+record the phase-1 baselines, the acceptance targets they feed and the known gaps.
 
 ```sh
 cargo build -p pascal-lsp --release
@@ -110,3 +110,84 @@ At most 64 stderr lines of 512 bytes are retained (the rest is drained), plus th
 No traversal outside the fixture or manifest root, no source writes outside the owned
 temporary fixture, no cache purge, and no gate evaluation (`releaseGateStatus` stays
 `not_evaluated` until the owning later phases exist).
+
+## Gate evidence rules
+
+`validate_sample` rejects negative time, schema mismatch, missing fixture/binary/input
+identity, malformed or unscoped counter snapshots (negative counts, non-boolean
+`saturated`, no `countScope`), unlabelled availability and an `ok` sample that carries a
+protocol error. Every phase-1 sample must have `releaseGateStatus: "not_evaluated"`.
+`gate_status(sample, gate)` only says whether a valid sample carries the evidence a later
+gate needs; it never evaluates a target:
+
+- `parse_count`: needs available, non-saturated counter snapshots (a saturated snapshot
+  is a valid timing but cannot satisfy it).
+- `complete_query`: needs available coverage. Today coverage is always unavailable
+  (`index_coverage_not_instrumented`), so timing-only samples cannot pass it.
+- `storage`: needs available storage usage. Persistence does not exist
+  (`persistence_not_implemented`).
+
+## Counter coverage and known exclusions
+
+Counters are process-lifetime aggregates; `coreParserInvocations`, `lspDocumentPreparations`
+and `resolverMetadataParses` overlap by design and **must never be summed**. Known gaps:
+
+- l4d-yehp: direct `project_content_hash` call sites are not counted in `legacyHashBytes`.
+- l4d-vdl5: parse sites outside `pascal_core::parser::parse_bytes` are not in
+  `coreParserInvocations` (`directive_fragment_rewrite`, cfg-pascal `prepared.rs`, lint4d
+  `cfg/project_snapshot.rs`).
+
+Absolute parse numbers are therefore lower bounds for the LSP references path only.
+
+## Recorded phase-1 baselines (synthetic only)
+
+Setup: release builds, 500 units / 5 importers (digest prefix `197518b3608f`, expected
+fingerprint prefix `707e0eff8f2f`, 10 locations), Intel i7-9700, 8 CPUs, 32 GB RAM, Linux.
+The machine was **not idle** (load average roughly 1.7-4.6 while running). Binaries: the
+retained uninstrumented build (from master + docs, sha256 `34f7251a...c7624d7c79`),
+and the instrumented build with `--profiling off` and `on` (profiling off = env unset).
+Warm/request scenarios have 30 samples, cold 5, the over-limit fixture 3. Runs were
+interleaved per scenario across the three binaries. Median ms (p95 in parentheses):
+
+| Scenario | uninstrumented | new, profiling off | new, profiling on |
+| --- | --- | --- | --- |
+| cold (5) | 772.8 (960.2) | 717.4 (783.9) | 737.1 (767.0) |
+| warm (30) | 525.2 (619.6) | 519.3 (529.9) | 519.6 (659.8) |
+| restart (30) | 685.5 (771.8) | 694.9 (736.1) | 690.5 (738.2) |
+| budget_pressure (30) | 515.0 (632.8) | 510.1 (536.7) | 511.1 (676.2) |
+| two_sessions s0 / s1 (30) | 744.1 / 751.2 | 741.1 / 736.2 | 736.3 / 744.1 |
+
+Edit and configuration-switch variants are in the retained result files. Differences
+between binaries are within sample spread on a shared machine; **no overhead target
+(disabled <=5%, first cold <=20%) is evaluated or claimed**. Samples were all valid and
+result fingerprints agreed across scenarios and binaries.
+
+Profiling-on counters (cold, one request on a fresh process): 508 core parser invocations,
+503 document preparations, 1 resolver metadata parse, 4,666 stamp probes, ~460 KB
+authorized payload, ~149 KB legacy hash bytes. The warm scenario's process totals are
+about 15.5k parser invocations over 31 requests, i.e. roughly one parse per unit per
+request: today nothing is reused across requests. Counters are attached to the last
+sample of a shared process, so the other warm samples show `metrics_not_reported_by_binary_or_run_not_orderly`;
+the uninstrumented binary and `profiling off` show `profiling_off`/the same reason, never zero.
+
+Unavailable: child RSS and block IO (GNU `time` is not installed), index coverage,
+storage usage, heap peak.
+
+### Over-limit fixture (10,500 units)
+
+All 3 samples of cold and warm failed on every binary with protocol error `-32803`,
+`project directory entry limit (10000) reached`. This is today's directory-entry limit
+(not raised); these samples are `invalid` and carry no timing. No larger-fixture baseline
+exists until the limit or indexing changes.
+
+### Real-corpus baseline
+
+Real-corpus baseline unavailable: no user-selected manifest. The real-corpus release gate
+stays open on l4d-zf1b.12; no synthetic number substitutes for it.
+
+## Later release targets (not measured here)
+
+>=90% fewer unchanged-restart indexing parses; fully reconciled representative references
+p95 <=5 s; first cold index overhead <=20%; disabled overhead <=5%. The restart scenario
+reuses source bytes with a new process and implies no persistence; the baselines above
+are the comparison, to be extended with real instrumentation by the owning phases.

@@ -1961,9 +1961,14 @@ impl NavigationIndex {
     where
         I: IntoIterator<Item = (String, Url)>,
     {
+        use pascal_project::analysis_metrics::{self, Metric};
+        analysis_metrics::record(Metric::ImportBindingCalls, 1);
         let bindings = bindings
             .into_iter()
-            .map(|(name, uri)| (canonical_name(&name), uri))
+            .map(|(name, uri)| {
+                analysis_metrics::record(Metric::ImportBindingPairs, 1);
+                (canonical_name(&name), uri)
+            })
             .collect();
         if let Some(document) = self.documents.get_mut(uri) {
             document.import_binding_fingerprint = Some(import_binding_fingerprint(
@@ -16239,6 +16244,10 @@ impl Document {
         }
         #[cfg(test)]
         TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(value.get().saturating_add(1)));
+        pascal_project::analysis_metrics::record(
+            pascal_project::analysis_metrics::Metric::LspDocumentPreparations,
+            1,
+        );
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
@@ -27418,6 +27427,75 @@ mod tests {
                 "unexpected auto-import context for {name}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_document_reuse_skips_preparation_and_parser() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let uri = Url::parse("file:///tmp/metrics-reuse.pas").expect("fixture URI");
+        let cancel = AtomicBool::new(false);
+        let context = ConditionalContext::default();
+        let source = "unit MetricsReuse;\ninterface\nimplementation\nend.\n";
+        let scope = TestScope::new();
+        let first =
+            Document::parse_with_cancel(uri.clone(), source.to_owned(), &context, &cancel, None)
+                .expect("first parse");
+        let after_first = scope.snapshot();
+        assert_eq!(after_first.value(Metric::LspDocumentPreparations), 1);
+        let parser_calls = after_first.value(Metric::CoreParserInvocations);
+        assert!(parser_calls >= 1);
+
+        let reused = Document::parse_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &context,
+            &cancel,
+            Some(first.parsed.clone()),
+        )
+        .expect("reused document");
+        assert!(Arc::ptr_eq(&reused.parsed, &first.parsed));
+        let after_reuse = scope.snapshot();
+        assert_eq!(after_reuse.value(Metric::LspDocumentPreparations), 1);
+        assert_eq!(
+            after_reuse.value(Metric::CoreParserInvocations),
+            parser_calls
+        );
+
+        Document::parse_with_cancel(
+            uri,
+            format!("{source}// changed\n"),
+            &context,
+            &cancel,
+            Some(first.parsed.clone()),
+        )
+        .expect("changed document");
+        let after_change = scope.snapshot();
+        assert_eq!(after_change.value(Metric::LspDocumentPreparations), 2);
+        assert!(after_change.value(Metric::CoreParserInvocations) > parser_calls);
+    }
+
+    #[test]
+    fn metrics_bind_imports_counts_calls_and_pairs() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let uri = Url::parse("file:///tmp/metrics-bind.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(
+                uri.clone(),
+                "unit MetricsBind;\ninterface\nimplementation\nend.\n".to_owned(),
+            )
+            .expect("fixture parses");
+        let scope = TestScope::new();
+        index.bind_imports(
+            &uri,
+            [
+                ("A".to_owned(), Url::parse("file:///tmp/a.pas").unwrap()),
+                ("B".to_owned(), Url::parse("file:///tmp/b.pas").unwrap()),
+            ],
+        );
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::ImportBindingCalls), 1);
+        assert_eq!(s.value(Metric::ImportBindingPairs), 2);
     }
 
     #[test]

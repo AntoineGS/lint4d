@@ -8292,6 +8292,10 @@ fn test_metadata_parses(path: &Path) -> usize {
 }
 
 fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
+    pascal_project::analysis_metrics::record(
+        pascal_project::analysis_metrics::Metric::ResolverMetadataParses,
+        1,
+    );
     #[cfg(test)]
     TEST_METADATA_PARSES.with(|parses| {
         *parses.borrow_mut().entry(source.path.clone()).or_default() += 1;
@@ -19478,6 +19482,59 @@ mod tests {
                 "{name} must be parsed once per resolver"
             );
         }
+    }
+
+    #[test]
+    fn metrics_resolver_metadata_parses_match_test_counter() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let root = PathBuf::from("/workspace");
+        let mut store = MemoryStore::default();
+        for (name, text) in [
+            (
+                "Main.pas",
+                "unit Main; interface uses A, B; implementation end.",
+            ),
+            ("A.pas", "unit A; interface uses B; implementation end."),
+            ("B.pas", "unit B; interface implementation end."),
+        ] {
+            store
+                .sources
+                .insert(root.join(name), text.as_bytes().to_vec());
+        }
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![root.clone()],
+            search_path_entries: vec![ProjectPathEntry {
+                path: root.clone(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            }],
+            ..ProjectContext::default()
+        };
+        reset_test_metadata_parses();
+        let scope = TestScope::new();
+        UnitResolver::new(context, vec![root.clone()], store, Default::default())
+            .resolve_project(
+                UnitResolveRequest {
+                    requested_name: "Main",
+                    importer_path: &root.join("Main.pas"),
+                    legacy_route: None,
+                },
+                &[],
+                &NoCancellation,
+            )
+            .expect("project graph");
+        let expected: usize = ["Main.pas", "A.pas", "B.pas"]
+            .iter()
+            .map(|name| test_metadata_parses(&root.join(name)))
+            .sum();
+        assert_eq!(expected, 3);
+        let snapshot = scope.snapshot();
+        assert_eq!(
+            snapshot.value(Metric::ResolverMetadataParses),
+            expected as u64
+        );
+        // Each metadata parse runs the core parser once for these clean units.
+        assert_eq!(snapshot.value(Metric::CoreParserInvocations), 3);
     }
 
     #[derive(Default)]

@@ -205,6 +205,10 @@ fn parse_fresh(source: &[u8]) -> Result<FreshParseResult, String> {
 }
 
 fn parse_bytes(source: &[u8], old_tree: Option<&Tree>) -> Result<Tree, String> {
+    pascal_project::analysis_metrics::record(
+        pascal_project::analysis_metrics::Metric::CoreParserInvocations,
+        1,
+    );
     PARSER
         .with(|parser| parser.borrow_mut().parse(source, old_tree))
         .ok_or_else(|| "parser returned no tree".to_string())
@@ -423,6 +427,28 @@ mod parse_with_patches_tests {
 
     fn info() -> FileInfo {
         FileInfo::new(PathBuf::from("test.pas"))
+    }
+
+    #[test]
+    fn metrics_core_parse_counts_real_invocation() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let scope = TestScope::new();
+        parse_file(&info(), b"unit A; interface implementation end.").unwrap();
+        assert_eq!(scope.snapshot().value(Metric::CoreParserInvocations), 1);
+    }
+
+    #[test]
+    fn metrics_core_parse_counts_rewrite_retry_invocations() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    {$IF DEFINED(WIN32) AND NOT DEFINED(UNITTEST)}\n\
+                    rappel: developper en 32 bits pour plus de stabilite\n\
+                    {$IFEND}\nend.\n";
+        let scope = TestScope::new();
+        let (_tree, _diags, patches) = parse_file_with_patches(&info(), src).expect("parse ok");
+        assert_eq!(patches.len(), 1, "the opaque rewrite must have run");
+        // One parse of the phase 1 source plus one retry of the rewritten source.
+        assert_eq!(scope.snapshot().value(Metric::CoreParserInvocations), 2);
     }
 
     #[test]

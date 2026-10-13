@@ -222,6 +222,17 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_analysis_metrics(environment: TempDir) -> Self {
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_ANALYSIS_METRICS"),
+            Some("1"),
+        );
+        server._environment = Some(environment);
+        server
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
     }
@@ -61153,6 +61164,9 @@ mod workspace_selection;
 
 #[path = "protocol/build_selection.rs"]
 mod build_selection;
+
+#[path = "protocol/cache_baseline.rs"]
+mod cache_baseline;
 
 fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
     write_file(

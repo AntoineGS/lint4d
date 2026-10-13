@@ -122,7 +122,7 @@ gate needs; it never evaluates a target:
 
 - `parse_count`: needs available, non-saturated counter snapshots (a saturated snapshot
   is a valid timing but cannot satisfy it).
-- `complete_query`: needs available coverage. Today coverage is always unavailable
+- `complete_query`: needs available coverage whose value reports `complete: true`. Today coverage is always unavailable
   (`index_coverage_not_instrumented`), so timing-only samples cannot pass it.
 - `storage`: needs available storage usage. Persistence does not exist
   (`persistence_not_implemented`).
@@ -137,17 +137,25 @@ and `resolverMetadataParses` overlap by design and **must never be summed**. Kno
   `coreParserInvocations` (`directive_fragment_rewrite`, cfg-pascal `prepared.rs`, lint4d
   `cfg/project_snapshot.rs`).
 
-Absolute parse numbers are therefore lower bounds for the LSP references path only.
+Absolute parse numbers are therefore lower bounds for the LSP references path only, and
+stay lower bounds until l4d-vdl5 and l4d-yehp land.
 
 ## Recorded phase-1 baselines (synthetic only)
 
 Setup: release builds, 500 units / 5 importers (digest prefix `197518b3608f`, expected
 fingerprint prefix `707e0eff8f2f`, 10 locations), Intel i7-9700, 8 CPUs, 32 GB RAM, Linux.
 The machine was **not idle** (load average roughly 1.7-4.6 while running). Binaries: the
-retained uninstrumented build (from master + docs, sha256 `34f7251a...c7624d7c79`),
-and the instrumented build with `--profiling off` and `on` (profiling off = env unset).
-Warm/request scenarios have 30 samples, cold 5, the over-limit fixture 3. Runs were
-interleaved per scenario across the three binaries. Median ms (p95 in parentheses):
+retained uninstrumented build (from master + docs, sha256
+`34f7251a704b6932368b62eafadefc5f7ec58ef2419bbac6da6f9129624d7c79`), and the instrumented
+build (sha256 `fdcf9247a8b6945489d5faf3411f40b2d5f70b7a07464bbe468f70980f7c6aa7`) with
+`--profiling off` and `on` (profiling off = env unset). The 10,500-unit fixture digest is
+`cf93bc4f59798706c73008e0f310acfc30e812229a6fa17cdaa45808c00d480a`. Raw samples, the
+matrix script and commands log live in `/tmp/opencode/l4d-cache-phase1-results/`
+(checksums in its `SHA256SUMS`). Warm/request scenarios have 30 samples, cold 5, the
+over-limit fixture 3. Cold samples ran 5 back-to-back per binary, grouped per scenario;
+they are **not paired per sample** across binaries. Spec §12.2 gates need per-sample paired
+runs and median paired ratios, so these numbers are not gate evidence. Median ms (p95 in
+parentheses):
 
 | Scenario | uninstrumented | new, profiling off | new, profiling on |
 | --- | --- | --- | --- |
@@ -159,8 +167,13 @@ interleaved per scenario across the three binaries. Median ms (p95 in parenthese
 
 Edit and configuration-switch variants are in the retained result files. Differences
 between binaries are within sample spread on a shared machine; **no overhead target
-(disabled <=5%, first cold <=20%) is evaluated or claimed**. Samples were all valid and
-result fingerprints agreed across scenarios and binaries.
+(disabled <=5%, first cold <=20%) is evaluated or claimed**. Samples were all valid
+(500-unit suite); the 10,500-unit samples are all invalid (see below). Result fingerprints
+agreed across binaries, and across scenarios except the source-edit variant (prefix
+`77200862df36`; every other scenario gives `707e0eff8f2f`).
+
+In the shared-process scenarios (warm, budget_pressure) an applyEdit violation or a
+non-orderly exit invalidates only the final sample; earlier samples had correct responses.
 
 Profiling-on counters (cold, one request on a fresh process): 508 core parser invocations,
 503 document preparations, 1 resolver metadata parse, 4,666 stamp probes, ~460 KB

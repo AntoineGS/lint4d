@@ -434,6 +434,33 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(window["after"], after)
         self.assertNotIn("reset", json.dumps(window).lower())
 
+    def test_counter_window_mirrors_checked_delta(self):
+        def snap(counters, saturated=False, schema=1):
+            return {"schema": schema, "counters": counters, "saturated": saturated}
+
+        good = snap({"a": 1})
+        cases = {
+            "missing name": (snap({}), snap({"a": 2})),
+            "negative delta": (snap({"a": 5}), snap({"a": 2})),
+            "saturated before": (snap({"a": 1}, saturated=True), snap({"a": 2})),
+            "saturated after": (good, snap({"a": 2}, saturated=True)),
+            "schema mismatch": (good, snap({"a": 2}, schema=2)),
+        }
+        for label, (before, after) in cases.items():
+            window = baseline.counter_window(before, after)
+            self.assertFalse(window["available"], label)
+            self.assertTrue(window["reason"], label)
+            self.assertNotIn("delta", window, label)
+        ok = baseline.counter_window(good, snap({"a": 3}))
+        self.assertEqual(ok["delta"], {"a": 2})
+
+    def test_incomplete_coverage_cannot_satisfy_complete_query_gate(self):
+        for value in ({"complete": False}, {}, "yes", [True], {"complete": "yes"}):
+            sample = self.good()
+            sample["coverage"] = baseline.available(value)
+            status = baseline.gate_status(sample, "complete_query")
+            self.assertFalse(status["satisfied"], value)
+
     def test_ok_sample_needs_real_result(self):
         for result in (
             {},
@@ -749,6 +776,19 @@ class CliTests(TempCase):
                  "--scenario", "warm", "--test-server", "--profiling", "off"]
             )
         self.assertNotEqual(code, 0)
+
+    def test_invalid_fixture_args_fail_before_output_is_created(self):
+        for flags in (["--fixture-units", "2"], ["--fixture-importers", "0"]):
+            out = self.tmp / "f.jsonl"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = baseline.main(
+                    ["--binary", sys.executable, "--output", str(out), "--scenario", "warm"]
+                    + flags
+                )
+            self.assertEqual(code, 2, flags)
+            self.assertFalse(out.exists(), flags)
+            self.assertIn("cache_baseline:", stderr.getvalue())
 
     def test_manifest_scenarios_are_read_only_subset(self):
         with self.assertRaises(ValueError):

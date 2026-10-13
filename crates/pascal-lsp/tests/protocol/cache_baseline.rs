@@ -66,6 +66,39 @@ fn metrics_test_snapshot_is_monotonic_across_worker_requests() {
     drop(temp);
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn metrics_test_endpoint_is_rejected_after_shutdown() {
+    let (temp, main, _provider, _main_source, _provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root").to_path_buf();
+    let mut server = TestServer::launch_with_analysis_metrics(tempfile::tempdir().unwrap());
+    server.initialize(&root, Value::Null);
+
+    let shutdown_id = RequestId::from("metrics-shutdown".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server.response(&shutdown_id);
+    assert!(shutdown.error.is_none(), "{shutdown:?}");
+
+    let id = RequestId::from("metrics-after-shutdown".to_string());
+    server.send_request(id.clone(), "pascal/testAnalysisMetrics", json!({}));
+    let response = server.response(&id);
+    assert_eq!(
+        response.error.expect("post-shutdown rejection").code,
+        -32600,
+        "{:?}",
+        response.result
+    );
+
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for LSP server");
+    assert!(
+        status.success(),
+        "LSP server exited unsuccessfully: {status}"
+    );
+    drop(temp);
+}
+
 fn metrics_launch_ordinary(environment: &Path, enabled: bool) -> TestServer {
     let child = Command::new(env!("CARGO_BIN_EXE_pascal-lsp"))
         .arg("--stdio")

@@ -11557,7 +11557,10 @@ fn event_loop(
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
-                if analysis_metrics_endpoint && request.method == TEST_ANALYSIS_METRICS_METHOD =>
+                if analysis_metrics_endpoint
+                    && request.method == TEST_ANALYSIS_METRICS_METHOD
+                    && !shutdown_received
+                    && file_notification_worker.is_none() =>
             {
                 let report = crate::analysis_metrics::bounded_report(
                     &pascal_project::analysis_metrics::PROCESS_COUNTERS.snapshot(),

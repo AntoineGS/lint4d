@@ -200,14 +200,18 @@ def fixture_names(units, importers):
     return names
 
 
-def write_fixture(root, units=500, importers=5, with_include=False):
-    root = pathlib.Path(root)
+def check_fixture_bounds(units, importers):
     if not isinstance(units, int) or not isinstance(importers, int):
         raise ValueError("units and importers must be integers")
     if units < 3 or units > MAX_FIXTURE_UNITS:
         raise ValueError("units must be within 3..%d" % MAX_FIXTURE_UNITS)
     if importers < 1 or importers >= units - 1:
         raise ValueError("importers must be within 1..units-2")
+
+
+def write_fixture(root, units=500, importers=5, with_include=False):
+    root = pathlib.Path(root)
+    check_fixture_bounds(units, importers)
     if root.exists() and (not root.is_dir() or any(root.iterdir())):
         raise ValueError("fixture root must be a new or empty directory")
     root.mkdir(parents=True, exist_ok=True)
@@ -318,11 +322,24 @@ def parse_time_report(text):
 
 
 def counter_window(before, after):
-    """Endpoint difference of two process snapshots; never exclusive to one request."""
+    """Endpoint difference of two process snapshots; never exclusive to one request.
+
+    Mirrors the Rust `checked_delta`: a missing name, a negative delta, a
+    saturated snapshot or a schema mismatch yields an unavailable entry.
+    """
+    if before.get("schema") != after.get("schema"):
+        return unavailable("counter_window_schema_mismatch")
+    if before.get("saturated") or after.get("saturated"):
+        return unavailable("counter_window_saturated")
     names = after.get("counters", {})
-    delta = {
-        name: names[name] - before.get("counters", {}).get(name, 0) for name in names
-    }
+    earlier = before.get("counters", {})
+    delta = {}
+    for name in names:
+        if name not in earlier:
+            return unavailable("counter_window_missing_name")
+        delta[name] = names[name] - earlier[name]
+        if delta[name] < 0:
+            return unavailable("counter_window_negative_delta")
     return {
         "scope": "process_window_endpoint",
         "requestExclusive": False,
@@ -451,6 +468,9 @@ def gate_status(sample, gate):
         entry = sample["coverage"]
         if not entry["available"]:
             return {"satisfied": False, "reason": "coverage unavailable: %s" % entry["reason"]}
+        value = entry["value"]
+        if not isinstance(value, dict) or value.get("complete") is not True:
+            return {"satisfied": False, "reason": "coverage incomplete"}
     else:
         entry = sample["storage"]
         if not entry["available"]:
@@ -1016,7 +1036,9 @@ def timed_references(session, subject):
     window = None
     if before is not None:
         if before["available"] and after["available"]:
-            window = available(counter_window(before["value"], after["value"]))
+            window = counter_window(before["value"], after["value"])
+            if window.get("available") is not False:
+                window = available(window)
         else:
             window = unavailable("test_server_snapshot_error")
     return response, elapsed, window
@@ -1427,6 +1449,7 @@ def main(argv=None):
             raise ValueError("--samples must be within 1..1000")
         if args.timeout_seconds <= 0:
             raise ValueError("--timeout-seconds must be positive")
+        check_fixture_bounds(args.fixture_units, args.fixture_importers)
         if args.test_server and args.profiling != "on":
             raise ValueError("--test-server requires --profiling on")
         if not os.path.isfile(args.binary):

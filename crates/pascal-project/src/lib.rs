@@ -11912,6 +11912,83 @@ mod tests {
             "legacy payload compatibility must not bypass configured exclusions"
         );
     }
+
+    fn metrics_payload_fixture() -> (tempfile::TempDir, ReadPolicy, ProjectPathEntry) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("A.pas");
+        fs::write(&path, b"unit A;").unwrap();
+        let policy = ReadPolicy::new(
+            &[root.path().to_path_buf()],
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry {
+            path,
+            provenance: ProjectPathProvenance::Configured,
+        };
+        (root, policy, entry)
+    }
+
+    #[test]
+    fn metrics_payload_counts_authorized_bytes_once() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        let (_root, policy, entry) = metrics_payload_fixture();
+        let scope = TestScope::new();
+        assert_eq!(policy.read_payload_bytes(&entry, 100).unwrap(), b"unit A;");
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 1);
+        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 7);
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 0);
+    }
+
+    #[test]
+    fn metrics_overlimit_preserves_read_error_and_prefix_count() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        let (_root, policy, entry) = metrics_payload_fixture();
+        let scope = TestScope::new();
+        assert_eq!(
+            policy.read_payload_bytes(&entry, 3).unwrap_err(),
+            "file exceeds the 3 byte safety limit"
+        );
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 1);
+        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 4);
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 1);
+    }
+
+    #[test]
+    fn metrics_unauthorized_payload_does_not_claim_an_authorized_attempt() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        let (_root, policy, _entry) = metrics_payload_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("B.pas");
+        fs::write(&path, b"unit B;").unwrap();
+        let entry = ProjectPathEntry {
+            path,
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let scope = TestScope::new();
+        assert_eq!(
+            policy.read_payload_bytes(&entry, 100).unwrap_err(),
+            "payload path is not authorized"
+        );
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 0);
+        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 0);
+        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 0);
+    }
+
+    #[test]
+    fn metrics_hash_and_stamp_probe_count_calls() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        let scope = TestScope::new();
+        content_hash_bytes(b"12345");
+        let _ = path_stamp_result(std::path::Path::new("/nonexistent/metrics-probe"));
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::LegacyHashBytes), 5);
+        assert_eq!(s.value(Metric::ProjectStampProbes), 1);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -11997,82 +12074,5 @@ mod windows_path_tests {
             "{} -> {status:?} {warnings:?}",
             short.display()
         );
-    }
-
-    fn metrics_payload_fixture() -> (tempfile::TempDir, ReadPolicy, ProjectPathEntry) {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("A.pas");
-        fs::write(&path, b"unit A;").unwrap();
-        let policy = ReadPolicy::new(
-            &[root.path().to_path_buf()],
-            &[],
-            &[],
-            &EffectiveOverrides::default(),
-        );
-        let entry = ProjectPathEntry {
-            path,
-            provenance: ProjectPathProvenance::Configured,
-        };
-        (root, policy, entry)
-    }
-
-    #[test]
-    fn metrics_payload_counts_authorized_bytes_once() {
-        use crate::analysis_metrics::{Metric, TestScope};
-        let (_root, policy, entry) = metrics_payload_fixture();
-        let scope = TestScope::new();
-        assert_eq!(policy.read_payload_bytes(&entry, 100).unwrap(), b"unit A;");
-        let s = scope.snapshot();
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 1);
-        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 7);
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 0);
-    }
-
-    #[test]
-    fn metrics_overlimit_preserves_read_error_and_prefix_count() {
-        use crate::analysis_metrics::{Metric, TestScope};
-        let (_root, policy, entry) = metrics_payload_fixture();
-        let scope = TestScope::new();
-        assert_eq!(
-            policy.read_payload_bytes(&entry, 3).unwrap_err(),
-            "file exceeds the 3 byte safety limit"
-        );
-        let s = scope.snapshot();
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 1);
-        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 4);
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 1);
-    }
-
-    #[test]
-    fn metrics_unauthorized_payload_does_not_claim_an_authorized_attempt() {
-        use crate::analysis_metrics::{Metric, TestScope};
-        let (_root, policy, _entry) = metrics_payload_fixture();
-        let outside = tempfile::tempdir().unwrap();
-        let path = outside.path().join("B.pas");
-        fs::write(&path, b"unit B;").unwrap();
-        let entry = ProjectPathEntry {
-            path,
-            provenance: ProjectPathProvenance::Configured,
-        };
-        let scope = TestScope::new();
-        assert_eq!(
-            policy.read_payload_bytes(&entry, 100).unwrap_err(),
-            "payload path is not authorized"
-        );
-        let s = scope.snapshot();
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadAttempts), 0);
-        assert_eq!(s.value(Metric::AuthorizedPayloadBytes), 0);
-        assert_eq!(s.value(Metric::AuthorizedPayloadReadFailures), 0);
-    }
-
-    #[test]
-    fn metrics_hash_and_stamp_probe_count_calls() {
-        use crate::analysis_metrics::{Metric, TestScope};
-        let scope = TestScope::new();
-        content_hash_bytes(b"12345");
-        let _ = path_stamp_result(std::path::Path::new("/nonexistent/metrics-probe"));
-        let s = scope.snapshot();
-        assert_eq!(s.value(Metric::LegacyHashBytes), 5);
-        assert_eq!(s.value(Metric::ProjectStampProbes), 1);
     }
 }

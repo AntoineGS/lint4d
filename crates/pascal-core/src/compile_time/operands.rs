@@ -167,8 +167,16 @@ impl AccessParser<'_> {
         self.text.as_bytes().get(self.pos).copied()
     }
     fn space(&mut self) {
-        while self.byte().is_some_and(|b| b.is_ascii_whitespace()) {
-            self.pos += 1;
+        loop {
+            if self.byte().is_some_and(|b| b.is_ascii_whitespace()) {
+                self.pos += 1;
+            } else if let Ok(Some(end)) =
+                crate::conditional::expression_trivia_end(self.text.as_bytes(), self.pos)
+            {
+                self.pos = end;
+            } else {
+                break;
+            }
         }
     }
     fn name(&mut self) -> Option<Range<usize>> {
@@ -499,19 +507,22 @@ impl<'a> BoundType<'a> {
             binding
         };
         let Some(binding) = binding else {
-            if let Fact::Known((state, decl)) =
-                bindings::imported_declaration(state, self.site, name, budget)?
-            {
-                if !decl.is_type {
-                    return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
+            match bindings::imported_declaration(state, self.site, name, budget)? {
+                Some(Fact::Known((state, decl))) => {
+                    if !decl.is_type {
+                        return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
+                    }
+                    return Ok(Fact::Known(Self {
+                        state,
+                        carrier: Carrier::Captured(&decl.ty),
+                        site: &decl.type_site,
+                        settings: &decl.settings,
+                        owner: &decl.key,
+                    }));
                 }
-                return Ok(Fact::Known(Self {
-                    state,
-                    carrier: Carrier::Captured(&decl.ty),
-                    site: &decl.type_site,
-                    settings: &decl.settings,
-                    owner: &decl.key,
-                }));
+                Some(Fact::Unknown(reason)) => return Ok(Fact::Unknown(reason)),
+                Some(Fact::Incomplete(reason)) => return Ok(Fact::Incomplete(reason)),
+                None => {}
             }
             return Ok(match bindings::intrinsic(name) {
                 Some(ty) => Fact::Known(Self {
@@ -549,20 +560,22 @@ impl<'a> BoundType<'a> {
                 else {
                     return Ok(Fact::Known(self));
                 };
-                let (state, decl) = if let Some(binding) =
-                    bindings::lookup(self.state, self.site, name, budget)?
-                {
-                    let Some(decl) = binding.type_declaration() else {
-                        return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                let (state, decl) =
+                    if let Some(binding) = bindings::lookup(self.state, self.site, name, budget)? {
+                        let Some(decl) = binding.type_declaration() else {
+                            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                        };
+                        (self.state, decl)
+                    } else {
+                        match bindings::imported_declaration(self.state, self.site, name, budget)? {
+                            Some(Fact::Known((state, decl))) if decl.is_type => (state, decl),
+                            Some(Fact::Known(_)) => {
+                                return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
+                            }
+                            Some(Fact::Unknown(reason)) => return Ok(Fact::Unknown(reason)),
+                            _ => return Ok(Fact::Known(self)),
+                        }
                     };
-                    (self.state, decl)
-                } else {
-                    match bindings::imported_declaration(self.state, self.site, name, budget)? {
-                        Fact::Known((state, decl)) if decl.is_type => (state, decl),
-                        Fact::Known(_) => return Ok(Fact::Unknown(UnknownReason::InvalidOperand)),
-                        _ => return Ok(Fact::Known(self)),
-                    }
-                };
                 for key in &visited {
                     budget.charge(
                         1,

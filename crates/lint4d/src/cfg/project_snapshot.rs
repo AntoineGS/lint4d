@@ -4,13 +4,15 @@
 //! does not rediscover files or infer import targets: it copies the resolver's
 //! explicit decisions into `cfg-pascal`'s caller-owned snapshot contract.
 
-use pascal_core::conditional::{
-    ConditionalAnalysis, ConditionalEnvironment, DirectiveKind, IncludeTransition, Truth,
-    is_option_directive,
+use pascal_core::compile_time::{
+    AdmittedProviderSource, CompileTimeBudget, CompileTimeLimits, CompileTimeResolver,
+    ProviderSource, analyze_source,
 };
+use pascal_core::conditional::{ConditionalAnalysis, DirectiveKind, Truth, is_option_directive};
 use pascal_core::resolver::{
-    LoadedSource, NoCancellation, ResolutionReport, ResolutionTarget, ResolvedImport,
-    ResolvedInclude, ResolvedProject, ResolvedUnit, SourceId,
+    AdmittedCapabilityOutcome, AdmittedCapabilityReports, CancellationToken, IncludeResolveRequest,
+    LoadedSource, NoCancellation, Resolution, ResolutionOutcome, ResolutionReport,
+    ResolutionTarget, ResolvedImport, ResolvedProject, ResolverError, SourceId, UnitResolveRequest,
 };
 use pascal_project::ConditionalContext;
 use std::collections::{HashMap, HashSet};
@@ -197,26 +199,22 @@ pub fn to_cfg_project_snapshot(
     }
 
     let snapshots = source_snapshots(&units, &project.include_sources);
-    let (projected_snapshots, active_includes) = match project_conditional_snapshots(
-        &snapshots,
-        &units,
-        &project.includes,
-        &options.conditional_context,
-    ) {
-        Ok(snapshots) => snapshots,
-        Err(reason) => {
-            status = incomplete_status(status, reason);
-            return Ok(CfgProjectSnapshot {
-                snapshot: raw_snapshot,
-                target_unit: root_unit,
-                status,
-                resolution,
-                target_path: root_source.path,
-                target_source_id: root_source.id,
-                target_analysis_bytes: root_analysis_bytes.clone(),
-            });
-        }
-    };
+    let (projected_snapshots, active_includes) =
+        match project_conditional_snapshots(&snapshots, &project, &options.conditional_context) {
+            Ok(snapshots) => snapshots,
+            Err(reason) => {
+                status = incomplete_status(status, reason);
+                return Ok(CfgProjectSnapshot {
+                    snapshot: raw_snapshot,
+                    target_unit: root_unit,
+                    status,
+                    resolution,
+                    target_path: root_source.path,
+                    target_source_id: root_source.id,
+                    target_analysis_bytes: root_analysis_bytes.clone(),
+                });
+            }
+        };
     let include_bindings =
         match preparation_include_bindings(&project, &snapshots, &active_includes) {
             Ok(bindings) => bindings,
@@ -440,15 +438,238 @@ fn source_snapshots(
     snapshots
 }
 
-/// Project each root/include occurrence with one stateful shared environment.
-/// A physical include reached with a different entry state cannot be encoded by
-/// cfg-pascal's one immutable snapshot, so preparation fails closed instead of
-/// freezing it under whichever root happened to be visited first.
-#[derive(Debug)]
-struct ProjectedSource {
-    entry_fingerprint: u64,
-    exit_environment: ConditionalEnvironment,
-    bytes: Vec<u8>,
+/// Replay only the resolver's already authorized, revision-bearing sources.
+/// Paths identify existing owners; they are never used to discover a filename.
+struct SnapshotResources<'a> {
+    project: &'a ResolvedProject,
+}
+
+impl<'a> SnapshotResources<'a> {
+    fn new(project: &'a ResolvedProject) -> Self {
+        Self { project }
+    }
+
+    fn source(&self, id: &SourceId) -> Option<&LoadedSource> {
+        std::iter::once(&self.project.root.source)
+            .chain(self.project.units.iter().map(|unit| &unit.source))
+            .chain(self.project.include_sources.iter())
+            .find(|source| source.id == *id)
+    }
+
+    fn owner(&self, path: &std::path::Path) -> Option<&LoadedSource> {
+        std::iter::once(&self.project.root.source)
+            .chain(self.project.units.iter().map(|unit| &unit.source))
+            .chain(self.project.include_sources.iter())
+            .find(|source| source.path == path)
+    }
+}
+
+fn admission_error(reason: impl fmt::Debug) -> ResolverError {
+    ResolverError::InvalidRequest(format!("CFG snapshot admission failed: {reason:?}"))
+}
+
+/// A conservative checked bound for the borrowed source's receiving copy.
+fn source_payload(source: &LoadedSource) -> Result<usize, ResolverError> {
+    let mut payload = [
+        std::mem::size_of::<LoadedSource>(),
+        source.id.as_str().len(),
+        source.path.as_os_str().len(),
+        source.bytes.len(),
+        source.decoded_text.as_ref().map_or(0, |text| text.len()),
+        std::mem::size_of_val(&source.revision),
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, size| sum.checked_add(size))
+    .ok_or_else(|| admission_error("source payload overflow"))?;
+    if let pascal_core::SourceRevision::Disk {
+        read_policy,
+        path_entry,
+        ..
+    } = &source.revision
+    {
+        let mut count = |size| {
+            payload = payload
+                .checked_add(size)
+                .ok_or("source revision payload overflow")?;
+            Ok(())
+        };
+        read_policy
+            .visit_owned_clone_payload(&mut count)
+            .map_err(admission_error)?;
+        path_entry
+            .visit_recovery_payload(&mut count)
+            .map_err(admission_error)?;
+    }
+    Ok(payload)
+}
+
+impl CompileTimeResolver for SnapshotResources<'_> {
+    fn include_capability(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let owner = self.owner(request.including_path);
+        let binding = owner.and_then(|owner| {
+            self.project.includes.iter().find(|include| {
+                include.including_source_id == owner.id
+                    && include.byte_range == request.byte_range
+                    && include.requested_name == request.requested_name
+            })
+        });
+        let source = binding.and_then(|binding| match &binding.target {
+            ResolutionTarget::Found(id) => self.source(id),
+            _ => None,
+        });
+        // The snapshot report already retains the original observations. No
+        // new Payload observation may claim that this adapter performed a read.
+        let reports = AdmittedCapabilityReports::copy(&[], &[], budget)?;
+        if let Some(source) = source {
+            let payload = source_payload(source)?;
+            let received = LoadedSource::admit_construction(budget, payload, payload, || {
+                let mut copy = source.clone();
+                // The input belongs to a prior resolver session, not this one.
+                copy.compile_time_backing = None;
+                Ok(copy)
+            })
+            .map_err(admission_error)?;
+            Ok(AdmittedCapabilityOutcome::new(
+                Resolution::Found(received),
+                reports,
+            ))
+        } else {
+            let reason = "active include has no authorized snapshot source";
+            let owner = budget
+                .admit_owned(1, reason.len(), reason.len(), || reason.to_string())
+                .map_err(admission_error)?;
+            AdmittedCapabilityOutcome::from_reason(owner, true, reports, budget)
+        }
+    }
+
+    fn unit_report_capability(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError> {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let binding = self.owner(request.importer_path).and_then(|owner| {
+            self.project.imports.iter().find(|import| {
+                import.importer_source_id == owner.id
+                    && import
+                        .site
+                        .requested_name
+                        .eq_ignore_ascii_case(request.requested_name)
+            })
+        });
+        let provider = binding.and_then(|binding| match &binding.target {
+            ResolutionTarget::Found(id) => std::iter::once(&self.project.root)
+                .chain(self.project.units.iter())
+                .find(|unit| unit.source.id == *id),
+            _ => None,
+        });
+        let reports = AdmittedCapabilityReports::copy(&[], &[], budget)?;
+        if let (Some(binding), Some(unit), Some(context)) = (
+            binding,
+            provider,
+            provider.and_then(|unit| self.project.conditional_contexts.get(&unit.source.id)),
+        ) {
+            let mut payload = source_payload(&unit.source)?;
+            for size in [
+                unit.requested_name.len(),
+                unit.declared_name.len(),
+                std::mem::size_of::<ProviderSource>(),
+                binding
+                    .authorized_qualifiers
+                    .len()
+                    .checked_mul(std::mem::size_of::<String>())
+                    .ok_or_else(|| admission_error("qualifier overflow"))?,
+            ] {
+                payload = payload
+                    .checked_add(size)
+                    .ok_or_else(|| admission_error("provider overflow"))?;
+            }
+            for qualifier in &binding.authorized_qualifiers {
+                payload = payload
+                    .checked_add(qualifier.len())
+                    .ok_or_else(|| admission_error("qualifier overflow"))?;
+            }
+            context
+                .visit_recovery_payload(&mut |size| {
+                    payload = payload
+                        .checked_add(size)
+                        .ok_or("context payload overflow")?;
+                    Ok(())
+                })
+                .map_err(admission_error)?;
+            let fields = context
+                .defines
+                .len()
+                .checked_add(context.options.len())
+                .and_then(|n| n.checked_add(context.constants.len()))
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<(String, pascal_core::conditional::ConstantValue)>()
+                            + 4 * std::mem::size_of::<usize>(),
+                    )
+                })
+                .ok_or_else(|| admission_error("context metadata overflow"))?;
+            payload = payload
+                .checked_add(fields)
+                .ok_or_else(|| admission_error("provider overflow"))?;
+            let received = budget
+                .admit_owned(1, payload, payload, || {
+                    let mut unit = unit.clone();
+                    unit.source.compile_time_backing = None;
+                    ProviderSource::new(
+                        unit,
+                        context.clone(),
+                        binding.authorized_qualifiers.clone(),
+                    )
+                })
+                .map_err(admission_error)?;
+            let backing = ProviderSource::admit_cached_backing(&received.unit.source, budget)?;
+            let capability = received.admit_copy(&backing, budget)?;
+            Ok(AdmittedCapabilityOutcome::new(
+                Resolution::Found(capability),
+                reports,
+            ))
+        } else {
+            let reason = "provider source or provider context is unavailable in snapshot";
+            let owner = budget
+                .admit_owned(1, reason.len(), reason.len(), || reason.to_string())
+                .map_err(admission_error)?;
+            AdmittedCapabilityOutcome::from_reason(owner, false, reports, budget)
+        }
+    }
+
+    fn include(
+        &mut self,
+        _: IncludeResolveRequest<'_>,
+        _: &mut CompileTimeBudget<'_>,
+        _: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+        Err(admission_error(
+            "legacy snapshot include callback is unavailable",
+        ))
+    }
+
+    fn unit(
+        &mut self,
+        _: UnitResolveRequest<'_>,
+        _: &mut CompileTimeBudget<'_>,
+        _: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+        Err(admission_error(
+            "legacy snapshot provider callback is unavailable",
+        ))
+    }
 }
 
 type ActiveIncludeKey = (String, usize, usize);
@@ -456,45 +677,96 @@ type ConditionalSnapshots = (Vec<cfg_pascal::SourceSnapshot>, HashSet<ActiveIncl
 
 fn project_conditional_snapshots(
     snapshots: &[cfg_pascal::SourceSnapshot],
-    units: &[ResolvedUnit],
-    includes: &[ResolvedInclude],
+    project: &ResolvedProject,
     context: &ConditionalContext,
 ) -> Result<ConditionalSnapshots, String> {
-    let mut source_bytes = HashMap::with_capacity(snapshots.len());
-    for snapshot in snapshots {
-        source_bytes.insert(
-            snapshot.source_id().as_str().to_string(),
-            snapshot.bytes().to_vec(),
-        );
-    }
-    let mut include_targets = HashMap::with_capacity(includes.len());
-    for include in includes {
-        if let ResolutionTarget::Found(target) = &include.target {
-            include_targets.insert(
-                (
-                    include.including_source_id.as_str().to_string(),
-                    include.byte_range.start,
-                    include.byte_range.end,
-                ),
-                target.as_str().to_string(),
-            );
-        }
-    }
-
     let mut projections = HashMap::with_capacity(snapshots.len());
     let mut active_includes = HashSet::new();
-    for unit in units {
-        let mut environment = ConditionalEnvironment::try_from_context(context)
-            .ok_or_else(|| "conditional context exceeded its admission bounds".to_string())?;
-        project_source_occurrence(
-            unit.source.id.as_str(),
-            &mut environment,
-            &source_bytes,
-            &include_targets,
-            &mut projections,
-            &mut Vec::new(),
-            &mut active_includes,
-        )?;
+    let unknown_context = ConditionalContext::default();
+    let mut resources = SnapshotResources::new(project);
+    for unit in std::iter::once(&project.root).chain(project.units.iter()) {
+        let unit_context = project
+            .conditional_contexts
+            .get(&unit.source.id)
+            .unwrap_or_else(|| {
+                if unit.source.id == project.root.source.id {
+                    context
+                } else {
+                    &unknown_context
+                }
+            });
+        let evaluated = analyze_source(
+            &unit.source,
+            unit_context,
+            &mut resources,
+            CompileTimeLimits::default(),
+            &NoCancellation,
+        )
+        .map_err(|error| error.to_string())?;
+        if !evaluated.reasons.is_empty() || evaluated.root.unknown_activity_requires_fail_closed() {
+            return Err(format!(
+                "shared compile-time CFG analysis incomplete for {}: {:?}",
+                unit.source.id.as_str(),
+                evaluated.reasons
+            ));
+        }
+        for occurrence in &evaluated.occurrences {
+            let source_bytes = occurrence.source.analysis_bytes();
+            let source = std::str::from_utf8(source_bytes.as_ref()).map_err(|_| {
+                format!(
+                    "conditional CFG projection requires UTF-8 source {}",
+                    occurrence.source.id.as_str()
+                )
+            })?;
+            if !occurrence.analysis.complete {
+                return Err(format!(
+                    "shared compile-time occurrence incomplete for {}",
+                    occurrence.source.id.as_str()
+                ));
+            }
+            let (projected, ranges) = project_conditional_source(source, &occurrence.analysis)?;
+            for range in &ranges {
+                let selection = evaluated
+                    .includes
+                    .iter()
+                    .find(|include| {
+                        include.owner == occurrence.id
+                            && include.directive.source == occurrence.source.id
+                            && include.directive.range == *range
+                    })
+                    .ok_or_else(|| {
+                        "active CFG include has no shared occurrence decision".to_string()
+                    })?;
+                if selection.child.is_none()
+                    || !matches!(selection.target, Resolution::Found(_))
+                    || selection.fragments.len() != 1
+                    || selection.fragments[0] != selection.directive
+                {
+                    return Err(
+                        "CFG splicer requires one exact decided physical include span".to_string(),
+                    );
+                }
+            }
+            // The strict splicer stores one projection per physical source, not
+            // per lexical entry. Deliberately reject repeats rather than reuse
+            // another occurrence's constants/settings/scopes (even if equal).
+            if projections
+                .insert(occurrence.source.id.as_str().to_string(), projected)
+                .is_some()
+            {
+                return Err(format!(
+                    "conditional CFG source {} has multiple entry contexts/occurrences",
+                    occurrence.source.id.as_str()
+                ));
+            }
+            for range in ranges {
+                active_includes.insert((
+                    occurrence.source.id.as_str().to_string(),
+                    range.start,
+                    range.end,
+                ));
+            }
+        }
     }
 
     let projected_snapshots = snapshots
@@ -502,7 +774,7 @@ fn project_conditional_snapshots(
         .map(|snapshot| {
             let bytes = projections
                 .get(snapshot.source_id().as_str())
-                .map(|projection| projection.bytes.clone())
+                .cloned()
                 .unwrap_or_else(|| snapshot.bytes().to_vec());
             Ok(cfg_pascal::SourceSnapshot::new(
                 snapshot.source_id().clone(),
@@ -511,99 +783,6 @@ fn project_conditional_snapshots(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((projected_snapshots, active_includes))
-}
-
-fn project_source_occurrence(
-    source_id: &str,
-    environment: &mut ConditionalEnvironment,
-    source_bytes: &HashMap<String, Vec<u8>>,
-    include_targets: &HashMap<(String, usize, usize), String>,
-    projections: &mut HashMap<String, ProjectedSource>,
-    active_sources: &mut Vec<String>,
-    active_includes: &mut HashSet<ActiveIncludeKey>,
-) -> Result<(), String> {
-    let entry_fingerprint = environment.fingerprint();
-    if active_sources.iter().any(|active| active == source_id) {
-        return Err(format!("conditional CFG include cycle at {source_id}"));
-    }
-    if let Some(existing) = projections.get(source_id) {
-        if existing.entry_fingerprint != entry_fingerprint {
-            return Err(format!(
-                "conditional CFG source {source_id} was reached with multiple entry contexts"
-            ));
-        }
-        *environment = existing.exit_environment.clone();
-        return Ok(());
-    }
-
-    let bytes = source_bytes
-        .get(source_id)
-        .ok_or_else(|| format!("conditional CFG source {source_id} was not loaded"))?;
-    let source = std::str::from_utf8(bytes)
-        .map_err(|_| format!("conditional CFG projection requires UTF-8 source {source_id}"))?;
-    active_sources.push(source_id.to_string());
-    let mut callback_error = None;
-    let analysis = pascal_core::conditional::analyze_with_include_callback(
-        source,
-        environment,
-        &NoCancellation,
-        &mut |directive, child_environment| {
-            let key = (source_id.to_string(), directive.start, directive.end);
-            let Some(target_id) = include_targets.get(&key) else {
-                callback_error = Some(format!(
-                    "active CFG include in {source_id} has no resolved target"
-                ));
-                return IncludeTransition {
-                    complete: false,
-                    environment_known: false,
-                };
-            };
-            match project_source_occurrence(
-                target_id,
-                child_environment,
-                source_bytes,
-                include_targets,
-                projections,
-                active_sources,
-                active_includes,
-            ) {
-                Ok(()) => IncludeTransition {
-                    complete: true,
-                    environment_known: true,
-                },
-                Err(error) => {
-                    callback_error = Some(error);
-                    IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    }
-                }
-            }
-        },
-    );
-    active_sources.pop();
-    if let Some(error) = callback_error {
-        return Err(error);
-    }
-    if !analysis.complete {
-        return Err(format!(
-            "conditional analysis incomplete for CFG source {source_id}"
-        ));
-    }
-    let (projected, source_active_includes) = project_conditional_source(source, &analysis)?;
-    for range in source_active_includes {
-        active_includes.insert((source_id.to_string(), range.start, range.end));
-    }
-    let exit_environment = environment.clone();
-    projections.insert(
-        source_id.to_string(),
-        ProjectedSource {
-            entry_fingerprint,
-            exit_environment,
-            bytes: projected,
-        },
-    );
-    Ok(())
 }
 
 fn project_conditional_source(

@@ -5,6 +5,10 @@ use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Finite prefix-purpose policy; whole-body sessions keep their own defaults.
+pub const HEADER_MAX_BYTE_WORK: usize = 64 * 1024 * 1024;
+pub const HEADER_MAX_BRANCH_STATES: usize = 256;
+
 /// Request-wide limits, including dimensions enforced by later consumers.
 /// Pending fragments have their own admission limit in addition to total
 /// retained bytes; generic retained storage is not automatically pending text.
@@ -36,8 +40,10 @@ impl Default for CompileTimeLimits {
             max_array_dimensions: 256,
             max_branch_states: 64,
             max_provider_queries: 256,
-            max_work: 1_000_000,
-            max_byte_work: 16_777_216,
+            // Finite normal-body work headroom. Header selection/reproof
+            // inherit this operation policy, with their distinct state fuse.
+            max_work: 2_000_000,
+            max_byte_work: 67_108_864,
             max_retained_bytes: 1_048_576,
         }
     }

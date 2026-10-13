@@ -4,6 +4,69 @@
 - Status: written spec approved by the user on 2026-10-08
 - Task: TASK-140
 
+## Approved LSP retention scope adjustment — 2026-10-11
+
+The user explicitly approved deferring LSP-wide retention accounting to
+`l4d-cnm`, rather than building new selected-source ownership and sparse-view
+APIs to enforce a new 1 MiB aggregate cap on previously supported documents.
+This supersedes earlier requirements that the LSP integration must apply that
+core default to every live selected-source payload, declaration fact and owned
+projection. It is an amendment to the ongoing navigation work, not authority
+for a new subsystem or an implementation restart.
+
+Keep the existing LSP document/file, aggregate source, dependency, include,
+expanded-output, directory-scan and cache limits. Keep evaluator work/byte-work,
+depth, cancellation, checked arithmetic, authorization/no-read, source identity,
+freshness, unknown-branch and edit-safety contracts. The standalone core default
+limits stay unchanged. LSP callers may select a finite compatibility retention
+policy from their existing resource limits instead of inheriting the new 1 MiB
+whole-session fuse; document that policy and do not claim complete aggregate heap
+accounting. Already implemented safe owners and receipts remain real and live;
+do not remove ownership checks, fabricate credits, restart budgets or exempt a
+specific fixture. No new receiving/sparse-view API or universal owner migration
+is required by this adjustment.
+
+Correct the two remaining existing LSP regressions under this approved boundary:
+large dependency navigation and related diagnostic clearing after a failed
+replacement. Their assertions and established refusal/clear behavior remain
+unchanged. Necessary bulk trivia scanning must still charge actual work and
+visited bytes, poll cancellation, preserve physical coordinates, and never skip
+conditional/include syntax. Independent Task 12 review and complete LSP validation
+still precede Task 13 and final actual import probes. No commit, push, deployment,
+real-source or configuration permission is added.
+
+## User-directed scope adjustment — 2026-10-10
+
+The user directed: defer work taking us away from the original ask and keep
+working. The active issue is Beads `l4d-140`; deferred resource-accounting work
+is `l4d-cnm`. This adjustment supersedes earlier whole-resolver accounting gates
+and the requirement to finish the cwd/cache allocation audit before navigation
+integration. It does not change the functional requirements below.
+
+Keep the existing bounded evaluator, provider/source/include/recovery limits,
+checked arithmetic, cancellation/error propagation, authorization/no-read rules,
+source-order continuation, ambiguity handling, freshness and physical source maps.
+Keep already implemented ownership protections; do not dismantle them simply to
+reduce scope. Defer the custom cwd/canonical-route allocation prototype, macOS
+global case-cache admission redesign, remaining universal allocation-owner
+migration and strict projection-retention/whole-cache accounting certification.
+Existing platform helpers retain their behavior; their allocations are outside
+the new strict request-accounting claim, not misclassified as native scratch.
+Do not claim total-process or complete resolver-allocation bounds.
+
+The two existing exact-retention projection gates remain unchanged evidence for
+`l4d-cnm`, not navigation acceptance blockers. Record their known failures
+separately; never delete their assertions or report a failing suite as passing.
+Cancellation that produces incorrect results, stale facts, unauthorized reads,
+or unsafe ownership remains an active defect, not deferred accounting work.
+Task 9 must pass a focused functional/provider integration review; Tasks 10–14
+then continue without restarting completed work. Final validation still requires
+the complete workspace checks, independent correctness review, the selected
+compiler/target operand regressions and all 13 unchanged actual import probes.
+Any extra failing tests require classification and correction unless specifically
+covered by the deferred accounting issue. No deployment, commit or push authority
+is added by this adjustment. Preserve unrelated work and deferred prototypes.
+
 ## 1. Intent and constraints
 
 Restore all 13 unit-definition jumps from

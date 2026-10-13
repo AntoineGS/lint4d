@@ -14,6 +14,523 @@ use pascal_project::{
 use support::compile_time::{Fixture, activity, context};
 
 #[test]
+fn task13_fix1_physical_newlines_in_directive_literals_never_authorize_precise_facts() {
+    for newline in ["\n", "\r\n", "\r"] {
+        // I1's exact LF fixture, plus CRLF/lone-CR physical line endings.
+        let source = format!(
+            "unit T; interface {{$IF 'a}}{newline}b'='a}}{newline}b'}}{{$DEFINE HIT}}{{$I selected.inc}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("selected.inc", "uses Selected;");
+        fixture.unit(
+            "Selected",
+            "unit Selected; interface type T=Byte; implementation end.",
+            context(LayoutPlatform::Win32),
+        );
+        match fixture.analyze() {
+            Ok(analysis) => {
+                assert!(
+                    !analysis.root.complete,
+                    "newline={newline:?}: {:?}",
+                    analysis.reasons
+                );
+                assert!(
+                    !analysis
+                        .root
+                        .directives
+                        .iter()
+                        .any(|directive| directive.body.contains("DEFINE HIT")
+                            && directive.activity == Truth::True)
+                );
+            }
+            Err(pascal_core::ResolverError::InvalidRequest(reason)) => {
+                assert!(reason.contains("MalformedSource"), "{reason}")
+            }
+            Err(error) => panic!("unexpected newline error: {error:?}"),
+        }
+        assert!(fixture.read_names().is_empty(), "newline={newline:?}");
+        assert!(fixture.unit_requests.is_empty());
+    }
+}
+
+#[test]
+fn task13_fix1_literal_newline_after_include_eof_is_not_a_valid_continuation() {
+    for newline in ["\n", "\r\n", "\r"] {
+        let source = format!(
+            "unit T; interface {{$I head.inc}}{newline}b'='a}}{newline}b'}}{{$DEFINE HIT}}{{$I selected.inc}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("head.inc", "{$IF 'a}");
+        fixture.include("selected.inc", "const Selected=1;");
+        match fixture.analyze() {
+            Ok(analysis) => {
+                assert!(
+                    !analysis.root.complete,
+                    "newline={newline:?}: {:?}",
+                    analysis.reasons
+                );
+                assert!(
+                    !analysis
+                        .root
+                        .directives
+                        .iter()
+                        .any(|directive| directive.body.contains("DEFINE HIT")
+                            && directive.activity == Truth::True)
+                );
+            }
+            Err(pascal_core::ResolverError::InvalidRequest(reason)) => {
+                assert!(reason.contains("MalformedSource"), "{reason}")
+            }
+            Err(error) => panic!("unexpected continuation error: {error:?}"),
+        }
+        assert_eq!(fixture.read_names(), vec!["head.inc"]);
+        assert!(fixture.unit_requests.is_empty());
+    }
+}
+
+#[test]
+fn task13_fix1_single_line_literals_and_closed_quote_linebreaks_preserve_physical_ranges() {
+    for directive in ["{$IF 1 { a\nb } = 1}", "(*$IF 1 (* a\r\nb *) = 1*)"] {
+        let source =
+            format!("unit T; interface {directive}{{$DEFINE HIT}}{{$ENDIF}} implementation end.");
+        let analysis = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+        assert!(
+            analysis
+                .root
+                .directives
+                .iter()
+                .any(|d| &source[d.start..d.end] == directive)
+        );
+    }
+    for literal in ["'a}'", "'a*)'", "'{ (* // *) }'", "'é😀''}*)'", "''''"] {
+        for (open, close) in [("{$IF ", "}"), ("(*$IF ", "*)")] {
+            let directive = format!("{open}{literal}={literal}{close}");
+            let source = format!(
+                "unit T; interface {directive}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+            );
+            let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+            let analysis = fixture.analyze().unwrap();
+            assert!(
+                analysis.root.complete,
+                "{directive}: {:?}",
+                analysis.reasons
+            );
+            assert_eq!(
+                activity(&analysis, "DEFINE HIT"),
+                Truth::True,
+                "{directive}"
+            );
+            assert_eq!(analysis.root.projected_source.len(), source.len());
+            assert!(
+                analysis
+                    .root
+                    .directives
+                    .iter()
+                    .any(|d| source[d.start..d.end] == directive)
+            );
+        }
+    }
+    for newline in ["\n", "\r\n", "\r"] {
+        let source = format!(
+            "unit T; interface {{$IF 'a}}'{newline}='a}}'}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let analysis = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+    }
+    // Physical concatenation, including an escaped apostrophe split between
+    // fragments, is valid when no physical newline is introduced.
+    for (head, tail) in [
+        ("{$IF 'a}", "b'='a}b'}"),
+        ("{$IF 'é😀'", "'}*)'='é😀''}*)'}"),
+    ] {
+        let source = format!(
+            "unit T; interface {{$I head.inc}}{tail}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("head.inc", head);
+        let analysis = fixture.analyze().unwrap();
+        assert!(
+            analysis.root.complete,
+            "head={head:?}: {:?}",
+            analysis.reasons
+        );
+        assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+        assert_eq!(analysis.root.projected_source.len(), source.len());
+        let directive = analysis
+            .directive_fragments
+            .iter()
+            .find(|d| d.directive.body.starts_with("IF"))
+            .unwrap();
+        assert!(
+            directive
+                .fragments
+                .iter()
+                .any(|anchor| anchor.source == fixture.root.id)
+        );
+        assert!(
+            directive
+                .fragments
+                .iter()
+                .any(|anchor| anchor.source != fixture.root.id)
+        );
+    }
+}
+
+#[test]
+fn task13_sizeof_whitespace_and_trivia_preserve_physical_operands() {
+    for operand in [
+        "SizeOf ( Types.T )",
+        "SizeOf { trivia } (LongWord)",
+        "SizeOf (* ) , trivia *) (LongWord)",
+        "SizeOf ( { operand } LongWord )",
+    ] {
+        let source = format!(
+            "unit Types; interface type T=LongWord; {{$IF {operand}=4}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        let analysis = fixture.analyze().unwrap();
+        assert_eq!(
+            activity(&analysis, "DEFINE HIT"),
+            Truth::True,
+            "{operand}: {:?}",
+            analysis.reasons
+        );
+        assert_eq!(analysis.root.projected_source.len(), source.len());
+        let directive = analysis
+            .root
+            .directives
+            .iter()
+            .find(|d| d.body.contains(operand))
+            .unwrap();
+        assert_eq!(
+            &source[directive.start..directive.end],
+            format!("{{$IF {operand}=4}}")
+        );
+    }
+}
+
+#[test]
+fn task13_operand_trivia_does_not_hide_malformed_or_shadowed_calls() {
+    for operand in [
+        "SizeOf { trivia } (Missing)",
+        "SizeOf { trivia } (LongWord, Byte)",
+        "SizeOf { trivia } ()",
+        "SizeOf { trivia } (MakeValue())",
+        "SizeOf {$DEFINE X} (LongWord)",
+        "SizeOf (*$DEFINE X*) (LongWord)",
+    ] {
+        let source = format!(
+            "unit T; interface {{$IF {operand}=4}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        assert_ne!(
+            activity(&fixture.analyze().unwrap(), "DEFINE HIT"),
+            Truth::True,
+            "{operand}"
+        );
+    }
+    let source = "unit T; interface function SizeOf(X:LongWord):Integer; implementation {$IF SizeOf { trivia } (LongWord)=4}{$DEFINE HIT}{$ENDIF} end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    assert_eq!(
+        activity(&fixture.analyze().unwrap(), "DEFINE HIT"),
+        Truth::Unknown
+    );
+}
+
+#[test]
+fn task13_paren_directive_trivia_keeps_delimiters_and_literal_braces() {
+    for directive in [
+        "(*$IF SizeOf { ) } (LongWord)=4*)",
+        "(*$IF SizeOf (* nested *) (LongWord)=4*)",
+        "{$IF SizeOf('{')=1}",
+    ] {
+        let source =
+            format!("unit T; interface {directive}{{$DEFINE HIT}}{{$ENDIF}} implementation end.");
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        let analysis = fixture.analyze().unwrap();
+        if directive.contains("SizeOf('") {
+            assert_ne!(activity(&analysis, "DEFINE HIT"), Truth::True);
+        } else {
+            assert_eq!(
+                activity(&analysis, "DEFINE HIT"),
+                Truth::True,
+                "{directive}: {:?}",
+                analysis.reasons
+            );
+        }
+        assert!(
+            analysis
+                .root
+                .directives
+                .iter()
+                .any(|d| &source[d.start..d.end] == directive)
+        );
+    }
+}
+
+#[test]
+fn task13_imported_whitespace_operand_is_known() {
+    let source = "unit Main; interface uses Types; {$IF SizeOf ( Types.T )=4}{$DEFINE HIT}{$ENDIF} implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    fixture.unit(
+        "Types",
+        "unit Types; interface type T=LongWord; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    let analysis = fixture.analyze().unwrap();
+    assert_eq!(
+        activity(&analysis, "DEFINE HIT"),
+        Truth::True,
+        "{:?}",
+        analysis.reasons
+    );
+}
+
+#[test]
+fn task13_imported_structural_alias_is_known() {
+    let mut local = Fixture::new(
+        "unit Types; interface {$A8} type Inner=record B:Byte; end; Payload=Inner; {$IF SizeOf(Payload)=1}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    let local_analysis = local.analyze().unwrap();
+    assert_eq!(
+        activity(&local_analysis, "DEFINE HIT"),
+        Truth::True,
+        "local: {:?}",
+        local_analysis.reasons
+    );
+    let mut fixture = Fixture::new(
+        "unit Main; interface uses Types; {$IF SizeOf(Types.Payload)=1}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    fixture.unit("Types", "unit Types; interface {$A8} type Inner=record B:Byte; end; Payload=Inner; implementation end.", context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert_eq!(
+        activity(&analysis, "DEFINE HIT"),
+        Truth::True,
+        "{:?}",
+        analysis.reasons
+    );
+}
+
+#[test]
+fn task13_nested_routine_and_prototype_parameters_use_declaration_scope() {
+    let source = "unit T; interface procedure Proto(const P:Byte); implementation procedure Later(const P:Int64); forward; procedure Outer(const P:Word); procedure Inner(const P:Byte); begin {$IF SizeOf ( P )=1}{$DEFINE INNER_OK}{$ENDIF} end; begin {$IF SizeOf ( P )=2}{$DEFINE OUTER_OK}{$ENDIF} end; procedure Later(const P:Int64); begin {$IF SizeOf ( P )=8}{$DEFINE LATER_OK}{$ENDIF} end; {$IF SizeOf(P)=1}{$DEFINE LEAK}{$ENDIF} end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    for name in ["DEFINE INNER_OK", "DEFINE OUTER_OK", "DEFINE LATER_OK"] {
+        assert_eq!(activity(&analysis, name), Truth::True, "{name}");
+    }
+    assert_eq!(activity(&analysis, "DEFINE LEAK"), Truth::Unknown);
+}
+
+#[test]
+fn task13_local_qualifier_shadow_keeps_trivia_operand_unknown() {
+    let mut fixture = Fixture::new(
+        "unit Main; interface uses Types; implementation procedure Run(Types:Byte); begin {$IF SizeOf ( Types.T )=4}{$DEFINE HIT}{$ENDIF} end; end.",
+        context(LayoutPlatform::Win32),
+    );
+    fixture.unit(
+        "Types",
+        "unit Types; interface type T=LongWord; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    assert_eq!(
+        activity(&fixture.analyze().unwrap(), "DEFINE HIT"),
+        Truth::Unknown
+    );
+}
+
+#[test]
+fn star_comment_multibyte_after_nonclosing_star_preserves_shared_decisions_and_anchors() {
+    for scalar in ["é", "😀"] {
+        for padding in [0, 4095, 4096, 8191] {
+            let source = format!(
+                "unit T; interface (* {}*{scalar} comment *) {{$IF SizeOf(Integer)=4}}{{$DEFINE HIT}}{{$ENDIF}} implementation end.",
+                "x".repeat(padding)
+            );
+            let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+            let analysis = fixture.analyze().unwrap();
+            assert!(analysis.root.complete, "{:?}", analysis.reasons);
+            assert_eq!(analysis.root.projected_source.len(), source.len());
+            assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+            let directive = analysis
+                .root
+                .directives
+                .iter()
+                .find(|d| d.body.contains("SizeOf"))
+                .unwrap();
+            assert_eq!(
+                &source[directive.start..directive.end],
+                "{$IF SizeOf(Integer)=4}"
+            );
+            assert_eq!(directive.start, source.find("{$IF").unwrap());
+            fixture.limits.max_byte_work = 32;
+            assert!(matches!(
+                fixture.analyze(),
+                Err(pascal_core::ResolverError::LimitExceeded {
+                    limit: "max_byte_work",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn star_comment_utf8_after_a_physical_fragment_star_continues_without_coordinate_fiction() {
+    for scalar in ["é", "😀"] {
+        let source = format!(
+            "unit T; interface {{$I open.inc}}{scalar} comment *) {{$IF SizeOf(Integer)=4}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("open.inc", "(* star *");
+        let analysis = fixture.analyze().unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        assert_eq!(analysis.root.projected_source.len(), source.len());
+        assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+        assert_eq!(analysis.occurrences.len(), 2);
+        assert_eq!(
+            analysis.occurrences[1].analysis.projected_source.len(),
+            "(* star *".len()
+        );
+        let directive = analysis
+            .root
+            .directives
+            .iter()
+            .find(|d| d.body.contains("SizeOf"))
+            .unwrap();
+        assert_eq!(
+            &source[directive.start..directive.end],
+            "{$IF SizeOf(Integer)=4}"
+        );
+        let anchor = analysis
+            .directive_fragments
+            .iter()
+            .find(|d| d.directive.body.contains("SizeOf"))
+            .unwrap();
+        assert_eq!(anchor.fragments.len(), 1);
+        assert_eq!(anchor.fragments[0].source, fixture.root.id);
+        assert_eq!(
+            &source[anchor.fragments[0].range.clone()],
+            "{$IF SizeOf(Integer)=4}"
+        );
+    }
+}
+
+#[test]
+fn star_comment_nonclosing_unicode_transition_keeps_bytework_and_cancellation_limits() {
+    struct CancelAfter(std::cell::Cell<usize>);
+    impl pascal_core::CancellationToken for CancelAfter {
+        fn is_cancelled(&self) -> bool {
+            let polls = self.0.get() + 1;
+            self.0.set(polls);
+            polls >= 250
+        }
+    }
+    for scalar in ["é", "😀"] {
+        let source = format!(
+            "unit T; interface (* star *{scalar} {} *) {{$I later.inc}} implementation end.",
+            "x".repeat(1_300_000)
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("later.inc", "const Later=1;");
+        fixture.limits.max_retained_bytes = 8 * 1024 * 1024;
+        fixture.limits.max_byte_work = 8192;
+        assert!(matches!(
+            fixture.analyze(),
+            Err(pascal_core::ResolverError::LimitExceeded {
+                limit: "max_byte_work",
+                ..
+            })
+        ));
+        assert!(fixture.requests.is_empty());
+        fixture.limits.max_byte_work = CompileTimeLimits::default().max_byte_work;
+        let cancel = CancelAfter(std::cell::Cell::new(0));
+        assert!(matches!(
+            fixture.analyze_with_cancel(&cancel),
+            Err(pascal_core::ResolverError::Cancelled)
+        ));
+        assert!(
+            fixture.requests.is_empty(),
+            "cancellation must precede the later include callback"
+        );
+    }
+}
+
+#[test]
+fn bulk_plain_trivia_keeps_directives_coordinates_and_default_work_bounds() {
+    for (open, close) in [("{", "}"), ("(*", "*)"), ("//", "\n")] {
+        let source = format!(
+            "unit T; interface const Before=7; {open}{} {close}\n{{$IF Before=7}}{{$DEFINE HIT}}{{$ENDIF}} const After=9; {{$IF After=9}}{{$DEFINE AFTER}}{{$ENDIF}} implementation end.",
+            "é😀x".repeat(190_000)
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.limits.max_retained_bytes = 8 * 1024 * 1024;
+        let analysis = fixture.analyze().unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        assert_eq!(activity(&analysis, "DEFINE HIT"), Truth::True);
+        assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
+        assert_eq!(analysis.root.projected_source.len(), source.len());
+        assert!(analysis.budget.budget_snapshot().work < CompileTimeLimits::default().max_work);
+        assert!(analysis.budget.budget_snapshot().byte_work >= source.len());
+        fixture.limits.max_byte_work = 4096;
+        assert!(matches!(
+            fixture.analyze(),
+            Err(pascal_core::ResolverError::LimitExceeded {
+                limit: "max_byte_work",
+                ..
+            })
+        ));
+        fixture.limits.max_byte_work = CompileTimeLimits::default().max_byte_work;
+        fixture.limits.max_work = 16;
+        assert!(matches!(
+            fixture.analyze(),
+            Err(pascal_core::ResolverError::LimitExceeded {
+                limit: "max_work",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn bulk_plain_trivia_polls_cancellation_inside_the_large_comment() {
+    struct CancelAfter(std::cell::Cell<usize>);
+    impl pascal_core::CancellationToken for CancelAfter {
+        fn is_cancelled(&self) -> bool {
+            let polls = self.0.get() + 1;
+            self.0.set(polls);
+            polls >= 250
+        }
+    }
+    let source = format!(
+        "unit T; interface {{{}}} {{$I forbidden.inc}} const Value=1; implementation end.",
+        "x".repeat(1_300_000)
+    );
+    let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+    fixture.limits.max_retained_bytes = 8 * 1024 * 1024;
+    fixture.include("forbidden.inc", "const Forbidden=1;");
+    let cancel = CancelAfter(std::cell::Cell::new(0));
+    assert!(matches!(
+        fixture.analyze_with_cancel(&cancel),
+        Err(pascal_core::ResolverError::Cancelled)
+    ));
+    assert!(
+        fixture.requests.is_empty(),
+        "cancellation must stop before the later include callback"
+    );
+}
+
+#[test]
 fn fix2_i4_ord_of_proven_enum_preserves_independent_later_proof() {
     for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
         let source = "unit T; interface {$DEFINE FLAG} type E=(e0=Ord(Defined(FLAG)),e1=e0+1); \
@@ -835,7 +1352,12 @@ fn root_occurrence_carriers_and_unavailable_resources_are_explicit() {
     assert_eq!(a.occurrences.len(), 1);
     assert_eq!(a.occurrences[0].id, OccurrenceId(0));
     assert_eq!(a.occurrences[0].source.id, f.root.id);
-    assert_eq!(a.header, Fact::Unknown(UnknownReason::HeaderNotAnalyzed));
+    let header = a.header.clone().known().expect("independent prefix proof");
+    assert_eq!(header.name, "T");
+    assert_eq!(header.declaration.source, f.root.id);
+    assert_eq!(header.declaration.occurrence, OccurrenceId(0));
+    assert_eq!(header.declaration.range, 0..7);
+    assert_eq!(header.name_parts[0].range, 5..6);
     assert!(matches!(
         &a.includes[0].target,
         pascal_core::Resolution::Unavailable { .. }

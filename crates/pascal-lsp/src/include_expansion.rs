@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 
 use lsp_types::Url;
-use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use pascal_core::conditional::{self, DirectiveKind, Truth};
+use pascal_core::conditional::{self, DirectiveKind};
 use pascal_project::ConditionalContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +62,9 @@ impl<'a> MappingBudget<'a> {
 pub(crate) struct ExpandedSource {
     text: String,
     map: SourceMap,
+    pub(crate) session: Option<std::sync::Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
+    pub(crate) conditionals: Option<conditional::ConditionalAnalysis>,
+    pub(crate) observations: Vec<IncludeObservation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +90,22 @@ impl ExpandedSource {
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         visit(self.text.len())?;
+        if let Some(session) = &self.session {
+            visit(session.budget.budget_snapshot().retained_bytes)?;
+        }
+        if let Some(analysis) = &self.conditionals {
+            visit(analysis.projected_source.len())?;
+            visit(std::mem::size_of_val(analysis.inactive_spans.as_slice()))?;
+            visit(std::mem::size_of_val(analysis.unknown_spans.as_slice()))?;
+            visit(std::mem::size_of_val(analysis.directives.as_slice()))?;
+            for directive in &analysis.directives {
+                visit(directive.body.len())?;
+            }
+        }
+        visit(std::mem::size_of_val(self.observations.as_slice()))?;
+        for observation in &self.observations {
+            visit(observation.path.as_os_str().len())?;
+        }
         for segment in &self.map.segments {
             let uri_bytes = match &segment.mapping {
                 SegmentMapping::Physical { uri, .. } => uri.as_str().len(),
@@ -106,7 +124,12 @@ impl ExpandedSource {
         self.push_physical_range(uri, source, 0)
     }
 
-    fn push_physical_range(&mut self, uri: Url, source: &str, source_start: usize) -> Range<usize> {
+    pub(crate) fn push_physical_range(
+        &mut self,
+        uri: Url,
+        source: &str,
+        source_start: usize,
+    ) -> Range<usize> {
         let range = self.push_text(source);
         if !range.is_empty() {
             self.map.segments.push(Segment {
@@ -242,6 +265,10 @@ impl ExpandedSource {
         &self.text
     }
 
+    pub(crate) fn segment_count(&self) -> usize {
+        self.map.segments.len()
+    }
+
     fn append(&mut self, child: &ExpandedSource) {
         let offset = self.text.len();
         self.text.push_str(&child.text);
@@ -304,6 +331,23 @@ pub(crate) struct IncludeObservation {
 }
 
 pub(crate) trait IncludeResolver {
+    fn compile_time_include(
+        &mut self,
+        _request: pascal_core::resolver::IncludeResolveRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<
+        pascal_core::resolver::AdmittedCapabilityOutcome<pascal_core::resolver::LoadedSource>,
+        pascal_core::resolver::ResolverError,
+    > {
+        let reports = pascal_core::resolver::AdmittedCapabilityReports::copy(&[], &[], budget)?;
+        Ok(pascal_core::resolver::AdmittedCapabilityOutcome::new(
+            pascal_core::resolver::Resolution::Unavailable {
+                reason: String::new(),
+            },
+            reports,
+        ))
+    }
     fn resolve_include(
         &mut self,
         owner: &Url,
@@ -329,121 +373,6 @@ pub(crate) struct ExpansionResult {
     pub(crate) errors: Vec<String>,
 }
 
-struct ExpansionState<'a> {
-    result: ExpansionResult,
-    limits: ExpansionLimits,
-    sources: usize,
-    directives: usize,
-    work: usize,
-    retained_source_bytes: usize,
-    expanded_bytes: usize,
-    segments: usize,
-    active: HashSet<Url>,
-    cancel: &'a AtomicBool,
-}
-
-impl ExpansionState<'_> {
-    fn cancelled(&self) -> bool {
-        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn charge_work(&mut self, amount: usize) -> Result<(), String> {
-        if self.cancelled() {
-            return Err("request cancelled".to_string());
-        }
-        self.work = self
-            .work
-            .checked_add(amount)
-            .ok_or_else(|| "include expansion work accounting overflowed".to_string())?;
-        if self.work > self.limits.max_work {
-            return Err(format!(
-                "include expansion work limit ({}) reached",
-                self.limits.max_work
-            ));
-        }
-        Ok(())
-    }
-
-    fn append_physical(
-        &mut self,
-        output: &mut ExpandedSource,
-        uri: Url,
-        source: &str,
-        source_start: usize,
-    ) -> Result<(), String> {
-        self.charge_work(source.len())?;
-        let new_size = self
-            .expanded_bytes
-            .checked_add(source.len())
-            .ok_or_else(|| "expanded include source size overflowed".to_string())?;
-        if new_size > self.limits.max_expanded_bytes {
-            return Err(format!(
-                "expanded include byte limit ({}) reached",
-                self.limits.max_expanded_bytes
-            ));
-        }
-        if self.segments >= self.limits.max_segments {
-            return Err(format!(
-                "include source-map segment limit ({}) reached",
-                self.limits.max_segments
-            ));
-        }
-        output.push_physical_range(uri, source, source_start);
-        self.expanded_bytes = new_size;
-        self.segments += 1;
-        Ok(())
-    }
-
-    fn append_synthetic(
-        &mut self,
-        output: &mut ExpandedSource,
-        source: &str,
-    ) -> Result<(), String> {
-        self.charge_work(source.len())?;
-        let new_size = self
-            .expanded_bytes
-            .checked_add(source.len())
-            .ok_or_else(|| "expanded include source size overflowed".to_string())?;
-        if new_size > self.limits.max_expanded_bytes {
-            return Err(format!(
-                "expanded include byte limit ({}) reached",
-                self.limits.max_expanded_bytes
-            ));
-        }
-        if self.segments >= self.limits.max_segments {
-            return Err(format!(
-                "include source-map segment limit ({}) reached",
-                self.limits.max_segments
-            ));
-        }
-        output.push_synthetic(source);
-        self.expanded_bytes = new_size;
-        self.segments += 1;
-        Ok(())
-    }
-
-    fn retain_payload(&mut self, bytes: usize) -> Result<(), String> {
-        self.retained_source_bytes = self
-            .retained_source_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| "retained include source size overflowed".to_string())?;
-        if self.retained_source_bytes > self.limits.max_work {
-            return Err(format!(
-                "include retained-source work limit ({}) reached",
-                self.limits.max_work
-            ));
-        }
-        Ok(())
-    }
-
-    fn incomplete(&mut self, error: String) {
-        self.result.complete = false;
-        if self.result.errors.len() < 256 {
-            self.result.errors.push(error);
-        }
-    }
-}
-
 pub(crate) fn expand_source<R: IncludeResolver>(
     root_uri: Url,
     source: &str,
@@ -464,405 +393,151 @@ pub(crate) fn expand_source_with_context<R: IncludeResolver>(
     limits: ExpansionLimits,
     cancel: &AtomicBool,
 ) -> Result<ExpansionResult, String> {
-    let mut state = ExpansionState {
-        result: ExpansionResult {
-            expanded: ExpandedSource::new(),
-            dependencies: Vec::new(),
-            complete: true,
-            errors: Vec::new(),
-        },
-        limits,
-        sources: 0,
-        directives: 0,
-        work: 0,
-        retained_source_bytes: 0,
-        expanded_bytes: 0,
-        segments: 0,
-        active: HashSet::new(),
-        cancel,
-    };
-    let Some(mut environment) = conditional::ConditionalEnvironment::try_from_context(context)
-    else {
-        state.result.complete = false;
-        state
-            .result
-            .errors
-            .push("conditional environment exceeds evaluator bounds".to_string());
-        return Ok(state.result);
-    };
-    let (complete, expanded) =
-        expand_file(&mut state, root_uri, source, &mut environment, resolver, 0)?;
-    state.result.expanded = expanded;
-    state.result.complete &= complete;
-    Ok(state.result)
+    expand_shared_source(root_uri, source, context, resolver, limits, cancel)
 }
 
-/// The first expansion pass must conservatively retain source from unknown
-/// branches so a preceding include can establish the facts that resolve them.
-/// Once the complete expanded buffer has been evaluated, discard only those
-/// provisional unknown-activity errors that the second pass proved resolved.
-pub(crate) fn reconcile_conditional_completeness(
-    result: &mut ExpansionResult,
-    analysis: &conditional::ConditionalAnalysis,
-) {
-    if !analysis.complete || analysis.unknown_activity_requires_fail_closed() {
-        result.complete = false;
-        if result.errors.len() < 256 {
-            result
-                .errors
-                .push("expanded conditional analysis did not complete".to_string());
-        }
-        return;
+struct SharedIncludes<'a, R> {
+    resolver: &'a mut R,
+    limits: ExpansionLimits,
+    sources: usize,
+}
+
+impl<R: IncludeResolver> pascal_core::compile_time::CompileTimeResolver for SharedIncludes<'_, R> {
+    fn include_capability(
+        &mut self,
+        request: pascal_core::resolver::IncludeResolveRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<
+        pascal_core::resolver::AdmittedCapabilityOutcome<pascal_core::resolver::LoadedSource>,
+        pascal_core::resolver::ResolverError,
+    > {
+        self.resolver.compile_time_include(request, budget, cancel)
     }
-    if !analysis.unknown_activity_requires_fail_closed() {
-        result.errors.retain(|error| {
-            !error.contains("include activity is unknown")
-                && !error.contains("conditional activity is unknown")
+    fn max_include_depth(&self) -> usize {
+        self.limits.max_depth
+    }
+    fn admit_include(
+        &mut self,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<bool, pascal_core::resolver::ResolverError> {
+        if cancel.is_cancelled() {
+            return Err(pascal_core::resolver::ResolverError::Cancelled);
+        }
+        if self.sources >= self.limits.max_sources {
+            return Ok(false);
+        }
+        budget.charge(1, 0, 0).map_err(|_| {
+            pascal_core::resolver::ResolverError::InvalidRequest("include admission limit".into())
+        })?;
+        self.sources += 1;
+        Ok(true)
+    }
+    fn include(
+        &mut self,
+        _request: pascal_core::resolver::IncludeResolveRequest<'_>,
+        _budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<
+        pascal_core::resolver::ResolutionOutcome<pascal_core::resolver::LoadedSource>,
+        pascal_core::resolver::ResolverError,
+    > {
+        Err(pascal_core::resolver::ResolverError::InvalidRequest(
+            "legacy include callback is not a compile-time capability".into(),
+        ))
+    }
+    fn unit(
+        &mut self,
+        _request: pascal_core::resolver::UnitResolveRequest<'_>,
+        _budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<
+        pascal_core::resolver::ResolutionOutcome<pascal_core::compile_time::ProviderSource>,
+        pascal_core::resolver::ResolverError,
+    > {
+        Err(pascal_core::resolver::ResolverError::InvalidRequest(
+            "include adapter has no unit capability".into(),
+        ))
+    }
+}
+
+fn expand_shared_source<R: IncludeResolver>(
+    root_uri: Url,
+    source: &str,
+    context: &ConditionalContext,
+    resolver: &mut R,
+    limits: ExpansionLimits,
+    cancel: &AtomicBool,
+) -> Result<ExpansionResult, String> {
+    use pascal_core::resolver::{LoadedSource, SourceId, SourceRevision};
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("request cancelled".into());
+    }
+    if source.len() > limits.max_work {
+        return Err("include expansion work limit reached".into());
+    }
+    if source.len() > limits.max_expanded_bytes {
+        return Err("expanded include byte limit reached".into());
+    }
+    let directives = conditional::analyze_with_cancel(source, &[], cancel).directives;
+    let admission = if directives.len() > limits.max_directives {
+        Some("include directive limit reached")
+    } else if directives.iter().any(|d| d.kind == DirectiveKind::Include) && limits.max_sources <= 1
+    {
+        Some("include source limit reached")
+    } else if directives.iter().any(|d| d.kind == DirectiveKind::Include) && limits.max_depth == 0 {
+        Some("include expansion depth limit reached")
+    } else {
+        None
+    };
+    if let Some(error) = admission {
+        return Ok(ExpansionResult {
+            expanded: ExpandedSource::default(),
+            dependencies: vec![],
+            complete: false,
+            errors: vec![error.into()],
         });
     }
-    if result.errors.is_empty() {
-        result.complete = true;
-    }
-}
-
-fn expand_file<R: IncludeResolver>(
-    state: &mut ExpansionState,
-    uri: Url,
-    source: &str,
-    environment: &mut conditional::ConditionalEnvironment,
-    resolver: &mut R,
-    depth: usize,
-) -> Result<(bool, ExpandedSource), String> {
-    if state.cancelled() {
-        return Err("request cancelled".to_string());
-    }
-    if depth > state.limits.max_depth {
-        state.incomplete(format!(
-            "include expansion depth limit ({}) reached at {}",
-            state.limits.max_depth, uri
-        ));
-        return Ok((false, ExpandedSource::new()));
-    }
-    if state.sources >= state.limits.max_sources {
-        state.incomplete(format!(
-            "include expansion source limit ({}) reached",
-            state.limits.max_sources
-        ));
-        return Ok((false, ExpandedSource::new()));
-    }
-    if !state.active.insert(uri.clone()) {
-        state.incomplete(format!("include cycle detected at {uri}"));
-        return Ok((false, ExpandedSource::new()));
-    }
-    state.sources += 1;
-
-    // Count the directives before invoking the stateful evaluator.  This is a
-    // syntax-only pass: it cannot resolve an include, retain a payload, or
-    // mutate the shared define environment.  Exhaustion therefore stops the
-    // request before the callback can perform any read.
-    let directive_count = conditional::analyze_with_cancel(source, &[], state.cancel)
-        .directives
-        .len();
-    if state.directives.saturating_add(directive_count) > state.limits.max_directives {
-        state.incomplete(format!(
-            "include directive limit ({}) reached",
-            state.limits.max_directives
-        ));
-        state.active.remove(&uri);
-        return Ok((false, ExpandedSource::new()));
-    }
-    state.directives = state.directives.saturating_add(directive_count);
-
-    let mut include_results: Vec<Option<ChildExpansion>> = Vec::new();
-    let mut callback_error = None;
-    let analysis = conditional::analyze_with_include_callback(
-        source,
-        environment,
-        state.cancel,
-        &mut |directive, environment| {
-            let mut transition = conditional::IncludeTransition {
-                complete: false,
-                environment_known: false,
-            };
-            if depth >= state.limits.max_depth {
-                state.incomplete(format!(
-                    "include expansion depth limit ({}) reached before resolving an include in {uri}",
-                    state.limits.max_depth
-                ));
-                include_results.push(None);
-                return transition;
-            }
-            if state.sources >= state.limits.max_sources {
-                state.incomplete(format!(
-                    "include expansion source limit ({}) reached before resolving an include in {uri}",
-                    state.limits.max_sources
-                ));
-                include_results.push(None);
-                return transition;
-            }
-            if state.segments >= state.limits.max_segments {
-                state.incomplete(format!(
-                    "include source-map segment limit ({}) reached before resolving an include in {uri}",
-                    state.limits.max_segments
-                ));
-                include_results.push(None);
-                return transition;
-            }
-            if let Err(error) = state.charge_work(1) {
-                callback_error = Some(error);
-                include_results.push(None);
-                return transition;
-            }
-            let size_hint = match resolver.include_size_hint(&uri, &directive.body, state.cancel) {
-                Ok(size_hint) => size_hint,
-                Err(error) => {
-                    callback_error = Some(error);
-                    include_results.push(None);
-                    return transition;
-                }
-            };
-            if let Some(size) = size_hint {
-                if state
-                    .expanded_bytes
-                    .checked_add(size)
-                    .is_none_or(|size| size > state.limits.max_expanded_bytes)
-                {
-                    state.incomplete(format!(
-                        "expanded include byte limit ({}) reached before reading an include",
-                        state.limits.max_expanded_bytes
-                    ));
-                    include_results.push(None);
-                    return transition;
-                }
-                if let Err(error) = state.charge_work(size) {
-                    state.incomplete(error);
-                    include_results.push(None);
-                    return transition;
-                }
-            }
-
-            match resolver.resolve_include(&uri, &directive.body, state.cancel) {
-                Ok(resolved) => {
-                    let actual_size = resolved.text.len();
-                    let unreserved = match size_hint {
-                        None => Some(actual_size),
-                        Some(hint) if actual_size > hint => Some(actual_size - hint),
-                        Some(_) => None,
-                    };
-                    if let Some(unreserved) = unreserved
-                        && let Err(error) = state.charge_work(unreserved)
-                    {
-                        state.incomplete(error);
-                        include_results.push(None);
-                        return transition;
-                    }
-                    if state
-                        .expanded_bytes
-                        .checked_add(actual_size)
-                        .is_none_or(|size| size > state.limits.max_expanded_bytes)
-                    {
-                        state.incomplete(format!(
-                            "expanded include byte limit ({}) reached",
-                            state.limits.max_expanded_bytes
-                        ));
-                        include_results.push(None);
-                        return transition;
-                    }
-                    if let Err(error) = state.retain_payload(actual_size) {
-                        state.incomplete(error);
-                        include_results.push(None);
-                        return transition;
-                    }
-                    if state.active.contains(&resolved.uri) {
-                        state.incomplete(format!("include cycle detected at {}", resolved.uri));
-                        include_results.push(None);
-                        return transition;
-                    }
-                    state.result.dependencies.push(resolved.clone());
-                    match expand_file(
-                        state,
-                        resolved.uri.clone(),
-                        &resolved.text,
-                        environment,
-                        resolver,
-                        depth + 1,
-                    ) {
-                        Ok((child_complete, expanded)) => {
-                            transition.complete = child_complete;
-                            transition.environment_known = child_complete;
-                            include_results.push(Some(ChildExpansion {
-                                expanded,
-                                text: resolved.text,
-                                complete: child_complete,
-                            }));
-                        }
-                        Err(error) => {
-                            callback_error = Some(error);
-                            include_results.push(None);
-                        }
-                    }
-                }
-                Err(error) => {
-                    state.incomplete(format!(
-                        "could not resolve active include in {uri}: {error}"
-                    ));
-                    include_results.push(None);
-                }
-            }
-            transition
+    let path = root_uri
+        .to_file_path()
+        .map_err(|_| "include root is not a file URI")?;
+    let root = LoadedSource {
+        id: SourceId::new(format!("source:{}", path.display())),
+        path,
+        bytes: std::sync::Arc::from(source.as_bytes()),
+        decoded_text: Some(std::sync::Arc::from(source)),
+        revision: SourceRevision::Overlay {
+            version: 0,
+            content_hash: pascal_project::content_hash_bytes(source.as_bytes()),
         },
-    );
-    if let Some(error) = callback_error {
-        state.active.remove(&uri);
-        return Err(error);
-    }
-    let unknown_requires_fail_closed = analysis.unknown_activity_requires_fail_closed();
-    let mut file_complete = analysis.complete && !unknown_requires_fail_closed;
-    if !analysis.complete || unknown_requires_fail_closed {
-        state.incomplete(format!("conditional analysis is incomplete for {uri}"));
-    }
-
-    let mut output = ExpandedSource::new();
-    let mut cursor = 0;
-    let mut include_index = 0;
-    for directive in &analysis.directives {
-        if state.cancelled() {
-            state.active.remove(&uri);
-            return Err("request cancelled".to_string());
-        }
-        if directive.start > cursor {
-            append_region(
-                state,
-                &mut output,
-                &uri,
-                source,
-                &analysis,
-                cursor,
-                directive.start,
-            )?;
-        }
-        let directive_source = source
-            .get(directive.start..directive.end)
-            .ok_or_else(|| "conditional directive span was not on a UTF-8 boundary".to_string())?;
-        // The include marker is only a source-map placeholder.  Keeping the
-        // textual `{$I ...}` in the expanded buffer would make the shared
-        // conditional analyzer conservatively clear the define environment
-        // immediately before it sees the included file's directives.  Mask
-        // that marker while retaining its exact byte/line footprint; all
-        // actual conditional/define directives remain visible to the second
-        // analysis pass over the expanded source.
-        if directive.kind == DirectiveKind::Include {
-            state.append_synthetic(&mut output, &mask_directive_bytes(directive_source))?;
-        } else {
-            state.append_synthetic(&mut output, directive_source)?;
-        }
-        if directive.kind == DirectiveKind::Include && directive.activity == Truth::True {
-            let child = include_results
-                .get_mut(include_index)
-                .and_then(Option::take);
-            include_index += 1;
-            if let Some(child) = child {
-                if !child.complete {
-                    file_complete = false;
-                }
-                output.append(&child.expanded);
-                if source
-                    .get(directive.end..)
-                    .and_then(|tail| tail.as_bytes().first())
-                    .is_some_and(|byte| !byte.is_ascii_whitespace())
-                    && !child.text.ends_with(['\n', '\r'])
-                {
-                    state.append_synthetic(&mut output, "\n")?;
-                }
-            } else {
-                file_complete = false;
-            }
-        }
-        cursor = directive.end;
-    }
-    if cursor < source.len() {
-        append_region(
-            state,
-            &mut output,
-            &uri,
-            source,
-            &analysis,
-            cursor,
-            source.len(),
-        )?;
-    }
-    state.active.remove(&uri);
-    Ok((file_complete, output))
-}
-
-struct ChildExpansion {
-    expanded: ExpandedSource,
-    text: String,
-    complete: bool,
-}
-
-fn update_known_define(defines: &mut Vec<String>, directive: &conditional::ConditionalDirective) {
-    let Some(symbol) = conditional::defined_symbol(&directive.body) else {
-        return;
+        compile_time_backing: None,
     };
-    if directive.activity == Truth::False {
-        return;
-    }
-    defines.retain(|define| !define.eq_ignore_ascii_case(&symbol));
-    if directive.kind == DirectiveKind::Define && directive.activity == Truth::True {
-        defines.push(symbol);
-    }
-}
-
-fn mask_directive_bytes(source: &str) -> String {
-    source
-        .chars()
-        .map(|character| match character {
-            '\n' | '\r' => character,
-            _ => ' ',
-        })
-        .collect()
-}
-
-fn append_region(
-    state: &mut ExpansionState,
-    output: &mut ExpandedSource,
-    uri: &Url,
-    source: &str,
-    analysis: &conditional::ConditionalAnalysis,
-    start: usize,
-    end: usize,
-) -> Result<(), String> {
-    let unknown_requires_fail_closed = analysis.unknown_activity_requires_fail_closed();
-    let mut boundaries = vec![start, end];
-    boundaries.extend(
-        analysis
-            .inactive_spans
-            .iter()
-            .chain(analysis.unknown_spans.iter())
-            .flat_map(|span| [span.start.max(start).min(end), span.end.max(start).min(end)]),
-    );
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    for window in boundaries.windows(2) {
-        let part_start = window[0];
-        let part_end = window[1];
-        if part_start >= part_end {
-            continue;
-        }
-        let unknown = analysis
-            .unknown_spans
-            .iter()
-            .any(|span| part_start >= span.start && part_end <= span.end);
-        let original = source
-            .get(part_start..part_end)
-            .ok_or_else(|| "include source region split a UTF-8 scalar".to_string())?;
-        if unknown && unknown_requires_fail_closed {
-            state.incomplete(format!("conditional activity is unknown in {uri}"));
-        }
-        state.append_physical(output, uri.clone(), original, part_start)?;
-    }
-    Ok(())
+    let mut resolver = SharedIncludes {
+        resolver,
+        limits,
+        sources: 1,
+    };
+    let analysis = pascal_core::compile_time::analyze_source(
+        &root,
+        context,
+        &mut resolver,
+        pascal_core::compile_time::CompileTimeLimits {
+            max_retained_bytes: crate::workspace::compile_time::lsp_compatibility_retention(
+                crate::workspace::ResourceLimits {
+                    max_file_bytes: limits.max_expanded_bytes,
+                    max_total_bytes: limits.max_expanded_bytes,
+                    max_cache_bytes: 0,
+                    ..Default::default()
+                },
+                limits,
+            ),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .map_err(|e| e.to_string())?;
+    crate::workspace::compile_time::mapped(std::sync::Arc::new(analysis), limits, cancel)
 }
 
 #[cfg(test)]
@@ -964,6 +639,22 @@ mod tests {
     }
 
     impl IncludeResolver for FixtureResolver {
+        fn compile_time_include(
+            &mut self,
+            request: pascal_core::resolver::IncludeResolveRequest<'_>,
+            budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+            cancel: &dyn pascal_core::resolver::CancellationToken,
+        ) -> Result<
+            pascal_core::resolver::AdmittedCapabilityOutcome<pascal_core::resolver::LoadedSource>,
+            pascal_core::resolver::ResolverError,
+        > {
+            let bytes = self
+                .sources
+                .get(request.requested_name)
+                .map_or(0, String::len);
+            fixture_capability(self, request, bytes, 0, budget, cancel)
+        }
+
         fn resolve_include(
             &mut self,
             _owner: &Url,
@@ -987,6 +678,84 @@ mod tests {
                 observations: Vec::new(),
             })
         }
+    }
+
+    fn fixture_capability<R: IncludeResolver>(
+        resolver: &mut R,
+        request: pascal_core::resolver::IncludeResolveRequest<'_>,
+        text_bytes: usize,
+        provenance_bytes: usize,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn pascal_core::resolver::CancellationToken,
+    ) -> Result<
+        pascal_core::resolver::AdmittedCapabilityOutcome<pascal_core::resolver::LoadedSource>,
+        pascal_core::resolver::ResolverError,
+    > {
+        use pascal_core::resolver::{
+            AdmittedCapabilityOutcome, AdmittedCapabilityReports, LoadedSource, Resolution,
+            SourceId, SourceRevision, SourceStoreError,
+        };
+        if cancel.is_cancelled() {
+            return Err(pascal_core::resolver::ResolverError::Cancelled);
+        }
+        // The fixture's source path and UTF-8 payload bounds are known by
+        // borrow; neither the legacy callback nor its copies run pre-admission.
+        let path_bytes = "/workspace/".len() + request.requested_name.len();
+        let metadata = std::mem::size_of::<LoadedSource>()
+            + 4 * path_bytes
+            + "source:".len()
+            + provenance_bytes;
+        let source =
+            LoadedSource::admit_construction(budget, text_bytes, text_bytes * 4 + metadata, || {
+                let owner = Url::from_file_path(request.including_path)
+                    .map_err(|_| SourceStoreError::AdmissionUnavailable)?;
+                let resolved = resolver
+                    .resolve_include(
+                        &owner,
+                        &format!("I {}", request.requested_name),
+                        &AtomicBool::new(false),
+                    )
+                    .map_err(|reason| SourceStoreError::Io {
+                        path: request.including_path.into(),
+                        message: reason,
+                    })?;
+                let path = resolved
+                    .uri
+                    .to_file_path()
+                    .map_err(|_| SourceStoreError::AdmissionUnavailable)?;
+                let hash = pascal_project::content_hash_bytes(resolved.text.as_bytes());
+                let revision = if let Some(path_entry) = resolved.path_entry {
+                    SourceRevision::Disk {
+                        stamp: pascal_project::ProjectReadStamp {
+                            bytes: text_bytes as u64,
+                            modified: None,
+                            is_dir: false,
+                            is_symlink: false,
+                        },
+                        content_hash: hash,
+                        read_policy: Default::default(),
+                        path_entry,
+                    }
+                } else {
+                    SourceRevision::Overlay {
+                        version: 0,
+                        content_hash: hash,
+                    }
+                };
+                Ok(LoadedSource {
+                    id: SourceId::new(format!("source:{}", path.display())),
+                    path,
+                    bytes: std::sync::Arc::from(resolved.text.as_bytes()),
+                    decoded_text: Some(std::sync::Arc::from(resolved.text)),
+                    revision,
+                    compile_time_backing: None,
+                })
+            })
+            .map_err(|e| pascal_core::resolver::ResolverError::InvalidRequest(format!("{e:?}")))?;
+        Ok(AdmittedCapabilityOutcome::new(
+            Resolution::Found(source),
+            AdmittedCapabilityReports::copy(&[], &[], budget)?,
+        ))
     }
 
     #[test]
@@ -1291,6 +1060,29 @@ mod tests {
         struct ProvenanceResolver;
 
         impl IncludeResolver for ProvenanceResolver {
+            fn compile_time_include(
+                &mut self,
+                request: pascal_core::resolver::IncludeResolveRequest<'_>,
+                budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+                cancel: &dyn pascal_core::resolver::CancellationToken,
+            ) -> Result<
+                pascal_core::resolver::AdmittedCapabilityOutcome<
+                    pascal_core::resolver::LoadedSource,
+                >,
+                pascal_core::resolver::ResolverError,
+            > {
+                fixture_capability(
+                    self,
+                    request,
+                    "{$DEFINE SAFE}\n".len(),
+                    "/mapped/Shared.inc".len()
+                        + "/mapped".len()
+                        + std::mem::size_of::<pascal_project::ProjectPathEntry>()
+                        + std::mem::size_of::<pascal_project::ReadPolicy>(),
+                    budget,
+                    cancel,
+                )
+            }
             fn resolve_include(
                 &mut self,
                 _owner: &Url,

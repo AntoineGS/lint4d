@@ -81,6 +81,50 @@ from Athens documentation. Unsupported target names are retained explicitly,
 with unknown defaults. These evidence limits must also be respected by future
 layout consumers.
 
+Layout consumers in `pascal-core::compile_time` now use reference-derived
+Windows ABI profiles separately from those limited default-switch facts:
+Delphi 2007/18.5 Win32 and exact CompilerVersion 20.0 through 37.0, with Win64
+from XE2/23.0. These are not locally executed compiler measurements or proof of
+every declaration in those releases. Profiles never use the host Rust ABI or
+mutable `WIN32`/`WIN64` defines to select storage. Missing, future, unsupported
+or contradictory build facts remain unknown.
+
+The [ABI fixture registry](../pascal-core/tests/fixtures/compile_time/abi.toml)
+records per-case storage **and alignment** evidence: Embarcadero's
+[Internal Data Formats](https://docwiki.embarcadero.com/RADStudio/Athens/en/Internal_Data_Formats_(Delphi)),
+[System.Extended](https://docwiki.embarcadero.com/Libraries/Florence/en/System.Extended),
+the Delphi/MSVC alignment correspondence in
+[Getting alignment right](http://rvelthuis.de/articles/articles-convert.html),
+and the mapped Win64 scalar/aggregate rules in Microsoft's
+[x64 software conventions](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions?view=msvc-170).
+The Win32-only alignment table is not extrapolated to Win64. Pointer/string/
+dynamic-array references are 4/8 bytes; Win32/Win64 `Extended` is 10/8 bytes
+with alignment 8. Pre-Unicode `Char` and native integers follow version-specific
+rules. Win64 `Real48` alignment remains unverified, so even a known width is
+not a complete layout fact.
+
+Supported source switches are A/ALIGN 1/2/4/8, Z/MINENUMSIZE 1/2/4,
+H/LONGSTRINGS, OLDTYPELAYOUT and REALCOMPATIBILITY; unsupported settings remain
+unknown. No-argument PUSHOPT/POPOPT on Florence/37 Windows saves/restores these
+settings; subset forms, earlier versions and malformed/unmatched restores do
+not establish a proven state. Grouped non-byte record fields with unknown/ON
+OLDTYPELAYOUT and ALIGN 16 remain unproven. A source declaration captures its
+definition-site settings; include-local changes continue into the parent in
+source order. Explicit unknown caller settings are never silently replaced.
+Project/library contexts and all five layout settings participate in downstream
+freshness identity alongside source/read observations. Discovery itself still
+does not ingest Pascal declarations, execute initializers or calculate storage.
+
+For the supported aliases, imported providers, records, arrays, variables and
+parameters, static selectors, source-order initializer continuation and
+header-only import navigation, see the
+[shared guide](../../docs/shared-resolver-architecture.md#compile-time-storage-facts)
+and [LSP support boundary](../pascal-lsp/README.md#compile-time-storage-and-import-headers).
+Unknown compiler settings, ambiguous or unauthorized providers, generic/DCU/
+function/property storage operands and unsupported layouts stay fail-closed.
+This is not TASK-47, full MSBuild evaluation or compiler parity. Release
+validation and actual ChainDriveAPI 13-import verification remain pending.
+
 ## Delphi installation profiles
 
 Project discovery can combine project metadata with locally installed Delphi

@@ -170,10 +170,10 @@ fn task9_b_error_cleanup_and_graph_replacement_refund_only_actual_owners() {
     let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
     let cache = budget.admit_owned(1, 0, 100, || 0).unwrap();
     let cache_usage = budget.snapshot();
-    let error: Result<(), &'static str> = (|| {
+    let error: Result<(), &'static str> = {
         let _scratch = budget.admit_owned(1, 0, 300, || vec![0; 300]).unwrap();
         Err("lookup failed")
-    })();
+    };
     assert!(error.is_err());
     assert_eq!(budget.snapshot().retained_bytes, cache_usage.retained_bytes);
     let old = budget
@@ -234,7 +234,7 @@ fn task9_b_work_and_byte_caps_are_transactional_before_first_ledger_allocation()
         let before = budget.snapshot();
         let called = Cell::new(false);
         assert!(
-            matches!(budget.admit_owned(1, 1, 1, || { called.set(true); () }), Err(IncompleteReason::Limit { name, .. }) if name == expected)
+            matches!(budget.admit_owned(1, 1, 1, || { called.set(true); }), Err(IncompleteReason::Limit { name, .. }) if name == expected)
         );
         assert_eq!(budget.snapshot(), before);
         assert!(!called.get());

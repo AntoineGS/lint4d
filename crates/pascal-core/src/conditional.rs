@@ -1172,6 +1172,15 @@ pub fn analyze_with_include_callback_context(
 /// Internal source-backed extension of the same directive interpreter. The
 /// session owns admission, lexical declarations, and unavailable-fact reasons.
 pub(crate) trait SourceOrder {
+    fn stop_source(&self) -> bool {
+        false
+    }
+    fn continue_source(&self, _end: usize, _length: usize) -> bool {
+        false
+    }
+    fn projection_end(&self, length: usize) -> usize {
+        length
+    }
     fn output_budget(
         &mut self,
         action: &mut dyn FnMut(&mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason>,
@@ -1297,7 +1306,14 @@ pub(crate) fn analyze_with_source_order(
                 Ok(())
             })?
         })?;
+        if order.stop_source() {
+            break;
+        }
         let Some(mut directive) = next.directive else {
+            if order.continue_source(end, source.len()) {
+                cursor = end;
+                continue;
+            }
             break;
         };
         directive.value_mut().activity = order.activity();
@@ -1332,9 +1348,11 @@ pub(crate) fn analyze_with_source_order(
             })
         })?;
     }
+    let end = order.projection_end(source.len());
+    let projection = &source[..end];
     output_action(order, |budget| {
-        output.grow(budget, 1, source.len(), source.len(), |output| {
-            output.projected_source = project_source(source, &output.inactive_spans, &masks);
+        output.grow(budget, 1, projection.len(), projection.len(), |output| {
+            output.projected_source = project_source(projection, &output.inactive_spans, &masks);
             output.complete = complete;
         })
     })?;
@@ -1344,6 +1362,7 @@ pub(crate) fn analyze_with_source_order(
 /// The same physical directive lexical rules as `lex_directives_inner`, but
 /// suspended at each directive and at child EOF rather than finalizing a root.
 pub(crate) struct DirectiveScanner {
+    stop_at_semicolon: bool,
     mode: DirectiveLex,
     pending: AdmittedOwned<String>,
     fragments: AdmittedOwned<Vec<SourceAnchor>>,
@@ -1351,6 +1370,66 @@ pub(crate) struct DirectiveScanner {
     // estimate. Anchor payload invoices stay with the independently owned Vec.
     fragment_slots: usize,
     prefix: usize,
+    body_mode: DirectiveLex,
+    shape_probe: Option<LayoutShapeProbe>,
+}
+
+#[derive(Default)]
+struct LayoutShapeProbe {
+    word_end: usize,
+    pending: bool,
+    found: bool,
+}
+
+impl LayoutShapeProbe {
+    fn normal_byte(
+        &mut self,
+        source: &str,
+        i: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        let bytes = source.as_bytes();
+        if i < self.word_end {
+            return Ok(());
+        }
+        budget.charge(1, 2, 0)?; // Current byte and bounded comment-opener lookahead.
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            return Ok(());
+        }
+        // Comments may separate the intrinsic identifier from its opening
+        // parenthesis. They do not turn escaped/larger names into intrinsics.
+        if byte == b'{'
+            || (byte == b'/' && bytes.get(i + 1) == Some(&b'/'))
+            || (byte == b'(' && bytes.get(i + 1) == Some(&b'*'))
+        {
+            return Ok(());
+        }
+        if byte == b'(' && self.pending {
+            self.found = true;
+        }
+        self.pending = false;
+        if matches!(byte, b's' | b'S') {
+            budget.charge(1, 8, 0)?;
+        }
+        if matches!(byte, b's' | b'S')
+            && bytes
+                .get(i..i + 6)
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"sizeof"))
+            && (i == 0 || !shape_identifier_byte(bytes[i - 1]))
+            && bytes
+                .get(i + 6)
+                .is_none_or(|byte| !shape_identifier_byte(*byte))
+        {
+            self.pending = true;
+            self.word_end = i + 6;
+        }
+        Ok(())
+    }
+}
+
+fn shape_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'&') || !byte.is_ascii()
 }
 #[derive(Default)]
 enum DirectiveLex {
@@ -1387,11 +1466,14 @@ impl DirectiveScanner {
         let pending = budget.admit_owned(0, 0, 0, String::new)?;
         let fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
         Ok(Self {
+            stop_at_semicolon: false,
             mode: DirectiveLex::default(),
             pending,
             fragments,
             fragment_slots: 0,
             prefix: 0,
+            body_mode: DirectiveLex::Normal,
+            shape_probe: None,
         })
     }
     pub(crate) fn complete(&self) -> bool {
@@ -1399,6 +1481,11 @@ impl DirectiveScanner {
             self.mode,
             DirectiveLex::Normal | DirectiveLex::Slash | DirectiveLex::Line | DirectiveLex::Quote
         )
+    }
+    pub(crate) fn prefix(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
+        let mut scanner = Self::new(budget)?;
+        scanner.stop_at_semicolon = true;
+        Ok(scanner)
     }
     pub(crate) fn next(
         &mut self,
@@ -1419,8 +1506,34 @@ impl DirectiveScanner {
             if cancel.is_cancelled() {
                 return Err(IncompleteReason::Cancelled);
             }
+            let delimiter = match self.mode {
+                Brace => Some('}'),
+                Line => Some('\n'),
+                StarComment => Some('*'),
+                _ => None,
+            };
+            if let Some(delimiter) = delimiter {
+                let skip = bounded_trivia_run(source, i, delimiter, budget)?;
+                if skip > 0 {
+                    i += skip;
+                    continue;
+                }
+            }
             budget.charge(1, 1, 0)?;
             let b = bytes[i];
+            if matches!(self.mode, Normal)
+                && let Some(probe) = &mut self.shape_probe
+                && (probe.pending || matches!(b, b's' | b'S'))
+            {
+                probe.normal_byte(source, i, budget)?;
+            }
+            if self.stop_at_semicolon && b == b';' && matches!(self.mode, Normal) {
+                return Ok(ScannerStep {
+                    text_end: i + 1,
+                    directive: None,
+                    deferred,
+                });
+            }
             match self.mode {
                 Slash => {
                     self.mode = if b == b'/' { Line } else { Normal };
@@ -1466,8 +1579,10 @@ impl DirectiveScanner {
                         .next()
                         .expect("byte in UTF-8 source")
                         .len_utf8();
-                    let closed = matches!(self.mode, DirectiveBrace) && b == b'}'
-                        || matches!(self.mode, DirectiveStar) && b == b')';
+                    let protected = self.body_byte(b)?;
+                    let closed = !protected
+                        && (matches!(self.mode, DirectiveBrace) && b == b'}'
+                            || matches!(self.mode, DirectiveStar) && b == b')');
                     let suffix = if matches!(self.mode, DirectiveBrace) {
                         1
                     } else {
@@ -1478,6 +1593,7 @@ impl DirectiveScanner {
                     if closed {
                         let directive = self.finish(suffix, budget)?;
                         self.mode = Normal;
+                        self.body_mode = Normal;
                         return Ok(ScannerStep {
                             text_end: directive.range.start,
                             directive: Some(directive),
@@ -1509,13 +1625,17 @@ impl DirectiveScanner {
                     }
                 }
                 StarEnd => {
-                    self.mode = if b == b')' {
-                        Normal
+                    if b == b')' {
+                        self.mode = Normal;
                     } else if b == b'*' {
-                        StarEnd
+                        self.mode = StarEnd;
                     } else {
-                        StarComment
-                    };
+                        // Do not consume just the leading byte of a scalar.
+                        // Re-enter the plain-comment search at this physical
+                        // character boundary, including across source fragments.
+                        self.mode = StarComment;
+                        continue;
+                    }
                 }
                 String => {
                     if b == b'\'' {
@@ -1562,6 +1682,73 @@ impl DirectiveScanner {
             directive: None,
             deferred,
         })
+    }
+
+    // The outer directive delimiter is not an expression delimiter while in
+    // Pascal trivia or a quoted literal. State survives physical include EOF.
+    fn body_byte(&mut self, byte: u8) -> Result<bool, IncompleteReason> {
+        use DirectiveLex::*;
+        let protected = match self.body_mode {
+            Brace => {
+                if byte == b'}' {
+                    self.body_mode = Normal;
+                }
+                true
+            }
+            Line => {
+                if byte == b'\n' {
+                    self.body_mode = Normal;
+                }
+                true
+            }
+            StarComment => {
+                if byte == b'*' {
+                    self.body_mode = StarEnd;
+                }
+                true
+            }
+            StarEnd => {
+                self.body_mode = if byte == b')' {
+                    Normal
+                } else if byte == b'*' {
+                    StarEnd
+                } else {
+                    StarComment
+                };
+                true
+            }
+            String => {
+                if byte == b'\'' {
+                    self.body_mode = Quote;
+                } else if matches!(byte, b'\r' | b'\n') {
+                    return Err(IncompleteReason::MalformedSource);
+                }
+                true
+            }
+            Quote if byte == b'\'' => {
+                self.body_mode = String;
+                true
+            }
+            Paren if byte == b'*' => {
+                self.body_mode = StarComment;
+                true
+            }
+            Slash if byte == b'/' => {
+                self.body_mode = Line;
+                true
+            }
+            _ => false,
+        };
+        if !protected {
+            self.body_mode = match byte {
+                b'{' => Brace,
+                b'(' => Paren,
+                b'/' => Slash,
+                b'\'' => String,
+                _ => Normal,
+            };
+        }
+        Ok(protected)
     }
 
     fn append(
@@ -1739,6 +1926,26 @@ impl DirectiveScanner {
             body_fragments,
         })
     }
+}
+
+/// One bounded standard-library delimiter search, never crossing a UTF-8
+/// boundary. Admit a search step and a visited-byte upper bound before each
+/// chunk; the delimiter itself remains for the normal lexical machine.
+pub(crate) fn bounded_trivia_run(
+    source: &str,
+    start: usize,
+    delimiter: char,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<usize, IncompleteReason> {
+    let mut end = source.len().min(start.saturating_add(4096));
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let chunk = &source[start..end];
+    // Admit the bounded visited-byte upper bound BEFORE the search. Work is
+    // one actual library search operation, not one evaluator step per byte.
+    budget.charge(1, chunk.len(), 0)?;
+    Ok(chunk.find(delimiter).unwrap_or(chunk.len()))
 }
 
 /// Scanner-only vector growth. Payload invoices attach before cloning identity
@@ -2072,7 +2279,7 @@ fn analyze_lexed(
         cursor = raw.end;
     }
 
-    if let Some(order) = order.as_deref_mut() {
+    if let Some(order) = order {
         active = order.activity();
         order.feed(cursor..source.len(), active);
     } else if cursor < source.len()
@@ -3114,35 +3321,102 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
 
 /// Allocation-free root classification/admission shape. This performs no
 /// conditional evaluation and cannot authorize a child. Actual include roots
-/// are interpreted only by the shared source-order session.
-pub(crate) fn source_directive_shape(
+/// and layout-query roots are interpreted only by the shared source-order
+/// session. The returned flags are (include, layout call, directive count).
+#[cfg(test)]
+fn source_directive_shape(source: &str, cancel: &dyn CancellationToken) -> (bool, bool, usize) {
+    source_shape_inner(source, cancel, false)
+}
+
+/// Admission-aware shape probe for resolver dispatch. Reuse the shared lexical
+/// scanner so ordinary comment bytes cost bounded search steps, not an
+/// eight-times-source-size evaluator estimate. Directive bodies retain their
+/// conservative expression-work admission before shape inspection.
+pub(crate) fn source_directive_shape_in_session(
+    source: &str,
+    id: &crate::SourceId,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<(bool, bool, usize), IncompleteReason> {
+    let mut scanner = DirectiveScanner::new(budget)?;
+    scanner.shape_probe = Some(LayoutShapeProbe::default());
+    let mut cursor = 0;
+    let mut count = 0;
+    let mut includes = false;
+    let mut layout = false;
+    while cursor < source.len() && count < MAX_DIRECTIVES {
+        let step = scanner.next(
+            source,
+            cursor,
+            id,
+            crate::compile_time::OccurrenceId(0),
+            budget,
+            cancel,
+        )?;
+        if let Some(directive) = step.directive {
+            budget.charge(
+                directive.body.len().saturating_mul(8),
+                directive.body.len(),
+                0,
+            )?;
+            includes |= include_shape(&directive.body);
+            layout |= directive_layout_shape(&directive.body, cancel);
+            count += 1;
+            cursor = directive.range.end;
+        } else {
+            break;
+        }
+    }
+    Ok((
+        includes,
+        layout
+            || scanner
+                .shape_probe
+                .as_ref()
+                .is_some_and(|probe| probe.found),
+        count,
+    ))
+}
+
+// Expression bodies reuse the same borrowed lexical boundaries but never
+// recurse into directives: only root IF/ELSEIF/ELIF bodies are expressions.
+fn source_shape_inner(
     source: &str,
     cancel: &dyn CancellationToken,
-) -> (bool, usize) {
+    expression_body: bool,
+) -> (bool, bool, usize) {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut count = 0;
     let mut includes = false;
+    let mut layout_call = false;
+    let mut pending_sizeof = false;
     while i < bytes.len() && count < MAX_DIRECTIVES {
         if cancel.is_cancelled() {
             break;
         }
         match bytes[i] {
             b'\'' => {
+                pending_sizeof = false;
                 let Some(next) = skip_string(bytes, i) else {
                     break;
                 };
                 i = next;
             }
-            b'"' => i = skip_assembler_string(bytes, i),
+            b'"' => {
+                pending_sizeof = false;
+                i = skip_assembler_string(bytes, i);
+            }
             b'/' if bytes.get(i + 1) == Some(&b'/') => i = skip_line_comment(bytes, i),
             b'{' => {
                 let Some(close) = find_byte(bytes, i + 1, b'}') else {
                     break;
                 };
-                if bytes.get(i + 1) == Some(&b'$') {
+                if !expression_body && bytes.get(i + 1) == Some(&b'$') {
                     count += 1;
-                    includes |= include_shape(&source[i + 2..close]);
+                    let body = &source[i + 2..close];
+                    includes |= include_shape(body);
+                    layout_call |= directive_layout_shape(body, cancel);
                 }
                 i = close + 1;
             }
@@ -3150,16 +3424,58 @@ pub(crate) fn source_directive_shape(
                 let Some(close) = find_sequence(bytes, i + 2, b"*)") else {
                     break;
                 };
-                if bytes.get(i + 2) == Some(&b'$') {
+                if !expression_body && bytes.get(i + 2) == Some(&b'$') {
                     count += 1;
-                    includes |= include_shape(&source[i + 3..close]);
+                    let body = &source[i + 3..close];
+                    includes |= include_shape(body);
+                    layout_call |= directive_layout_shape(body, cancel);
                 }
                 i = close + 2;
             }
-            _ => i += 1,
+            byte if byte.is_ascii_whitespace() => i += 1,
+            b'(' => {
+                layout_call |= pending_sizeof;
+                pending_sizeof = false;
+                i += 1;
+            }
+            // Escaped names and larger identifiers are not the intrinsic call.
+            b'&' => {
+                pending_sizeof = false;
+                i = shape_identifier_end(source, i + 1);
+            }
+            _ => {
+                let end = shape_identifier_end(source, i);
+                if end > i {
+                    pending_sizeof = source[i..end].eq_ignore_ascii_case("sizeof");
+                    i = end;
+                } else {
+                    pending_sizeof = false;
+                    i += source[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
         }
     }
-    (includes, count)
+    (includes, layout_call, count)
+}
+
+fn shape_identifier_end(source: &str, start: usize) -> usize {
+    let mut end = start;
+    for ch in source[start..].chars() {
+        if ch != '_' && !ch.is_alphanumeric() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+fn directive_layout_shape(body: &str, cancel: &dyn CancellationToken) -> bool {
+    directive_keyword(body).is_some_and(|keyword| {
+        (keyword.eq_ignore_ascii_case("if")
+            || keyword.eq_ignore_ascii_case("elseif")
+            || keyword.eq_ignore_ascii_case("elif"))
+            && source_shape_inner(directive_arguments(body), cancel, true).1
+    })
 }
 
 /// Shape classification needs no owned keyword or switch/condition decoder.
@@ -3455,15 +3771,26 @@ pub(crate) fn condition_expression(body: &str) -> Option<&str> {
     }
 }
 
+// These aliases preserve the callbacks' independent query/budget lifetimes and
+// borrowed trait-object lifetime. They add neither an owner nor an allocation.
+type BudgetQueryLookup<'a> = dyn FnMut(
+        ExpressionQuery<'_>,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>
+    + 'a;
+type BudgetNameLookup<'a> = dyn FnMut(
+        &str,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>
+    + 'a;
+type NameLookup<'a> = dyn FnMut(&str) -> Option<BoundValue> + 'a;
+type QueryLookup<'a> = dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue> + 'a;
+
 pub(crate) fn evaluate_source_condition(
     body: &str,
     environment: &ConditionalEnvironment,
     budget: &mut crate::compile_time::CompileTimeBudget<'_>,
-    lookup: &mut dyn FnMut(
-        ExpressionQuery<'_>,
-        &mut crate::compile_time::CompileTimeBudget<'_>,
-    )
-        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    lookup: &mut BudgetQueryLookup<'_>,
 ) -> Result<Truth, crate::compile_time::IncompleteReason> {
     if let Some(expression) = condition_expression(body) {
         Ok(
@@ -3545,7 +3872,7 @@ fn evaluate_typed_expression_with_lookup<'a>(
     expression: &str,
     environment: &'a ConditionalEnvironment,
     complete: &mut bool,
-    mut lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
+    mut lookup: Option<&'a mut NameLookup<'a>>,
 ) -> Value {
     if lookup.is_none() {
         return parse_bound_expression(expression, environment, complete, None, false);
@@ -3588,7 +3915,7 @@ fn parse_bound_expression<'a>(
     expression: &'a str,
     environment: &'a ConditionalEnvironment,
     complete: &mut bool,
-    lookup: Option<&'a mut dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue>>,
+    lookup: Option<&'a mut QueryLookup<'a>>,
     static_only: bool,
 ) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
@@ -3632,11 +3959,7 @@ fn parse_bound_expression<'a>(
 pub(crate) fn type_bound_expression(
     expression: &str,
     budget: &mut crate::compile_time::CompileTimeBudget<'_>,
-    lookup: &mut dyn FnMut(
-        &str,
-        &mut crate::compile_time::CompileTimeBudget<'_>,
-    )
-        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    lookup: &mut BudgetNameLookup<'_>,
 ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
     bound_expression_mode(expression, budget, lookup, true)
 }
@@ -3644,11 +3967,7 @@ pub(crate) fn type_bound_expression(
 fn bound_expression_mode(
     expression: &str,
     budget: &mut crate::compile_time::CompileTimeBudget<'_>,
-    lookup: &mut dyn FnMut(
-        &str,
-        &mut crate::compile_time::CompileTimeBudget<'_>,
-    )
-        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    lookup: &mut BudgetNameLookup<'_>,
     static_only: bool,
 ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
     if expression.len() > MAX_EXPRESSION_BYTES {
@@ -3671,11 +3990,7 @@ pub(crate) fn evaluate_layout_expression(
     expression: &str,
     environment: &ConditionalEnvironment,
     budget: &mut crate::compile_time::CompileTimeBudget<'_>,
-    lookup: &mut dyn FnMut(
-        ExpressionQuery<'_>,
-        &mut crate::compile_time::CompileTimeBudget<'_>,
-    )
-        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    lookup: &mut BudgetQueryLookup<'_>,
     static_only: bool,
     strict: bool,
 ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
@@ -3689,7 +4004,7 @@ pub(crate) fn evaluate_layout_expression(
     // Each byte can produce a token; reserve token capacity, token clones and
     // string intermediates before tokenization. Existing parser work/depth caps
     // remain in force. Lookup payloads are admitted by the callback.
-    let before = budget.snapshot().retained_bytes;
+    let before = budget.manual_retained();
     let scratch = expression
         .len()
         .checked_add(1)
@@ -3752,8 +4067,7 @@ pub(crate) fn evaluate_layout_expression(
     };
     budget.release(
         budget
-            .snapshot()
-            .retained_bytes
+            .manual_retained()
             .saturating_sub(before)
             .saturating_sub(if output.is_some() { output_bytes } else { 0 }),
     );
@@ -3798,6 +4112,18 @@ fn tokenize_expression_spanned(expression: &str) -> (Vec<ExprToken>, Vec<Range<u
     let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
+        match expression_trivia_end(bytes, index) {
+            Ok(Some(end)) => {
+                index = end;
+                continue;
+            }
+            Err(()) => {
+                tokens.push(ExprToken::Invalid);
+                spans.push(index..bytes.len());
+                break;
+            }
+            Ok(None) => {}
+        }
         if bytes[index].is_ascii_whitespace() {
             index += 1;
             continue;
@@ -3870,6 +4196,9 @@ fn tokenize_expression_spanned(expression: &str) -> (Vec<ExprToken>, Vec<Range<u
                 let mut value = String::new();
                 let mut closed = false;
                 while index < bytes.len() {
+                    if matches!(bytes[index], b'\r' | b'\n') {
+                        break;
+                    }
                     if bytes[index] == b'\'' {
                         if bytes.get(index + 1) == Some(&b'\'') {
                             value.push('\'');
@@ -3953,6 +4282,31 @@ fn tokenize_expression_spanned(expression: &str) -> (Vec<ExprToken>, Vec<Range<u
     (tokens, spans)
 }
 
+/// Shared expression/access lexer trivia. Keep original byte spans and reject
+/// unfinished comments rather than manufacturing a complete operand at EOF.
+pub(crate) fn expression_trivia_end(bytes: &[u8], start: usize) -> Result<Option<usize>, ()> {
+    if bytes.get(start) == Some(&b'{') {
+        if bytes.get(start + 1) == Some(&b'$') {
+            return Err(());
+        }
+        return find_byte(bytes, start + 1, b'}')
+            .map(|end| Some(end + 1))
+            .ok_or(());
+    }
+    if bytes.get(start..start + 2) == Some(b"(*") {
+        if bytes.get(start + 2) == Some(&b'$') {
+            return Err(());
+        }
+        return find_sequence(bytes, start + 2, b"*)")
+            .map(|end| Some(end + 2))
+            .ok_or(());
+    }
+    if bytes.get(start..start + 2) == Some(b"//") {
+        return Ok(Some(skip_line_comment(bytes, start)));
+    }
+    Ok(None)
+}
+
 /// Reserve tokenizer scratch before the shared lexical count; no index grammar
 /// or payload normalization is added by the operand parser.
 pub(crate) fn expression_token_count(
@@ -3978,7 +4332,7 @@ struct ExpressionParser<'a> {
     expression: &'a str,
     index: usize,
     environment: &'a ConditionalEnvironment,
-    lookup: Option<&'a mut dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue>>,
+    lookup: Option<&'a mut QueryLookup<'a>>,
     malformed: bool,
     depth: usize,
     work: usize,
@@ -4206,6 +4560,19 @@ impl ExpressionParser<'_> {
         let mut comma = false;
         let mut end = None;
         while pos < bytes.len() {
+            if !quoted {
+                match expression_trivia_end(bytes, pos) {
+                    Ok(Some(next)) => {
+                        pos = next;
+                        continue;
+                    }
+                    Err(()) => {
+                        self.malformed = true;
+                        return Value::Error;
+                    }
+                    Ok(None) => {}
+                }
+            }
             let ch = bytes[pos];
             if ch == b'\'' {
                 if quoted && bytes.get(pos + 1) == Some(&b'\'') {
@@ -5025,6 +5392,260 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expression_cleanup_is_owner_local_on_add_replace_drop_and_failure() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, IncompleteReason};
+        for construction in [false, true] {
+            for action in ["add", "replace", "drop"] {
+                for fail in [false, true] {
+                    let mut budget = CompileTimeBudget::new(
+                        CompileTimeLimits::default(),
+                        &crate::NoCancellation,
+                    );
+                    let observer = budget.admit_owned(0, 0, 0, || ()).unwrap();
+                    let mut held = if action == "add" {
+                        None
+                    } else {
+                        Some(
+                            budget
+                                .admit_owned(1, 17, 100_000, || vec![0u8; 100_000])
+                                .unwrap(),
+                        )
+                    };
+                    let mut run = |budget: &mut CompileTimeBudget<'_>| {
+                        budget.charge(1, 13, 70_000).unwrap();
+                        let manual = budget.manual_retained();
+                        let before = budget.snapshot();
+                        let result = super::evaluate_layout_expression(
+                            "Value",
+                            &super::ConditionalEnvironment::default(),
+                            budget,
+                            &mut |_, b| {
+                                match action {
+                                    "add" | "replace" => {
+                                        held =
+                                            Some(b.admit_owned(1, 19, 100_000, || {
+                                                vec![0u8; 100_000]
+                                            })?)
+                                    }
+                                    "drop" => drop(held.take()),
+                                    _ => unreachable!(),
+                                }
+                                if fail {
+                                    return Err(IncompleteReason::MalformedSource);
+                                }
+                                // Nested expression scratch shares this owner, but its
+                                // surviving output is explicitly handed to the parent.
+                                super::evaluate_layout_expression(
+                                    "'kept'",
+                                    &super::ConditionalEnvironment::default(),
+                                    b,
+                                    &mut |_, _| Ok(None),
+                                    false,
+                                    false,
+                                )
+                            },
+                            false,
+                            false,
+                        );
+                        if fail {
+                            assert!(result.is_err());
+                        } else {
+                            assert!(
+                                matches!(result.unwrap(), Some(super::BoundValue::Constant(super::ConstantValue::String(s))) if s == "kept")
+                            );
+                        }
+                        assert_eq!(budget.manual_retained(), manual + if fail { 0 } else { 4 });
+                        assert!(budget.snapshot().work > before.work);
+                        assert!(budget.snapshot().byte_work > before.byte_work);
+                        budget.release(70_000 + if fail { 0 } else { 4 });
+                        Ok(())
+                    };
+                    if construction {
+                        drop(budget.admit_compilation(0, &mut run).unwrap());
+                    } else {
+                        run(&mut budget).unwrap();
+                    }
+                    let live = observer.budget_snapshot();
+                    drop(held);
+                    let dead = observer.budget_snapshot();
+                    assert_eq!(live.work, dead.work);
+                    assert_eq!(live.byte_work, dead.byte_work);
+                    assert_eq!(budget.manual_retained(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task13_fix1_expression_lexer_rejects_physical_newlines_in_ordinary_literals() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let expression = format!("'a}}{newline}b'='a}}{newline}b'");
+            let (tokens, spans) = super::tokenize_expression_spanned(&expression);
+            assert!(
+                tokens.contains(&super::ExprToken::Invalid),
+                "{expression:?}"
+            );
+            assert_eq!(spans[0].start, 0);
+            let mut complete = true;
+            assert_eq!(
+                super::evaluate_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut complete
+                ),
+                super::Truth::Unknown
+            );
+            assert!(!complete);
+            let mut budget = super::CompileTimeBudget::new(
+                crate::compile_time::CompileTimeLimits::default(),
+                &crate::NoCancellation,
+            );
+            assert!(
+                super::evaluate_layout_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut budget,
+                    &mut |_, _| panic!("malformed literal must not need binding lookup"),
+                    false,
+                    false
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(matches!(
+                super::evaluate_layout_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut budget,
+                    &mut |_, _| panic!("malformed literal must not need binding lookup"),
+                    false,
+                    true
+                ),
+                Err(crate::compile_time::IncompleteReason::MalformedSource)
+            ));
+        }
+        for expression in [
+            "'é😀''}*)'='é😀''}*)'",
+            "'a}'\n='a}'",
+            "'a}'\r\n='a}'",
+            "'a}'\r='a}'",
+            "1 { a\nb } = 1",
+            "1 (* a\r\nb *) = 1",
+        ] {
+            let mut complete = true;
+            assert_eq!(
+                super::evaluate_expression(
+                    expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut complete
+                ),
+                super::Truth::True,
+                "{expression:?}"
+            );
+            assert!(complete);
+        }
+    }
+    #[test]
+    fn admitted_shape_probe_charges_plain_steps_without_inspecting_every_byte_for_sizeof() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits};
+        let source = "x:=1;\n".repeat(16_000);
+        let id = crate::SourceId::new("shape-counter");
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: source.len() + 64,
+                ..Default::default()
+            },
+            &crate::NoCancellation,
+        );
+        assert_eq!(
+            super::source_directive_shape_in_session(
+                &source,
+                &id,
+                &mut budget,
+                &crate::NoCancellation
+            )
+            .unwrap(),
+            (false, false, 0)
+        );
+        assert_eq!(budget.snapshot().work, source.len());
+        assert_eq!(budget.snapshot().byte_work, source.len());
+        let source = "const N=SizeOf(Integer); {$IF N=4}{$DEFINE HIT}{$ENDIF}";
+        let before = budget.snapshot();
+        // Reuse the same budget: no reset/refund of the plain scan's work.
+        assert!(
+            super::source_directive_shape_in_session(
+                source,
+                &id,
+                &mut budget,
+                &crate::NoCancellation
+            )
+            .is_err()
+        );
+        assert!(budget.snapshot().work >= before.work);
+    }
+    #[test]
+    fn task11_fix1_shape_distinguishes_layout_calls_from_lexical_mentions() {
+        for source in [
+            "// SizeOf(LongWord)\n",
+            "{SizeOf(LongWord)}",
+            "(*SizeOf(LongWord)*)",
+            "'SizeOf(LongWord)'",
+            "'escaped '' SizeOf(LongWord)'",
+            "\"SizeOf\"",
+            "MySizeOf(T)",
+            "SizeOfValue(T)",
+            "αSizeOf(T)",
+            "SizeOfα(T)",
+            "&SizeOf(T)",
+            "{$HPPEMIT 'SizeOf(LongWord)'}",
+            "{$HPPEMIT SizeOf(T)}",
+            "{$DEFINE SizeOf} {$IFDEF SizeOf} {$ENDIF}",
+            "{$IFNDEF SizeOf} {$ENDIF}",
+            "{$IFOPT SizeOf} {$ENDIF}",
+            "{$IF 'SizeOf(T)' = 'SizeOf(T)'} {$ENDIF}",
+            "{$IF MySizeOf=1} {$ENDIF}",
+            "const SizeOf=1;",
+        ] {
+            assert!(
+                !super::source_directive_shape(source, &crate::NoCancellation).1,
+                "fake call: {source}"
+            );
+        }
+        for source in [
+            "{$IF SizeOf(Types.T)=4}",
+            "(*$IF sIzEoF ( Types.T ) = 4 *)",
+            "{$ELSEIF SizeOf(T)>0}",
+            "(*$ELIF sizeof(T)=4*)",
+            "const N=SizeOf(LongWord); {$IF N=4}",
+            "const N=SizeOf { trivia } (LongWord);",
+            "const N=SizeOf (* trivia *) (LongWord);",
+            "const N=SizeOf // trivia\n (LongWord);",
+        ] {
+            assert!(
+                super::source_directive_shape(source, &crate::NoCancellation).1,
+                "missed call: {source}"
+            );
+        }
+        assert_eq!(
+            super::source_directive_shape(
+                "'{$I fake.inc}' {$I real.inc} (*$IF SizeOf(T)=4*)",
+                &crate::NoCancellation
+            ),
+            (true, true, 2)
+        );
+        struct Cancelled;
+        impl crate::CancellationToken for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        assert_eq!(
+            super::source_directive_shape("{$IF SizeOf(T)=4} {$I body.inc}", &Cancelled),
+            (false, false, 0)
+        );
+    }
+
     #[test]
     fn scanner_split_emission_keeps_physical_owners_after_reuse_and_budget_exit() {
         use crate::compile_time::{CompileTimeLimits, OccurrenceId};

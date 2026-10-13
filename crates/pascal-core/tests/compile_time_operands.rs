@@ -1,9 +1,128 @@
 #[path = "support/compile_time.rs"]
 mod support;
-use pascal_core::NoCancellation;
 use pascal_core::compile_time::*;
+use pascal_core::{NoCancellation, SourceId};
 use pascal_project::{ConditionalContext, ConditionalFact, LayoutPlatform};
 use support::*;
+
+#[test]
+fn imported_integer_pointee_preserves_unknown_and_captured_identity() {
+    for (label, imports, declarations, provider, expected) in [
+        (
+            "alternatives",
+            "uses Other;",
+            "P=^Integer;",
+            Some(
+                "unit Other; interface {$IFDEF OPEN} type Integer=Int64; {$ELSE} type Integer=Word; {$ENDIF} const Flag=True; implementation end.",
+            ),
+            None,
+        ),
+        ("missing", "uses Other;", "P=^Integer;", None, None),
+        (
+            "known",
+            "uses Other;",
+            "P=^Integer;",
+            Some("unit Other; interface type Integer=Int64; const Flag=True; implementation end."),
+            Some(8),
+        ),
+        (
+            "empty",
+            "uses Other;",
+            "P=^Integer;",
+            Some("unit Other; interface const Flag=True; implementation end."),
+            Some(4),
+        ),
+        ("no import", "", "P=^Integer;", None, Some(4)),
+        (
+            "local alias",
+            "uses Other;",
+            "Integer=Word; Alias=Integer; P=^Alias;",
+            Some("unit Other; interface type Integer=Int64; const Flag=True; implementation end."),
+            Some(2),
+        ),
+        ("forward alias", "", "P=^Alias; Alias=Int64;", None, Some(8)),
+    ] {
+        let text = format!(
+            "unit Main; interface {imports} type {declarations} var V:P; {{$IF Other.Flag}}{{$DEFINE READY}}{{$ENDIF}} {{site}} implementation procedure Test; type Integer=Byte; begin {{local}} end; end."
+        );
+        let mut f = Fixture::new(&text, context(LayoutPlatform::Win32));
+        if let Some(provider) = provider {
+            f.unit("Other", provider, context(LayoutPlatform::Win32));
+        }
+        let a = f.analyze().unwrap();
+        if provider.is_some() {
+            assert_eq!(f.read_names(), ["Other"], "{label}");
+        }
+        let mut captured_identity = None;
+        for marker in ["{site}", "{local}"] {
+            let site = a
+                .facts
+                .site_at(&f.root.id, OccurrenceId(0), text.find(marker).unwrap())
+                .unwrap();
+            let mut b = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let pointer = parse_sizeof_operand("V", &mut b).known().unwrap();
+            assert_eq!(
+                a.facts
+                    .layout_operand(site.clone(), &pointer, &mut b)
+                    .known()
+                    .map(|v| v.storage.size),
+                Some(4),
+                "pointer storage {label}"
+            );
+            let operand = parse_sizeof_operand("V^", &mut b).known().unwrap();
+            let result = a.facts.layout_operand(site, &operand, &mut b);
+            match expected {
+                Some(size) => {
+                    let known = result.known().unwrap();
+                    assert_eq!(known.storage.size, size, "{label} {marker}");
+                    if label == "known" {
+                        let TypeIdentity::Declared(key) = &known.identity else {
+                            panic!("imported identity lost: {known:?}")
+                        };
+                        assert_eq!(key.anchor.source, SourceId::new("/fixture/Other.pas"));
+                    }
+                    if label == "empty" || label == "no import" {
+                        assert_eq!(known.identity, TypeIdentity::Intrinsic("integer".into()));
+                    }
+                    if let Some(identity) = &captured_identity {
+                        assert_eq!(
+                            &known.identity, identity,
+                            "query-local shadow must not rebind {label}"
+                        );
+                    }
+                    captured_identity = Some(known.identity);
+                }
+                None => assert!(
+                    matches!(result, Fact::Unknown(_)),
+                    "{label} {marker}: {result:?}"
+                ),
+            }
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            let mut cancelled_budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &cancelled);
+            let site = a
+                .facts
+                .site_at(&f.root.id, OccurrenceId(0), text.find(marker).unwrap())
+                .unwrap();
+            assert!(matches!(
+                a.facts
+                    .layout_operand(site.clone(), &operand, &mut cancelled_budget),
+                Fact::Incomplete(IncompleteReason::Cancelled)
+            ));
+            let mut exhausted = CompileTimeBudget::new(
+                CompileTimeLimits {
+                    max_work: 0,
+                    ..CompileTimeLimits::default()
+                },
+                &NoCancellation,
+            );
+            assert!(matches!(
+                a.facts.layout_operand(site, &operand, &mut exhausted),
+                Fact::Incomplete(_)
+            ));
+        }
+    }
+}
 
 fn i1_context(platform: LayoutPlatform) -> ConditionalContext {
     let mut context = context(platform);

@@ -492,7 +492,18 @@ fn index_domain(
                 let Some(decl) = binding.type_declaration() else {
                     return Ok(None);
                 };
-                return type_domain(state, &decl.site, &decl.ty, depth + 1, budget);
+                return type_domain(state, &decl.type_site, &decl.ty, depth + 1, budget);
+            }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) if decl.is_type => {
+                        type_domain(provider, &decl.type_site, &decl.ty, depth + 1, budget)
+                    }
+                    Fact::Incomplete(reason) => Err(reason),
+                    _ => Ok(None),
+                };
             }
             budget.charge(1, name.len(), name.len())?;
             let canonical = name.to_ascii_lowercase();
@@ -565,14 +576,22 @@ fn index_domain_name(
         let Some(decl) = binding.type_declaration() else {
             return Ok(None);
         };
-        type_domain(state, &decl.site, &decl.ty, depth + 1, budget)
-    } else {
-        budget.charge(1, name.len(), size_of::<IndexExpr>() + name.len())?;
-        let index = IndexExpr::Domain(name.to_owned());
-        let result = index_domain(state, site, &index, depth + 1, budget);
-        budget.release(size_of::<IndexExpr>() + name.len());
-        result
+        return type_domain(state, &decl.type_site, &decl.ty, depth + 1, budget);
     }
+    if let Some(imported) = super::bindings::imported_declaration(state, site, name, budget)? {
+        return match imported {
+            Fact::Known((provider, decl)) if decl.is_type => {
+                type_domain(provider, &decl.type_site, &decl.ty, depth + 1, budget)
+            }
+            Fact::Incomplete(reason) => Err(reason),
+            _ => Ok(None),
+        };
+    }
+    budget.charge(1, name.len(), size_of::<IndexExpr>() + name.len())?;
+    let index = IndexExpr::Domain(name.to_owned());
+    let result = index_domain(state, site, &index, depth + 1, budget);
+    budget.release(size_of::<IndexExpr>() + name.len());
+    result
 }
 
 fn ordinal_expression(
@@ -618,12 +637,28 @@ fn selector_kind(
                 };
                 return selector_kind(
                     state,
-                    &decl.site,
+                    &decl.type_site,
                     &decl.ty,
                     Some(&decl.key),
                     depth + 1,
                     budget,
                 );
+            }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) if decl.is_type => selector_kind(
+                        provider,
+                        &decl.type_site,
+                        &decl.ty,
+                        Some(&decl.key),
+                        depth + 1,
+                        budget,
+                    ),
+                    Fact::Incomplete(reason) => Err(reason),
+                    _ => Ok(None),
+                };
             }
             Ok(match intrinsic(name) {
                 Some(BuiltinType::Boolean) => Some(OrdinalKind::Boolean),
@@ -768,6 +803,10 @@ fn constant_expression_at(
     captured_expression_at(state, site, text, logical, &[], &[], depth, budget)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Captured lexical site, source offset and prior enum members/values share the caller's depth and admission budget; keep these borrowed inputs without a new owning carrier"
+)]
 fn captured_expression_at(
     state: &CompileTimeState,
     site: &BindingSite,
@@ -901,6 +940,17 @@ pub(super) fn scalar_query(
             if qualifier_blocked(state, site, name, budget)? {
                 return Ok(None);
             }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) => {
+                        constant_name(provider, &provider.site(), &decl.name, depth + 1, budget)
+                    }
+                    Fact::Unknown(_) => Ok(None),
+                    Fact::Incomplete(reason) => Err(reason),
+                };
+            }
             let value = constant_name(state, site, name, depth, budget)?;
             if value.is_some() {
                 Ok(value)
@@ -954,6 +1004,13 @@ pub(super) fn lexical_constant_name(
         return Ok(Some(
             constant_name(state, site, name, depth + 1, budget)?.unwrap_or(BoundValue::Unproven),
         ));
+    }
+    if qualifier_blocked(state, site, name, budget)?
+        || super::bindings::imported_declaration(state, site, name, budget)?.is_some()
+    {
+        // A declaration or an uncertain import blocks intrinsic execution. This
+        // is not an attempt to execute user functions or overloads.
+        return Ok(Some(BoundValue::Unproven));
     }
     // CompilerVersion is an explicit immutable context fact, but source lexical
     // bindings must win. Keep its existing Version category, not an integer cast.
@@ -1104,10 +1161,14 @@ pub(super) fn constant_name(
         return Ok(None);
     }
     // Immutable explicit context facts are admitted only after lexical blockers.
-    if let Fact::Known((provider, decl)) =
-        super::bindings::imported_declaration(state, site, name, budget)?
-    {
-        return constant_name(provider, &provider.site(), &decl.name, depth + 1, budget);
+    if let Some(imported) = super::bindings::imported_declaration(state, site, name, budget)? {
+        return match imported {
+            Fact::Known((provider, decl)) => {
+                constant_name(provider, &provider.site(), &decl.name, depth + 1, budget)
+            }
+            Fact::Unknown(_) => Ok(None),
+            Fact::Incomplete(reason) => Err(reason),
+        };
     }
     let mut found = None;
     for (key, value) in &state.context.constants {

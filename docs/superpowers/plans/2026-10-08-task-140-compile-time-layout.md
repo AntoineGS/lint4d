@@ -13,6 +13,56 @@
 **Execution:** User approved subagent-driven execution and requested an isolated
 worktree on 2026-10-08; branch `task-140-compile-time-layout`.
 
+## Task 12 continuation — approved LSP retention boundary, 2026-10-11
+
+The user approved deferring LSP-wide total-retention accounting to `l4d-cnm` and
+keeping the pre-existing bounded LSP size policy rather than adding a new
+ownership/sparse-view subsystem. The spec's latest LSP retention adjustment takes
+precedence over earlier Task 12 debug instructions requiring every selected
+source, fact and full projection to fit the standalone core 1 MiB default.
+
+Resume the existing Task 12 implementer against its preserved work. Use existing
+finite LSP document/source/expansion/cache limits for the LSP retention policy;
+core defaults and source/include/depth/work/byte-work/cancellation/authorization
+contracts remain unchanged. Do not implement the proposed three public receiving
+and view APIs, discard safe ownership, guess invoices or use fixture exemptions.
+Trace every LSP resolver/session entry so normal selected dependency admission,
+expansion and audits consistently use that policy; respect explicitly selected
+retention limits without silently clamping LSP callers back to the core default.
+
+Keep the crash/identity/legacy-route/no-read/dedup fixes already made. Finish the
+two original failing tests (large source and diagnostic replacement clearing),
+with existing RED evidence and targeted boundary controls. If scanning a large
+comment encounters the unchanged work cap, use bounded bulk trivia traversal
+charging actual operations and visited byte-work, not larger work limits or
+free scans. Run the full LSP suite once the two focused tests are green, then
+independent Task 12 spec/quality review. Continue original Tasks 13–14 without
+restarting completed tasks or adding an approval loop. Beads is the progress
+authority; all deferred accounting/lint gaps remain honestly recorded.
+
+## Active execution scope — user direction 2026-10-10
+
+The user explicitly requested deferral of detours and continued execution of the
+original navigation fix. Beads `l4d-140` is the task/progress authority; `l4d-cnm`
+is the deferred, non-blocking strict allocation/projection audit. Backlog and the
+old markdown execution ledger are historical. The spec's scope adjustment takes
+precedence over earlier Task 9 audit briefs and gates.
+
+Resume the existing Task 9 worker only to preserve/shelve its own exact cwd/route
+prototype and verify the committed provider integration against the functional
+requirements. Do not implement a new macOS admission port or resume the universal
+owner migration. Review that functional checkpoint, then execute existing Tasks
+10–14: source-backed headers, shared CFG adapter, LSP integration, freshness and
+bounded evaluator regressions, documentation/full checks/actual 13-import probe.
+Keep original source/evaluation limits and existing ownership protections. Strict
+projection accounting failures remain recorded under `l4d-cnm` with assertions
+unchanged; do not hide failures by changing limits, deleting tests or claiming an
+all-green suite. Functional regressions and authorization/cancellation/freshness
+defects still block acceptance. No new design subsystem or reapproval loop is
+needed for this explicitly requested narrowing of the existing approved plan.
+Do not commit, push, deploy, edit real sources/configuration or discard unrelated
+work. A deferred prototype must be recoverable exactly before it is shelved.
+
 ## Global Constraints
 
 - Work runs in `.worktrees/task-140-compile-time-layout`, as explicitly requested by the user on 2026-10-08; leave the original checkout untouched.
@@ -30,16 +80,18 @@ worktree on 2026-10-08; branch `task-140-compile-time-layout`.
 - No new runtime dependencies, full navigation-index extraction, arbitrary Delphi execution, DCU layout inference, or unbounded provider scans.
 - The additional limits introduced below supplement, rather than bypass, existing source/include/recovery budgets.
 - User approved this plan and selected subagent-driven execution in a worktree on 2026-10-08. Writing the plan alone did not authorize execution; that later user approval does.
-- User approved the cwd platform-internal scratch exception on 2026-10-09. Native receiving buffers and every implementation-controlled path/metadata allocation remain pre-admitted; native internal temporary memory/work is not a total-process resource guarantee. Relative-route behavior and authorization remain unchanged.
+- User approved the cwd platform-internal scratch exception on 2026-10-09; the cwd/cache allocation prototype and broader strict ownership audit are now deferred to `l4d-cnm` by the 2026-10-10 scope adjustment. Existing platform-route behavior and authorization remain unchanged; no total-process allocation guarantee is claimed.
 
 ### Task 9 continuation: approved cwd boundary amendment
+
+Historical continuation, now deferred to `l4d-cnm`; not a gate for Task 10.
 
 This continues the existing Task 9, not a new native path-recovery subsystem.
 The user approved the exception rather than a custom native backend. Preserve
 the selected subagent/worktree execution and all existing review gates.
 
 - [x] Investigate the actual relative-route/cwd allocation blocker and obtain user approval of the narrow native scratch exception.
-- [x] Record the approved exception in the spec, Backlog and execution ledger.
+- [x] Record the approved exception in the spec and tracking (now Beads).
 - [ ] Implement a private admitted cwd receiver using native caller buffers, checked retry/growth, independent lossless path conversion, and distinct native-error versus budget/cancellation results. No new runtime dependency or source-open mechanism.
 - [ ] Test actual cwd equality and non-Unicode/long/error behavior in isolated child processes, original allocation/last-owner/refusal/cancellation behavior, and unchanged relative-route capability. Platform-specific evidence must be labeled honestly.
 - [ ] Independently review original receiver/conversion ownership, FFI safety, exact cwd semantics and the documented exception before integrating fallback canonical-route construction.
@@ -1392,7 +1444,7 @@ git commit -m "fix(core): revalidate and account compile-time layout dependencie
 
 **Files:** Update `crates/pascal-lsp/README.md`,
 `crates/pascal-project/README.md`, and `docs/shared-resolver-architecture.md`;
-update TASK-140 only through Backlog MCP. Write diagnostic logs/probe files
+update `l4d-140` only through Beads. Write diagnostic logs/probe files
 under `/tmp/opencode`, not real source/config directories.
 
 **Interfaces:** No new product APIs. The verified artifact is the configured
@@ -1414,9 +1466,11 @@ cargo test --workspace --no-fail-fast
 git diff --check
 ```
 
-  Each command must exit 0; read the full test summary and record pass/fail/ignored
-  counts rather than reusing TASK-139's counts. If any fails, investigate with
-  systematic-debugging and rerun the failed checks after correction.
+  Read full summaries and record pass/fail/ignored counts rather than reusing
+  TASK-139's counts. Formatting, compilation and lint checks must pass. Test
+  failures explicitly deferred to `l4d-cnm` remain visible and separately
+  reported, never described as passing. Investigate every other failure with
+  systematic-debugging and rerun after correction.
 - [ ] **Step 3: Perform the agreed whole-change review.** Use
   `jev.review_select` with TASK-140 requirements, the implementation scope (base
   commit recorded before execution), mandatory correctness coverage, and the
@@ -1471,8 +1525,8 @@ send('exit', None, request=False)
   remaining conditional limitations. Existing obsolete-reference warnings do
   not authorize editing the real project. A 13/13 header-only result does not
   excuse failed `SizeOf`/include-value regressions or unresolved claimed support.
-- [ ] **Step 6: Record evidence and final scope.** Use Backlog task finalization
-  instructions before checking acceptance criteria or marking Done. Record
+- [ ] **Step 6: Record evidence and final scope.** Use Beads and the repository's
+  finalization instructions before checking acceptance criteria or closing. Record
   command outputs/test totals, review results, supported ABI references, actual
   probe paths/results, and remaining limits. Tell the user to restart the Pascal
   LSP/Neovim to load the rebuilt release binary; do not restart their editor.

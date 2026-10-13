@@ -720,15 +720,17 @@ fn byte_work_occurrences_have_fixed_shared_usage_bounds() {
         assert_eq!(output.occurrences.len(), count + 1);
         assert_eq!(output.includes.len(), count);
         assert_eq!(fixture.read_names(), vec!["body.inc"; count]);
-        // R16's successful default-budget audit measured 15,726 / 40,906.
+        // Task12's charged plain-trivia runs remove the old per-byte probe
+        // lookahead. Task13 measures 11,734 / 32,826 under the same defaults.
         // Fixed bounds catch significant extra work or accidentally free child
         // processing; they never determine the configured refusal budget.
         let bounds = match count {
-            1 => 14 * 1024..=16 * 1024,
-            3 => 36 * 1024..=44 * 1024,
+            1 => 11 * 1024..=12 * 1024,
+            3 => 32 * 1024..=34 * 1024,
             _ => unreachable!(),
         };
         let usage = output.budget.budget_snapshot();
+        eprintln!("occurrences={count}: {usage:?}");
         assert!(
             bounds.contains(&usage.byte_work),
             "occurrences={count}: {usage:?}"
@@ -760,15 +762,15 @@ fn nested_occurrences_share_definition_and_byte_work_limits() {
         context(LayoutPlatform::Win32),
     );
     one.include("body.inc", &comment);
-    // R16: 12,000 was an estimate before honest continuation recopy invoices.
-    // Audit: one=15,726, three=40,906 under default limits, publication=0.
+    // Task13: one=11,734 after Task12's bounded plain-trivia scan; the
+    // unchanged 16KiB cap still refuses repeated occurrence work.
     // This fixed test-only budget keeps one complete and repeated work bounded;
     // it is not computed from current usage and changes no production default.
     const OCCURRENCE_BYTE_WORK_LIMIT: usize = 16 * 1024;
     one.limits.max_byte_work = OCCURRENCE_BYTE_WORK_LIMIT;
     let single = one.analyze().unwrap();
     assert!(single.root.complete);
-    assert!((14 * 1024..=16 * 1024).contains(&single.budget.budget_snapshot().byte_work));
+    assert!((11 * 1024..=12 * 1024).contains(&single.budget.budget_snapshot().byte_work));
     assert_eq!(one.read_names(), vec!["body.inc"]);
     let mut many = Fixture::new(
         "unit T; interface {$I body.inc}{$I body.inc}{$I body.inc} implementation end.",

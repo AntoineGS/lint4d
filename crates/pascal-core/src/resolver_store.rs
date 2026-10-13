@@ -186,7 +186,7 @@ impl FilesystemSourceStore {
         } else {
             0
         };
-        listing
+        let unused_path_reservation = listing
             .grow(budget, 1, path_bytes, path_bytes + capacity, |listing| {
                 let v = if directory {
                     &mut listing.directories
@@ -196,8 +196,16 @@ impl FilesystemSourceStore {
                 if growth {
                     v.reserve_exact(1);
                 }
-                v.push(build());
+                let path = build();
+                let unused = path_bytes.saturating_sub(path.capacity());
+                v.push(path);
+                unused
             })
+            .map_err(|r| super::store_admission_error(r, budget))?;
+        // Keep the pre-allocation OS filename bound until construction ends,
+        // then retire only its unused portion, not the live PathBuf capacity.
+        listing
+            .retire_storage(unused_path_reservation)
             .map_err(|r| super::store_admission_error(r, budget))?;
         if growth {
             listing
@@ -416,14 +424,13 @@ impl SourceStore for FilesystemSourceStore {
                     continue;
                 }
             };
-            if kind.is_symlink() {
-                listing.value_mut().complete = false;
-                continue;
-            }
             // The OS filename bound is known before DirEntry::path allocates.
             let filename_bound = if cfg!(windows) { 1024 } else { 255 };
             let bound = request.directory.as_os_str().len() + 1 + filename_bound;
-            if kind.is_file() || kind.is_dir() {
+            // A symlink's spelling is not permission to follow its target.
+            // Match the ordinary name-only listing; payload authorization is
+            // still checked independently when a selected candidate is read.
+            if kind.is_file() || kind.is_dir() || kind.is_symlink() {
                 Self::push_admitted_path(
                     &mut listing,
                     bound,

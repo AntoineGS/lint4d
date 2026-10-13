@@ -14,7 +14,7 @@ description = "Navigation library for a native Linux Delphi/Object Pascal LSP"
 # Opt-in only: this builds the deterministic child-process harness used by the
 # `protocol_barriers` integration target. It is intentionally not a default
 # feature and must never be enabled for the production `pascal-lsp` binary.
-test-support = []
+test-support = ["pascal-project/test-support"]
 
 [[bin]]
 name = "pascal-lsp-test-server"

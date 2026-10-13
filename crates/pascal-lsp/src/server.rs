@@ -1170,6 +1170,7 @@ pub struct TestBarrierConfig {
     outbound_control_limit: Option<usize>,
     workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
     dispatch: Option<PathBuf>,
+    analysis_metrics: bool,
 }
 
 #[cfg(feature = "test-support")]
@@ -1223,7 +1224,14 @@ impl TestBarrierConfig {
             outbound_control_limit: None,
             workspace_fifo_probe: None,
             dispatch: None,
+            analysis_metrics: false,
         }
+    }
+
+    /// Serves `pascal/testAnalysisMetrics`; never enabled by `run_stdio`.
+    pub fn with_analysis_metrics(mut self, enabled: bool) -> Self {
+        self.analysis_metrics = enabled;
+        self
     }
 
     pub fn with_outbound_writer(
@@ -10703,10 +10711,15 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
     }
 }
 
+#[cfg(feature = "test-support")]
+const TEST_ANALYSIS_METRICS_METHOD: &str = "pascal/testAnalysisMetrics";
+
 fn run_connection(
     connection: &ProtocolConnection,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-support")]
+    let analysis_metrics_endpoint = test_barriers.analysis_metrics;
     let (initialize_id, initialize, options, initialize_value) = loop {
         let (initialize_id, initialize_value) = connection.initialize_start()?;
         let initialize: InitializeParams = match serde_json::from_value(initialize_value.clone()) {
@@ -10799,6 +10812,8 @@ fn run_connection(
         watch_events,
         work_done_progress_supported,
         jobs,
+        #[cfg(feature = "test-support")]
+        analysis_metrics_endpoint,
     )
 }
 
@@ -11069,6 +11084,7 @@ fn event_loop(
     watch_events: crate::file_watch::WatchEvents,
     work_done_progress_supported: bool,
     mut jobs: AnalysisJobs,
+    #[cfg(feature = "test-support")] analysis_metrics_endpoint: bool,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
@@ -11538,6 +11554,25 @@ fn event_loop(
                 deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if analysis_metrics_endpoint && request.method == TEST_ANALYSIS_METRICS_METHOD =>
+            {
+                let report = crate::analysis_metrics::bounded_report(
+                    &pascal_project::analysis_metrics::PROCESS_COUNTERS.snapshot(),
+                    crate::analysis_metrics::ReportMoment::WindowEndpoint,
+                )
+                .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()));
+                match report {
+                    Ok(report) => send_ok(connection, request.id, report)?,
+                    Err(error) => send_error(
+                        connection,
+                        request.id,
+                        ErrorCode::InternalError,
+                        format!("analysis metrics unavailable: {error}"),
+                    )?,
+                }
             }
             Message::Request(request) if file_notification_worker.is_some() => {
                 queue_workspace_message(
@@ -16697,6 +16732,8 @@ mod tests {
             crate::file_watch::WatchEvents::channel().1,
             false,
             AnalysisJobs::new(),
+            #[cfg(feature = "test-support")]
+            false,
         )
         .expect("event loop completes");
         assert!(result);

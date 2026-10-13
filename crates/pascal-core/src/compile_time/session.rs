@@ -404,6 +404,8 @@ pub(crate) fn analyze_source_in_session(
             false,
             OccurrenceId(0),
             true,
+            false,
+            None,
         )
     })?;
     publish_analysis(analysis, budget)
@@ -411,9 +413,94 @@ pub(crate) fn analyze_source_in_session(
 
 struct ProviderSession {
     active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
+    identities: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     queries: usize,
     next_occurrence: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
+}
+
+pub(super) fn header_in_session(
+    root: &LoadedSource,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<Fact<VerifiedUnitHeader>, ResolverError> {
+    let header = header_owned_in_session(root, context, resolver, budget, cancel)?;
+    let payload = match &*header {
+        Fact::Known(h) => {
+            let initial = h
+                .name
+                .len()
+                .checked_add(h.declaration.source.as_str().len())
+                .ok_or_else(|| ResolverError::InvalidRequest("header payload overflow".into()))?;
+            h.name_parts.iter().try_fold(initial, |sum, a| {
+                budget
+                    .charge(1, 0, 0)
+                    .map_err(|r| resolver_error(r, budget))?;
+                sum.checked_add(size_of::<SourceAnchor>())
+                    .and_then(|n| n.checked_add(a.source.as_str().len()))
+                    .ok_or_else(|| ResolverError::InvalidRequest("header payload overflow".into()))
+            })?
+        }
+        Fact::Incomplete(IncompleteReason::RequiredSource { source, reason }) => source
+            .as_str()
+            .len()
+            .checked_add(reason.len())
+            .ok_or_else(|| {
+                ResolverError::InvalidRequest("header reason payload overflow".into())
+            })?,
+        _ => 0,
+    };
+    budget
+        .charge(1, payload, payload)
+        .map_err(|r| resolver_error(r, budget))?;
+    Ok((*header).clone())
+}
+
+pub(crate) fn header_owned_in_session(
+    root: &LoadedSource,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
+    let coordinate = super::coordinates::text(root, budget, cancel)?;
+    if let Some(header) = super::header::plain_header_in_session(root, &coordinate, budget, cancel)?
+    {
+        return Ok(header);
+    }
+    header_with_coordinates_in_session(root, &coordinate, context, resolver, budget, cancel)
+}
+
+pub(crate) fn header_with_coordinates_in_session(
+    root: &LoadedSource,
+    coordinate: &Arc<str>,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
+    let mut output = budget.admit_compilation(0, |budget| {
+        let mut providers = ProviderSession::new(budget)?;
+        analyze_source_with_providers_inner(
+            root,
+            context,
+            resolver,
+            budget,
+            cancel,
+            &mut providers,
+            false,
+            OccurrenceId(0),
+            false,
+            true,
+            Some(coordinate.clone()),
+        )
+    })?;
+    let empty = budget
+        .admit_owned(0, 0, 0, || Fact::Unknown(UnknownReason::HeaderNotAnalyzed))
+        .map_err(|r| resolver_error(r, budget))?;
+    Ok(std::mem::replace(&mut output.value_mut().header, empty))
 }
 
 impl ProviderSession {
@@ -424,8 +511,12 @@ impl ProviderSession {
         let declarations = budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?;
+        let identities = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
         Ok(Self {
             active,
+            identities,
             declarations,
             queries: 0,
             next_occurrence: 1,
@@ -605,6 +696,7 @@ struct ProviderKey {
     revision: crate::SourceRevision,
     context: ConditionalContext,
     qualifiers: Vec<String>,
+    occurrence: OccurrenceId,
 }
 
 fn push_owner<T>(
@@ -626,6 +718,10 @@ fn push_owner<T>(
         .map_err(|r| resolver_error(r, budget))?
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "One compilation handoff preserves the caller's root occurrence, interface scope, shared provider owner, budget and cancellation token without repackaging ownership"
+)]
 fn analyze_source_with_providers(
     root: &LoadedSource,
     context: &ConditionalContext,
@@ -647,6 +743,8 @@ fn analyze_source_with_providers(
             interface_only,
             root_occurrence,
             false,
+            false,
+            None,
         )
     })
 }
@@ -662,9 +760,10 @@ fn analyze_source_with_providers_inner(
     interface_only: bool,
     root_occurrence: OccurrenceId,
     metadata_admitted: bool,
+    header_only: bool,
+    prepared_coordinate: Option<Arc<str>>,
 ) -> Result<SessionOutput, ResolverError> {
     let limits = budget.limits();
-    let bytes = root.analysis_bytes();
     let metadata = crate::resolver::loaded_source_metadata_retained(root);
     if !metadata_admitted {
         budget
@@ -677,13 +776,29 @@ fn analyze_source_with_providers_inner(
     let reserve = size_of::<crate::SourceId>() + root.id.as_str().len();
     budget
         .charge(1, root.id.as_str().len(), reserve)
-        .map_err(|r| resolver_error(r, &budget))?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| ResolverError::InvalidRequest("root coordinate text is not UTF-8".into()))?;
+        .map_err(|r| resolver_error(r, budget))?;
+    let coordinate_owner = if prepared_coordinate.is_none() {
+        Some(super::coordinates::text(root, budget, cancel)?)
+    } else {
+        None
+    };
+    let coordinate = prepared_coordinate
+        .as_ref()
+        .or(coordinate_owner.as_deref())
+        .expect("coordinate owner");
+    let text = coordinate.as_ref();
     let mut state = CompileTimeState::admitted_new(context, root, budget)?;
     state.value_mut().interface_only = interface_only;
-    super::declarations::limit(1, limits.max_branch_states.min(64), "max_branch_states")
-        .map_err(|r| resolver_error(r, &budget))?;
+    super::declarations::limit(
+        1,
+        limits.max_branch_states.min(if header_only {
+            super::HEADER_MAX_BRANCH_STATES
+        } else {
+            CompileTimeLimits::default().max_branch_states
+        }),
+        "max_branch_states",
+    )
+    .map_err(|r| resolver_error(r, budget))?;
     // Graph payload and its final conditional environment belong to this path
     // from construction; frame/current Vec slots remain coordinator storage.
     let first = budget.admit_compilation(0, |budget| {
@@ -702,7 +817,7 @@ fn analyze_source_with_providers_inner(
             .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
         budget
             .charge(entries + 1, 0, metadata)
-            .map_err(|r| resolver_error(r, &budget))?;
+            .map_err(|r| resolver_error(r, budget))?;
         // The conditional environment is separately retained from the immutable
         // declaration context. Admit its context payload before construction.
         let mut failure = None;
@@ -714,23 +829,20 @@ fn analyze_source_with_providers_inner(
                 })
             })
             .map_err(|_| {
-                resolver_error(
-                    failure.unwrap_or(IncompleteReason::MalformedSource),
-                    &budget,
-                )
+                resolver_error(failure.unwrap_or(IncompleteReason::MalformedSource), budget)
             })?;
         budget
             .charge(1, 0, size_of::<Sequence>())
-            .map_err(|r| resolver_error(r, &budget))?;
+            .map_err(|r| resolver_error(r, budget))?;
         let mut environment = ConditionalEnvironment::from_context(context);
         environment.typed_state = Some(Box::new(
             state
                 .snapshot(budget)
-                .map_err(|r| resolver_error(r, &budget))?,
+                .map_err(|r| resolver_error(r, budget))?,
         ));
         let scalar = environment
             .snapshot_scalar(budget)
-            .map_err(|r| resolver_error(r, &budget))?;
+            .map_err(|r| resolver_error(r, budget))?;
         environment
             .typed_state
             .as_deref_mut()
@@ -752,7 +864,14 @@ fn analyze_source_with_providers_inner(
             size_of::<(OccurrenceId, std::path::PathBuf)>() + root.path.as_os_str().len(),
         )
         .map_err(|r| resolver_error(r, budget))?;
+    let header_proof = budget
+        .admit_owned(0, 0, 0, super::header::HeaderProof::default)
+        .map_err(|r| resolver_error(r, budget))?;
     let mut session = RootSession {
+        header_only,
+        header_proof,
+        prefix_end: 0,
+        coordinate: coordinate.clone(),
         root: root.clone(),
         resolver,
         cancel,
@@ -769,8 +888,12 @@ fn analyze_source_with_providers_inner(
         warnings: budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?,
-        scanner: conditional::DirectiveScanner::new(budget)
-            .map_err(|r| resolver_error(r, budget))?,
+        scanner: (if header_only {
+            conditional::DirectiveScanner::prefix(budget)
+        } else {
+            conditional::DirectiveScanner::new(budget)
+        })
+        .map_err(|r| resolver_error(r, budget))?,
         resource_error: None,
         directive_count: 0,
         directive_fragments: budget
@@ -810,28 +933,28 @@ fn analyze_source_with_providers_inner(
     if let Some(error) = session.resource_error.take() {
         return Err(error);
     }
-    if !session.scanner.complete() {
+    if !session.scanner.complete() && !(header_only && session.header_proof.done()) {
         session.record(IncompleteReason::MalformedSource);
     }
     if let Some(reason) = session.fatal.take() {
-        return Err(resolver_error(reason, &session.budget));
+        return Err(resolver_error(reason, session.budget));
     }
-    if !session.frames.is_empty() {
+    if !session.frames.is_empty() && (!header_only || !session.header_proof.done()) {
         session.record(IncompleteReason::MalformedSource);
         let paths = session.reachable_count();
         session
             .budget
             .charge(paths, 0, paths * size_of::<AdmittedOwned<ReachablePath>>())
-            .map_err(|r| resolver_error(r, &session.budget))?;
+            .map_err(|r| resolver_error(r, session.budget))?;
         for mut frame in std::mem::take(&mut session.frames) {
             session.current.append(&mut frame.pending);
             session.current.append(&mut frame.joined);
         }
     }
-    if session.reasons.is_empty() {
+    if session.reasons.is_empty() && !header_only {
         let mut failure = None;
         for path in &mut session.current {
-            if let Err(reason) = path.finish_owned(&mut session.budget) {
+            if let Err(reason) = path.finish_owned(session.budget) {
                 failure = Some(reason);
                 break;
             } else if path.state().unknown {
@@ -872,7 +995,7 @@ fn analyze_source_with_providers_inner(
         session.state = state;
     }
     if let Some(reason) = session.fatal.take() {
-        return Err(resolver_error(reason, &session.budget));
+        return Err(resolver_error(reason, session.budget));
     }
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
@@ -909,7 +1032,7 @@ fn analyze_source_with_providers_inner(
             .map_err(|r| resolver_error(r, session.budget))??;
     }
     if let Some(reason) = session.fatal.take() {
-        return Err(resolver_error(reason, &session.budget));
+        return Err(resolver_error(reason, session.budget));
     }
     if !session.reasons.is_empty() {
         failed_projection(&mut analysis, text, session.budget)?;
@@ -940,23 +1063,25 @@ fn analyze_source_with_providers_inner(
         session
             .budget
             .charge(1, occurrence.analysis.projected_source.len(), 0)
-            .map_err(|r| resolver_error(r, &session.budget))?;
+            .map_err(|r| resolver_error(r, session.budget))?;
         let mut bytes = std::mem::take(&mut occurrence.analysis.projected_source).into_bytes();
         for directive in session.directive_fragments.iter() {
             session
                 .budget
                 .charge(1, 0, 0)
-                .map_err(|r| resolver_error(r, &session.budget))?;
+                .map_err(|r| resolver_error(r, session.budget))?;
             for anchor in &directive.fragments {
                 session
                     .budget
                     .charge(1, 0, 0)
-                    .map_err(|r| resolver_error(r, &session.budget))?;
-                if anchor.occurrence == occurrence.id {
+                    .map_err(|r| resolver_error(r, session.budget))?;
+                if anchor.occurrence == occurrence.id
+                    && (!header_only || anchor.range.end <= bytes.len())
+                {
                     session
                         .budget
                         .charge(1, anchor.range.len(), 0)
-                        .map_err(|r| resolver_error(r, &session.budget))?;
+                        .map_err(|r| resolver_error(r, session.budget))?;
                     for byte in &mut bytes[anchor.range.clone()] {
                         if !matches!(*byte, b'\n' | b'\r') {
                             *byte = b' ';
@@ -970,6 +1095,29 @@ fn analyze_source_with_providers_inner(
     }
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
+    }
+    let mut header = session
+        .header_proof
+        .map_value(session.budget, super::header::HeaderProof::finish)
+        .map_err(|r| resolver_error(r, session.budget))?;
+    if !matches!(&*header, Fact::Known(_))
+        && let Some(reason) = session.reasons.first()
+    {
+        let payload = match reason {
+            IncompleteReason::RequiredSource { source, reason } => source
+                .as_str()
+                .len()
+                .checked_add(reason.len())
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("header reason payload overflow".into())
+                })?,
+            _ => 0,
+        };
+        header
+            .grow(session.budget, 1, payload, payload, |header| {
+                *header = Fact::Incomplete(reason.clone())
+            })
+            .map_err(|r| resolver_error(r, session.budget))?;
     }
     Ok(SessionOutput {
         root: analysis,
@@ -991,10 +1139,7 @@ fn analyze_source_with_providers_inner(
         },
         includes: session.includes,
         facts: Some(session.state),
-        header: session
-            .budget
-            .admit_owned(0, 0, 0, || Fact::Unknown(UnknownReason::HeaderNotAnalyzed))
-            .map_err(|r| resolver_error(r, session.budget))?,
+        header,
         reasons: session.reasons,
         observations: session.observations,
         warnings: session.warnings,
@@ -1175,6 +1320,10 @@ pub(crate) fn resolver_error(
 }
 
 struct RootSession<'a, 'b> {
+    coordinate: Arc<str>,
+    header_only: bool,
+    header_proof: AdmittedOwned<super::header::HeaderProof>,
+    prefix_end: usize,
     root: LoadedSource,
     resolver: &'a mut dyn CompileTimeResolver,
     cancel: &'a dyn CancellationToken,
@@ -1288,16 +1437,9 @@ impl ProviderEngine<'_, '_> {
                 }
             }
             ExpressionQuery::LexicalName(name, _) => {
-                // Intrinsic probes are explicitly source-lexical checks, not
-                // actual imported operand queries (e.g. the SizeOf callee).
-                if super::bindings::lookup(state, site, name, self.budget)
-                    .map_err(|r| resolver_error(r, self.budget))?
-                    .is_some()
-                {
-                    self.prepare_name(state, site, name, false, depth + 1)
-                } else {
-                    Ok(())
-                }
+                // Intrinsic eligibility requires absence from all source-visible
+                // providers too. prepare_name never reads unknown-activity imports.
+                self.prepare_name(state, site, name, false, depth + 1)
             }
             ExpressionQuery::Name(name, _) | ExpressionQuery::Declared(name, _) => {
                 self.prepare_name(state, site, name, false, depth + 1)
@@ -1714,9 +1856,18 @@ impl ProviderEngine<'_, '_> {
         depth: usize,
     ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
         self.budget
-            .charge(self.providers.active.len() + 1, 0, 0)
+            .charge(
+                self.providers.active.len() + self.providers.identities.len() + 1,
+                0,
+                0,
+            )
             .map_err(|r| resolver_error(r, self.budget))?;
-        for key in self.providers.active.iter() {
+        for key in self
+            .providers
+            .active
+            .iter()
+            .chain(self.providers.identities.iter())
+        {
             admit_provider_context(&provider.context, self.budget, false)?;
             admit_provider_context(&key.context, self.budget, false)?;
             let n = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
@@ -1769,12 +1920,29 @@ impl ProviderEngine<'_, '_> {
         )
         .map_err(|r| resolver_error(r, self.budget))?;
         let metadata = provider_owned_payload(&provider)?;
-        let occurrence = OccurrenceId(self.providers.next_occurrence);
-        self.providers.next_occurrence = self
-            .providers
-            .next_occurrence
-            .checked_add(1)
-            .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
+        // Separately compiled unit roots have one nominal identity per proven
+        // source/revision/context/qualifier capability in this session. Repeating
+        // preparation on different root paths must not create distinct enums or
+        // aliases merely because the provider is analyzed again. Included
+        // fragments still receive their own physical occurrences normally.
+        let previous = self.providers.identities.iter().find(|key| {
+            key.source == provider.unit.source.id
+                && key.revision == provider.unit.source.revision
+                && key.context == provider.context
+                && key.qualifiers == provider.authorized_qualifiers
+        });
+        let new_identity = previous.is_none();
+        let occurrence = if let Some(key) = previous {
+            key.occurrence
+        } else {
+            let occurrence = OccurrenceId(self.providers.next_occurrence);
+            self.providers.next_occurrence = self
+                .providers
+                .next_occurrence
+                .checked_add(1)
+                .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
+            occurrence
+        };
         let key = self
             .budget
             .admit_owned(1, metadata, metadata, || ProviderKey {
@@ -1782,6 +1950,7 @@ impl ProviderEngine<'_, '_> {
                 revision: provider.unit.source.revision.clone(),
                 context: provider.context.clone(),
                 qualifiers: provider.authorized_qualifiers.clone(),
+                occurrence,
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.active, key, self.budget)?;
@@ -1823,8 +1992,18 @@ impl ProviderEngine<'_, '_> {
             result?;
             Ok(analysis)
         });
-        self.providers.active.value_mut().pop();
+        let key = self
+            .providers
+            .active
+            .value_mut()
+            .pop()
+            .expect("active provider identity");
         let mut analysis = result?;
+        if new_identity {
+            // Transfer the already admitted identity owner, not an interval of
+            // callback usage or a cached graph/source/report allocation.
+            push_owner(&mut self.providers.identities, key, self.budget)?;
+        }
         let empty_observations = self
             .budget
             .admit_owned(0, 0, 0, Vec::new)
@@ -1949,11 +2128,23 @@ impl RootSession<'_, '_> {
     }
 
     fn walk_include(&mut self, directive: &ConditionalDirective) -> Result<(), ResolverError> {
+        // Admission/resolution has a large temporary frame in debug builds.
+        // Finish it before descending: no resolver temporaries need to remain
+        // live across a textual include's source-order continuation.
+        let index = self.prepare_include(directive)?;
+        self.walk_admitted_include(index)
+    }
+
+    #[inline(never)]
+    fn prepare_include(
+        &mut self,
+        directive: &ConditionalDirective,
+    ) -> Result<usize, ResolverError> {
         // A reachable hypothetical path is not an authorization to read bytes.
         let name = crate::resolver::include_name(&directive.body);
         self.budget
             .charge(self.occurrences.len() + 1, 0, 0)
-            .map_err(|r| resolver_error(r, &self.budget))?;
+            .map_err(|r| resolver_error(r, self.budget))?;
         let mapping = &self.directive_fragments[self.current_directive];
         let anchor = mapping.fragments.first().expect("include delimiter");
         let owner = anchor.occurrence;
@@ -1974,7 +2165,7 @@ impl RootSession<'_, '_> {
                 directive.body.len(),
                 size_of::<IncludeOccurrence>() + self.root.id.as_str().len(),
             )
-            .map_err(|r| resolver_error(r, &self.budget))?;
+            .map_err(|r| resolver_error(r, self.budget))?;
         let (mut result, reports) = if directive.activity != Truth::True {
             (
                 crate::resolver::AdmittedCapabilityResult::from(Resolution::Unavailable {
@@ -2016,14 +2207,14 @@ impl RootSession<'_, '_> {
         if let Some(reports) = reports {
             reports.consume_into(&mut self.observations, &mut self.warnings, self.budget)?;
         }
-        if let Resolution::Found(child) = result.result() {
-            if self.active_sources.contains(&child.id) {
-                result = Resolution::Incomplete {
-                    reason: "textual include cycle".into(),
-                    candidates: vec![],
-                }
-                .into();
+        if let Resolution::Found(child) = result.result()
+            && self.active_sources.contains(&child.id)
+        {
+            result = Resolution::Incomplete {
+                reason: "textual include cycle".into(),
+                candidates: vec![],
             }
+            .into();
         }
         let index = self.includes.len();
         self.budget
@@ -2082,6 +2273,11 @@ impl RootSession<'_, '_> {
         self.includes
             .move_field(include, self.budget, |values, include| values.push(include))
             .map_err(|r| resolver_error(r, self.budget))?;
+        Ok(index)
+    }
+
+    #[inline(never)]
+    fn walk_admitted_include(&mut self, index: usize) -> Result<(), ResolverError> {
         match &self.includes[index].target {
             Resolution::Found(child) => {
                 // The child output source metadata is copied once into its
@@ -2101,11 +2297,10 @@ impl RootSession<'_, '_> {
                         metadata + child.id.as_str().len(),
                         metadata + child.id.as_str().len() + size_of::<crate::SourceId>(),
                     )
-                    .map_err(|r| resolver_error(r, &self.budget))?;
-                let bytes = output.source.analysis_bytes();
-                let text = std::str::from_utf8(&bytes).map_err(|_| {
-                    ResolverError::InvalidRequest("include coordinate text is not UTF-8".into())
-                })?;
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                let coordinate =
+                    super::coordinates::text(&output.source, self.budget, self.cancel)?;
+                let text = coordinate.as_ref();
                 let child = child.clone();
                 let occurrence = OccurrenceId(self.providers.next_occurrence);
                 self.budget
@@ -2125,10 +2320,20 @@ impl RootSession<'_, '_> {
                     .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
                 self.includes.value_mut()[index].child = Some(occurrence);
                 let parent = std::mem::replace(&mut self.root, child);
+                let parent_coordinate =
+                    std::mem::replace(&mut self.coordinate, (*coordinate).clone());
                 let parent_occurrence = std::mem::replace(&mut self.occurrence, occurrence);
                 self.active_sources.push(self.root.id.clone());
                 let result =
-                    conditional::analyze_with_source_order(&text, self.context, self.cancel, self);
+                    conditional::analyze_with_source_order(text, self.context, self.cancel, self);
+                // Restore on error as well as success, before the scoped child
+                // coordinate owner can drop. Only physical coordinates change;
+                // paths, lexer, settings and conditional frames stay alive.
+                let source = std::mem::replace(&mut self.root, parent);
+                drop(source);
+                self.occurrence = parent_occurrence;
+                self.coordinate = parent_coordinate;
+                self.active_sources.pop();
                 let mut analysis = result.map_err(|()| {
                     self.resource_error.take().unwrap_or_else(|| {
                         resolver_error(
@@ -2143,14 +2348,8 @@ impl RootSession<'_, '_> {
                     self.record(IncompleteReason::MalformedSource);
                 }
                 if !self.reasons.is_empty() {
-                    failed_projection(&mut analysis, &text, self.budget)?;
+                    failed_projection(&mut analysis, text, self.budget)?;
                 }
-                // Only physical coordinates change. Typed paths, scopes, lexer,
-                // scalar history, settings and conditional frames stay alive.
-                let source = std::mem::replace(&mut self.root, parent);
-                drop(source);
-                self.occurrence = parent_occurrence;
-                self.active_sources.pop();
                 output
                     .move_field(analysis, self.budget, |output, analysis| {
                         output.analysis = analysis
@@ -2243,7 +2442,14 @@ impl RootSession<'_, '_> {
         let forks = decisions.iter().filter(|d| **d == Truth::Unknown).count();
         super::declarations::limit(
             total + forks,
-            self.budget.limits().max_branch_states.min(64),
+            self.budget
+                .limits()
+                .max_branch_states
+                .min(if self.header_only {
+                    super::HEADER_MAX_BRANCH_STATES
+                } else {
+                    CompileTimeLimits::default().max_branch_states
+                }),
             "max_branch_states",
         )?;
         let mut clones = Vec::new();
@@ -2362,12 +2568,12 @@ impl RootSession<'_, '_> {
             self.fatal = Some(reason);
             return;
         }
-        if self.state.failure.is_none() {
-            if let Err(reason) = self.state.grow(self.budget, 1, dynamic, dynamic, |state| {
+        if self.state.failure.is_none()
+            && let Err(reason) = self.state.grow(self.budget, 1, dynamic, dynamic, |state| {
                 state.failure = Some(reason.clone());
-            }) {
-                self.fatal = Some(reason);
-            }
+            })
+        {
+            self.fatal = Some(reason);
         }
     }
 }
@@ -2448,6 +2654,10 @@ impl AdmittedOwned<ReachablePath> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Per-path evaluation borrows physical fragments and shared provider/report owners under the same budget and cancellation token; no detached copies or allocations"
+)]
 fn evaluate_path_condition(
     body_fragments: &[SourceAnchor],
     path: &mut ReachablePath,
@@ -2516,6 +2726,19 @@ fn evaluate_path_condition(
 }
 
 impl SourceOrder for RootSession<'_, '_> {
+    fn stop_source(&self) -> bool {
+        self.header_only && self.header_proof.done()
+    }
+    fn continue_source(&self, end: usize, length: usize) -> bool {
+        self.header_only && !self.header_proof.done() && end < length
+    }
+    fn projection_end(&self, length: usize) -> usize {
+        if self.header_only {
+            self.prefix_end
+        } else {
+            length
+        }
+    }
     fn output_budget(
         &mut self,
         action: &mut dyn FnMut(&mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason>,
@@ -2529,27 +2752,59 @@ impl SourceOrder for RootSession<'_, '_> {
         source: &str,
         cursor: usize,
     ) -> Result<conditional::SourceOrderStep, ()> {
+        if self.header_only && self.header_proof.done() {
+            self.prefix_end = cursor;
+            return Ok(conditional::SourceOrderStep {
+                text_end: cursor,
+                directive: None,
+            });
+        }
         if !self.current.is_empty() && self.current.iter().all(|p| p.state().interface_complete) {
             return Ok(conditional::SourceOrderStep {
                 text_end: source.len(),
                 directive: None,
             });
         }
-        let next = match self.scanner.next(
+        let scanned = self.scanner.next(
             source,
             cursor,
             &self.root.id,
             self.occurrence,
-            &mut self.budget,
+            self.budget,
             self.cancel,
-        ) {
+        );
+        let next = match scanned {
             Ok(next) => next,
             Err(reason) => {
                 self.record(reason);
                 return Err(());
             }
         };
+        self.prefix_end = next.text_end;
         for (anchor, text) in next.deferred.iter() {
+            let activity = self.activity();
+            self.header_proof
+                .with_budget_mut(self.budget, |proof, budget| {
+                    proof.feed(
+                        SourceFragment {
+                            source: &anchor.source,
+                            occurrence: anchor.occurrence,
+                            physical_start: anchor.range.start,
+                            text,
+                        },
+                        activity,
+                        budget,
+                    )
+                })
+                .map_err(|r| {
+                    self.fatal = Some(r);
+                })?
+                .map_err(|r| {
+                    self.fatal = Some(r);
+                })?;
+            if self.header_only {
+                continue;
+            }
             if self.reasons.is_empty() {
                 for path in &mut self.current {
                     if let Err(reason) = path.feed_owned(
@@ -2557,10 +2812,10 @@ impl SourceOrder for RootSession<'_, '_> {
                             source: &anchor.source,
                             occurrence: anchor.occurrence,
                             physical_start: anchor.range.start,
-                            text: &text,
+                            text,
                         },
                         Truth::True,
-                        &mut self.budget,
+                        self.budget,
                     ) {
                         self.record(reason);
                         return Err(());
@@ -2590,7 +2845,7 @@ impl SourceOrder for RootSession<'_, '_> {
         }
         let kind = conditional::directive_kind(&scanned.body);
         if kind == DirectiveKind::Include {
-            match self.resolver.admit_include(&mut self.budget, self.cancel) {
+            match self.resolver.admit_include(self.budget, self.cancel) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.record(IncompleteReason::RequiredSource {
@@ -2614,8 +2869,23 @@ impl SourceOrder for RootSession<'_, '_> {
             condition: None,
         };
         self.current_directive = self.directive_fragments.len();
-        let slots = if self.directive_fragments.len() == self.directive_fragments.capacity() {
-            (self.directive_fragments.len() + 1)
+        let capacity = if self.directive_fragments.len() == self.directive_fragments.capacity() {
+            // Bootstrap tiny sessions without spare slots; subsequent growth
+            // is geometric. This also preserves their deliberately small
+            // caller/occurrence bounds, without fabricated work charges.
+            (if self.directive_fragments.capacity() < 3 {
+                self.directive_fragments.capacity().checked_add(1)
+            } else {
+                self.directive_fragments.capacity().checked_mul(2)
+            })
+            .ok_or_else(|| {
+                self.fatal = Some(IncompleteReason::MalformedSource);
+            })?
+        } else {
+            0
+        };
+        let slots = if capacity != 0 {
+            capacity
                 .checked_mul(size_of::<DirectiveFragments>())
                 .ok_or_else(|| {
                     self.fatal = Some(IncompleteReason::MalformedSource);
@@ -2631,7 +2901,12 @@ impl SourceOrder for RootSession<'_, '_> {
         self.directive_fragments
             .grow(self.budget, 1, copy_slots, slots, |values| {
                 if slots != 0 {
-                    values.reserve_exact(1);
+                    // Admit the new backing and every possibly copied old byte
+                    // before allocation. The replaced backing actually dies here;
+                    // spare capacity needs no allocation or copy charge.
+                    let mut receiving = Vec::with_capacity(capacity);
+                    receiving.append(values);
+                    drop(std::mem::replace(values, receiving));
                 }
                 values.push(DirectiveFragments {
                     completion: self.occurrence,
@@ -2741,12 +3016,36 @@ impl SourceOrder for RootSession<'_, '_> {
         }
     }
     fn feed(&mut self, range: Range<usize>, activity: Truth) {
+        let text = self.coordinate.as_ref();
+        let result = self
+            .header_proof
+            .with_budget_mut(self.budget, |proof, budget| {
+                proof.feed(
+                    SourceFragment {
+                        source: &self.root.id,
+                        occurrence: self.occurrence,
+                        physical_start: range.start,
+                        text: &text[range.clone()],
+                    },
+                    activity,
+                    budget,
+                )
+            });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) | Err(reason) => {
+                self.fatal = Some(reason);
+                return;
+            }
+        }
+        if self.header_only {
+            return;
+        }
         if self.fatal.is_some() || self.state.failure.is_some() || activity == Truth::False {
             return;
         }
         let mut failure = None;
-        let bytes = self.root.analysis_bytes();
-        let text = std::str::from_utf8(&bytes).expect("validated physical source");
+        let text = self.coordinate.as_ref();
         for path in &mut self.current {
             if let Err(reason) = path.feed_owned(
                 SourceFragment {
@@ -2756,7 +3055,7 @@ impl SourceOrder for RootSession<'_, '_> {
                     text: &text[range.clone()],
                 },
                 Truth::True,
-                &mut self.budget,
+                self.budget,
             ) {
                 failure = Some(reason);
                 break;
@@ -3070,9 +3369,545 @@ fn argument_anchor(
     })
 }
 
+/// Per-path bridge used by IF and declaration-captured constant expressions.
+/// The session compares complete expression results across paths; the public
+/// sizeof_operand projects returned graphs across alternatives. Captured bounds
+/// must stay in their owning path, even when the primary returned graph also
+/// carries alternatives. No literal typing, callable evaluation or memory reads.
+pub(super) fn sizeof_value(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    argument: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    budget.with_layout_query(|budget| {
+        let before = budget.manual_retained();
+        let result = match parse_sizeof_operand(argument, budget) {
+            Fact::Known(operand) => {
+                match state.layout_operand_single(site.clone(), &operand, budget) {
+                    Fact::Known(layout) => Ok(i64::try_from(layout.storage.size)
+                        .ok()
+                        .map(|n| BoundValue::Constant(ConstantValue::Integer(n)))),
+                    Fact::Unknown(_) => Ok(None),
+                    Fact::Incomplete(reason) => Err(reason),
+                }
+            }
+            Fact::Unknown(_) => Ok(None),
+            Fact::Incomplete(reason) => Err(reason),
+        };
+        // Operand strings/selectors and returned layout identities are scratch;
+        // only a scalar integer can survive this bridge.
+        budget.release(budget.manual_retained().saturating_sub(before));
+        result
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_work_defaults_fit_actual_dense_processing_with_finite_retention() {
+        // Work-profile proof only: keep the standalone 1 MiB retention default
+        // separate, as the finite LSP adapter does for real source/output owners.
+        let limits = CompileTimeLimits {
+            max_retained_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let root = graph_source(&format!(
+            "unit Dense; interface {} implementation end.",
+            "{$DEFINE LOCAL}\n".repeat(8_000)
+        ));
+        let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+        let result = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        );
+        assert!(
+            result.is_ok(),
+            "normal directive processing must fit finite work defaults: {result:?}; {:?}",
+            budget.snapshot()
+        );
+        let output = result.unwrap();
+        let spent = output.budget.budget_snapshot();
+        eprintln!("normal dense output: {spent:?}");
+        assert!(output.root.complete);
+        assert!(output.reasons.is_empty());
+        assert_eq!(output.directive_fragments.len(), 8_000);
+        assert!(spent.work > 1_000_000);
+        assert!(spent.work < 2_000_000);
+        assert!(spent.byte_work < 64 * 1024 * 1024);
+        let old = analyze_source(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            CompileTimeLimits {
+                max_work: 1_000_000,
+                max_byte_work: 16 * 1024 * 1024,
+                ..limits
+            },
+            &NoCancellation,
+        );
+        eprintln!("old work defaults on the same normal fixture: {old:?}");
+        assert!(matches!(
+            old,
+            Err(ResolverError::LimitExceeded {
+                limit: "max_work",
+                observed: 1_000_001,
+                maximum: 1_000_000
+            })
+        ));
+        let extreme = graph_source(&format!(
+            "unit Dense; interface {} implementation end.",
+            "{$DEFINE LOCAL}\n".repeat(16_000)
+        ));
+        let refusal = analyze_source(
+            &extreme,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            limits,
+            &NoCancellation,
+        );
+        assert!(
+            matches!(
+                refusal,
+                Err(ResolverError::LimitExceeded {
+                    limit: "max_work",
+                    observed: 2_000_001,
+                    maximum: 2_000_000
+                })
+            ),
+            "genuine dense processing must retain 2M fuse: {refusal:?}"
+        );
+        struct CancelAfter(std::cell::Cell<usize>);
+        impl CancellationToken for CancelAfter {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= 512
+            }
+        }
+        let cancel = CancelAfter(std::cell::Cell::new(0));
+        let mut budget = CompileTimeBudget::new(limits, &cancel);
+        assert!(matches!(
+            analyze_source_in_session(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoGraphCallbacks,
+                &mut budget,
+                &cancel
+            ),
+            Err(ResolverError::Cancelled)
+        ));
+        assert!(budget.snapshot().work > 0);
+        assert!(budget.snapshot().byte_work > 0);
+    }
+
+    #[test]
+    fn normal_byte_work_default_fits_real_declaration_processing() {
+        let declarations = (0..1000)
+            .map(|i| format!("C{i}={i};\n"))
+            .collect::<String>();
+        let conditions = (0..6)
+            .map(|i| format!("{{$IFDEF FEATURE_{i}}}{{$ENDIF}}\n"))
+            .collect::<String>();
+        let root = graph_source(&format!(
+            "unit Dense; interface const {declarations} {conditions} implementation end."
+        ));
+        let limits = CompileTimeLimits {
+            max_work: 2_000_000,
+            max_retained_bytes: 128 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+        let result = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        );
+        assert!(
+            result.is_ok(),
+            "ordinary real declarations must fit finite byte default: {result:?}; {:?}",
+            budget.snapshot()
+        );
+        let output = result.unwrap();
+        let spent = output.budget.budget_snapshot();
+        eprintln!("normal declarations output: {spent:?}");
+        assert!(
+            !output
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, IncompleteReason::Limit { .. })),
+            "conservative unknown activity is distinct from resource refusal: {:?}",
+            output.reasons
+        );
+        assert!(spent.byte_work > 16 * 1024 * 1024);
+        assert!(spent.byte_work < 64 * 1024 * 1024);
+        assert!(spent.work < 2_000_000);
+        let refusal = analyze_source(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            CompileTimeLimits {
+                max_byte_work: 16 * 1024 * 1024,
+                ..limits
+            },
+            &NoCancellation,
+        );
+        assert!(matches!(
+            refusal,
+            Err(ResolverError::LimitExceeded {
+                limit: "max_byte_work",
+                ..
+            })
+        ));
+        let declarations = (0..3000)
+            .map(|i| format!("C{i}={i};\n"))
+            .collect::<String>();
+        let extreme = graph_source(&format!(
+            "unit Dense; interface const {declarations} {conditions} implementation end."
+        ));
+        let refusal = analyze_source(
+            &extreme,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            limits,
+            &NoCancellation,
+        );
+        assert!(
+            matches!(
+                refusal,
+                Err(ResolverError::LimitExceeded {
+                    limit: "max_byte_work",
+                    maximum: 67_108_864,
+                    ..
+                })
+            ),
+            "actual declaration snapshots must retain 64MiB fuse: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn required_firedac_style_prefix_proves_common_header_at_144_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("FireDAC.Phys.IB.pas");
+        let prefix = "{$I FireDAC.inc}\n{$IFDEF IOS}{$HPPEMIT 'mobile'}{$ELSE}{$IFDEF WIN32}{$HPPEMIT 'win'}{$ENDIF}{$ENDIF}\n";
+        let text = format!(
+            "{prefix}unit FireDAC.Phys.IB; interface {{$I forbidden-body.inc}} implementation end."
+        );
+        std::fs::write(&path, &text).unwrap();
+        std::fs::write(dir.path().join("FireDAC.inc"), concat!(
+            "{$IFDEF CPU64}{$DEFINE FD64}{$UNDEF FD32}{$ELSE}{$DEFINE FD32}{$UNDEF FD64}{$ENDIF}\n",
+            "{$IFDEF MOBILE}{$DEFINE FD_MOBILE}{$ENDIF}\n",
+            "{$DEFINE FD_MONITOR}{$IFDEF FD_MONITOR}{$DEFINE FD_LOG}{$ENDIF}\n",
+            "{$IFDEF WIN32}{empty arm}{$ENDIF}\n",
+            "{$IFDEF SQLITE_STATIC}{$DEFINE FD_SQL_STATIC}{$ELSE}{$IFDEF SQLITE_EXTERNAL}{$DEFINE FD_SQL_EXTERNAL}{$ENDIF}{$ENDIF}\n",
+            "{$IFDEF IB_STATIC}{$DEFINE FD_IB_STATIC}{$DEFINE FD_IB_BRAND}{$ENDIF}\n"
+        )).unwrap();
+        let project = pascal_project::ProjectContext::discover(
+            &path,
+            &[dir.path().into()],
+            &Default::default(),
+        )
+        .unwrap();
+        let context = ConditionalContext::default();
+        let prove = |limits| {
+            let mut resolver = crate::UnitResolver::new(
+                project.clone(),
+                vec![dir.path().into()],
+                crate::FilesystemSourceStore::new(),
+                crate::ResolverLimits {
+                    max_compile_time_byte_work: 64 * 1024 * 1024,
+                    max_compile_time_retained_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            );
+            let root = resolver
+                .load_source(&path, None, crate::SourceKind::Unit, &NoCancellation)
+                .unwrap();
+            let result = crate::compile_time::verify_unit_header(
+                &root,
+                &context,
+                &mut resolver,
+                limits,
+                &NoCancellation,
+            );
+            let report = resolver.finish();
+            assert!(!report.observations.iter().any(|o| matches!(o, ResolutionObservation::Payload { path, .. } | ResolutionObservation::Candidate { path, .. } if path.ends_with("forbidden-body.inc"))));
+            result
+        };
+        let limits = CompileTimeLimits {
+            max_branch_states: 256,
+            max_byte_work: 64 * 1024 * 1024,
+            max_retained_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let proof = prove(limits).unwrap();
+        assert!(
+            matches!(proof, Fact::Known(ref h) if h.name == "FireDAC.Phys.IB"),
+            "144-state required prefix: {proof:?}"
+        );
+        let tight = prove(CompileTimeLimits {
+            max_branch_states: 64,
+            ..limits
+        })
+        .unwrap();
+        assert!(
+            !matches!(tight, Fact::Known(_)),
+            "old caller ceiling must remain tight"
+        );
+        let mut selection = crate::UnitResolver::new(
+            project.clone(),
+            vec![dir.path().into()],
+            crate::FilesystemSourceStore::new(),
+            crate::ResolverLimits {
+                max_compile_time_byte_work: 64 * 1024 * 1024,
+                max_compile_time_retained_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        let selected = selection
+            .try_resolve_unit(
+                UnitResolveRequest {
+                    requested_name: "FireDAC.Phys.IB",
+                    importer_path: &dir.path().join("Main.pas"),
+                    legacy_route: None,
+                },
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(selected.result, Resolution::Found(_)),
+            "outer candidate must use header purpose: {:?}",
+            selected.result
+        );
+        let at128 = prove(CompileTimeLimits {
+            max_branch_states: 128,
+            ..limits
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                at128,
+                Fact::Incomplete(IncompleteReason::Limit {
+                    name: "max_branch_states",
+                    maximum: 128
+                })
+            ),
+            "nested HPPEMIT requires the final 144 states: {at128:?}"
+        );
+        for tighter in [
+            CompileTimeLimits {
+                max_byte_work: 1024,
+                ..limits
+            },
+            CompileTimeLimits {
+                max_work: 32,
+                ..limits
+            },
+        ] {
+            assert!(prove(tighter).is_err(), "tight actual work must refuse");
+        }
+        std::fs::write(&path, format!("{prefix}{{$IFDEF EXTRA_A}}{{$ENDIF}}{{$IFDEF EXTRA_B}}{{$ENDIF}}unit FireDAC.Phys.IB; interface implementation end.")).unwrap();
+        let exhausted = prove(limits).unwrap();
+        assert!(
+            matches!(
+                exhausted,
+                Fact::Incomplete(IncompleteReason::Limit {
+                    name: "max_branch_states",
+                    maximum: 256
+                })
+            ),
+            "genuine >256 states must refuse: {exhausted:?}"
+        );
+        std::fs::write(&path, format!("{prefix}{{$IFDEF OTHER_HEADER}}unit Other;{{$ELSE}}unit FireDAC.Phys.IB;{{$ENDIF}} interface implementation end.")).unwrap();
+        assert!(
+            !matches!(prove(limits).unwrap(), Fact::Known(_)),
+            "different headers cannot converge"
+        );
+        std::fs::write(
+            &path,
+            "{$I absent.inc}unit FireDAC.Phys.IB; interface implementation end.",
+        )
+        .unwrap();
+        assert!(
+            !matches!(prove(limits).unwrap(), Fact::Known(_)),
+            "missing prefix include cannot be skipped"
+        );
+        std::fs::write(&path, "{$IFDEF UNKNOWN_INCLUDE}{$I absent.inc}{$ENDIF}unit FireDAC.Phys.IB; interface implementation end.").unwrap();
+        assert!(
+            !matches!(prove(limits).unwrap(), Fact::Known(_)),
+            "unknown prefix include cannot be assumed inactive"
+        );
+        std::fs::write(
+            &path,
+            "{$I /outside/denied.inc}unit FireDAC.Phys.IB; interface implementation end.",
+        )
+        .unwrap();
+        assert!(
+            !matches!(prove(limits).unwrap(), Fact::Known(_)),
+            "unauthorized prefix include cannot be skipped"
+        );
+        std::fs::write(&path, &text).unwrap();
+        struct CancelPrefix(std::cell::Cell<usize>);
+        impl CancellationToken for CancelPrefix {
+            fn is_cancelled(&self) -> bool {
+                let calls = self.0.get();
+                self.0.set(calls + 1);
+                calls >= 512
+            }
+        }
+        let cancel = CancelPrefix(std::cell::Cell::new(0));
+        let mut resolver = crate::UnitResolver::new(
+            project,
+            vec![dir.path().into()],
+            crate::FilesystemSourceStore::new(),
+            crate::ResolverLimits {
+                max_compile_time_byte_work: limits.max_byte_work,
+                max_compile_time_retained_bytes: limits.max_retained_bytes,
+                ..Default::default()
+            },
+        );
+        let root = resolver
+            .load_source(&path, None, crate::SourceKind::Unit, &NoCancellation)
+            .unwrap();
+        let mut budget = CompileTimeBudget::new(limits, &cancel);
+        assert!(matches!(
+            header_in_session(&root, &context, &mut resolver, &mut budget, &cancel),
+            Err(ResolverError::Cancelled)
+        ));
+        assert!(budget.snapshot().work > 0);
+        assert!(budget.snapshot().byte_work > 0);
+        assert!(budget.snapshot().byte_work <= limits.max_byte_work);
+    }
+
+    #[test]
+    fn dense_directives_fit_fixed_byte_work_with_owned_amortized_backing() {
+        struct NoResources;
+        impl CompileTimeResolver for NoResources {
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("dense local directives must not request a provider")
+            }
+            fn include(
+                &mut self,
+                _: IncludeResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                panic!("dense local directives must not request an include")
+            }
+        }
+        let text = format!(
+            "unit Dense; interface {} implementation end.",
+            "{$DEFINE LOCAL}\n".repeat(2048)
+        );
+        let root = LoadedSource {
+            id: SourceId::new("Dense.pas"),
+            path: "Dense.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        };
+        let limits = CompileTimeLimits {
+            max_byte_work: 8 * 1024 * 1024,
+            max_retained_bytes: 8 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+        let observer = budget.admit_owned(0, 0, 0, || ()).unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let result = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoResources,
+            &mut budget,
+            &NoCancellation,
+        );
+        assert!(
+            result.is_ok(),
+            "actual dense session refused fixed 8 MiB cap: {result:?}; {:?}",
+            budget.snapshot()
+        );
+        let output = result.unwrap();
+        assert!(output.root.complete);
+        assert_eq!(output.directive_fragments.len(), 2048);
+        assert!(output.directive_fragments.capacity() >= 2048);
+        let spent = budget.snapshot();
+        assert!(spent.byte_work > 2048 * size_of::<DirectiveFragments>());
+        assert!(spent.byte_work <= limits.max_byte_work);
+        assert!(spent.work > 2048);
+        drop(output);
+        assert_eq!(budget.snapshot().retained_bytes, baseline);
+        assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        assert_eq!(budget.snapshot().work, spent.work);
+        drop(observer);
+        for limits in [
+            CompileTimeLimits {
+                max_byte_work: 1024,
+                ..limits
+            },
+            CompileTimeLimits {
+                max_work: 32,
+                ..limits
+            },
+        ] {
+            let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
+            let observer = budget.admit_owned(0, 0, 0, || ()).unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            assert!(
+                analyze_source_in_session(
+                    &root,
+                    &ConditionalContext::default(),
+                    &mut NoResources,
+                    &mut budget,
+                    &NoCancellation
+                )
+                .is_err()
+            );
+            assert!(budget.snapshot().work > 0);
+            assert_eq!(budget.snapshot().retained_bytes, baseline);
+            drop(observer);
+        }
+        struct CancelAfter(std::cell::Cell<usize>);
+        impl CancellationToken for CancelAfter {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= 256
+            }
+        }
+        let cancel = CancelAfter(std::cell::Cell::new(0));
+        let mut budget = CompileTimeBudget::new(limits, &cancel);
+        let observer = budget.admit_owned(0, 0, 0, || ()).unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        assert!(matches!(
+            analyze_source_in_session(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoResources,
+                &mut budget,
+                &cancel
+            ),
+            Err(ResolverError::Cancelled)
+        ));
+        assert!(budget.snapshot().work > 0);
+        assert_eq!(budget.snapshot().retained_bytes, baseline);
+        drop(observer);
+    }
 
     #[test]
     fn include_r18_root_output_and_provider_child_keep_selected_backing_and_empty_failure_reports()
@@ -4350,7 +5185,7 @@ mod tests {
         };
         append_observations(
             &mut analysis.value_mut().observations,
-            &[observation.clone()],
+            std::slice::from_ref(&observation),
             &mut budget,
         )
         .unwrap();
@@ -5107,37 +5942,4 @@ mod tests {
         let byte_start = text.find("Byte").unwrap();
         assert_eq!(byte_anchor.range, byte_start..byte_start + 4);
     }
-}
-
-/// Per-path bridge used by IF and declaration-captured constant expressions.
-/// The session compares complete expression results across paths; the public
-/// sizeof_operand projects returned graphs across alternatives. Captured bounds
-/// must stay in their owning path, even when the primary returned graph also
-/// carries alternatives. No literal typing, callable evaluation or memory reads.
-pub(super) fn sizeof_value(
-    state: &CompileTimeState,
-    site: &BindingSite,
-    argument: &str,
-    budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<BoundValue>, IncompleteReason> {
-    budget.with_layout_query(|budget| {
-        let before = budget.manual_retained();
-        let result = match parse_sizeof_operand(argument, budget) {
-            Fact::Known(operand) => {
-                match state.layout_operand_single(site.clone(), &operand, budget) {
-                    Fact::Known(layout) => Ok(i64::try_from(layout.storage.size)
-                        .ok()
-                        .map(|n| BoundValue::Constant(ConstantValue::Integer(n)))),
-                    Fact::Unknown(_) => Ok(None),
-                    Fact::Incomplete(reason) => Err(reason),
-                }
-            }
-            Fact::Unknown(_) => Ok(None),
-            Fact::Incomplete(reason) => Err(reason),
-        };
-        // Operand strings/selectors and returned layout identities are scratch;
-        // only a scalar integer can survive this bridge.
-        budget.release(budget.manual_retained().saturating_sub(before));
-        result
-    })
 }

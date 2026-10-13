@@ -42,11 +42,11 @@ fn options(version: Option<CompilerVersion>) -> ProjectOptions {
 
 #[test]
 fn target_facts_are_not_defines() {
-    let version = Some(CompilerVersion::new(37, 0));
-    let win32 = LayoutContext::for_target(version, Some(&TargetPlatform::Win32));
-    let win64 = LayoutContext::for_target(version, Some(&TargetPlatform::Win64));
+    let version = CompilerVersion::new(37, 0);
+    let win32 = LayoutContext::for_target(Some(version), Some(&TargetPlatform::Win32));
+    let win64 = LayoutContext::for_target(Some(version), Some(&TargetPlatform::Win64));
     let mut ctx = ConditionalContext::default()
-        .with_compiler_version(version.unwrap())
+        .with_compiler_version(version)
         .with_layout(win32.clone());
     let before = ctx.fingerprint();
     ctx.set_define("WIN64", F::True);

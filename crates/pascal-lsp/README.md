@@ -2005,12 +2005,11 @@ Not implemented or incomplete:
 - Full member accessibility and Delphi declaration-order rules. This is a
   syntactic index, not a compiler-validated semantic model.
 - Full compiler-equivalent conditional evaluation is not implemented. The
-  bounded include expander uses only explicit `CompilerVersion`, `IFOPT`,
-  define, and constant facts plus its finite typed expression subset; it does
-  not infer host compiler state. Unknown alternatives and Pascal-dependent
-  include expressions therefore produce no navigation result, withhold
-  diagnostics, or block rename rather than being guessed.
- - Full MSBuild evaluation, arbitrary `.dproj` targets, and compiler-equivalent
+  shared source-order session supports the bounded storage/initializer subset
+  below, alongside explicit `CompilerVersion`, `IFOPT`, define and constant
+  facts; it does not infer host compiler state. Unproven alternatives withhold
+  navigation, diagnostics or rename rather than being guessed.
+- Full MSBuild evaluation, arbitrary `.dproj` targets, and compiler-equivalent
   search-path/configuration loading are not implemented.
 - Compiler-equivalent overload selection and anonymous callable inference are
   not implemented. Completion and signature help remain conservative when
@@ -2023,6 +2022,81 @@ Not implemented or incomplete:
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.
+
+### Compile-time storage and import headers
+
+Conditional source selection and include expansion use the shared
+`pascal-core::compile_time` source-order session. Its `SizeOf` subset binds:
+
+- Intrinsic scalar, pointer, string and dynamic-array-reference storage;
+  ordinary/strong aliases, ordinal enums/subranges, bounded static arrays,
+  nested records, packing, padding and supported variant parts.
+- Source-declared global/local variables and parameters (including `const`,
+  `var` and `out`), statically proven record fields, array elements and pointer
+  dereferences. Selectors use declared types, never runtime memory or values.
+  Open-array parameters are not dynamic-array variables.
+- Current-unit and imported qualified names, namespaced units and project
+  aliases only with a uniquely selected, authorized source provider. Routine
+  scopes, lexical shadowing, declaration sequence and definition-site settings
+  remain authoritative; a familiar `System` suffix is not intrinsic proof.
+
+The ABI profiles are reference-derived, not measurements from a local Delphi
+compiler: Delphi 2007/18.5 Win32 and exact 20.0–37.0 Windows versions (Win64
+from XE2/23.0). See the [project layout context](../pascal-project/README.md#layout-context-data-only)
+and [ABI evidence registry](../pascal-core/tests/fixtures/compile_time/abi.toml).
+Pointers/reference variables are 4 bytes on Win32 and 8 on Win64, not their
+payload size; `Extended` is 10/8 bytes respectively, with inherent alignment 8.
+Win64 `Real48` alignment is unverified and remains unknown. Only Athens/36.0
+has referenced A8/H+ defaults; Florence/37.0 settings must be explicit when
+required. Missing settings block dependent layouts, not unrelated scalar facts.
+
+Active includes continue the parent's lexer, scope, declarations, scalar
+initializer and local layout-option state in source order. A supported
+initializer such as `N = SizeOf(T)` may cross physical include boundaries and
+control a later conditional or include without a second pass. Repeated include
+occurrences retain separate identities. Plain whitespace/comment trivia around
+`SizeOf` and its operand is supported; malformed trivia, compiler directives
+disguised as trivia, runtime calls and shadowed intrinsics are not repaired.
+Unknown alternatives retain correlated paths within the branch budget; a
+hypothetical active path does not authorize an otherwise unknown include read.
+Missing, ambiguous, denied, cyclic or exhausted required includes are not empty
+fragments or default initializer values.
+
+For a `uses` entry, navigation may return a **physical source-backed unit-header
+definition** when the body's analysis is incomplete. The shared bounded header
+path also runs before provider body/closure indexing when the body would refuse
+its finite work budget. Candidate selection and request-local prefix reproof use
+a header-purpose ceiling of 64 MiB byte-work and 256 reachable states; tighter
+caller limits and cancellation still apply. Whole-body sessions use the measured
+finite 2,000,000-operation / 64 MiB profile and retain their separate 64-state
+ceiling. Header selection and reproof inherit the same operation policy while
+keeping their 256-state purpose. Explicit smaller callers and shared remaining
+budgets are preserved. These are charged-work limits, not RSS or
+allocator measurements, and header availability does not certify body completion.
+The header
+proof still requires the selected source's declared name, active header,
+authorization and unambiguous identity. It returns the actual file/range,
+including include-owned header spans, not synthetic projected coordinates.
+It does not prove body symbols, import completeness, editable rename safety,
+or a compiled-only/DCU definition. Provider/include payloads, negative lookup
+observations, project and library layout contexts, overlays and file events
+remain part of freshness checks for cold and warm results.
+Selected-header reload repeats the actual authenticated import selection with
+its original importer, alias/namespace rules and ordered authority entries; it
+does not substitute a different equal-depth entry through filename-based reload.
+Full source/revision/policy/entry comparison and publication validation remain
+strict. Known headers never grant body or edit authority. The measured work
+headroom accommodates bounded outputs; remaining branch Limits and unsupported
+or unknown semantic facts are still reported, not reinterpreted as completeness.
+
+Unsupported generics in storage operands, functions/properties, class/interface
+instance layouts, sets, Variant, unverified legacy grouped-field layouts,
+ALIGN 16, unknown settings/targets/versions, ambiguous bindings and overflow
+remain unknown/fail-closed. Bounded expression typing is not a general Delphi
+constant evaluator (TASK-47). Existing generic/property *navigation* support
+above does not imply compile-time layout support. Tests cover the supported
+subset; release validation and the actual ChainDriveAPI 13-import probe are
+still pending, not a compiler-parity or 13/13 deployment guarantee.
 
 ### Supported project evaluation and `.delphilsp.json`
 
@@ -2127,8 +2201,8 @@ source-bearing includes may contribute physical edits in their `.inc` or Pascal
 sources; the planner maps virtual edits back to those files and rejects
 synthetic, cross-segment, external, stale, or incomplete edits. Known-inactive
 unresolved includes are skipped; active or unknown unresolved includes still
-block. Pascal-dependent conditional expressions and incomplete include audits
-remain unsupported; missing or unreadable includes cannot be treated as
+block. Expressions outside the supported source-order subset and incomplete
+include audits remain unsupported; missing or unreadable includes cannot be treated as
 evidence that no reference exists. Source conditional compilation is projected
 for analysis rather than textually expanded. Unit/module renames outside the
 negotiated, uniquely selected same-context provider subset (which requires
@@ -2225,7 +2299,23 @@ work. Exceeding a bound marks the source unknown rather than returning a
 partial proof. Includes used by rename are separately bounded by 4,096 files,
 256 MiB, 16,384 directives, and 256 nested include levels.
 
-Source-semantic diagnostics have additional per-request bounds:
+Compile-time work, byte-work, declaration/field/provider counts, pending text,
+scope/type depth and branch alternatives are also bounded and cancellable.
+Checked layout arithmetic never wraps into a known size. Core defaults include
+2,000,000 work units, 64 MiB byte-work, 1 MiB retained storage, depth 256 and
+64 branch states; other limits can refuse earlier. In particular, default
+include-depth 256 success has not been demonstrated: isolated depth probes
+refuse earlier at retention limits. The LSP preserves its existing **finite
+compatibility retention policy**, derived from clamped document, total-source,
+expanded-output and cache limits, rather than applying the standalone core
+1 MiB fuse to all LSP-owned data. It does not certify aggregate resolver/LSP
+heap allocation, native parser storage or process RSS. Two historical strict
+projection-retention assertions remain failing and deferred under `l4d-cnm`;
+they are not ignored or described as passing. See the
+[resource boundary](../../docs/shared-resolver-architecture.md#compile-time-resource-boundary)
+for exact defaults and regression references.
+
+Source-semantic diagnostic limits:
 
 | Semantic diagnostic limit | Value |
 | --- | ---: |

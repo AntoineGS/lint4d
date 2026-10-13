@@ -64,6 +64,7 @@ pub struct ResolverLimits {
 
 impl Default for ResolverLimits {
     fn default() -> Self {
+        let work = crate::compile_time::CompileTimeLimits::default();
         Self {
             max_dependency_units: 256,
             max_directory_entries: 1_048_576,
@@ -79,8 +80,8 @@ impl Default for ResolverLimits {
             max_package_catalogues: 64,
             max_resolution_warnings: 256,
             max_compile_time_retained_bytes: 1_048_576,
-            max_compile_time_work: 1_000_000,
-            max_compile_time_byte_work: 16_777_216,
+            max_compile_time_work: work.max_work,
+            max_compile_time_byte_work: work.max_byte_work,
         }
     }
 }
@@ -1468,6 +1469,10 @@ struct OwnedUnitNames {
     declared: AdmittedOwned<String>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Built moves the admitted report owners inline; boxing would add storage outside their existing receipts and change the owning handoff"
+)]
 enum CallbackReports {
     Requested,
     Built(AdmittedCapabilityReports),
@@ -1843,8 +1848,20 @@ impl StoreCache {
             let capacity = budget
                 .admit_owned(1, 0, bytes, || ())
                 .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+            // OwnedDirectoryKey hashes/compares only DirectoryCacheKey. ReadPolicy
+            // hashes/compares configured/mapped roots, authorized files,
+            // exclusions and exclusion bases, not compiled glob/regex caches;
+            // admission receipt state is not a key.
+            #[expect(
+                clippy::mutable_key_type,
+                reason = "Interior receipt/regex cache state is excluded from key Eq/Hash"
+            )]
             let mut receiving = HashMap::with_capacity(count);
             receiving.extend(self.directories.drain());
+            #[expect(
+                clippy::mutable_key_type,
+                reason = "Moving the same immutable directory keys preserves Eq/Hash and their receipts"
+            )]
             let old = std::mem::replace(&mut self.directories, receiving);
             drop(old);
             self.directory_capacity = Some(capacity);
@@ -2164,7 +2181,7 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<(), ResolverError> {
         self.check_cancel(cancel)?;
         let admit = |current: usize, amount: usize, maximum: usize, limit| {
-            let observed = current.checked_add(amount).unwrap_or(usize::MAX);
+            let observed = current.saturating_add(amount);
             if observed > maximum {
                 Err(ResolverError::LimitExceeded {
                     limit,
@@ -2287,8 +2304,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let route = self.effective_root_route(root);
         let root_path_bytes = root.path.as_os_str().len() + std::mem::size_of::<PathBuf>();
         self.charge_compile_time(1, root_path_bytes, root_path_bytes, cancel)?;
-        let previous_path =
-            std::mem::replace(&mut self.compile_time_root_path, Some(root.path.clone()));
+        let previous_path = self.compile_time_root_path.replace(root.path.clone());
         let previous = std::mem::replace(&mut self.compile_time_route, route);
         let defaults = crate::compile_time::CompileTimeLimits::default();
         let aggregate = self.compile_time_usage();
@@ -2303,11 +2319,12 @@ impl<S: SourceStore> UnitResolver<S> {
                     .max_compile_time_byte_work
                     .saturating_sub(aggregate.byte_work),
             ),
-            max_retained_bytes: defaults.max_retained_bytes.min(
-                self.limits
-                    .max_compile_time_retained_bytes
-                    .saturating_sub(aggregate.retained_bytes),
-            ),
+            // An explicit resolver retention selection must reach this session.
+            // Default resolver construction still selects the core 1 MiB cap.
+            max_retained_bytes: self
+                .limits
+                .max_compile_time_retained_bytes
+                .saturating_sub(aggregate.retained_bytes),
             ..defaults
         };
         let mut budget = crate::compile_time::CompileTimeBudget::new(limits, cancel);
@@ -2373,10 +2390,46 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<SourceOrderProjection, ResolverError> {
         let retained_before = self.compile_time_accounting.retained_bytes;
         let result = (|| {
-            self.charge_compile_time(text.len().saturating_mul(8), text.len(), 0, cancel)?;
-            let (has_includes, directives) =
-                crate::conditional::source_directive_shape(text, cancel);
-            if !has_includes {
+            let defaults = crate::compile_time::CompileTimeLimits::default();
+            let used = self.compile_time_usage();
+            let mut probe_budget = CompileTimeBudget::new(
+                crate::compile_time::CompileTimeLimits {
+                    max_work: defaults
+                        .max_work
+                        .min(self.limits.max_compile_time_work.saturating_sub(used.work)),
+                    max_byte_work: defaults.max_byte_work.min(
+                        self.limits
+                            .max_compile_time_byte_work
+                            .saturating_sub(used.byte_work),
+                    ),
+                    max_retained_bytes: self
+                        .limits
+                        .max_compile_time_retained_bytes
+                        .saturating_sub(used.retained_bytes),
+                    ..defaults
+                },
+                cancel,
+            );
+            let shape = crate::conditional::source_directive_shape_in_session(
+                text,
+                &source.id,
+                &mut probe_budget,
+                cancel,
+            );
+            let scanned = probe_budget.snapshot();
+            // Transfer monotonic probe work to the same resolver aggregate on
+            // success AND refusal. Only ephemeral scanner scratch has died.
+            self.charge_compile_time(scanned.work, scanned.byte_work, 0, cancel)?;
+            let (has_includes, has_layout_query, directives) =
+                shape.map_err(|r| crate::compile_time::resolver_error(r, &probe_budget))?;
+            // The lexical-only shortcut cannot evaluate source-backed layout
+            // queries (including qualified providers). These must use the same
+            // shared session even when the source contains no textual include.
+            if !has_includes && !has_layout_query {
+                // The legacy scalar analyzer still uses its conservative
+                // whole-source estimate; shared dispatch below charges actual
+                // scanner/evaluator steps and must not inherit that estimate.
+                self.charge_compile_time(text.len().saturating_mul(8), text.len(), 0, cancel)?;
                 let context = self.context.conditional_context_for(&source.path);
                 let mut context_bytes = 0usize;
                 context
@@ -2439,11 +2492,12 @@ impl<S: SourceStore> UnitResolver<S> {
             drop(root);
             self.release_compile_time(scratch);
             let mut analysis = result?;
-            let unsupported = analysis.occurrences.iter().any(|o| {
-                o.analysis.directives.iter().any(|d| {
-                    d.potentially_active() && d.kind == crate::conditional::DirectiveKind::Other
-                })
-            });
+            let unsupported = retain_includes
+                && analysis.occurrences.iter().any(|o| {
+                    o.analysis.directives.iter().any(|d| {
+                        d.potentially_active() && d.kind == crate::conditional::DirectiveKind::Other
+                    })
+                });
             if unsupported {
                 analysis.value_mut().root.complete = false;
                 self.mark_incomplete(format!(
@@ -2834,6 +2888,10 @@ impl<S: SourceStore> UnitResolver<S> {
             .map(|(resolved, _)| resolved)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Import handoff keeps physical coordinate policy, compiled-name authorization, include retention and cancellation explicit without changing source ownership"
+    )]
     fn resolve_imports_inner(
         &mut self,
         importer: &ResolvedUnit,
@@ -2863,6 +2921,10 @@ impl<S: SourceStore> UnitResolver<S> {
         result.map(|resolved| (resolved, projection.includes))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Admitted import pass borrows the original source, selected names and analysis under unchanged coordinate and cancellation policies"
+    )]
     fn resolve_imports_admitted(
         &mut self,
         importer: &ResolvedUnit,
@@ -2903,11 +2965,6 @@ impl<S: SourceStore> UnitResolver<S> {
         for site in sites {
             self.check_cancel(cancel)?;
             let importer_route = self.effective_root_route(&importer.source);
-            let key = UnitCacheKey::new(
-                &importer.source.path,
-                &site.requested_name,
-                importer_route.as_ref(),
-            );
             let inactive = analysis_contains_range(&analysis.inactive_spans, &site.byte_range);
             let unknown = (require_byte_preserving_coordinates
                 && text.len() != importer.source.bytes.len())
@@ -2923,8 +2980,6 @@ impl<S: SourceStore> UnitResolver<S> {
                         reason: "import conditional activity is unknown".to_string(),
                         candidates: Vec::new(),
                     }
-                } else if let Some(unit) = self.unit_cache.get(&key).cloned() {
-                    Resolution::Found(unit)
                 } else if self.project_unit_ids.as_ref().is_some_and(|ids| {
                     ids.len().saturating_sub(1) >= self.limits.max_dependency_units
                 }) {
@@ -3312,8 +3367,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
                 let text = source_text(&importer.source);
                 let (resolved, include_result) = self.resolve_imports_inner(
-                    &importer,
-                    &importer_sites,
+                    importer,
+                    importer_sites,
                     &text,
                     importer.source.decoded_text.is_none(),
                     None,
@@ -3527,9 +3582,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 &self.report.warnings[before_warnings..],
                 &mut budget,
             )
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 self.report.complete = false;
-                error
             })?;
             self.callback_reports = Some(CallbackReports::Built(reports));
             return Ok(ResolutionOutcome {
@@ -3569,12 +3623,8 @@ impl<S: SourceStore> UnitResolver<S> {
             request.requested_name,
             request.legacy_route,
         );
-        if self.compile_time_store.is_none()
-            && !skip_browsing
-            && let Some(unit) = self.unit_cache.get(&key).cloned()
-        {
-            return Ok(Resolution::Found(unit));
-        }
+        // A previous selected name is not a proof of the current prefix,
+        // include dependencies or source-local conditional context.
         let route = request.legacy_route.cloned();
         let result = self.resolve_unit_inner(request, skip_browsing, cancel)?;
         if matches!(&result, Resolution::Incomplete { .. }) {
@@ -3748,15 +3798,15 @@ impl<S: SourceStore> UnitResolver<S> {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
                 }
-                if issue.kind == pascal_project::ProjectPathIssueKind::MissingReference {
-                    if let Some(name) = &issue.unit_name {
-                        budget
-                            .charge(1, name.len().min(lookup.len()), 0)
-                            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-                        if name.eq_ignore_ascii_case(&lookup) {
-                            found = Some(issue);
-                            break;
-                        }
+                if issue.kind == pascal_project::ProjectPathIssueKind::MissingReference
+                    && let Some(name) = &issue.unit_name
+                {
+                    budget
+                        .charge(1, name.len().min(lookup.len()), 0)
+                        .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                    if name.eq_ignore_ascii_case(&lookup) {
+                        found = Some(issue);
+                        break;
                     }
                 }
             }
@@ -3984,7 +4034,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         let tiers = self.filename_tiers_scratch(unit_name, namespaces, cancel)?;
         for names in tiers.iter() {
-            let paths = self.paths_for_names(&directory, &entry, &names, &listing, cancel)?;
+            let paths = self.paths_for_names(&directory, &entry, names, &listing, cancel)?;
             let group = CandidateGroup {
                 paths,
                 legacy_route,
@@ -4106,7 +4156,7 @@ impl<S: SourceStore> UnitResolver<S> {
                             paths: self.paths_for_names(
                                 &nested,
                                 &nested_entry,
-                                &names,
+                                names,
                                 &nested_listing,
                                 cancel,
                             )?,
@@ -4238,12 +4288,11 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
         if let (LookupScratch::Admitted(paths), Some(budget)) =
             (&group.paths, self.store_budget(cancel))
+            && !paths.is_admitted_by(&budget)
         {
-            if !paths.is_admitted_by(&budget) {
-                return Err(ResolverError::InvalidRequest(
-                    "foreign-root candidate group".into(),
-                ));
-            }
+            return Err(ResolverError::InvalidRequest(
+                "foreign-root candidate group".into(),
+            ));
         }
         if self.owning_unit_candidates {
             return self.resolve_candidate_group_owned(group, requested, lookup, cancel);
@@ -4357,35 +4406,47 @@ impl<S: SourceStore> UnitResolver<S> {
         for index in order.iter() {
             let (path, entry) = &group.paths[*index];
             self.check_cancel(cancel)?;
-            match self.load_candidate(&path, &entry, group.legacy_route, SourceKind::Unit, cancel) {
+            match self.load_candidate(path, entry, group.legacy_route, SourceKind::Unit, cancel) {
                 Ok(source) => {
-                    let mut parsed_owner = if self.owning_unit_callback {
-                        let mut budget = self.store_budget(cancel).expect("owning unit root");
-                        owned_header_name(source.analysis_bytes().as_ref(), &mut budget, cancel)?
-                    } else {
-                        None
+                    let proof = self.prove_candidate_header(&source, cancel)?;
+                    let mut parsed_owner = match &*proof {
+                        crate::compile_time::Fact::Known(h) => {
+                            let mut budget = self.store_budget(cancel).unwrap_or_else(|| {
+                                CompileTimeBudget::new(
+                                    crate::compile_time::CompileTimeLimits::default(),
+                                    cancel,
+                                )
+                            });
+                            Some(
+                                budget
+                                    .admit_owned(1, h.name.len(), h.name.len(), || {
+                                        canonical_unit_name(&h.name)
+                                    })
+                                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+                            )
+                        }
+                        crate::compile_time::Fact::Unknown(
+                            crate::compile_time::UnknownReason::UnresolvedName,
+                        ) => None,
+                        crate::compile_time::Fact::Unknown(_)
+                        | crate::compile_time::Fact::Incomplete(_) => {
+                            return Ok(Some(Resolution::Incomplete {
+                                reason: self.unit_reason_build(
+                                    32,
+                                    cancel,
+                                    format_args!("unit header prefix is not proven"),
+                                )?,
+                                candidates,
+                            }));
+                        }
                     };
                     let declared_name = if self.owning_unit_callback {
                         None
-                    } else if self.compile_time_store.is_some() {
-                        let bytes = source.analysis_bytes();
-                        self.admit_lookup_storage(bytes.len(), bytes.len(), 0, cancel)?;
-                        if let Some(name) = admitted_header_name(&bytes) {
-                            self.admit_lookup_storage(
-                                1,
-                                name.len(),
-                                2 * name.len() + std::mem::size_of::<String>(),
-                                cancel,
-                            )?;
-                            Some(canonical_unit_name(name))
-                        } else {
-                            None
-                        }
+                    } else if let Some(name) = &parsed_owner {
+                        self.admit_lookup_storage(1, name.len(), name.len(), cancel)?;
+                        Some((**name).clone())
                     } else {
-                        match self.store.declared_unit_name(&source) {
-                            Some(declared_name) => declared_name,
-                            None => self.source_metadata(&source).declared_name.clone(),
-                        }
+                        None
                     };
                     let valid_name = declared_name_matches(
                         parsed_owner
@@ -4420,7 +4481,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     }
                 }
                 Err(SourceStoreError::NotFound { path: missing }) => {
-                    self.record_candidate(&missing, Some(&entry), false, cancel)?;
+                    self.record_candidate(&missing, Some(entry), false, cancel)?;
                 }
                 Err(SourceStoreError::Unauthorized { path, reason }) => {
                     self.warning_args(
@@ -4537,6 +4598,91 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
+    fn prove_candidate_header(
+        &mut self,
+        source: &LoadedSource,
+        cancel: &dyn CancellationToken,
+    ) -> Result<
+        AdmittedOwned<crate::compile_time::Fact<crate::compile_time::VerifiedUnitHeader>>,
+        ResolverError,
+    > {
+        let shared_root = self.compile_time_store.is_some();
+        let mut budget = if let Some(budget) = self.store_budget(cancel) {
+            budget
+        } else {
+            // Ordinary (non-admitted) lookup has no shared root budget. Its
+            // prefix proof must still obey the resolver's remaining limits,
+            // not silently replace a stricter caller cap by public defaults.
+            let used = self.compile_time_usage();
+            CompileTimeBudget::new(
+                crate::compile_time::CompileTimeLimits {
+                    max_branch_states: crate::compile_time::HEADER_MAX_BRANCH_STATES,
+                    max_work: self
+                        .limits
+                        .max_compile_time_work
+                        .saturating_sub(used.work)
+                        .min(crate::compile_time::CompileTimeLimits::default().max_work),
+                    max_byte_work: self
+                        .limits
+                        .max_compile_time_byte_work
+                        .saturating_sub(used.byte_work)
+                        .min(crate::compile_time::HEADER_MAX_BYTE_WORK),
+                    max_retained_bytes: self
+                        .limits
+                        .max_compile_time_retained_bytes
+                        .saturating_sub(used.retained_bytes),
+                    ..crate::compile_time::CompileTimeLimits::default()
+                },
+                cancel,
+            )
+        };
+        let result = (|| {
+            let coordinate = crate::compile_time::coordinate_text(source, &mut budget, cancel)?;
+            if let Some(header) = crate::compile_time::plain_header_in_session(
+                source,
+                &coordinate,
+                &mut budget,
+                cancel,
+            )? {
+                return Ok(header);
+            }
+            let reserve = conditional_context_reserve_polled(&self.context, cancel)?;
+            let context = budget
+                .admit_owned(1, reserve, reserve, || {
+                    self.context.conditional_context_for(&source.path)
+                })
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            crate::compile_time::header_with_coordinates_in_session(
+                source,
+                &coordinate,
+                &context,
+                self,
+                &mut budget,
+                cancel,
+            )
+        })();
+        if !shared_root {
+            // The private proof's CPU history is spent on every exit, including
+            // refusal/cancellation. Mirror analyze_source's work watermarks so
+            // an include/report observing this same ledger cannot bill it again.
+            // Temporary header/coordinate storage is never a permanent debit.
+            let usage = budget.snapshot();
+            self.report_owners.record_work(&budget);
+            self.compile_time_accounting.work += usage.work;
+            self.compile_time_accounting.byte_work += usage.byte_work;
+            if let Some(root) = self
+                .compile_time_caches
+                .iter()
+                .find(|r| r.view.is_admitted_by(&budget))
+            {
+                let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                cache.value_mut().recorded_work = usage.work;
+                cache.value_mut().recorded_byte_work = usage.byte_work;
+            }
+        }
+        result
+    }
+
     fn candidate_result(
         &mut self,
         candidates: AdmittedOwned<Vec<ResolutionCandidate>>,
@@ -4649,8 +4795,28 @@ impl<S: SourceStore> UnitResolver<S> {
             self.check_cancel(cancel)?;
             match self.load_candidate(path, entry, group.legacy_route, SourceKind::Unit, cancel) {
                 Ok(source) => {
-                    let name =
-                        owned_header_name(source.analysis_bytes().as_ref(), &mut budget, cancel)?;
+                    let proof = self.prove_candidate_header(&source, cancel)?;
+                    let name = match &*proof {
+                        crate::compile_time::Fact::Known(h) => Some(
+                            budget
+                                .admit_owned(1, h.name.len(), h.name.len(), || {
+                                    canonical_unit_name(&h.name)
+                                })
+                                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+                        ),
+                        crate::compile_time::Fact::Unknown(
+                            crate::compile_time::UnknownReason::UnresolvedName,
+                        ) => None,
+                        crate::compile_time::Fact::Unknown(_)
+                        | crate::compile_time::Fact::Incomplete(_) => {
+                            let reason = self.unit_reason_build(
+                                32,
+                                cancel,
+                                format_args!("unit header prefix is not proven"),
+                            )?;
+                            return self.candidate_result(rejected, Some(reason));
+                        }
+                    };
                     if declared_name_matches_owned(
                         name.as_ref().map(|n| n.as_str()),
                         requested,
@@ -5453,7 +5619,7 @@ impl<S: SourceStore> UnitResolver<S> {
                         // Each visit reads only O(1) lengths. Poll at bounded
                         // eight-visit intervals, in addition to every admitted
                         // group preflight, rather than one poll per scalar size.
-                        if sizing_visits % 8 == 0 && cancel.is_cancelled() {
+                        if sizing_visits.is_multiple_of(8) && cancel.is_cancelled() {
                             failure = Some(SourceStoreError::Cancelled);
                             return Err("revision sizing cancelled".into());
                         }
@@ -5461,11 +5627,11 @@ impl<S: SourceStore> UnitResolver<S> {
                         observation_bytes = observation_bytes
                             .checked_add(bytes)
                             .ok_or_else(|| "revision sizing overflow".to_string())?;
-                    } else if let Some(budget) = sizing_budget.as_mut() {
-                        if let Err(reason) = budget.charge(work, 0, 0) {
-                            failure = Some(store_admission_error(reason, budget));
-                            return Err("revision sizing refused".into());
-                        }
+                    } else if let Some(budget) = sizing_budget.as_mut()
+                        && let Err(reason) = budget.charge(work, 0, 0)
+                    {
+                        failure = Some(store_admission_error(reason, budget));
+                        return Err("revision sizing refused".into());
                     }
                     Ok(())
                 })
@@ -5764,6 +5930,7 @@ impl<S: SourceStore> UnitResolver<S> {
             entries.insert(0, owner_entry);
         }
         let mut saw_incomplete = false;
+        let mut saw_unauthorized = false;
         for entry in entries {
             self.check_cancel(cancel)?;
             self.record_include_search_directory(&entry, cancel)?;
@@ -5843,6 +6010,10 @@ impl<S: SourceStore> UnitResolver<S> {
                                 }
                                 Err(error) => {
                                     saw_incomplete = true;
+                                    saw_unauthorized |= matches!(
+                                        error.error_ref(),
+                                        SourceStoreError::Unauthorized { .. }
+                                    );
                                     self.include_error_warning(error, cancel)?;
                                     break;
                                 }
@@ -5905,12 +6076,25 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
                 Err(error) => {
                     saw_incomplete = true;
+                    saw_unauthorized |=
+                        matches!(error.error_ref(), SourceStoreError::Unauthorized { .. });
                     self.include_error_warning(error, cancel)?;
                     break;
                 }
             }
         }
         if saw_incomplete {
+            if saw_unauthorized {
+                const REASON: &str = "is outside the owning project's readable roots";
+                return Ok(Resolution::Incomplete {
+                    reason: self.include_reason_build(
+                        REASON.len() + request.requested_name.len() + "include  ".len(),
+                        cancel,
+                        format_args!("include {} {REASON}", request.requested_name),
+                    )?,
+                    candidates: Vec::new(),
+                });
+            }
             self.diagnostic_args(
                 cancel,
                 request
@@ -6588,6 +6772,26 @@ impl<S: SourceStore> UnitResolver<S> {
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
             let listing =
                 self.list_directory(&current, &current_entry, legacy_route, cancel, false)?;
+            // No candidate from a partial listing can be selected. Preserve
+            // that refusal before admitting sorting/dedup scratch for entries
+            // that cannot contribute a result.
+            if !listing.complete {
+                let bound = current
+                    .as_os_str()
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(64))
+                    .ok_or_else(overflow)?;
+                self.diagnostic_args(
+                    cancel,
+                    bound,
+                    format_args!(
+                        "case-insensitive lookup under {} was incomplete",
+                        current.display()
+                    ),
+                )?;
+                return Ok(CaseInsensitiveLookup::Incomplete);
+            }
             let count = listing
                 .files
                 .len()
@@ -6651,23 +6855,6 @@ impl<S: SourceStore> UnitResolver<S> {
                     Ok(matches)
                 },
             )?;
-            if !listing.complete {
-                let bound = current
-                    .as_os_str()
-                    .len()
-                    .checked_mul(4)
-                    .and_then(|n| n.checked_add(64))
-                    .ok_or_else(overflow)?;
-                self.diagnostic_args(
-                    cancel,
-                    bound,
-                    format_args!(
-                        "case-insensitive lookup under {} was incomplete",
-                        current.display()
-                    ),
-                )?;
-                return Ok(CaseInsensitiveLookup::Incomplete);
-            }
             let exact = matches.iter().find(|index| {
                 candidate_at(**index)
                     .file_name()
@@ -7476,26 +7663,25 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         }
         let outcome =
             crate::compile_time::CompileTimeResolver::unit(self, request, budget, cancel)?;
-        if self.owning_unit_callback {
-            if let Some(provider) = self.callback_provider.take() {
-                if !matches!(&outcome.result,Resolution::Unavailable {reason} if reason.is_empty())
-                {
-                    return Err(ResolverError::InvalidRequest(
-                        "owned provider handoff mismatch".into(),
-                    ));
-                }
-                let backing = crate::compile_time::ProviderSource::admit_cached_backing(
-                    &provider.unit.source,
-                    budget,
-                )?;
-                let provider =
-                    crate::compile_time::ProviderSource::promote_owned(provider, backing, budget)?;
-                return Ok(ResolutionOutcome {
-                    result: Resolution::Found(provider),
-                    observations: outcome.observations,
-                    warnings: outcome.warnings,
-                });
+        if self.owning_unit_callback
+            && let Some(provider) = self.callback_provider.take()
+        {
+            if !matches!(&outcome.result,Resolution::Unavailable {reason} if reason.is_empty()) {
+                return Err(ResolverError::InvalidRequest(
+                    "owned provider handoff mismatch".into(),
+                ));
             }
+            let backing = crate::compile_time::ProviderSource::admit_cached_backing(
+                &provider.unit.source,
+                budget,
+            )?;
+            let provider =
+                crate::compile_time::ProviderSource::promote_owned(provider, backing, budget)?;
+            return Ok(ResolutionOutcome {
+                result: Resolution::Found(provider),
+                observations: outcome.observations,
+                warnings: outcome.warnings,
+            });
         }
         let result = match outcome.result {
             Resolution::Found(_) => {
@@ -7567,6 +7753,24 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
                     .filter(|r| path_equivalent(&r.source_path, request.including_path))
                     .cloned()
             });
+        // Typed include payloads live in the admitted cache, not `loaded`.
+        // Routes are minted only from a successfully loaded source's exact
+        // provenance; consult that registry without borrowing cache payloads.
+        let route = route.or_else(|| {
+            // Absence at the current physical root is an explicit revocation,
+            // not permission to resurrect a prior request's registry authority.
+            if self
+                .compile_time_root_path
+                .as_ref()
+                .is_some_and(|path| path_equivalent(path, request.including_path))
+            {
+                return None;
+            }
+            self.legacy_routes
+                .values()
+                .find(|route| path_equivalent(&route.source_path, request.including_path))
+                .cloned()
+        });
         // The store's bounded payload read supplements the shared typed budget.
         // Do not reset any resolver counters or construct a child resolver.
         let outcome = self.store_call(budget)?.try_resolve_include(
@@ -7609,7 +7813,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
                     }
                 }
             }
-            if let Some(route) = route {
+            if let Some(route) = self.legacy_route_for_source(source, route.as_ref()) {
                 self.legacy_routes.insert(source.id.clone(), route);
             }
         }
@@ -8370,6 +8574,7 @@ fn canonical_unit_name(name: &str) -> String {
 /// Borrow-only unit-header metadata for the admitted lookup. In particular it
 /// does not invoke the legacy whole-file tree-sitter parser before root admission.
 /// Directives before the header cannot prove an unconditional unit identity.
+#[cfg(test)]
 fn admitted_header_name(bytes: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(bytes)
         .ok()?
@@ -8511,6 +8716,7 @@ fn build_unit_reason(
     })
 }
 
+#[cfg(test)]
 fn owned_header_name(
     bytes: &[u8],
     budget: &mut CompileTimeBudget<'_>,
@@ -8556,6 +8762,7 @@ fn owned_header_name(
     Ok(Some(name))
 }
 
+#[cfg(test)]
 fn header_name_polled<'a>(
     bytes: &'a [u8],
     cancel: &dyn CancellationToken,
@@ -8975,12 +9182,12 @@ fn legacy_route_authorizes_directory(directory: &Path, route: &LegacyRoute) -> b
 }
 
 fn copy_case_path(
-    path: &PathBuf,
+    path: &Path,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<AdmittedOwned<PathBuf>, ResolverError> {
     let bytes = path.as_os_str().len();
     budget
-        .admit_owned(1, bytes, bytes, || path.clone())
+        .admit_owned(1, bytes, bytes, || path.to_path_buf())
         .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
@@ -9757,6 +9964,64 @@ mod tests {
             owned.report().observations,
             partial.report().observations,
             "failure cleanup preserves lookup evidence"
+        );
+    }
+
+    #[test]
+    fn fixround1_shared_candidate_proof_never_records_private_work_again() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let outcome = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    requested_name: "Other",
+                    importer_path: &root,
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(matches!(outcome.result(), Resolution::Found(_)));
+        assert!(budget.snapshot().work > 0 && budget.snapshot().byte_work > 0);
+        assert_eq!(
+            resolver.compile_time_accounting.work, 0,
+            "shared-root work is already in the owning ledger"
+        );
+        assert_eq!(resolver.compile_time_accounting.byte_work, 0);
+        assert_eq!(resolver.compile_time_usage().work, budget.snapshot().work);
+        assert_eq!(
+            resolver.compile_time_usage().byte_work,
+            budget.snapshot().byte_work
+        );
+
+        let (dir, root, mut ordinary) = physical_report_resolver();
+        fs::write(dir.path().join("Other.pas"), "{$I header.inc}").unwrap();
+        fs::write(dir.path().join("header.inc"), "unit Other;").unwrap();
+        let outcome = ordinary.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Other",
+                importer_path: &root,
+                legacy_route: None,
+            },
+            &NoCancellation,
+        );
+        assert!(matches!(outcome.result, Resolution::Found(_)));
+        assert!(ordinary.compile_time_accounting.work > 0);
+        assert_eq!(
+            ordinary.compile_time_usage().work,
+            ordinary.compile_time_accounting.work,
+            "private work is recorded once, not again through the include cache/report ledger"
+        );
+        assert_eq!(
+            ordinary.compile_time_usage().byte_work,
+            ordinary.compile_time_accounting.byte_work
+        );
+        assert_eq!(
+            ordinary.compile_time_accounting.retained_bytes,
+            ordinary.compile_time_caches.capacity() * std::mem::size_of::<StoreRoot>(),
+            "only the existing persistent cache-vector backing is posted, not temporary proof storage"
         );
     }
 
@@ -15897,8 +16162,10 @@ mod tests {
             Err(ResolverError::LimitExceeded { .. })
         ));
         assert_eq!(budget.snapshot(), before);
-        let mut limits = CompileTimeLimits::default();
-        limits.max_work = 0;
+        let limits = CompileTimeLimits {
+            max_work: 0,
+            ..CompileTimeLimits::default()
+        };
         let mut exhausted = CompileTimeBudget::new(limits, &NoCancellation);
         assert!(matches!(
             owned_header_name(b"unit Other;", &mut exhausted, &NoCancellation),
@@ -16235,8 +16502,10 @@ mod tests {
             .list_directory(dir.path(), &entry, None, &NoCancellation, false)
             .unwrap();
         let pointer = listing.files.as_ptr();
-        let mut limits = CompileTimeLimits::default();
-        limits.max_work = 0;
+        let limits = CompileTimeLimits {
+            max_work: 0,
+            ..CompileTimeLimits::default()
+        };
         let mut budget = CompileTimeBudget::new(limits, &NoCancellation);
         let probe = Probe(0.into());
         assert!(matches!(
@@ -16987,11 +17256,10 @@ mod tests {
         );
     }
 
-    fn physical_directory_backing_invoice(listing: &DirectoryListing, directory: &Path) -> usize {
-        let count = listing.files.len() + listing.directories.len();
+    fn physical_directory_backing_invoice(listing: &DirectoryListing, _directory: &Path) -> usize {
         std::mem::size_of::<AdmittedOwned<DirectoryListing>>()
             + 2 * std::mem::size_of::<usize>() // Arc's actual counters; this backing is usize-aligned
-            + count * (directory.as_os_str().len() + 1 + if cfg!(windows) { 1024 } else { 255 })
+            + listing.files.iter().chain(&listing.directories).map(|path| path.capacity()).sum::<usize>()
             + (listing.files.capacity() + listing.directories.capacity()) * std::mem::size_of::<PathBuf>()
     }
 
@@ -17508,6 +17776,10 @@ mod tests {
         assert_eq!(before.byte_work, budget.snapshot().byte_work);
         let mut cache = root_cache.view.lock().unwrap();
         let before = budget.snapshot();
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Test retires map backing with unchanged DirectoryCacheKey Eq/Hash; receipt and compiled regex caches are not key identity"
+        )]
         let backing = std::mem::take(&mut cache.value_mut().directories);
         let capacity_owner = cache.value_mut().directory_capacity.take().unwrap();
         drop(backing);
@@ -17722,6 +17994,10 @@ mod tests {
                     drop(pairs);
                     assert_eq!(cache.directories.capacity(), 7);
                     let before = budget.snapshot();
+                    #[expect(
+                        clippy::mutable_key_type,
+                        reason = "Test retires map backing with unchanged DirectoryCacheKey Eq/Hash; receipt and compiled regex caches are not key identity"
+                    )]
                     let map = std::mem::take(&mut cache.value_mut().directories);
                     let capacity = cache.value_mut().directory_capacity.take().unwrap();
                     drop(map);
@@ -17829,6 +18105,10 @@ mod tests {
         assert!(receiving.directory_capacity.is_some());
         assert_eq!(after_entries.work, before.work);
         assert_eq!(after_entries.byte_work, before.byte_work);
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Test retires map backing with unchanged DirectoryCacheKey Eq/Hash; receipt and compiled regex caches are not key identity"
+        )]
         let map = std::mem::take(&mut receiving.value_mut().directories);
         let owner = receiving.value_mut().directory_capacity.take().unwrap();
         drop(map);

@@ -1752,11 +1752,39 @@ pub(crate) fn document_links_from_input(
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    let conditionals = pascal_core::conditional::analyze_with_context_and_cancel(
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let context_key = match workspace.context_for_uri_with_cancel(&uri, Some(cancel)) {
+        Ok(key) => key,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let expansion = match super::compile_time::expand_with_limits(
+        &workspace,
+        &uri,
         &source,
-        &conditional_context_for_uri(&context, &uri),
+        &context_key,
+        super::compile_time::SessionLimits {
+            expansion: workspace.include_expansion_limits(),
+            directory_entries: MAX_DOCUMENT_LINK_FRESHNESS_RECORDS,
+        },
         cancel,
-    );
+        None,
+    ) {
+        Ok(expansion) => expansion,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let Some(session) = expansion.expanded.session.as_ref() else {
+        // Directive-free sources use the physical passthrough and have no
+        // link-bearing directives or compile-time child decisions to expose.
+        let mut records = vec![source_record];
+        records.extend(metadata_records);
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Ok(Vec::new()),
+            records,
+        );
+    };
+    let conditionals = &session.root;
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1770,14 +1798,16 @@ pub(crate) fn document_links_from_input(
             records,
         );
     }
-    let mut workspace = super::Workspace::from_analysis_input(&input);
-    let context_key = match workspace.context_for_uri_with_cancel(&uri, Some(cancel)) {
-        Ok(key) => key,
-        Err(error) => return failed(source_generation, configuration_generation, error),
-    };
     let mut links = Vec::new();
-    let mut freshness_records = 0usize;
-    let mut freshness_bytes = 0usize;
+    if let Err(error) = workspace.record_document_link_expansion_sources(
+        &expansion,
+        &context,
+        cancel,
+        MAX_DOCUMENT_LINK_FRESHNESS_RECORDS,
+        MAX_DOCUMENT_LINK_FRESHNESS_BYTES,
+    ) {
+        return failed(source_generation, configuration_generation, error);
+    }
     let mut resource_bytes = 0usize;
     let mut resource_records = Vec::new();
     for directive in conditionals.directives.iter().filter(|directive| {
@@ -1914,41 +1944,19 @@ pub(crate) fn document_links_from_input(
             }
             target
         } else {
-            let target_source = format!("{{${}}}", directive.body);
-            let expansion = match workspace.expand_source_with_cancel(
-                &uri,
-                &target_source,
-                &context_key,
-                Some(cancel),
-            ) {
-                Ok(expansion) => expansion,
-                Err(_) => continue,
-            };
-            if !expansion.complete {
-                continue;
-            }
-            let (record_count, observation_bytes) = match workspace
-                .record_document_link_expansion_sources(
-                    &expansion,
-                    &context,
-                    cancel,
-                    MAX_DOCUMENT_LINK_FRESHNESS_RECORDS.saturating_sub(freshness_records),
-                    MAX_DOCUMENT_LINK_FRESHNESS_BYTES.saturating_sub(freshness_bytes),
-                ) {
-                Ok(counts) => counts,
-                Err(error) if error == CANCELLATION_MESSAGE => {
-                    return cancelled(source_generation, configuration_generation);
-                }
-                Err(error) => {
-                    return failed(source_generation, configuration_generation, error);
-                }
-            };
-            freshness_records = freshness_records.saturating_add(record_count);
-            freshness_bytes = freshness_bytes.saturating_add(observation_bytes);
-            let Some(target) = expansion
-                .dependencies
-                .first()
-                .map(|dependency| dependency.uri.clone())
+            let Some(target) = session
+                .includes
+                .iter()
+                .find(|include| {
+                    include.owner == session.occurrences[0].id
+                        && include.directive.range == (directive.start..directive.end)
+                })
+                .and_then(|include| match &include.target {
+                    pascal_core::resolver::Resolution::Found(source) => {
+                        Url::from_file_path(&source.path).ok()
+                    }
+                    _ => None,
+                })
             else {
                 continue;
             };

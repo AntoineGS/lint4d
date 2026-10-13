@@ -74,6 +74,7 @@ pub struct CompileTimeState {
     pending_backing: usize,
     word_backing: usize,
     lex: Lex,
+    discarding_trivia_comment: bool,
     section: Section,
     composite_depth: usize,
     rhs: bool,
@@ -212,6 +213,7 @@ impl CompileTimeState {
             pending_backing: 0,
             word_backing: 0,
             lex: Lex::Normal,
+            discarding_trivia_comment: false,
             section: Section::None,
             composite_depth: 0,
             rhs: false,
@@ -284,10 +286,47 @@ impl CompileTimeState {
             .physical_start
             .checked_add(fragment.text.len())
             .ok_or(IncompleteReason::MalformedSource)?;
-        for (i, ch) in fragment.text.char_indices() {
+        let mut i = 0;
+        while i < fragment.text.len() {
             if self.interface_complete {
                 break;
             }
+            if self.discarding_trivia_comment {
+                let delimiter = match self.lex {
+                    Lex::Brace => Some('}'),
+                    Lex::Line => Some('\n'),
+                    Lex::StarComment => Some('*'),
+                    _ => None,
+                };
+                if let Some(delimiter) = delimiter {
+                    let skip = crate::conditional::bounded_trivia_run(
+                        fragment.text,
+                        i,
+                        delimiter,
+                        budget,
+                    )?;
+                    if skip > 0 {
+                        self.map_char(
+                            fragment.source,
+                            fragment.occurrence,
+                            fragment.physical_start + i,
+                            skip,
+                            budget,
+                        )?;
+                        self.logical = self
+                            .logical
+                            .checked_add(skip)
+                            .ok_or(IncompleteReason::MalformedSource)?;
+                        i += skip;
+                        self.clear_pending(budget);
+                        continue;
+                    }
+                }
+            }
+            let ch = fragment.text[i..]
+                .chars()
+                .next()
+                .expect("UTF-8 feed boundary");
             budget.charge(1, ch.len_utf8(), 0)?;
             let offset = fragment.physical_start + i;
             self.map_char(
@@ -297,17 +336,41 @@ impl CompileTimeState {
                 ch.len_utf8(),
                 budget,
             )?;
-            limit(
-                self.pending.len().saturating_add(ch.len_utf8()),
-                budget.limits().max_pending_bytes,
-                "max_pending_bytes",
-            )?;
-            push_continuation_char(&mut self.pending, &mut self.pending_backing, ch, budget)?;
+            if !self.discarding_trivia_comment {
+                limit(
+                    self.pending.len().saturating_add(ch.len_utf8()),
+                    budget.limits().max_pending_bytes,
+                    "max_pending_bytes",
+                )?;
+                push_continuation_char(&mut self.pending, &mut self.pending_backing, ch, budget)?;
+            }
             self.logical = self
                 .logical
                 .checked_add(ch.len_utf8())
                 .ok_or(IncompleteReason::MalformedSource)?;
             self.lex_char(ch, budget)?;
+            if self.discarding_trivia_comment {
+                self.clear_pending(budget);
+                if matches!(self.lex, Lex::Normal) {
+                    self.discarding_trivia_comment = false;
+                }
+            } else {
+                let opener = match self.lex {
+                    Lex::Brace if ch == '{' => Some("{"),
+                    Lex::Line if ch == '/' => Some("//"),
+                    Lex::StarComment if ch == '*' => Some("(*"),
+                    _ => None,
+                };
+                if opener.is_some_and(|opener| {
+                    self.pending
+                        .strip_suffix(opener)
+                        .is_some_and(|prefix| prefix.trim().is_empty())
+                }) {
+                    self.discarding_trivia_comment = true;
+                    self.clear_pending(budget);
+                }
+            }
+            i += ch.len_utf8();
         }
         // Endpoint snapshots are needed even for an empty fragment and for a
         // query immediately after a just-completed declaration.
@@ -323,16 +386,15 @@ impl CompileTimeState {
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
         let site = self.site();
-        if let Some(last) = self.spans.last_mut() {
-            if last.anchor.source == *source
-                && last.anchor.occurrence == occurrence
-                && last.anchor.range.end == offset
-                && last.site == site
-                && last.logical_start + last.anchor.range.len() == self.logical
-            {
-                last.anchor.range.end += len;
-                return Ok(());
-            }
+        if let Some(last) = self.spans.last_mut()
+            && last.anchor.source == *source
+            && last.anchor.occurrence == occurrence
+            && last.anchor.range.end == offset
+            && last.site == site
+            && last.logical_start + last.anchor.range.len() == self.logical
+        {
+            last.anchor.range.end += len;
+            return Ok(());
         }
         budget.charge(
             1,
@@ -654,17 +716,17 @@ impl CompileTimeState {
                 if tree.root_node().has_error() {
                     return Ok(());
                 }
-                if let Some(unit) = find_node(tree.root_node(), "unit", budget)? {
-                    if let Some(name) = find_node(unit, "moduleName", budget)? {
-                        let text = name
-                            .utf8_text(source.as_bytes())
-                            .map_err(|_| IncompleteReason::MalformedSource)?;
-                        budget.charge(1, text.len(), text.len())?;
-                        let mut name: String =
-                            text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                        name.make_ascii_lowercase();
-                        self.unit_name = Some(name);
-                    }
+                if let Some(unit) = find_node(tree.root_node(), "unit", budget)?
+                    && let Some(name) = find_node(unit, "moduleName", budget)?
+                {
+                    let text = name
+                        .utf8_text(source.as_bytes())
+                        .map_err(|_| IncompleteReason::MalformedSource)?;
+                    budget.charge(1, text.len(), text.len())?;
+                    let mut name: String =
+                        text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                    name.make_ascii_lowercase();
+                    self.unit_name = Some(name);
                 }
                 Ok(())
             });
@@ -911,10 +973,8 @@ impl CompileTimeState {
                 budget.charge(1, ty_text.len(), ty_text.len())?;
                 TypeExpr::Unsupported(ty_text.into())
             };
-            if strong {
-                if let TypeExpr::Named(name) = ty {
-                    ty = TypeExpr::StrongAlias(name);
-                }
+            if strong && let TypeExpr::Named(name) = ty {
+                ty = TypeExpr::StrongAlias(name);
             }
             self.sequence.0 = self
                 .sequence
@@ -967,22 +1027,21 @@ impl CompileTimeState {
         len: usize,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<SourceAnchor, IncompleteReason> {
-        if let Some(span) = self.spans.get(self.span_index(logical, budget)?) {
-            if logical >= span.logical_start
-                && logical < span.logical_start + span.anchor.range.len()
-            {
-                budget.charge(
-                    1,
-                    span.anchor.source.as_str().len(),
-                    size_of::<SourceAnchor>() + span.anchor.source.as_str().len(),
-                )?;
-                let start = span.anchor.range.start + logical - span.logical_start;
-                return Ok(SourceAnchor {
-                    source: span.anchor.source.clone(),
-                    occurrence: span.anchor.occurrence,
-                    range: start..(start + len).min(span.anchor.range.end),
-                });
-            }
+        if let Some(span) = self.spans.get(self.span_index(logical, budget)?)
+            && logical >= span.logical_start
+            && logical < span.logical_start + span.anchor.range.len()
+        {
+            budget.charge(
+                1,
+                span.anchor.source.as_str().len(),
+                size_of::<SourceAnchor>() + span.anchor.source.as_str().len(),
+            )?;
+            let start = span.anchor.range.start + logical - span.logical_start;
+            return Ok(SourceAnchor {
+                source: span.anchor.source.clone(),
+                occurrence: span.anchor.occurrence,
+                range: start..(start + len).min(span.anchor.range.end),
+            });
         }
         Err(IncompleteReason::MalformedSource)
     }
@@ -1075,23 +1134,23 @@ impl CompileTimeState {
         }
         self.clear_pending(budget);
         let site = self.site();
-        if let Some(last) = self.spans.last() {
-            if last.site != site {
-                budget.charge(
-                    1,
-                    last.anchor.source.as_str().len(),
-                    size_of::<Span>() + last.anchor.source.as_str().len(),
-                )?;
-                self.spans.push(Span {
-                    anchor: SourceAnchor {
-                        source: last.anchor.source.clone(),
-                        occurrence: last.anchor.occurrence,
-                        range: last.anchor.range.end..last.anchor.range.end,
-                    },
-                    logical_start: self.logical,
-                    site,
-                });
-            }
+        if let Some(last) = self.spans.last()
+            && last.site != site
+        {
+            budget.charge(
+                1,
+                last.anchor.source.as_str().len(),
+                size_of::<Span>() + last.anchor.source.as_str().len(),
+            )?;
+            self.spans.push(Span {
+                anchor: SourceAnchor {
+                    source: last.anchor.source.clone(),
+                    occurrence: last.anchor.occurrence,
+                    range: last.anchor.range.end..last.anchor.range.end,
+                },
+                logical_start: self.logical,
+                site,
+            });
         }
         self.finished = true;
         Ok(())
@@ -1170,12 +1229,16 @@ impl CompileTimeState {
             budget.release(budget.manual_retained().saturating_sub(before));
             return Fact::Incomplete(reason);
         }
-        let anchor = self
-            .spans
-            .iter()
-            .rev()
-            .find(|span| span.site == site)
-            .map(|span| &span.anchor);
+        let mut anchor = None;
+        for span in self.spans.iter().rev().filter(|span| span.site == site) {
+            // A branch-entry endpoint may exist only on the taken path. Prefer
+            // actual source at this binding site when mapping other paths.
+            if !span.anchor.range.is_empty() {
+                anchor = Some(&span.anchor);
+                break;
+            }
+            anchor = anchor.or(Some(&span.anchor));
+        }
         for alternative in &self.alternatives {
             let scratch = budget.manual_retained();
             if let Err(reason) = budget.charge(alternative.spans.len() + 1, 0, 0) {
@@ -1183,7 +1246,9 @@ impl CompileTimeState {
                 break;
             }
             let alternative_site = anchor.and_then(|anchor| {
-                alternative.site_at(&anchor.source, anchor.occurrence, anchor.range.end)
+                // The start belongs to this physical span; its inclusive end
+                // can instead select a subsequent branch-only endpoint.
+                alternative.site_at(&anchor.source, anchor.occurrence, anchor.range.start)
             });
             let candidate = match alternative_site {
                 Some(site) => query(alternative, site, budget),

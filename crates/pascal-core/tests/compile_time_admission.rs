@@ -395,7 +395,8 @@ fn fix2_i3b_cached_parsed_root_sites_refuse_before_vector_copy() {
             ..Default::default()
         },
     );
-    // Warm real parsed metadata without walking any provider/import.
+    // Unit selection now proves only its prefix; it intentionally does not
+    // parse the body to warm import metadata as a side effect.
     assert!(matches!(
         resolver
             .resolve_unit(
@@ -408,6 +409,14 @@ fn fix2_i3b_cached_parsed_root_sites_refuse_before_vector_copy() {
             )
             .result,
         Resolution::Found(_)
+    ));
+    // Warm real body metadata through its actual consumer. This same bounded
+    // root attempt fails before walking any provider/import. The second call
+    // below still tests cached-vector admission with the original limit and
+    // allocation assertions, not full-parser accounting.
+    assert!(matches!(
+        resolver.resolve_project_from_source(&path, "T", &[], None, &NoCancellation),
+        Err(ResolverError::LimitExceeded { .. })
     ));
     let before = resolver.report().observations.len();
     let (result, allocations) =

@@ -100,6 +100,7 @@ pub(crate) fn test_take_freshness_observation_visits() -> usize {
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
+pub(crate) mod compile_time;
 pub(crate) mod extract;
 pub mod project_catalogue;
 pub mod projects;
@@ -3684,7 +3685,8 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Location>, String> {
         check_workspace_cancel(Some(cancel))?;
-        let context_key = self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), budget)?;
+        let mut context_key =
+            self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), budget)?;
         if self.context_has_invalid_project_selection(&context_key) {
             return Err(format!(
                 "project selection is invalid; navigation is unavailable for {uri}"
@@ -3731,14 +3733,35 @@ impl Workspace {
             check_workspace_cancel(Some(cancel))?;
             let mut pinned = HashSet::new();
             pinned.insert(uri.clone());
-            let locations = self.resolve_navigation_once_with_cancel(
+            let locations = match self.resolve_navigation_once_with_cancel(
                 uri,
                 position,
                 target,
                 &context_key,
                 &mut pinned,
                 Some(cancel),
-            )?;
+            ) {
+                Ok(locations) => locations,
+                Err(error) if error == compile_time::HEADER_CHANGED => {
+                    context_key =
+                        self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), budget)?;
+                    if self.context_has_invalid_project_selection(&context_key)
+                        || self.context_has_override_error(&context_key)
+                    {
+                        return Err("header retry context is invalid".into());
+                    }
+                    if !self.load_source_with_cancel(
+                        uri,
+                        &context_key,
+                        &HashSet::new(),
+                        Some(cancel),
+                    )? {
+                        return Ok(Vec::new());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let changed =
                 self.revalidate_pinned_with_cancel(&pinned, &context_key, Some(cancel))?;
             if !changed {
@@ -6761,6 +6784,41 @@ impl Workspace {
         if !self.navigation_query_is_answerable(uri, position, cancel)? {
             return Ok(Vec::new());
         }
+        if target == NavigationTarget::Definition {
+            let no_cancel = AtomicBool::new(false);
+            let mut mapping = crate::include_expansion::MappingBudget::new(
+                cancel.unwrap_or(&no_cancel),
+                self.include_expansion_limits().max_work,
+            );
+            let sites = self
+                .virtual_query_positions_with_budget(uri, position, &mut mapping)?
+                .into_iter()
+                .filter_map(|(owner, position)| {
+                    self.index
+                        .import_site_at(&owner, position)
+                        .map(|site| (owner, site))
+                })
+                .collect::<Vec<_>>();
+            if !sites.is_empty() {
+                if sites.len() != 1 {
+                    return Ok(Vec::new());
+                }
+                let (owner, site) = &sites[0];
+                let mut location = None;
+                let mut compiled = false;
+                self.load_imports_with_session_cache_for_header(
+                    owner,
+                    context_key,
+                    pinned,
+                    cancel,
+                    &ResolverSessionCache::default(),
+                    Some((site, &mut location, &mut compiled)),
+                )?;
+                if !compiled {
+                    return Ok(location.into_iter().collect());
+                }
+            }
+        }
         let mut frontier = vec![uri.clone()];
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
@@ -6903,6 +6961,29 @@ impl Workspace {
         pinned: &mut HashSet<Url>,
         cancel: Option<&AtomicBool>,
         session_cache: &ResolverSessionCache,
+    ) -> Result<Vec<Url>, String> {
+        self.load_imports_with_session_cache_for_header(
+            uri,
+            context_key,
+            pinned,
+            cancel,
+            session_cache,
+            None,
+        )
+    }
+
+    fn load_imports_with_session_cache_for_header(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        session_cache: &ResolverSessionCache,
+        selected_header: Option<(
+            &crate::navigation::ImportMetadata,
+            &mut Option<Location>,
+            &mut bool,
+        )>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
         let imports = self.index.imports(uri);
@@ -7097,6 +7178,61 @@ impl Workspace {
         let resolved_for_cache = import_claim
             .as_ref()
             .map(|_| std::sync::Arc::clone(&resolved));
+        if let Some((site, location, compiled)) = selected_header {
+            let selected = resolved.bindings.iter().find(|binding| {
+                binding.site.byte_range == (site.span.start..site.span.end)
+                    && binding.site.section == site.section
+                    && binding.site.requested_name.eq_ignore_ascii_case(&site.name)
+            });
+            let compiled_name = context
+                .unit_aliases
+                .iter()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(&site.name))
+                .map_or(site.name.as_str(), |(_, target)| target.as_str())
+                .to_ascii_lowercase();
+            *compiled = selected
+                .is_some_and(|binding| matches!(binding.target, ResolutionTarget::Unavailable))
+                && compiled_by_name.contains_key(&compiled_name);
+            if !*compiled {
+                let report = match cached_report {
+                    Some(report) => report,
+                    None => Arc::new(
+                        resolver
+                            .take()
+                            .expect("computed selection resolver")
+                            .finish(),
+                    ),
+                };
+                self.merge_resolution_report(&effective_context_key, &report);
+                if report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.to_ascii_lowercase().contains("rejected"))
+                {
+                    return Err("required header dependency was rejected".into());
+                }
+                if let Some(binding) = selected
+                    && let ResolutionTarget::Found(id) = &binding.target
+                    && let Some(dependency) = resolved
+                        .dependencies
+                        .iter()
+                        .find(|unit| &unit.source.id == id)
+                {
+                    *location = compile_time::selected_import_header(
+                        self,
+                        uri,
+                        (&effective_context_key, &context),
+                        (&dependency.source, binding),
+                        &report,
+                        legacy_route.as_ref(),
+                        resolver_cancel,
+                    )?;
+                }
+                // Selection-only observations are not semantic imports or a parsed
+                // provider. No body indexing, closure walk or symbol grant occurs.
+                return Ok(Vec::new());
+            }
+        }
         let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
@@ -7887,8 +8023,8 @@ impl Workspace {
             cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
         {
             Some((*expansion).clone())
-        } else if rename::may_contain_include_directive(source.as_bytes()) {
-            let mut expansion =
+        } else if compile_time::requires_session(&source) {
+            let expansion =
                 match self.expand_source_with_control(uri, &source, context_key, cancel, budget) {
                     Ok(expansion) => expansion,
                     Err(error)
@@ -7908,22 +8044,8 @@ impl Workspace {
                         return Ok(false);
                     }
                 };
-            let fallback_cancel = AtomicBool::new(false);
-            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
-                expansion.expanded.text(),
-                &conditional_context,
-                cancel.unwrap_or(&fallback_cancel),
-            );
-            crate::include_expansion::reconcile_conditional_completeness(
-                &mut expansion,
-                &conditional,
-            );
             Some(expansion)
         } else {
-            // Avoid paying for a second full lexical pass on ordinary Pascal
-            // sources.  The navigation parser still performs the normal
-            // conditional analysis below; only source-bearing include roots
-            // need a virtual buffer and reverse map.
             self.remove_expansion_with_control(uri, cancel, budget)?;
             None
         };
@@ -7952,21 +8074,23 @@ impl Workspace {
                     .map(|cached| cached.parsed.clone())
             });
         let update = match cancel {
-            Some(cancel) => self.index.update_with_context_and_cached_with_cancel(
+            Some(cancel) => self.index.update_with_session(
                 uri.clone(),
                 indexed_source.clone(),
                 &conditional_context,
                 cached,
                 cancel,
+                expansion.as_ref().map(|e| &e.expanded),
             ),
             None => {
                 let cancel = AtomicBool::new(false);
-                self.index.update_with_context_and_cached_with_cancel(
+                self.index.update_with_session(
                     uri.clone(),
                     indexed_source.clone(),
                     &conditional_context,
                     cached,
                     &cancel,
+                    expansion.as_ref().map(|e| &e.expanded),
                 )
             }
         };
@@ -8019,7 +8143,9 @@ impl Workspace {
             }),
             _ => None,
         };
-        if let Some(expansion) = expansion {
+        if let Some(expansion) = expansion.filter(|e| {
+            !e.complete || !e.dependencies.is_empty() || !e.expanded.observations.is_empty()
+        }) {
             self.store_expansion_with_control(uri, context_key, source, expansion, cancel, budget)?;
             let context = self
                 .contexts
@@ -8032,6 +8158,8 @@ impl Workspace {
                 &context,
                 cancel.unwrap_or(&fallback_cancel),
             )?;
+        } else {
+            self.remove_expansion_with_control(uri, cancel, budget)?;
         }
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -8260,7 +8388,7 @@ impl Workspace {
         check_workspace_cancel(cancel)?;
         let mut source_texts = HashMap::from([(uri.clone(), physical_source.clone())]);
         let mut dependency_entries = HashMap::new();
-        let mut include_observations = Vec::new();
+        let mut include_observations = result.expanded.observations.clone();
         let mut dependencies = HashSet::new();
         for dependency in result.dependencies {
             check_workspace_cancel(cancel)?;
@@ -8467,6 +8595,19 @@ impl Workspace {
     ) -> Result<(usize, usize), String> {
         let mut record_count = 0usize;
         let mut observation_bytes = 0usize;
+        for observation in &expansion.expanded.observations {
+            check_workspace_cancel(Some(cancel))?;
+            record_count = record_count
+                .checked_add(1)
+                .ok_or("document-link freshness record count overflowed")?;
+            observation_bytes = observation_bytes
+                .checked_add(observation.path.as_os_str().len())
+                .ok_or("document-link freshness byte count overflowed")?;
+            if record_count > max_records || observation_bytes > max_observation_bytes {
+                return Err("document-link freshness evidence exceeds its work limit".into());
+            }
+            self.record_include_analysis_observation(observation, context, true);
+        }
         for dependency in &expansion.dependencies {
             check_workspace_cancel(Some(cancel))?;
             record_count = record_count
@@ -8701,6 +8842,34 @@ impl Workspace {
                         format!("could not reserve include invalidation queue: {error}")
                     })?;
                     queue.push(parent.clone());
+                }
+            }
+            // Provider/prefix payloads used by compile-time decisions need
+            // invalidation edges too, but are not textual include children and
+            // must not enter the physical include map or publication set.
+            if let Ok(path) = current.to_file_path() {
+                for (root, expansion) in &self.expansions {
+                    check_workspace_cancel(cancel)?;
+                    if root == &current {
+                        continue;
+                    }
+                    let mut depends = false;
+                    for observation in &expansion.expanded.observations {
+                        if let Some(budget) = budget {
+                            budget.charge_path_visits(1)?;
+                        }
+                        check_workspace_cancel(cancel)?;
+                        if native_paths_equal(&path, &observation.path) {
+                            depends = true;
+                            break;
+                        }
+                    }
+                    if depends {
+                        queue.try_reserve(1).map_err(|error| {
+                            format!("could not reserve compile-time invalidation queue: {error}")
+                        })?;
+                        queue.push(root.clone());
+                    }
                 }
             }
         }
@@ -13622,15 +13791,12 @@ impl Workspace {
         }
         let config = resolved_config.value;
         check_workspace_cancel(Some(cancel))?;
-        let mut expansion =
-            self.expand_source_with_cancel(uri, &source, &context_key, Some(cancel))?;
-        let conditional_context = conditional_context_for_path(&context, &path);
-        let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
-            expansion.expanded.text(),
-            &conditional_context,
-            cancel,
-        );
-        crate::include_expansion::reconcile_conditional_completeness(&mut expansion, &conditional);
+        let expansion = self.expand_source_with_cancel(uri, &source, &context_key, Some(cancel))?;
+        let conditional = expansion
+            .expanded
+            .conditionals
+            .clone()
+            .ok_or("diagnostics lost the shared compile-time session")?;
         let expansion_complete = expansion.complete;
         self.store_expansion(uri, &context_key, source.clone(), expansion);
         self.record_expansion_analysis_sources(uri, &context, cancel)?;
@@ -14088,18 +14254,8 @@ impl Workspace {
             else {
                 continue;
             };
-            let mut expansion =
+            let expansion =
                 self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
-            let conditional_context = conditional_context_for_uri(&context, &root_uri);
-            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
-                expansion.expanded.text(),
-                &conditional_context,
-                cancel,
-            );
-            crate::include_expansion::reconcile_conditional_completeness(
-                &mut expansion,
-                &conditional,
-            );
             self.store_expansion(&root_uri, &context_key, source.to_string(), expansion);
             self.record_expansion_analysis_sources(&root_uri, &context, cancel)?;
         }
@@ -14142,18 +14298,8 @@ impl Workspace {
             if has_invalid_project_selection(&context) || context.override_error.is_some() {
                 continue;
             }
-            let mut expansion =
+            let expansion =
                 self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
-            let conditional_context = conditional_context_for_uri(&context, &root_uri);
-            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
-                expansion.expanded.text(),
-                &conditional_context,
-                cancel,
-            );
-            crate::include_expansion::reconcile_conditional_completeness(
-                &mut expansion,
-                &conditional,
-            );
             self.store_expansion(&root_uri, &context_key, source, expansion);
         }
         Ok(())
@@ -15725,6 +15871,565 @@ fn is_immutable_override_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normal_body_adapter_inherits_finite_measured_work_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Dense.pas");
+        let source = format!(
+            "unit Dense; interface\n{}const Exported=1; implementation end.",
+            "{$DEFINE LOCAL}\n".repeat(8_000)
+        );
+        fs::write(&path, &source).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut workspace = test_workspace(vec![temp.path().into()], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.clone(), 1)
+            .unwrap();
+        let key = &workspace.document_contexts[&uri];
+        let unit = workspace
+            .project_cache
+            .peek_unit(
+                &uri,
+                &workspace.contexts[key].context,
+                crate::project_cache::overlay_content_hash(&source),
+                &workspace.overlay_inputs(),
+            )
+            .expect("actual body cache entry");
+        let session = unit
+            .expansion
+            .as_ref()
+            .unwrap()
+            .expanded
+            .session
+            .as_ref()
+            .unwrap();
+        assert!(session.root.complete);
+        let usage = session.budget.budget_snapshot();
+        eprintln!("actual LSP normal body session: {usage:?}");
+        assert!(usage.work > 1_000_000 && usage.work < 2_000_000);
+        assert!(usage.byte_work < 67_108_864);
+        assert!(workspace.index.contains(&uri));
+        assert_eq!(
+            workspace.navigate(&uri, Position::new(8_001, 6), NavigationTarget::Definition),
+            vec![lsp_types::Location::new(
+                uri.clone(),
+                Range::new(Position::new(8_001, 6), Position::new(8_001, 14))
+            )]
+        );
+    }
+    #[test]
+    fn selected_header_reload_preserves_ordered_mapped_authority_for_sysutils_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let sdk = temp.path().join("sdk");
+        let rtl = sdk.join("rtl/sys");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&rtl).unwrap();
+        let main = project.join("Main.pas");
+        let source = "unit Main; interface uses SysUtils; implementation end.";
+        fs::write(&main, source).unwrap();
+        fs::write(project.join("App.dproj"), "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\DelphiSources\\rtl\\sys</DCC_UnitSearchPath><DCC_UnitAlias>SysUtils=System.SysUtils</DCC_UnitAlias></PropertyGroup></Project>").unwrap();
+        fs::write(
+            project.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\DelphiSources'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .unwrap();
+        let provider = rtl.join("System.SysUtils.pas");
+        fs::write(
+            &provider,
+            "unit System.SysUtils; interface const Value=1; implementation end.",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(&main).unwrap();
+        let provider_uri = Url::from_file_path(&provider).unwrap();
+        let mut workspace = test_workspace(
+            vec![project.clone()],
+            WorkspaceOptions {
+                source_paths: vec![rtl.display().to_string()],
+                ..Default::default()
+            },
+        );
+        workspace
+            .open_document(uri.clone(), source.into(), 1)
+            .unwrap();
+        let key = workspace.document_contexts[&uri].clone();
+        let context = workspace.contexts[&key].context.clone();
+        let entries = context
+            .search_path_entries
+            .iter()
+            .filter(|entry| entry.path == rtl)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            2,
+            "real discovery must retain overlapping authorities"
+        );
+        assert!(matches!(
+            entries[0].provenance,
+            ProjectPathProvenance::Mapped { .. }
+        ));
+        assert!(matches!(
+            entries[1].provenance,
+            ProjectPathProvenance::Configured
+        ));
+        let cancel = AtomicBool::new(false);
+        let input = workspace.analysis_input();
+        let route = workspace.legacy_route_for_resolver(&uri, &main, &key, &context);
+        let mut resolver = super::resolver::resolver_for_context(
+            context.clone(),
+            input.roots.clone(),
+            &input,
+            &cancel,
+        );
+        let selected = resolver
+            .try_resolve_unit(
+                pascal_core::UnitResolveRequest {
+                    requested_name: "SysUtils",
+                    importer_path: &main,
+                    legacy_route: route.as_ref(),
+                },
+                &cancel,
+            )
+            .unwrap();
+        let pascal_core::Resolution::Found(selected) = selected.result else {
+            panic!("authentic alias selection must succeed")
+        };
+        let pascal_core::SourceRevision::Disk {
+            path_entry,
+            read_policy,
+            ..
+        } = &selected.source.revision
+        else {
+            panic!("disk selection required")
+        };
+        assert!(matches!(
+            path_entry.provenance,
+            ProjectPathProvenance::Mapped { .. }
+        ));
+        let generic = resolver
+            .load_source(
+                &provider,
+                route.as_ref(),
+                pascal_core::SourceKind::Unit,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(generic.bytes, selected.source.bytes);
+        assert_eq!(generic.decoded_text, selected.source.decoded_text);
+        assert_ne!(
+            generic.revision, selected.source.revision,
+            "stable provenance-only mismatch is the RED witness"
+        );
+        workspace.analysis_records = Some(HashMap::new());
+        let position = Position::new(0, source.find("SysUtils").unwrap() as u32);
+        for large in [false, true] {
+            if large {
+                let body = format!(
+                    "unit System.SysUtils; interface implementation procedure Run; var X: Integer; begin {} end; end.",
+                    "X := X + 1;\n".repeat(100_000)
+                );
+                assert!(body.len() > 1024 * 1024);
+                fs::write(&provider, body).unwrap();
+            }
+            let locations = workspace.navigate(&uri, position, NavigationTarget::Definition);
+            assert_eq!(
+                locations,
+                vec![lsp_types::Location::new(
+                    provider_uri.clone(),
+                    Range::new(Position::new(0, 5), Position::new(0, 20))
+                )],
+                "stable selected authority must reload, large={large}: {:?}",
+                workspace.warnings
+            );
+            let record = &workspace.analysis_records.as_ref().unwrap()[&provider_uri];
+            assert_eq!(
+                record.path_entry.as_ref(),
+                Some(path_entry),
+                "actual reloaded authority, not either allowed entry"
+            );
+            assert_eq!(record.read_policy.as_ref(), Some(read_policy));
+            assert!(
+                !workspace.index.contains(&provider_uri),
+                "no header-only provider body grant"
+            );
+            assert!(
+                !workspace
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("changed repeatedly"))
+            );
+        }
+        // Real current header edits must change coordinates, not be accepted
+        // through the earlier stable-byte authority witness.
+        fs::write(
+            &provider,
+            "{😀}\nunit System.SysUtils; interface implementation end.",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.navigate(&uri, position, NavigationTarget::Definition)[0].range,
+            Range::new(Position::new(1, 5), Position::new(1, 20))
+        );
+        let duplicate = rtl.join("SYSTEM.SYSUTILS.pas");
+        fs::write(
+            &duplicate,
+            "unit System.SysUtils; interface implementation end.",
+        )
+        .unwrap();
+        assert!(
+            workspace
+                .navigate(&uri, position, NavigationTarget::Definition)
+                .is_empty(),
+            "actual duplicate candidates stay ambiguous"
+        );
+        fs::remove_file(duplicate).unwrap();
+        let include = rtl.join("header.inc");
+        fs::write(&provider, "{$I header.inc} interface implementation end.").unwrap();
+        fs::write(&include, "unit System.SysUtils;").unwrap();
+        let included = workspace.navigate(&uri, position, NavigationTarget::Definition);
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].uri, Url::from_file_path(&include).unwrap());
+        fs::write(&include, "unit Other;").unwrap();
+        assert!(
+            workspace
+                .navigate(&uri, position, NavigationTarget::Definition)
+                .is_empty()
+        );
+        fs::remove_file(&include).unwrap();
+        assert!(
+            workspace
+                .navigate(&uri, position, NavigationTarget::Definition)
+                .is_empty()
+        );
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside.inc");
+            fs::write(&outside, "unit System.SysUtils;").unwrap();
+            std::os::unix::fs::symlink(&outside, &include).unwrap();
+            assert!(
+                workspace
+                    .navigate(&uri, position, NavigationTarget::Definition)
+                    .is_empty(),
+                "prefix symlink cannot escape current selected authority"
+            );
+        }
+    }
+    #[test]
+    fn selected_header_definition_survives_actual_body_byte_work_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("Main.pas");
+        let dense = temp.path().join("Dense.pas");
+        let source = "unit Main; interface uses Dense; implementation procedure Run; begin Exported; end; end.";
+        fs::write(&main, source).unwrap();
+        fs::write(
+            &dense,
+            format!(
+                "unit Dense; interface {} const Exported=1; implementation end.",
+                "{$DEFINE LOCAL}\n".repeat(2048)
+            ),
+        )
+        .unwrap();
+        let _cap = super::resolver::test_byte_work_cap(256 * 1024);
+        let mut workspace = test_workspace(vec![temp.path().into()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(&main).unwrap();
+        workspace
+            .open_document(uri.clone(), source.into(), 1)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let key = workspace.document_contexts[&uri].clone();
+        let context = workspace.contexts[&key].context.clone();
+        let input = workspace.analysis_input();
+        let mut resolver =
+            super::resolver::resolver_for_context(context, input.roots.clone(), &input, &cancel);
+        let root = resolver
+            .load_source(&dense, None, pascal_core::SourceKind::Unit, &cancel)
+            .unwrap();
+        let refusal = resolver.analyze_compile_time(&root, &cancel).unwrap_err();
+        assert!(
+            refusal.to_string().contains("max_byte_work"),
+            "genuine fixed-cap body refusal: {refusal:?}"
+        );
+        super::compile_time::take_body_analyses();
+        let locations = workspace.navigate(
+            &uri,
+            Position::new(0, source.find("Dense").unwrap() as u32),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(
+            super::compile_time::take_body_analyses(),
+            0,
+            "import header request must precede provider-body/closure work"
+        );
+        assert_eq!(
+            locations.len(),
+            1,
+            "selected prefix must survive body Err, warnings: {:?}",
+            workspace.warnings
+        );
+        assert_eq!(locations[0].uri, Url::from_file_path(&dense).unwrap());
+        assert_eq!(
+            locations[0].range,
+            Range::new(Position::new(0, 5), Position::new(0, 10))
+        );
+        assert!(
+            !workspace.index.contains(&locations[0].uri),
+            "no parsed body/header symbol authority"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                workspace.navigate(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    NavigationTarget::Definition
+                ),
+                locations
+            );
+        }
+        for target in [NavigationTarget::Definition, NavigationTarget::Declaration] {
+            assert!(
+                workspace
+                    .navigate(
+                        &uri,
+                        Position::new(0, source.find("Exported").unwrap() as u32),
+                        target
+                    )
+                    .is_empty()
+            );
+        }
+        assert!(
+            workspace
+                .rename_edits(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    "Renamed",
+                    true
+                )
+                .is_err()
+        );
+        // A whole physical header in an admitted include can be read-only
+        // navigation authority without creating a provider document.
+        let include = temp.path().join("header.inc");
+        let header = "{😀} unit Dense;\r\n";
+        fs::write(&include, header).unwrap();
+        fs::write(
+            &dense,
+            format!(
+                "{{$I header.inc}} interface {} const Exported=1; implementation end.",
+                "{$DEFINE LOCAL}\n".repeat(2048)
+            ),
+        )
+        .unwrap();
+        workspace.analysis_records = Some(HashMap::new());
+        let included = workspace.navigate(
+            &uri,
+            Position::new(0, source.find("Dense").unwrap() as u32),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].uri, Url::from_file_path(&include).unwrap());
+        assert_eq!(
+            included[0].range,
+            Range::new(Position::new(0, 10), Position::new(0, 15))
+        );
+        assert!(
+            workspace
+                .analysis_records
+                .as_ref()
+                .unwrap()
+                .values()
+                .any(|record| record.uri == included[0].uri && record.include_payload),
+            "unindexed physical header include must remain a publication observation"
+        );
+        fs::write(&include, "unit Other;").unwrap();
+        assert!(
+            workspace
+                .navigate(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    NavigationTarget::Definition
+                )
+                .is_empty()
+        );
+        fs::remove_file(&include).unwrap();
+        assert!(
+            workspace
+                .navigate(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    NavigationTarget::Definition
+                )
+                .is_empty()
+        );
+        // Actual same-tier matching provider files are ambiguous, including
+        // appearance after an earlier negative directory/candidate observation.
+        fs::write(
+            &dense,
+            "unit Dense; interface const Exported=1; implementation end.",
+        )
+        .unwrap();
+        let duplicate = temp.path().join("DENSE.pas");
+        fs::write(&duplicate, "unit Dense; interface implementation end.").unwrap();
+        assert!(
+            workspace
+                .navigate(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    NavigationTarget::Definition
+                )
+                .is_empty()
+        );
+        fs::remove_file(duplicate).unwrap();
+        assert_eq!(
+            workspace
+                .navigate(
+                    &uri,
+                    Position::new(0, source.find("Dense").unwrap() as u32),
+                    NavigationTarget::Definition
+                )
+                .len(),
+            1
+        );
+        assert!(
+            !workspace
+                .navigate(
+                    &uri,
+                    Position::new(0, source.find("Exported").unwrap() as u32),
+                    NavigationTarget::Definition
+                )
+                .is_empty(),
+            "fully analyzable provider retains body authority"
+        );
+    }
+
+    #[test]
+    fn resource_refusing_header_selection_keeps_alias_namespace_and_site_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("App.dproj");
+        let main = temp.path().join("Main.pas");
+        let source = "unit Main; interface uses SysUtils; implementation end.";
+        fs::write(&main, source).unwrap();
+        fs::write(&project, "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>SysUtils=System.SysUtils</DCC_UnitAlias><DCC_Namespace>System</DCC_Namespace></PropertyGroup></Project>").unwrap();
+        let provider = temp.path().join("System.SysUtils.pas");
+        fs::write(
+            &provider,
+            format!(
+                "unit System.SysUtils; interface {} implementation end.",
+                "{$DEFINE LOCAL}\n".repeat(2048)
+            ),
+        )
+        .unwrap();
+        let _cap = super::resolver::test_byte_work_cap(256 * 1024);
+        let uri = Url::from_file_path(&main).unwrap();
+        let mut workspace = test_workspace(vec![temp.path().into()], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.into(), 1)
+            .unwrap();
+        let position = Position::new(0, source.find("SysUtils").unwrap() as u32);
+        for _ in 0..2 {
+            let locations = workspace.navigate(&uri, position, NavigationTarget::Definition);
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].uri, Url::from_file_path(&provider).unwrap());
+            assert_eq!(
+                locations[0].range,
+                Range::new(Position::new(0, 5), Position::new(0, 20))
+            );
+            assert!(!workspace.index.contains(&locations[0].uri));
+        }
+        fs::write(&project, "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>SysUtils=Missing.Other</DCC_UnitAlias></PropertyGroup></Project>").unwrap();
+        workspace.file_event(&Url::from_file_path(&project).unwrap(), FileChange::Changed);
+        assert!(
+            workspace
+                .navigate(&uri, position, NavigationTarget::Definition)
+                .is_empty()
+        );
+        fs::write(&project, "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>System</DCC_Namespace></PropertyGroup></Project>").unwrap();
+        workspace.file_event(&Url::from_file_path(&project).unwrap(), FileChange::Changed);
+        assert_eq!(
+            workspace
+                .navigate(&uri, position, NavigationTarget::Definition)
+                .len(),
+            1
+        );
+        let unknown = "unit Main; interface {$IFDEF UNKNOWN_SITE} uses SysUtils; {$ELSE} uses SysUtils; {$ENDIF} implementation end.";
+        workspace
+            .open_document(uri.clone(), unknown.into(), 2)
+            .unwrap();
+        for offset in unknown.match_indices("SysUtils").map(|(offset, _)| offset) {
+            assert!(
+                workspace
+                    .navigate(
+                        &uri,
+                        Position::new(0, offset as u32),
+                        NavigationTarget::Definition
+                    )
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn selected_header_observation_change_retries_once_then_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("Main.pas");
+        let provider = temp.path().join("Provider.pas");
+        let include = temp.path().join("header.inc");
+        let source = "unit Main; interface uses Provider; implementation end.";
+        fs::write(&main, source).unwrap();
+        fs::write(
+            &provider,
+            "{$I header.inc} interface {$IF Unsupported(1)} {$ENDIF} implementation end.",
+        )
+        .unwrap();
+        fs::write(&include, "unit Provider;").unwrap();
+        let uri = Url::from_file_path(&main).unwrap();
+        let mut workspace = test_workspace(vec![temp.path().into()], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.into(), 1)
+            .unwrap();
+        let path = include.clone();
+        let mut first = true;
+        super::compile_time::test_header_revalidation_hook(Some(Box::new(move || {
+            if first {
+                first = false;
+                fs::write(&path, "{😀} unit Provider;").unwrap();
+            }
+        })));
+        let locations = workspace.navigate(
+            &uri,
+            Position::new(0, source.find("Provider").unwrap() as u32),
+            NavigationTarget::Definition,
+        );
+        super::compile_time::test_header_revalidation_hook(None);
+        assert_eq!(
+            locations.len(),
+            1,
+            "one changed actual include should redo prefix selection/proof: {:?}",
+            workspace.warnings
+        );
+        assert_eq!(
+            locations[0].range,
+            Range::new(Position::new(0, 10), Position::new(0, 18))
+        );
+        let path = include.clone();
+        let mut sequence = 0;
+        super::compile_time::test_header_revalidation_hook(Some(Box::new(move || {
+            sequence += 1;
+            fs::write(&path, format!("{{change {sequence}}} unit Provider;")).unwrap();
+        })));
+        let locations = workspace.navigate(
+            &uri,
+            Position::new(0, source.find("Provider").unwrap() as u32),
+            NavigationTarget::Definition,
+        );
+        super::compile_time::test_header_revalidation_hook(None);
+        assert!(
+            locations.is_empty(),
+            "repeated change cannot publish stale capability"
+        );
+    }
     #[cfg(unix)]
     use super::scan_external_units;
     use super::{
@@ -20778,6 +21483,22 @@ BDS = '/fake/37'
             .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
             .expect("compiled provider should bind");
         assert_eq!(provider.scheme(), "lint4d-dcu");
+        let locations = workspace
+            .resolve_navigation_once_with_cancel(
+                &source_uri,
+                Position::new(0, source.find("Lint4dFixture.Classes").unwrap() as u32),
+                NavigationTarget::Definition,
+                &key,
+                &mut HashSet::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            locations.len(),
+            1,
+            "independent source-header path must preserve validated compiled fallback"
+        );
+        assert_eq!(locations[0].uri.scheme(), "lint4d-dcu");
     }
 
     #[test]

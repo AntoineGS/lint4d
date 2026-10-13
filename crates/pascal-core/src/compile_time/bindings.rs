@@ -98,7 +98,7 @@ impl InterfaceFacts {
         self.attempted.hash(&mut h);
         self.failure
             .as_ref()
-            .map(|r| std::mem::discriminant(r))
+            .map(std::mem::discriminant)
             .hash(&mut h);
         if let Some(provider) = &self.provided {
             provider.unit.requested_name.hash(&mut h);
@@ -198,11 +198,14 @@ pub(super) fn imported_declaration<'a>(
     site: &BindingSite,
     name: &str,
     budget: &mut CompileTimeBudget<'_>,
-) -> Result<Fact<(&'a CompileTimeState, &'a Declaration)>, IncompleteReason> {
+) -> Result<Option<Fact<(&'a CompileTimeState, &'a Declaration)>>, IncompleteReason> {
+    // None proves absence in all participating providers. Unknown is a binding
+    // barrier, not permission to consult compiler-context or DEFINE fallbacks.
     let root = name.split('.').next().unwrap_or(name);
     if name.contains('.') && lookup(state, site, root, budget)?.is_some() {
-        return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        return Ok(Some(Fact::Unknown(UnknownReason::UnresolvedName)));
     }
+    let explicitly_qualified = has_authorized_provider_qualifier(state, site, name, budget)?;
     let mut result = None;
     for interface in &state.interfaces {
         budget.charge(1, 0, 0)?;
@@ -224,27 +227,42 @@ pub(super) fn imported_declaration<'a>(
                 break;
             }
         }
+        if explicitly_qualified && !qualified {
+            continue;
+        }
+        // Unknown-activity imports cannot be read, but are not proven absent.
+        // After qualified exclusion, they prevent an unqualified identity proof.
+        if !interface.pending.authorized {
+            return Ok(Some(Fact::Unknown(UnknownReason::UnknownActivity)));
+        }
         let Some(graph) = &interface.graph else {
             if qualified || !name.contains('.') {
-                return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                return Ok(Some(Fact::Unknown(UnknownReason::UnresolvedName)));
             }
             continue;
         };
         if !graph.alternatives.is_empty() || graph.failure.is_some() || graph.unknown {
-            return Ok(Fact::Unknown(UnknownReason::UnknownActivity));
+            return Ok(Some(Fact::Unknown(UnknownReason::UnknownActivity)));
         }
-        let Some(Binding::Declaration(decl)) = lookup(graph, &graph.site(), suffix, budget)? else {
-            continue;
+        let decl = match lookup(graph, &graph.site(), suffix, budget)? {
+            Some(Binding::Declaration(decl)) => decl,
+            Some(Binding::EnumMember { owner, .. }) if owner.exported => {
+                // Unsupported imported member values are still source bindings.
+                // Their real parent owns export visibility; never manufacture a
+                // type declaration or prove absence for scalar/callee fallback.
+                return Ok(Some(Fact::Unknown(UnknownReason::UnresolvedName)));
+            }
+            _ => continue,
         };
         if !decl.exported {
             continue;
         }
         if result.is_some() {
-            return Ok(Fact::Unknown(UnknownReason::AmbiguousBinding));
+            return Ok(Some(Fact::Unknown(UnknownReason::AmbiguousBinding)));
         }
         result = Some((&***graph, decl));
     }
-    Ok(result.map_or(Fact::Unknown(UnknownReason::UnresolvedName), Fact::Known))
+    Ok(result.map(Fact::Known))
 }
 
 pub(super) fn imported_operand_with_query(
@@ -255,10 +273,12 @@ pub(super) fn imported_operand_with_query(
     query_site: &BindingSite,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<Fact<KnownLayout>>, IncompleteReason> {
+    let text = text.trim();
     let root = text.split(['.', '[', '^']).next().unwrap_or(text).trim();
     if text.contains('.') && lookup(state, site, root, budget)?.is_some() {
         return Ok(Some(Fact::Unknown(UnknownReason::UnresolvedName)));
     }
+    let explicitly_qualified = has_authorized_provider_qualifier(state, site, text, budget)?;
     let mut result = None;
     for interface in &state.interfaces {
         budget.charge(1, 0, 0)?;
@@ -279,6 +299,12 @@ pub(super) fn imported_operand_with_query(
                 qualified = true;
                 break;
             }
+        }
+        if explicitly_qualified && !qualified {
+            continue;
+        }
+        if !interface.pending.authorized {
+            return Ok(Some(Fact::Unknown(UnknownReason::UnknownActivity)));
         }
         let root = suffix
             .split(['.', '[', '^'])
@@ -342,6 +368,34 @@ pub(super) fn imported_operand_with_query(
         result = Some(fact);
     }
     Ok(result)
+}
+
+/// Match the preparation path's authorized, source-visible provider spellings.
+/// A dot alone is not qualification: imported record members may be unqualified.
+fn has_authorized_provider_qualifier(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    for interface in &state.interfaces {
+        budget.charge(1, 0, 0)?;
+        if interface.site.sequence.0 > site.sequence.0 || !interface.pending.authorized {
+            continue;
+        }
+        for qualifier in &interface.qualifiers {
+            budget.charge(1, qualifier.len().min(name.len()), 0)?;
+            if name.len() > qualifier.len()
+                && name.as_bytes().get(qualifier.len()) == Some(&b'.')
+                && name
+                    .get(..qualifier.len())
+                    .is_some_and(|p| same_name(p, qualifier))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn layout_retained(layout: &KnownLayout) -> usize {
@@ -523,10 +577,10 @@ pub(super) fn layout_name(
     let mut identity_bytes = 0;
     let result = (|| {
         let decl = lookup(state, &site, &name, budget)?;
-        if decl.is_none() {
-            if let Some(fact) = imported_operand(state, &site, &name, budget)? {
-                return Ok(fact);
-            }
+        if decl.is_none()
+            && let Some(fact) = imported_operand(state, &site, &name, budget)?
+        {
+            return Ok(fact);
         }
         let identity = if let Some(binding) = decl {
             let Some(decl) = binding.type_declaration() else {
@@ -593,23 +647,24 @@ pub(super) fn lookup<'a>(
     }
     // Only a parser-proven current-unit prefix is admitted before the resource
     // provider owner. Never strip a familiar external/System suffix.
-    if let Some(unit) = &state.unit_name {
-        if name.len() > unit.len() && name.as_bytes().get(unit.len()) == Some(&b'.') {
-            let Some(prefix) = name.get(..unit.len()) else {
-                return Ok(None);
-            };
-            budget.charge(1, unit.len(), 0)?;
-            if same_name(prefix, unit) {
-                let root = prefix.split('.').next().unwrap_or(prefix);
-                let suffix = &name[unit.len() + 1..];
-                budget.charge(suffix.len(), suffix.len(), 0)?;
-                if !suffix.contains('.') && lookup(state, site, root, budget)?.is_none() {
-                    let global = BindingSite {
-                        scope: ScopeId(0),
-                        sequence: site.sequence,
-                    };
-                    return lookup(state, &global, suffix, budget);
-                }
+    if let Some(unit) = &state.unit_name
+        && name.len() > unit.len()
+        && name.as_bytes().get(unit.len()) == Some(&b'.')
+    {
+        let Some(prefix) = name.get(..unit.len()) else {
+            return Ok(None);
+        };
+        budget.charge(1, unit.len(), 0)?;
+        if same_name(prefix, unit) {
+            let root = prefix.split('.').next().unwrap_or(prefix);
+            let suffix = &name[unit.len() + 1..];
+            budget.charge(suffix.len(), suffix.len(), 0)?;
+            if !suffix.contains('.') && lookup(state, site, root, budget)?.is_none() {
+                let global = BindingSite {
+                    scope: ScopeId(0),
+                    sequence: site.sequence,
+                };
+                return lookup(state, &global, suffix, budget);
             }
         }
     }

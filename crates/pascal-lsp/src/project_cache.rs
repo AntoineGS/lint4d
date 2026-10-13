@@ -230,6 +230,7 @@ pub(crate) fn expansion_probes(expansion: &ExpansionResult) -> Vec<Probe> {
         .dependencies
         .iter()
         .flat_map(|include| include.observations.iter())
+        .chain(expansion.expanded.observations.iter())
         .filter_map(|observation| {
             let path = observation.path.clone();
             if let (Some(version), Some(content_hash)) =

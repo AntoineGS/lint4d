@@ -6420,24 +6420,9 @@ fn build_snapshot_with_policy(
         let may_contain_include = may_contain_include_directive(source.as_bytes());
         let mut indexed_source = source.clone();
         if mode != SnapshotMode::WorkspaceSymbols && may_contain_include {
-            let expansion_context = loader
-                .contexts
-                .get(&source_context_key)
-                .map(|state| conditional_context_for_path(&state.context, &path))
-                .unwrap_or_default();
             match loader.expand_source_with_cancel(&uri, &source, &source_context_key, Some(cancel))
             {
                 Ok(expansion) => {
-                    let mut expansion = expansion;
-                    let conditional = conditional::analyze_with_context_and_cancel(
-                        expansion.expanded.text(),
-                        &expansion_context,
-                        cancel,
-                    );
-                    include_expansion::reconcile_conditional_completeness(
-                        &mut expansion,
-                        &conditional,
-                    );
                     if !expansion.complete && mode != SnapshotMode::Assistance {
                         complete = false;
                         if let Some(error) = expansion.errors.first() {
@@ -6665,12 +6650,13 @@ fn build_snapshot_with_policy(
             })
             .map(|cached| cached.parsed.clone());
         index
-            .update_with_context_and_cached_with_cancel(
+            .update_with_session(
                 uri.clone(),
                 indexed_source.clone(),
                 &conditional_context,
                 cached,
                 cancel,
+                loader.expansions.get(&uri).map(|e| &e.expanded),
             )
             .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
         retained_files = retained_files.saturating_add(1);
@@ -6995,6 +6981,7 @@ fn build_snapshot_with_policy(
             allow_incomplete_context_for,
             cancel,
             cache: HashMap::new(),
+            session: None,
             resolution_cache: HashMap::new(),
             resolvers: HashMap::new(),
             active: HashSet::new(),
@@ -8283,6 +8270,7 @@ struct IncludeAuditor<'a> {
     allow_incomplete_context_for: &'a [Url],
     cancel: &'a AtomicBool,
     cache: HashMap<String, IncludeAnalysis>,
+    session: Option<Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
     resolution_cache: HashMap<String, Resolution<LoadedSource>>,
     resolvers:
         HashMap<ContextKey, pascal_core::resolver::UnitResolver<shared_resolver::LspSourceStore>>,
@@ -8301,6 +8289,7 @@ struct IncludeInspection<'a> {
     owner_path: &'a Path,
     legacy_route: Option<LegacyRoute>,
     conditional_environment: Option<conditional::ConditionalEnvironment>,
+    occurrence: pascal_core::compile_time::OccurrenceId,
 }
 
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
@@ -8321,9 +8310,23 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         let context = auditor.context_for_source(&uri)?;
-        let Some(source) = auditor.sources.get(&uri).cloned() else {
+        let Some(mut source) = auditor.sources.get(&uri).cloned() else {
             continue;
         };
+        // Snapshot sources may contain a bounded include-owner summary. That
+        // summary is not a new physical revision and must never be submitted
+        // as the authenticated root. Expansion captured the original decoded
+        // text before summarization, in this owner's source-specific context.
+        if let Some(expansion) = auditor.loader.expansions.get(&uri)
+            && context
+                .as_ref()
+                .is_some_and(|(key, _)| key == &expansion.context_key)
+        {
+            source = expansion.physical_source.clone();
+        }
+        if !super::compile_time::requires_session(&source) {
+            continue;
+        }
         let conditional_context = context
             .as_ref()
             .map(|(_, context)| {
@@ -8351,8 +8354,45 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             .allow_incomplete_context_for
             .iter()
             .any(|allowed_uri| allowed_uri == &uri);
-        let preliminary =
-            conditional::analyze_with_context_and_cancel(&source, &conditional_context, cancel);
+        let Some((session_key, _)) = context.as_ref() else {
+            auditor.record_error(format!("include owner {uri} has no project context"));
+            auditor.stopped = true;
+            break;
+        };
+        let session = if let Some(session) = auditor
+            .loader
+            .expansions
+            .get(&uri)
+            .filter(|e| e.physical_source == source && &e.context_key == session_key)
+            .and_then(|e| e.expanded.session.clone())
+        {
+            session
+        } else {
+            super::compile_time::expand(
+                auditor.loader,
+                &uri,
+                &source,
+                session_key,
+                auditor.loader.include_expansion_limits(),
+                cancel,
+                None,
+            )?
+            .expanded
+            .session
+            .ok_or("include audit has no shared session")?
+        };
+        let preliminary = &session.root;
+        // Occurrence IDs are local to a shared analysis session. Keep payload
+        // and resolver caches/budgets, but never reuse another root's decision
+        // for an equal occurrence number with different lexical entry facts.
+        if auditor
+            .session
+            .as_ref()
+            .is_none_or(|previous| !Arc::ptr_eq(previous, &session))
+        {
+            auditor.cache.clear();
+        }
+        auditor.session = Some(session.clone());
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -8383,72 +8423,38 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             auditor.stopped = true;
             break;
         };
-        let mut callback_error = None;
-        let mut include =
-            |directive: &ConditionalDirective,
-             environment: &mut conditional::ConditionalEnvironment| {
-                if auditor.stopped {
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                if is_cancelled(cancel) {
-                    callback_error = Some(CANCELLATION_MESSAGE.to_string());
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                if !auditor.take_directive_budget() {
-                    auditor.record_error(format!(
-                    "rename cannot prove completeness because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
-                ));
-                    auditor.stopped = true;
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                let directive = legacy_directive(directive);
-                let analysis = match auditor.inspect_top_level(
-                    &uri,
-                    &directive,
-                    &context_key,
-                    &context,
-                    Some(environment.clone()),
-                ) {
-                    Ok(analysis) => analysis,
-                    Err(error) => {
-                        callback_error = Some(error);
-                        return conditional::IncludeTransition {
-                            complete: false,
-                            environment_known: false,
-                        };
-                    }
-                };
-                if let Some(next_environment) = analysis.environment {
-                    *environment = next_environment;
-                    conditional::IncludeTransition {
-                        complete: analysis.safe,
-                        environment_known: analysis.safe,
-                    }
-                } else {
-                    conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    }
-                }
-            };
-        let conditional = conditional::analyze_with_include_callback(
-            &source,
-            &mut environment,
-            cancel,
-            &mut include,
-        );
-        if let Some(error) = callback_error {
-            return Err(error);
+        let report = pascal_core::resolver::ResolutionReport {
+            observations: session.observations.clone(),
+            warnings: session.warnings.clone(),
+            complete: session.root.complete,
+            incomplete_reasons: vec![],
+        };
+        auditor.observe_resolver_report(&context_key, &report);
+        for directive in preliminary
+            .directives
+            .iter()
+            .filter(|d| d.kind == ConditionalDirectiveKind::Include && d.potentially_active())
+        {
+            if auditor.stopped {
+                break;
+            }
+            if !auditor.take_directive_budget() {
+                auditor.record_error("include directive limit reached".into());
+                auditor.stopped = true;
+                break;
+            }
+            let analysis = auditor.inspect_top_level(
+                &uri,
+                &legacy_directive(directive),
+                &context_key,
+                &context,
+                Some(environment.clone()),
+            )?;
+            if let Some(next) = analysis.environment {
+                environment = next;
+            }
         }
+        let conditional = preliminary;
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -8739,13 +8745,27 @@ impl IncludeAuditor<'_> {
             ));
         };
         let legacy_route = self.top_level_legacy_route(&owner_path, context_key, context);
-        let resolution = self.resolve_include(
-            context_key,
-            context,
-            &owner_path,
-            directive,
-            legacy_route.as_ref(),
-        )?;
+        let proven = self
+            .session
+            .as_ref()
+            .and_then(|s| {
+                let root = s.occurrences.first()?.id;
+                s.includes
+                    .iter()
+                    .find(|i| i.owner == root && i.directive.range.start == directive.start)
+            })
+            .cloned();
+        let resolution = if let Some(include) = &proven {
+            include.target.clone()
+        } else {
+            self.resolve_include(
+                context_key,
+                context,
+                &owner_path,
+                directive,
+                legacy_route.as_ref(),
+            )?
+        };
         let source = match resolution {
             Resolution::Found(source) => source,
             Resolution::Unavailable { .. } => {
@@ -8788,6 +8808,9 @@ impl IncludeAuditor<'_> {
             owner_path: &owner_path,
             legacy_route,
             conditional_environment,
+            occurrence: proven
+                .and_then(|i| i.child)
+                .ok_or("include has no proven lexical-entry occurrence")?,
         };
         let analysis = self.inspect_include_file(&source, inspection, 0)?;
         if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
@@ -8811,6 +8834,7 @@ impl IncludeAuditor<'_> {
         inherited_route: Option<LegacyRoute>,
         conditional_environment: conditional::ConditionalEnvironment,
         depth: usize,
+        parent: pascal_core::compile_time::OccurrenceId,
     ) -> Result<IncludeAnalysis, String> {
         if depth >= MAX_RENAME_INCLUDE_DEPTH {
             self.stopped = true;
@@ -8821,13 +8845,26 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
-        let resolution = self.resolve_include(
-            context_key,
-            context,
-            owner_path,
-            directive,
-            inherited_route.as_ref(),
-        )?;
+        let proven = self
+            .session
+            .as_ref()
+            .and_then(|s| {
+                s.includes
+                    .iter()
+                    .find(|i| i.owner == parent && i.directive.range.start == directive.start)
+            })
+            .cloned();
+        let resolution = if let Some(include) = &proven {
+            include.target.clone()
+        } else {
+            self.resolve_include(
+                context_key,
+                context,
+                owner_path,
+                directive,
+                inherited_route.as_ref(),
+            )?
+        };
         let source = match resolution {
             Resolution::Found(source) => source,
             Resolution::Unavailable { .. } => {
@@ -8857,6 +8894,9 @@ impl IncludeAuditor<'_> {
             owner_path,
             legacy_route,
             conditional_environment: Some(conditional_environment),
+            occurrence: proven
+                .and_then(|i| i.child)
+                .ok_or("nested include has no proven lexical-entry occurrence")?,
         };
         self.inspect_include_file(&source, inspection, depth + 1)
     }
@@ -8889,13 +8929,14 @@ impl IncludeAuditor<'_> {
                 false,
             ));
         }
-        let cache_key = include_cache_key(
+        let mut cache_key = include_cache_key(
             path,
             inspection.context_key,
             inspection.owner_path,
             inspection.legacy_route.as_ref(),
             inspection.conditional_environment.as_ref(),
         );
+        cache_key.push_str(&format!("|occurrence:{}", inspection.occurrence.0));
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
         }
@@ -8958,96 +8999,62 @@ impl IncludeAuditor<'_> {
         // boundary is unknown, the empty environment intentionally makes
         // conditional facts unknown; it must not resurrect project defines.
         let include_text = shared_resolver::decode_source_bytes(&source.bytes);
-        let inherited_facts = inspection
-            .conditional_environment
-            .as_ref()
-            .is_some_and(conditional::ConditionalEnvironment::has_facts);
+        // Every child has a source-order lexical entry, even when its scalar
+        // defines happen to be empty. Do not turn that into an independent
+        // physical-edit proof for inherited conditional candidate activity.
+        let inherited_facts = true;
         let mut environment = inspection.conditional_environment.unwrap_or_default();
         self.active.insert(active_key.clone());
         let cancel = self.cancel;
-        let mut callback_error = None;
         let mut nested_failure = None;
-        let mut nested_include =
-            |directive: &ConditionalDirective,
-             environment: &mut conditional::ConditionalEnvironment| {
-                if is_cancelled(cancel) {
-                    callback_error = Some(CANCELLATION_MESSAGE.to_string());
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                if self.stopped {
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                if !self.take_directive_budget() {
-                    self.stopped = true;
-                    nested_failure = Some(format!(
-                        "include {path:?} could not be audited because include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) was reached"
-                    ));
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                let directive = legacy_directive(directive);
-                let child = match self.inspect_nested(
-                    path,
-                    &directive,
-                    inspection.context_key,
-                    inspection.context,
-                    inspection.legacy_route.clone(),
-                    environment.clone(),
-                    depth,
-                ) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        callback_error = Some(error);
-                        return conditional::IncludeTransition {
-                            complete: false,
-                            environment_known: false,
-                        };
-                    }
-                };
-                if !child.safe {
-                    self.stopped = true;
-                    nested_failure = Some(child.reason.unwrap_or_else(|| {
+        let conditional = self
+            .session
+            .as_ref()
+            .and_then(|s| s.occurrences.iter().find(|o| o.id == inspection.occurrence))
+            .ok_or("include audit lost lexical-entry state")?
+            .analysis
+            .clone();
+        for directive in conditional
+            .directives
+            .iter()
+            .filter(|d| d.kind == ConditionalDirectiveKind::Include && d.potentially_active())
+        {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.into());
+            }
+            if self.stopped {
+                break;
+            }
+            if !self.take_directive_budget() {
+                self.stopped = true;
+                nested_failure = Some(format!(
+                    "include directive limit ({MAX_RENAME_INCLUDE_DIRECTIVES}) reached"
+                ));
+                break;
+            }
+            let child = self.inspect_nested(
+                path,
+                &legacy_directive(directive),
+                inspection.context_key,
+                inspection.context,
+                inspection.legacy_route.clone(),
+                environment.clone(),
+                depth,
+                inspection.occurrence,
+            )?;
+            if !child.safe {
+                self.stopped = true;
+                nested_failure =
+                    Some(child.reason.unwrap_or_else(|| {
                         format!("include {path:?} contains unsafe nested source")
                     }));
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                }
-                let Some(next_environment) = child.environment else {
-                    self.stopped = true;
-                    nested_failure = Some(format!(
-                        "include {path:?} did not yield a known conditional environment"
-                    ));
-                    return conditional::IncludeTransition {
-                        complete: false,
-                        environment_known: false,
-                    };
-                };
-                *environment = next_environment;
-                conditional::IncludeTransition {
-                    complete: true,
-                    environment_known: true,
-                }
-            };
-        let conditional = conditional::analyze_with_include_callback(
-            &include_text,
-            &mut environment,
-            cancel,
-            &mut nested_include,
-        );
-        self.active.remove(&active_key);
-        if let Some(error) = callback_error {
-            return Err(error);
+                break;
+            }
+            if let Some(next) = child.environment {
+                environment = next;
+            }
         }
+        self.active.remove(&active_key);
         if is_cancelled(self.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -9774,28 +9781,14 @@ pub(super) fn expand_source_with_workspace(
     cancel: &AtomicBool,
     budget: Option<&super::ReconciliationBudget>,
 ) -> Result<ExpansionResult, String> {
-    let context = workspace
-        .contexts
-        .get(context_key)
-        .map(|state| state.context.clone())
-        .ok_or_else(|| format!("project context was not retained for {root_uri}"))?;
-    let mut resolver = WorkspaceIncludeResolver {
+    super::compile_time::expand(
         workspace,
-        context: &context,
-        context_key,
-        max_file_bytes: workspace.options.limits.max_file_bytes,
-        max_total_bytes: workspace.options.limits.max_total_bytes,
-        budget,
-        legacy_authorizations: HashMap::new(),
-    };
-    let conditional_context = conditional_context_for_uri(&context, root_uri);
-    include_expansion::expand_source_with_context(
-        root_uri.clone(),
+        root_uri,
         source,
-        &conditional_context,
-        &mut resolver,
+        context_key,
         limits,
         cancel,
+        budget,
     )
 }
 

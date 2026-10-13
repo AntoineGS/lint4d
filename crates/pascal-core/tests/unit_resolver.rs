@@ -11,6 +11,715 @@ use pascal_project::{
 };
 
 #[test]
+fn explicit_retention_selection_reaches_the_shared_session_without_a_default_clamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Retention.pas");
+    // More than 1 MiB of projection, but fewer than 1M declaration-feed chars.
+    let text = format!(
+        "unit Retention; interface {{ {} }} implementation end.",
+        "😀".repeat(270_000)
+    );
+    std::fs::write(&path, &text).unwrap();
+    for selected in [
+        ResolverLimits::default().max_compile_time_retained_bytes,
+        8 * 1024 * 1024,
+    ] {
+        let context =
+            ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+                .unwrap();
+        let mut resolver = UnitResolver::new(
+            context,
+            vec![dir.path().into()],
+            FilesystemSourceStore::new(),
+            ResolverLimits {
+                max_compile_time_retained_bytes: selected,
+                ..ResolverLimits::default()
+            },
+        );
+        let source = resolver
+            .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+            .unwrap();
+        let result = resolver.analyze_compile_time(&source, &NoCancellation);
+        if selected == 1_048_576 {
+            assert!(
+                matches!(
+                    result,
+                    Err(ResolverError::LimitExceeded {
+                        limit: "max_retained_bytes",
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.root.projected_source.len(), text.len());
+            assert!(result.root.complete);
+        }
+    }
+}
+
+#[test]
+fn large_plain_comment_import_projection_charges_scanner_steps_not_eight_times_source_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Large.pas");
+    let text = format!(
+        "unit Large; interface {{$I Body.inc}} {{{}}} implementation end.",
+        "x".repeat(1_300_000)
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(dir.path().join("Body.inc"), "const Value=1;").unwrap();
+    let context =
+        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_retained_bytes: 16 * 1024 * 1024,
+            ..ResolverLimits::default()
+        },
+    );
+    let source = resolver
+        .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+        .unwrap();
+    let importer = pascal_core::ResolvedUnit {
+        requested_name: "Large".into(),
+        declared_name: "Large".into(),
+        source,
+    };
+    let imports = resolver
+        .resolve_imports_with_text(&importer, &[], &text, &NoCancellation)
+        .unwrap();
+    assert!(imports.complete);
+}
+
+// Public-path regression for Task11 I1/l4d-8h2. Always use a fresh resolver:
+// neither cache reuse nor result rewriting may hide source-order dispatch.
+fn task11_fix1_resolver(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> UnitResolver<FilesystemSourceStore> {
+    let conditional = ConditionalContext::default()
+        .with_compiler_version(CompilerVersion::new(37, 0))
+        .with_layout(pascal_project::LayoutContext {
+            platform: Some(pascal_project::LayoutPlatform::Win32),
+            defaults: pascal_project::LayoutSettings {
+                long_strings: ConditionalFact::True,
+                real_compatibility: ConditionalFact::False,
+                ..Default::default()
+            },
+        });
+    let options = ProjectOptions {
+        source_paths: vec![root.to_string_lossy().into_owned()],
+        conditional_context: conditional.clone(),
+        ..ProjectOptions::default()
+    };
+    let mut context = ProjectContext::discover(path, &[root.into()], &options).unwrap();
+    context.conditional_context = conditional;
+    UnitResolver::new(
+        context,
+        vec![root.into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    )
+}
+
+fn task11_fix1_sites(text: &str) -> Vec<pascal_core::ImportSite> {
+    ["Types", "Chosen", "Forbidden"]
+        .into_iter()
+        .filter_map(|name| {
+            let start = text.find(&format!("uses {name}"))? + 5;
+            Some(pascal_core::ImportSite {
+                byte_range: start..start + name.len(),
+                requested_name: name.into(),
+                section: if name == "Types" {
+                    pascal_core::ImportSection::Interface
+                } else {
+                    pascal_core::ImportSection::Implementation
+                },
+            })
+        })
+        .collect()
+}
+
+fn task11_fix1_imports(
+    root: &std::path::Path,
+    text: &str,
+    with_text: bool,
+) -> pascal_core::ResolvedImports {
+    let path = root.join("App.pas");
+    std::fs::write(&path, text).unwrap();
+    let mut resolver = task11_fix1_resolver(root, &path);
+    let source = resolver
+        .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+        .unwrap();
+    let unit = pascal_core::ResolvedUnit {
+        requested_name: "App".into(),
+        declared_name: "App".into(),
+        source,
+    };
+    let sites = task11_fix1_sites(text);
+    if with_text {
+        resolver
+            .resolve_imports_with_text(&unit, &sites, text, &NoCancellation)
+            .unwrap()
+    } else {
+        resolver
+            .resolve_imports(&unit, &sites, &NoCancellation)
+            .unwrap()
+    }
+}
+
+#[test]
+fn task11_fix1_fake_sizeof_text_does_not_change_public_import_completeness() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface implementation end.",
+    )
+    .unwrap();
+    let mut failures = Vec::new();
+    for suffix in [
+        "// ordinary\n",
+        "// SizeOf\n",
+        "{ SizeOf(LongWord) }",
+        "(* SizeOf(LongWord) *)",
+        "const Text = 'SizeOf(LongWord)';",
+        "const Text = 'escaped '' SizeOf(LongWord)';",
+        "const MySizeOf = 1;",
+        "const SizeOfValue = 1;",
+        "procedure MySizeOf(); begin end;",
+        "{$HPPEMIT 'SizeOf(LongWord)'}",
+        "{$HPPEMIT SizeOf}",
+        "{$DEFINE SizeOf} {$IFDEF SizeOf} {$ENDIF}",
+        "{$DEFINE MySizeOf} {$IFDEF MySizeOf} {$ENDIF}",
+        "{$IF 'SizeOf(LongWord)' = 'SizeOf(LongWord)'} {$ENDIF}",
+        "const MySizeOf=1; {$IF MySizeOf=1} {$ENDIF}",
+        "asm CMP AL,\"SizeOf\" end;",
+    ] {
+        let text = format!(
+            "unit App; interface uses Types; implementation {{$POINTERMATH ON}} {suffix} end."
+        );
+        for with_text in [false, true] {
+            let imports = task11_fix1_imports(temp.path(), &text, with_text);
+            if !imports.complete
+                || !matches!(
+                    imports.bindings[0].target,
+                    pascal_core::ResolutionTarget::Found(_)
+                )
+            {
+                failures.push(format!("with_text={with_text}, {suffix:?}: {imports:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn task11_fix1_genuine_no_include_layout_queries_keep_shared_provider_decisions() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface type T=Pointer; implementation end.",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("Chosen.pas"),
+        "unit Chosen; interface implementation end.",
+    )
+    .unwrap();
+    let mut failures = Vec::new();
+    for selection in [
+        "{$IF SizeOf(Types.T)=4} uses Chosen; {$ELSE} uses Forbidden; {$ENDIF}",
+        "(*$IF SizeOf(Types.T)=4*) uses Chosen; (*$ELSE*) uses Forbidden; (*$ENDIF*)",
+        "{$IF sIzEoF(Types.T)=4} uses Chosen; {$ELSE} uses Forbidden; {$ENDIF}",
+        "(*$IF sIzEoF (Types.T) = 4 *) uses Chosen; (*$ELSE*) uses Forbidden; (*$ENDIF*)",
+        "{$IF false} uses Forbidden; {$ELSEIF SizeOf(Types.T)=4} uses Chosen; {$ENDIF}",
+        "const N=SizeOf(LongWord); {$IF N=4} uses Chosen; {$ELSE} uses Forbidden; {$ENDIF}",
+        // Task13/l4d-3yam: these exact whitespace/trivia forms are proven by
+        // shared-session and physical Workspace regressions, not guessed text.
+        "const N=SizeOf ( Types.T ); {$IF N=4} uses Chosen; {$ELSE} uses Forbidden; {$ENDIF}",
+        "const N=SizeOf { trivia } (LongWord); {$IF N=4} uses Chosen; {$ELSE} uses Forbidden; {$ENDIF}",
+    ] {
+        let text = format!(
+            "unit App; interface uses Types; implementation {{$POINTERMATH ON}} {selection} end."
+        );
+        for with_text in [false, true] {
+            let imports = task11_fix1_imports(temp.path(), &text, with_text);
+            if !imports.complete
+                || !matches!(
+                    imports.bindings[0].target,
+                    pascal_core::ResolutionTarget::Found(_)
+                )
+                || !matches!(
+                    imports.bindings[1].target,
+                    pascal_core::ResolutionTarget::Found(_)
+                )
+                || !matches!(
+                    imports.bindings[2].target,
+                    pascal_core::ResolutionTarget::Unavailable
+                )
+                || imports.dependencies.len() != 2
+            {
+                failures.push(format!("with_text={with_text}, {selection}: complete={}, targets={:?}, dependencies={}", imports.complete, imports.bindings.iter().map(|binding| &binding.target).collect::<Vec<_>>(), imports.dependencies.len()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn task11_fix1_unknown_layout_operands_still_fail_closed() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface type T=Pointer; implementation end.",
+    )
+    .unwrap();
+    // These must still be classified as calls, but this correction must not
+    // turn an unresolved/unsupported operand into a guessed branch decision.
+    for query in [
+        "SizeOf(Missing)",
+        "SizeOf ( Types.Missing )",
+        "SizeOf { trivia } (Missing)",
+        "SizeOf { trivia } (MakeValue())",
+    ] {
+        let text = format!(
+            "unit App; interface uses Types; implementation {{$POINTERMATH ON}} const N={query}; {{$IF N=4}} uses Chosen; {{$ELSE}} uses Forbidden; {{$ENDIF}} end."
+        );
+        for with_text in [false, true] {
+            let imports = task11_fix1_imports(temp.path(), &text, with_text);
+            assert!(!imports.complete, "with_text={with_text}, {query}");
+            assert!(matches!(
+                imports.bindings[1].target,
+                pascal_core::ResolutionTarget::Incomplete
+            ));
+            assert!(matches!(
+                imports.bindings[2].target,
+                pascal_core::ResolutionTarget::Incomplete
+            ));
+        }
+    }
+}
+
+#[test]
+fn task11_fix1_retained_project_still_rejects_unsupported_active_directives() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface implementation end.",
+    )
+    .unwrap();
+    for suffix in [
+        "// ordinary\n",
+        "// SizeOf\n",
+        "{$IF SizeOf(LongWord)=4} {$ENDIF}",
+    ] {
+        let path = temp.path().join("App.pas");
+        let text = format!(
+            "unit App; interface uses Types; implementation {{$POINTERMATH ON}} {suffix} end."
+        );
+        std::fs::write(&path, &text).unwrap();
+        let mut resolver = task11_fix1_resolver(temp.path(), &path);
+        let project = resolver
+            .resolve_project_from_source(
+                &path,
+                "App",
+                &task11_fix1_sites(&text),
+                None,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            !project.complete,
+            "{suffix}: strict retained preparation accepted unsupported input"
+        );
+        assert!(!project.report.complete);
+    }
+}
+
+#[test]
+fn firedac_filesystem_candidate_accepts_directive_preamble() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("FireDAC.Phys.IB.pas"), "{$IF Defined(IOS) OR Defined(ANDROID)}{$HPPEMIT LINKUNIT}{$ELSE}{$HPPEMIT '#pragma link unit'}{$ENDIF} unit FireDAC.Phys.IB; interface {$IF UnsupportedFunction(T)} {$I forbidden.inc}{$ENDIF} implementation end.").unwrap();
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "FireDAC.Phys.IB",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Found(_)),
+        "{:?}",
+        outcome.result
+    );
+}
+
+#[test]
+fn firedac_prefix_proof_obeys_resolver_work_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("FireDAC.Phys.IB.pas"),
+        format!(
+            "{} unit FireDAC.Phys.IB;",
+            "{$HPPEMIT 'prefix work'}".repeat(100)
+        ),
+    )
+    .unwrap();
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_work: 32,
+            ..ResolverLimits::default()
+        },
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "FireDAC.Phys.IB",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Incomplete { .. }),
+        "{:?}",
+        outcome.result
+    );
+}
+
+#[test]
+fn fixround1_ordinary_header_search_work_is_cumulative_and_blocks_later_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut context = configured_disk_context(root);
+    let mut paths = Vec::new();
+    for (index, name) in ["Wrong", "Wrong", "Main"].iter().enumerate() {
+        let directory = root.join(index.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("Main.pas");
+        std::fs::write(&path, format!("{}unit {name};", " ".repeat(3000))).unwrap();
+        context.search_paths.push(directory.clone());
+        context
+            .search_path_entries
+            .push(ProjectPathEntry::legacy(directory));
+        paths.push(path);
+    }
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_work: 10_000,
+            ..ResolverLimits::default()
+        },
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Main",
+            importer_path: &root.join("App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Incomplete { .. }),
+        "expected cumulative proof refusal"
+    );
+    let usage = resolver.compile_time_usage();
+    assert!(usage.work >= 6000 && usage.work <= 10_000, "{usage:?}");
+    assert!(usage.byte_work >= 6000, "{usage:?}");
+    assert_eq!(
+        usage.retained_bytes, 0,
+        "temporary header storage is not permanent"
+    );
+    assert!(!outcome.observations.iter().any(|o| matches!(o, pascal_core::ResolutionObservation::Payload { path, .. } if path == &paths[2])), "refusal must precede the third candidate read");
+}
+
+#[test]
+fn fixround1_ordinary_proofs_record_success_mismatch_unknown_and_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let path = root.join("Main.pas");
+    for (text, expected) in [
+        (format!("{}unit Main;", " ".repeat(3000)), 0),
+        (format!("{}unit Wrong;", " ".repeat(3000)), 1),
+        ("{$IF Unsupported(T)} unit Main; {$ENDIF}".into(), 2),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let mut resolver = UnitResolver::new(
+            configured_disk_context(root),
+            vec![root.to_path_buf()],
+            FilesystemSourceStore::new(),
+            ResolverLimits::default(),
+        );
+        let outcome = resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Main",
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        );
+        match expected {
+            0 => assert!(matches!(outcome.result, Resolution::Found(_))),
+            1 => assert!(matches!(outcome.result, Resolution::Unavailable { .. })),
+            _ => assert!(matches!(outcome.result, Resolution::Incomplete { .. })),
+        }
+        let usage = resolver.compile_time_usage();
+        assert!(
+            usage.work > 0 && usage.byte_work > 0,
+            "every result spends proof work: {usage:?}"
+        );
+        assert_eq!(usage.retained_bytes, 0);
+        let before = usage.work;
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Main",
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        );
+        assert!(
+            resolver.compile_time_usage().work > before,
+            "a subsequent ordinary lookup must not reset history"
+        );
+    }
+    struct Stop(std::cell::Cell<usize>);
+    impl CancellationToken for Stop {
+        fn is_cancelled(&self) -> bool {
+            let n = self.0.get() + 1;
+            self.0.set(n);
+            n >= 250
+        }
+    }
+    std::fs::write(&path, format!("{}unit Main;", " ".repeat(3000))).unwrap();
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Main",
+            importer_path: &root.join("App.pas"),
+            legacy_route: None,
+        },
+        &Stop(0.into()),
+    );
+    assert!(!matches!(outcome.result, Resolution::Found(_)));
+    let usage = resolver.compile_time_usage();
+    assert!(
+        usage.work > 0 && usage.byte_work > 0,
+        "cancelled proof history is spent: {usage:?}"
+    );
+    assert_eq!(usage.retained_bytes, 0);
+}
+
+#[test]
+fn fixround1_ordinary_include_report_watermarks_do_not_double_bill() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("Main.pas"), "{$I header.inc}").unwrap();
+    std::fs::write(root.join("header.inc"), "unit Main;").unwrap();
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    assert!(matches!(
+        resolver
+            .resolve_unit(
+                UnitResolveRequest {
+                    requested_name: "Main",
+                    importer_path: &root.join("App.pas"),
+                    legacy_route: None
+                },
+                &NoCancellation
+            )
+            .result,
+        Resolution::Found(_)
+    ));
+    let usage = resolver.compile_time_usage();
+    assert!(usage.work > 0 && usage.byte_work > 0);
+    // Shared callback controls are also covered by the actual owning resolver
+    // tests; here verify repeated ordinary proofs retain cumulative watermarks.
+    assert!(matches!(
+        resolver
+            .resolve_unit(
+                UnitResolveRequest {
+                    requested_name: "Main",
+                    importer_path: &root.join("App.pas"),
+                    legacy_route: None
+                },
+                &NoCancellation
+            )
+            .result,
+        Resolution::Found(_)
+    ));
+    assert!(resolver.compile_time_usage().work > usage.work);
+}
+
+#[test]
+fn firedac_unknown_header_blocks_lower_priority_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lower = root.join("lower");
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::write(
+        root.join("FireDAC.Phys.IB.pas"),
+        "{$IF UnsupportedFunction(T)} unit FireDAC.Phys.IB; {$ENDIF}",
+    )
+    .unwrap();
+    std::fs::write(lower.join("FireDAC.Phys.IB.pas"), "unit FireDAC.Phys.IB;").unwrap();
+    let mut context = configured_disk_context(root);
+    context.search_paths.push(lower.clone());
+    context
+        .search_path_entries
+        .push(ProjectPathEntry::legacy(lower));
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "FireDAC.Phys.IB",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Incomplete { .. }),
+        "{:?}",
+        outcome.result
+    );
+}
+
+#[test]
+fn firedac_case_equivalent_sources_remain_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    for name in ["FireDAC.Phys.IB.pas", "firedac.phys.ib.PAS"] {
+        std::fs::write(
+            root.join(name),
+            "{$HPPEMIT 'unit fake;'} unit FireDAC.Phys.IB;",
+        )
+        .unwrap();
+    }
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "FireDAC.Phys.IB",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Ambiguous { .. }),
+        "{:?}",
+        outcome.result
+    );
+}
+
+#[test]
+fn firedac_prefix_include_changes_invalidate_selected_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("FireDAC.Phys.IB.pas"),
+        "{$I select.inc} {$IFDEF READY} unit FireDAC.Phys.IB; {$ELSE} unit Wrong; {$ENDIF}",
+    )
+    .unwrap();
+    std::fs::write(root.join("select.inc"), "{$DEFINE READY}").unwrap();
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let importer = root.join("Main.pas");
+    let request = || UnitResolveRequest {
+        requested_name: "FireDAC.Phys.IB",
+        importer_path: &importer,
+        legacy_route: None,
+    };
+    assert!(matches!(
+        resolver.resolve_unit(request(), &NoCancellation).result,
+        Resolution::Found(_)
+    ));
+    std::fs::write(root.join("select.inc"), "{$UNDEF READY}").unwrap();
+    assert!(!matches!(
+        resolver.resolve_unit(request(), &NoCancellation).result,
+        Resolution::Found(_)
+    ));
+}
+
+#[test]
+fn firedac_candidate_acceptance_uses_source_local_library_context() {
+    let mut context = fixture_context();
+    context.project_file = Some("/workspace/App.dproj".into());
+    context.project_source_roots = vec!["/workspace".into()];
+    context.search_paths.push("/sdk/lib".into());
+    context
+        .search_path_entries
+        .push(ProjectPathEntry::legacy("/sdk/lib".into()));
+    context
+        .conditional_context
+        .set_define("PRIVATE", ConditionalFact::True);
+    context.library_conditional_context =
+        support_context().with_absent_define(ConditionalFact::False);
+    let mut store = MemoryStore::default();
+    store.add(
+        "/sdk/lib/FireDAC.Phys.IB.pas",
+        "{$IFDEF PRIVATE} unit Wrong; {$ELSE} unit FireDAC.Phys.IB; {$ENDIF}",
+    );
+    let mut resolver = UnitResolver::new(
+        context,
+        vec!["/workspace".into()],
+        store,
+        ResolverLimits::default(),
+    );
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "FireDAC.Phys.IB",
+            importer_path: Path::new("/workspace/Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(outcome.result, Resolution::Found(_)),
+        "{:?}",
+        outcome.result
+    );
+}
+
+#[test]
 #[ignore = "requires explicitly supplied local Delphi installations"]
 fn local_delphi_rtl_unit_resolution() {
     use std::{env, fs, path::PathBuf};
@@ -678,7 +1387,7 @@ impl SourceStore for DeclaredNameStore {
 }
 
 #[test]
-fn resolver_uses_store_provided_declared_names() {
+fn resolver_does_not_treat_store_provided_declared_names_as_proof() {
     let mut inner = MemoryStore::default();
     inner.add(
         "/workspace/Errors.pas",
@@ -704,8 +1413,8 @@ fn resolver_uses_store_provided_declared_names() {
         &NoCancellation,
     );
     assert!(
-        matches!(result.result, Resolution::Found(_)),
-        "the store-provided declared name must replace parsing the candidate"
+        matches!(result.result, Resolution::Unavailable { .. }),
+        "a cached raw name cannot replace source-backed proof"
     );
 }
 

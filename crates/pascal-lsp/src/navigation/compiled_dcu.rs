@@ -338,6 +338,11 @@ pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
         unit.hash(&mut hasher);
     }
     context.defines.hash(&mut hasher);
+    context.conditional_context.fingerprint().hash(&mut hasher);
+    context
+        .library_conditional_context
+        .fingerprint()
+        .hash(&mut hasher);
     context.config.hash(&mut hasher);
     context.platform.hash(&mut hasher);
     context.overrides.hash(&mut hasher);
@@ -517,4 +522,65 @@ pub fn discover_compiled_units(
         });
     }
     Ok(loaded)
+}
+
+#[cfg(test)]
+mod task13_fingerprint_tests {
+    use super::*;
+    use pascal_project::{ConditionalFact, LayoutContext, LayoutPlatform, LayoutSettings};
+
+    #[test]
+    fn project_fingerprint_covers_each_project_and_provider_layout_default() {
+        let conditional_context =
+            pascal_project::ConditionalContext::default().with_layout(LayoutContext {
+                platform: Some(LayoutPlatform::Win32),
+                defaults: LayoutSettings::default(),
+            });
+        let base = ProjectContext {
+            library_conditional_context: conditional_context.clone(),
+            conditional_context,
+            ..ProjectContext::default()
+        };
+        let before = project_context_fingerprint(&base);
+        for defaults in [
+            LayoutSettings {
+                record_alignment: Some(1),
+                ..LayoutSettings::default()
+            },
+            LayoutSettings {
+                minimum_enum_size: Some(4),
+                ..LayoutSettings::default()
+            },
+            LayoutSettings {
+                long_strings: ConditionalFact::True,
+                ..LayoutSettings::default()
+            },
+            LayoutSettings {
+                old_type_layout: ConditionalFact::True,
+                ..LayoutSettings::default()
+            },
+            LayoutSettings {
+                real_compatibility: ConditionalFact::True,
+                ..LayoutSettings::default()
+            },
+        ] {
+            for library in [false, true] {
+                let mut edited = base.clone();
+                let context = if library {
+                    &mut edited.library_conditional_context
+                } else {
+                    &mut edited.conditional_context
+                };
+                *context = context.clone().with_layout(LayoutContext {
+                    platform: Some(LayoutPlatform::Win32),
+                    defaults: defaults.clone(),
+                });
+                assert_ne!(
+                    project_context_fingerprint(&edited),
+                    before,
+                    "library={library}, {defaults:?}"
+                );
+            }
+        }
+    }
 }

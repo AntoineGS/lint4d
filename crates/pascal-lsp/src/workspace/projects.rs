@@ -149,7 +149,7 @@ pub(crate) struct ProjectContextPreparation {
 impl ProjectContextPreparation {
     pub(crate) fn needs_installation_choice(&self) -> bool {
         matches!(
-            self.state.context.installation_selection.as_ref(),
+            self.state.context.installation_selection(),
             Some(InstallationSelection::NeedsChoice { .. })
         )
     }
@@ -474,7 +474,7 @@ impl Workspace {
             "directory"
         } else if self.options.project_file.is_some() {
             "configured"
-        } else if context.project_file.is_some() {
+        } else if context.project_file().is_some() {
             "automatic"
         } else if !candidates.files.is_empty() {
             "ambiguous"
@@ -483,13 +483,13 @@ impl Workspace {
         };
 
         let (installation_candidates, installation_selection_mode) =
-            if let Some(project_file) = context.project_file.as_deref() {
+            if let Some(project_file) = context.project_file() {
                 match self.installation_selection_snapshot(project_file, cancel, budget) {
                     Ok((_, candidates, selection)) => (
                         candidates,
                         installation_selection_mode(&selection).to_string(),
                     ),
-                    Err(error) if context.override_error.as_deref() == Some(error.as_str()) => {
+                    Err(error) if context.override_error() == Some(error.as_str()) => {
                         // Project discovery already recorded this exact
                         // malformed-override diagnostic in the context. Keep
                         // the inspection request usable, but do not convert a
@@ -506,7 +506,7 @@ impl Workspace {
                 (Vec::new(), "automatic".to_string())
             };
         let path_issues = context
-            .path_issues
+            .path_issues()
             .iter()
             .map(|issue| {
                 serde_json::json!({
@@ -529,25 +529,20 @@ impl Workspace {
                 .filter_map(|path| file_uri(path))
                 .collect(),
             selected_project_uri: selection_is_valid
-                .then(|| {
-                    context
-                        .project_file
-                        .as_ref()
-                        .and_then(|path| file_uri(path))
-                })
+                .then(|| context.project_file().and_then(file_uri))
                 .flatten(),
             selection_mode: selection_mode.to_string(),
-            selected_installation_id: context.installation_selection.as_ref().and_then(
-                |selection| match selection {
+            selected_installation_id: context.installation_selection().and_then(|selection| {
+                match selection {
                     InstallationSelection::Selected { id, .. } => Some(id.clone()),
                     _ => None,
-                },
-            ),
+                }
+            }),
             installation_selection_mode,
             installation_candidates,
             main_source_uri: context.main_source().and_then(file_uri),
             installation_config_uris: context
-                .installation_config_files
+                .installation_config_files()
                 .iter()
                 .filter_map(|path| file_uri(path))
                 .collect(),
@@ -709,8 +704,8 @@ impl Workspace {
             self.discover_build_context(&project_path, selections.clone(), cancel, budget)?;
         if let Some(value) = value {
             let selection = match field {
-                BuildField::Config => &validation.context.config_selection,
-                BuildField::Platform => &validation.context.platform_selection,
+                BuildField::Config => &validation.context.config_selection(),
+                BuildField::Platform => &validation.context.platform_selection(),
             };
             if !selection
                 .candidates
@@ -782,8 +777,7 @@ impl Workspace {
         )?;
         if discovery
             .context
-            .project_file
-            .as_deref()
+            .project_file()
             .is_none_or(|path| !project_paths_equal(path, project_path))
         {
             return Err(format!(
@@ -873,8 +867,7 @@ impl Workspace {
             }
         };
         if validation
-            .project_file
-            .as_deref()
+            .project_file()
             .is_none_or(|path| !project_paths_equal(path, &project_path))
         {
             return Err(format!(
@@ -895,7 +888,7 @@ impl Workspace {
             .collect::<HashSet<_>>();
         let project_dependency =
             self.preflight_project_selection_dependency(&project_path, budget)?;
-        let selected_after_change = match validation.installation_selection.as_ref() {
+        let selected_after_change = match validation.installation_selection() {
             Some(InstallationSelection::Selected { id, .. }) => Some(id.clone()),
             _ => None,
         };
@@ -916,8 +909,7 @@ impl Workspace {
             } else {
                 installation_selection_mode(
                     validation
-                        .installation_selection
-                        .as_ref()
+                        .installation_selection()
                         .unwrap_or(&InstallationSelection::Legacy),
                 )
                 .to_string()
@@ -1133,7 +1125,8 @@ impl Workspace {
         )?;
         let selection = discovery
             .context
-            .installation_selection
+            .installation_selection()
+            .cloned()
             .unwrap_or(InstallationSelection::Legacy);
         Ok((configuration, candidates, selection))
     }
@@ -1322,8 +1315,7 @@ impl Workspace {
         )?;
         if validation
             .context
-            .project_file
-            .as_deref()
+            .project_file()
             .is_none_or(|found| !project_paths_equal(found, &selected))
             && project.is_some()
         {
@@ -1472,11 +1464,11 @@ impl Workspace {
 
 fn build_context_info(project_uri: &Url, project: &DiscoveredProject) -> BuildContextInfo {
     let context = &project.context;
-    let rtl_constants = &context.conditional_closure;
+    let rtl_constants = &context.conditional_closure();
     BuildContextInfo {
         project_uri: canonical_file_uri(project_uri),
-        config: build_selection_info(&context.config_selection),
-        platform: build_selection_info(&context.platform_selection),
+        config: build_selection_info(context.config_selection()),
+        platform: build_selection_info(context.platform_selection()),
         conditionals: ConditionalsInfo {
             closed: rtl_constants.closed,
             open_reasons: rtl_constants

@@ -18,7 +18,7 @@ fn short_directory_names_retire_unused_filename_reservation() {
     let request = DirectoryRequest {
         directory: temp.path(),
         entry: &entry,
-        read_policy: &context.read_policy,
+        read_policy: context.read_policy(),
     };
     let mut store = FilesystemSourceStore::new();
     let mut budget = CompileTimeBudget::new(
@@ -54,7 +54,7 @@ fn admitted_spelling_listing_keeps_symlink_names_without_following_targets() {
     let request = DirectoryRequest {
         directory: temp.path(),
         entry: &entry,
-        read_policy: &context.read_policy,
+        read_policy: context.read_policy(),
     };
     let mut store = FilesystemSourceStore::new();
     let ordinary = store.list_directory(request, &NoCancellation).unwrap();

@@ -975,6 +975,7 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "libc",
+ "pascal-project",
  "quick-xml",
  "serde",
  "serde_json",

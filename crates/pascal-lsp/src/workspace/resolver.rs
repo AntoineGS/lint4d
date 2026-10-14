@@ -370,7 +370,7 @@ impl LspSourceStore {
                 path: path.clone(),
                 reason: "source is outside the requester-scoped project roots".to_string(),
             })?;
-        let read_policy = self.context.read_policy.clone();
+        let read_policy = self.context.read_policy().clone();
         self.load(
             SourceRequest {
                 path: &path,
@@ -877,7 +877,7 @@ pub(crate) fn source_record_for_loaded(
             content_bytes: None,
             candidate_membership: None,
             candidate_observations: Vec::new(),
-            read_policy: Some(context.read_policy.clone()),
+            read_policy: Some(context.read_policy().clone()),
             path_entry: context.path_entry_for(&source.path),
             include_payload,
             missing_provider_candidate: false,
@@ -980,7 +980,7 @@ fn payload_record(
             content_bytes: None,
             candidate_membership: None,
             candidate_observations: Vec::new(),
-            read_policy: Some(context.read_policy.clone()),
+            read_policy: Some(context.read_policy().clone()),
             path_entry: context.path_entry_for(path),
             include_payload: false,
             missing_provider_candidate: false,
@@ -1123,7 +1123,7 @@ pub(crate) fn report_records(
                         Some(read.stamp.clone()),
                         Some(read.content_hash),
                         read.content_bytes.clone(),
-                        Some(context.read_policy.clone()),
+                        Some(context.read_policy().clone()),
                         context.path_entry_for(&read.path),
                     )
                 }
@@ -1364,7 +1364,7 @@ mod admitted_encoding_tests {
                 .unwrap()
                 .context;
         let entry = context.path_entry_for(&path).unwrap();
-        let policy = context.read_policy.clone();
+        let policy = context.read_policy().clone();
         let mut store = LspSourceStore::from_input(context, &workspace.analysis_input());
         let mut budget = CompileTimeBudget::new(
             CompileTimeLimits {

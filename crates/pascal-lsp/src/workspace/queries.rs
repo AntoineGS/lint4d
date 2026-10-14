@@ -942,7 +942,7 @@ pub(crate) fn references_from_input(
             ),
         );
     }
-    if owner.state.context.override_error.is_some() {
+    if owner.state.context.override_error().is_some() {
         return failed(
             source_generation,
             configuration_generation,
@@ -1032,7 +1032,7 @@ pub(crate) fn highlights_from_input(
             ),
         );
     }
-    if owner.state.context.override_error.is_some() {
+    if owner.state.context.override_error().is_some() {
         return failed(
             source_generation,
             configuration_generation,
@@ -1886,14 +1886,14 @@ pub(crate) fn document_links_from_input(
                 continue;
             };
             let target_path = directory.join(path);
-            let Some(entry) = context.read_policy.entry_for_path(&target_path) else {
+            let Some(entry) = context.read_policy().entry_for_path(&target_path) else {
                 continue;
             };
-            if !context.read_policy.allows_location(&entry) {
+            if !context.read_policy().allows_location(&entry) {
                 continue;
             }
             let bytes = match context
-                .read_policy
+                .read_policy()
                 .read_payload_bytes(&entry, MAX_DOCUMENT_LINK_RESOURCE_FILE_BYTES)
             {
                 Ok(bytes) => bytes,
@@ -1926,7 +1926,7 @@ pub(crate) fn document_links_from_input(
                 content_bytes: None,
                 candidate_membership: None,
                 candidate_observations: Vec::new(),
-                read_policy: Some(context.read_policy.clone()),
+                read_policy: Some(context.read_policy().clone()),
                 path_entry: Some(entry),
                 include_payload: false,
                 missing_provider_candidate: false,
@@ -1985,7 +1985,7 @@ pub(crate) fn document_links_from_input(
             // A document link needs a selected project/workspace read root,
             // independent of that legacy navigation fallback.
             if super::context_path_entry(&context, &real_path).is_none()
-                || !context.read_policy.allows_location(&ProjectPathEntry {
+                || !context.read_policy().allows_location(&ProjectPathEntry {
                     path: target_path,
                     provenance: ProjectPathProvenance::LegacyNative,
                 })
@@ -2810,7 +2810,7 @@ mod tests {
         let (context, _) =
             project_context_and_metadata_for_input(&input, &source_uri(&source), &cancel)
                 .expect("automatic project discovery");
-        assert_eq!(context.project_file, Some(project));
+        assert_eq!(context.project_file(), Some(project.as_path()));
         assert_eq!(context.defines(), vec!["CAPTURED"]);
     }
 
@@ -3035,13 +3035,17 @@ mod tests {
         );
 
         let mut changed_context = input.clone();
-        changed_context
-            .cached_documents
-            .get_mut(&uri)
-            .expect("cached document")
-            .context
-            .conditional_context
-            .set_define("CONTEXT_CHANGED", pascal_project::ConditionalFact::True);
+        crate::edit_context(
+            &mut changed_context
+                .cached_documents
+                .get_mut(&uri)
+                .expect("cached document")
+                .context,
+            |p| {
+                p.conditional_context
+                    .set_define("CONTEXT_CHANGED", pascal_project::ConditionalFact::True)
+            },
+        );
         crate::navigation::test_reset_document_parse_count();
         let computed =
             selection_ranges_from_input(changed_context, &uri, vec![Position::new(0, 0)], &cancel);

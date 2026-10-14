@@ -134,11 +134,11 @@ fn unverified_compiler_defaults_are_not_project_property_defaults() {
     for version in [None, Some(CompilerVersion::new(37, 0))] {
         let (_temp, context) = discover("", options(version));
         assert_eq!(
-            context.conditional_context.layout.defaults,
+            context.conditional_context().layout.defaults,
             LayoutSettings::default()
         );
         assert_eq!(
-            context.library_conditional_context.layout.defaults,
+            context.library_conditional_context().layout.defaults,
             LayoutSettings::default()
         );
         let (_temp, context) = discover(
@@ -146,23 +146,27 @@ fn unverified_compiler_defaults_are_not_project_property_defaults() {
             options(version),
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.record_alignment,
+            context
+                .conditional_context()
+                .layout
+                .defaults
+                .record_alignment,
             Some(2)
         );
         assert_eq!(
             context
-                .conditional_context
+                .conditional_context()
                 .layout
                 .defaults
                 .minimum_enum_size,
             Some(1)
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.long_strings,
+            context.conditional_context().layout.defaults.long_strings,
             F::True
         );
         assert_eq!(
-            context.library_conditional_context.layout.defaults,
+            context.library_conditional_context().layout.defaults,
             LayoutSettings::default()
         );
     }
@@ -176,13 +180,16 @@ fn invalid_selection_does_not_establish_target_or_compiler_defaults() {
     // Legacy global options retain their selection mode even when undeclared;
     // layout admission must independently respect the declared candidate set.
     assert_eq!(
-        context.platform_selection.selected.as_deref(),
+        context.platform_selection().selected.as_deref(),
         Some("Win64")
     );
-    assert_eq!(context.platform_selection.candidates, ["Win32"]);
-    assert_eq!(context.conditional_context.layout, LayoutContext::default());
+    assert_eq!(context.platform_selection().candidates, ["Win32"]);
     assert_eq!(
-        context.library_conditional_context.layout,
+        context.conditional_context().layout,
+        LayoutContext::default()
+    );
+    assert_eq!(
+        context.library_conditional_context().layout,
         LayoutContext::default()
     );
 }
@@ -195,16 +202,20 @@ fn unresolved_or_invalid_properties_invalidate_only_affected_settings() {
             options(Some(CompilerVersion::new(36, 0))),
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.record_alignment,
+            context
+                .conditional_context()
+                .layout
+                .defaults
+                .record_alignment,
             None
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.long_strings,
+            context.conditional_context().layout.defaults.long_strings,
             F::True
         );
         assert_eq!(
             context
-                .library_conditional_context
+                .library_conditional_context()
                 .layout
                 .defaults
                 .record_alignment,
@@ -216,19 +227,23 @@ fn unresolved_or_invalid_properties_invalidate_only_affected_settings() {
         options(Some(CompilerVersion::new(36, 0))),
     );
     assert_eq!(
-        context.conditional_context.layout.defaults.long_strings,
+        context.conditional_context().layout.defaults.long_strings,
         F::Unknown
     );
     assert_eq!(
         context
-            .conditional_context
+            .conditional_context()
             .layout
             .defaults
             .minimum_enum_size,
         None
     );
     assert_eq!(
-        context.conditional_context.layout.defaults.record_alignment,
+        context
+            .conditional_context()
+            .layout
+            .defaults
+            .record_alignment,
         Some(8)
     );
 }
@@ -241,8 +256,8 @@ fn explicit_unknown_layout_cannot_be_filled_by_metadata() {
         .with_layout(LayoutContext::default());
     let (_temp, context) = discover("<DCC_Alignment>1</DCC_Alignment>", opts);
     for ctx in [
-        &context.conditional_context,
-        &context.library_conditional_context,
+        &context.conditional_context(),
+        &context.library_conditional_context(),
     ] {
         assert_eq!(ctx.layout, LayoutContext::default());
         assert!(ctx.layout_explicit);
@@ -261,16 +276,19 @@ fn explicit_layout_overrides_properties_but_not_conflicting_target() {
     let mut opts = options(Some(CompilerVersion::new(36, 0)));
     opts.conditional_context = opts.conditional_context.with_layout(supplied.clone());
     let (_temp, context) = discover("<DCC_Alignment>1</DCC_Alignment>", opts.clone());
-    assert_eq!(context.conditional_context.layout, supplied);
-    assert_eq!(context.library_conditional_context.layout, supplied);
+    assert_eq!(context.conditional_context().layout, supplied);
+    assert_eq!(context.library_conditional_context().layout, supplied);
     opts.conditional_context.layout.platform = Some(LayoutPlatform::Win64);
     let (_temp, context) = discover("", opts);
-    assert_eq!(context.conditional_context.layout, LayoutContext::default());
     assert_eq!(
-        context.library_conditional_context.layout,
+        context.conditional_context().layout,
         LayoutContext::default()
     );
-    assert!(context.conditional_context.layout_explicit);
+    assert_eq!(
+        context.library_conditional_context().layout,
+        LayoutContext::default()
+    );
+    assert!(context.conditional_context().layout_explicit);
 }
 
 #[test]
@@ -342,11 +360,15 @@ fn unknown_conditions_and_imports_do_not_supply_defaults() {
         options(Some(CompilerVersion::new(36, 0))),
     );
     assert_eq!(
-        context.conditional_context.layout.defaults.record_alignment,
+        context
+            .conditional_context()
+            .layout
+            .defaults
+            .record_alignment,
         None
     );
     assert_eq!(
-        context.conditional_context.layout.defaults.long_strings,
+        context.conditional_context().layout.defaults.long_strings,
         F::True
     );
 
@@ -360,11 +382,15 @@ fn unknown_conditions_and_imports_do_not_supply_defaults() {
             opts.clone(),
         );
         assert_eq!(
-            context.conditional_context.layout.platform,
+            context.conditional_context().layout.platform,
             Some(LayoutPlatform::Win32)
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.record_alignment,
+            context
+                .conditional_context()
+                .layout
+                .defaults
+                .record_alignment,
             if later_assignment.is_empty() {
                 None
             } else {
@@ -372,12 +398,12 @@ fn unknown_conditions_and_imports_do_not_supply_defaults() {
             }
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.long_strings,
+            context.conditional_context().layout.defaults.long_strings,
             F::Unknown
         );
         assert_eq!(
             context
-                .library_conditional_context
+                .library_conditional_context()
                 .layout
                 .defaults
                 .record_alignment,
@@ -385,7 +411,7 @@ fn unknown_conditions_and_imports_do_not_supply_defaults() {
         );
         assert_eq!(
             context
-                .library_conditional_context
+                .library_conditional_context()
                 .layout
                 .defaults
                 .long_strings,
@@ -409,19 +435,23 @@ fn bounded_property_values_are_data_without_compiler_defaults() {
             options(None),
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.record_alignment,
+            context
+                .conditional_context()
+                .layout
+                .defaults
+                .record_alignment,
             alignment.parse().ok()
         );
         assert_eq!(
             context
-                .conditional_context
+                .conditional_context()
                 .layout
                 .defaults
                 .minimum_enum_size,
             enum_size.parse().ok()
         );
         assert_eq!(
-            context.conditional_context.layout.defaults.long_strings,
+            context.conditional_context().layout.defaults.long_strings,
             expected
         );
     }
@@ -448,38 +478,42 @@ fn standalone_layout_uses_only_explicit_target_facts() {
         .context
     };
     assert_eq!(
-        discover_source(&opts).conditional_context.layout,
+        discover_source(&opts).conditional_context().layout,
         LayoutContext::default()
     );
     opts.platform = Some("x64".into());
     let context = discover_source(&opts);
     assert_eq!(
-        context.conditional_context.layout.platform,
+        context.conditional_context().layout.platform,
         Some(LayoutPlatform::Win64)
     );
     assert_eq!(
-        context.conditional_context.layout.defaults.record_alignment,
+        context
+            .conditional_context()
+            .layout
+            .defaults
+            .record_alignment,
         Some(8)
     );
     assert_eq!(
-        context.conditional_context.layout,
-        context.library_conditional_context.layout
+        context.conditional_context().layout,
+        context.library_conditional_context().layout
     );
     opts.platform = Some("Linux64".into());
     let context = discover_source(&opts);
     assert_eq!(
-        context.conditional_context.layout.platform,
+        context.conditional_context().layout.platform,
         Some(LayoutPlatform::Other("Linux64".into()))
     );
     assert_eq!(
-        context.conditional_context.layout.defaults,
+        context.conditional_context().layout.defaults,
         LayoutSettings::default()
     );
     opts.conditional_context = opts
         .conditional_context
         .with_layout(LayoutContext::default());
     assert_eq!(
-        discover_source(&opts).conditional_context.layout,
+        discover_source(&opts).conditional_context().layout,
         LayoutContext::default()
     );
 }

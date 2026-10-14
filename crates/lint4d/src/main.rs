@@ -698,8 +698,8 @@ fn resolve_source_project(
     }
     let configuration_id = format!(
         "config={};platform={}",
-        project.context.config.as_deref().unwrap_or_default(),
-        project.context.platform.as_deref().unwrap_or_default()
+        project.context.config().unwrap_or_default(),
+        project.context.platform().unwrap_or_default()
     );
     Some(SourceProject {
         project,

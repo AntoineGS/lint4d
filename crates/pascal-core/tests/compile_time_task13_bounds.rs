@@ -6,6 +6,15 @@ use pascal_core::{NoCancellation, ResolverError};
 use pascal_project::LayoutPlatform;
 use support::{Fixture, activity, context};
 
+fn edit_context<R>(
+    context: &mut pascal_project::ProjectContext,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts);
+}
+
 #[test]
 fn task13_depth_boundaries_are_safe_in_isolated_default_stack_processes() {
     for case in [
@@ -150,7 +159,9 @@ fn task13_include_boundary(case: &str) {
     let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
         .unwrap()
         .context;
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut limits = ResolverLimits::default();
     assert_eq!(limits.max_include_depth, 256);
     if depth <= 5 {
@@ -371,7 +382,9 @@ fn task13_failed_include_probes_recover_without_resetting_work_or_publishing_par
     let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
         .unwrap()
         .context;
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![root.into()],

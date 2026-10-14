@@ -1040,8 +1040,8 @@ pub(crate) enum SnapshotMode {
 
 fn context_incomplete_for_mode(mode: SnapshotMode, context: &ProjectContext) -> bool {
     match mode {
-        SnapshotMode::Workspace => !context.discovery_complete,
-        SnapshotMode::WorkspaceSymbols => context.override_error.is_some(),
+        SnapshotMode::Workspace => !context.discovery_complete(),
+        SnapshotMode::WorkspaceSymbols => context.override_error().is_some(),
         SnapshotMode::Local | SnapshotMode::LocalWithImports | SnapshotMode::Assistance => false,
     }
 }
@@ -1210,20 +1210,11 @@ impl Enumeration {
 }
 
 fn evaluated_contexts_equal(left: &ProjectContext, right: &ProjectContext) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    normalize_standalone_legacy_roots(&mut left);
-    normalize_standalone_legacy_roots(&mut right);
-    left == right
-}
-
-fn normalize_standalone_legacy_roots(context: &mut ProjectContext) {
-    if context.project_file.is_some() {
-        return;
+    if left.project_file().is_none() && right.project_file().is_none() {
+        left.eq_ignoring_legacy_search_roots(right)
+    } else {
+        left == right
     }
-    context
-        .search_path_entries
-        .retain(|entry| !matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
 }
 
 #[derive(Debug, Clone)]
@@ -2379,7 +2370,7 @@ pub(crate) fn source_for_input_with_owner(
             "project selection is invalid; select a current project or Automatic for {uri}"
         ));
     }
-    if let Some(error) = owner.state.context.override_error.as_deref() {
+    if let Some(error) = owner.state.context.override_error() {
         return Err(format!(
             "project override configuration is invalid; analysis is unavailable for {uri}: {error}"
         ));
@@ -2394,7 +2385,7 @@ pub(crate) fn source_for_input_with_owner(
         })
         .ok_or_else(|| format!("source is outside the effective project read roots: {uri}"))?;
     let allow_legacy_payload = matches!(&entry.provenance, ProjectPathProvenance::LegacyNative);
-    let read_policy = owner.state.context.read_policy.clone();
+    let read_policy = owner.state.context.read_policy().clone();
     let disk = read_disk_source(
         &path,
         input.options.limits.max_file_bytes,
@@ -2588,7 +2579,7 @@ pub(crate) fn input_source_is_readable_with_owner(
         Some(&owner.key),
         legacy_route,
     ) && (workspace.accepts_path(&path)
-        || owner.state.context.project_file.is_some()
+        || owner.state.context.project_file().is_some()
         || workspace.mapped_path_is_readable(&path, &owner.key)
         || legacy_route)
 }
@@ -2667,12 +2658,13 @@ fn binding_classification_for_input(
     // An incomplete project context cannot establish conditional branch facts.
     // Self-contained classification must therefore prove the local binding
     // without inheriting defines from an ambiguous or partially read project.
-    let conditional_context =
-        if !context.discovery_complete && !matches!(self_contained_mode, SelfContainedMode::None) {
-            ConditionalContext::default()
-        } else {
-            conditional_context_for_uri(&context, uri)
-        };
+    let conditional_context = if !context.discovery_complete()
+        && !matches!(self_contained_mode, SelfContainedMode::None)
+    {
+        ConditionalContext::default()
+    } else {
+        conditional_context_for_uri(&context, uri)
+    };
     let expanded_info = expanded_binding_info_for_input(
         input,
         uri,
@@ -2714,7 +2706,7 @@ fn add_project_unit_alias_names(
         .iter()
         .map(|name| name.trim_start_matches('&').to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    for (alias, target) in &context.unit_aliases {
+    for (alias, target) in context.unit_aliases() {
         if names.contains(&target.trim_start_matches('&').to_ascii_lowercase()) {
             info.names.push(alias.clone());
         }
@@ -2876,8 +2868,8 @@ pub(crate) fn consumed_context_records(
     cancel: &AtomicBool,
 ) -> Result<Vec<SourceRecord>, String> {
     let mut metadata_paths = state.context_observations.metadata_files.clone();
-    if let Some(project_file) = &state.context.project_file {
-        metadata_paths.push(project_file.clone());
+    if let Some(project_file) = state.context.project_file() {
+        metadata_paths.push(project_file.to_path_buf());
     }
     if let Some(main_source) = state.context.main_source() {
         metadata_paths.push(main_source.to_path_buf());
@@ -3444,7 +3436,7 @@ fn unit_provider_path_is_project_metadata(context: &ProjectContext, provider_uri
         .main_source()
         .is_some_and(|path| path_key(&absolute_path(path.to_path_buf())) == provider_key)
         || context
-            .explicit_unit_entries
+            .explicit_unit_entries()
             .values()
             .flatten()
             .any(|entry| path_key(&absolute_path(entry.path.clone())) == provider_key)
@@ -3693,8 +3685,8 @@ pub(crate) fn symbol_rename_from_input(
         let (query, _) = project_state_and_metadata_for_input(&input, uri, cancel)?;
         let (provider, _) = project_state_and_metadata_for_input(&input, &provider_uri, cancel)?;
         Ok::<_, String>(
-            query.context.discovery_complete
-                && provider.context.discovery_complete
+            query.context.discovery_complete()
+                && provider.context.discovery_complete()
                 && query.context == provider.context
                 && query.context_observations == provider.context_observations,
         )
@@ -3917,7 +3909,7 @@ fn rename_from_input_impl(
         // explicit unit path, or a package `contains ... in` path pointing at
         // the pre-move URI.
         if unit_provider_path_is_project_metadata(&state.context, &uri)
-            || !state.context.packages.is_empty()
+            || !state.context.packages().is_empty()
             || project_records.iter().any(|record| {
                 record
                     .path
@@ -4526,7 +4518,7 @@ fn selected_explicit_uses_path_edits(
             }
             let (consumer_state, _) =
                 project_state_and_metadata_for_input(input, source_uri, cancel)?;
-            if !consumer_state.context.discovery_complete
+            if !consumer_state.context.discovery_complete()
                 || !project_contexts_match_for_explicit_in_path(
                     &consumer_state.context,
                     &consumer_state.context_observations,
@@ -5266,8 +5258,8 @@ fn snapshot_context_for_uri(
 }
 
 fn context_state_is_reusable_for_exact_directory(state: &ContextState) -> bool {
-    if !state.context.discovery_complete
-        || !state.context.binding_metadata_complete
+    if !state.context.discovery_complete()
+        || !state.context.binding_metadata_complete()
         || state.project_candidate_memberships.is_empty()
     {
         return false;
@@ -5335,7 +5327,7 @@ fn snapshot_payload_dependency(
             "source path is outside the effective project read roots: {path:?}"
         ));
     }
-    Ok((context.read_policy.clone(), entry))
+    Ok((context.read_policy().clone(), entry))
 }
 
 fn discover_enumerated_contexts(
@@ -5475,7 +5467,7 @@ fn discover_enumerated_contexts(
             && enumeration
                 .contexts
                 .get(&owner)
-                .is_some_and(|state| !state.context.discovery_complete)
+                .is_some_and(|state| !state.context.discovery_complete())
         {
             enumeration.complete = false;
             enumeration.reason.get_or_insert_with(|| {
@@ -5555,7 +5547,7 @@ fn discover_project_metadata_contexts(
 fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mapped_read_roots = context
-        .overrides
+        .overrides()
         .read_roots()
         .into_iter()
         .map(|root| super::native_mapping_root(&root))
@@ -5583,13 +5575,13 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
         }
         ProjectPathProvenance::LegacyNative => {}
     };
-    for entry in &context.search_path_entries {
+    for entry in context.search_path_entries() {
         add_entry(entry);
     }
-    if let Some(entry) = &context.main_source_entry {
+    if let Some(entry) = &context.main_source_entry() {
         add_entry(entry);
     }
-    for entries in context.explicit_unit_entries.values() {
+    for entries in context.explicit_unit_entries().values() {
         for entry in entries {
             add_entry(entry);
         }
@@ -5599,7 +5591,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
     // them back to an effective mapping by destination containment so an
     // absolute mapped include can also contribute its consumer root.
     for include_path in &context.include_paths() {
-        for mapping in &context.overrides.path_mappings {
+        for mapping in &context.overrides().path_mappings {
             let root = super::native_mapping_root(&mapping.to);
             if super::path_starts_with_native(include_path, &root) {
                 add_root(&root);
@@ -5610,7 +5602,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
     // project has no unit-search, MainSource, reference, or include entry
     // under that destination. Keep the package root scoped to contexts that
     // actually request named packages; do not form a global mapping union.
-    if !context.packages.is_empty() {
+    if !context.packages().is_empty() {
         for root in mapped_read_roots {
             add_root(&root);
         }
@@ -5645,8 +5637,8 @@ fn enumerate_mapped_sources(
             continue;
         };
         let mapped_roots = mapped_source_roots(&context);
-        if !context.discovery_complete
-            && (!mapped_roots.is_empty() || context.override_error.is_some())
+        if !context.discovery_complete()
+            && (!mapped_roots.is_empty() || context.override_error().is_some())
         {
             enumeration.complete = false;
             enumeration.reason.get_or_insert_with(|| {
@@ -6045,7 +6037,7 @@ fn build_snapshot_with_policy(
             if !loader
                 .contexts
                 .get(context_key)
-                .is_some_and(|state| state.context.discovery_complete)
+                .is_some_and(|state| state.context.discovery_complete())
             {
                 let target_has_include = priority_seed
                     .as_ref()
@@ -6243,7 +6235,7 @@ fn build_snapshot_with_policy(
         if !loader
             .contexts
             .get(&context_key)
-            .is_some_and(|state| state.context.discovery_complete)
+            .is_some_and(|state| state.context.discovery_complete())
         {
             complete = false;
             incomplete_reason.get_or_insert_with(|| {
@@ -6651,7 +6643,7 @@ fn build_snapshot_with_policy(
                 if allow_incomplete_context_for
                     .iter()
                     .any(|allowed_uri| allowed_uri == &uri)
-                    && !state.context.discovery_complete
+                    && !state.context.discovery_complete()
                 {
                     ConditionalContext::default()
                 } else {
@@ -7164,7 +7156,7 @@ fn retain_expansion_dependencies(
                 });
                 continue;
             };
-            (context.read_policy.clone(), path_entry.clone())
+            (context.read_policy().clone(), path_entry.clone())
         } else {
             match snapshot_payload_dependency(loader, context_key, &path) {
                 Ok(value) => value,
@@ -7177,7 +7169,7 @@ fn retain_expansion_dependencies(
                         continue;
                     };
                     (
-                        context.read_policy.clone(),
+                        context.read_policy().clone(),
                         ProjectPathEntry {
                             path: path.clone(),
                             provenance: ProjectPathProvenance::LegacyNative,
@@ -7383,13 +7375,13 @@ fn assistance_auto_import_scopes(
         let mut roots = context.search_paths();
         roots.extend(
             context
-                .main_source_entry
+                .main_source_entry()
                 .iter()
                 .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
         );
         roots.extend(
             context
-                .explicit_unit_entries
+                .explicit_unit_entries()
                 .values()
                 .flatten()
                 .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
@@ -7408,7 +7400,7 @@ fn assistance_auto_import_scopes(
         for root in roots {
             let root = absolute_path(root);
             let path_entry = context
-                .search_path_entries
+                .search_path_entries()
                 .iter()
                 .find(|entry| paths_equal_ci(&entry.path, &root))
                 .cloned()
@@ -7421,7 +7413,7 @@ fn assistance_auto_import_scopes(
                 root,
                 provider_units: provider_units.clone(),
                 candidate_prefixes: candidate_prefixes.to_vec(),
-                read_policy: context.read_policy.clone(),
+                read_policy: context.read_policy().clone(),
                 path_entry,
             });
         }
@@ -7736,13 +7728,13 @@ fn enumerate_assistance_provider_sources(
         let mut context_roots = context.search_paths();
         context_roots.extend(
             context
-                .main_source_entry
+                .main_source_entry()
                 .iter()
                 .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
         );
         context_roots.extend(
             context
-                .explicit_unit_entries
+                .explicit_unit_entries()
                 .values()
                 .flatten()
                 .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
@@ -7971,7 +7963,7 @@ fn capture_context_baseline(
                 baseline.set_payload_observation(
                     path,
                     stamp,
-                    state.context.read_policy.clone(),
+                    state.context.read_policy().clone(),
                     path_entry,
                 );
             }
@@ -8361,7 +8353,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         let conditional_context = context
             .as_ref()
             .map(|(_, context, _)| {
-                if !context.discovery_complete
+                if !context.discovery_complete()
                     && auditor
                         .allow_incomplete_context_for
                         .iter()
@@ -8380,7 +8372,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         }
         let incomplete_context = context
             .as_ref()
-            .is_none_or(|(_, context, _)| !context.discovery_complete);
+            .is_none_or(|(_, context, _)| !context.discovery_complete());
         let allow_incomplete_context = auditor
             .allow_incomplete_context_for
             .iter()
@@ -8554,7 +8546,7 @@ impl IncludeAuditor<'_> {
             .allow_incomplete_context_for
             .iter()
             .any(|allowed_uri| allowed_uri == uri);
-        if !context.discovery_complete && !allow_incomplete_context {
+        if !context.discovery_complete() && !allow_incomplete_context {
             self.result.incomplete_reason.get_or_insert_with(|| {
                 format!("project context is ambiguous or incomplete for {uri}")
             });
@@ -9326,7 +9318,7 @@ fn is_readable_include_for_context(
     }
 
     workspace.accepts_path(&path)
-        || context.search_path_entries.iter().any(|entry| {
+        || context.search_path_entries().iter().any(|entry| {
             if !path_starts_with_native(&path, &entry.path) {
                 return false;
             }
@@ -9338,7 +9330,7 @@ fn is_readable_include_for_context(
                 ProjectPathProvenance::LegacyNative => true,
             }
         })
-        || context.include_path_entries.iter().any(|entry| {
+        || context.include_path_entries().iter().any(|entry| {
             if !path_starts_with_native(&path, &entry.path) {
                 return false;
             }
@@ -9397,9 +9389,9 @@ fn legacy_search_entry_selected(
 ) -> bool {
     selected_directory.is_some_and(|directory| {
         context
-            .search_path_entries
+            .search_path_entries()
             .iter()
-            .chain(context.include_path_entries.iter())
+            .chain(context.include_path_entries().iter())
             .any(|entry| {
                 path_key(&entry.path) == path_key(directory)
                     && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
@@ -9451,11 +9443,11 @@ fn owner_has_legacy_or_workspace_authority(
         matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
             && path_starts_with_native(owner_path, &entry.path)
     };
-    context.search_path_entries.iter().any(is_legacy)
-        || context.include_path_entries.iter().any(is_legacy)
-        || context.main_source_entry.as_ref().is_some_and(is_legacy)
+    context.search_path_entries().iter().any(is_legacy)
+        || context.include_path_entries().iter().any(is_legacy)
+        || context.main_source_entry().is_some_and(is_legacy)
         || context
-            .explicit_unit_entries
+            .explicit_unit_entries()
             .values()
             .flatten()
             .any(is_legacy)
@@ -9868,7 +9860,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
         let lookup = resolve_include_path_with_overrides_and_overlay(
             &directive,
             &directories,
-            &self.context.overrides,
+            self.context.overrides(),
             |candidate| {
                 Url::from_file_path(candidate)
                     .ok()
@@ -9963,7 +9955,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
         }
         let source = match &route {
             IncludeRoute::Mapped { .. } => read_mapped_include(
-                &self.context.read_policy,
+                self.context.read_policy(),
                 &path_entry,
                 self.max_file_bytes,
                 self.max_total_bytes,
@@ -9972,7 +9964,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
             )?,
             IncludeRoute::Legacy => read_include(
                 &path,
-                &self.context.read_policy,
+                self.context.read_policy(),
                 &path_entry,
                 self.max_file_bytes,
                 Some(self.max_total_bytes),
@@ -10018,7 +10010,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
         let lookup = resolve_include_path_with_overrides_and_overlay(
             &directive,
             &directories,
-            &self.context.overrides,
+            self.context.overrides(),
             |candidate| {
                 Url::from_file_path(candidate)
                     .ok()
@@ -10732,7 +10724,7 @@ mod tests {
             path: candidate.clone(),
             provenance: ProjectPathProvenance::Configured,
         };
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             search_path_entries: vec![root_entry],
             read_policy: ReadPolicy::new(
@@ -10741,8 +10733,8 @@ mod tests {
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let stamp = super::path_stamp_result(&candidate)
             .expect("candidate stamp")
             .expect("candidate exists");
@@ -10760,7 +10752,7 @@ mod tests {
                     revision: SourceRevision::Disk {
                         stamp: stamp.clone(),
                         content_hash: pascal_project::content_hash_bytes(original),
-                        read_policy: context.read_policy.clone(),
+                        read_policy: context.read_policy().clone(),
                         path_entry: candidate_entry,
                     },
                 },
@@ -10820,13 +10812,17 @@ mod tests {
             .expect("indexed document should be available to snapshots")
             .parsed
             .clone();
-        input
-            .cached_documents
-            .get_mut(&uri)
-            .expect("cached context")
-            .context
-            .conditional_context
-            .set_define("FEATURE", pascal_project::ConditionalFact::True);
+        crate::edit_context(
+            &mut input
+                .cached_documents
+                .get_mut(&uri)
+                .expect("cached context")
+                .context,
+            |p| {
+                p.conditional_context
+                    .set_define("FEATURE", pascal_project::ConditionalFact::True)
+            },
+        );
         let cancel = AtomicBool::new(false);
 
         let snapshot = build_snapshot(
@@ -10976,17 +10972,17 @@ mod tests {
             overrides: EffectiveOverrides::default(),
         };
         let old = ContextState {
-            context: ProjectContext {
+            context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/old"))],
-                ..ProjectContext::default()
-            },
+                ..pascal_project::ProjectContextParts::default()
+            }),
             ..ContextState::default()
         };
         let new = ContextState {
-            context: ProjectContext {
+            context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/new"))],
-                ..ProjectContext::default()
-            },
+                ..pascal_project::ProjectContextParts::default()
+            }),
             ..ContextState::default()
         };
         let mut enumeration = Enumeration {
@@ -11346,7 +11342,7 @@ mod tests {
         let provider_owner = super::owner_for_input(&input, &provider_uri, &cancel)
             .expect("priority provider context");
         assert!(
-            provider_owner.state.context.discovery_complete,
+            provider_owner.state.context.discovery_complete(),
             "priority provider context must be complete"
         );
         let references = super::super::queries::references_from_input(
@@ -11423,7 +11419,7 @@ mod tests {
         let provider_owner = super::owner_for_input(&input, &provider_uri, &cancel)
             .expect("priority provider context");
         assert!(
-            provider_owner.state.context.discovery_complete,
+            provider_owner.state.context.discovery_complete(),
             "priority provider context must be complete"
         );
         let references = super::super::queries::references_from_input(
@@ -11492,14 +11488,14 @@ mod tests {
             overrides: EffectiveOverrides::default(),
         };
         let state = ContextState {
-            context: ProjectContext {
+            context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 discovery_complete: false,
                 search_path_entries: vec![super::super::super::project::ProjectPathEntry {
                     path: external,
                     provenance: super::super::super::project::ProjectPathProvenance::LegacyNative,
                 }],
-                ..ProjectContext::default()
-            },
+                ..pascal_project::ProjectContextParts::default()
+            }),
             ..ContextState::default()
         };
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());

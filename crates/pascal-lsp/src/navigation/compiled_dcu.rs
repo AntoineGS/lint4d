@@ -297,12 +297,12 @@ fn safe_unit_name(name: &str) -> bool {
 
 pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
     let mut hasher = DefaultHasher::new();
-    context.project_file.hash(&mut hasher);
+    context.project_file().hash(&mut hasher);
     context.main_source().hash(&mut hasher);
-    context.search_path_entries.hash(&mut hasher);
-    context.debug_dcu_path_entries.hash(&mut hasher);
-    context.browsing_path_entries.hash(&mut hasher);
-    match &context.installation_selection {
+    context.search_path_entries().hash(&mut hasher);
+    context.debug_dcu_path_entries().hash(&mut hasher);
+    context.browsing_path_entries().hash(&mut hasher);
+    match &context.installation_selection() {
         Some(pascal_project::InstallationSelection::Legacy) => 0u8.hash(&mut hasher),
         Some(pascal_project::InstallationSelection::Selected { id, origin }) => {
             1u8.hash(&mut hasher);
@@ -320,34 +320,40 @@ pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
         None => 4u8.hash(&mut hasher),
     }
     context
-        .installation_evidence
+        .installation_evidence()
         .compiler_version
         .map(|version| (version.major, version.minor, version.patch))
         .hash(&mut hasher);
     context
-        .installation_evidence
+        .installation_evidence()
         .project_version
         .hash(&mut hasher);
-    context.installation_evidence.bds_root.hash(&mut hasher);
-    context.installation_evidence.conflicting.hash(&mut hasher);
-    context.unit_namespaces.hash(&mut hasher);
-    let mut aliases = context.unit_aliases.iter().collect::<Vec<_>>();
+    context.installation_evidence().bds_root.hash(&mut hasher);
+    context
+        .installation_evidence()
+        .conflicting
+        .hash(&mut hasher);
+    context.unit_namespaces().hash(&mut hasher);
+    let mut aliases = context.unit_aliases().iter().collect::<Vec<_>>();
     aliases.sort_by(|left, right| left.0.cmp(right.0));
     for (alias, unit) in aliases {
         alias.hash(&mut hasher);
         unit.hash(&mut hasher);
     }
     context.defines().hash(&mut hasher);
-    context.conditional_context.fingerprint().hash(&mut hasher);
     context
-        .library_conditional_context
+        .conditional_context()
         .fingerprint()
         .hash(&mut hasher);
-    context.config.hash(&mut hasher);
-    context.platform.hash(&mut hasher);
-    context.overrides.hash(&mut hasher);
-    context.discovery_complete.hash(&mut hasher);
-    context.read_policy.hash(&mut hasher);
+    context
+        .library_conditional_context()
+        .fingerprint()
+        .hash(&mut hasher);
+    context.config().hash(&mut hasher);
+    context.platform().hash(&mut hasher);
+    context.overrides().hash(&mut hasher);
+    context.discovery_complete().hash(&mut hasher);
+    context.read_policy().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -361,12 +367,12 @@ pub fn discover_compiled_units(
     cancel: &AtomicBool,
 ) -> Result<Vec<AuthorizedCompiledUnit>, String> {
     let started = Instant::now();
-    if !context.discovery_complete
+    if !context.discovery_complete()
         || imported_units.len() > MAX_DCU_IMPORTS
         || context
-            .search_path_entries
+            .search_path_entries()
             .len()
-            .saturating_add(context.debug_dcu_path_entries.len())
+            .saturating_add(context.debug_dcu_path_entries().len())
             > MAX_DCU_SEARCH_PATHS
     {
         return Ok(Vec::new());
@@ -392,9 +398,9 @@ pub fn discover_compiled_units(
         let mut candidates = Vec::<PathBuf>::new();
         let mut source_exists = false;
         for search in context
-            .search_path_entries
+            .search_path_entries()
             .iter()
-            .chain(&context.debug_dcu_path_entries)
+            .chain(context.debug_dcu_path_entries())
         {
             if cancel.load(Ordering::Relaxed) {
                 return Err("request cancelled".to_string());
@@ -402,7 +408,7 @@ pub fn discover_compiled_units(
             if started.elapsed() > MAX_DCU_DISCOVERY_TIME {
                 return Ok(Vec::new());
             }
-            if !context.read_policy.allows_location(search) {
+            if !context.read_policy().allows_location(search) {
                 continue;
             }
             let Ok(entries) = fs::read_dir(&search.path) else {
@@ -438,21 +444,18 @@ pub fn discover_compiled_units(
                             || extension.eq_ignore_ascii_case("pp") =>
                     {
                         if context
-                            .read_policy
+                            .read_policy()
                             .entry_for_path(&path)
-                            .is_some_and(|entry| context.read_policy.allows_location(&entry))
+                            .is_some_and(|entry| context.read_policy().allows_location(&entry))
                         {
                             source_exists = true;
                         }
                     }
                     Some(extension)
                         if extension.eq_ignore_ascii_case("dcu")
-                            && context
-                                .read_policy
-                                .entry_for_path(&path)
-                                .is_some_and(|entry| {
-                                    context.read_policy.allows_location(&entry)
-                                }) =>
+                            && context.read_policy().entry_for_path(&path).is_some_and(
+                                |entry| context.read_policy().allows_location(&entry),
+                            ) =>
                     {
                         candidates.push(path);
                         if candidates.len() > 1 {
@@ -470,7 +473,7 @@ pub fn discover_compiled_units(
             continue;
         }
         let path = candidates.pop().expect("one candidate checked above");
-        let Some(path_entry) = context.read_policy.entry_for_path(&path) else {
+        let Some(path_entry) = context.read_policy().entry_for_path(&path) else {
             continue;
         };
         match fs::symlink_metadata(&path) {
@@ -479,7 +482,7 @@ pub fn discover_compiled_units(
             _ => continue,
         }
         let bytes = match context
-            .read_policy
+            .read_policy()
             .read_payload_bytes(&path_entry, MAX_DCU_BYTES as u64)
         {
             Ok(bytes) => bytes,
@@ -536,11 +539,11 @@ mod task13_fingerprint_tests {
                 platform: Some(LayoutPlatform::Win32),
                 defaults: LayoutSettings::default(),
             });
-        let base = ProjectContext {
+        let base = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             library_conditional_context: conditional_context.clone(),
             conditional_context,
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let before = project_context_fingerprint(&base);
         for defaults in [
             LayoutSettings {
@@ -565,16 +568,17 @@ mod task13_fingerprint_tests {
             },
         ] {
             for library in [false, true] {
-                let mut edited = base.clone();
+                let mut parts = base.clone().into_parts();
                 let context = if library {
-                    &mut edited.library_conditional_context
+                    &mut parts.library_conditional_context
                 } else {
-                    &mut edited.conditional_context
+                    &mut parts.conditional_context
                 };
                 *context = context.clone().with_layout(LayoutContext {
                     platform: Some(LayoutPlatform::Win32),
                     defaults: defaults.clone(),
                 });
+                let edited = ProjectContext::from_parts(parts);
                 assert_ne!(
                     project_context_fingerprint(&edited),
                     before,

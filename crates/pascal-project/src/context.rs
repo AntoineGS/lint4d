@@ -89,71 +89,199 @@ pub struct ProjectCandidateMembership {
     pub readable: bool,
 }
 /// Metadata used to resolve units without eagerly parsing the repository.
+///
+/// Other crates read a context through accessors and cannot change it:
+///
+/// ```compile_fail,E0616
+/// let mut context = pascal_project::ProjectContext::default();
+/// context.discovery_complete = true;
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
     /// Whether project selection and the metadata needed for binding completed
     /// without an ambiguity or an unresolved project-selection fallback.
-    pub discovery_complete: bool,
-    pub binding_metadata_complete: bool,
-    pub path_issues: Vec<ProjectPathIssue>,
-    pub project_file: Option<PathBuf>,
+    pub(crate) discovery_complete: bool,
+    pub(crate) binding_metadata_complete: bool,
+    pub(crate) path_issues: Vec<ProjectPathIssue>,
+    pub(crate) project_file: Option<PathBuf>,
     /// Direct root-project identity facts used before installation-dependent
     /// imports are evaluated.
-    pub installation_evidence: InstallationEvidence,
+    pub(crate) installation_evidence: InstallationEvidence,
     /// The project-scoped installation result, if profile selection applies.
-    pub installation_selection: Option<InstallationSelection>,
+    pub(crate) installation_selection: Option<InstallationSelection>,
     /// Ordered project and caller-provided unit search paths, tagged with their
     /// source provenance. This keeps legacy native roots distinct from
     /// configured and mapped roots.
-    pub search_path_entries: Vec<ProjectPathEntry>,
+    pub(crate) search_path_entries: Vec<ProjectPathEntry>,
     /// Source-navigation-only fallbacks from the selected IDE installation.
-    pub browsing_path_entries: Vec<ProjectPathEntry>,
+    pub(crate) browsing_path_entries: Vec<ProjectPathEntry>,
     /// Selected IDE debug DCU locations, kept out of source lookup.
-    pub debug_dcu_path_entries: Vec<ProjectPathEntry>,
+    pub(crate) debug_dcu_path_entries: Vec<ProjectPathEntry>,
     /// MainSource and explicit references retain the provenance of the path
     /// expression that produced them so membership cannot bypass mapped-root
     /// safety checks.
-    pub main_source_entry: Option<ProjectPathEntry>,
-    pub explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
+    pub(crate) main_source_entry: Option<ProjectPathEntry>,
+    pub(crate) explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
     /// Ordered project-relative include paths from DCC_IncludePath.
     ///
     /// Include paths are kept separate from unit search paths because include
     /// lookup must not make an arbitrary directory a Pascal unit candidate.
     /// Include paths retain their source provenance for read authorization.
-    pub include_path_entries: Vec<ProjectPathEntry>,
-    pub unit_namespaces: Vec<String>,
-    pub unit_aliases: HashMap<String, String>,
+    pub(crate) include_path_entries: Vec<ProjectPathEntry>,
+    pub(crate) unit_namespaces: Vec<String>,
+    pub(crate) unit_aliases: HashMap<String, String>,
     /// Effective compiler/version/options/constants used by source analysis.
-    pub conditional_context: ConditionalContext,
+    pub(crate) conditional_context: ConditionalContext,
     /// Whether project sources can close their define set and resolved RTL constants.
-    pub conditional_closure: ConditionalClosure,
+    pub(crate) conditional_closure: ConditionalClosure,
     /// Caller facts and compiler/RTL predefined facts for library sources.
-    pub library_conditional_context: ConditionalContext,
+    pub(crate) library_conditional_context: ConditionalContext,
     /// Roots whose sources the project compiles with its own defines: the
     /// project directory, unit search paths, caller source paths, and IDE
     /// library-path entries outside the selected installation's directories.
-    pub project_source_roots: Vec<PathBuf>,
-    pub config: Option<String>,
-    pub platform: Option<String>,
+    pub(crate) project_source_roots: Vec<PathBuf>,
+    pub(crate) config: Option<String>,
+    pub(crate) platform: Option<String>,
     /// The selected build configuration and the `.dproj` configuration choices.
-    pub config_selection: BuildSelection,
+    pub(crate) config_selection: BuildSelection,
     /// The selected target platform and the `.dproj` platform choices.
-    pub platform_selection: BuildSelection,
+    pub(crate) platform_selection: BuildSelection,
     /// The immutable Delphi override snapshot used to evaluate this context.
-    pub overrides: EffectiveOverrides,
+    pub(crate) overrides: EffectiveOverrides,
     /// The requester-scoped read policy used while evaluating this context.
-    pub read_policy: ReadPolicy,
+    pub(crate) read_policy: ReadPolicy,
     /// Ordered, case-insensitively unique package names from DCC_UsePackage.
     /// Package exports are resolved lazily and are not merged into the unit
     /// search paths or the project-wide unit index.
-    pub packages: Vec<String>,
+    pub(crate) packages: Vec<String>,
     /// Exact selected installation environment and imported IDE XML files
     /// consumed while constructing this context.
-    pub installation_config_files: Vec<PathBuf>,
-    pub override_error: Option<String>,
+    pub(crate) installation_config_files: Vec<PathBuf>,
+    pub(crate) override_error: Option<String>,
 }
 
 impl ProjectContext {
+    pub fn discovery_complete(&self) -> bool {
+        self.discovery_complete
+    }
+
+    pub fn binding_metadata_complete(&self) -> bool {
+        self.binding_metadata_complete
+    }
+
+    pub fn path_issues(&self) -> &[ProjectPathIssue] {
+        &self.path_issues
+    }
+
+    pub fn project_file(&self) -> Option<&Path> {
+        self.project_file.as_deref()
+    }
+
+    pub fn installation_evidence(&self) -> &InstallationEvidence {
+        &self.installation_evidence
+    }
+
+    pub fn installation_selection(&self) -> Option<&InstallationSelection> {
+        self.installation_selection.as_ref()
+    }
+
+    pub fn search_path_entries(&self) -> &[ProjectPathEntry] {
+        &self.search_path_entries
+    }
+
+    pub fn browsing_path_entries(&self) -> &[ProjectPathEntry] {
+        &self.browsing_path_entries
+    }
+
+    pub fn debug_dcu_path_entries(&self) -> &[ProjectPathEntry] {
+        &self.debug_dcu_path_entries
+    }
+
+    pub fn main_source_entry(&self) -> Option<&ProjectPathEntry> {
+        self.main_source_entry.as_ref()
+    }
+
+    pub fn explicit_unit_entries(&self) -> &HashMap<String, Vec<ProjectPathEntry>> {
+        &self.explicit_unit_entries
+    }
+
+    pub fn include_path_entries(&self) -> &[ProjectPathEntry] {
+        &self.include_path_entries
+    }
+
+    pub fn unit_namespaces(&self) -> &[String] {
+        &self.unit_namespaces
+    }
+
+    pub fn unit_aliases(&self) -> &HashMap<String, String> {
+        &self.unit_aliases
+    }
+
+    pub fn conditional_context(&self) -> &ConditionalContext {
+        &self.conditional_context
+    }
+
+    pub fn conditional_closure(&self) -> &ConditionalClosure {
+        &self.conditional_closure
+    }
+
+    pub fn library_conditional_context(&self) -> &ConditionalContext {
+        &self.library_conditional_context
+    }
+
+    pub fn project_source_roots(&self) -> &[PathBuf] {
+        &self.project_source_roots
+    }
+
+    pub fn config(&self) -> Option<&str> {
+        self.config.as_deref()
+    }
+
+    pub fn platform(&self) -> Option<&str> {
+        self.platform.as_deref()
+    }
+
+    pub fn config_selection(&self) -> &BuildSelection {
+        &self.config_selection
+    }
+
+    pub fn platform_selection(&self) -> &BuildSelection {
+        &self.platform_selection
+    }
+
+    pub fn overrides(&self) -> &EffectiveOverrides {
+        &self.overrides
+    }
+
+    pub fn read_policy(&self) -> &ReadPolicy {
+        &self.read_policy
+    }
+
+    pub fn packages(&self) -> &[String] {
+        &self.packages
+    }
+
+    pub fn installation_config_files(&self) -> &[PathBuf] {
+        &self.installation_config_files
+    }
+
+    pub fn override_error(&self) -> Option<&str> {
+        self.override_error.as_deref()
+    }
+
+    /// Equality that ignores `LegacyNative` search roots, which rename treats
+    /// as incidental for contexts without a project file.
+    pub fn eq_ignoring_legacy_search_roots(&self, other: &Self) -> bool {
+        fn without_legacy_roots(context: &ProjectContext) -> ProjectContext {
+            let mut context = context.clone();
+            context
+                .search_path_entries
+                .retain(|entry| !matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
+            context
+        }
+        without_legacy_roots(self) == without_legacy_roots(other)
+    }
+
     /// Ordered unit search paths, without provenance.
     pub fn search_paths(&self) -> Vec<PathBuf> {
         paths_from_entries(&self.search_path_entries)
@@ -510,9 +638,188 @@ impl ProjectContext {
     }
 }
 
+/// The stored fields of a [`ProjectContext`], for tests that build or adjust
+/// one directly. Production contexts come from discovery.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectContextParts {
+    pub discovery_complete: bool,
+    pub binding_metadata_complete: bool,
+    pub path_issues: Vec<ProjectPathIssue>,
+    pub project_file: Option<PathBuf>,
+    pub installation_evidence: InstallationEvidence,
+    pub installation_selection: Option<InstallationSelection>,
+    pub search_path_entries: Vec<ProjectPathEntry>,
+    pub browsing_path_entries: Vec<ProjectPathEntry>,
+    pub debug_dcu_path_entries: Vec<ProjectPathEntry>,
+    pub main_source_entry: Option<ProjectPathEntry>,
+    pub explicit_unit_entries: HashMap<String, Vec<ProjectPathEntry>>,
+    pub include_path_entries: Vec<ProjectPathEntry>,
+    pub unit_namespaces: Vec<String>,
+    pub unit_aliases: HashMap<String, String>,
+    pub conditional_context: ConditionalContext,
+    pub conditional_closure: ConditionalClosure,
+    pub library_conditional_context: ConditionalContext,
+    pub project_source_roots: Vec<PathBuf>,
+    pub config: Option<String>,
+    pub platform: Option<String>,
+    pub config_selection: BuildSelection,
+    pub platform_selection: BuildSelection,
+    pub overrides: EffectiveOverrides,
+    pub read_policy: ReadPolicy,
+    pub packages: Vec<String>,
+    pub installation_config_files: Vec<PathBuf>,
+    pub override_error: Option<String>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ProjectContext {
+    pub fn from_parts(parts: ProjectContextParts) -> Self {
+        let ProjectContextParts {
+            discovery_complete,
+            binding_metadata_complete,
+            path_issues,
+            project_file,
+            installation_evidence,
+            installation_selection,
+            search_path_entries,
+            browsing_path_entries,
+            debug_dcu_path_entries,
+            main_source_entry,
+            explicit_unit_entries,
+            include_path_entries,
+            unit_namespaces,
+            unit_aliases,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            project_source_roots,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages,
+            installation_config_files,
+            override_error,
+        } = parts;
+        Self {
+            discovery_complete,
+            binding_metadata_complete,
+            path_issues,
+            project_file,
+            installation_evidence,
+            installation_selection,
+            search_path_entries,
+            browsing_path_entries,
+            debug_dcu_path_entries,
+            main_source_entry,
+            explicit_unit_entries,
+            include_path_entries,
+            unit_namespaces,
+            unit_aliases,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            project_source_roots,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages,
+            installation_config_files,
+            override_error,
+        }
+    }
+
+    pub fn into_parts(self) -> ProjectContextParts {
+        let Self {
+            discovery_complete,
+            binding_metadata_complete,
+            path_issues,
+            project_file,
+            installation_evidence,
+            installation_selection,
+            search_path_entries,
+            browsing_path_entries,
+            debug_dcu_path_entries,
+            main_source_entry,
+            explicit_unit_entries,
+            include_path_entries,
+            unit_namespaces,
+            unit_aliases,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            project_source_roots,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages,
+            installation_config_files,
+            override_error,
+        } = self;
+        ProjectContextParts {
+            discovery_complete,
+            binding_metadata_complete,
+            path_issues,
+            project_file,
+            installation_evidence,
+            installation_selection,
+            search_path_entries,
+            browsing_path_entries,
+            debug_dcu_path_entries,
+            main_source_entry,
+            explicit_unit_entries,
+            include_path_entries,
+            unit_namespaces,
+            unit_aliases,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            project_source_roots,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages,
+            installation_config_files,
+            override_error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_search_roots_can_be_ignored_in_comparison() {
+        let configured = ProjectPathEntry::configured("/w/src".into());
+        let with_legacy = ProjectContext {
+            search_path_entries: vec![ProjectPathEntry::legacy("/w".into()), configured.clone()],
+            ..ProjectContext::default()
+        };
+        let without_legacy = ProjectContext {
+            search_path_entries: vec![configured],
+            ..ProjectContext::default()
+        };
+        assert_ne!(with_legacy, without_legacy);
+        assert!(with_legacy.eq_ignoring_legacy_search_roots(&without_legacy));
+        let other = ProjectContext {
+            search_path_entries: vec![ProjectPathEntry::configured("/w/other".into())],
+            ..ProjectContext::default()
+        };
+        assert!(!with_legacy.eq_ignoring_legacy_search_roots(&other));
+    }
 
     #[test]
     fn session_selections_prefer_the_exact_project_path() {

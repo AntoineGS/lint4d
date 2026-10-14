@@ -181,8 +181,8 @@ fn synthetic_project() -> SyntheticProject {
     )
     .expect("synthetic project context should be discoverable")
     .context;
-    assert!(context.discovery_complete);
-    assert_eq!(context.project_file, options.project_file);
+    assert!(context.discovery_complete());
+    assert_eq!(context.project_file(), options.project_file.as_deref());
 
     SyntheticProject {
         _directory: directory,

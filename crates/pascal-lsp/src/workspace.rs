@@ -2161,7 +2161,7 @@ pub(crate) struct ContextKey {
 }
 
 fn selected_installation_id(context: &ProjectContext) -> Option<String> {
-    match context.installation_selection.as_ref() {
+    match context.installation_selection() {
         Some(pascal_project::InstallationSelection::Selected { id, .. }) => Some(id.clone()),
         _ => None,
     }
@@ -3062,14 +3062,14 @@ impl Workspace {
             let path = snapshot.importer.to_file_path().ok();
             let entry = path
                 .as_deref()
-                .and_then(|path| snapshot.context.context.read_policy.entry_for_path(path));
+                .and_then(|path| snapshot.context.context.read_policy().entry_for_path(path));
             let Some(entry) = entry else {
                 return Ok(None);
             };
             let bytes = match snapshot
                 .context
                 .context
-                .read_policy
+                .read_policy()
                 .read_payload_bytes(&entry, 8 * 1024 * 1024)
             {
                 Ok(bytes) => bytes,
@@ -3085,7 +3085,7 @@ impl Workspace {
         }
         if !snapshot
             .unit
-            .is_current_with_cancel(&snapshot.context.context.read_policy, cancel)?
+            .is_current_with_cancel(snapshot.context.context.read_policy(), cancel)?
         {
             return Ok(None);
         }
@@ -3153,7 +3153,7 @@ impl Workspace {
             if visits > 64 {
                 return Err("compiled virtual-document context limit exceeded".to_string());
             }
-            if !state.context.discovery_complete
+            if !state.context.discovery_complete()
                 || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                     != fingerprint
                 || !context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
@@ -3165,7 +3165,7 @@ impl Workspace {
                 discover_compiled_units(&state.context, std::slice::from_ref(&unit_name), &cancel)?
                     .into_iter()
                     .find(|unit| {
-                        unit.document.uri() == uri && unit.is_current(&state.context.read_policy)
+                        unit.document.uri() == uri && unit.is_current(state.context.read_policy())
                     })
             else {
                 continue;
@@ -3185,10 +3185,10 @@ impl Workspace {
         let path = importer.to_file_path().ok()?;
         let context_key = self.document_contexts.get(importer)?;
         let context = self.contexts.get(context_key)?;
-        let entry = context.context.read_policy.entry_for_path(&path)?;
+        let entry = context.context.read_policy().entry_for_path(&path)?;
         let bytes = context
             .context
-            .read_policy
+            .read_policy()
             .read_payload_bytes(&entry, 8 * 1024 * 1024)
             .ok()?;
         let text = resolver::decode_source_bytes(&bytes);
@@ -3478,9 +3478,9 @@ impl Workspace {
 
     pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
         for (key, incoming) in state.contexts {
-            let preserve_existing = !incoming.context.discovery_complete
+            let preserve_existing = !incoming.context.discovery_complete()
                 && self.contexts.get(&key).is_some_and(|existing| {
-                    existing.context.discovery_complete
+                    existing.context.discovery_complete()
                         && self.context_has_open_legacy_overlay(existing)
                 });
             if !preserve_existing {
@@ -3491,9 +3491,9 @@ impl Workspace {
         self.open_document_contexts
             .extend(state.open_document_contexts);
         for (uri, incoming) in state.document_owners {
-            let preserve_existing = !incoming.state.context.discovery_complete
+            let preserve_existing = !incoming.state.context.discovery_complete()
                 && self.document_owners.get(&uri).is_some_and(|existing| {
-                    existing.state.context.discovery_complete
+                    existing.state.context.discovery_complete()
                         && self.context_has_open_legacy_overlay(&existing.state)
                 });
             if !preserve_existing {
@@ -3714,8 +3714,7 @@ impl Workspace {
         candidates: &ProjectCandidates,
     ) -> Option<PathBuf> {
         context
-            .project_file
-            .as_deref()
+            .project_file()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .or_else(|| context_key.and_then(|key| key.project_scope.clone()))
@@ -6315,7 +6314,7 @@ impl Workspace {
                 "project selection is invalid; select a current project or Automatic for {uri}"
             ));
         }
-        if let Some(error) = context.override_error.as_deref() {
+        if let Some(error) = context.override_error() {
             return Err(format!(
                 "project override configuration is invalid for {uri}: {error}"
             ));
@@ -6357,7 +6356,7 @@ impl Workspace {
             read_disk_source(
                 &path,
                 self.options.limits.max_file_bytes,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
                 legacy_payload,
             )?
@@ -6724,7 +6723,7 @@ impl Workspace {
                 "project selection is invalid; select a current project or Automatic for {uri}"
             ));
         }
-        if let Some(error) = context.override_error.as_deref() {
+        if let Some(error) = context.override_error() {
             return Err(format!(
                 "project override configuration is invalid for {uri}: {error}"
             ));
@@ -6774,7 +6773,7 @@ impl Workspace {
             let source = read_disk_source_with_cancel(
                 &path,
                 self.options.limits.max_file_bytes,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
                 legacy_payload,
                 Some(cancel),
@@ -6785,7 +6784,7 @@ impl Workspace {
                 source.stamp.clone(),
                 source.content_hash,
                 &path,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
             );
             source.text
@@ -7122,14 +7121,14 @@ impl Workspace {
             self.store_interface_imports(uri, &context, Vec::new(), true, Vec::new());
             return Ok(Vec::new());
         }
-        if context.project_file.is_none() {
+        if context.project_file().is_none() {
             let roots = self
                 .roots
                 .iter()
                 .map(|root| root.path.clone())
                 .collect::<Vec<_>>();
             for import in &imports {
-                let names = unit_filename_candidates(&import.name, &context.unit_namespaces)
+                let names = unit_filename_candidates(&import.name, context.unit_namespaces())
                     .into_iter()
                     .map(|name| name.to_ascii_lowercase())
                     .collect::<Vec<_>>();
@@ -7142,7 +7141,7 @@ impl Workspace {
                     self.record_missing_provider_scope(
                         root,
                         &names,
-                        &context.read_policy,
+                        context.read_policy(),
                         &path_entry,
                     );
                 }
@@ -7303,7 +7302,7 @@ impl Workspace {
                     && binding.site.requested_name.eq_ignore_ascii_case(&site.name)
             });
             let compiled_name = context
-                .unit_aliases
+                .unit_aliases()
                 .iter()
                 .find(|(alias, _)| alias.eq_ignore_ascii_case(&site.name))
                 .map_or(site.name.as_str(), |(_, target)| target.as_str())
@@ -7560,7 +7559,7 @@ impl Workspace {
                     // match the validated canonical DCU back to every import
                     // spelling that resolves through that alias.
                     let resolved_name = context
-                        .unit_aliases
+                        .unit_aliases()
                         .iter()
                         .find(|(alias, _)| alias.eq_ignore_ascii_case(requested))
                         .map_or(requested.as_str(), |(_, target)| target.as_str());
@@ -7591,7 +7590,7 @@ impl Workspace {
                 Some(content_hash),
                 None,
                 None,
-                Some(context.read_policy.clone()),
+                Some(context.read_policy().clone()),
                 Some(path_entry.clone()),
                 false,
             ) {
@@ -7892,7 +7891,7 @@ impl Workspace {
             matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
                 && (legacy_route_authorized || legacy_route_granted || explicit_legacy_entry);
         let readable = if verified_legacy_payload {
-            context.read_policy.allows_legacy_route_entry(&entry)
+            context.read_policy().allows_legacy_route_entry(&entry)
         } else {
             self.ensure_supported_project_context_with_legacy_route(
                 &path,
@@ -7976,7 +7975,7 @@ impl Workspace {
                     current_stamp,
                     content_hash_bytes(source.as_bytes()),
                     &path,
-                    &context.read_policy,
+                    context.read_policy(),
                     &entry,
                 );
             }
@@ -7992,7 +7991,7 @@ impl Workspace {
                 read_disk_source_with_budget(
                     &path,
                     self.options.limits.max_file_bytes,
-                    &context.read_policy,
+                    context.read_policy(),
                     &entry,
                     verified_legacy_payload,
                     cancel,
@@ -8039,7 +8038,7 @@ impl Workspace {
                 stamp.clone(),
                 content_hash,
                 &path,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
             );
             if legacy_route_granted {
@@ -8617,7 +8616,7 @@ impl Workspace {
             let root_content_hash = closed_source_content_hash(
                 &expansion.physical_source,
                 self.options.limits.max_file_bytes,
-                &context.read_policy,
+                context.read_policy(),
                 &root_entry,
             );
             self.record_closed_analysis_source(
@@ -8626,7 +8625,7 @@ impl Workspace {
                 root_stamp,
                 root_content_hash,
                 &root_path,
-                &context.read_policy,
+                context.read_policy(),
                 &root_entry,
             );
         }
@@ -8677,7 +8676,7 @@ impl Workspace {
             let disk = read_disk_source_with_cancel(
                 &path,
                 self.options.limits.max_file_bytes,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
                 allow_legacy_payload,
                 Some(cancel),
@@ -8691,7 +8690,7 @@ impl Workspace {
                 disk.stamp,
                 disk.content_hash,
                 &path,
-                &context.read_policy,
+                context.read_policy(),
                 &entry,
             );
             if let Some(records) = self.analysis_records.as_mut()
@@ -8793,7 +8792,7 @@ impl Workspace {
             let disk = read_disk_source_with_cancel(
                 &path,
                 self.options.limits.max_file_bytes,
-                &context.read_policy,
+                context.read_policy(),
                 &path_entry,
                 allow_legacy_payload,
                 Some(cancel),
@@ -8809,7 +8808,7 @@ impl Workspace {
                 disk.stamp,
                 disk.content_hash,
                 &path,
-                &context.read_policy,
+                context.read_policy(),
                 &path_entry,
             );
             if let Some(record) = self
@@ -8862,7 +8861,7 @@ impl Workspace {
                 content_bytes: None,
                 candidate_membership: None,
                 candidate_observations: Vec::new(),
-                read_policy: Some(context.read_policy.clone()),
+                read_policy: Some(context.read_policy().clone()),
                 path_entry: Some(path_entry),
                 include_payload: false,
                 missing_provider_candidate: !observation.present,
@@ -10147,8 +10146,7 @@ impl Workspace {
         };
         state
             .context
-            .project_file
-            .as_deref()
+            .project_file()
             .is_none_or(|project_file| paths_equal_ci(project_file, selected))
     }
 
@@ -10296,18 +10294,18 @@ impl Workspace {
     fn context_key_for_path(&self, path: &Path, context: Option<&ProjectContext>) -> ContextKey {
         let selection = self.runtime_selection_for_path_default(path);
         ContextKey {
-            project_file: context.and_then(|context| context.project_file.clone()),
+            project_file: context.and_then(|context| context.project_file().map(Path::to_path_buf)),
             installation_id: context.and_then(selected_installation_id),
             workspace_root: self.root_for_path(path),
             project_scope: self.project_scope_for_path(path, context),
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
             selection_project: selection.map(|(_, project)| project),
-            config: context.and_then(|context| context.config.clone()),
-            platform: context.and_then(|context| context.platform.clone()),
+            config: context.and_then(|context| context.config().map(str::to_owned)),
+            platform: context.and_then(|context| context.platform().map(str::to_owned)),
             build_selection_modes: context.map(|context| {
                 (
-                    context.config_selection.mode,
-                    context.platform_selection.mode,
+                    context.config_selection().mode,
+                    context.platform_selection().mode,
                 )
             }),
             conditional_context: context
@@ -10316,7 +10314,7 @@ impl Workspace {
             context_fingerprint: context
                 .map(crate::navigation::compiled_dcu::project_context_fingerprint),
             overrides: context
-                .map(|context| context.overrides.clone())
+                .map(|context| context.overrides().clone())
                 .unwrap_or_default(),
         }
     }
@@ -10332,29 +10330,28 @@ impl Workspace {
         check_workspace_cancel(cancel)?;
         let project_scope = discovered_scope.or_else(|| {
             context
-                .project_file
-                .as_deref()
+                .project_file()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
         });
         Ok(ContextKey {
-            project_file: context.project_file.clone(),
+            project_file: context.project_file().map(Path::to_path_buf),
             installation_id: selected_installation_id(context),
             workspace_root: self.root_for_path(path),
             project_scope,
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
             selection_project: selection.map(|(_, project)| project),
-            config: context.config.clone(),
-            platform: context.platform.clone(),
+            config: context.config().map(str::to_owned),
+            platform: context.platform().map(str::to_owned),
             build_selection_modes: Some((
-                context.config_selection.mode,
-                context.platform_selection.mode,
+                context.config_selection().mode,
+                context.platform_selection().mode,
             )),
             conditional_context: conditional_context_for_path(context, path),
             context_fingerprint: Some(
                 crate::navigation::compiled_dcu::project_context_fingerprint(context),
             ),
-            overrides: context.overrides.clone(),
+            overrides: context.overrides().clone(),
         })
     }
 
@@ -10426,7 +10423,7 @@ impl Workspace {
         context: Option<&ProjectContext>,
     ) -> Option<PathBuf> {
         if let Some(scope) = context
-            .and_then(|context| context.project_file.as_deref())
+            .and_then(|context| context.project_file())
             .and_then(Path::parent)
         {
             return Some(scope.to_path_buf());
@@ -10465,7 +10462,7 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
         let initial_metadata_count = context_observations.metadata_files.len()
-            + usize::from(context.project_file.is_some())
+            + usize::from(context.project_file().is_some())
             + usize::from(context.main_source().is_some());
         if let Some(budget) = budget {
             budget.charge_path_visits(initial_metadata_count)?;
@@ -10479,9 +10476,9 @@ impl Workspace {
             check_workspace_cancel(cancel)?;
             metadata.push(path.clone());
         }
-        if let Some(project_file) = &context.project_file {
+        if let Some(project_file) = &context.project_file() {
             check_workspace_cancel(cancel)?;
-            metadata.push(project_file.clone());
+            metadata.push(project_file.to_path_buf());
         }
         if let Some(main_source) = context.main_source() {
             check_workspace_cancel(cancel)?;
@@ -10535,8 +10532,7 @@ impl Workspace {
             project_candidate_memberships.insert(directory, membership);
         }
         let project_directory = context
-            .project_file
-            .as_deref()
+            .project_file()
             .and_then(Path::parent)
             .or(key.project_scope.as_deref());
         if let Some(budget) = budget {
@@ -10845,7 +10841,7 @@ impl Workspace {
     fn context_has_override_error(&self, key: &ContextKey) -> bool {
         self.contexts
             .get(key)
-            .is_some_and(|state| state.context.override_error.is_some())
+            .is_some_and(|state| state.context.override_error().is_some())
     }
 
     fn invalidate_contexts_with_control(
@@ -11447,7 +11443,7 @@ impl Workspace {
         let Some(entry) = context_path_entry(context, path) else {
             return legacy_route
                 && context
-                    .read_policy
+                    .read_policy()
                     .allows_legacy_route_entry(&ProjectPathEntry::legacy(path.to_path_buf()));
         };
         let explicit_legacy = project_path_entry_for(context, path)
@@ -11455,7 +11451,7 @@ impl Workspace {
         if matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
             && (legacy_route || explicit_legacy)
         {
-            return context.read_policy.allows_legacy_route_entry(&entry);
+            return context.read_policy().allows_legacy_route_entry(&entry);
         }
         if !self.project_path_entry_is_readable(path, &entry, context) {
             return false;
@@ -11479,7 +11475,7 @@ impl Workspace {
         entry: &ProjectPathEntry,
         context: &ProjectContext,
     ) -> bool {
-        context.read_policy.allows_path(path, &entry.provenance)
+        context.read_policy().allows_path(path, &entry.provenance)
     }
 
     fn mapped_path_is_readable(&self, path: &Path, context_key: &ContextKey) -> bool {
@@ -11537,7 +11533,7 @@ impl Workspace {
     ) -> Result<Option<Url>, String> {
         check_workspace_cancel(cancel)?;
         let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
-        if let Some(entries) = context.explicit_unit_entries.get(lookup_name) {
+        if let Some(entries) = context.explicit_unit_entries().get(lookup_name) {
             let mut explicit = Vec::new();
             for entry in entries {
                 if !explicit.contains(&entry.path) {
@@ -11553,11 +11549,11 @@ impl Workspace {
             .and_then(Path::parent)
             .map(Path::to_path_buf);
         let legacy_current_source = current_path.as_deref().is_some_and(|path| {
-            context.main_source_entry.as_ref().is_some_and(|entry| {
+            context.main_source_entry().is_some_and(|entry| {
                 matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
                     && native_paths_equal(&entry.path, path)
             }) || context
-                .explicit_unit_entries
+                .explicit_unit_entries()
                 .values()
                 .flatten()
                 .any(|entry| {
@@ -11575,7 +11571,7 @@ impl Workspace {
                 self.directory_unit_candidate_groups(
                     &directory,
                     lookup_name,
-                    &context.unit_namespaces,
+                    context.unit_namespaces(),
                     context_key,
                 )
                 .into_iter()
@@ -11584,7 +11580,7 @@ impl Workspace {
         }
         for directory in &context.search_paths() {
             check_workspace_cancel(cancel)?;
-            let legacy_search_path = context.search_path_entries.iter().any(|entry| {
+            let legacy_search_path = context.search_path_entries().iter().any(|entry| {
                 matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
                     && native_paths_equal(&entry.path, directory)
             });
@@ -11592,14 +11588,14 @@ impl Workspace {
                 self.directory_unit_candidate_groups(
                     directory,
                     lookup_name,
-                    &context.unit_namespaces,
+                    context.unit_namespaces(),
                     context_key,
                 )
                 .into_iter()
                 .map(|paths| (paths, legacy_search_path)),
             );
         }
-        if context.project_file.is_none() {
+        if context.project_file().is_none() {
             check_workspace_cancel(cancel)?;
             groups.push((
                 self.filename_unit_candidates(lookup_name, context, context_key),
@@ -11629,7 +11625,7 @@ impl Workspace {
                     continue;
                 }
                 let legacy_search_path_route = legacy_search_path
-                    && context.search_path_entries.iter().any(|entry| {
+                    && context.search_path_entries().iter().any(|entry| {
                         matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
                             && path_starts_with_native(&path, &entry.path)
                     });
@@ -11724,9 +11720,9 @@ impl Workspace {
                 return Ok(None);
             }
         }
-        if context.project_file.is_some()
-            && !context.explicit_unit_entries.is_empty()
-            && !context.explicit_unit_entries.contains_key(lookup_name)
+        if context.project_file().is_some()
+            && !context.explicit_unit_entries().is_empty()
+            && !context.explicit_unit_entries().contains_key(lookup_name)
         {
             self.warn(format!(
                 "unsupported unit filename mapping for {requested_name}: no explicit project filename mapping; declaration filename mismatch cannot be inferred safely"
@@ -11782,10 +11778,10 @@ impl Workspace {
             complete: true,
             ..PackageLookup::default()
         };
-        if context.packages.is_empty() {
+        if context.packages().is_empty() {
             return Ok(lookup);
         }
-        if context.packages.len() > MAX_PACKAGE_LOOKUPS {
+        if context.packages().len() > MAX_PACKAGE_LOOKUPS {
             lookup.complete = false;
             lookup.warnings.push(format!(
                 "named package lookup limit ({MAX_PACKAGE_LOOKUPS}) reached while resolving {requested_name}"
@@ -11793,7 +11789,7 @@ impl Workspace {
             return Ok(lookup);
         }
 
-        let package_names = context.packages.to_vec();
+        let package_names = context.packages().to_vec();
         for package_name in &package_names {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
@@ -11868,7 +11864,7 @@ impl Workspace {
                     if let Some(budget) = budget {
                         budget.charge_package_path_visits(1)?;
                     }
-                    if !context.read_policy.allows_location(entry) {
+                    if !context.read_policy().allows_location(entry) {
                         lookup.warnings.push(format!(
                             "source package {package_name} maps {requested_name} outside configured workspace/source roots; skipped: {}",
                             entry.path.display()
@@ -12047,10 +12043,10 @@ impl Workspace {
         }
         let key = PackageMetadataKey {
             descriptor: path.to_path_buf(),
-            overrides: context.overrides.clone(),
-            read_policy: context.read_policy.clone(),
-            config: context.config.clone(),
-            platform: context.platform.clone(),
+            overrides: context.overrides().clone(),
+            read_policy: context.read_policy().clone(),
+            config: context.config().map(str::to_owned),
+            platform: context.platform().map(str::to_owned),
             conditional_context: conditional_context_for_path(context, path),
         };
         let stamp = path_stamp(path);
@@ -12758,7 +12754,7 @@ impl Workspace {
         context: &ProjectContext,
         context_key: &ContextKey,
     ) -> Vec<PathBuf> {
-        let names = unit_filename_candidates(unit_name, &context.unit_namespaces)
+        let names = unit_filename_candidates(unit_name, context.unit_namespaces())
             .into_iter()
             .map(|name| name.to_ascii_lowercase())
             .collect::<Vec<_>>();
@@ -12799,7 +12795,7 @@ impl Workspace {
                 names.clone()
             };
             let path_entry = context
-                .search_path_entries
+                .search_path_entries()
                 .iter()
                 .find(|entry| paths_equal_ci(&entry.path, root))
                 .cloned()
@@ -12811,7 +12807,7 @@ impl Workspace {
             self.record_missing_provider_scope(
                 root,
                 &scope_names,
-                &context.read_policy,
+                context.read_policy(),
                 &path_entry,
             );
             for name in &names {
@@ -13836,7 +13832,7 @@ impl Workspace {
                         )],
                     ));
                 }
-                if let Some(error) = context.override_error.as_deref() {
+                if let Some(error) = context.override_error() {
                     return Ok(single_diagnostic_publication(
                         uri,
                         None,
@@ -13851,7 +13847,7 @@ impl Workspace {
                 let legacy_route = self.legacy_route_is_current(uri, &path, &context_key);
                 let has_authorized_read_root = legacy_route
                     || self.accepts_path(&path)
-                    || context.read_policy.entry_for_path(&path).is_some();
+                    || context.read_policy().entry_for_path(&path).is_some();
                 if !has_authorized_read_root {
                     return Ok(single_diagnostic_publication(
                         uri,
@@ -13894,7 +13890,7 @@ impl Workspace {
                 let source = read_disk_source_with_cancel(
                     &path,
                     self.options.limits.max_file_bytes,
-                    &context.read_policy,
+                    context.read_policy(),
                     &entry,
                     allow_legacy_payload,
                     Some(cancel),
@@ -13932,7 +13928,7 @@ impl Workspace {
                 )],
             ));
         }
-        if let Some(error) = context.override_error.as_deref() {
+        if let Some(error) = context.override_error() {
             return Ok(single_diagnostic_publication(
                 uri,
                 version,
@@ -14311,11 +14307,11 @@ impl Workspace {
         }
         let configuration_id = format!(
             "config={};platform={}",
-            context.config.as_deref().unwrap_or_default(),
-            context.platform.as_deref().unwrap_or_default()
+            context.config().unwrap_or_default(),
+            context.platform().unwrap_or_default()
         );
         let options = lint4d::cfg::CfgSnapshotOptions {
-            prepare_configured_sources: context.project_file.is_some(),
+            prepare_configured_sources: context.project_file().is_some(),
             configuration_id: Some(configuration_id),
             conditional_context: conditional_context.clone(),
             preparation_environment: lint4d::cfg::PreparationEnvironment::Partial,
@@ -14474,7 +14470,7 @@ impl Workspace {
             }) else {
                 continue;
             };
-            if invalid_selection || context.override_error.is_some() {
+            if invalid_selection || context.override_error().is_some() {
                 continue;
             }
             let expansion =
@@ -14690,7 +14686,7 @@ fn project_unit_stems(context: &ProjectContext, current_path: &Path) -> HashSet<
     if let Some(main_source) = context.main_source() {
         add_stem(main_source);
     }
-    for entry in context.explicit_unit_entries.values().flatten() {
+    for entry in context.explicit_unit_entries().values().flatten() {
         add_stem(&entry.path);
     }
     // DCC_UnitSearchPath is a compiler lookup path, not a project-file list.
@@ -15685,12 +15681,11 @@ fn project_path_entry_for<'a>(
     path: &Path,
 ) -> Option<&'a ProjectPathEntry> {
     context
-        .main_source_entry
-        .as_ref()
+        .main_source_entry()
         .filter(|entry| native_paths_equal(&entry.path, path))
         .or_else(|| {
             context
-                .explicit_unit_entries
+                .explicit_unit_entries()
                 .values()
                 .flatten()
                 .find(|entry| native_paths_equal(&entry.path, path))
@@ -15705,7 +15700,7 @@ fn context_path_entry(context: &ProjectContext, path: &Path) -> Option<ProjectPa
         });
     }
     context
-        .search_path_entries
+        .search_path_entries()
         .iter()
         .filter(|entry| path_starts_with_native(path, &entry.path))
         .max_by_key(|entry| entry.path.components().count())
@@ -15713,7 +15708,7 @@ fn context_path_entry(context: &ProjectContext, path: &Path) -> Option<ProjectPa
             path: path.to_path_buf(),
             provenance: entry.provenance.clone(),
         })
-        .or_else(|| context.read_policy.entry_for_path(path))
+        .or_else(|| context.read_policy().entry_for_path(path))
 }
 
 fn native_mapping_root(root: &Path) -> PathBuf {
@@ -15726,12 +15721,11 @@ fn context_uses_mapped_root(
     resolved_root: &Path,
 ) -> bool {
     context
-        .main_source_entry
-        .as_ref()
+        .main_source_entry()
         .into_iter()
-        .chain(context.search_path_entries.iter())
-        .chain(context.include_path_entries.iter())
-        .chain(context.explicit_unit_entries.values().flatten())
+        .chain(context.search_path_entries().iter())
+        .chain(context.include_path_entries().iter())
+        .chain(context.explicit_unit_entries().values().flatten())
         .any(|entry| match &entry.provenance {
             ProjectPathProvenance::Mapped { root: mapped_root } => {
                 package_paths_equal(mapped_root, resolved_root)
@@ -15906,7 +15900,7 @@ fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
 
 fn aliased_unit_name(context: &ProjectContext, name: &str) -> String {
     context
-        .unit_aliases
+        .unit_aliases()
         .iter()
         .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
         .map_or_else(
@@ -15957,7 +15951,7 @@ fn unit_name_matches(
         return false;
     }
     context
-        .unit_namespaces
+        .unit_namespaces()
         .iter()
         .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual))
 }
@@ -15972,7 +15966,7 @@ fn package_unit_name_matches(
         || actual.eq_ignore_ascii_case(lookup)
         || (!lookup.contains('.')
             && context
-                .unit_namespaces
+                .unit_namespaces()
                 .iter()
                 .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual)))
 }
@@ -16176,7 +16170,7 @@ mod tests {
         let key = workspace.document_contexts[&uri].clone();
         let context = workspace.contexts[&key].context.clone();
         let entries = context
-            .search_path_entries
+            .search_path_entries()
             .iter()
             .filter(|entry| entry.path == rtl)
             .collect::<Vec<_>>();
@@ -17489,13 +17483,13 @@ mod tests {
             .find_map(|(candidate, parsed)| (candidate == uri).then_some(parsed))
             .expect("cached parsed document");
         let mut context = pascal_project::ProjectContext::default();
-        context
-            .search_path_entries
-            .extend((0..=65_536).map(|index| {
+        crate::edit_context(&mut context, |p| {
+            p.search_path_entries.extend((0..=65_536).map(|index| {
                 pascal_project::ProjectPathEntry::configured(
                     temp.path().join(format!("search-{index:05}")),
                 )
-            }));
+            }))
+        });
         workspace.cached_documents.insert(
             uri,
             crate::workspace::rename::CachedDocument { context, parsed },
@@ -19223,14 +19217,8 @@ mod tests {
         let left_context = &workspace.contexts[&left_key].context;
         let nested_context = &workspace.contexts[&nested_key].context;
         let right_context = &workspace.contexts[&right_key].context;
-        assert_eq!(
-            left_context.project_file.as_deref(),
-            Some(left_project.as_path())
-        );
-        assert_eq!(
-            right_context.project_file.as_deref(),
-            Some(right_project.as_path())
-        );
+        assert_eq!(left_context.project_file(), Some(left_project.as_path()));
+        assert_eq!(right_context.project_file(), Some(right_project.as_path()));
         assert_ne!(left_key, right_key);
         assert!(
             !left_context
@@ -19432,10 +19420,10 @@ mod tests {
         let hook_project = project.clone();
         let _hook = super::rename::test_after_enumerated_context(
             move |processed, path, context| {
-                hook_seen
-                    .lock()
-                    .expect("context observations")
-                    .push((path.to_path_buf(), context.project_file.clone()));
+                hook_seen.lock().expect("context observations").push((
+                    path.to_path_buf(),
+                    context.project_file().map(Path::to_path_buf),
+                ));
                 if processed == 1 {
                     fs::write(
                         &hook_project,
@@ -19687,7 +19675,7 @@ mod tests {
             let key = workspace
                 .context_for_uri(&Url::from_file_path(path).unwrap())
                 .unwrap();
-            workspace.contexts[&key].context.discovery_complete
+            workspace.contexts[&key].context.discovery_complete()
         };
         assert!(
             discovery_complete(&mut fresh, &clean_source),
@@ -21699,7 +21687,7 @@ BDS = '/fake/37'
             .join("Lint4dFixture.Classes.dcu");
         let fixture_path = fixture_root.join("Lint4dFixture.Classes.dcu");
         fs::copy(&fixture_source, &fixture_path).expect("copy fixture into authorized path");
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
             read_policy: ReadPolicy::new(
@@ -21708,8 +21696,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let key = ContextKey {
             installation_id: None,
             project_file: None,
@@ -21829,7 +21817,7 @@ BDS = '/fake/37'
         fs::write(&source_path, source).expect("write project source");
         let source_uri = Url::from_file_path(&source_path).expect("source URI");
 
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
             read_policy: ReadPolicy::new(
@@ -21838,8 +21826,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let expected_dcu_uri = super::discover_compiled_units(
             &context,
             &["Lint4dFixture.Classes".to_string()],
@@ -21947,7 +21935,7 @@ BDS = '/fake/37'
         let source = "unit Consumer; interface uses Lint4dFixture.Classes; type TAlias = TSimpleClass; implementation end.";
         fs::write(&source_path, source).expect("write importer");
         let source_uri = Url::from_file_path(&source_path).expect("source URI");
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             project_file: Some(temp.path().join("App.dproj")),
             browsing_path_entries: vec![ProjectPathEntry::legacy(browsing.clone())],
@@ -21958,8 +21946,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         assert_eq!(
             super::discover_compiled_units(
                 &context,
@@ -22053,7 +22041,7 @@ BDS = '/fake/37'
             "unit Consumer; interface uses OldUnit, Lint4dFixture.Classes; implementation end.";
         fs::write(&source_path, source).expect("write importer");
         let source_uri = Url::from_file_path(&source_path).expect("source URI");
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             project_file: Some(temp.path().join("App.dproj")),
             unit_aliases: HashMap::from([(
@@ -22068,11 +22056,11 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let key = ContextKey {
             installation_id: None,
-            project_file: context.project_file.clone(),
+            project_file: context.project_file().map(Path::to_path_buf),
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
             selection_scope: None,
@@ -22192,7 +22180,7 @@ BDS = '/fake/37'
             "unit Lint4dFixture.Classes; interface implementation end.",
         )
         .expect("write browsing-only provider");
-        let mut context = ProjectContext {
+        let mut context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             project_file: Some(temp.path().join("App.dproj")),
             browsing_path_entries: vec![ProjectPathEntry::legacy(browsing)],
@@ -22203,8 +22191,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         assert_eq!(
             super::discover_compiled_units(
                 &context,
@@ -22216,14 +22204,16 @@ BDS = '/fake/37'
             1,
             "control cases require a real, validated DCU candidate"
         );
-        context.path_issues.push(pascal_project::ProjectPathIssue {
-            kind: pascal_project::ProjectPathIssueKind::MissingReference,
-            source_file: temp.path().join("App.dproj"),
-            property: "DCCReference".to_string(),
-            raw: "Lint4dFixture.Classes.pas".to_string(),
-            path: Some(temp.path().join("Lint4dFixture.Classes.pas")),
-            unit_name: Some("lint4dfixture.classes".to_string()),
-            provenance: ProjectPathProvenance::LegacyNative,
+        crate::edit_context(&mut context, |p| {
+            p.path_issues.push(pascal_project::ProjectPathIssue {
+                kind: pascal_project::ProjectPathIssueKind::MissingReference,
+                source_file: temp.path().join("App.dproj"),
+                property: "DCCReference".to_string(),
+                raw: "Lint4dFixture.Classes.pas".to_string(),
+                path: Some(temp.path().join("Lint4dFixture.Classes.pas")),
+                unit_name: Some("lint4dfixture.classes".to_string()),
+                provenance: ProjectPathProvenance::LegacyNative,
+            })
         });
         let missing_reservation = resolve_with_context(
             context.clone(),
@@ -22235,7 +22225,7 @@ BDS = '/fake/37'
             "missing explicit binding is a reservation"
         );
 
-        context.path_issues.clear();
+        crate::edit_context(&mut context, |p| p.path_issues.clear());
         let inactive = resolve_with_context(
             context,
             temp.path(),
@@ -22273,7 +22263,7 @@ BDS = '/fake/37'
             .into_iter()
             .map(|path| ProjectPathEntry::legacy(path.to_path_buf()))
             .collect();
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             search_path_entries,
             read_policy: ReadPolicy::new(
@@ -22286,8 +22276,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let key = ContextKey {
             installation_id: None,
             project_file: None,
@@ -23810,14 +23800,14 @@ BDS = '/fake/37'
         let mut second_context =
             ConditionalContext::default().with_compiler_version(CompilerVersion::new(24, 0));
         second_context.set_define("FEATURE", ConditionalFact::False);
-        let first = ProjectContext {
+        let first = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             conditional_context: first_context,
-            ..ProjectContext::default()
-        };
-        let second = ProjectContext {
+            ..pascal_project::ProjectContextParts::default()
+        });
+        let second = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             conditional_context: second_context,
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
 
         let first_key = workspace.context_key_for_path(&source, Some(&first));
         let second_key = workspace.context_key_for_path(&source, Some(&second));
@@ -23920,7 +23910,7 @@ BDS = '/fake/37'
             path: root.clone(),
             provenance: ProjectPathProvenance::Configured,
         };
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
             search_path_entries: vec![entry],
             read_policy: ReadPolicy::new(
@@ -23929,8 +23919,8 @@ BDS = '/fake/37'
                 &[],
                 &EffectiveOverrides::default(),
             ),
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let cancel = AtomicBool::new(false);
         let mut resolver = super::resolver::resolver_for_context(
             context,
@@ -25502,7 +25492,7 @@ BDS = '/fake/37'
             .expect("re-added context state")
             .context;
         assert_eq!(
-            second.overrides.properties.get("bds").map(String::as_str),
+            second.overrides().properties.get("bds").map(String::as_str),
             Some("first")
         );
     }
@@ -25760,7 +25750,7 @@ BDS = '/fake/37'
                 .get(&initial_key)
                 .expect("initial context state")
                 .context
-                .project_file
+                .project_file()
                 .is_none()
         );
 
@@ -25779,8 +25769,7 @@ BDS = '/fake/37'
                 .get(&refreshed_key)
                 .expect("refreshed context state")
                 .context
-                .project_file
-                .as_deref(),
+                .project_file(),
             Some(project.as_path())
         );
     }
@@ -25811,7 +25800,7 @@ BDS = '/fake/37'
                 .get(&initial_key)
                 .expect("initial context state")
                 .context
-                .project_file
+                .project_file()
                 .is_none()
         );
 
@@ -25830,8 +25819,7 @@ BDS = '/fake/37'
                 .get(&refreshed_key)
                 .expect("refreshed context state")
                 .context
-                .project_file
-                .as_deref(),
+                .project_file(),
             Some(project.as_path())
         );
     }

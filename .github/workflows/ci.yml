@@ -19,18 +19,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: Check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  grammar:
+    name: Grammar generation
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/tree-sitter-pascal/package-lock.json
+      - name: Install grammar dependencies
+        run: npm ci
+        working-directory: crates/tree-sitter-pascal
+      - name: Check generated grammar files
+        run: |
+          npx tree-sitter generate
+          git diff --exit-code -- src/
+        working-directory: crates/tree-sitter-pascal
+      - name: Test grammar corpus
+        run: npx tree-sitter test
+        working-directory: crates/tree-sitter-pascal
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Test grammar Rust crate
+        run: cargo test -p tree-sitter-pascal
 
   test:
     name: Test (${{ matrix.os }})
@@ -41,10 +53,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
       # Project reads refuse symlinked path components, and macOS reaches its
       # temporary directory through one (/var -> /private/var).
       - name: Resolve TMPDIR symlinks
@@ -69,25 +80,69 @@ jobs:
         run: |
           echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --no-fail-fast
+      - run: cargo test --workspace --no-fail-fast --locked
+      - name: Install pinned Neovim
+        if: runner.os == 'Linux'
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/nvim-linux-x86_64.tar.gz"
+          install_dir="$RUNNER_TEMP/neovim-v0.12.6"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz
+          printf '%s  %s\n' 474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87 "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/nvim-linux-x86_64" "$install_dir"
+          version="$("$install_dir/bin/nvim" --version | head -n 1)"
+          [[ "$version" == "NVIM v0.12.6" ]]
+          printf '%s\n' "$install_dir/bin" >> "$GITHUB_PATH"
+      - name: Test protocol barriers
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p pascal-lsp --features test-support --test protocol_barriers
+      - name: Require the Neovim smoke tests
+        if: runner.os == 'Linux'
+        env:
+          REQUIRE_NVIM: '1'
+        run: cargo test --locked -p pascal-lsp --test neovim
+
+  stable:
+    name: Stable advisory check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  benchmark-smoke:
+    name: Benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p lint4d --locked -- --test
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy test-support protocol cases
+        run: cargo clippy -p pascal-lsp --all-targets --features test-support --locked -- -D warnings
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt
       - run: cargo fmt --check
@@ -97,11 +152,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: audit
-      - run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
       - run: cargo audit --deny warnings
 
   deny:
@@ -109,7 +166,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: deny
@@ -119,18 +176,19 @@ jobs:
 
   coverage:
     name: Code Coverage
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
-      - run: cargo install cargo-llvm-cov --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
         with:

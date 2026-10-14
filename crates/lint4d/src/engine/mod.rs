@@ -23,6 +23,16 @@ use pascal_core::parser::node_text;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
+std::thread_local! {
+    static CFG_BUILDER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_cfg_builder_call() {
+    CFG_BUILDER_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
 /// Run all lint rules on a single file and return sorted, filtered diagnostics.
 ///
 /// This is a convenience wrapper that creates a default [`RuleRegistry`] and
@@ -108,11 +118,17 @@ fn run_lint_with_cfg_project_mode(
 
     let unit_name =
         extract_unit_name(analysis_tree.root_node(), &analysis_source).unwrap_or_default();
-    // Build per-method CFGs only when a CFG rule will consume them.  Project
+    // Build per-method CFGs only when an eligible CFG rule will consume them. Project
     // build failures in that mode are surfaced as one bounded engine
     // diagnostic; file-local-only mode must not manufacture a CFG diagnostic
     // while deliberately withholding uncertain flow conclusions.
-    let cfg_map = if run_cfg_rules {
+    let has_enabled_cfg_consumer = run_cfg_rules
+        && registry.all_rules().iter().any(|rule| {
+            rule.requires_cfg() && rule_is_eligible_for_dispatch(rule.meta(), file, config)
+        });
+    let cfg_map = if has_enabled_cfg_consumer {
+        #[cfg(test)]
+        record_cfg_builder_call();
         let file_cfgs = match file_cfgs {
             CfgInputs::FileLocal { tree, source } => build_file_cfgs(&tree, &source),
             CfgInputs::Project {
@@ -143,20 +159,7 @@ fn run_lint_with_cfg_project_mode(
     for rule in registry.all_rules() {
         let meta = rule.meta();
 
-        // Skip rules that are off by default and not explicitly enabled in config.
-        if !meta.enabled_by_default && config.rule_severity(meta.id).is_none() {
-            continue;
-        }
-
-        // Skip rules that are explicitly turned off.
-        if let Some(RuleSeverityOverride::Off) = config.rule_severity(meta.id) {
-            continue;
-        }
-
-        // Skip naming rules for .dpr/.dpk files (project/package files).
-        if matches!(file.file_type, FileType::Dpr | FileType::Dpk)
-            && matches!(meta.category, RuleCategory::NamingConvention)
-        {
+        if !rule_is_eligible_for_dispatch(meta, file, config) {
             continue;
         }
 
@@ -258,6 +261,22 @@ fn run_lint_with_cfg_project_mode(
     diagnostics
 }
 
+fn rule_is_eligible_for_dispatch(
+    meta: &crate::rules::RuleMeta,
+    file: &FileInfo,
+    config: &Config,
+) -> bool {
+    let enabled = match config.rule_severity(meta.id) {
+        Some(RuleSeverityOverride::Off) => false,
+        Some(RuleSeverityOverride::Severity(_)) => true,
+        None => meta.enabled_by_default,
+    };
+
+    enabled
+        && !(matches!(file.file_type, FileType::Dpr | FileType::Dpk)
+            && matches!(meta.category, RuleCategory::NamingConvention))
+}
+
 #[derive(Debug)]
 enum CfgInputs {
     FileLocal {
@@ -347,19 +366,22 @@ fn map_diagnostics_to_original(
     source_map: &cfg_pascal::SourceMap,
     original_source: &[u8],
 ) -> bool {
+    if diagnostics.is_empty() {
+        return true;
+    }
+
+    let mut prepared_positions = LineStartIndex::new(source_map.prepared_bytes());
+    let mut original_positions = LineStartIndex::new(original_source);
+
     for diagnostic in diagnostics {
-        let Some(start) = byte_offset_at_position(
-            source_map.prepared_bytes(),
-            diagnostic.line,
-            diagnostic.column,
-        ) else {
+        let Some(start) =
+            prepared_positions.byte_offset_at_position(diagnostic.line, diagnostic.column)
+        else {
             return false;
         };
-        let Some(end) = byte_offset_at_position(
-            source_map.prepared_bytes(),
-            diagnostic.end_line,
-            diagnostic.end_column,
-        ) else {
+        let Some(end) =
+            prepared_positions.byte_offset_at_position(diagnostic.end_line, diagnostic.end_column)
+        else {
             return false;
         };
         if start >= end {
@@ -385,10 +407,12 @@ fn map_diagnostics_to_original(
             return false;
         }
         let original_range = original.byte_range();
-        let Some((line, column)) = position_at_offset(original_source, original_range.start) else {
+        let Some((line, column)) = original_positions.position_at_offset(original_range.start)
+        else {
             return false;
         };
-        let Some((end_line, end_column)) = position_at_offset(original_source, original_range.end)
+        let Some((end_line, end_column)) =
+            original_positions.position_at_offset(original_range.end)
         else {
             return false;
         };
@@ -400,41 +424,159 @@ fn map_diagnostics_to_original(
     true
 }
 
-fn byte_offset_at_position(source: &[u8], line: usize, column: usize) -> Option<usize> {
-    if line == 0 || column == 0 {
-        return None;
-    }
-    let mut current_line = 1;
-    let mut line_start = 0;
-    for (index, byte) in source.iter().enumerate() {
-        if current_line == line {
-            break;
-        }
-        if *byte == b'\n' {
-            current_line += 1;
-            line_start = index + 1;
-        }
-    }
-    if current_line != line {
-        return None;
-    }
-    let offset = line_start + column - 1;
-    (offset <= source.len()).then_some(offset)
+/// Private LF-only byte-coordinate index used while mapping prepared
+/// diagnostics. It borrows the source and extends a monotonic prefix only as
+/// coordinates require; cached starts serve direct line lookup and binary
+/// search.
+struct LineStartIndex<'source> {
+    source: &'source [u8],
+    line_starts: Vec<usize>,
+    scanned_to: usize,
 }
 
-fn position_at_offset(source: &[u8], offset: usize) -> Option<(usize, usize)> {
-    if offset > source.len() {
-        return None;
-    }
-    let mut line = 1;
-    let mut line_start = 0;
-    for (index, byte) in source.iter().enumerate().take(offset) {
-        if *byte == b'\n' {
-            line += 1;
-            line_start = index + 1;
+impl<'source> LineStartIndex<'source> {
+    fn new(source: &'source [u8]) -> Self {
+        #[cfg(test)]
+        record_line_start_index_build();
+
+        Self {
+            source,
+            line_starts: vec![0],
+            scanned_to: 0,
         }
     }
-    Some((line, offset - line_start + 1))
+
+    fn byte_offset_at_position(&mut self, line: usize, column: usize) -> Option<usize> {
+        if line == 0 || column == 0 {
+            return None;
+        }
+        self.extend_through_line(line);
+        let line_start = *self.line_starts.get(line - 1)?;
+        // Keep the original usize arithmetic order: debug overflow still
+        // panics, and release overflow still wraps before the bounds check.
+        let offset = line_start + column - 1;
+        (offset <= self.source.len()).then_some(offset)
+    }
+
+    fn position_at_offset(&mut self, offset: usize) -> Option<(usize, usize)> {
+        if offset > self.source.len() {
+            return None;
+        }
+        self.extend_through_offset(offset);
+
+        #[cfg(test)]
+        let mut search_probes = 0;
+        let line_index = self.line_starts.partition_point(|line_start| {
+            #[cfg(test)]
+            {
+                search_probes += 1;
+            }
+            *line_start <= offset
+        }) - 1;
+        #[cfg(test)]
+        record_line_start_search_probes(search_probes);
+
+        let line_start = self.line_starts[line_index];
+        Some((line_index + 1, offset - line_start + 1))
+    }
+
+    fn extend_through_line(&mut self, line: usize) {
+        #[cfg(test)]
+        let previous_scanned_to = self.scanned_to;
+        #[cfg(test)]
+        let previous_line_starts = self.line_starts.len();
+        while self.line_starts.len() < line && self.scanned_to < self.source.len() {
+            self.scan_next_byte();
+        }
+        #[cfg(test)]
+        self.record_scan_extension(previous_scanned_to, previous_line_starts);
+    }
+
+    fn extend_through_offset(&mut self, offset: usize) {
+        #[cfg(test)]
+        let previous_scanned_to = self.scanned_to;
+        #[cfg(test)]
+        let previous_line_starts = self.line_starts.len();
+        while self.scanned_to < offset {
+            self.scan_next_byte();
+        }
+        #[cfg(test)]
+        self.record_scan_extension(previous_scanned_to, previous_line_starts);
+    }
+
+    fn scan_next_byte(&mut self) {
+        if self.source[self.scanned_to] == b'\n' {
+            self.line_starts.push(self.scanned_to + 1);
+        }
+        self.scanned_to += 1;
+    }
+
+    #[cfg(test)]
+    fn record_scan_extension(&self, previous_scanned_to: usize, previous_line_starts: usize) {
+        record_line_start_scan(
+            self.scanned_to - previous_scanned_to,
+            self.line_starts.len() - previous_line_starts,
+        );
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct LineStartIndexWork {
+    builds: usize,
+    bytes_scanned: usize,
+    line_starts_added: usize,
+    offset_search_probes: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LINE_START_INDEX_WORK: std::cell::Cell<LineStartIndexWork> = const {
+        std::cell::Cell::new(LineStartIndexWork {
+            builds: 0,
+            bytes_scanned: 0,
+            line_starts_added: 0,
+            offset_search_probes: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+fn record_line_start_index_build() {
+    LINE_START_INDEX_WORK.with(|counter| {
+        let mut work = counter.get();
+        work.builds += 1;
+        counter.set(work);
+    });
+}
+
+#[cfg(test)]
+fn record_line_start_scan(bytes_scanned: usize, line_starts_added: usize) {
+    LINE_START_INDEX_WORK.with(|counter| {
+        let mut work = counter.get();
+        work.bytes_scanned += bytes_scanned;
+        work.line_starts_added += line_starts_added;
+        counter.set(work);
+    });
+}
+
+#[cfg(test)]
+fn record_line_start_search_probes(probes: usize) {
+    LINE_START_INDEX_WORK.with(|counter| {
+        let mut work = counter.get();
+        work.offset_search_probes += probes;
+        counter.set(work);
+    });
+}
+
+#[cfg(test)]
+fn reset_line_start_index_work() {
+    LINE_START_INDEX_WORK.with(|work| work.set(LineStartIndexWork::default()));
+}
+
+#[cfg(test)]
+fn line_start_index_work() -> LineStartIndexWork {
+    LINE_START_INDEX_WORK.with(std::cell::Cell::get)
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -574,4 +716,472 @@ fn find_enclosing_scope(scopes: &[ProcScope], line: usize) -> Option<String> {
         }
     }
     best.map(|s| s.name.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CFG_BUILDER_CALLS, FileInfo, RuleRegistry, run_lint, run_lint_file_local_rules};
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    const NO_CFG_RULES_CONFIG: &str = r#"
+version = 1
+[rules]
+resource-leak-unprotected = "off"
+resource-leak-no-try = "off"
+field-not-freed = "off"
+field-reassign-leak = "off"
+bare-except = "off"
+empty-except = "off"
+raise-in-destructor = "off"
+type-prefix = "off"
+interface-prefix = "off"
+constant-naming = "off"
+identifier-casing = "off"
+inherited-order = "off"
+inherited-missing = "off"
+use-after-free = "off"
+transaction = "off"
+"#;
+
+    fn reset_cfg_builder_calls() {
+        CFG_BUILDER_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn cfg_builder_calls() -> usize {
+        CFG_BUILDER_CALLS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn naming_and_with_rules_run_without_building_cfgs_when_cfg_consumers_are_off() {
+        reset_cfg_builder_calls();
+        let source = b"unit Gate;\ninterface\nimplementation\nprocedure Run;\nvar badName: Integer; Obj: TObject;\nbegin\n  with Obj do badName := 1;\nend;\nend.\n";
+        let file = FileInfo::new(PathBuf::from("Gate.pas"));
+        let config = NO_CFG_RULES_CONFIG.parse::<Config>().unwrap();
+
+        let diagnostics = run_lint(&file, source, &config);
+
+        assert_eq!(cfg_builder_calls(), 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.rule_id == "with-statement")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.rule_id == "local-variable-naming")
+        );
+        assert!(diagnostics.iter().all(|diag| diag.rule_id != "parse-error"));
+    }
+
+    #[test]
+    fn enabled_cfg_consumer_builds_cfg_and_keeps_its_diagnostic() {
+        reset_cfg_builder_calls();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/resource_leak/bad_unprotected.pas");
+        let source = std::fs::read(&path).unwrap();
+        let file = FileInfo::new(path);
+        let config = "version = 1".parse::<Config>().unwrap();
+
+        let diagnostics = run_lint(&file, &source, &config);
+
+        assert_eq!(cfg_builder_calls(), 1);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.rule_id == "resource-leak-unprotected")
+        );
+    }
+
+    #[test]
+    fn explicitly_enabled_default_off_cfg_consumer_triggers_build() {
+        reset_cfg_builder_calls();
+        let file = FileInfo::new(PathBuf::from("Gate.pas"));
+        let source = b"unit Gate;\ninterface\nimplementation\nend.\n";
+        let config = format!("{NO_CFG_RULES_CONFIG}\nunchecked-nil = \"warning\"\n")
+            .parse::<Config>()
+            .unwrap();
+
+        let _ = run_lint(&file, source, &config);
+
+        assert_eq!(cfg_builder_calls(), 1);
+    }
+
+    #[test]
+    fn dpr_and_dpk_naming_exclusions_match_dispatch_and_do_not_build_cfgs() {
+        for extension in ["dpr", "dpk"] {
+            reset_cfg_builder_calls();
+            let file = FileInfo::new(PathBuf::from(format!("Gate.{extension}")));
+            let source = b"unit Gate;\ninterface\nimplementation\nprocedure Run;\nvar badName: Integer;\nbegin\n  badName := 1;\nend;\nend.\n";
+            let config = NO_CFG_RULES_CONFIG.parse::<Config>().unwrap();
+
+            let diagnostics = run_lint(&file, source, &config);
+
+            assert_eq!(cfg_builder_calls(), 0);
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diag| diag.rule_id != "local-variable-naming")
+            );
+        }
+    }
+
+    #[test]
+    fn default_off_cfg_consumer_does_not_trigger_build_until_enabled() {
+        reset_cfg_builder_calls();
+        let file = FileInfo::new(PathBuf::from("Gate.pas"));
+        let source = b"unit Gate;\ninterface\nimplementation\nend.\n";
+        let config = NO_CFG_RULES_CONFIG.parse::<Config>().unwrap();
+
+        let _ = run_lint(&file, source, &config);
+
+        assert_eq!(cfg_builder_calls(), 0);
+    }
+
+    #[test]
+    fn file_local_mode_never_builds_cfgs() {
+        reset_cfg_builder_calls();
+        let file = FileInfo::new(PathBuf::from("Gate.pas"));
+        let source = b"unit Gate;\ninterface\nimplementation\nend.\n";
+        let config = "version = 1".parse::<Config>().unwrap();
+
+        let _ = run_lint_file_local_rules(&file, source, &config, &RuleRegistry::new());
+
+        assert_eq!(cfg_builder_calls(), 0);
+    }
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::{
+        Diagnostic, LineStartIndex, Severity, line_start_index_work, map_diagnostics_to_original,
+        reset_line_start_index_work,
+    };
+    use cfg_pascal::{ExpansionId, ProjectSourceId, SourceMap, SourceMapSegment, SourceSnapshot};
+
+    fn byte_offset_at_position(source: &[u8], line: usize, column: usize) -> Option<usize> {
+        LineStartIndex::new(source).byte_offset_at_position(line, column)
+    }
+
+    fn position_at_offset(source: &[u8], offset: usize) -> Option<(usize, usize)> {
+        LineStartIndex::new(source).position_at_offset(offset)
+    }
+
+    #[test]
+    fn byte_positions_are_lf_only_raw_byte_columns_and_may_cross_lines() {
+        let source = b"a\nb\n";
+        for (line, column, expected) in [
+            (1, 1, Some(0)),
+            (1, 2, Some(1)),
+            (1, 3, Some(2)), // The old conversion does not clamp to line 1.
+            (2, 2, Some(3)),
+            (3, 1, Some(4)), // The trailing LF creates a final empty line.
+        ] {
+            assert_eq!(byte_offset_at_position(source, line, column), expected);
+        }
+
+        let crlf = b"a\r\nb";
+        assert_eq!(byte_offset_at_position(crlf, 1, 2), Some(1)); // CR
+        assert_eq!(byte_offset_at_position(crlf, 1, 3), Some(2)); // LF
+        assert_eq!(byte_offset_at_position(crlf, 1, 4), Some(3)); // Crosses LF.
+        assert_eq!(byte_offset_at_position(crlf, 2, 1), Some(3));
+
+        let utf8 = "éx".as_bytes();
+        assert_eq!(byte_offset_at_position(utf8, 1, 2), Some(1));
+        assert_eq!(byte_offset_at_position(utf8, 1, 3), Some(2));
+
+        let invalid_utf8 = b"\xff\x80\n";
+        assert_eq!(byte_offset_at_position(invalid_utf8, 1, 3), Some(2));
+        assert_eq!(byte_offset_at_position(invalid_utf8, 2, 1), Some(3));
+    }
+
+    #[test]
+    fn byte_offsets_keep_lf_ownership_and_eof_line_semantics() {
+        assert_eq!(position_at_offset(b"", 0), Some((1, 1)));
+
+        let source = b"a\nb\n";
+        for (offset, expected) in [
+            (0, Some((1, 1))),
+            (1, Some((1, 2))), // The LF belongs to the preceding line.
+            (2, Some((2, 1))),
+            (3, Some((2, 2))),
+            (4, Some((3, 1))), // EOF after trailing LF is the final empty line.
+        ] {
+            assert_eq!(position_at_offset(source, offset), expected);
+        }
+
+        let crlf = b"a\r\nb";
+        assert_eq!(position_at_offset(crlf, 1), Some((1, 2)));
+        assert_eq!(position_at_offset(crlf, 2), Some((1, 3)));
+        assert_eq!(position_at_offset(crlf, 3), Some((2, 1)));
+
+        assert_eq!(position_at_offset("é".as_bytes(), 1), Some((1, 2)));
+        assert_eq!(position_at_offset("é".as_bytes(), 2), Some((1, 3)));
+        assert_eq!(position_at_offset(b"\xff\xfe\n", 2), Some((1, 3)));
+        assert_eq!(position_at_offset(b"\xff\xfe\n", 3), Some((2, 1)));
+    }
+
+    #[test]
+    fn byte_coordinate_conversions_reject_zero_and_out_of_range_values() {
+        assert_eq!(byte_offset_at_position(b"", 0, 1), None);
+        assert_eq!(byte_offset_at_position(b"", 1, 0), None);
+        assert_eq!(byte_offset_at_position(b"", 1, 2), None);
+        assert_eq!(byte_offset_at_position(b"a\n", 3, 1), None);
+        assert_eq!(byte_offset_at_position(b"a\n", 1, 4), None);
+        assert_eq!(position_at_offset(b"", 1), None);
+        assert_eq!(position_at_offset(b"a", 2), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn byte_position_addition_keeps_debug_overflow_panic() {
+        let _ = byte_offset_at_position(b"\n", 2, usize::MAX);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn byte_position_addition_keeps_release_wrapping_result() {
+        assert_eq!(byte_offset_at_position(b"\n", 2, usize::MAX), None);
+    }
+
+    fn diagnostic(line: usize, column: usize, end_line: usize, end_column: usize) -> Diagnostic {
+        Diagnostic {
+            rule_id: "test-rule".to_string(),
+            severity: Severity::Warning,
+            message: "test diagnostic".to_string(),
+            line,
+            column,
+            end_line,
+            end_column,
+            help: None,
+            scope: None,
+        }
+    }
+
+    fn two_mib_source_with_dense_prefix_lines() -> Vec<u8> {
+        let mut source = vec![b'x'; 2 * 1024 * 1024];
+        for line in 1..=8_192 {
+            source[line * 2 - 1] = b'\n';
+        }
+        source
+    }
+
+    fn identity_source_map(source: &[u8]) -> SourceMap {
+        SourceMap::identity(SourceSnapshot::new(
+            ProjectSourceId::new("large.pas"),
+            source,
+        ))
+        .expect("identity source map")
+    }
+
+    #[test]
+    fn empty_mapped_diagnostics_do_not_build_or_scan_coordinate_indices() {
+        let source = two_mib_source_with_dense_prefix_lines();
+        let source_map = identity_source_map(&source);
+        let mut diagnostics = Vec::new();
+
+        reset_line_start_index_work();
+        assert!(map_diagnostics_to_original(
+            &mut diagnostics,
+            &source_map,
+            &source,
+        ));
+        let work = line_start_index_work();
+
+        assert_eq!(work.builds, 0);
+        assert_eq!(work.bytes_scanned, 0);
+        assert_eq!(work.offset_search_probes, 0);
+    }
+
+    #[test]
+    fn sparse_out_of_order_diagnostics_reuse_only_the_needed_line_prefix() {
+        const SOURCE_LEN: usize = 2 * 1024 * 1024;
+        let mut source = vec![b'x'; SOURCE_LEN];
+        source[..8].copy_from_slice(b"a\nb\nc\nd\n");
+        let source_map = identity_source_map(&source);
+        let mut diagnostics = vec![
+            diagnostic(4, 1, 4, 2),
+            diagnostic(2, 1, 2, 2),
+            diagnostic(3, 1, 3, 2),
+        ];
+
+        reset_line_start_index_work();
+        let started = std::time::Instant::now();
+        assert!(map_diagnostics_to_original(
+            &mut diagnostics,
+            &source_map,
+            &source,
+        ));
+        let elapsed = started.elapsed();
+        let work = line_start_index_work();
+
+        assert_eq!(work.builds, 2);
+        // The first (line 4) query scans prepared bytes through its line
+        // start (6); original offsets 6 and 7 extend the other prefix to 7.
+        // Later line 2/3 queries move backward and reuse both cached prefixes.
+        assert_eq!(work.bytes_scanned, 6 + 7);
+        assert_eq!(work.line_starts_added, 3 + 3);
+        assert!(work.offset_search_probes > 0);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diag| (diag.line, diag.column, diag.end_line, diag.end_column))
+                .collect::<Vec<_>>(),
+            [(4, 1, 4, 2), (2, 1, 2, 2), (3, 1, 3, 2)]
+        );
+        eprintln!(
+            "2 MiB sparse out-of-order SourceMap: mapped 3 diagnostics in {elapsed:?}; index builds={}, prefix bytes scanned={}, line starts added={}, offset binary-search probes={}",
+            work.builds, work.bytes_scanned, work.line_starts_added, work.offset_search_probes,
+        );
+    }
+
+    #[test]
+    fn end_of_source_position_query_extends_the_prefix_to_eof() {
+        const SOURCE_LEN: usize = 2 * 1024 * 1024;
+        let source = two_mib_source_with_dense_prefix_lines();
+        let source_map = identity_source_map(&source);
+        // Deliberately use a line-1 column that crosses the intervening lines:
+        // the old coordinate contract allows it when the total offset is valid.
+        let mut diagnostics = vec![diagnostic(1, SOURCE_LEN, 1, SOURCE_LEN + 1)];
+
+        reset_line_start_index_work();
+        let started = std::time::Instant::now();
+        assert!(map_diagnostics_to_original(
+            &mut diagnostics,
+            &source_map,
+            &source,
+        ));
+        let elapsed = started.elapsed();
+        let work = line_start_index_work();
+
+        assert_eq!(work.builds, 2);
+        // Position-to-byte on line 1 needs no scan; the original end offset is
+        // EOF, so byte-to-position must scan all original bytes to find its line.
+        assert_eq!(work.bytes_scanned, SOURCE_LEN);
+        assert_eq!(work.line_starts_added, 8_192);
+        assert_eq!(diagnostics[0].line, 8_193);
+        assert_eq!(diagnostics[0].column, SOURCE_LEN - 16_384);
+        assert_eq!(diagnostics[0].end_line, 8_193);
+        assert_eq!(diagnostics[0].end_column, SOURCE_LEN - 16_384 + 1);
+        eprintln!(
+            "2 MiB EOF SourceMap: mapped 1 diagnostic in {elapsed:?}; index builds={}, prefix bytes scanned={}, line starts added={}, offset binary-search probes={}",
+            work.builds, work.bytes_scanned, work.line_starts_added, work.offset_search_probes,
+        );
+    }
+
+    #[test]
+    fn source_map_failure_preserves_old_partial_mutation_order_for_fallback() {
+        let source_id = ProjectSourceId::new("origin.pas");
+        let source_map = SourceMap::new(
+            b"abc\n",
+            vec![SourceSnapshot::new(source_id.clone(), b"prefix abc\n")],
+            vec![SourceMapSegment::copied(
+                0..4,
+                source_id,
+                7..11,
+                ExpansionId::root(),
+            )],
+        )
+        .expect("valid copied source map");
+        let mut diagnostics = vec![
+            diagnostic(1, 1, 1, 2),
+            diagnostic(99, 1, 99, 2),
+            diagnostic(1, 2, 1, 3),
+        ];
+
+        assert!(!map_diagnostics_to_original(
+            &mut diagnostics,
+            &source_map,
+            b"prefix abc\n"
+        ));
+
+        // The first diagnostic was mapped before the second rejected the
+        // prepared coordinates. The caller discards this partial vector and
+        // reruns against the original source; later diagnostics are untouched.
+        assert_eq!(
+            (
+                diagnostics[0].line,
+                diagnostics[0].column,
+                diagnostics[0].end_line,
+                diagnostics[0].end_column,
+            ),
+            (1, 8, 1, 9)
+        );
+        assert_eq!(
+            (
+                diagnostics[1].line,
+                diagnostics[1].column,
+                diagnostics[1].end_line,
+                diagnostics[1].end_column,
+            ),
+            (99, 1, 99, 2)
+        );
+        assert_eq!(
+            (
+                diagnostics[2].line,
+                diagnostics[2].column,
+                diagnostics[2].end_line,
+                diagnostics[2].end_column,
+            ),
+            (1, 2, 1, 3)
+        );
+    }
+
+    #[test]
+    fn maps_ten_thousand_diagnostics_through_a_two_mib_source_map() {
+        const DIAGNOSTIC_COUNT: usize = 10_000;
+
+        let prepared = two_mib_source_with_dense_prefix_lines();
+        let source_map = identity_source_map(&prepared);
+        let mut diagnostics = Vec::with_capacity(DIAGNOSTIC_COUNT);
+        let mut legacy_coordinate_scan_bytes = 0usize;
+        for index in 0..DIAGNOSTIC_COUNT {
+            let line = 4_097 + index % 4_096;
+            let line_start = (line - 1) * 2;
+            // The old conversion loops visit line_start + 1 bytes for each
+            // position-to-offset conversion, then offset bytes for each
+            // offset-to-position conversion: exactly 4 * line_start + 3.
+            legacy_coordinate_scan_bytes += 4 * line_start + 3;
+            diagnostics.push(diagnostic(line, 1, line, 2));
+        }
+
+        reset_line_start_index_work();
+        let started = std::time::Instant::now();
+        assert!(map_diagnostics_to_original(
+            &mut diagnostics,
+            &source_map,
+            prepared.as_slice(),
+        ));
+        let elapsed = started.elapsed();
+        let work = line_start_index_work();
+
+        assert_eq!(diagnostics.len(), DIAGNOSTIC_COUNT);
+        assert_eq!(work.builds, 2, "prepared and original indices are reused");
+        assert_eq!(work.bytes_scanned, (8_192 - 1) * 2 + ((8_192 - 1) * 2 + 1));
+        assert_eq!(work.line_starts_added, 2 * (8_192 - 1));
+        assert!(work.offset_search_probes > 0);
+        // Rust 1.99's std probe measured 15 predicates for 8,193 entries;
+        // keep a conservative bound rather than assuming 14.
+        assert!(
+            work.offset_search_probes <= DIAGNOSTIC_COUNT * 2 * 16,
+            "each of two offset lookups per diagnostic should use at most 16 binary-search probes; observed {}",
+            work.offset_search_probes,
+        );
+        assert!(diagnostics.iter().enumerate().all(|(index, diagnostic)| {
+            diagnostic.line == 4_097 + index % 4_096
+                && diagnostic.column == 1
+                && diagnostic.end_line == diagnostic.line
+                && diagnostic.end_column == 2
+        }));
+        eprintln!(
+            "2 MiB identity SourceMap: mapped {DIAGNOSTIC_COUNT} diagnostics in {elapsed:?}; index builds={}, prefix bytes scanned={}, line starts added={}, offset binary-search probes={}, legacy conversion loop model visits {} bytes",
+            work.builds,
+            work.bytes_scanned,
+            work.line_starts_added,
+            work.offset_search_probes,
+            legacy_coordinate_scan_bytes,
+        );
+    }
 }

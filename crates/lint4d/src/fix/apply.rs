@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
@@ -26,6 +26,36 @@ pub(crate) fn collect_edits_bounded(
     budget: &mut Option<&mut dyn FixWorkBudget>,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<TextEdit>, String> {
+    collect_edits_with_shadow_barriers(
+        root, source, rename_map, scopes, fix_config, false, budget, cancel,
+    )
+}
+
+pub(crate) fn collect_edits_restricted(
+    root: Node,
+    source: &[u8],
+    rename_map: &RenameMap,
+    scopes: &Scopes,
+    fix_config: &FixConfig,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<TextEdit>, String> {
+    collect_edits_with_shadow_barriers(
+        root, source, rename_map, scopes, fix_config, true, budget, cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_edits_with_shadow_barriers(
+    root: Node,
+    source: &[u8],
+    rename_map: &RenameMap,
+    scopes: &Scopes,
+    fix_config: &FixConfig,
+    shadow_barriers: bool,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<TextEdit>, String> {
     let mut edits = Vec::new();
     walk_for_edits(
         root,
@@ -34,6 +64,8 @@ pub(crate) fn collect_edits_bounded(
         scopes,
         None,
         fix_config.casing,
+        shadow_barriers,
+        false,
         &mut edits,
         budget,
         cancel,
@@ -49,12 +81,17 @@ fn walk_for_edits(
     scopes: &Scopes,
     proc_ctx: Option<&ProcContext<'_>>,
     casing_enabled: bool,
+    shadow_barriers: bool,
+    inside_with_body: bool,
     edits: &mut Vec<TextEdit>,
     budget: &mut Option<&mut dyn FixWorkBudget>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
     super::charge_budget(budget, cancel, 1, 0)?;
     if node.kind() == K::IDENTIFIER {
+        if shadow_barriers && inside_with_body {
+            return Ok(());
+        }
         resolve_and_emit(
             node,
             source,
@@ -62,6 +99,7 @@ fn walk_for_edits(
             scopes,
             proc_ctx,
             casing_enabled,
+            shadow_barriers,
             edits,
             budget,
             cancel,
@@ -93,7 +131,71 @@ fn walk_for_edits(
             }
             None => HashMap::new(),
         };
-        collect_method_scope_bounded(node, source, &mut method_scope, budget, cancel)?;
+        let mut blocked_local_names = if shadow_barriers {
+            match proc_ctx {
+                Some(ctx) => {
+                    charge_string_hash_set_clone(&ctx.blocked_local_names, budget, cancel)?;
+                    ctx.blocked_local_names.clone()
+                }
+                None => HashSet::new(),
+            }
+        } else {
+            HashSet::new()
+        };
+        let mut blocked_local_renames = if shadow_barriers {
+            match proc_ctx {
+                Some(ctx) => {
+                    charge_blocked_rename_set_clone(&ctx.blocked_local_renames, budget, cancel)?;
+                    ctx.blocked_local_renames.clone()
+                }
+                None => HashSet::new(),
+            }
+        } else {
+            HashSet::new()
+        };
+        let mut local_declaration_renames = HashSet::new();
+        let mut restricted_shadow_names = HashSet::new();
+        if shadow_barriers {
+            let mut direct_scope = HashMap::new();
+            collect_method_scope_bounded(node, source, &mut direct_scope, budget, cancel)?;
+            if node.kind() == K::LAMBDA {
+                collect_lambda_argument_scope(node, source, &mut direct_scope, budget, cancel)?;
+            }
+            let ambiguous_declarations =
+                collect_restricted_declaration_shadows(node, source, budget, cancel)?;
+
+            // A direct local/parameter declaration shadows inherited names.
+            // Keep its spelling available for ordinary case normalization.
+            for (name, declared_name) in &direct_scope {
+                insert_string_hash_set(&mut restricted_shadow_names, name, budget, cancel)?;
+                blocked_local_names.remove(name);
+                charge_hash_map_insert(
+                    &method_scope,
+                    budget,
+                    cancel,
+                    name.len(),
+                    declared_name.len(),
+                )?;
+                method_scope.insert(name.clone(), declared_name.clone());
+            }
+
+            // Local constants, types, and routines are lexical shadows too,
+            // but this walker cannot safely resolve their unqualified uses.
+            // Suppress matching edits rather than borrowing an outer local's
+            // rename or casing.
+            for name in ambiguous_declarations {
+                insert_string_hash_set(&mut restricted_shadow_names, &name, budget, cancel)?;
+                insert_string_hash_set(&mut blocked_local_names, &name, budget, cancel)?;
+            }
+
+            // Remove inherited spelling-based candidates here. An own
+            // candidate for this routine is considered below; blocked
+            // ancestor candidates are carried to all descendant routines.
+            local_renames.retain(|name, _| !restricted_shadow_names.contains(name));
+            local_rename_ranges.retain(|name, _| !restricted_shadow_names.contains(name));
+        } else {
+            collect_method_scope_bounded(node, source, &mut method_scope, budget, cancel)?;
+        }
 
         // Apply local renames for THIS procedure AND enclosing procedures.
         // An outer procedure's rename with range (rps, rpe) applies if this
@@ -132,6 +234,33 @@ fn walk_for_edits(
         });
         for ((rps, rpe, old_lower), new_name) in containing_renames {
             super::charge_budget(budget, cancel, 1, old_lower.len() + new_name.len())?;
+            let rename_key = if shadow_barriers {
+                charge_owned_budget(budget, cancel, old_lower.len())?;
+                Some((*rps, *rpe, old_lower.clone()))
+            } else {
+                None
+            };
+            if rename_key
+                .as_ref()
+                .is_some_and(|key| blocked_local_renames.contains(key))
+            {
+                continue;
+            }
+            if shadow_barriers
+                && (*rps, *rpe) != (ps, pe)
+                && restricted_shadow_names.contains(old_lower)
+            {
+                insert_blocked_rename(
+                    &mut blocked_local_renames,
+                    rename_key.expect("restricted mode materializes local rename keys"),
+                    budget,
+                    cancel,
+                )?;
+                continue;
+            }
+            if shadow_barriers && (*rps, *rpe) == (ps, pe) {
+                insert_string_hash_set(&mut local_declaration_renames, old_lower, budget, cancel)?;
+            }
             method_scope.remove(old_lower);
             charge_hash_map_insert(
                 &method_scope,
@@ -185,6 +314,9 @@ fn walk_for_edits(
             method_scope,
             local_renames,
             local_rename_ranges,
+            blocked_local_names,
+            blocked_local_renames,
+            local_declaration_renames,
             class_fields,
         };
 
@@ -196,6 +328,8 @@ fn walk_for_edits(
                 scopes,
                 Some(&ctx),
                 casing_enabled,
+                shadow_barriers,
+                inside_with_body,
                 edits,
                 budget,
                 cancel,
@@ -205,6 +339,9 @@ fn walk_for_edits(
     }
 
     // Default: recurse into children
+    let with_body = (shadow_barriers && node.kind() == K::WITH)
+        .then(|| node.child_by_field_name("body").map(|body| body.id()))
+        .flatten();
     for child in node.children(&mut node.walk()) {
         walk_for_edits(
             child,
@@ -213,6 +350,8 @@ fn walk_for_edits(
             scopes,
             proc_ctx,
             casing_enabled,
+            shadow_barriers,
+            inside_with_body || with_body == Some(child.id()),
             edits,
             budget,
             cancel,
@@ -229,6 +368,7 @@ fn resolve_and_emit(
     scopes: &Scopes,
     proc_ctx: Option<&ProcContext>,
     casing_enabled: bool,
+    shadow_barriers: bool,
     edits: &mut Vec<TextEdit>,
     budget: &mut Option<&mut dyn FixWorkBudget>,
     cancel: Option<&AtomicBool>,
@@ -243,6 +383,22 @@ fn resolve_and_emit(
     let text = node_text(node, source);
     charge_owned_budget(budget, cancel, lowercase_utf8_len(&text))?;
     let lower = text.to_lowercase();
+
+    if shadow_barriers {
+        if is_inside_typeref(node) {
+            return Ok(());
+        }
+        let own_local_declaration = node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), K::DECL_VAR | K::DECL_ARG)
+                && proc_ctx.is_some_and(|ctx| ctx.local_declaration_renames.contains(&lower))
+        });
+        if is_declaration_position(node) && !own_local_declaration {
+            return Ok(());
+        }
+        if proc_ctx.is_some_and(|ctx| ctx.blocked_local_names.contains(&lower)) {
+            return Ok(());
+        }
+    }
 
     // Step 1: Check local rename (innermost matching enclosing procedure).
     // A rename keyed to (rps, rpe) applies if this proc context is contained
@@ -308,6 +464,210 @@ fn resolve_and_emit(
             cancel,
         )?;
     }
+    Ok(())
+}
+
+fn collect_lambda_argument_scope(
+    lambda: Node,
+    source: &[u8],
+    scope: &mut HashMap<String, String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let Some(args) = lambda.child_by_field_name("args") else {
+        return Ok(());
+    };
+    for arg in args.children(&mut args.walk()) {
+        charge_budget(budget, cancel, 1, 0)?;
+        if arg.kind() != K::DECL_ARG {
+            continue;
+        }
+        for index in 0..arg.child_count() {
+            charge_budget(budget, cancel, 1, 0)?;
+            let Some(name) = arg.child(index) else {
+                continue;
+            };
+            if name.kind() == K::IDENTIFIER
+                && arg.field_name_for_child(index as u32) == Some("name")
+            {
+                insert_scope_identifier(name, source, scope, budget, cancel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_scope_identifier(
+    node: Node,
+    source: &[u8],
+    scope: &mut HashMap<String, String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let text_bytes = node.end_byte().saturating_sub(node.start_byte());
+    charge_owned_budget(budget, cancel, decoded_text_capacity(text_bytes))?;
+    let name = node_text(node, source);
+    let lower_len = lowercase_utf8_len(&name);
+    charge_owned_budget(budget, cancel, lower_len)?;
+    charge_hash_map_insert(scope, budget, cancel, lower_len, name.len())?;
+    scope.insert(name.to_lowercase(), name);
+    Ok(())
+}
+
+fn collect_restricted_declaration_shadows(
+    proc_node: Node,
+    source: &[u8],
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<HashSet<String>, String> {
+    let mut names = HashSet::new();
+    if let Some(local) = proc_node.child_by_field_name("local") {
+        collect_local_declaration_shadows(local, source, &mut names, budget, cancel)?;
+    }
+    Ok(names)
+}
+
+fn collect_local_declaration_shadows(
+    node: Node,
+    source: &[u8],
+    names: &mut HashSet<String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, 1, 0)?;
+    match node.kind() {
+        K::DEF_PROC => {
+            if let Some(header) = node.child_by_field_name("header")
+                && let Some(name) = header.child_by_field_name("name")
+            {
+                collect_identifier_names(name, source, names, budget, cancel)?;
+            }
+            return Ok(());
+        }
+        K::LAMBDA => return Ok(()),
+        K::DECL_CONST | K::DECL_TYPE | K::DECL_PROC => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_identifier_names(name, source, names, budget, cancel)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_local_declaration_shadows(child, source, names, budget, cancel)?;
+    }
+    Ok(())
+}
+
+fn collect_identifier_names(
+    node: Node,
+    source: &[u8],
+    names: &mut HashSet<String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, 1, 0)?;
+    if node.kind() == K::IDENTIFIER {
+        let text_bytes = node.end_byte().saturating_sub(node.start_byte());
+        charge_owned_budget(budget, cancel, decoded_text_capacity(text_bytes))?;
+        let name = node_text(node, source);
+        let lower_len = lowercase_utf8_len(&name);
+        charge_owned_budget(budget, cancel, lower_len)?;
+        insert_string_hash_set(names, &name.to_lowercase(), budget, cancel)?;
+        return Ok(());
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_identifier_names(child, source, names, budget, cancel)?;
+    }
+    Ok(())
+}
+
+fn charge_string_hash_set_clone(
+    set: &HashSet<String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, set.len(), 0)?;
+    charge_owned_budget(
+        budget,
+        cancel,
+        set.capacity()
+            .saturating_mul(std::mem::size_of::<(String, usize)>())
+            .saturating_add(set.iter().map(String::len).sum::<usize>()),
+    )
+}
+
+fn charge_blocked_rename_set_clone(
+    set: &HashSet<(usize, usize, String)>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, set.len(), 0)?;
+    charge_owned_budget(
+        budget,
+        cancel,
+        set.capacity()
+            .saturating_mul(std::mem::size_of::<((usize, usize, String), usize)>())
+            .saturating_add(set.iter().map(|(_, _, name)| name.len()).sum::<usize>()),
+    )
+}
+
+fn insert_string_hash_set(
+    set: &mut HashSet<String>,
+    value: &str,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, 1, 0)?;
+    if set.contains(value) {
+        return Ok(());
+    }
+    let growth = if set.len() == set.capacity() {
+        set.capacity()
+            .max(1)
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<(String, usize)>())
+    } else {
+        0
+    };
+    charge_owned_budget(
+        budget,
+        cancel,
+        std::mem::size_of::<String>()
+            .saturating_add(value.len())
+            .saturating_add(growth),
+    )?;
+    set.insert(value.to_owned());
+    Ok(())
+}
+
+fn insert_blocked_rename(
+    set: &mut HashSet<(usize, usize, String)>,
+    value: (usize, usize, String),
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, 1, 0)?;
+    if set.contains(&value) {
+        return Ok(());
+    }
+    let growth = if set.len() == set.capacity() {
+        set.capacity()
+            .max(1)
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<((usize, usize, String), usize)>())
+    } else {
+        0
+    };
+    charge_owned_budget(
+        budget,
+        cancel,
+        std::mem::size_of::<(usize, usize, String)>()
+            .saturating_add(value.2.len())
+            .saturating_add(growth),
+    )?;
+    set.insert(value);
     Ok(())
 }
 
@@ -471,11 +831,178 @@ pub(crate) fn apply_edits(
         }
     }
 
-    let count = edits.len();
-    let mut result = source.to_vec();
     for edit in &edits {
-        result.splice(edit.start_byte..edit.end_byte, edit.new_text.bytes());
+        if edit.start_byte > edit.end_byte {
+            return Err(format!(
+                "invalid edit range {}..{} — start exceeds end",
+                edit.start_byte, edit.end_byte,
+            ));
+        }
+        if edit.end_byte > source.len() {
+            return Err(format!(
+                "edit range {}..{} exceeds source length {}",
+                edit.start_byte,
+                edit.end_byte,
+                source.len(),
+            ));
+        }
     }
 
+    let count = edits.len();
+    let output_len = edits.iter().try_fold(source.len(), |length, edit| {
+        length
+            .checked_sub(edit.end_byte - edit.start_byte)
+            .and_then(|length| length.checked_add(edit.new_text.len()))
+            .ok_or_else(|| "edited source length overflow".to_string())
+    })?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(output_len)
+        .map_err(|error| format!("could not reserve edited source: {error}"))?;
+
+    // The edits are sorted descending, so reverse iteration constructs the
+    // result in source order without repeatedly moving the untouched suffix.
+    let mut cursor = 0;
+    for edit in edits.iter().rev() {
+        result.extend_from_slice(&source[cursor..edit.start_byte]);
+        result.extend_from_slice(edit.new_text.as_bytes());
+        cursor = edit.end_byte;
+    }
+    result.extend_from_slice(&source[cursor..]);
+    debug_assert_eq!(result.len(), output_len);
+
     Ok((result, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextEdit, apply_edits};
+
+    fn edit(start_byte: usize, end_byte: usize, new_text: &str) -> TextEdit {
+        TextEdit {
+            start_byte,
+            end_byte,
+            new_text: new_text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn applying_no_edits_copies_source_and_reports_zero() {
+        assert_eq!(
+            apply_edits(b"source", Vec::new()).unwrap(),
+            (b"source".to_vec(), 0)
+        );
+    }
+
+    #[test]
+    fn applies_unsorted_adjacent_edits_and_boundary_insertion() {
+        let edits = vec![
+            edit(4, 6, ""),
+            edit(3, 3, "X"),
+            edit(0, 2, "A"),
+            edit(2, 3, "B"),
+        ];
+
+        assert_eq!(
+            apply_edits(b"abcdef", edits).unwrap(),
+            (b"ABXd".to_vec(), 4)
+        );
+    }
+
+    #[test]
+    fn applies_replacements_that_grow_and_shrink_the_source() {
+        let edits = vec![edit(4, 5, ""), edit(1, 2, "long")];
+
+        assert_eq!(
+            apply_edits(b"012345", edits).unwrap(),
+            (b"0long235".to_vec(), 2)
+        );
+    }
+
+    #[test]
+    fn same_offset_insertions_keep_bottom_up_splice_order() {
+        let edits = vec![edit(1, 1, "X"), edit(1, 1, "Y")];
+
+        assert_eq!(apply_edits(b"ab", edits).unwrap(), (b"aYXb".to_vec(), 2));
+    }
+
+    #[test]
+    fn replacement_then_equal_offset_insertions_keep_stable_splice_order() {
+        let edits = vec![edit(1, 2, "R"), edit(1, 1, "X"), edit(1, 1, "Y")];
+
+        assert_eq!(
+            apply_edits(b"abcd", edits).unwrap(),
+            (b"aYXRcd".to_vec(), 3)
+        );
+    }
+
+    #[test]
+    fn insertion_before_equal_offset_replacement_keeps_overlap_error_offsets() {
+        let edits = vec![edit(1, 1, "X"), edit(1, 2, "R")];
+
+        assert_eq!(
+            apply_edits(b"abcd", edits).unwrap_err(),
+            "overlapping edits detected at byte offsets 1..1 and 1..2 — skipping file"
+        );
+    }
+
+    #[test]
+    fn overlapping_edits_keep_the_existing_error_and_offset_order() {
+        let edits = vec![edit(2, 4, "Y"), edit(3, 5, "X")];
+
+        let error = apply_edits(b"abcdef", edits).unwrap_err();
+        assert_eq!(
+            error,
+            "overlapping edits detected at byte offsets 3..5 and 2..4 — skipping file"
+        );
+    }
+
+    #[test]
+    fn rejects_reversed_edit_range_without_panicking() {
+        let outcome = std::panic::catch_unwind(|| apply_edits(b"abc", vec![edit(2, 1, "x")]));
+
+        assert!(outcome.is_ok(), "invalid edit range panicked");
+        assert!(
+            outcome
+                .unwrap()
+                .unwrap_err()
+                .contains("invalid edit range 2..1")
+        );
+    }
+
+    #[test]
+    fn rejects_edit_past_source_end_without_panicking() {
+        let outcome = std::panic::catch_unwind(|| apply_edits(b"abc", vec![edit(2, 4, "x")]));
+
+        assert!(outcome.is_ok(), "out-of-bounds edit range panicked");
+        assert!(
+            outcome
+                .unwrap()
+                .unwrap_err()
+                .contains("edit range 2..4 exceeds source length 3")
+        );
+    }
+
+    #[test]
+    fn applies_ten_thousand_edits_to_a_five_mib_source() {
+        let source = vec![b'a'; 5 * 1024 * 1024];
+        let edit_count = 10_000;
+        let edits = (0..edit_count)
+            .map(|index| {
+                let start_byte = index * 512;
+                edit(start_byte, start_byte + 1, "bb")
+            })
+            .collect();
+        let mut expected = Vec::with_capacity(source.len() + edit_count);
+        let mut cursor = 0;
+        for index in 0..edit_count {
+            let start_byte = index * 512;
+            expected.extend_from_slice(&source[cursor..start_byte]);
+            expected.extend_from_slice(b"bb");
+            cursor = start_byte + 1;
+        }
+        expected.extend_from_slice(&source[cursor..]);
+
+        assert_eq!(apply_edits(&source, edits).unwrap(), (expected, edit_count));
+    }
 }

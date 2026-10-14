@@ -1,6 +1,17 @@
 ---
-source: tests/snapshot_test.rs
-assertion_line: 67
+source: crates/lint4d/tests/snapshot_test.rs
 expression: diagnostics
 ---
-[]
+[
+  {
+    "rule_id": "resource-leak-no-try",
+    "severity": "warning",
+    "message": "'Obj' is created without a try..finally block. If an exception occurs after construction, the object will leak.",
+    "line": 11,
+    "column": 3,
+    "end_line": 11,
+    "end_column": 24,
+    "help": "Wrap the usage in a try..finally block and free the object in the finally clause.",
+    "scope": "TestNoTry"
+  }
+]

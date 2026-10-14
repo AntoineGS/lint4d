@@ -8,7 +8,10 @@ pub use types::RenameMap;
 use crate::config::Config;
 use crate::engine::suppress::parse_suppressions;
 use crate::engine::{FileInfo, FileType, parse_file};
+use crate::rules::scope::collect_file_scope_bounded;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tree_sitter::Node;
 
 use apply::apply_edits;
 use types::FixConfig;
@@ -59,6 +62,170 @@ pub fn fix_file(
 
     let edits = collect_file_edits(file, source, config, None)?;
     apply_edits(source, edits)
+}
+
+/// Apply the conservative naming fixes supported by the `--fix-fmt` CLI.
+///
+/// Unlike the legacy library fixer, this path leaves file-scoped declaration
+/// renames untouched and only applies local renames whose spelling differs by
+/// case. It returns warnings for skipped candidates so the CLI can explain
+/// what it deliberately did not change.
+pub fn fix_file_restricted(
+    file: &FileInfo,
+    source: &[u8],
+    config: &Config,
+) -> Result<(Vec<u8>, usize, Vec<String>), String> {
+    if matches!(file.file_type, FileType::Dpr | FileType::Dpk) {
+        return Ok((source.to_vec(), 0, Vec::new()));
+    }
+
+    std::str::from_utf8(source).map_err(|e| format!("invalid UTF-8: {e}"))?;
+    let (tree, parse_errors) = parse_file(file, source)?;
+    let root = tree.root_node();
+    if !parse_errors.is_empty() || root.has_error() {
+        return Ok((
+            source.to_vec(),
+            0,
+            vec!["skipped all fixes because the file contains parse errors".to_string()],
+        ));
+    }
+
+    let suppressions = parse_suppressions(source);
+    let mut budget = None;
+    let mut rename_map = rename_map::build_rename_map_bounded(
+        root,
+        source,
+        config,
+        &suppressions,
+        &mut budget,
+        None,
+    )?;
+    let scopes = collect_file_scope_bounded(root, source, &mut budget, None)?;
+    let warnings = restricted_fix_warnings(root, source, &rename_map, &scopes);
+
+    // A CLI local rename is safe here only when the old and new names are the
+    // same Pascal identifier after case folding. File-scoped candidates are
+    // reported above but are never passed to the edit walker.
+    rename_map
+        .local
+        .retain(|(_, _, old_name), new_name| old_name == &new_name.to_lowercase());
+    rename_map.file.clear();
+
+    let fix_config = FixConfig::for_rules(config, &["identifier-casing", "local-variable-naming"]);
+    let edits = apply::collect_edits_restricted(
+        root,
+        source,
+        &rename_map,
+        &scopes,
+        &fix_config,
+        &mut budget,
+        None,
+    )?;
+    let (fixed, edit_count) = apply_edits(source, edits)?;
+    Ok((fixed, edit_count, warnings))
+}
+
+fn restricted_fix_warnings(
+    root: Node,
+    source: &[u8],
+    rename_map: &RenameMap,
+    scopes: &crate::rules::scope::Scopes,
+) -> Vec<String> {
+    let mut warnings = BTreeSet::new();
+    let mut named_declarations = HashSet::new();
+    collect_skipped_declaration_warnings(
+        root,
+        source,
+        rename_map,
+        &mut named_declarations,
+        &mut warnings,
+    );
+    for (old_name, new_name) in &rename_map.file {
+        if named_declarations.contains(old_name) {
+            continue;
+        }
+        let original = scopes
+            .file
+            .get(old_name)
+            .map(String::as_str)
+            .unwrap_or(old_name);
+        warnings.insert(format!(
+            "skipped declaration rename {original} -> {new_name}"
+        ));
+    }
+    let mut non_case_locals = HashMap::new();
+    for ((proc_start, proc_end, old_name), new_name) in &rename_map.local {
+        if old_name != &new_name.to_lowercase() {
+            non_case_locals
+                .entry((*proc_start, *proc_end))
+                .or_insert_with(Vec::new)
+                .push((old_name, new_name));
+        }
+    }
+    collect_non_case_local_warnings(root, source, &non_case_locals, &mut warnings);
+    warnings.into_iter().collect()
+}
+
+fn collect_skipped_declaration_warnings(
+    node: Node,
+    source: &[u8],
+    rename_map: &RenameMap,
+    named_declarations: &mut HashSet<String>,
+    warnings: &mut BTreeSet<String>,
+) {
+    if matches!(
+        node.kind(),
+        pascal_core::node_kind::DECL_TYPE | pascal_core::node_kind::DECL_CONST
+    ) && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let original = crate::rules::helpers::node_text(name_node, source);
+        let lower = original.to_lowercase();
+        if let Some(new_name) = rename_map.file.get(&lower) {
+            named_declarations.insert(lower);
+            warnings.insert(format!(
+                "skipped declaration rename {original} -> {new_name}"
+            ));
+        }
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_skipped_declaration_warnings(
+            child,
+            source,
+            rename_map,
+            named_declarations,
+            warnings,
+        );
+    }
+}
+
+fn collect_non_case_local_warnings<'a>(
+    node: Node,
+    source: &[u8],
+    candidates: &HashMap<(usize, usize), Vec<(&'a String, &'a String)>>,
+    warnings: &mut BTreeSet<String>,
+) {
+    if matches!(
+        node.kind(),
+        pascal_core::node_kind::DEF_PROC | pascal_core::node_kind::LAMBDA
+    ) && let Some(candidates) = candidates.get(&(node.start_byte(), node.end_byte()))
+    {
+        let mut local_names = HashMap::new();
+        crate::rules::scope::collect_method_scope(node, source, &mut local_names);
+        for (old_name, new_name) in candidates {
+            let original = local_names
+                .get(*old_name)
+                .map(String::as_str)
+                .unwrap_or(old_name);
+            warnings.insert(format!(
+                "skipped non-case local rename {original} -> {new_name}"
+            ));
+        }
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_non_case_local_warnings(child, source, candidates, warnings);
+    }
 }
 
 /// Return the parser-derived edits for a selected finite set of naming rules.

@@ -9,7 +9,7 @@ use lint4d::config::baseline::Baseline;
 use lint4d::discovery::discover_files;
 use lint4d::discovery::dproj::parse_dproj;
 use lint4d::engine::{FileInfo, Severity, run_lint_with_cfg_project};
-use lint4d::fix::fix_file;
+use lint4d::fix::fix_file_restricted;
 use lint4d::output::json::format_json_output;
 use lint4d::output::text::format_diagnostics;
 use lint4d::rules::RuleRegistry;
@@ -888,10 +888,10 @@ fn run_fix_fmt(files: &[FileInfo], config: &Config) {
                 return None;
             }
             let source = fs::read(&file.path).ok()?;
-            match fix_file(file, &source, config) {
-                Ok((new_source, count)) => {
-                    if count > 0 {
-                        Some((file.path.clone(), new_source, count))
+            match fix_file_restricted(file, &source, config) {
+                Ok((new_source, count, warnings)) => {
+                    if count > 0 || !warnings.is_empty() {
+                        Some((file.path.clone(), new_source, count, warnings))
                     } else {
                         None
                     }
@@ -908,12 +908,17 @@ fn run_fix_fmt(files: &[FileInfo], config: &Config) {
         })
         .collect();
 
-    for (path, new_source, count) in &results {
-        if let Err(e) = fs::write(path, new_source) {
-            eprintln!("lint4d: error: failed to write {}: {}", path.display(), e);
-            process::exit(EXIT_ERROR);
+    for (path, new_source, count, warnings) in &results {
+        for warning in warnings {
+            eprintln!("lint4d: warning: {}: {}", path.display(), warning);
         }
-        eprintln!("Fixed {} identifier(s) in {}", count, path.display());
+        if *count > 0 {
+            if let Err(e) = fs::write(path, new_source) {
+                eprintln!("lint4d: error: failed to write {}: {}", path.display(), e);
+                process::exit(EXIT_ERROR);
+            }
+            eprintln!("Fixed {} identifier(s) in {}", count, path.display());
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, RuleSeverityOverride};
 
@@ -35,6 +35,12 @@ pub(crate) struct ProcContext<'a> {
     pub method_scope: HashMap<String, String>,
     pub local_renames: HashMap<String, String>,
     pub local_rename_ranges: HashMap<String, usize>,
+    /// Local const/type/procedure names whose references are ambiguous here.
+    pub blocked_local_names: HashSet<String>,
+    /// Ancestor local candidates blocked by an intervening declaration.
+    pub blocked_local_renames: HashSet<(usize, usize, String)>,
+    /// Names declared by this procedure with an approved local rename.
+    pub local_declaration_renames: HashSet<String>,
     pub class_fields: Option<&'a HashMap<String, String>>,
 }
 

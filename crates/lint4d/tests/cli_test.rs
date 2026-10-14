@@ -439,24 +439,44 @@ fn latin1(source: &str) -> Vec<u8> {
 }
 
 #[test]
-fn fix_fmt_renames_type_prefix_in_place() {
+fn fix_fmt_skips_public_type_rename_and_fixes_case_only_local_shadow() {
     let dir = TempDir::new().unwrap();
+    let path = dir.path().join("BadPrefix.pas");
     fs::write(
-        dir.path().join("BadPrefix.pas"),
-        "unit BadPrefix;\n\ninterface\n\ntype\n  MyClass = class(TObject)\n  end;\n\nimplementation\n\nend.\n",
+        &path,
+        "unit BadPrefix;\n\ninterface\n\ntype\n  Foo = class(TObject)\n  end;\n  Printable = interface\n  end;\n\nimplementation\n\nprocedure Work;\nvar\n  foo: Integer;\nbegin\n  foo := 1;\nend;\n\nend.\n",
     )
     .unwrap();
 
-    lint4d()
-        .arg("--fix-fmt")
-        .arg(dir.path().join("BadPrefix.pas"))
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("Fixed"));
+    let output = lint4d().arg("--fix-fmt").arg(&path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "lint4d failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let content = fs::read_to_string(dir.path().join("BadPrefix.pas")).unwrap();
-    assert!(content.contains("TMyClass = class(TObject)"));
-    assert!(!content.contains(" MyClass"));
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("\n  Foo = class(TObject)"),
+        "public type was renamed:\n{content}"
+    );
+    assert!(
+        content.contains("\n  Printable = interface"),
+        "public interface was renamed:\n{content}"
+    );
+    assert!(!content.contains("TFoo = class"), "{content}");
+    assert!(content.contains("Foo: Integer;"), "{content}");
+    assert!(content.contains("Foo := 1;"), "{content}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Foo -> TFoo"),
+        "missing skipped-rename warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Printable -> IPrintable"),
+        "missing skipped-interface warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -514,11 +534,12 @@ fn fix_fmt_mutually_exclusive_with_generate_baseline() {
 }
 
 #[test]
-fn fix_fmt_renames_constant_and_usages() {
+fn fix_fmt_skips_constant_rename_and_warns_with_suggestion() {
     let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Const.pas");
     fs::write(
-        dir.path().join("Const.pas"),
-        r#"unit Const;
+        &path,
+        r#"unit &Const;
 
 interface
 
@@ -539,15 +560,127 @@ end.
     )
     .unwrap();
 
-    lint4d()
-        .arg("--fix-fmt")
-        .arg(dir.path().join("Const.pas"))
-        .assert()
-        .success();
+    let output = lint4d().arg("--fix-fmt").arg(&path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "lint4d failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let content = fs::read_to_string(dir.path().join("Const.pas")).unwrap();
-    assert!(content.contains("MAX_SIZE = 100;"));
-    assert!(content.contains("x := MAX_SIZE;"));
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("maxSize = 100;"), "{content}");
+    assert!(content.contains("x := maxSize;"), "{content}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("maxSize -> MAX_SIZE"),
+        "missing skipped-rename warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fix_fmt_nested_shadow_blocks_ancestor_but_capture_is_preserved() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Nested.pas");
+    fs::write(
+        &path,
+        r#"unit Nested;
+interface
+implementation
+procedure Outer;
+var
+  myVar: Integer;
+  procedure ShadowParameter(MYVAR: Integer);
+  begin
+    MYVAR := 3;
+  end;
+  procedure ShadowLocal;
+  var
+    MYVAR: Integer;
+  begin
+    MYVAR := 4;
+  end;
+  procedure Capture;
+  begin
+    myVar := 5;
+  end;
+begin
+  myVar := 2;
+end;
+end.
+"#,
+    )
+    .unwrap();
+
+    lint4d().arg("--fix-fmt").arg(&path).assert().success();
+
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("MyVar: Integer;"), "{content}");
+    assert!(
+        content.contains("ShadowParameter(MYVAR: Integer)"),
+        "{content}"
+    );
+    assert!(content.contains("MYVAR := 3;"), "{content}");
+    assert!(content.contains("MYVAR: Integer;"), "{content}");
+    assert!(content.contains("MYVAR := 4;"), "{content}");
+    assert!(
+        !content.contains("myVar := 5;"),
+        "capture not fixed:\n{content}"
+    );
+    assert!(content.contains("MyVar := 5;"), "{content}");
+    assert!(content.contains("MyVar := 2;"), "{content}");
+}
+
+#[test]
+fn fix_fmt_renames_case_only_parameter_and_usages() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Parameter.pas");
+    fs::write(
+        &path,
+        "unit Parameter;\ninterface\nimplementation\nprocedure Work(badParam: Integer);\nbegin\n  badParam := 1;\nend;\nend.\n",
+    )
+    .unwrap();
+
+    lint4d().arg("--fix-fmt").arg(&path).assert().success();
+
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("Work(BadParam: Integer)"), "{content}");
+    assert!(content.contains("BadParam := 1;"), "{content}");
+}
+
+#[test]
+fn fix_fmt_declines_non_case_local_rename_and_warns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("NonCase.pas");
+    let source = "unit NonCase;\ninterface\nimplementation\nprocedure Work;\nvar\n  bad_name: Integer;\nbegin\n  bad_name := 1;\nend;\nend.\n";
+    fs::write(&path, source).unwrap();
+
+    let output = lint4d().arg("--fix-fmt").arg(&path).output().unwrap();
+    assert!(output.status.success());
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("bad_name -> BadName"),
+        "missing non-case warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fix_fmt_parse_error_leaves_file_unchanged_and_warns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Malformed.pas");
+    let source = "unit Malformed;\ninterface\nimplementation\nprocedure Work;\nvar\n  badLocal: Integer;\nbegin\n  badLocal := ;\nend;\nend.\n";
+    fs::write(&path, source).unwrap();
+
+    let output = lint4d().arg("--fix-fmt").arg(&path).output().unwrap();
+    assert!(output.status.success());
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("parse error"),
+        "missing parse-error warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The 8.3 short form of `path`, when its volume generates short names.

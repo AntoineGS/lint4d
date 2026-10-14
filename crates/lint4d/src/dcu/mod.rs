@@ -123,19 +123,35 @@ pub struct DcuUnit {
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(test)]
+#[derive(Default)]
+struct LoadTestMetrics {
+    read_attempts: AtomicUsize,
+    warnings: AtomicUsize,
+}
+
+type UnitLoad = Arc<OnceLock<Result<Arc<DcuUnit>, DcuError>>>;
 
 /// Cross-unit type resolution context with lazy DCU loading.
 ///
 /// On construction, scans directories to build a unit name → file path index
 /// without parsing any DCU files. Units are parsed on first access and cached.
-/// Thread-safe: uses `Mutex` for the loaded units cache so it can be shared
-/// across rayon worker threads.
+/// Thread-safe: a short-lived mutex protects the unit-entry map and each entry
+/// synchronizes its own lazy initialization.
 pub struct ProjectContext {
     /// Unit name (case-folded) → file path, for units not yet loaded.
     index: HashMap<String, PathBuf>,
-    /// Loaded units, keyed by case-folded unit name.
-    units: Mutex<HashMap<String, DcuUnit>>,
+    /// Per-unit load results, keyed by case-folded unit name.
+    /// Pre-parsed units get initialized entries at construction; indexed units
+    /// get entries on first access; unknown names do not.
+    units: Mutex<HashMap<String, UnitLoad>>,
+    /// Successful preloaded and lazy-loaded entries; failed entries do not count.
+    loaded_units: AtomicUsize,
+    #[cfg(test)]
+    load_test_metrics: LoadTestMetrics,
 }
 
 impl ProjectContext {
@@ -143,11 +159,20 @@ impl ProjectContext {
     pub fn from_units(units: Vec<DcuUnit>) -> Self {
         let mut map = HashMap::new();
         for unit in units {
-            map.insert(unit.name.to_lowercase(), unit);
+            let key = unit.name.to_lowercase();
+            let entry = OnceLock::new();
+            entry
+                .set(Ok(Arc::new(unit)))
+                .expect("new unit cache entry is empty");
+            map.insert(key, Arc::new(entry));
         }
+        let loaded_units = map.len();
         Self {
             index: HashMap::new(),
             units: Mutex::new(map),
+            loaded_units: AtomicUsize::new(loaded_units),
+            #[cfg(test)]
+            load_test_metrics: LoadTestMetrics::default(),
         }
     }
 
@@ -176,43 +201,75 @@ impl ProjectContext {
         Ok(Self {
             index,
             units: Mutex::new(HashMap::new()),
+            loaded_units: AtomicUsize::new(0),
+            #[cfg(test)]
+            load_test_metrics: LoadTestMetrics::default(),
         })
     }
 
     /// Number of DCU files available (indexed, not necessarily loaded).
     pub fn unit_count(&self) -> usize {
-        self.index.len() + self.units.lock().unwrap().len()
+        self.index.len() + self.loaded_units.load(Ordering::Relaxed)
     }
 
     /// Ensure a unit is loaded, parsing its DCU on first access.
     fn ensure_loaded(&self, unit_name: &str) {
         let key = unit_name.to_lowercase();
-        if self.units.lock().unwrap().contains_key(&key) {
-            return;
-        }
-        let Some(path) = self.index.get(&key) else {
+        let Some(path) = self.index.get(&key).cloned() else {
             return;
         };
-        let path = path.clone();
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("lint4d: warning: failed to read {}: {}", path.display(), e);
-                return;
-            }
+        let entry = {
+            let mut units = self.units.lock().unwrap();
+            Arc::clone(
+                units
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
         };
-        match types::parse_dcu(&data) {
-            Ok(unit) => {
-                self.units.lock().unwrap().insert(key, unit);
+
+        // The per-unit initializer performs the filesystem read and parser
+        // work in this entry's once-cell. Its result, including failures, is
+        // retained for every caller that already has this indexed entry.
+        let _ = entry.get_or_init(|| {
+            #[cfg(test)]
+            self.load_test_metrics
+                .read_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            let data = match std::fs::read(&path) {
+                Ok(data) => data,
+                Err(error) => {
+                    #[cfg(test)]
+                    self.load_test_metrics
+                        .warnings
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "lint4d: warning: failed to read {}: {}",
+                        path.display(),
+                        error
+                    );
+                    return Err(DcuError::Io(error));
+                }
+            };
+            match types::parse_dcu(&data) {
+                Ok(unit) => {
+                    let unit = Arc::new(unit);
+                    self.loaded_units.fetch_add(1, Ordering::Relaxed);
+                    Ok(unit)
+                }
+                Err(error) => {
+                    let wrapped = DcuError::InUnit {
+                        unit: key.clone(),
+                        source: Box::new(error),
+                    };
+                    #[cfg(test)]
+                    self.load_test_metrics
+                        .warnings
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!("lint4d: warning: skipping {}: {}", path.display(), wrapped);
+                    Err(wrapped)
+                }
             }
-            Err(e) => {
-                let wrapped = DcuError::InUnit {
-                    unit: key.clone(),
-                    source: Box::new(e),
-                };
-                eprintln!("lint4d: warning: skipping {}: {}", path.display(), wrapped);
-            }
-        }
+        });
     }
 
     /// Resolve a type by name, searching the given units in reverse order
@@ -222,10 +279,12 @@ impl ProjectContext {
             self.ensure_loaded(unit_name);
         }
 
-        let units = self.units.lock().unwrap();
         for unit_name in uses.iter().rev() {
             let key = unit_name.to_lowercase();
-            if let Some(unit) = units.get(&key) {
+            let entry = { self.units.lock().unwrap().get(&key).cloned() };
+            if let Some(entry) = entry
+                && let Some(Ok(unit)) = entry.get()
+            {
                 for ty in &unit.types {
                     if ty.name.eq_ignore_ascii_case(name) {
                         return Some(ty.clone());
@@ -295,5 +354,149 @@ impl ProjectContext {
             }
         }
         Some(false)
+    }
+}
+
+#[cfg(test)]
+mod context_loading_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const CLASS_FIXTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    const WORKERS: usize = 8;
+
+    fn fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temporary DCU directory");
+        std::fs::write(dir.path().join("Retry.dcu"), CLASS_FIXTURE)
+            .expect("write indexed DCU fixture");
+        dir
+    }
+
+    fn uses_retry() -> Vec<String> {
+        vec!["Retry".to_string()]
+    }
+
+    fn metric(value: &AtomicUsize) -> usize {
+        value.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn concurrent_missing_indexed_unit_is_negative_cached_and_fresh_context_retries() {
+        let dir = fixture_dir();
+        let path = dir.path().join("Retry.dcu");
+        let context =
+            Arc::new(ProjectContext::from_dcu_paths(&[dir.path().to_path_buf()]).unwrap());
+        assert_eq!(context.unit_count(), 1);
+        std::fs::remove_file(&path).expect("remove indexed file before first load");
+
+        let start = Arc::new(Barrier::new(WORKERS));
+        let first_wave_finished = Arc::new(Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let context = Arc::clone(&context);
+                let start = Arc::clone(&start);
+                let first_wave_finished = Arc::clone(&first_wave_finished);
+                thread::spawn(move || {
+                    let uses = uses_retry();
+                    start.wait();
+                    assert!(context.resolve_type("TSimpleClass", &uses).is_none());
+                    first_wave_finished.wait();
+                    assert!(context.resolve_type("TSimpleClass", &uses).is_none());
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker resolves missing indexed unit");
+        }
+
+        assert_eq!(metric(&context.load_test_metrics.read_attempts), 1);
+        assert_eq!(metric(&context.load_test_metrics.warnings), 1);
+        assert_eq!(
+            context.unit_count(),
+            1,
+            "failed entries are not loaded units"
+        );
+
+        std::fs::write(&path, CLASS_FIXTURE).expect("restore indexed DCU fixture");
+        assert!(
+            context
+                .resolve_type("TSimpleClass", &uses_retry())
+                .is_none()
+        );
+        assert_eq!(metric(&context.load_test_metrics.read_attempts), 1);
+        assert_eq!(metric(&context.load_test_metrics.warnings), 1);
+
+        let fresh = ProjectContext::from_dcu_paths(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(
+            fresh
+                .resolve_type("TSimpleClass", &uses_retry())
+                .as_ref()
+                .map(|ty| ty.name.as_str()),
+            Some("TSimpleClass")
+        );
+        assert_eq!(metric(&fresh.load_test_metrics.read_attempts), 1);
+        assert_eq!(metric(&fresh.load_test_metrics.warnings), 0);
+        assert_eq!(
+            fresh.unit_count(),
+            2,
+            "loaded indexed units retain old count semantics"
+        );
+    }
+
+    #[test]
+    fn concurrent_successful_indexed_load_is_reused() {
+        let dir = fixture_dir();
+        let context =
+            Arc::new(ProjectContext::from_dcu_paths(&[dir.path().to_path_buf()]).unwrap());
+        let start = Arc::new(Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let context = Arc::clone(&context);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    context
+                        .resolve_type("TSimpleClass", &uses_retry())
+                        .expect("fixture type resolves")
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().name, "TSimpleClass");
+        }
+
+        for _ in 0..WORKERS {
+            assert_eq!(
+                context
+                    .resolve_type("TSimpleClass", &uses_retry())
+                    .unwrap()
+                    .name,
+                "TSimpleClass"
+            );
+        }
+        assert_eq!(metric(&context.load_test_metrics.read_attempts), 1);
+        assert_eq!(metric(&context.load_test_metrics.warnings), 0);
+        assert_eq!(context.unit_count(), 2);
+    }
+
+    #[test]
+    fn malformed_indexed_unit_failure_is_cached_with_one_warning() {
+        let dir = tempfile::tempdir().expect("temporary DCU directory");
+        std::fs::write(dir.path().join("Broken.dcu"), b"not a DCU").unwrap();
+        let context = ProjectContext::from_dcu_paths(&[dir.path().to_path_buf()]).unwrap();
+
+        for _ in 0..WORKERS {
+            assert!(
+                context
+                    .resolve_type("TAbsent", &["Broken".to_string()])
+                    .is_none()
+            );
+        }
+
+        assert_eq!(metric(&context.load_test_metrics.read_attempts), 1);
+        assert_eq!(metric(&context.load_test_metrics.warnings), 1);
+        assert_eq!(context.unit_count(), 1);
     }
 }

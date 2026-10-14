@@ -25,44 +25,22 @@ opt-level = 3
 [profile.dev]
 debug = "line-tables-only"
 
-# Optimize third-party deps in dev builds so incremental edits stay fast.
-[profile.dev.package."*"]
+# l4d-71 measured three rotating rounds with Rust 1.99 on Linux.
+# One clean build, one real edit rebuild, and one full pascal-lsp suite:
+# selective median 256.385s vs current 277.483s (~7.6% lower).
+# Component medians: clean 53.972s vs 76.910s; edit 2.869s vs 2.869s; suite 199.721s vs 197.175s.
+# The suite was slower under selective; this is only the defined workload mix,
+# not a universal runtime or workstation speed claim.
+[profile.dev.package.tree-sitter]
 opt-level = 3
-
-# ...except proc macros and their helpers, which only run at compile time;
-# optimizing them roughly doubles clean-build time for no runtime benefit.
-[profile.dev.package.proc-macro2]
-opt-level = 0
-[profile.dev.package.quote]
-opt-level = 0
-[profile.dev.package.syn]
-opt-level = 0
-[profile.dev.package.synstructure]
-opt-level = 0
-[profile.dev.package.heck]
-opt-level = 0
-[profile.dev.package.rustversion]
-opt-level = 0
-[profile.dev.package.clap_derive]
-opt-level = 0
-[profile.dev.package.serde_derive]
-opt-level = 0
-[profile.dev.package.serde_repr]
-opt-level = 0
-[profile.dev.package.thiserror-impl]
-opt-level = 0
-[profile.dev.package.displaydoc]
-opt-level = 0
-[profile.dev.package.icu_provider_macros]
-opt-level = 0
-[profile.dev.package.yoke-derive]
-opt-level = 0
-[profile.dev.package.zerofrom-derive]
-opt-level = 0
-[profile.dev.package.zerovec-derive]
-opt-level = 0
-[profile.dev.package.zerocopy-derive]
-opt-level = 0
+[profile.dev.package.tree-sitter-pascal]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.globset]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
 
 # ---- Shared package metadata (review BP-H8) ------------------------
 [workspace.package]

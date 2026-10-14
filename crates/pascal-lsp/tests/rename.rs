@@ -1945,13 +1945,13 @@ end.
 fn selecting_one_overload_without_a_call_renames_its_exact_pair() {
     let source = "unit OverloadedDeclarationRename;
 interface
-procedure Do(Value: Integer); overload;
-procedure Do(Value: string); overload;
+procedure Perform(Value: Integer); overload;
+procedure Perform(Value: string); overload;
 implementation
-procedure Do(Value: Integer);
+procedure Perform(Value: Integer);
 begin
 end;
-procedure Do(Value: string);
+procedure Perform(Value: string);
 begin
 end;
 end.
@@ -1960,20 +1960,24 @@ end.
     let source_uri = update(&mut index, "OverloadedDeclarationRename", source);
 
     let edits = index
-        .rename_edits(&source_uri, position_of(source, "Do", 0), "RenamedDo")
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Perform", 0),
+            "RenamedPerform",
+        )
         .expect("an unambiguous overload declaration has an exact pair");
     assert_exact_edits(
         &edits,
         vec![
             (
                 source_uri.clone(),
-                range_of(source, "Do", 0),
-                "RenamedDo".to_owned(),
+                range_of(source, "Perform", 0),
+                "RenamedPerform".to_owned(),
             ),
             (
                 source_uri.clone(),
-                range_of(source, "Do", 2),
-                "RenamedDo".to_owned(),
+                range_of(source, "Perform", 2),
+                "RenamedPerform".to_owned(),
             ),
         ],
     );

@@ -15449,7 +15449,7 @@ end.
 
 #[test]
 fn hover_bounds_empty_structured_type_excerpts_to_the_type_node() {
-    let source = "unit EmptyType; interface type TEmptyClass = class end; const ClassValue = 42; TEmptyRecord = record end; const RecordValue = 43; TForward = class; const ForwardValue = 44; implementation procedure Surprise; begin WriteLn(123); end; end.\n";
+    let source = "unit EmptyType; interface type TEmptyClass = class end; const ClassValue = 42; type TEmptyRecord = record end; const RecordValue = 43; type TForward = class; const ForwardValue = 44; implementation procedure Surprise; begin WriteLn(123); end; end.\n";
     let mut index = NavigationIndex::new();
     let source_uri = uri("EmptyType");
     index
@@ -16206,7 +16206,7 @@ begin
   Uses;
   Later;
 end;
-procedure Inline;
+procedure InlineVariableScope;
 begin
   Value := 1;
   var Value: Integer;

@@ -22,13 +22,54 @@ fn neovim_is_available() -> bool {
     let environment = tempfile::tempdir().expect("isolated Neovim environment");
     let mut command = Command::new("nvim");
     configure_neovim_environment(&mut command, &environment);
-    command.arg("--version").output().is_ok()
+    let availability = match command.arg("--version").output() {
+        Ok(output) if output.status.success() => return true,
+        Ok(output) => format!(
+            "nvim --version exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("could not launch nvim --version: {error}"),
+    };
+
+    if std::env::var("REQUIRE_NVIM").is_ok_and(|value| value == "1") {
+        panic!("REQUIRE_NVIM=1 but Neovim is unavailable: {availability}");
+    }
+
+    eprintln!("Neovim integration skipped: {availability}");
+    false
+}
+
+#[test]
+fn require_nvim_fails_when_neovim_is_unavailable() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "neovim_example_navigates_and_applies_workspace_edits_without_saving",
+            "--nocapture",
+        ])
+        .env("PATH", "")
+        .env("REQUIRE_NVIM", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "REQUIRE_NVIM=1 let a missing nvim silently pass:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("REQUIRE_NVIM=1"),
+        "child failed for a reason other than required Neovim enforcement:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
 fn neovim_example_navigates_and_applies_workspace_edits_without_saving() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -90,7 +131,6 @@ fn neovim_example_navigates_and_applies_workspace_edits_without_saving() {
 #[test]
 fn neovim_example_navigates_and_tracks_unsaved_documents() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -152,7 +192,6 @@ fn neovim_example_navigates_and_tracks_unsaved_documents() {
 #[test]
 fn neovim_project_selection() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -245,7 +284,6 @@ fn neovim_project_selection() {
 #[test]
 fn neovim_installation_selection() {
     if !neovim_is_available() {
-        eprintln!("Neovim installation-selection integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -413,7 +451,6 @@ fn neovim_installation_selection() {
 #[test]
 fn neovim_build_selection() {
     if !neovim_is_available() {
-        eprintln!("Neovim build-selection integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -487,7 +524,6 @@ fn neovim_build_selection() {
 #[test]
 fn neovim_delphi_overrides_navigate_to_native_source() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -575,7 +611,6 @@ fn neovim_delphi_overrides_navigate_to_native_source() {
 #[test]
 fn neovim_watches_repository_parent_configuration_fallback() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -635,7 +670,6 @@ fn neovim_watches_repository_parent_configuration_fallback() {
 #[test]
 fn neovim_standard_symbol_reference_and_highlight_queries() {
     if !neovim_is_available() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
         return;
     }
     let directory = tempfile::Builder::new()
@@ -699,8 +733,7 @@ fn neovim_standard_symbol_reference_and_highlight_queries() {
 
 #[test]
 fn neovim_standard_assistance_requests_use_overlays_without_saving() {
-    if Command::new("nvim").arg("--version").output().is_err() {
-        eprintln!("Neovim integration skipped: nvim is not installed");
+    if !neovim_is_available() {
         return;
     }
     let directory = tempfile::Builder::new()

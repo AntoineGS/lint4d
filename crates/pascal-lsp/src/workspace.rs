@@ -40,8 +40,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -56,6 +58,7 @@ thread_local! {
     static TEST_CONTEXT_PRUNE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_FRESHNESS_OBSERVATION_VISITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static TEST_EXCLUDE_GLOB_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -95,6 +98,18 @@ fn note_freshness_observation_visit() {
 #[cfg(test)]
 pub(crate) fn test_take_freshness_observation_visits() -> usize {
     TEST_FRESHNESS_OBSERVATION_VISITS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_test_exclude_glob_warnings() -> Vec<String> {
+    TEST_EXCLUDE_GLOB_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
+}
+
+fn warn_exclude_glob(message: String) {
+    #[cfg(test)]
+    TEST_EXCLUDE_GLOB_WARNINGS.with(|warnings| warnings.borrow_mut().push(message));
+    #[cfg(not(test))]
+    eprintln!("pascal-lsp: warning: {message}");
 }
 
 mod closure;
@@ -2509,19 +2524,59 @@ impl KnownDocumentOwner {
     }
 }
 
-/// Exclusion globs compiled twice: as written, and folding letter case for
-/// paths on case-insensitive volumes.
-#[derive(Debug, Clone)]
+/// Exact exclusions are compiled eagerly; the folded set is built on first
+/// use for paths on case-insensitive volumes.
+#[derive(Debug)]
 struct ExcludeGlobs {
     exact: globset::GlobSet,
-    case_insensitive: globset::GlobSet,
+    case_insensitive_builder: GlobSetBuilder,
+    case_insensitive: OnceLock<Option<globset::GlobSet>>,
+    #[cfg(test)]
+    build_counts: ExcludeGlobBuildCounts,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ExcludeGlobBuildCounts {
+    exact: AtomicUsize,
+    case_insensitive: AtomicUsize,
+}
+
+#[cfg(test)]
+impl ExcludeGlobs {
+    fn test_build_counts(&self) -> (usize, usize) {
+        (
+            self.build_counts.exact.load(Ordering::Relaxed),
+            self.build_counts.case_insensitive.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl ExcludeGlobs {
+    fn case_insensitive_set(&self) -> Option<&globset::GlobSet> {
+        self.case_insensitive
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.build_counts
+                    .case_insensitive
+                    .fetch_add(1, Ordering::Relaxed);
+                self.case_insensitive_builder.build().map_or_else(
+                    |error| {
+                        warn_exclude_glob(format!("failed to build exclude globs: {error}"));
+                        None
+                    },
+                    Some,
+                )
+            })
+            .as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ExcludeMatcher {
     root: PathBuf,
     config_root: PathBuf,
-    patterns: Option<ExcludeGlobs>,
+    patterns: Option<Arc<ExcludeGlobs>>,
 }
 
 impl ExcludeMatcher {
@@ -2551,7 +2606,7 @@ impl ExcludeMatcher {
 #[derive(Debug, Clone)]
 struct LintExcludeMatcher {
     root: PathBuf,
-    patterns: Option<ExcludeGlobs>,
+    patterns: Option<Arc<ExcludeGlobs>>,
 }
 
 impl LintExcludeMatcher {
@@ -2571,14 +2626,14 @@ impl LintExcludeMatcher {
     }
 }
 
-fn compile_exclude_patterns(patterns: &[String]) -> Option<ExcludeGlobs> {
+fn compile_exclude_patterns(patterns: &[String]) -> Option<Arc<ExcludeGlobs>> {
     compile_exclude_patterns_with_cancel(patterns, None).unwrap_or_default()
 }
 
 fn compile_exclude_patterns_with_cancel(
     patterns: &[String],
     cancel: Option<&AtomicBool>,
-) -> Result<Option<ExcludeGlobs>, String> {
+) -> Result<Option<Arc<ExcludeGlobs>>, String> {
     let mut exact = GlobSetBuilder::new();
     let mut case_insensitive = GlobSetBuilder::new();
     let mut valid_pattern_count = 0;
@@ -2600,7 +2655,9 @@ fn compile_exclude_patterns_with_cancel(
                 valid_pattern_count += 1;
             }
             Err(error) => {
-                eprintln!("pascal-lsp: warning: ignoring invalid exclude glob {pattern:?}: {error}")
+                warn_exclude_glob(format!(
+                    "ignoring invalid exclude glob {pattern:?}: {error}"
+                ));
             }
         }
     }
@@ -2608,27 +2665,48 @@ fn compile_exclude_patterns_with_cancel(
         return Ok(None);
     }
     check_workspace_cancel(cancel)?;
-    match exact.build().and_then(|exact| {
-        case_insensitive
-            .build()
-            .map(|case_insensitive| ExcludeGlobs {
-                exact,
-                case_insensitive,
-            })
-    }) {
-        Ok(globs) => Ok(Some(globs)),
+    #[cfg(test)]
+    let build_counts = ExcludeGlobBuildCounts::default();
+    #[cfg(test)]
+    build_counts.exact.fetch_add(1, Ordering::Relaxed);
+    let exact = match exact.build() {
+        Ok(exact) => exact,
         Err(error) => {
-            eprintln!("pascal-lsp: warning: failed to build exclude globs: {error}");
-            Ok(None)
+            warn_exclude_glob(format!("failed to build exclude globs: {error}"));
+            return Ok(None);
         }
-    }
+    };
+    Ok(Some(Arc::new(ExcludeGlobs {
+        exact,
+        case_insensitive_builder: case_insensitive,
+        case_insensitive: OnceLock::new(),
+        #[cfg(test)]
+        build_counts,
+    })))
 }
 
 /// Whether `relative` (a part of `path`) matches an exclusion, folding letter
 /// case when `path` is on a case-insensitive volume.
 fn matches_exclude_patterns(patterns: &ExcludeGlobs, path: &Path, relative: &Path) -> bool {
-    let patterns = if pascal_project::path_identity::is_case_insensitive(path) {
-        &patterns.case_insensitive
+    matches_exclude_patterns_for_case(
+        patterns,
+        path,
+        relative,
+        pascal_project::path_identity::is_case_insensitive(path),
+    )
+}
+
+fn matches_exclude_patterns_for_case(
+    patterns: &ExcludeGlobs,
+    _path: &Path,
+    relative: &Path,
+    case_insensitive: bool,
+) -> bool {
+    let patterns = if case_insensitive {
+        let Some(patterns) = patterns.case_insensitive_set() else {
+            return false;
+        };
+        patterns
     } else {
         &patterns.exact
     };
@@ -2681,7 +2759,7 @@ impl WorkspaceRoot {
     fn new_with_patterns(
         path: PathBuf,
         options: &WorkspaceOptions,
-        patterns: Option<ExcludeGlobs>,
+        patterns: Option<Arc<ExcludeGlobs>>,
     ) -> Self {
         let path = absolute_path(path);
         // Lint configuration is selected per effective project context at
@@ -15812,6 +15890,203 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sensitive_exclude_match_does_not_build_folded_set() {
+        let patterns = super::compile_exclude_patterns(&["Keep.pas".to_owned()])
+            .expect("valid exclusion patterns");
+
+        assert_eq!(patterns.test_build_counts(), (1, 0));
+        assert!(super::matches_exclude_patterns(
+            &patterns,
+            Path::new("/workspace/Keep.pas"),
+            Path::new("Keep.pas"),
+        ));
+        assert!(!super::matches_exclude_patterns(
+            &patterns,
+            Path::new("/workspace/keep.pas"),
+            Path::new("keep.pas"),
+        ));
+    }
+
+    #[test]
+    fn folded_exclude_set_is_shared_by_cloned_roots_and_normalizes_patterns() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let options = WorkspaceOptions {
+            exclude: vec!["Dir\\*.PAS".to_owned(), "Ignored".to_owned()],
+            ..WorkspaceOptions::default()
+        };
+        let roots = super::build_workspace_roots(
+            vec![temp.path().join("one"), temp.path().join("two")],
+            &options,
+        );
+        let first = Arc::clone(
+            roots[0]
+                .excludes
+                .patterns
+                .as_ref()
+                .expect("compiled patterns"),
+        );
+        let second = roots[1]
+            .excludes
+            .patterns
+            .as_ref()
+            .expect("compiled patterns");
+        let first_clone = roots[0].clone();
+
+        assert!(Arc::ptr_eq(&first, second));
+        assert_eq!(first.test_build_counts(), (1, 0));
+        assert!(super::matches_exclude_patterns_for_case(
+            &first,
+            Path::new("/workspace/dir/file.pas"),
+            Path::new("dir/file.pas"),
+            true,
+        ));
+        assert_eq!(first.test_build_counts(), (1, 1));
+        assert!(super::matches_exclude_patterns_for_case(
+            second,
+            Path::new("/workspace/Dir/file.PAS"),
+            Path::new("Dir/file.PAS"),
+            true,
+        ));
+        assert!(super::matches_exclude_patterns_for_case(
+            first_clone
+                .excludes
+                .patterns
+                .as_ref()
+                .expect("cloned root retains patterns"),
+            Path::new("/workspace/Ignored/child.pas"),
+            Path::new("Ignored/child.pas"),
+            false,
+        ));
+        assert_eq!(first.test_build_counts(), (1, 1));
+    }
+
+    #[test]
+    fn invalid_exclude_patterns_warn_eagerly_and_valid_patterns_remain_usable() {
+        super::take_test_exclude_glob_warnings();
+        let patterns = super::compile_exclude_patterns(&["[".to_owned(), "Keep.pas".to_owned()])
+            .expect("one valid exclusion pattern remains");
+
+        let warnings = super::take_test_exclude_glob_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ignoring invalid exclude glob"));
+        assert_eq!(patterns.test_build_counts(), (1, 0));
+        assert!(super::matches_exclude_patterns_for_case(
+            &patterns,
+            Path::new("/workspace/Keep.pas"),
+            Path::new("Keep.pas"),
+            false,
+        ));
+        assert!(super::matches_exclude_patterns_for_case(
+            &patterns,
+            Path::new("/workspace/keep.PAS"),
+            Path::new("keep.PAS"),
+            true,
+        ));
+        assert_eq!(patterns.test_build_counts(), (1, 1));
+
+        super::take_test_exclude_glob_warnings();
+        assert!(super::compile_exclude_patterns(&["[".to_owned()]).is_none());
+        let warnings = super::take_test_exclude_glob_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ignoring invalid exclude glob"));
+    }
+
+    #[test]
+    fn pre_cancelled_exclude_compilation_publishes_no_matcher() {
+        super::take_test_exclude_glob_warnings();
+        let cancel = AtomicBool::new(true);
+
+        let result =
+            super::compile_exclude_patterns_with_cancel(&["Keep.pas".to_owned()], Some(&cancel));
+
+        assert_eq!(
+            result.expect_err("pre-cancelled compilation"),
+            "request cancelled"
+        );
+        assert!(super::take_test_exclude_glob_warnings().is_empty());
+    }
+
+    #[test]
+    fn exclude_defaults_and_lint_exclusions_keep_separate_matching_behavior() {
+        let root = PathBuf::from("/workspace");
+        let patterns = Arc::new(
+            super::compile_exclude_patterns(&["Keep.pas".to_owned()])
+                .expect("valid exclusion patterns"),
+        );
+        let matcher = super::ExcludeMatcher {
+            root: root.clone(),
+            config_root: root.clone(),
+            patterns: Some(Arc::clone(&patterns)),
+        };
+
+        assert!(matcher.is_excluded(&root.join(".git/config.pas"), &root));
+        assert_eq!(patterns.test_build_counts(), (1, 0));
+
+        let lint_matcher = super::LintExcludeMatcher::new(&root, &[".git\\*.pas".to_owned()]);
+        let lint_patterns = lint_matcher.patterns.as_ref().expect("lint patterns");
+        assert!(lint_matcher.is_excluded(&root.join(".git/Keep.pas")));
+        assert_eq!(lint_patterns.test_build_counts(), (1, 0));
+        assert!(!lint_matcher.is_excluded(&root.join("Other.pas")));
+        assert_eq!(lint_patterns.test_build_counts(), (1, 0));
+    }
+
+    #[test]
+    fn failed_folded_exclude_set_build_is_cached_without_disabling_exact_or_defaults() {
+        super::take_test_exclude_glob_warnings();
+        let literal = "a".repeat(250_000);
+        let patterns = Arc::new(
+            super::compile_exclude_patterns(std::slice::from_ref(&literal))
+                .expect("exact set should build even when folded set cannot"),
+        );
+        let patterns_clone = Arc::clone(&patterns);
+        let root = PathBuf::from("/workspace");
+        let matcher = super::ExcludeMatcher {
+            root: root.clone(),
+            config_root: root.clone(),
+            patterns: Some(Arc::clone(&patterns)),
+        };
+
+        assert_eq!(patterns.test_build_counts(), (1, 0));
+        assert!(super::matches_exclude_patterns_for_case(
+            &patterns,
+            Path::new("/workspace/literal"),
+            Path::new(&literal),
+            false,
+        ));
+        assert!(super::take_test_exclude_glob_warnings().is_empty());
+
+        assert!(matcher.is_excluded(&root.join(".git/config.pas"), &root));
+        assert_eq!(patterns.test_build_counts(), (1, 0));
+        assert!(!super::matches_exclude_patterns_for_case(
+            &patterns,
+            Path::new("/workspace/literal"),
+            Path::new(&literal),
+            true,
+        ));
+        let warnings = super::take_test_exclude_glob_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("failed to build exclude globs"));
+        assert_eq!(patterns.test_build_counts(), (1, 1));
+
+        assert!(!super::matches_exclude_patterns_for_case(
+            &patterns_clone,
+            Path::new("/workspace/literal"),
+            Path::new(&literal),
+            true,
+        ));
+        assert!(super::matches_exclude_patterns_for_case(
+            &patterns_clone,
+            Path::new("/workspace/literal"),
+            Path::new(&literal),
+            false,
+        ));
+        assert!(matcher.is_excluded(&root.join(".git/config.pas"), &root));
+        assert!(super::take_test_exclude_glob_warnings().is_empty());
+        assert_eq!(patterns.test_build_counts(), (1, 1));
+    }
 
     fn budget_test_context_key(index: usize) -> ContextKey {
         ContextKey {

@@ -2,6 +2,8 @@
 
 #[path = "server/project_prompts.rs"]
 mod project_prompts;
+#[path = "server/records.rs"]
+mod records;
 #[path = "server/uri_spelling.rs"]
 mod uri_spelling;
 
@@ -39,6 +41,11 @@ use lsp_types::{
     RelativePattern, SelectionRangeParams, ServerInfo, ShowMessageParams, SignatureHelpParams,
     SymbolInformation, TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
     WorkspaceDiagnosticParams, WorkspaceEdit, WorkspaceFolder,
+};
+#[cfg(test)]
+use records::compact_completion_record_bytes;
+use records::{
+    compact_completion_records, compact_diagnostic_records, source_records_retained_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1862,198 +1869,6 @@ impl Default for CompletionResolutionStore {
     }
 }
 
-fn compact_completion_records(
-    records: &[SourceRecord],
-) -> Result<(Vec<SourceRecord>, usize), String> {
-    let mut compact = Vec::with_capacity(records.len());
-    let mut bytes = 0usize;
-    for record in records {
-        let content_hash = record.content_hash.or_else(|| {
-            if record.open {
-                // The compact observation below intentionally drops the full
-                // overlay text.  Revalidation therefore interprets this as a
-                // raw-byte hash, while parsed_text_hash retains the decoded
-                // LSP-text identity for parser freshness.
-                Some(crate::workspace::content_hash_bytes(record.text.as_bytes()))
-            } else {
-                record
-                    .content_bytes
-                    .as_deref()
-                    .map(crate::workspace::content_hash_bytes)
-                    .or_else(|| {
-                        (!record.text.is_empty())
-                            .then(|| crate::workspace::content_hash_bytes(record.text.as_bytes()))
-                    })
-            }
-        });
-        if !record.open && record.path.is_none() && content_hash.is_none() {
-            return Err(format!(
-                "completion dependency {} has no bounded content observation",
-                record.uri
-            ));
-        }
-        let observation = SourceRecord {
-            uri: record.uri.clone(),
-            text: String::new(),
-            version: record.version,
-            stamp: record.stamp.clone(),
-            open: record.open,
-            path: record.path.clone(),
-            path_stamp: record.path_stamp.clone(),
-            content_hash,
-            parsed_text_hash: record.parsed_text_hash.or_else(|| {
-                (!record.text.is_empty())
-                    .then(|| crate::workspace::rename::text_content_hash(&record.text))
-            }),
-            content_bytes: None,
-            candidate_membership: record.candidate_membership.clone(),
-            candidate_observations: record.candidate_observations.clone(),
-            read_policy: record.read_policy.clone(),
-            path_entry: record.path_entry.clone(),
-            include_payload: record.include_payload,
-            missing_provider_candidate: record.missing_provider_candidate,
-            document_link_missing_candidate: record.document_link_missing_candidate,
-            directory_observation: record.directory_observation,
-            document_link_ancestor: record.document_link_ancestor,
-            missing_provider_scope: record.missing_provider_scope.clone(),
-            auto_import_provider_observation: record.auto_import_provider_observation,
-            auto_import_scopes: record.auto_import_scopes.clone(),
-        };
-        let observation_bytes = compact_completion_record_bytes(&observation);
-        bytes = bytes.saturating_add(observation_bytes);
-        compact.push(observation);
-        if compact.len() > MAX_COMPLETION_RESOLUTION_RECORDS
-            || bytes > MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
-        {
-            return Err("completion dependency observations exceed the bounded limit".to_string());
-        }
-    }
-    Ok((compact, bytes))
-}
-
-fn path_storage_bytes(path: &PathBuf) -> usize {
-    size_of::<PathBuf>().saturating_add(path.capacity())
-}
-
-fn path_entry_storage_bytes(entry: &pascal_project::ProjectPathEntry) -> usize {
-    size_of::<pascal_project::ProjectPathEntry>()
-        .saturating_add(path_storage_bytes(&entry.path))
-        .saturating_add(match &entry.provenance {
-            pascal_project::ProjectPathProvenance::Mapped { root } => path_storage_bytes(root),
-            pascal_project::ProjectPathProvenance::LegacyNative
-            | pascal_project::ProjectPathProvenance::Configured => 0,
-        })
-}
-
-fn candidate_membership_storage_bytes(
-    membership: &pascal_project::ProjectCandidateMembership,
-) -> usize {
-    size_of::<pascal_project::ProjectCandidateMembership>().saturating_add(
-        membership
-            .paths
-            .iter()
-            .map(path_storage_bytes)
-            .sum::<usize>(),
-    )
-}
-
-fn candidate_observations_storage_bytes(
-    observations: &[crate::workspace::rename::ResolverCandidateObservation],
-) -> usize {
-    observations
-        .iter()
-        .map(|observation| {
-            size_of::<crate::workspace::rename::ResolverCandidateObservation>()
-                .saturating_add(path_storage_bytes(&observation.path))
-        })
-        .sum()
-}
-
-fn missing_provider_scope_storage_bytes(
-    scope: &crate::workspace::rename::MissingProviderScope,
-) -> usize {
-    size_of::<crate::workspace::rename::MissingProviderScope>()
-        .saturating_add(path_storage_bytes(&scope.root))
-        .saturating_add(
-            scope
-                .names
-                .iter()
-                .map(|name| size_of::<String>().saturating_add(name.capacity()))
-                .sum::<usize>(),
-        )
-        .saturating_add(scope.read_policy.retained_size_hint())
-        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
-}
-
-fn auto_import_scope_storage_bytes(
-    scope: &crate::workspace::rename::AutoImportProviderScope,
-) -> usize {
-    size_of::<crate::workspace::rename::AutoImportProviderScope>()
-        .saturating_add(path_storage_bytes(&scope.root))
-        .saturating_add(
-            scope
-                .provider_units
-                .iter()
-                .chain(scope.candidate_prefixes.iter())
-                .map(|value| size_of::<String>().saturating_add(value.capacity()))
-                .sum::<usize>(),
-        )
-        .saturating_add(scope.read_policy.retained_size_hint())
-        .saturating_add(path_entry_storage_bytes(&scope.path_entry))
-}
-
-fn compact_completion_record_bytes(record: &SourceRecord) -> usize {
-    size_of::<SourceRecord>()
-        .saturating_add(record.uri.as_str().len())
-        .saturating_add(
-            record
-                .text
-                .capacity()
-                .saturating_mul(std::mem::size_of::<u8>()),
-        )
-        .saturating_add(record.path.as_ref().map_or(0, path_storage_bytes))
-        .saturating_add(
-            record
-                .content_bytes
-                .as_ref()
-                .map_or(0, |bytes| bytes.capacity()),
-        )
-        .saturating_add(
-            record
-                .candidate_membership
-                .as_ref()
-                .map_or(0, candidate_membership_storage_bytes),
-        )
-        .saturating_add(candidate_observations_storage_bytes(
-            &record.candidate_observations,
-        ))
-        .saturating_add(
-            record
-                .read_policy
-                .as_ref()
-                .map_or(0, pascal_project::ReadPolicy::retained_size_hint),
-        )
-        .saturating_add(
-            record
-                .path_entry
-                .as_ref()
-                .map_or(0, path_entry_storage_bytes),
-        )
-        .saturating_add(
-            record
-                .missing_provider_scope
-                .as_ref()
-                .map_or(0, missing_provider_scope_storage_bytes),
-        )
-        .saturating_add(
-            record
-                .auto_import_scopes
-                .iter()
-                .map(auto_import_scope_storage_bytes)
-                .sum::<usize>(),
-        )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentationFormat {
     PlainText,
@@ -2462,86 +2277,6 @@ fn diagnostic_items_retained_bytes(diagnostics: &[lsp_types::Diagnostic]) -> Res
     let encoded = serde_json::to_vec(diagnostics)
         .map_err(|error| format!("could not encode diagnostic storage estimate: {error}"))?;
     Ok(size_of::<Vec<lsp_types::Diagnostic>>().saturating_add(encoded.len()))
-}
-
-fn compact_diagnostic_records(records: &[SourceRecord]) -> Result<Vec<SourceRecord>, String> {
-    if records.len() > MAX_DIAGNOSTIC_DEPENDENCY_RECORDS {
-        return Err(format!(
-            "diagnostic validation evidence exceeds the {MAX_DIAGNOSTIC_DEPENDENCY_RECORDS}-record limit"
-        ));
-    }
-
-    // Preflight the bounded representation before allocating its vector.  The
-    // source payloads are deliberately excluded: freshness is proved from the
-    // content hashes below, while authorization and resolver observations are
-    // retained for dependency validation.
-    let mut estimated_bytes = 0usize;
-    for record in records {
-        let full = compact_completion_record_bytes(record);
-        let source_payload = record
-            .text
-            .capacity()
-            .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::capacity));
-        estimated_bytes = estimated_bytes.saturating_add(full.saturating_sub(source_payload));
-        if estimated_bytes > MAX_DIAGNOSTIC_VALIDATION_BYTES {
-            return Err(format!(
-                "diagnostic validation evidence exceeds the {MAX_DIAGNOSTIC_VALIDATION_BYTES}-byte limit"
-            ));
-        }
-    }
-
-    let mut compact = Vec::with_capacity(records.len());
-    for record in records {
-        let content_hash = record.content_hash.or_else(|| {
-            if record.open {
-                Some(crate::workspace::content_hash_bytes(record.text.as_bytes()))
-            } else {
-                record
-                    .content_bytes
-                    .as_deref()
-                    .map(crate::workspace::content_hash_bytes)
-                    .or_else(|| {
-                        (!record.text.is_empty())
-                            .then(|| crate::workspace::content_hash_bytes(record.text.as_bytes()))
-                    })
-            }
-        });
-        if !record.open && record.path.is_none() && content_hash.is_none() {
-            return Err(format!(
-                "diagnostic dependency {} has no bounded content observation",
-                record.uri
-            ));
-        }
-        let compact_record = SourceRecord {
-            uri: record.uri.clone(),
-            text: String::new(),
-            version: record.version,
-            stamp: record.stamp.clone(),
-            open: record.open,
-            path: record.path.clone(),
-            path_stamp: record.path_stamp.clone(),
-            content_hash,
-            parsed_text_hash: record.parsed_text_hash.or_else(|| {
-                (!record.text.is_empty())
-                    .then(|| crate::workspace::rename::text_content_hash(&record.text))
-            }),
-            content_bytes: None,
-            candidate_membership: record.candidate_membership.clone(),
-            candidate_observations: record.candidate_observations.clone(),
-            read_policy: record.read_policy.clone(),
-            path_entry: record.path_entry.clone(),
-            include_payload: record.include_payload,
-            missing_provider_candidate: record.missing_provider_candidate,
-            document_link_missing_candidate: record.document_link_missing_candidate,
-            directory_observation: record.directory_observation,
-            document_link_ancestor: record.document_link_ancestor,
-            missing_provider_scope: record.missing_provider_scope.clone(),
-            auto_import_provider_observation: record.auto_import_provider_observation,
-            auto_import_scopes: record.auto_import_scopes.clone(),
-        };
-        compact.push(compact_record);
-    }
-    Ok(compact)
 }
 
 fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
@@ -4386,54 +4121,6 @@ fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
     )
 }
 
-fn source_records_retained_bytes(records: &[SourceRecord]) -> usize {
-    let mut bytes = size_of::<Vec<SourceRecord>>()
-        .saturating_add(records.len().saturating_mul(size_of::<SourceRecord>()));
-    for record in records {
-        bytes = bytes
-            .saturating_add(size_of::<SourceRecord>())
-            .saturating_add(record.uri.as_str().len())
-            .saturating_add(record.text.capacity())
-            .saturating_add(record.path.as_ref().map_or(0, path_storage_bytes))
-            .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::capacity))
-            .saturating_add(
-                record
-                    .candidate_membership
-                    .as_ref()
-                    .map_or(0, candidate_membership_storage_bytes),
-            )
-            .saturating_add(candidate_observations_storage_bytes(
-                &record.candidate_observations,
-            ))
-            .saturating_add(
-                record
-                    .read_policy
-                    .as_ref()
-                    .map_or(0, pascal_project::ReadPolicy::retained_size_hint),
-            )
-            .saturating_add(
-                record
-                    .path_entry
-                    .as_ref()
-                    .map_or(0, path_entry_storage_bytes),
-            )
-            .saturating_add(
-                record
-                    .missing_provider_scope
-                    .as_ref()
-                    .map_or(0, missing_provider_scope_storage_bytes),
-            )
-            .saturating_add(
-                record
-                    .auto_import_scopes
-                    .iter()
-                    .map(auto_import_scope_storage_bytes)
-                    .sum::<usize>(),
-            );
-    }
-    bytes
-}
-
 #[derive(Debug, Clone)]
 enum ProgressTarget {
     Client {
@@ -5215,6 +4902,13 @@ struct QueuedDiagnostic {
 enum QueuedAnalysis {
     Client(QueuedClientAnalysis),
     Diagnostic(QueuedDiagnostic),
+}
+
+#[derive(Default)]
+struct QueuedReplacementCapacity {
+    jobs: usize,
+    recipients: usize,
+    partial_tokens: usize,
 }
 
 #[derive(Clone)]
@@ -7204,6 +6898,42 @@ impl AnalysisJobs {
             .saturating_add(self.retired_partial_validations.len())
     }
 
+    fn queued_replacement_capacity(
+        &self,
+        replacement_candidates: &[AnalysisComputationId],
+    ) -> QueuedReplacementCapacity {
+        let candidates = replacement_candidates
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut counted = HashSet::new();
+        let mut capacity = QueuedReplacementCapacity::default();
+        for queued in self.queue.iter() {
+            let QueuedAnalysis::Client(job) = queued else {
+                continue;
+            };
+            if !candidates.contains(&job.id) || !counted.insert(job.id) {
+                continue;
+            }
+            capacity.jobs += 1;
+            capacity.recipients += job.recipients.len();
+            capacity.partial_tokens += job
+                .recipients
+                .iter()
+                .filter(|recipient| {
+                    recipient
+                        .partial_result_token
+                        .as_ref()
+                        .and_then(|token| self.partial_tokens.get(token))
+                        .is_some_and(|(job_id, request_id)| {
+                            job_id == &job.id && request_id == &recipient.id
+                        })
+                })
+                .count();
+        }
+        capacity
+    }
+
     fn partial_delivery_bytes(&self) -> usize {
         let delivering = self
             .partial_deliveries
@@ -7339,70 +7069,81 @@ impl AnalysisJobs {
 
         let title = progress_title(&request).to_string();
         let key = ObservationKey::for_request(&request, workspace);
-        // Queued requests this one replaces are cancelled only once it is
-        // admitted, so a rejected request does not cost the client both answers.
-        let replaced = key.as_ref().map_or_else(Vec::new, |key| {
-            self.observation_jobs
-                .iter()
-                .filter(|(existing, id)| {
-                    existing.is_replaced_by(key) && !self.pending.contains_key(id)
-                })
-                .map(|(_, id)| *id)
-                .collect::<Vec<_>>()
-        });
+        // Compute supersession candidates without mutating any admitted work.
+        // A rejected request must not cancel the request whose answer it would
+        // have superseded.
+        let mut replaced = Vec::new();
+        let mut replaced_ids = HashSet::new();
+        let mut superseded = Vec::new();
+        let mut superseded_ids = HashSet::new();
         if let Some(key) = key.as_ref() {
-            let superseded = self
-                .observation_jobs
-                .iter()
-                .filter(|(existing, _)| existing.is_superseded_by(key))
-                .map(|(_, id)| *id)
-                .collect::<Vec<_>>();
-            for primary_id in superseded {
-                self.supersede_client(&primary_id, connection, ANALYSIS_SUPERSEDED_MESSAGE)?;
-            }
-
-            if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
-                if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
-                    || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
+            for (existing, primary_id) in &self.observation_jobs {
+                if existing.is_replaced_by(key)
+                    && !self.pending.contains_key(primary_id)
+                    && replaced_ids.insert(*primary_id)
                 {
-                    return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
+                    replaced.push(*primary_id);
                 }
-                let recipient = ClientRecipient {
-                    id: id.clone(),
-                    work_done_token: tokens.work_done.clone(),
-                    partial_result_token: tokens.partial_result.clone(),
-                };
-                if let Some(state) = self.attach_client(&primary_id, recipient.clone()) {
-                    self.request_to_job.insert(id, primary_id);
-                    self.register_partial_token(&recipient, primary_id);
-                    self.progress.begin_client(
-                        connection,
-                        AnalysisJobId::Client(primary_id),
-                        &recipient,
-                        &title,
-                    )?;
-                    if state == ClientAnalysisState::Running
-                        && let Some(connection) = connection
-                    {
-                        self.progress.report_started_recipient(
-                            connection,
-                            AnalysisJobId::Client(primary_id),
-                            &recipient.id,
-                        )?;
-                    }
-                    for primary_id in replaced {
-                        self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
-                    }
-                    return Ok(());
+                if existing.is_superseded_by(key) && superseded_ids.insert(*primary_id) {
+                    superseded.push(*primary_id);
                 }
-                self.observation_jobs.remove(key);
             }
         }
-
-        if self.client_recipient_count() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
-            || self.partial_tokens.len() >= MAX_CLIENT_ANALYSIS_RECIPIENTS
-            || self.queue.len() >= MAX_CLIENT_ANALYSIS_QUEUE
+        let replacement_capacity = self.queued_replacement_capacity(&replaced);
+        let projected_recipients = self
+            .client_recipient_count()
+            .saturating_sub(replacement_capacity.recipients)
+            .saturating_add(1);
+        let projected_partial_tokens = self
+            .partial_tokens
+            .len()
+            .saturating_sub(replacement_capacity.partial_tokens)
+            .saturating_add(usize::from(tokens.partial_result.is_some()));
+        if projected_recipients > MAX_CLIENT_ANALYSIS_RECIPIENTS
+            || projected_partial_tokens > MAX_CLIENT_ANALYSIS_RECIPIENTS
         {
+            return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
+        }
+
+        if let Some(key) = key.as_ref()
+            && let Some(primary_id) = self.observation_jobs.get(key).cloned()
+        {
+            let recipient = ClientRecipient {
+                id: id.clone(),
+                work_done_token: tokens.work_done.clone(),
+                partial_result_token: tokens.partial_result.clone(),
+            };
+            if let Some(state) = self.attach_client(&primary_id, recipient.clone()) {
+                self.request_to_job.insert(id, primary_id);
+                self.register_partial_token(&recipient, primary_id);
+                self.cancel_version_superseded_candidates(&superseded, connection)?;
+                self.progress.begin_client(
+                    connection,
+                    AnalysisJobId::Client(primary_id),
+                    &recipient,
+                    &title,
+                )?;
+                if state == ClientAnalysisState::Running
+                    && let Some(connection) = connection
+                {
+                    self.progress.report_started_recipient(
+                        connection,
+                        AnalysisJobId::Client(primary_id),
+                        &recipient.id,
+                    )?;
+                }
+                self.cancel_replaced_candidates(&replaced, connection)?;
+                return Ok(());
+            }
+            self.observation_jobs.remove(key);
+        }
+
+        let projected_queue = self
+            .queue
+            .len()
+            .saturating_sub(replacement_capacity.jobs)
+            .saturating_add(1);
+        if projected_queue > MAX_CLIENT_ANALYSIS_QUEUE {
             return Err(ANALYSIS_QUEUE_FULL_MESSAGE.to_string());
         }
 
@@ -7431,15 +7172,14 @@ impl AnalysisJobs {
             }),
         );
         self.register_partial_token(&recipient, primary_id);
+        self.cancel_version_superseded_candidates(&superseded, connection)?;
         self.progress.begin_client(
             connection,
             AnalysisJobId::Client(primary_id),
             &recipient,
             &title,
         )?;
-        for primary_id in replaced {
-            self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
-        }
+        self.cancel_replaced_candidates(&replaced, connection)?;
         let failures = self.pump(workspace, connection);
         self.handle_dispatch_failures(failures, connection)
     }
@@ -7549,6 +7289,28 @@ impl AnalysisJobs {
         for id in ids {
             send_error(connection, id, code, message)
                 .map_err(|error| format!("could not send analysis response: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn cancel_version_superseded_candidates(
+        &mut self,
+        superseded: &[AnalysisComputationId],
+        connection: Option<&dyn ProtocolSender>,
+    ) -> Result<(), String> {
+        for primary_id in superseded {
+            self.supersede_client(primary_id, connection, ANALYSIS_SUPERSEDED_MESSAGE)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_replaced_candidates(
+        &mut self,
+        replaced: &[AnalysisComputationId],
+        connection: Option<&dyn ProtocolSender>,
+    ) -> Result<(), String> {
+        for primary_id in replaced {
+            self.supersede_client(primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
         }
         Ok(())
     }
@@ -10914,6 +10676,80 @@ fn wait_at_workspace_file_worker_test_barrier(
     Ok(())
 }
 
+/// Conservatively identify rename notifications whose worker may invalidate
+/// results captured at the pre-notification revision. This is deliberately a
+/// bounded raw-shape check: parsing/canonicalizing URIs remains in the worker.
+fn raw_file_uri_has_conservative_shape(uri: &str) -> bool {
+    let Some(path) = uri.strip_prefix("file://") else {
+        return false;
+    };
+    if !path.starts_with('/') {
+        return false;
+    }
+
+    let bytes = uri.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let Some(high) = bytes.get(index + 1) else {
+                return false;
+            };
+            let Some(low) = bytes.get(index + 2) else {
+                return false;
+            };
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return false;
+            }
+            index += 3;
+        } else if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte) {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn workspace_file_notification_requires_precommit_fence(notification: &Notification) -> bool {
+    if notification.method != "workspace/didRenameFiles" {
+        return false;
+    }
+
+    let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
+        return true;
+    };
+    if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+        return true;
+    }
+
+    let mut total_uri_bytes = 0usize;
+    for file in files {
+        let Some(old_uri) = file.get("oldUri").and_then(Value::as_str) else {
+            return true;
+        };
+        let Some(new_uri) = file.get("newUri").and_then(Value::as_str) else {
+            return true;
+        };
+        for uri in [old_uri, new_uri] {
+            if uri.len() <= "file://".len() || uri.len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+                return true;
+            }
+            let Some(next_total) = total_uri_bytes.checked_add(uri.len()) else {
+                return true;
+            };
+            if next_total > MAX_FILE_OPERATION_BATCH_URI_BYTES {
+                return true;
+            }
+            if !raw_file_uri_has_conservative_shape(uri) {
+                return true;
+            }
+            total_uri_bytes = next_total;
+        }
+    }
+    false
+}
+
 fn spawn_workspace_file_notification(
     workspace: &mut Workspace,
     notification: Notification,
@@ -10925,7 +10761,12 @@ fn spawn_workspace_file_notification(
     let worker_cancellation = Arc::clone(&cancellation);
     let deadline_expired = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + workspace_notification_deadline();
+    let precommit_fence = workspace_file_notification_requires_precommit_fence(&notification);
     let revision = WorkspaceRevision::of(workspace);
+    let revision = WorkspaceRevision {
+        fenced: revision.fenced || precommit_fence,
+        ..revision
+    };
     let owned_workspace = std::mem::take(workspace);
     let join = thread::Builder::new()
         .name("PascalLspWorkspaceMutation".to_string())
@@ -11051,6 +10892,17 @@ fn select_workspace_event_message(
                 message
             })
             .or_else(|| deferred_workspace_overflow.take())
+    }
+}
+
+fn workspace_notification_deadline_log_message(
+    test_deadline_requested: bool,
+    deadline_elapsed: bool,
+) -> &'static str {
+    if test_deadline_requested && !deadline_elapsed {
+        "pascal-lsp: workspace notification reconciliation test-triggered expiry; requesting cooperative cancellation"
+    } else {
+        "pascal-lsp: workspace notification reconciliation deadline elapsed; requesting cooperative cancellation"
     }
 }
 
@@ -11263,11 +11115,33 @@ fn event_loop(
                     return Ok(true);
                 }
                 Err(TryRecvError::Empty) => {
-                    if Instant::now() >= worker.deadline
+                    let deadline_elapsed = Instant::now() >= worker.deadline;
+                    #[cfg(feature = "test-support")]
+                    let test_deadline_requested =
+                        std::env::var_os("PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_TRIGGER")
+                            .is_some_and(|path| std::path::Path::new(&path).exists());
+                    #[cfg(not(feature = "test-support"))]
+                    let test_deadline_requested = false;
+                    if (deadline_elapsed || test_deadline_requested)
                         && !worker.deadline_expired.swap(true, Ordering::AcqRel)
                     {
+                        #[cfg(feature = "test-support")]
+                        if let Some(marker) = std::env::var_os(
+                            "PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_EXPIRED",
+                        ) {
+                            let evidence: &[u8] = if test_deadline_requested && !deadline_elapsed {
+                                b"test-triggered"
+                            } else {
+                                b"deadline-elapsed"
+                            };
+                            let _ = std::fs::write(marker, evidence);
+                        }
                         eprintln!(
-                            "pascal-lsp: workspace notification reconciliation deadline elapsed; requesting cooperative cancellation"
+                            "{}",
+                            workspace_notification_deadline_log_message(
+                                test_deadline_requested,
+                                deadline_elapsed,
+                            )
                         );
                         worker.cancellation.store(true, Ordering::Release);
                     }
@@ -15486,10 +15360,15 @@ fn is_affected_neovim_document_pull_client(raw_initialize: &Value) -> bool {
             .is_some_and(|version| {
                 matches!(
                     version.trim(),
-                    // Neovim 0.12.5 reports the first form from its LSP
-                    // clientInfo and the second form is accepted for clients
-                    // that include the usual display-version prefix.
-                    "0.12.5" | "v0.12.5" | "0.12.5+v0.12.5" | "v0.12.5+v0.12.5"
+                    // These observed Neovim 0.12.5/0.12.6 versions keep
+                    // attached buffers in document-pull mode despite also
+                    // advertising workspace diagnostics.
+                    "0.12.5"
+                        | "v0.12.5"
+                        | "0.12.5+v0.12.5"
+                        | "v0.12.5+v0.12.5"
+                        | "0.12.6"
+                        | "0.12.6+v0.12.6"
                 )
             })
 }
@@ -15500,12 +15379,11 @@ fn supports_workspace_diagnostic_reports(raw_initialize: &Value) -> bool {
     // inspect the raw initialize value only to accept either workspace wire
     // spelling.  Refresh support is optional and does not gate reports.
     //
-    // The evidenced Neovim 0.12.5 client advertises the canonical capability
-    // but deliberately keeps attached buffers in document-pull mode.  Its
-    // workspace refresh handler then ignores workspace reports for those
-    // buffers and opens every unopened URI returned by the scan.  Keep only
-    // that exact, versioned client on document pull; versionless, unknown, and
-    // newer clients still receive the standard workspace provider.
+    // The evidenced Neovim 0.12.5 and 0.12.6 clients advertise the canonical
+    // capability but keep attached buffers in document-pull mode. Their
+    // workspace refresh handlers therefore do not update those diagnostics.
+    // Keep only those exact, versioned clients on document pull; versionless,
+    // unknown, and newer clients still receive the standard workspace provider.
     let neovim_document_pull_compat = is_affected_neovim_document_pull_client(raw_initialize);
     !neovim_document_pull_compat
         && (raw_initialize
@@ -15576,17 +15454,19 @@ mod tests {
         CompletionResolutionStore, CompletionResult, ConfigurationCoordinator,
         DiagnosticPublicationDiscardScan, DiagnosticPublicationTurnBudget, DiagnosticPullStore,
         DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
-        MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
-        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK,
-        MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
-        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
-        PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
-        PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
+        MAX_CLIENT_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
+        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK, MAX_PAYLOAD_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
+        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, NavigationTarget,
+        OutboundClass, OutboundQueue, OutputError, PartialDelivery, PartialDeliveryRecipient,
+        PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
+        ProtocolSender, TestBarrierConfig, WorkspaceRevision, deliver_analysis_result,
         event_loop_receive_timeout, handle_request, invalidate_analysis_result,
         pump_pending_diagnostic_publications, select_workspace_event_message,
-        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
+        spawn_workspace_file_notification, supports_diagnostic_refresh,
+        supports_workspace_diagnostic_reports,
     };
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -15609,6 +15489,22 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn workspace_notification_deadline_log_distinguishes_trigger_from_elapsed_time() {
+        assert_eq!(
+            super::workspace_notification_deadline_log_message(true, false),
+            "pascal-lsp: workspace notification reconciliation test-triggered expiry; requesting cooperative cancellation"
+        );
+        assert_eq!(
+            super::workspace_notification_deadline_log_message(false, true),
+            "pascal-lsp: workspace notification reconciliation deadline elapsed; requesting cooperative cancellation"
+        );
+        assert_eq!(
+            super::workspace_notification_deadline_log_message(true, true),
+            "pascal-lsp: workspace notification reconciliation deadline elapsed; requesting cooperative cancellation"
+        );
+    }
 
     struct BackpressureOnceSender {
         should_block: AtomicBool,
@@ -17731,7 +17627,7 @@ mod tests {
                 }
             }
         })));
-        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+        assert!(!supports_workspace_diagnostic_reports(&serde_json::json!({
             "clientInfo": {"name": "Neovim", "version": "0.12.6"},
             "capabilities": {
                 "workspace": {
@@ -17755,6 +17651,57 @@ mod tests {
                 }
             }
         })));
+    }
+
+    #[test]
+    fn neovim_0126_display_versions_keep_attached_buffers_on_document_diagnostics() {
+        let advertised_workspace_diagnostics = ["0.12.6", "0.12.6+v0.12.6"].map(|version| {
+            let raw_initialize = serde_json::json!({
+                "clientInfo": {"name": "Neovim", "version": version},
+                "capabilities": {
+                    "workspace": {"diagnostics": {"refreshSupport": true}}
+                }
+            });
+            supports_workspace_diagnostic_reports(&raw_initialize)
+        });
+
+        assert_eq!(
+            advertised_workspace_diagnostics,
+            [false, false],
+            "the two observed Neovim 0.12.6 display forms must use document diagnostics"
+        );
+    }
+
+    #[test]
+    fn neovim_document_pull_compatibility_keeps_legacy_and_nearby_controls() {
+        for (name, version, expected_workspace_support) in [
+            ("Neovim", "0.12.5", false),
+            ("Neovim", "v0.12.5", false),
+            ("Neovim", "0.12.5+v0.12.5", false),
+            ("Neovim", "v0.12.5+v0.12.5", false),
+            ("Neovim", "0.13.0", true),
+            ("Neovim", "0.12.60", true),
+            ("OtherEditor", "0.12.6", true),
+        ] {
+            let raw_initialize = serde_json::json!({
+                "clientInfo": {"name": name, "version": version},
+                "capabilities": {
+                    "workspace": {"diagnostics": {"refreshSupport": true}}
+                }
+            });
+            assert_eq!(
+                supports_workspace_diagnostic_reports(&raw_initialize),
+                expected_workspace_support,
+                "unexpected workspace diagnostic capability for {name} {version}"
+            );
+        }
+
+        let default_client = serde_json::json!({
+            "capabilities": {
+                "workspace": {"diagnostics": {"refreshSupport": true}}
+            }
+        });
+        assert!(supports_workspace_diagnostic_reports(&default_client));
     }
 
     fn test_completion_analysis(uri: &Url, index: usize) -> CompletionAnalysis {
@@ -18072,6 +18019,441 @@ mod tests {
             error.contains("byte") || error.contains("bounded"),
             "{error}"
         );
+    }
+
+    fn compact_with_both_wrappers(record: &SourceRecord) -> (SourceRecord, SourceRecord, usize) {
+        let (mut completion, bytes) =
+            super::compact_completion_records(std::slice::from_ref(record))
+                .expect("completion compaction");
+        let mut diagnostic = super::compact_diagnostic_records(std::slice::from_ref(record))
+            .expect("diagnostic compaction");
+        assert_eq!(completion.len(), 1);
+        assert_eq!(diagnostic.len(), 1);
+        (completion.remove(0), diagnostic.remove(0), bytes)
+    }
+
+    fn assert_compaction_hashes(
+        record: &SourceRecord,
+        expected_content_hash: Option<u64>,
+        expected_parsed_text_hash: Option<u64>,
+    ) {
+        let (completion, diagnostic, _) = compact_with_both_wrappers(record);
+        for compacted in [&completion, &diagnostic] {
+            assert_eq!(compacted.content_hash, expected_content_hash);
+            assert_eq!(compacted.parsed_text_hash, expected_parsed_text_hash);
+            assert!(compacted.text.is_empty());
+            assert!(compacted.content_bytes.is_none());
+        }
+    }
+
+    fn assert_compaction_witnesses(compacted: &SourceRecord, source: &SourceRecord) {
+        assert_eq!(compacted.uri, source.uri);
+        assert!(compacted.text.is_empty());
+        assert_eq!(compacted.version, source.version);
+        assert_eq!(compacted.stamp, source.stamp);
+        assert_eq!(compacted.open, source.open);
+        assert_eq!(compacted.path, source.path);
+        assert_eq!(compacted.path_stamp, source.path_stamp);
+        assert_eq!(compacted.content_hash, source.content_hash);
+        assert_eq!(compacted.parsed_text_hash, source.parsed_text_hash);
+        assert!(compacted.content_bytes.is_none());
+        assert_eq!(compacted.candidate_membership, source.candidate_membership);
+        assert_eq!(
+            compacted.candidate_observations,
+            source.candidate_observations
+        );
+        assert_eq!(compacted.read_policy, source.read_policy);
+        assert_eq!(compacted.path_entry, source.path_entry);
+        assert_eq!(compacted.include_payload, source.include_payload);
+        assert_eq!(
+            compacted.missing_provider_candidate,
+            source.missing_provider_candidate
+        );
+        assert_eq!(
+            compacted.document_link_missing_candidate,
+            source.document_link_missing_candidate
+        );
+        assert_eq!(
+            compacted.directory_observation,
+            source.directory_observation
+        );
+        assert_eq!(
+            compacted.document_link_ancestor,
+            source.document_link_ancestor
+        );
+        assert_eq!(
+            compacted.missing_provider_scope,
+            source.missing_provider_scope
+        );
+        assert_eq!(
+            compacted.auto_import_provider_observation,
+            source.auto_import_provider_observation
+        );
+        assert_eq!(compacted.auto_import_scopes, source.auto_import_scopes);
+    }
+
+    fn marked_compaction_record() -> SourceRecord {
+        let read_roots = [PathBuf::from("/projection-sentinel/authorized-root")];
+        let source_paths = ["projection-source-path".to_string()];
+        let exclusions = ["*.projection-sentinel".to_string()];
+        let read_policy = pascal_project::ReadPolicy::new(
+            &read_roots,
+            &source_paths,
+            &exclusions,
+            &pascal_project::delphi_overrides::EffectiveOverrides::default(),
+        );
+        let path_entry = pascal_project::ProjectPathEntry {
+            path: PathBuf::from("/projection-sentinel/path-entry.pas"),
+            provenance: pascal_project::ProjectPathProvenance::Mapped {
+                root: PathBuf::from("/projection-sentinel/mapped-root"),
+            },
+        };
+        let missing_provider_scope = crate::workspace::rename::MissingProviderScope {
+            root: PathBuf::from("/projection-sentinel/missing-root"),
+            names: vec!["MissingSentinelProvider".to_string()],
+            read_policy: read_policy.clone(),
+            path_entry: path_entry.clone(),
+        };
+        let auto_import_scope = crate::workspace::rename::AutoImportProviderScope {
+            root: PathBuf::from("/projection-sentinel/auto-import-root"),
+            provider_units: vec!["SentinelProviderUnit".to_string()],
+            candidate_prefixes: vec!["SentinelCandidatePrefix".to_string()],
+            read_policy: read_policy.clone(),
+            path_entry: path_entry.clone(),
+        };
+
+        SourceRecord {
+            uri: Url::parse("file:///projection-sentinel/source.pas").expect("source URI"),
+            text: "decoded projection sentinel".to_string(),
+            version: Some(37),
+            stamp: None,
+            open: false,
+            path: Some(PathBuf::from("/projection-sentinel/source.pas")),
+            path_stamp: Some(pascal_project::ProjectReadStamp {
+                bytes: 53,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                is_dir: false,
+                is_symlink: true,
+            }),
+            content_hash: Some(0xA11C_E001),
+            parsed_text_hash: Some(0xA11C_E002),
+            content_bytes: Some(vec![0x00, 0xFF, 0x53]),
+            candidate_membership: Some(pascal_project::ProjectCandidateMembership {
+                paths: vec![PathBuf::from(
+                    "/projection-sentinel/candidate-membership.pas",
+                )],
+                readable: true,
+            }),
+            candidate_observations: vec![crate::workspace::rename::ResolverCandidateObservation {
+                path: PathBuf::from("/projection-sentinel/candidate-observation.pas"),
+                present: false,
+            }],
+            read_policy: Some(read_policy.clone()),
+            path_entry: Some(path_entry.clone()),
+            include_payload: true,
+            missing_provider_candidate: true,
+            document_link_missing_candidate: false,
+            directory_observation: true,
+            document_link_ancestor: false,
+            missing_provider_scope: Some(missing_provider_scope),
+            auto_import_provider_observation: true,
+            auto_import_scopes: vec![auto_import_scope],
+        }
+    }
+
+    fn source_record_with_path_estimate(
+        target_bytes: usize,
+        open: bool,
+        fill_path_to_capacity: bool,
+    ) -> SourceRecord {
+        let mut record = test_completion_record(
+            Url::parse("file:///compaction-capacity-boundary.pas").expect("boundary URI"),
+        );
+        record.open = open;
+        if !open {
+            record.content_hash = Some(0xB0A_D001);
+        }
+        let fixed_bytes = super::compact_completion_record_bytes(&record);
+        let path_capacity = target_bytes
+            .checked_sub(fixed_bytes)
+            .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<PathBuf>()))
+            .expect("boundary target can contain its fixed record and path headers");
+        let path = if fill_path_to_capacity {
+            let mut text = String::with_capacity(path_capacity);
+            text.extend(std::iter::repeat_n('x', path_capacity));
+            PathBuf::from(text)
+        } else {
+            let mut path = PathBuf::with_capacity(path_capacity);
+            path.push("witness");
+            path
+        };
+        record.path = Some(path);
+        assert_eq!(
+            super::compact_completion_record_bytes(&record),
+            target_bytes,
+            "boundary fixture must be sized by the actual retained-capacity estimate"
+        );
+        record
+    }
+
+    fn missing_closed_compaction_record() -> SourceRecord {
+        let mut record = test_completion_record(
+            Url::parse("file:///missing-bounded-observation.pas").expect("missing URI"),
+        );
+        record.open = false;
+        record
+    }
+
+    #[test]
+    fn both_compaction_wrappers_preserve_all_twenty_two_source_record_fields() {
+        let source = marked_compaction_record();
+        let (completion, diagnostic, _) = compact_with_both_wrappers(&source);
+
+        assert_compaction_witnesses(&completion, &source);
+        assert_compaction_witnesses(&diagnostic, &source);
+    }
+
+    #[test]
+    fn both_compaction_wrappers_preserve_hash_fallbacks_and_closed_observations() {
+        let mut open =
+            test_completion_record(Url::parse("file:///open-overlay-hash.pas").expect("open URI"));
+        open.text = "unit Café; interface end.".to_string();
+        assert_compaction_hashes(
+            &open,
+            Some(crate::workspace::content_hash_bytes(open.text.as_bytes())),
+            Some(crate::workspace::rename::text_content_hash(&open.text)),
+        );
+
+        let empty_open = test_completion_record(
+            Url::parse("file:///empty-open-overlay-hash.pas").expect("empty open URI"),
+        );
+        assert_compaction_hashes(
+            &empty_open,
+            Some(crate::workspace::content_hash_bytes(b"")),
+            None,
+        );
+
+        let mut raw_payload = test_completion_record(
+            Url::parse("file:///closed-raw-payload-hash.pas").expect("raw payload URI"),
+        );
+        raw_payload.open = false;
+        raw_payload.text = "decoded text is not the raw payload".to_string();
+        raw_payload.content_bytes = Some(vec![0x00, 0xFF, 0x53, 0x10]);
+        let raw_hash = crate::workspace::content_hash_bytes(&[0x00, 0xFF, 0x53, 0x10]);
+        assert_ne!(
+            raw_hash,
+            crate::workspace::content_hash_bytes(raw_payload.text.as_bytes())
+        );
+        assert_compaction_hashes(
+            &raw_payload,
+            Some(raw_hash),
+            Some(crate::workspace::rename::text_content_hash(
+                &raw_payload.text,
+            )),
+        );
+
+        let mut closed_text = test_completion_record(
+            Url::parse("file:///closed-text-fallback-hash.pas").expect("text fallback URI"),
+        );
+        closed_text.open = false;
+        closed_text.text = "closed decoded text fallback".to_string();
+        assert_compaction_hashes(
+            &closed_text,
+            Some(crate::workspace::content_hash_bytes(
+                closed_text.text.as_bytes(),
+            )),
+            Some(crate::workspace::rename::text_content_hash(
+                &closed_text.text,
+            )),
+        );
+
+        let mut supplied = test_completion_record(
+            Url::parse("file:///supplied-hashes.pas").expect("supplied hash URI"),
+        );
+        supplied.open = false;
+        supplied.text = "text differs from both supplied hashes".to_string();
+        supplied.content_bytes = Some(vec![0x99, 0x88, 0x77]);
+        supplied.content_hash = Some(0xDEAD_BEEF_1234_5678);
+        supplied.parsed_text_hash = Some(0x0123_4567_89AB_CDEF);
+        assert_compaction_hashes(&supplied, supplied.content_hash, supplied.parsed_text_hash);
+
+        let mut path_only = test_completion_record(
+            Url::parse("file:///closed-path-only-observation.pas").expect("path-only URI"),
+        );
+        path_only.open = false;
+        path_only.path = Some(PathBuf::from("/sentinel/path-only-closed.pas"));
+        path_only.path_stamp = Some(pascal_project::ProjectReadStamp {
+            bytes: 71,
+            modified: None,
+            is_dir: false,
+            is_symlink: false,
+        });
+        assert_compaction_hashes(&path_only, None, None);
+        let (completion, diagnostic, _) = compact_with_both_wrappers(&path_only);
+        for compacted in [&completion, &diagnostic] {
+            assert_eq!(compacted.path, path_only.path);
+            assert_eq!(compacted.path_stamp, path_only.path_stamp);
+        }
+    }
+
+    #[test]
+    fn compaction_wrappers_keep_missing_observation_messages_and_policy_order() {
+        let missing = missing_closed_compaction_record();
+        assert_eq!(
+            super::compact_completion_records(std::slice::from_ref(&missing))
+                .expect_err("completion rejects an unobserved closed record"),
+            "completion dependency file:///missing-bounded-observation.pas has no bounded content observation"
+        );
+        assert_eq!(
+            super::compact_diagnostic_records(std::slice::from_ref(&missing))
+                .expect_err("diagnostics reject an unobserved closed record"),
+            "diagnostic dependency file:///missing-bounded-observation.pas has no bounded content observation"
+        );
+
+        let over_count = vec![missing.clone(); super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS + 1];
+        assert_eq!(
+            super::compact_completion_records(&over_count)
+                .expect_err("completion projects before checking its count bound"),
+            "completion dependency file:///missing-bounded-observation.pas has no bounded content observation"
+        );
+        assert_eq!(
+            super::compact_diagnostic_records(&over_count)
+                .expect_err("diagnostic count is checked before projecting records"),
+            "diagnostic validation evidence exceeds the 32768-record limit"
+        );
+    }
+
+    #[test]
+    fn compaction_record_and_byte_boundaries_use_exact_capacity_estimates() {
+        let small = test_completion_record(
+            Url::parse("file:///compaction-count-boundary.pas").expect("count URI"),
+        );
+        let completion_at_count = vec![small.clone(); super::MAX_COMPLETION_RESOLUTION_RECORDS];
+        let (completion, completion_bytes) =
+            super::compact_completion_records(&completion_at_count)
+                .expect("exact completion count bound is accepted");
+        assert_eq!(completion.len(), super::MAX_COMPLETION_RESOLUTION_RECORDS);
+        assert_eq!(
+            completion_bytes,
+            completion.iter().fold(0usize, |bytes, record| {
+                bytes.saturating_add(super::compact_completion_record_bytes(record))
+            })
+        );
+        let too_many_completion = vec![small.clone(); super::MAX_COMPLETION_RESOLUTION_RECORDS + 1];
+        assert_eq!(
+            super::compact_completion_records(&too_many_completion)
+                .expect_err("completion count above the exact boundary is rejected"),
+            "completion dependency observations exceed the bounded limit"
+        );
+
+        let diagnostic_at_count = vec![small.clone(); super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS];
+        let diagnostic = super::compact_diagnostic_records(&diagnostic_at_count)
+            .expect("exact diagnostic count bound is accepted");
+        assert_eq!(diagnostic.len(), super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS);
+        let too_many_diagnostic = vec![small; super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS + 1];
+        assert_eq!(
+            super::compact_diagnostic_records(&too_many_diagnostic)
+                .expect_err("diagnostic count above the exact boundary is rejected"),
+            "diagnostic validation evidence exceeds the 32768-record limit"
+        );
+
+        let completion_at_bytes = source_record_with_path_estimate(
+            super::MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
+            true,
+            true,
+        );
+        let (completion, bytes) =
+            super::compact_completion_records(std::slice::from_ref(&completion_at_bytes))
+                .expect("exact completion byte bound is accepted");
+        assert_eq!(bytes, super::MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES);
+        assert_eq!(
+            super::compact_completion_record_bytes(&completion[0]),
+            super::MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+        );
+        let completion_over_bytes = source_record_with_path_estimate(
+            super::MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES + 1,
+            true,
+            true,
+        );
+        assert_eq!(
+            super::compact_completion_records(std::slice::from_ref(&completion_over_bytes))
+                .expect_err("completion estimate one byte over the limit is rejected"),
+            "completion dependency observations exceed the bounded limit"
+        );
+
+        let diagnostic_at_bytes =
+            source_record_with_path_estimate(super::MAX_DIAGNOSTIC_VALIDATION_BYTES, false, false);
+        assert_eq!(
+            super::compact_completion_record_bytes(&diagnostic_at_bytes),
+            super::MAX_DIAGNOSTIC_VALIDATION_BYTES
+        );
+        let diagnostic =
+            super::compact_diagnostic_records(std::slice::from_ref(&diagnostic_at_bytes))
+                .expect("exact diagnostic preflight byte bound is accepted");
+        assert_eq!(diagnostic.len(), 1);
+        assert_eq!(diagnostic[0].path, diagnostic_at_bytes.path);
+
+        let mut diagnostic_over_bytes = source_record_with_path_estimate(
+            super::MAX_DIAGNOSTIC_VALIDATION_BYTES + 1,
+            false,
+            false,
+        );
+        assert_eq!(
+            super::compact_completion_record_bytes(&diagnostic_over_bytes),
+            super::MAX_DIAGNOSTIC_VALIDATION_BYTES + 1
+        );
+        assert_eq!(
+            super::compact_diagnostic_records(std::slice::from_ref(&diagnostic_over_bytes))
+                .expect_err("diagnostic estimate one byte over the limit is rejected"),
+            "diagnostic validation evidence exceeds the 67108864-byte limit"
+        );
+
+        let oversized_path = diagnostic_over_bytes.path.take().expect("capacity witness");
+        diagnostic_over_bytes.content_hash = None;
+        diagnostic_over_bytes.candidate_membership =
+            Some(pascal_project::ProjectCandidateMembership {
+                paths: vec![oversized_path],
+                readable: true,
+            });
+        diagnostic_over_bytes.path = None;
+        assert!(
+            super::compact_completion_record_bytes(&diagnostic_over_bytes)
+                > super::MAX_DIAGNOSTIC_VALIDATION_BYTES
+        );
+        assert_eq!(
+            super::compact_diagnostic_records(std::slice::from_ref(&diagnostic_over_bytes))
+                .expect_err("diagnostic byte preflight precedes missing-observation checks"),
+            "diagnostic validation evidence exceeds the 67108864-byte limit"
+        );
+        assert_eq!(
+            super::compact_completion_records(std::slice::from_ref(&diagnostic_over_bytes))
+                .expect_err(
+                    "completion projection checks missing observation before its byte bound"
+                ),
+            "completion dependency file:///compaction-capacity-boundary.pas has no bounded content observation"
+        );
+
+        let mut payload_only = test_completion_record(
+            Url::parse("file:///diagnostic-source-payload-capacity.pas")
+                .expect("source payload URI"),
+        );
+        let payload_capacity = super::MAX_DIAGNOSTIC_VALIDATION_BYTES / 2 + 1;
+        payload_only.text = String::with_capacity(payload_capacity);
+        payload_only.content_bytes = Some(Vec::with_capacity(payload_capacity));
+        let source_payload_capacity = payload_only
+            .text
+            .capacity()
+            .saturating_add(payload_only.content_bytes.as_ref().map_or(0, Vec::capacity));
+        assert!(source_payload_capacity > super::MAX_DIAGNOSTIC_VALIDATION_BYTES);
+        let full_estimate = super::compact_completion_record_bytes(&payload_only);
+        assert_eq!(
+            full_estimate.saturating_sub(source_payload_capacity),
+            std::mem::size_of::<SourceRecord>() + payload_only.uri.as_str().len()
+        );
+        let compacted = super::compact_diagnostic_records(std::slice::from_ref(&payload_only))
+            .expect("diagnostic preflight subtracts both source-payload capacities");
+        assert!(compacted[0].text.is_empty());
+        assert!(compacted[0].content_bytes.is_none());
     }
 
     fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {
@@ -18769,118 +19151,682 @@ mod tests {
         assert_eq!(received, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + 3);
     }
 
-    #[test]
-    fn rejected_newer_hover_does_not_cancel_the_queued_one() {
-        let temp = tempfile::tempdir().expect("workspace");
-        let root = temp.path().to_path_buf();
-        let workspace = test_workspace(vec![root.clone()], Default::default());
-        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
-        let hover = |line| AnalysisRequest::Hover {
-            uri: uri.clone(),
+    fn queue_test_hover(
+        jobs: &mut AnalysisJobs,
+        workspace: &Workspace,
+        uri: Url,
+        line: u32,
+        primary_id: AnalysisComputationId,
+        recipient_ids: &[RequestId],
+    ) -> super::ObservationKey {
+        jobs.next_computation_id = jobs.next_computation_id.max(primary_id.0.saturating_add(1));
+        let request = AnalysisRequest::Hover {
+            uri,
             position: Position::new(line, 0),
             format: MarkupKind::PlainText,
         };
-        let mut jobs = AnalysisJobs::new();
-        let older_id = RequestId::from("older-queued-hover".to_string());
-        let older_job = AnalysisComputationId(1);
-        let older_key = super::ObservationKey::for_request(&hover(0), &workspace);
-        jobs.observation_jobs
-            .insert(older_key.clone().expect("hover key"), older_job);
-        jobs.request_to_job.insert(older_id.clone(), older_job);
+        let key = super::ObservationKey::for_request(&request, workspace).expect("hover key");
+        let recipients = recipient_ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                jobs.request_to_job.insert(id.clone(), primary_id);
+                super::ClientRecipient {
+                    id,
+                    work_done_token: None,
+                    partial_result_token: None,
+                }
+            })
+            .collect();
+        jobs.observation_jobs.insert(key.clone(), primary_id);
         jobs.queue.push(
             AnalysisPriority::Interactive,
             super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
-                id: older_job,
-                request: hover(0),
+                id: primary_id,
+                request,
                 features: symbol_client_features(),
-                recipients: vec![super::ClientRecipient {
-                    id: older_id.clone(),
-                    work_done_token: None,
-                    partial_result_token: None,
-                }],
-                key: older_key,
+                recipients,
+                key: Some(key.clone()),
             }),
         );
-        // Fill the rest of the recipient admission budget.
+        key
+    }
+
+    fn begin_queued_test_work_done_progress(
+        jobs: &mut AnalysisJobs,
+        request_id: &RequestId,
+        token: lsp_types::ProgressToken,
+        connection: &RecordingSender,
+    ) {
+        let primary_id = *jobs
+            .request_to_job
+            .get(request_id)
+            .expect("queued test request mapping");
+        let recipient = {
+            let Some(super::QueuedAnalysis::Client(job)) = jobs
+                .queue
+                .find_mut(|queued| matches!(queued, super::QueuedAnalysis::Client(job) if job.id == primary_id))
+            else {
+                panic!("test request is queued");
+            };
+            let recipient = job
+                .recipients
+                .iter_mut()
+                .find(|recipient| &recipient.id == request_id)
+                .expect("test recipient");
+            recipient.work_done_token = Some(token);
+            recipient.clone()
+        };
+        jobs.progress
+            .begin_client(
+                Some(connection),
+                super::AnalysisJobId::Client(primary_id),
+                &recipient,
+                "Hover",
+            )
+            .expect("begin test work-done progress");
+    }
+
+    fn queue_test_diagnostic(jobs: &mut AnalysisJobs, id: AnalysisComputationId, uri: Url) {
+        jobs.next_computation_id = jobs.next_computation_id.max(id.0.saturating_add(1));
+        jobs.diagnostic_jobs.insert(uri.clone(), id);
+        jobs.queue.push(
+            AnalysisPriority::Diagnostics,
+            super::QueuedAnalysis::Diagnostic(super::QueuedDiagnostic { id, uri }),
+        );
+    }
+
+    const TEST_PARTIAL_DELIVERY_SOURCE: &str = "unit Main; interface implementation end.\n";
+
+    /// Writes `Main.pas` and opens it, so a partial delivery can record the
+    /// same open-document observation that production revalidation checks.
+    fn open_test_partial_delivery_source(
+        root: &std::path::Path,
+        workspace: &mut Workspace,
+    ) -> Location {
+        let source = root.join("Main.pas");
+        fs::write(&source, TEST_PARTIAL_DELIVERY_SOURCE).expect("source");
+        let uri = Url::from_file_path(source).expect("source URI");
+        workspace
+            .open_document(uri.clone(), TEST_PARTIAL_DELIVERY_SOURCE.to_string(), 1)
+            .expect("open partial delivery source");
+        Location::new(uri, Range::new(Position::new(0, 0), Position::new(0, 1)))
+    }
+
+    fn add_test_partial_delivery_recipients(
+        jobs: &mut AnalysisJobs,
+        workspace: &Workspace,
+        count: usize,
+        location: Location,
+    ) {
+        let job_id = AnalysisComputationId(0);
+        jobs.next_computation_id = jobs.next_computation_id.max(job_id.0.saturating_add(1));
+        let recipients = (0..count)
+            .map(|index| {
+                let id = RequestId::from(format!("delivering-{index}"));
+                let token = lsp_types::ProgressToken::String(format!("partial-{index}"));
+                jobs.partial_tokens
+                    .insert(token.clone(), (job_id, id.clone()));
+                PartialDeliveryRecipient {
+                    id,
+                    token,
+                    next_item: 0,
+                }
+            })
+            .collect();
+        let payload = PartialResultPayload::References(Arc::new(vec![location.clone()]));
+        let records = Arc::new(vec![SourceRecord {
+            text: TEST_PARTIAL_DELIVERY_SOURCE.to_string(),
+            ..test_completion_record(location.uri.clone())
+        }]);
+        let revalidation_input = Arc::new(workspace.revalidation_input());
+        let retained_bytes = payload
+            .retained_bytes()
+            .expect("test partial payload retained size")
+            .saturating_add(super::source_records_retained_bytes(records.as_slice()))
+            .saturating_add(revalidation_input.retained_bytes());
         jobs.partial_deliveries.push_back(PartialDelivery {
-            job_id: AnalysisComputationId(0),
+            job_id,
             source_generation: workspace.source_generation(),
             configuration_generation: workspace.configuration_generation(),
-            payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            payload,
             retrigger_on_stale: false,
-            recipients: (1..MAX_CLIENT_ANALYSIS_RECIPIENTS)
-                .map(|index| PartialDeliveryRecipient {
-                    id: RequestId::from(format!("delivering-{index}")),
-                    token: lsp_types::ProgressToken::String(format!("partial-{index}")),
-                    next_item: 0,
-                })
-                .collect(),
+            recipients,
             next_recipient: 0,
-            retained_bytes: 1,
+            retained_bytes,
             validation: PartialDeliveryValidation::new(
-                Arc::new(workspace.revalidation_input()),
-                Arc::new(Vec::new()),
+                revalidation_input,
+                records,
                 TestBarrierConfig::disabled(),
             ),
         });
+        assert_test_partial_delivery_is_production_shaped(jobs, workspace);
+    }
+
+    fn assert_test_partial_delivery_is_production_shaped(
+        jobs: &AnalysisJobs,
+        workspace: &Workspace,
+    ) {
+        let delivery = jobs
+            .partial_deliveries
+            .back()
+            .expect("test partial delivery");
+        assert!(
+            matches!(&delivery.payload, PartialResultPayload::References(items) if !items.is_empty()),
+            "partial delivery fixture must contain a nonempty references payload"
+        );
+        assert_eq!(delivery.source_generation, workspace.source_generation());
+        assert_eq!(
+            delivery.configuration_generation,
+            workspace.configuration_generation()
+        );
+        assert_eq!(delivery.next_recipient, 0);
+        for recipient in &delivery.recipients {
+            assert_eq!(recipient.next_item, 0);
+            assert_eq!(
+                jobs.partial_tokens.get(&recipient.token),
+                Some(&(delivery.job_id, recipient.id.clone())),
+                "every delivery token must map to its exact job and recipient"
+            );
+        }
+        let retained_bytes = delivery
+            .payload
+            .retained_bytes()
+            .expect("test partial payload retained size")
+            .saturating_add(super::source_records_retained_bytes(
+                delivery.validation.records.as_slice(),
+            ))
+            .saturating_add(delivery.validation.input.retained_bytes());
+        assert_eq!(
+            delivery.retained_bytes, retained_bytes,
+            "partial delivery retained size must account for payload, records, and revalidation input"
+        );
+        crate::workspace::rename::revalidate_revalidation_input(
+            &delivery.validation.input,
+            delivery.validation.records.as_slice(),
+            &AtomicBool::new(false),
+        )
+        .expect("partial delivery source records must match the captured workspace input");
+    }
+
+    fn assert_replacement_cancellation(connection: &RecordingSender, id: &RequestId) {
+        let messages = connection.messages.lock().expect("recorded messages");
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::Response(response)
+                    if &response.id == id
+                        && response.error.as_ref().is_some_and(|error| {
+                            error.code == -32800 && error.message == super::ANALYSIS_REPLACED_MESSAGE
+                        })
+            )),
+            "request {id:?} should receive the existing replacement cancellation"
+        );
+    }
+
+    #[test]
+    fn rejected_newer_document_version_does_not_cancel_the_queued_one() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        workspace
+            .open_document(
+                uri.clone(),
+                "unit Main; interface implementation end.\n".to_string(),
+                1,
+            )
+            .expect("open version 1");
+        let hover = || AnalysisRequest::Hover {
+            uri: uri.clone(),
+            position: Position::new(0, 0),
+            format: MarkupKind::PlainText,
+        };
+        let mut jobs = AnalysisJobs::new();
+        let older_id = RequestId::from("older-version-hover".to_string());
+        let older_job = AnalysisComputationId(1000);
+        let older_key = queue_test_hover(
+            &mut jobs,
+            &workspace,
+            uri.clone(),
+            0,
+            older_job,
+            std::slice::from_ref(&older_id),
+        );
         let connection = RecordingSender::default();
+        let old_token = lsp_types::ProgressToken::String("rejected-old-work-done".to_string());
+        begin_queued_test_work_done_progress(&mut jobs, &older_id, old_token.clone(), &connection);
+        connection
+            .messages
+            .lock()
+            .expect("recorded messages")
+            .clear();
+        for index in 0..MAX_ANALYSIS_QUEUE - 1 {
+            let diagnostic_uri =
+                Url::from_file_path(root.join(format!("Diag{index}.pas"))).expect("diagnostic URI");
+            queue_test_diagnostic(
+                &mut jobs,
+                AnalysisComputationId(u64::try_from(index + 1).expect("diagnostic id")),
+                diagnostic_uri,
+            );
+        }
+        assert_eq!(jobs.queue.len(), MAX_ANALYSIS_QUEUE);
+        workspace
+            .change_document(
+                uri.clone(),
+                "unit Main; interface implementation end.\n".to_string(),
+                2,
+            )
+            .expect("change to version 2");
+        let new_token = lsp_types::ProgressToken::String("rejected-new-work-done".to_string());
 
         let error = jobs
             .enqueue_client(
-                RequestId::from("newer-rejected-hover".to_string()),
-                hover(1),
+                RequestId::from("newer-version-rejected-hover".to_string()),
+                hover(),
                 &workspace,
                 symbol_client_features(),
-                None,
+                Some(new_token.clone()),
                 Some(&connection),
             )
-            .expect_err("the full admission budget rejects the newer hover");
+            .expect_err("the full client queue rejects the newer version");
 
         assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+        assert_eq!(jobs.request_to_job.get(&older_id), Some(&older_job));
+        assert_eq!(jobs.observation_jobs.get(&older_key), Some(&older_job));
+        assert!(jobs.queue.iter().any(|queued| matches!(
+            queued,
+            super::QueuedAnalysis::Client(job) if job.id == older_job
+        )));
+        assert_eq!(jobs.queue.len(), MAX_ANALYSIS_QUEUE);
         assert!(
             connection
                 .messages
                 .lock()
                 .expect("recorded messages")
                 .is_empty(),
-            "the older hover must not be cancelled for a rejected request"
+            "the older hover must not be cancelled for a rejected newer version"
         );
-        assert_eq!(jobs.request_to_job.get(&older_id), Some(&older_job));
-        assert_eq!(jobs.queue.len(), 1);
+        assert!(matches!(
+            jobs.progress.target(&old_token),
+            Some(super::ProgressTarget::Client {
+                job_id: super::AnalysisJobId::Client(owner),
+                request_id,
+            }) if owner == older_job && request_id == older_id
+        ));
+        assert!(
+            jobs.progress.target(&new_token).is_none(),
+            "a rejected recipient must not begin or own work-done progress"
+        );
+    }
+
+    #[test]
+    fn attached_newer_version_ends_old_progress_before_begin_and_report() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        let first_source = "unit Main; interface implementation end.\n";
+        let second_source = "unit Main; interface const Changed = 1; implementation end.\n";
+        workspace
+            .open_document(uri.clone(), first_source.to_string(), 1)
+            .expect("open version 1");
+
+        let mut jobs = AnalysisJobs::new();
+        let old_id = RequestId::from("attached-old-version".to_string());
+        let old_job = AnalysisComputationId(1000);
+        queue_test_hover(
+            &mut jobs,
+            &workspace,
+            uri.clone(),
+            0,
+            old_job,
+            std::slice::from_ref(&old_id),
+        );
+        let connection = RecordingSender::default();
+        let old_token = lsp_types::ProgressToken::String("attached-old-progress".to_string());
+        begin_queued_test_work_done_progress(&mut jobs, &old_id, old_token.clone(), &connection);
+        connection
+            .messages
+            .lock()
+            .expect("recorded messages")
+            .clear();
+
+        workspace
+            .change_document(uri.clone(), second_source.to_string(), 2)
+            .expect("change to version 2");
+        let attached_id = RequestId::from("attached-new-version".to_string());
+        let attached_request = AnalysisRequest::Hover {
+            uri: uri.clone(),
+            position: Position::new(0, 0),
+            format: MarkupKind::PlainText,
+        };
+        let attached_key =
+            super::ObservationKey::for_request(&attached_request, &workspace).expect("hover key");
+        let attached_job = AnalysisComputationId(2000);
+        let seed_id = RequestId::from("running-new-version-owner".to_string());
+        let (release_worker, worker_release) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = worker_release.recv();
+        });
+        jobs.next_computation_id = attached_job.0.saturating_add(1);
+        jobs.request_to_job.insert(seed_id.clone(), attached_job);
+        jobs.observation_jobs
+            .insert(attached_key.clone(), attached_job);
+        jobs.pending.insert(
+            attached_job,
+            super::PendingAnalysis {
+                cancellation: Arc::new(AtomicBool::new(false)),
+                handle,
+                recipients: vec![super::ClientRecipient {
+                    id: seed_id,
+                    work_done_token: None,
+                    partial_result_token: None,
+                }],
+                key: Some(attached_key),
+                priority: AnalysisPriority::Interactive,
+            },
+        );
+
+        let new_token = lsp_types::ProgressToken::String("attached-new-progress".to_string());
+        jobs.enqueue_client(
+            attached_id.clone(),
+            attached_request,
+            &workspace,
+            symbol_client_features(),
+            Some(new_token.clone()),
+            Some(&connection),
+        )
+        .expect("attach the new recipient to its running computation");
+
+        {
+            let messages = connection.messages.lock().expect("recorded messages");
+            assert_eq!(
+                messages.len(),
+                4,
+                "only cancellation and attached progress are sent"
+            );
+            assert!(matches!(
+                &messages[0],
+                Message::Response(response)
+                    if response.id == old_id
+                        && response.error.as_ref().is_some_and(|error| {
+                            error.code == -32800
+                                && error.message == ANALYSIS_SUPERSEDED_MESSAGE
+                        })
+            ));
+            assert!(matches!(
+                &messages[1],
+                Message::Notification(notification)
+                    if notification.method == "$/progress"
+                        && notification.params["token"] == serde_json::json!("attached-old-progress")
+                        && notification.params["value"]["kind"] == "end"
+                        && notification.params["value"]["message"] == "Superseded"
+            ));
+            assert!(matches!(
+                &messages[2],
+                Message::Notification(notification)
+                    if notification.method == "$/progress"
+                        && notification.params["token"] == serde_json::json!("attached-new-progress")
+                        && notification.params["value"]["kind"] == "begin"
+                        && notification.params["value"]["message"] == "Queued for analysis"
+            ));
+            assert!(matches!(
+                &messages[3],
+                Message::Notification(notification)
+                    if notification.method == "$/progress"
+                        && notification.params["token"] == serde_json::json!("attached-new-progress")
+                        && notification.params["value"]["kind"] == "report"
+                        && notification.params["value"]["message"] == "Analysis started"
+            ));
+        }
+        assert!(jobs.progress.target(&old_token).is_none());
+        assert!(matches!(
+            jobs.progress.target(&new_token),
+            Some(super::ProgressTarget::Client {
+                job_id: super::AnalysisJobId::Client(owner),
+                request_id,
+            }) if owner == attached_job && request_id == attached_id
+        ));
+        assert_eq!(jobs.request_to_job.get(&attached_id), Some(&attached_job));
+        assert!(
+            jobs.pending[&attached_job]
+                .recipients
+                .iter()
+                .any(|recipient| recipient.id == attached_id)
+        );
+
+        release_worker.send(()).expect("release test worker");
+        jobs.pending
+            .remove(&attached_job)
+            .expect("running computation")
+            .handle
+            .join()
+            .expect("join test worker");
+    }
+
+    #[test]
+    fn replacement_at_recipient_limit_cancels_all_coalesced_recipients() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let location = open_test_partial_delivery_source(&root, &mut workspace);
+        let uri = location.uri.clone();
+        let hover = |line| AnalysisRequest::Hover {
+            uri: uri.clone(),
+            position: Position::new(line, 0),
+            format: MarkupKind::PlainText,
+        };
+        let mut jobs = AnalysisJobs::new();
+        let older_ids = [
+            RequestId::from("older-queued-hover-1".to_string()),
+            RequestId::from("older-queued-hover-2".to_string()),
+        ];
+        let older_job = AnalysisComputationId(1);
+        let older_key =
+            queue_test_hover(&mut jobs, &workspace, uri.clone(), 0, older_job, &older_ids);
+        // Fill the rest of the recipient admission budget.
+        add_test_partial_delivery_recipients(
+            &mut jobs,
+            &workspace,
+            MAX_CLIENT_ANALYSIS_RECIPIENTS - older_ids.len(),
+            location,
+        );
+        assert_eq!(
+            jobs.client_recipient_count(),
+            MAX_CLIENT_ANALYSIS_RECIPIENTS
+        );
+        let partial_tokens_before = jobs.partial_tokens.len();
+        let connection = RecordingSender::default();
+
+        jobs.enqueue_client(
+            RequestId::from("replacement-hover".to_string()),
+            hover(1),
+            &workspace,
+            symbol_client_features(),
+            None,
+            Some(&connection),
+        )
+        .expect("replacement frees recipient capacity before admission");
+
+        for older_id in &older_ids {
+            assert!(!jobs.request_to_job.contains_key(older_id));
+            assert_replacement_cancellation(&connection, older_id);
+        }
+        assert!(!jobs.observation_jobs.contains_key(&older_key));
+        assert_eq!(
+            jobs.client_recipient_count(),
+            MAX_CLIENT_ANALYSIS_RECIPIENTS - 1
+        );
+        assert_eq!(jobs.partial_tokens.len(), partial_tokens_before);
+        assert!(
+            jobs.request_to_job
+                .contains_key(&RequestId::from("replacement-hover".to_string()))
+        );
+    }
+
+    #[test]
+    fn replacement_at_client_queue_limit_uses_the_freed_queue_slot() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        let old_id = RequestId::from("old-queued-hover".to_string());
+        let old_job = AnalysisComputationId(1000);
+        let mut jobs = AnalysisJobs::new();
+        // Retain a queued same-kind request and unrelated diagnostic work at
+        // the client queue limit, without filling the recipient bound.
+        let old_key = queue_test_hover(
+            &mut jobs,
+            &workspace,
+            uri.clone(),
+            0,
+            old_job,
+            std::slice::from_ref(&old_id),
+        );
+        for index in 0..MAX_CLIENT_ANALYSIS_QUEUE - 1 {
+            let diagnostic_uri = Url::from_file_path(root.join(format!("Other{index}.pas")))
+                .expect("diagnostic URI");
+            queue_test_diagnostic(
+                &mut jobs,
+                AnalysisComputationId(u64::try_from(index + 1).expect("diagnostic id")),
+                diagnostic_uri,
+            );
+        }
+        assert_eq!(jobs.queue.len(), MAX_CLIENT_ANALYSIS_QUEUE);
+        assert!(jobs.client_recipient_count() < MAX_CLIENT_ANALYSIS_RECIPIENTS);
+        let connection = RecordingSender::default();
+
+        jobs.enqueue_client(
+            RequestId::from("replacement-at-queue-limit".to_string()),
+            AnalysisRequest::Hover {
+                uri,
+                position: Position::new(1, 0),
+                format: MarkupKind::PlainText,
+            },
+            &workspace,
+            symbol_client_features(),
+            None,
+            Some(&connection),
+        )
+        .expect("replacement frees a client queue slot");
+
+        assert!(!jobs.request_to_job.contains_key(&old_id));
+        assert!(!jobs.observation_jobs.contains_key(&old_key));
+        assert_replacement_cancellation(&connection, &old_id);
+        assert!(
+            jobs.request_to_job
+                .contains_key(&RequestId::from("replacement-at-queue-limit".to_string()))
+        );
+        assert!(jobs.queue.len() <= MAX_CLIENT_ANALYSIS_QUEUE);
+    }
+
+    #[test]
+    fn full_unrelated_client_queue_still_rejects_a_new_hover() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let workspace = test_workspace(vec![root.clone()], Default::default());
+        let mut jobs = AnalysisJobs::new();
+        for index in 0..MAX_CLIENT_ANALYSIS_QUEUE {
+            let diagnostic_uri = Url::from_file_path(root.join(format!("Other{index}.pas")))
+                .expect("diagnostic URI");
+            queue_test_diagnostic(
+                &mut jobs,
+                AnalysisComputationId(u64::try_from(index + 1).expect("diagnostic id")),
+                diagnostic_uri,
+            );
+        }
+        let request_id = RequestId::from("unrelated-full-queue-hover".to_string());
+        let error = jobs
+            .enqueue_client(
+                request_id.clone(),
+                AnalysisRequest::Hover {
+                    uri: Url::from_file_path(root.join("Main.pas")).expect("source URI"),
+                    position: Position::new(0, 0),
+                    format: MarkupKind::PlainText,
+                },
+                &workspace,
+                symbol_client_features(),
+                None,
+                None,
+            )
+            .expect_err("an unrelated full queue has no replacement credit");
+
+        assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+        assert_eq!(jobs.queue.len(), MAX_CLIENT_ANALYSIS_QUEUE);
+        assert!(!jobs.request_to_job.contains_key(&request_id));
+        assert_eq!(jobs.diagnostic_jobs.len(), MAX_CLIENT_ANALYSIS_QUEUE);
+    }
+
+    #[test]
+    fn progress_token_collision_does_not_cancel_a_queued_replacement_candidate() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let location = open_test_partial_delivery_source(&root, &mut workspace);
+        let uri = location.uri.clone();
+        let old_id = RequestId::from("old-hover-before-token-collision".to_string());
+        let old_job = AnalysisComputationId(1000);
+        let mut jobs = AnalysisJobs::new();
+        let old_key = queue_test_hover(
+            &mut jobs,
+            &workspace,
+            uri.clone(),
+            0,
+            old_job,
+            std::slice::from_ref(&old_id),
+        );
+        add_test_partial_delivery_recipients(&mut jobs, &workspace, 1, location);
+        let busy_token = lsp_types::ProgressToken::String("partial-0".to_string());
+        let connection = RecordingSender::default();
+
+        let error = jobs
+            .enqueue_client(
+                RequestId::from("colliding-replacement-hover".to_string()),
+                AnalysisRequest::Hover {
+                    uri,
+                    position: Position::new(1, 0),
+                    format: MarkupKind::PlainText,
+                },
+                &workspace,
+                symbol_client_features(),
+                Some(busy_token),
+                Some(&connection),
+            )
+            .expect_err("active partial-result token cannot be reused as workDoneToken");
+
+        assert_eq!(
+            error,
+            "progress token is already in use by another operation"
+        );
+        assert_eq!(jobs.request_to_job.get(&old_id), Some(&old_job));
+        assert_eq!(jobs.observation_jobs.get(&old_key), Some(&old_job));
+        assert!(jobs.queue.iter().any(|queued| matches!(
+            queued,
+            super::QueuedAnalysis::Client(job) if job.id == old_job
+        )));
+        assert!(
+            connection
+                .messages
+                .lock()
+                .expect("recorded messages")
+                .is_empty()
+        );
     }
 
     #[test]
     fn delivering_recipients_consume_the_global_admission_bound() {
         let temp = tempfile::tempdir().expect("workspace");
         let root = temp.path().to_path_buf();
-        let source = root.join("Main.pas");
-        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
-        let workspace = test_workspace(vec![root], Default::default());
-        let records = Arc::new(Vec::new());
-        let validation = PartialDeliveryValidation::new(
-            Arc::new(workspace.revalidation_input()),
-            Arc::clone(&records),
-            TestBarrierConfig::disabled(),
-        );
-        let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
-            .map(|index| PartialDeliveryRecipient {
-                id: RequestId::from(format!("delivering-{index}")),
-                token: lsp_types::ProgressToken::String(format!("partial-{index}")),
-                next_item: 0,
-            })
-            .collect();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let location = open_test_partial_delivery_source(&root, &mut workspace);
         let mut jobs = AnalysisJobs::new();
-        jobs.partial_deliveries.push_back(PartialDelivery {
-            job_id: AnalysisComputationId(0),
-            source_generation: workspace.source_generation(),
-            configuration_generation: workspace.configuration_generation(),
-            payload: PartialResultPayload::References(Arc::new(Vec::new())),
-            retrigger_on_stale: false,
-            recipients,
-            next_recipient: 0,
-            retained_bytes: 1,
-            validation,
-        });
+        add_test_partial_delivery_recipients(
+            &mut jobs,
+            &workspace,
+            MAX_CLIENT_ANALYSIS_RECIPIENTS,
+            location,
+        );
         assert_eq!(
             jobs.client_recipient_count(),
             MAX_CLIENT_ANALYSIS_RECIPIENTS
@@ -19347,6 +20293,327 @@ mod tests {
         };
         assert_eq!(response.id, id);
         assert_eq!(response.error.expect("stale result error").code, -32803);
+    }
+
+    fn padded_test_file_uri(label: &str, target_len: usize) -> String {
+        let mut uri = format!("file:///bounded-rename/{label}");
+        while uri.len() < target_len {
+            uri.push('/');
+            let component_len = (target_len - uri.len()).min(160);
+            uri.extend(std::iter::repeat_n('x', component_len));
+        }
+        assert_eq!(uri.len(), target_len);
+        uri
+    }
+
+    fn oversized_test_rename_notification() -> Notification {
+        let files = (0..5)
+            .map(|index| {
+                serde_json::json!({
+                    "oldUri": padded_test_file_uri(&format!("old-{index}"), 3_300),
+                    "newUri": padded_test_file_uri(&format!("new-{index}"), 3_300),
+                })
+            })
+            .collect::<Vec<_>>();
+        let uri_bytes = files
+            .iter()
+            .map(|file| {
+                file["oldUri"].as_str().unwrap().len() + file["newUri"].as_str().unwrap().len()
+            })
+            .sum::<usize>();
+        assert_eq!(files.len(), 5, "remain below the existing 64-entry cap");
+        assert!(uri_bytes > 32 * 1024, "exercise aggregate URI overflow");
+        assert!(files.iter().all(|file| {
+            file["oldUri"].as_str().unwrap().len() <= 4_096
+                && file["newUri"].as_str().unwrap().len() <= 4_096
+        }));
+        Notification::new(
+            "workspace/didRenameFiles".to_string(),
+            serde_json::json!({"files": files}),
+        )
+    }
+
+    fn worker_revision_for_test_notification(notification: Notification) -> WorkspaceRevision {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let mut worker =
+            spawn_workspace_file_notification(&mut workspace, notification, false, false);
+        let revision = worker.revision;
+        let (workspace, result, _) = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test file-notification worker completes");
+        assert!(result.is_ok(), "notification worker: {result:?}");
+        assert!(
+            worker
+                .join
+                .take()
+                .expect("worker thread handle")
+                .join()
+                .is_ok()
+        );
+        drop(workspace);
+        revision
+    }
+
+    fn rename_notification_for_test(files: serde_json::Value) -> Notification {
+        Notification::new(
+            "workspace/didRenameFiles".to_string(),
+            serde_json::json!({"files": files}),
+        )
+    }
+
+    #[test]
+    fn bounded_safe_notifications_keep_precommit_delivery_eligible() {
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(
+                serde_json::json!([])
+            ))
+            .fenced
+        );
+
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(
+                serde_json::json!([{
+                    "oldUri": "file:///tmp/Unchanged.pas",
+                    "newUri": "file:///tmp/Unchanged.pas"
+                }])
+            ))
+            .fenced
+        );
+
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(
+                serde_json::json!([{
+                    "oldUri": "file:///tmp/Old.pas",
+                    "newUri": "file:///tmp/New.pas"
+                }])
+            ))
+            .fenced
+        );
+
+        let at_entry_limit = (0..super::MAX_FILE_OPERATION_BATCH_ENTRIES)
+            .map(|index| {
+                serde_json::json!({
+                    "oldUri": padded_test_file_uri(&format!("at-count-old-{index}"), 240),
+                    "newUri": padded_test_file_uri(&format!("at-count-new-{index}"), 240),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(at_entry_limit.len() * 2 * 240 <= super::MAX_FILE_OPERATION_BATCH_URI_BYTES);
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(
+                serde_json::json!(at_entry_limit)
+            ))
+            .fenced
+        );
+
+        let endpoint_at_limit = serde_json::json!([{
+            "oldUri": padded_test_file_uri("endpoint-at-limit", super::MAX_OPEN_DOCUMENT_URI_BYTES),
+            "newUri": "file:///tmp/Short.pas"
+        }]);
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(endpoint_at_limit))
+                .fenced
+        );
+
+        let near_cap = (0..8)
+            .map(|index| {
+                serde_json::json!({
+                    "oldUri": padded_test_file_uri(&format!("safe-old-{index}"), 2_048),
+                    "newUri": padded_test_file_uri(&format!("safe-new-{index}"), 2_048),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            near_cap.len() * 2 * 2_048,
+            super::MAX_FILE_OPERATION_BATCH_URI_BYTES
+        );
+        assert!(
+            !worker_revision_for_test_notification(rename_notification_for_test(
+                serde_json::json!(near_cap)
+            ))
+            .fenced
+        );
+
+        let unrelated_watcher = Notification::new(
+            "workspace/didChangeWatchedFiles".to_string(),
+            serde_json::json!({"changes": [{"uri": "file:///tmp/Changed.pas", "type": 1}]}),
+        );
+        assert!(!worker_revision_for_test_notification(unrelated_watcher).fenced);
+    }
+
+    #[test]
+    fn unsafe_rename_shapes_and_existing_limits_fence_only_the_worker_revision() {
+        let over_bytes = (0..8)
+            .map(|index| {
+                let endpoint_len = if index == 7 { 2_049 } else { 2_048 };
+                serde_json::json!({
+                    "oldUri": padded_test_file_uri(&format!("over-bytes-old-{index}"), endpoint_len),
+                    "newUri": padded_test_file_uri(&format!("over-bytes-new-{index}"), 2_048),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            over_bytes
+                .iter()
+                .map(|pair| pair["oldUri"].as_str().unwrap().len()
+                    + pair["newUri"].as_str().unwrap().len())
+                .sum::<usize>(),
+            super::MAX_FILE_OPERATION_BATCH_URI_BYTES + 1
+        );
+
+        let over_count = (0..super::MAX_FILE_OPERATION_BATCH_ENTRIES + 1)
+            .map(|index| {
+                serde_json::json!({
+                    "oldUri": padded_test_file_uri(&format!("over-count-old-{index}"), 240),
+                    "newUri": padded_test_file_uri(&format!("over-count-new-{index}"), 240),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(over_count.len() * 2 * 240 <= super::MAX_FILE_OPERATION_BATCH_URI_BYTES);
+
+        let over_endpoint = serde_json::json!([{
+            "oldUri": padded_test_file_uri("unretainable", super::MAX_OPEN_DOCUMENT_URI_BYTES + 1),
+            "newUri": "file:///tmp/Short.pas"
+        }]);
+
+        for (label, files) in [
+            ("aggregate URI bytes", serde_json::json!(over_bytes)),
+            ("entry count", serde_json::json!(over_count)),
+            ("unretainable endpoint", over_endpoint),
+            (
+                "missing endpoint",
+                serde_json::json!([{"oldUri": "file:///tmp/Old.pas"}]),
+            ),
+            (
+                "wrong endpoint type",
+                serde_json::json!([{"oldUri": "file:///tmp/Old.pas", "newUri": 7}]),
+            ),
+            (
+                "non-file endpoint",
+                serde_json::json!([{
+                    "oldUri": "not-a-file-uri", "newUri": "file:///tmp/New.pas"
+                }]),
+            ),
+            (
+                "malformed percent escape",
+                serde_json::json!([{
+                    "oldUri": "file:///tmp/Bad%GG.pas", "newUri": "file:///tmp/New.pas"
+                }]),
+            ),
+        ] {
+            assert!(
+                worker_revision_for_test_notification(rename_notification_for_test(files)).fenced,
+                "{label} must fence only this worker revision"
+            );
+        }
+
+        let malformed_shape = Notification::new(
+            "workspace/didRenameFiles".to_string(),
+            serde_json::json!({"files": {"not": "an array"}}),
+        );
+        assert!(worker_revision_for_test_notification(malformed_shape).fenced);
+    }
+
+    #[test]
+    fn unsafe_rename_worker_revision_holds_a_completed_valid_navigation_result() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(&root).expect("fixture directory");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+        fs::write(&provider, provider_source).expect("provider source");
+        fs::write(&consumer, consumer_source).expect("consumer source");
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let mut jobs = AnalysisJobs::new();
+        let request_id = RequestId::from("valid-navigation-before-unsafe-rename".to_string());
+        jobs.start(
+            request_id.clone(),
+            AnalysisRequest::Navigation {
+                uri: consumer_uri,
+                position: Position::new(3, 24),
+                target: NavigationTarget::Definition,
+            },
+            &workspace,
+            symbol_client_features(),
+        )
+        .expect("navigation worker starts");
+
+        let primary_id = *jobs
+            .request_to_job
+            .get(&request_id)
+            .expect("live client-to-worker mapping");
+        let pending = jobs.pending.get(&primary_id).expect("active worker slot");
+        assert_eq!(pending.recipients.len(), 1);
+        assert_eq!(pending.recipients[0].id, request_id);
+        let result = jobs
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("completed navigation result reaches its result slot");
+        assert_eq!(result.id, AnalysisJobId::Client(primary_id));
+        assert!(
+            !result.records.is_empty(),
+            "navigation carries freshness evidence"
+        );
+        match &result.value {
+            AnalysisResultValue::Navigation(navigation) => {
+                let locations = navigation
+                    .value
+                    .as_ref()
+                    .expect("navigation computation succeeds");
+                assert!(
+                    locations
+                        .iter()
+                        .any(|location| location.uri == provider_uri),
+                    "completed result resolves to the old provider: {locations:?}"
+                );
+            }
+            _ => panic!("expected a navigation result"),
+        }
+
+        let prior_revision = WorkspaceRevision::of(&workspace);
+        assert!(!prior_revision.fenced);
+        assert!(jobs.is_deliverable_during_reconciliation(primary_id, &result, prior_revision,));
+
+        let mut worker = spawn_workspace_file_notification(
+            &mut workspace,
+            oversized_test_rename_notification(),
+            false,
+            false,
+        );
+        let worker_revision = worker.revision;
+        assert!(
+            !jobs.is_deliverable_during_reconciliation(primary_id, &result, worker_revision),
+            "matching completed results must be held for the unsafe rename revision"
+        );
+        assert!(
+            worker_revision.fenced,
+            "unsafe rename preflight fences only this revision"
+        );
+
+        let (_, worker_result, _) = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test notification worker completes");
+        assert!(
+            worker_result.is_ok(),
+            "worker reconciliation: {worker_result:?}"
+        );
+        assert!(
+            worker
+                .join
+                .take()
+                .expect("worker thread handle")
+                .join()
+                .is_ok()
+        );
     }
 
     #[test]

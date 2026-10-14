@@ -12596,9 +12596,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn configuration_revalidation_readers_do_not_block_on_fifo_replacement() {
+        const READ_ROUNDS: usize = 8_192;
+        const MIDDLE_READ_ROUNDS: usize = READ_ROUNDS - 2;
         let target = std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_TARGET");
         if let Some(target) = target {
             let target = std::path::PathBuf::from(target);
+            let ready = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_READY")
+                    .expect("FIFO reader child ready marker"),
+            );
+            let start = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_START")
+                    .expect("FIFO reader child start marker"),
+            );
+            let first_read_round_complete = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_FIRST_READ_ROUND_COMPLETE")
+                    .expect("FIFO first read-round marker"),
+            );
+            let continue_reads = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_CONTINUE_READS")
+                    .expect("FIFO reader continue marker"),
+            );
+            let pre_final_read_round = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_PRE_FINAL_READ_ROUND")
+                    .expect("FIFO pre-final-read marker"),
+            );
+            let allow_final_read = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_ALLOW_FINAL_READ")
+                    .expect("FIFO final-read gate marker"),
+            );
+            let reads_finished = std::path::PathBuf::from(
+                std::env::var_os("LINT4D_EXACT_CONFIG_FIFO_READS_FINISHED")
+                    .expect("FIFO reader read-finished marker"),
+            );
             let policy_root = target.parent().expect("FIFO target parent").to_path_buf();
             let read_policy = ReadPolicy::new(
                 std::slice::from_ref(&policy_root),
@@ -12611,14 +12641,32 @@ mod tests {
                 provenance: ProjectPathProvenance::Configured,
             };
             let cancel = AtomicBool::new(false);
-            // Bounded by time, not iterations: a reader that blocks on the FIFO
-            // never returns, so only a real block outlasts the parent's deadline.
-            let until = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < until {
+            let read_round = || {
                 let _ = read_exact_file_bytes(&target, &read_policy, &path_entry, &cancel);
                 let _ = file_content_hash(&target, &read_policy, &path_entry, &cancel);
                 let _ = super::read_scan_source(&target, &read_policy, &path_entry, &cancel);
+            };
+            fs::write(&ready, b"ready").expect("signal FIFO reader child readiness");
+            while !start.exists() {
+                thread::sleep(Duration::from_millis(5));
             }
+            read_round();
+            fs::write(&first_read_round_complete, b"complete")
+                .expect("signal first complete read round");
+            while !continue_reads.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            for _ in 0..MIDDLE_READ_ROUNDS {
+                read_round();
+            }
+            fs::write(&pre_final_read_round, b"ready")
+                .expect("signal before final actual read round");
+            while !allow_final_read.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            read_round();
+            fs::write(&reads_finished, b"finished")
+                .expect("signal final actual read round completion");
             return;
         }
 
@@ -12626,6 +12674,13 @@ mod tests {
         let target = temp.path().join(".lint4d.toml");
         let held = temp.path().join("held-config");
         let fifo = temp.path().join("config-fifo");
+        let ready = temp.path().join("reader-ready");
+        let start = temp.path().join("reader-start");
+        let first_read_round_complete = temp.path().join("first-read-round-complete");
+        let continue_reads = temp.path().join("continue-reads");
+        let pre_final_read_round = temp.path().join("pre-final-read-round");
+        let allow_final_read = temp.path().join("allow-final-read");
+        let reads_finished = temp.path().join("reader-reads-finished");
         fs::write(&target, b"[rules]\n").expect("initial configuration");
         let status = Command::new("mkfifo")
             .arg(&fifo)
@@ -12639,38 +12694,217 @@ mod tests {
                 "--nocapture",
             ])
             .env("LINT4D_EXACT_CONFIG_FIFO_TARGET", &target)
+            .env("LINT4D_EXACT_CONFIG_FIFO_READY", &ready)
+            .env("LINT4D_EXACT_CONFIG_FIFO_START", &start)
+            .env(
+                "LINT4D_EXACT_CONFIG_FIFO_FIRST_READ_ROUND_COMPLETE",
+                &first_read_round_complete,
+            )
+            .env("LINT4D_EXACT_CONFIG_FIFO_CONTINUE_READS", &continue_reads)
+            .env(
+                "LINT4D_EXACT_CONFIG_FIFO_PRE_FINAL_READ_ROUND",
+                &pre_final_read_round,
+            )
+            .env("LINT4D_EXACT_CONFIG_FIFO_ALLOW_FINAL_READ", &allow_final_read)
+            .env("LINT4D_EXACT_CONFIG_FIFO_READS_FINISHED", &reads_finished)
             .spawn()
             .expect("spawn FIFO reader child");
+        const WATCHDOG: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + WATCHDOG;
+        while !ready.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("FIFO reader child did not signal readiness");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let replacer_stop = stop.clone();
-        let replacer = std::thread::spawn(move || {
+        let replacements = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replacer_replacements = replacements.clone();
+        let replacer_first_read_round_complete = first_read_round_complete.clone();
+        let replacer_reads_finished = reads_finished.clone();
+        let mut replacer = Some(std::thread::spawn(move || {
+            let mut initial_cycle_completed = false;
             while !replacer_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = fs::rename(&target, &held);
-                let _ = fs::rename(&fifo, &target);
-                let _ = fs::rename(&target, &fifo);
-                let _ = fs::rename(&held, &target);
+                if initial_cycle_completed && !replacer_first_read_round_complete.exists() {
+                    thread::yield_now();
+                    continue;
+                }
+                if replacer_reads_finished.exists() {
+                    break;
+                }
+                let moved_target = fs::rename(&target, &held).is_ok();
+                let moved_fifo_in = fs::rename(&fifo, &target).is_ok();
+                let moved_fifo_out = fs::rename(&target, &fifo).is_ok();
+                let restored_target = fs::rename(&held, &target).is_ok();
+                if moved_target && moved_fifo_in && moved_fifo_out && restored_target {
+                    replacer_replacements.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    initial_cycle_completed = true;
+                }
             }
-        });
+        }));
+        let abort_test = |child: &mut std::process::Child,
+                          replacer: &mut Option<std::thread::JoinHandle<()>>,
+                          message: &str|
+         -> ! {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(replacer) = replacer.take() {
+                let _ = replacer.join();
+            }
+            panic!("{message}");
+        };
 
-        // Generous: the child reads for 2 s, and process startup or a loaded
-        // machine must not be mistaken for a blocked reader.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        while replacements.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if Instant::now() >= deadline {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO replacer did not complete its initial cycle",
+                );
+            }
+            if child
+                .try_wait()
+                .expect("poll FIFO reader child during initial replacement")
+                .is_some()
+            {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child exited before the initial replacement cycle",
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Err(error) = fs::write(&start, b"start") {
+            abort_test(
+                &mut child,
+                &mut replacer,
+                &format!("start bounded FIFO reader run: {error}"),
+            );
+        }
+
+        while !first_read_round_complete.exists() {
+            if Instant::now() >= deadline {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child did not complete its first read round",
+                );
+            }
+            if child
+                .try_wait()
+                .expect("poll FIFO reader child during first read round")
+                .is_some()
+            {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child exited before completing its first read round",
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let replacements_after_first_read_round =
+            replacements.load(std::sync::atomic::Ordering::Relaxed);
+        if let Err(error) = fs::write(&continue_reads, b"continue") {
+            abort_test(
+                &mut child,
+                &mut replacer,
+                &format!("start remaining bounded read rounds: {error}"),
+            );
+        }
+
+        while !pre_final_read_round.exists() {
+            if Instant::now() >= deadline {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child did not complete its middle read rounds",
+                );
+            }
+            if child
+                .try_wait()
+                .expect("poll FIFO reader child during bounded read rounds")
+                .is_some()
+            {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child exited before the pre-final-read handshake",
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let replacement_cycles_before_final_read = loop {
+            let completed_cycles = replacements.load(std::sync::atomic::Ordering::Relaxed);
+            if completed_cycles > replacements_after_first_read_round {
+                break completed_cycles;
+            }
+            if Instant::now() >= deadline {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO replacement made no completed cycle between the first and final read rounds",
+                );
+            }
+            if child
+                .try_wait()
+                .expect("poll FIFO reader child before finish handshake")
+                .is_some()
+            {
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "FIFO reader child exited before post-snapshot replacement was observed",
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        if reads_finished.exists() {
+            abort_test(
+                &mut child,
+                &mut replacer,
+                "child must remain gated before the final actual read round",
+            );
+        }
+        if let Err(error) = fs::write(&allow_final_read, b"read") {
+            abort_test(
+                &mut child,
+                &mut replacer,
+                &format!("release child for final actual read round: {error}"),
+            );
+        }
+
         let status = loop {
             if let Some(status) = child.try_wait().expect("poll FIFO reader child") {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                replacer.join().expect("join FIFO replacer");
-                panic!("configuration revalidation reader blocked on a replaced FIFO");
+                abort_test(
+                    &mut child,
+                    &mut replacer,
+                    "configuration revalidation reader blocked during FIFO replacement",
+                );
             }
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         };
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        replacer.join().expect("join FIFO replacer");
+        replacer
+            .take()
+            .expect("FIFO replacer thread")
+            .join()
+            .expect("join FIFO replacer");
         assert!(status.success(), "FIFO reader child exited with {status}");
+        let finish_evidence = fs::read(&reads_finished).expect("read finished-round evidence");
+        assert_eq!(finish_evidence.as_slice(), b"finished");
+        assert!(
+            replacement_cycles_before_final_read > replacements_after_first_read_round,
+            "a full replacement cycle must complete after the first read round and before the final read round"
+        );
     }
 
     #[test]

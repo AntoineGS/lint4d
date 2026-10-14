@@ -2014,15 +2014,14 @@ impl NavigationIndex {
                 if !options.include_declaration && (is_binding_member || is_unit_declaration) {
                     continue;
                 }
-                let is_direct_declaration =
-                    document.symbols.iter().any(|symbol| symbol.span == span);
+                let is_direct_declaration = document.direct_symbol_indices.contains_key(&span);
                 let member_expression = member_expression_at(identifier);
                 let qualified_type_path = qualified_type_path_at(identifier, &document.source);
                 let use_name = use_name_at(identifier, &document.source);
                 if binding_has_class_owner
                     && member_expression.is_none()
                     && qualified_type_path.is_none()
-                    && !document.symbols.iter().any(|symbol| symbol.span == span)
+                    && !is_direct_declaration
                     && self.has_foreign_class_owner(binding, uri, document, span.start)
                 {
                     if !options.strict_resolution && !is_binding_member {
@@ -4220,4 +4219,141 @@ fn contains_identifier(source: &str, span: Span, key: &str) -> bool {
         }
     }
     start.is_some_and(|token_start| canonical_name(&block[token_start..]) == key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Span, collect_nodes_matching};
+    use super::NavigationIndex;
+    use lsp_types::Url;
+
+    #[test]
+    fn parsed_direct_symbol_index_matches_linear_span_membership() {
+        let source = "unit DirectSymbolIndex;\ninterface\ntype\n  TBox = class\n  public\n    Value: Integer;\n    procedure Run;\n  end;\nimplementation\nprocedure TBox.Run;\nvar\n  Local: Integer;\nbegin\n  Local := Value;\n  WriteLn(Local);\nend;\nend.\n";
+        let uri = Url::parse("file:///DirectSymbolIndex.pas").expect("valid file URL");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("Pascal unit parses");
+        let document = index.documents.get(&uri).expect("unit is indexed");
+
+        let identifiers = collect_nodes_matching(document.tree.root_node(), "identifier");
+        assert!(
+            !identifiers.is_empty(),
+            "fixture contains parsed identifiers"
+        );
+        let mut has_non_symbol_identifier = false;
+        for identifier in identifiers {
+            let span = Span::from_node(identifier);
+            let linear_membership = document.symbols.iter().any(|symbol| symbol.span == span);
+            assert_eq!(
+                document.direct_symbol_indices.contains_key(&span),
+                linear_membership,
+                "indexed and linear declaration membership differ at {span:?}"
+            );
+            has_non_symbol_identifier |= !linear_membership;
+        }
+        assert!(
+            has_non_symbol_identifier,
+            "fixture has references that are not direct declarations"
+        );
+
+        let declaration_start = source
+            .find("Value: Integer")
+            .expect("field declaration is present");
+        let declaration_span = Span {
+            start: declaration_start,
+            end: declaration_start + "Value".len(),
+        };
+        assert!(
+            document
+                .direct_symbol_indices
+                .contains_key(&declaration_span)
+        );
+        assert!(
+            document
+                .symbols
+                .iter()
+                .any(|symbol| symbol.span == declaration_span)
+        );
+
+        let reference_start = source
+            .find("Local := Value")
+            .expect("field reference is present")
+            + "Local := ".len();
+        let reference_span = Span {
+            start: reference_start,
+            end: reference_start + "Value".len(),
+        };
+        assert!(!document.direct_symbol_indices.contains_key(&reference_span));
+        assert!(
+            !document
+                .symbols
+                .iter()
+                .any(|symbol| symbol.span == reference_span)
+        );
+
+        for (span, indices) in &document.direct_symbol_indices {
+            assert!(!indices.is_empty(), "indexed span {span:?} has symbols");
+            for index in indices {
+                assert_eq!(
+                    document.symbols.get(*index).map(|symbol| symbol.span),
+                    Some(*span),
+                    "every index for {span:?} points to a symbol at that span"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_abbreviated_parameter_indexes_each_symbol_at_the_same_span() {
+        let source = "unit DirectIndexAbbreviatedParameters;\ninterface\nprocedure Run(Value: Integer);\nimplementation\nprocedure Run;\nbegin\n  Value := Value + 1;\nend;\nend.\n";
+        let uri =
+            Url::parse("file:///DirectIndexAbbreviatedParameters.pas").expect("valid file URL");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("Pascal unit parses");
+        let document = index.documents.get(&uri).expect("unit is indexed");
+
+        let parameter_start = source
+            .find("Value: Integer")
+            .expect("interface parameter is present");
+        let parameter_span = Span {
+            start: parameter_start,
+            end: parameter_start + "Value".len(),
+        };
+        let indices = document
+            .direct_symbol_indices
+            .get(&parameter_span)
+            .expect("parameter declaration span is indexed");
+        assert!(
+            indices.len() > 1,
+            "abbreviated definition injects a second symbol at the declaration span"
+        );
+
+        let distinct_indices = indices
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct_indices.len(), indices.len());
+        for index in indices {
+            assert_eq!(
+                document.symbols.get(*index).map(|symbol| symbol.span),
+                Some(parameter_span),
+                "every same-span index identifies a symbol at that exact span"
+            );
+        }
+
+        let identifiers = collect_nodes_matching(document.tree.root_node(), "identifier");
+        assert!(!identifiers.is_empty());
+        for identifier in identifiers {
+            let span = Span::from_node(identifier);
+            assert_eq!(
+                document.direct_symbol_indices.contains_key(&span),
+                document.symbols.iter().any(|symbol| symbol.span == span),
+                "indexed and linear declaration membership differ at {span:?}"
+            );
+        }
+    }
 }

@@ -308,7 +308,7 @@ fn discover_context(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
-) -> Result<ProjectContext, String> {
+) -> Result<Arc<ProjectContext>, String> {
     let (overrides, warnings) = production_override_session();
     discover_context_with_selections(
         file,
@@ -781,8 +781,8 @@ fn discover_context_with_selections_inner(
                         if let Some(work_budget) = work_budget {
                             work_budget.check_cancelled()?;
                         }
-                        project.context.discovery_complete = false;
-                        project.context.override_error = Some(error);
+                        Arc::make_mut(&mut project.context).discovery_complete = false;
+                        Arc::make_mut(&mut project.context).override_error = Some(error);
                         return Ok(
                             read_tracker.into_discovery(project, discovery_selection.clone())
                         );
@@ -885,7 +885,7 @@ fn discover_context_with_selections_inner(
                 exclusions,
             )?;
             if override_error.is_some() {
-                project.context.override_error = override_error;
+                Arc::make_mut(&mut project.context).override_error = override_error;
             }
             Ok(read_tracker.into_discovery(project, discovery_selection.clone()))
         }

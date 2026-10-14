@@ -1495,7 +1495,7 @@ fn ensure_semantic_tokens_ready(
 
 struct SyntaxDocument {
     source: String,
-    context: pascal_project::ProjectContext,
+    context: std::sync::Arc<pascal_project::ProjectContext>,
     records: Vec<super::rename::SourceRecord>,
 }
 

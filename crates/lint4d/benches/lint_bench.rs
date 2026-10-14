@@ -48,7 +48,7 @@ struct SyntheticProject {
     _directory: TempDir,
     files: Vec<FileInfo>,
     source_roots: Vec<PathBuf>,
-    context: ProjectContext,
+    context: std::sync::Arc<ProjectContext>,
     dcu_context: DcuProjectContext,
     config: Config,
     registry: RuleRegistry,

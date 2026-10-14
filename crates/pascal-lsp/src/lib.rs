@@ -23,11 +23,39 @@ pub use pascal_project as project;
 pub use pascal_project::{ProjectContext, ProjectOptions, discover};
 
 #[cfg(test)]
-pub(crate) fn edit_context<R>(
-    context: &mut pascal_project::ProjectContext,
+pub(crate) trait ContextSlot: Default {
+    fn into_context(self) -> pascal_project::ProjectContext;
+    fn from_context(context: pascal_project::ProjectContext) -> Self;
+}
+
+#[cfg(test)]
+impl ContextSlot for pascal_project::ProjectContext {
+    fn into_context(self) -> pascal_project::ProjectContext {
+        self
+    }
+
+    fn from_context(context: pascal_project::ProjectContext) -> Self {
+        context
+    }
+}
+
+#[cfg(test)]
+impl ContextSlot for std::sync::Arc<pascal_project::ProjectContext> {
+    fn into_context(self) -> pascal_project::ProjectContext {
+        std::sync::Arc::unwrap_or_clone(self)
+    }
+
+    fn from_context(context: pascal_project::ProjectContext) -> Self {
+        std::sync::Arc::new(context)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn edit_context<C: ContextSlot, R>(
+    context: &mut C,
     edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
 ) {
-    let mut parts = std::mem::take(context).into_parts();
+    let mut parts = std::mem::take(context).into_context().into_parts();
     edit(&mut parts);
-    *context = pascal_project::ProjectContext::from_parts(parts);
+    *context = C::from_context(pascal_project::ProjectContext::from_parts(parts));
 }

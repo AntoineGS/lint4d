@@ -2221,7 +2221,7 @@ pub(crate) struct LegacyRouteProof {
 
 #[derive(Debug, Default)]
 pub(crate) struct ContextState {
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     context_observations: ProjectObservations,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
@@ -2980,7 +2980,7 @@ struct SharedLintRequest<'a> {
     lint_source: &'a [u8],
     config: &'a lint4d::config::Config,
     context_key: &'a ContextKey,
-    context: &'a ProjectContext,
+    context: &'a Arc<ProjectContext>,
     context_observations: &'a ProjectObservations,
     cancel: &'a AtomicBool,
 }
@@ -9855,7 +9855,7 @@ impl Workspace {
                     warnings.push(error);
                 }
                 let discovery = ProjectDiscovery {
-                    context: ProjectContext::default(),
+                    context: Arc::default(),
                     context_observations: ProjectObservations {
                         metadata_files: vec![selected.to_path_buf()],
                         warnings,
@@ -10453,7 +10453,7 @@ impl Workspace {
     fn install_context(
         &mut self,
         key: ContextKey,
-        context: ProjectContext,
+        context: Arc<ProjectContext>,
         context_observations: ProjectObservations,
         observations: Vec<ProjectReadObservation>,
         mut candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
@@ -16069,7 +16069,7 @@ mod tests {
     #[test]
     fn context_states_differing_only_in_observations_are_not_equal() {
         let state = |warnings: Vec<String>| ContextState {
-            context: ProjectContext::default(),
+            context: Arc::default(),
             context_observations: pascal_project::ProjectObservations {
                 warnings,
                 ..Default::default()
@@ -17492,7 +17492,10 @@ mod tests {
         });
         workspace.cached_documents.insert(
             uri,
-            crate::workspace::rename::CachedDocument { context, parsed },
+            crate::workspace::rename::CachedDocument {
+                context: context.into(),
+                parsed,
+            },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -17531,7 +17534,7 @@ mod tests {
         workspace.cached_documents.insert(
             uri,
             crate::workspace::rename::CachedDocument {
-                context: pascal_project::ProjectContext::default(),
+                context: Arc::default(),
                 parsed,
             },
         );
@@ -21717,7 +21720,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context: context.clone(),
+                context: context.clone().into(),
                 ..ContextState::default()
             },
         );
@@ -21860,7 +21863,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context,
+                context: context.into(),
                 ..ContextState::default()
             },
         );
@@ -21979,7 +21982,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context,
+                context: context.into(),
                 ..ContextState::default()
             },
         );
@@ -22078,7 +22081,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context,
+                context: context.into(),
                 ..ContextState::default()
             },
         );
@@ -22136,7 +22139,7 @@ BDS = '/fake/37'
             workspace.contexts.insert(
                 key.clone(),
                 ContextState {
-                    context,
+                    context: context.into(),
                     ..ContextState::default()
                 },
             );
@@ -22298,7 +22301,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context: context.clone(),
+                context: context.clone().into(),
                 ..ContextState::default()
             },
         );
@@ -22427,7 +22430,7 @@ BDS = '/fake/37'
         workspace
             .install_context(
                 key.clone(),
-                ProjectContext::default(),
+                Arc::default(),
                 ProjectObservations::default(),
                 Vec::new(),
                 HashMap::new(),
@@ -22479,7 +22482,7 @@ BDS = '/fake/37'
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path().to_path_buf();
         let state = super::ContextState {
-            context: ProjectContext::default(),
+            context: Arc::default(),
             context_observations: ProjectObservations::default(),
             watched_paths: HashMap::new(),
             project_candidate_memberships: HashMap::from([(
@@ -22534,7 +22537,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key,
             super::ContextState {
-                context: ProjectContext::default(),
+                context: Arc::default(),
                 context_observations: ProjectObservations::default(),
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
@@ -22640,7 +22643,7 @@ BDS = '/fake/37'
         workspace
             .install_context(
                 key.clone(),
-                ProjectContext::default(),
+                Arc::default(),
                 context_observations,
                 observations,
                 HashMap::new(),
@@ -22693,7 +22696,7 @@ BDS = '/fake/37'
         workspace
             .install_context(
                 key.clone(),
-                ProjectContext::default(),
+                Arc::default(),
                 ProjectObservations::default(),
                 Vec::new(),
                 HashMap::new(),
@@ -22773,7 +22776,7 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             super::ContextState {
-                context: ProjectContext::default(),
+                context: Arc::default(),
                 context_observations: ProjectObservations {
                     metadata_files,
                     ..ProjectObservations::default()
@@ -22883,7 +22886,7 @@ BDS = '/fake/37'
         let owner = KnownDocumentOwner {
             key,
             state: Arc::new(ContextState {
-                context: ProjectContext::default(),
+                context: Arc::default(),
                 context_observations: ProjectObservations::default(),
                 watched_paths: HashMap::new(),
                 project_candidate_memberships: HashMap::new(),
@@ -23923,7 +23926,7 @@ BDS = '/fake/37'
         });
         let cancel = AtomicBool::new(false);
         let mut resolver = super::resolver::resolver_for_context(
-            context,
+            context.into(),
             &ProjectObservations::default(),
             vec![root],
             &input,
@@ -26067,7 +26070,7 @@ BDS = '/fake/37'
         workspace
             .install_context(
                 key.clone(),
-                ProjectContext::default(),
+                Arc::default(),
                 context_observations,
                 Vec::new(),
                 std::collections::HashMap::new(),

@@ -16,9 +16,11 @@ fn edit_context<R>(
 }
 
 fn context(root: &std::path::Path, dir: &std::path::Path) -> ProjectContext {
-    ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default())
-        .unwrap()
-        .context
+    std::sync::Arc::unwrap_or_clone(
+        ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default())
+            .unwrap()
+            .context,
+    )
 }
 
 #[test]

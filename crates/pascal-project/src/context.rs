@@ -884,7 +884,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let observed = DiscoveredProject {
-            context: base.clone(),
+            context: base.clone().into(),
             observations: ProjectObservations {
                 metadata_files: vec!["Unit.pas".into()],
                 metadata_observations: vec![MetadataObservation::Stat {
@@ -894,11 +894,11 @@ mod tests {
                 system_pas_searches: Vec::new(),
             },
         };
-        assert_eq!(base, observed.context);
+        assert_eq!(base, *observed.context);
         assert_ne!(
             observed,
             DiscoveredProject {
-                context: base.clone(),
+                context: base.clone().into(),
                 observations: ProjectObservations::default(),
             }
         );

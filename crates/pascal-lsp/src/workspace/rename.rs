@@ -224,7 +224,7 @@ pub(crate) struct OverlayInput {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedDocument {
-    pub(crate) context: ProjectContext,
+    pub(crate) context: Arc<ProjectContext>,
     pub(crate) parsed: Arc<ParsedDocument>,
 }
 
@@ -2834,7 +2834,7 @@ pub(crate) fn project_context_and_metadata_for_input(
     input: &WorkspaceInput,
     uri: &Url,
     cancel: &AtomicBool,
-) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
+) -> Result<(Arc<ProjectContext>, Vec<SourceRecord>), String> {
     project_state_and_metadata_for_input(input, uri, cancel)
         .map(|(state, records)| (state.context, records))
 }
@@ -2858,7 +2858,7 @@ fn project_state_and_metadata_for_input(
 pub(crate) fn project_context_and_metadata_for_owner(
     owner: &KnownDocumentOwner,
     cancel: &AtomicBool,
-) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
+) -> Result<(Arc<ProjectContext>, Vec<SourceRecord>), String> {
     let records = consumed_context_records(&owner.state, cancel)?;
     Ok((owner.state.context.clone(), records))
 }
@@ -8307,7 +8307,7 @@ struct IncludeAuditor<'a> {
 
 struct IncludeInspection<'a> {
     context_key: &'a ContextKey,
-    context: &'a ProjectContext,
+    context: &'a Arc<ProjectContext>,
     context_observations: &'a ProjectObservations,
     owner_path: &'a Path,
     legacy_route: Option<LegacyRoute>,
@@ -8510,7 +8510,7 @@ impl IncludeAuditor<'_> {
     fn context_for_source(
         &mut self,
         uri: &Url,
-    ) -> Result<Option<(ContextKey, ProjectContext, ProjectObservations)>, String> {
+    ) -> Result<Option<(ContextKey, Arc<ProjectContext>, ProjectObservations)>, String> {
         let context_key = if let Some(context_key) = self.contexts.get(uri).cloned() {
             Some(context_key)
         } else if let Some(context_key) = self.loader.document_contexts.get(uri).cloned() {
@@ -8610,7 +8610,7 @@ impl IncludeAuditor<'_> {
     fn resolve_include(
         &mut self,
         context_key: &ContextKey,
-        context: &ProjectContext,
+        context: &Arc<ProjectContext>,
         context_observations: &ProjectObservations,
         including_path: &Path,
         directive: &Directive,
@@ -8758,7 +8758,7 @@ impl IncludeAuditor<'_> {
         uri: &Url,
         directive: &Directive,
         context_key: &ContextKey,
-        context: &ProjectContext,
+        context: &Arc<ProjectContext>,
         context_observations: &ProjectObservations,
         conditional_environment: Option<conditional::ConditionalEnvironment>,
     ) -> Result<IncludeAnalysis, String> {
@@ -8860,7 +8860,7 @@ impl IncludeAuditor<'_> {
         owner_path: &Path,
         directive: &Directive,
         context_key: &ContextKey,
-        context: &ProjectContext,
+        context: &Arc<ProjectContext>,
         context_observations: &ProjectObservations,
         inherited_route: Option<LegacyRoute>,
         conditional_environment: conditional::ConditionalEnvironment,
@@ -10975,14 +10975,16 @@ mod tests {
             context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/old"))],
                 ..pascal_project::ProjectContextParts::default()
-            }),
+            })
+            .into(),
             ..ContextState::default()
         };
         let new = ContextState {
             context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/new"))],
                 ..pascal_project::ProjectContextParts::default()
-            }),
+            })
+            .into(),
             ..ContextState::default()
         };
         let mut enumeration = Enumeration {
@@ -11495,7 +11497,8 @@ mod tests {
                     provenance: super::super::super::project::ProjectPathProvenance::LegacyNative,
                 }],
                 ..pascal_project::ProjectContextParts::default()
-            }),
+            })
+            .into(),
             ..ContextState::default()
         };
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());

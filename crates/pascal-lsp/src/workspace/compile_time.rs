@@ -405,7 +405,7 @@ pub(super) fn selected_import_header(
     importer: &Url,
     owning_context: (
         &ContextKey,
-        &pascal_project::ProjectContext,
+        &Arc<pascal_project::ProjectContext>,
         &pascal_project::ProjectObservations,
     ),
     selected_site: (&LoadedSource, &pascal_core::ResolvedImport),

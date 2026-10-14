@@ -64,7 +64,7 @@ pub(super) fn build_standalone_context_with_overrides(
         exclusions,
         None,
     )?;
-    project.context.override_error = override_error;
+    Arc::make_mut(&mut project.context).override_error = override_error;
     Ok(project)
 }
 
@@ -938,7 +938,7 @@ pub(super) fn build_project_context(
     };
 
     Ok(DiscoveredProject {
-        context: ProjectContext {
+        context: Arc::new(ProjectContext {
             discovery_complete,
             binding_metadata_complete: !builder.incomplete
                 && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
@@ -970,7 +970,7 @@ pub(super) fn build_project_context(
             packages: package_list(&builder),
             installation_config_files,
             override_error: None,
-        },
+        }),
         observations: ProjectObservations {
             metadata_files,
             metadata_observations,
@@ -1073,7 +1073,7 @@ fn build_standalone_context(
         complete_metadata_observations(&metadata_files, metadata_observations);
 
     Ok(DiscoveredProject {
-        context: ProjectContext {
+        context: Arc::new(ProjectContext {
             discovery_complete,
             binding_metadata_complete: discovery_complete,
             path_issues: Vec::new(),
@@ -1101,7 +1101,7 @@ fn build_standalone_context(
             packages: Vec::new(),
             installation_config_files: Vec::new(),
             override_error: None,
-        },
+        }),
         observations: ProjectObservations {
             metadata_files,
             metadata_observations,

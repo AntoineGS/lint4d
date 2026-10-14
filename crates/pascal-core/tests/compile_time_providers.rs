@@ -5,12 +5,12 @@ use pascal_project::LayoutPlatform;
 use support::{Fixture, activity, context};
 
 fn edit_context<R>(
-    context: &mut pascal_project::ProjectContext,
+    context: &mut std::sync::Arc<pascal_project::ProjectContext>,
     edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
 ) {
-    let mut parts = std::mem::take(context).into_parts();
+    let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(context)).into_parts();
     edit(&mut parts);
-    *context = pascal_project::ProjectContext::from_parts(parts);
+    *context = pascal_project::ProjectContext::from_parts(parts).into();
 }
 
 fn assert_qualified_export_fact(

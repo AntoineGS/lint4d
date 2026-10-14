@@ -1422,7 +1422,7 @@ pub use store::{FilesystemSourceStore, OverlaySource};
 /// Resolver-owned caches and observations are request-local. Callers may
 /// explicitly share bounded package catalogues with an operation-scoped cache.
 pub struct UnitResolver<S> {
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     workspace_roots: Vec<PathBuf>,
     store: S,
     limits: ResolverLimits,
@@ -2607,7 +2607,7 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     pub fn new(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
@@ -2620,7 +2620,7 @@ impl<S: SourceStore> UnitResolver<S> {
     /// and unchanged source-store state in one operation. Discard the cache
     /// when that operation completes.
     pub fn new_with_session_cache(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
@@ -2630,12 +2630,13 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn new_inner(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
         session_cache: Option<ResolverSessionCache>,
     ) -> Self {
+        let context = context.into();
         let session_cache = session_cache.filter(|cache| cache.bind(&context, limits));
         let mut report = ResolutionReport {
             observations: Vec::new(),
@@ -8087,7 +8088,7 @@ struct ResolverSessionCacheState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolverSessionCacheScope {
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     limits: ResolverLimits,
 }
 
@@ -8100,16 +8101,16 @@ struct CachedCatalogue {
 }
 
 impl ResolverSessionCache {
-    fn bind(&self, context: &ProjectContext, limits: ResolverLimits) -> bool {
+    fn bind(&self, context: &Arc<ProjectContext>, limits: ResolverLimits) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &state.scope {
-            Some(bound_scope) => bound_scope.limits == limits && &bound_scope.context == context,
+            Some(bound_scope) => bound_scope.limits == limits && bound_scope.context == *context,
             None => {
                 state.scope = Some(ResolverSessionCacheScope {
-                    context: context.clone(),
+                    context: Arc::clone(context),
                     limits,
                 });
                 true
@@ -8254,13 +8255,41 @@ fn source_text(source: &LoadedSource) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn edit_context<R>(
-    context: &mut ProjectContext,
+pub(crate) trait ContextSlot: Default {
+    fn into_context(self) -> ProjectContext;
+    fn from_context(context: ProjectContext) -> Self;
+}
+
+#[cfg(test)]
+impl ContextSlot for ProjectContext {
+    fn into_context(self) -> ProjectContext {
+        self
+    }
+
+    fn from_context(context: ProjectContext) -> Self {
+        context
+    }
+}
+
+#[cfg(test)]
+impl ContextSlot for Arc<ProjectContext> {
+    fn into_context(self) -> ProjectContext {
+        Arc::unwrap_or_clone(self)
+    }
+
+    fn from_context(context: ProjectContext) -> Self {
+        Arc::new(context)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn edit_context<C: ContextSlot, R>(
+    context: &mut C,
     edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
 ) {
-    let mut parts = std::mem::take(context).into_parts();
+    let mut parts = std::mem::take(context).into_context().into_parts();
     edit(&mut parts);
-    *context = ProjectContext::from_parts(parts);
+    *context = C::from_context(ProjectContext::from_parts(parts));
 }
 
 #[cfg(test)]

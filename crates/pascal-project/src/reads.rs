@@ -243,7 +243,7 @@ pub struct ProjectReadStamp {
 
 #[derive(Debug, Clone)]
 pub struct ProjectDiscovery {
-    pub context: ProjectContext,
+    pub context: Arc<ProjectContext>,
     /// Observations made while constructing `context`.
     pub context_observations: ProjectObservations,
     pub observations: Vec<ProjectReadObservation>,

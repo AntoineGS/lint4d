@@ -11,6 +11,7 @@ use pascal_project::{
 };
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 const WEBQUERY_DPROJ: &str = r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -1849,6 +1850,20 @@ fn cached_discovery_returns_the_construction_observations() {
     assert_eq!(built.context, cached.context);
 }
 
+#[test]
+fn cached_discoveries_share_one_context() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let _scope = ProjectDiscoveryCacheScope::new();
+
+    let first = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+    let second = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+
+    assert!(Arc::ptr_eq(&first.context, &second.context));
+}
+
 fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -1884,7 +1899,7 @@ fn discover_webquery_at(
     options: &ProjectOptions,
     overrides: &OverrideSession,
 ) -> ProjectContext {
-    discover_webquery_project_at(root, options, overrides).context
+    Arc::unwrap_or_clone(discover_webquery_project_at(root, options, overrides).context)
 }
 
 #[derive(Clone, Copy)]

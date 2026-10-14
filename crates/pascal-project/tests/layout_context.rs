@@ -4,6 +4,7 @@ use pascal_project::{
     LayoutSettings, ProjectContext, ProjectOptions, SourceOrigin, TargetPlatform,
 };
 use std::fs;
+use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
 fn discover(properties: &str, options: ProjectOptions) -> (TempDir, ProjectContext) {
@@ -28,7 +29,7 @@ fn discover(properties: &str, options: ProjectOptions) -> (TempDir, ProjectConte
     )
     .unwrap()
     .context;
-    (temp, context)
+    (temp, Arc::unwrap_or_clone(context))
 }
 
 fn options(version: Option<CompilerVersion>) -> ProjectOptions {

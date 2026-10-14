@@ -44,6 +44,6 @@ impl ProjectObservations {
 /// A discovered context and the observations made while constructing it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveredProject {
-    pub context: ProjectContext,
+    pub context: Arc<ProjectContext>,
     pub observations: ProjectObservations,
 }

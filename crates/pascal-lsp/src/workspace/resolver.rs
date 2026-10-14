@@ -92,7 +92,7 @@ pub(crate) struct LspSourceStore {
     pub(crate) paths_to_uris: HashMap<PathBuf, Url>,
     deleted_overrides: HashMap<PathBuf, Option<DiskStamp>>,
     rejected_paths: std::collections::HashSet<PathBuf>,
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     project_cache: crate::project_cache::ProjectCache,
     disk: FilesystemSourceStore,
 }
@@ -280,7 +280,7 @@ fn admit_decoded_source(
 }
 
 impl LspSourceStore {
-    pub(crate) fn from_input(context: ProjectContext, input: &WorkspaceInput) -> Self {
+    pub(crate) fn from_input(context: Arc<ProjectContext>, input: &WorkspaceInput) -> Self {
         let mut overlays = HashMap::new();
         let mut paths_to_uris = HashMap::new();
         for (uri, overlay) in &input.overlays {
@@ -765,7 +765,7 @@ fn with_decoded_text(mut source: LoadedSource) -> LoadedSource {
 }
 
 pub(crate) fn resolver_for_context(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
@@ -782,7 +782,7 @@ pub(crate) fn resolver_for_context(
 }
 
 pub(crate) fn resolver_for_context_with_limits(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
@@ -799,7 +799,7 @@ pub(crate) fn resolver_for_context_with_limits(
 }
 
 pub(crate) fn resolver_for_context_with_session_cache(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
@@ -826,7 +826,7 @@ pub(crate) fn resolver_for_context_with_session_cache(
 }
 
 fn resolver_for_context_with_limits_and_session_cache(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     mut limits: ResolverLimits,

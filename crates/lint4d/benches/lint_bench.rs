@@ -179,7 +179,8 @@ fn synthetic_project() -> SyntheticProject {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("synthetic project context should be discoverable");
+    .expect("synthetic project context should be discoverable")
+    .context;
     assert!(context.discovery_complete);
     assert_eq!(context.project_file, options.project_file);
 

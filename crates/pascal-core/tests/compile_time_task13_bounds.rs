@@ -147,8 +147,9 @@ fn task13_include_boundary(case: &str) {
         };
         std::fs::write(root.join(format!("f{i}.inc")), body).unwrap();
     }
-    let mut ctx =
-        ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default()).unwrap();
+    let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     ctx.conditional_context = context(LayoutPlatform::Win32);
     let mut limits = ResolverLimits::default();
     assert_eq!(limits.max_include_depth, 256);
@@ -367,8 +368,9 @@ fn task13_failed_include_probes_recover_without_resetting_work_or_publishing_par
     let path = root.join("T.pas");
     let text = "unit T; interface const Width=SizeOf({$I operand.inc}); {$IF Width=1}{$DEFINE HIT}{$ENDIF} implementation end.";
     std::fs::write(&path, text).unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default()).unwrap();
+    let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     ctx.conditional_context = context(LayoutPlatform::Win32);
     let mut resolver = UnitResolver::new(
         ctx,

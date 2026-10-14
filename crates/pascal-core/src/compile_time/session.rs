@@ -3614,7 +3614,8 @@ mod tests {
             &[dir.path().into()],
             &Default::default(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         let context = ConditionalContext::default();
         let prove = |limits| {
             let mut resolver = crate::UnitResolver::new(
@@ -4000,7 +4001,8 @@ mod tests {
                     &[dir.path().into()],
                     &Default::default(),
                 )
-                .unwrap();
+                .unwrap()
+                .context;
                 project.conditional_context = ConditionalContext::default()
                     .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
                     .with_layout(pascal_project::LayoutContext {
@@ -4187,7 +4189,8 @@ mod tests {
                 &[dir.path().into()],
                 &Default::default(),
             )
-            .unwrap();
+            .unwrap()
+            .context;
             project
                 .unit_aliases
                 .insert("Alias".into(), "Space.Other".into());
@@ -4336,7 +4339,8 @@ mod tests {
                 &[dir.path().into()],
                 &Default::default(),
             )
-            .unwrap();
+            .unwrap()
+            .context;
             if failed {
                 let bad = dir.path().join("Broken.pas");
                 let entry = project.path_entry_for(&bad).unwrap();
@@ -4491,7 +4495,8 @@ mod tests {
             &[dir.path().into()],
             &Default::default(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         project
             .unit_aliases
             .insert("Alias".into(), "Space.Other".into());

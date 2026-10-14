@@ -7,9 +7,9 @@
 
 use crate::compile_time::{AdmittedOwned, AdmittedShared, CompileTimeBudget};
 use pascal_project::{
-    MetadataObservation, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_identity,
-    path_stamp_result, read_package_metadata_with_observations,
+    MetadataObservation, ProjectContext, ProjectObservations, ProjectPathEntry,
+    ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ReadPolicy,
+    content_hash_bytes, path_identity, path_stamp_result, read_package_metadata_with_observations,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2643,15 +2643,6 @@ impl<S: SourceStore> UnitResolver<S> {
             complete: context.discovery_complete,
             incomplete_reasons: Vec::new(),
         };
-        for observation in &context.metadata_observations {
-            push_observation(
-                &mut report.observations,
-                ResolutionObservation::Metadata(observation.clone()),
-            );
-        }
-        for warning in &context.warnings {
-            push_warning(&mut report, warning.clone(), limits.max_resolution_warnings);
-        }
         if !context.discovery_complete {
             report
                 .incomplete_reasons
@@ -2701,6 +2692,25 @@ impl<S: SourceStore> UnitResolver<S> {
             callback_unit_names: None,
             callback_provider: None,
         }
+    }
+
+    /// Seed the resolution report with what constructing the context
+    /// observed, so report consumers can revalidate those reads.
+    pub fn with_context_observations(mut self, observations: &ProjectObservations) -> Self {
+        for observation in &observations.metadata_observations {
+            push_observation(
+                &mut self.report.observations,
+                ResolutionObservation::Metadata(observation.clone()),
+            );
+        }
+        for warning in &observations.warnings {
+            push_warning(
+                &mut self.report,
+                warning.clone(),
+                self.limits.max_resolution_warnings,
+            );
+        }
+        self
     }
 
     /// Declared name and imports of a loaded source, parsed at most once per
@@ -10043,8 +10053,9 @@ mod tests {
             "unit Other; interface implementation end.",
         )
         .unwrap();
-        let context =
-            ProjectContext::discover(&root, &[dir.path().into()], &Default::default()).unwrap();
+        let context = ProjectContext::discover(&root, &[dir.path().into()], &Default::default())
+            .unwrap()
+            .context;
         let resolver = UnitResolver::new(
             context,
             vec![dir.path().into()],

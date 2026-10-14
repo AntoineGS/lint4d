@@ -125,7 +125,7 @@ pub(super) struct ProjectContextBuildCacheKey {
 
 #[derive(Debug, Clone)]
 pub(super) struct CachedProjectContext {
-    pub(super) context: ProjectContext,
+    pub(super) project: DiscoveredProject,
     pub(super) observations: Vec<ProjectReadObservation>,
     pub(super) metadata_paths: Vec<PathBuf>,
     pub(super) metadata_observations: Vec<MetadataObservation>,
@@ -268,7 +268,7 @@ fn project_context_cache_is_current(
             return Ok(false);
         }
     }
-    for observation in &cached.context.metadata_observations {
+    for observation in &cached.project.observations.metadata_observations {
         check_project_scan_cancel(cancel)?;
         if let Some(work_budget) = work_budget {
             work_budget.check_cancelled()?;
@@ -882,7 +882,7 @@ mod tests {
 
         for expected in expected_paths {
             assert!(
-                context.search_paths.contains(&expected),
+                context.context.search_paths.contains(&expected),
                 "case-insensitive discovery should retain on-disk spelling for {}",
                 expected.display()
             );
@@ -922,7 +922,8 @@ mod tests {
             &options,
             &overrides,
         )
-        .expect("first discovery");
+        .expect("first discovery")
+        .context;
         assert!(first.search_paths.contains(&requested));
         fs::create_dir_all(&expected).expect("create directory between discovery calls");
 
@@ -932,7 +933,8 @@ mod tests {
             &options,
             &overrides,
         )
-        .expect("second discovery");
+        .expect("second discovery")
+        .context;
 
         assert!(
             second.search_paths.contains(&expected),

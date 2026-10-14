@@ -244,6 +244,8 @@ pub struct ProjectReadStamp {
 #[derive(Debug, Clone)]
 pub struct ProjectDiscovery {
     pub context: ProjectContext,
+    /// Observations made while constructing `context`.
+    pub context_observations: ProjectObservations,
     pub observations: Vec<ProjectReadObservation>,
     pub candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     /// Runtime project selection resolved while evaluating this source path.
@@ -385,10 +387,11 @@ impl<'a> ProjectReadTracker<'a> {
 
     pub(super) fn into_discovery(
         self,
-        mut context: ProjectContext,
+        mut project: DiscoveredProject,
         project_selection: Option<(PathBuf, PathBuf)>,
     ) -> ProjectDiscovery {
-        let project_scope = context
+        let project_scope = project
+            .context
             .project_file
             .as_deref()
             .and_then(Path::parent)
@@ -408,19 +411,21 @@ impl<'a> ProjectReadTracker<'a> {
                     .max_by_key(|directory| directory.components().count())
             });
         for path in &self.metadata_paths {
-            if !context
+            if !project
+                .observations
                 .metadata_files
                 .iter()
                 .any(|existing| project_paths_equal(existing, path))
             {
-                context.metadata_files.push(path.clone());
+                project.observations.metadata_files.push(path.clone());
             }
         }
         for observation in self.metadata_observations {
-            add_metadata_observation(&mut context.metadata_observations, observation);
+            add_metadata_observation(&mut project.observations.metadata_observations, observation);
         }
         ProjectDiscovery {
-            context,
+            context: project.context,
+            context_observations: project.observations,
             observations: self.observations,
             candidate_memberships: self.candidate_memberships,
             project_selection,
@@ -840,7 +845,7 @@ mod tests {
         tracker.record(&path, first_stamp.clone(), b"first");
         tracker.record(&path, second_stamp, b"second");
 
-        let discovery = tracker.into_discovery(ProjectContext::default(), None);
+        let discovery = tracker.into_discovery(DiscoveredProject::default(), None);
         assert_eq!(discovery.observations.len(), 1);
         assert_eq!(discovery.observations[0].stamp, first_stamp);
         assert_eq!(

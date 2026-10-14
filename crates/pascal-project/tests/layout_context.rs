@@ -26,7 +26,8 @@ fn discover(properties: &str, options: ProjectOptions) -> (TempDir, ProjectConte
         &options,
         &OverrideSession::default(),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     (temp, context)
 }
 
@@ -444,6 +445,7 @@ fn standalone_layout_uses_only_explicit_target_facts() {
             &OverrideSession::default(),
         )
         .unwrap()
+        .context
     };
     assert_eq!(
         discover_source(&opts).conditional_context.layout,

@@ -4,8 +4,9 @@ use pascal_project::build_selection::{
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::rtl_constants::RtlConstantSource;
 use pascal_project::{
-    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, OpenReason,
-    ProjectContext, ProjectDiscoveryCacheScope, ProjectOptions, ProjectPathEntry, SourceOrigin,
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, DiscoveredProject,
+    OpenReason, ProjectContext, ProjectDiscoveryCacheScope, ProjectOptions, ProjectPathEntry,
+    SourceOrigin,
 };
 use std::fs;
 use std::path::Path;
@@ -356,11 +357,14 @@ fn invalid_session_build_choice_is_reported_without_falling_back() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(context.config_selection.mode, BuildSelectionMode::Invalid);
     assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning
             == &format!(
                 "build configuration `Gone` is not defined by {}",
@@ -388,11 +392,14 @@ fn invalid_session_platform_choice_has_its_own_invalid_mode() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(context.platform_selection.mode, BuildSelectionMode::Invalid);
     assert_eq!(context.platform_selection.selected.as_deref(), Some("Gone"));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning
             == &format!(
                 "platform `Gone` is not defined by {}",
@@ -416,11 +423,14 @@ fn invalid_config_toml_build_choice_is_reported_without_falling_back() {
     };
     let overrides = OverrideSession::new(Some(root.join("config.toml")));
 
-    let context = discover_webquery_at(root, &options, &overrides);
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &overrides);
 
     assert_eq!(context.config_selection.mode, BuildSelectionMode::Invalid);
     assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning
             == &format!(
                 "build configuration `Gone` is not defined by {}",
@@ -439,14 +449,17 @@ fn invalid_global_build_configuration_stays_configured_and_warns() {
     let root = temp.path();
     write_webquery_fixture(root);
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(
         context.config_selection.mode,
         BuildSelectionMode::Configured
     );
     assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning
             == &format!(
                 "build configuration `Gone` is not defined by {}",
@@ -515,7 +528,8 @@ fn override_property_configuration_is_reported_as_configured() {
         &ProjectOptions::default(),
         &OverrideSession::new(None),
     )
-    .expect("WebQuery discovery with configuration override");
+    .expect("WebQuery discovery with configuration override")
+    .context;
 
     assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
     assert_eq!(
@@ -535,7 +549,8 @@ fn standalone_contexts_have_default_build_selections() {
         &[temp.path().to_path_buf()],
         &ProjectOptions::default(),
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
 
     assert_eq!(context.config_selection, BuildSelection::default());
     assert_eq!(context.platform_selection, BuildSelection::default());
@@ -676,7 +691,8 @@ fn caller_source_paths_are_classified_as_project_compiled_roots() {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("project discovery");
+    .expect("project discovery")
+    .context;
 
     assert!(context.project_source_roots.contains(&shared));
     assert_eq!(
@@ -726,7 +742,8 @@ fn explicit_in_clause_paths_are_project_compiled_when_the_file_name_differs() {
         &d2010_options(),
         &OverrideSession::new(None),
     )
-    .expect("project discovery");
+    .expect("project discovery")
+    .context;
 
     assert!(context.conditional_closure.closed);
     assert_eq!(
@@ -742,7 +759,10 @@ fn explicit_in_clause_paths_are_project_compiled_when_the_file_name_differs() {
 #[test]
 fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
     let fixture = IdeLibraryFixture::new();
-    let context = fixture.discover(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = fixture.discover(
         "<PropertyGroup Condition=\"'$(Platform)'=='Win32'\">\
          <DelphiLibraryPath>C:\\Shared</DelphiLibraryPath></PropertyGroup>",
         "",
@@ -756,7 +776,7 @@ fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
     assert!(
         context.search_paths.contains(&fixture.shared),
         "warnings: {:?}",
-        context.warnings
+        observations.warnings
     );
 }
 
@@ -767,7 +787,10 @@ fn ide_library_path_sources_are_project_compiled_except_inside_the_installation(
     let rtl = fixture.sdk.join("source/rtl");
     let rtl_file = fixture.unit(&rtl, "SysUtils");
     let browsing_file = fixture.unit(&fixture.sdk.join("source/vcl"), "Forms");
-    let context = fixture.discover(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = fixture.discover(
         "<PropertyGroup>\
          <DelphiLibraryPath>C:\\Shared;$(BDS)/source/rtl</DelphiLibraryPath>\
          <DelphiBrowsingPath>$(BDS)/source/vcl</DelphiBrowsingPath>\
@@ -779,7 +802,7 @@ fn ide_library_path_sources_are_project_compiled_except_inside_the_installation(
     assert!(
         context.conditional_closure.closed,
         "open reasons: {:?}; warnings: {:?}",
-        context.conditional_closure.open_reasons, context.warnings
+        context.conditional_closure.open_reasons, observations.warnings
     );
     assert!(context.search_paths.contains(&fixture.shared));
     assert!(context.search_paths.contains(&rtl));
@@ -793,7 +816,10 @@ fn library_path_under_an_imported_bdscommondir_stays_library_code() {
     let fixture = IdeLibraryFixture::new();
     let common = fixture.root.join("common");
     let common_file = fixture.unit(&common.join("Dcp"), "CommonUnit");
-    let context = fixture.discover(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = fixture.discover(
         "<PropertyGroup>\
          <DelphiLibraryPath>C:\\Shared;$(BDSCOMMONDIR)\\Dcp</DelphiLibraryPath>\
          </PropertyGroup>",
@@ -807,7 +833,7 @@ fn library_path_under_an_imported_bdscommondir_stays_library_code() {
     assert!(
         context.search_paths.contains(&common.join("Dcp")),
         "warnings: {:?}",
-        context.warnings
+        observations.warnings
     );
     assert_library(&context, &common_file);
 }
@@ -817,7 +843,10 @@ fn library_path_under_an_unmapped_installation_root_stays_library_code() {
     let fixture = IdeLibraryFixture::new();
     let mapped_source = fixture.root.join("mapped-sdk-source");
     let source_file = fixture.unit(&mapped_source, "SysUtils");
-    let context = fixture.discover_with_bds(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = fixture.discover_with_bds(
         "C:\\SDK",
         "<PropertyGroup>\
          <DelphiLibraryPath>C:\\Shared;C:\\SDK\\source</DelphiLibraryPath>\
@@ -831,7 +860,7 @@ fn library_path_under_an_unmapped_installation_root_stays_library_code() {
     assert!(
         context.search_paths.contains(&mapped_source),
         "warnings: {:?}",
-        context.warnings
+        observations.warnings
     );
     assert_library(&context, &source_file);
 }
@@ -841,7 +870,10 @@ fn library_path_with_dot_dot_segments_under_an_unmapped_root_stays_library_code(
     let fixture = IdeLibraryFixture::new();
     let mapped_source = fixture.root.join("mapped-sdk-source");
     let source_file = fixture.unit(&mapped_source, "SysUtils");
-    let context = fixture.discover_with_bds(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = fixture.discover_with_bds(
         "C:\\SDK",
         "<PropertyGroup>\
          <DelphiLibraryPath>C:\\Other\\..\\SDK\\.\\source</DelphiLibraryPath>\
@@ -855,7 +887,7 @@ fn library_path_with_dot_dot_segments_under_an_unmapped_root_stays_library_code(
     assert!(
         context.search_paths.contains(&mapped_source),
         "warnings: {:?}",
-        context.warnings
+        observations.warnings
     );
     assert_library(&context, &source_file);
 }
@@ -866,7 +898,10 @@ fn any_installation_spelling_of_a_duplicate_library_entry_keeps_it_library_code(
         let fixture = IdeLibraryFixture::new();
         let mapped_source = fixture.root.join("mapped-sdk-source");
         let source_file = fixture.unit(&mapped_source, "SysUtils");
-        let context = fixture.discover_with_bds(
+        let DiscoveredProject {
+            context,
+            observations,
+        } = fixture.discover_with_bds(
             "C:\\SDK",
             &format!(
                 "<PropertyGroup><DelphiLibraryPath>{library}</DelphiLibraryPath></PropertyGroup>"
@@ -881,7 +916,7 @@ fn any_installation_spelling_of_a_duplicate_library_entry_keeps_it_library_code(
         assert!(
             context.search_paths.contains(&mapped_source),
             "{library}: warnings: {:?}",
-            context.warnings
+            observations.warnings
         );
         assert_library(&context, &source_file);
     }
@@ -922,7 +957,12 @@ impl IdeLibraryFixture {
         file
     }
 
-    fn discover(&self, env_options: &str, rsvars_extra: &str, toml_extra: &str) -> ProjectContext {
+    fn discover(
+        &self,
+        env_options: &str,
+        rsvars_extra: &str,
+        toml_extra: &str,
+    ) -> DiscoveredProject {
         write(
             &self.sdk.join("bin/rsvars.bat"),
             &format!("SET BDS={}\n{rsvars_extra}", self.sdk.display()),
@@ -931,7 +971,12 @@ impl IdeLibraryFixture {
         self.discover_with_bds(&bds, env_options, toml_extra)
     }
 
-    fn discover_with_bds(&self, bds: &str, env_options: &str, toml_extra: &str) -> ProjectContext {
+    fn discover_with_bds(
+        &self,
+        bds: &str,
+        env_options: &str,
+        toml_extra: &str,
+    ) -> DiscoveredProject {
         write(
             &self.appdata.join("EnvOptions.proj"),
             &format!("<Project>{env_options}</Project>"),
@@ -1068,7 +1113,8 @@ fn dpr_and_dpk_projects_keep_absent_defines_unknown_without_a_dproj() {
             &options,
             &OverrideSession::new(None),
         )
-        .expect("Pascal project discovery");
+        .expect("Pascal project discovery")
+        .context;
         let conditionals = context.conditional_context_for(&project);
 
         assert!(
@@ -1116,7 +1162,10 @@ fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(
         context.conditional_closure.rtl_source,
@@ -1145,12 +1194,12 @@ fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
         Some(&ConstantValue::Boolean(true))
     );
     assert!(
-        context
+        observations
             .metadata_observations
             .iter()
             .any(|observation| observation.path() == system_pas)
     );
-    assert!(context.metadata_files.contains(&system_pas));
+    assert!(observations.metadata_files.contains(&system_pas));
     assert!(context.project_source_roots.contains(&root.join("rtl")));
     assert_eq!(
         context.source_origin(&system_pas),
@@ -1177,14 +1226,17 @@ fn inconclusive_system_pas_declarations_warn_and_use_the_version_table() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(
         context.conditional_closure.rtl_source,
         RtlConstantSource::Table
     );
     assert!(
-        context
+        observations
             .warnings
             .iter()
             .any(|warning| { warning.contains("System.pas RTL constant scan was inconclusive") })
@@ -1225,14 +1277,17 @@ fn valid_rtl_override_skips_system_pas_search_entirely() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(Some(config)));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(Some(config)));
 
     assert_eq!(
         context.conditional_closure.rtl_source,
         RtlConstantSource::Override
     );
     assert!(
-        !context
+        !observations
             .warnings
             .iter()
             .any(|warning| warning.contains("for System.pas"))
@@ -1254,7 +1309,10 @@ fn compiler_before_104_skips_system_pas_search() {
         ..ProjectOptions::default()
     };
 
-    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover_webquery_project_at(root, &options, &OverrideSession::new(None));
 
     assert_eq!(
         context.conditional_closure.rtl_source,
@@ -1268,7 +1326,7 @@ fn compiler_before_104_skips_system_pas_search() {
             .is_empty()
     );
     assert!(
-        !context
+        !observations
             .warnings
             .iter()
             .any(|warning| warning.contains("for System.pas"))
@@ -1363,7 +1421,8 @@ fn standalone_contexts_remain_open_and_use_client_predefined_symbols() {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
 
     assert!(!context.conditional_closure.closed);
     assert!(
@@ -1384,7 +1443,10 @@ fn standalone_pas_sources_do_not_infer_console_target() {
     let source = temp.path().join("Standalone.pas");
     write(&source, "unit Standalone; interface implementation end.");
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &source,
         &[temp.path().to_path_buf()],
         &ProjectOptions::default(),
@@ -1397,7 +1459,7 @@ fn standalone_pas_sources_do_not_infer_console_target() {
         ConditionalFact::Unknown
     );
     assert!(
-        context
+        observations
             .metadata_observations
             .iter()
             .all(|observation| observation.path() != source),
@@ -1421,7 +1483,8 @@ fn standalone_context_keeps_version_symbols_when_platform_is_unknown() {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
     let conditionals = context.conditional_context_for(&source);
 
     assert_eq!(conditionals.define("VER350"), ConditionalFact::True);
@@ -1446,7 +1509,8 @@ fn dcc_and_nativecode_are_version_facts_on_other_platforms() {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
     let conditionals = context.conditional_context_for(&source);
 
     assert_eq!(conditionals.define("DCC"), ConditionalFact::True);
@@ -1554,13 +1618,16 @@ fn empty_configuration_candidates_leave_each_selection_source_unverified() {
         write_webquery_fixture_with_dproj(root, NO_CONFIG_CANDIDATES);
         let (options, overrides) = empty_candidate_selection_input(root, origin, false);
 
-        let context = discover_webquery_at(root, &options, &overrides);
+        let DiscoveredProject {
+            context,
+            observations,
+        } = discover_webquery_project_at(root, &options, &overrides);
 
         assert!(context.config_selection.candidates.is_empty());
         assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
         assert_eq!(context.config_selection.mode, expected_mode);
         assert!(
-            !context
+            !observations
                 .warnings
                 .iter()
                 .any(|warning| { warning.contains("build configuration `Debug` is not defined") })
@@ -1619,7 +1686,10 @@ fn empty_platform_candidates_leave_each_selection_source_unverified() {
         write_webquery_fixture_with_dproj(root, NO_PLATFORM_CANDIDATES);
         let (options, overrides) = empty_candidate_selection_input(root, origin, true);
 
-        let context = discover_webquery_at(root, &options, &overrides);
+        let DiscoveredProject {
+            context,
+            observations,
+        } = discover_webquery_project_at(root, &options, &overrides);
 
         assert_eq!(context.config_selection.candidates, ["Debug"]);
         assert!(context.platform_selection.candidates.is_empty());
@@ -1629,7 +1699,7 @@ fn empty_platform_candidates_leave_each_selection_source_unverified() {
         );
         assert_eq!(context.platform_selection.mode, expected_mode);
         assert!(
-            !context
+            !observations
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("platform `Win32` is not defined"))
@@ -1730,6 +1800,28 @@ fn removing_last_build_candidate_keeps_session_and_config_choices_open() {
     }
 }
 
+#[test]
+fn cached_discovery_returns_the_construction_observations() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let _scope = ProjectDiscoveryCacheScope::new();
+
+    let built = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+    let cached = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+
+    assert!(
+        built
+            .observations
+            .metadata_files
+            .iter()
+            .any(|path| path.ends_with("App.dproj"))
+    );
+    assert_eq!(built.observations, cached.observations);
+    assert_eq!(built.context, cached.context);
+}
+
 fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -1746,11 +1838,11 @@ fn d2010_options() -> ProjectOptions {
     }
 }
 
-fn discover_webquery_at(
+fn discover_webquery_project_at(
     root: &Path,
     options: &ProjectOptions,
     overrides: &OverrideSession,
-) -> ProjectContext {
+) -> DiscoveredProject {
     ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
@@ -1758,6 +1850,14 @@ fn discover_webquery_at(
         overrides,
     )
     .expect("WebQuery discovery")
+}
+
+fn discover_webquery_at(
+    root: &Path,
+    options: &ProjectOptions,
+    overrides: &OverrideSession,
+) -> ProjectContext {
+    discover_webquery_project_at(root, options, overrides).context
 }
 
 #[derive(Clone, Copy)]

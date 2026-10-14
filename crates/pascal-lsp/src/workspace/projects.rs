@@ -9,9 +9,10 @@ use lsp_types::Url;
 use pascal_project::installation_config::ConfigurationSourceStamp;
 use pascal_project::rtl_constants::RtlConstantSource;
 use pascal_project::{
-    BuildChoice, BuildSelection, InstallationSelection, ProjectContext, discover_with_selections,
-    discover_with_selections_and_observations_with_work_budget, project_candidates,
-    project_candidates_with_work_budget, runtime_project_selection, selected_project_is_current,
+    BuildChoice, BuildSelection, DiscoveredProject, InstallationSelection,
+    discover_with_selections, discover_with_selections_and_observations_with_work_budget,
+    project_candidates, project_candidates_with_work_budget, runtime_project_selection,
+    selected_project_is_current,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -429,10 +430,15 @@ impl Workspace {
         let path = document_path(&uri)?;
         let context_key =
             self.context_for_project_protocol_anchor_with_control(&uri, cancel, budget)?;
-        let context = self
+        let (context, mut warnings) = self
             .contexts
             .get(&context_key)
-            .map(|state| state.context.clone())
+            .map(|state| {
+                (
+                    state.context.clone(),
+                    state.context_observations.warnings.clone(),
+                )
+            })
             .ok_or_else(|| format!("project context was not retained for {uri}"))?;
         let roots = self.workspace_root_paths();
         let candidates = project_candidates_with_work_budget(
@@ -457,7 +463,6 @@ impl Workspace {
         let scope =
             self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
 
-        let mut warnings = context.warnings.clone();
         let (lint_config_uri, fmt_config_uri, checked_paths) =
             self.resolve_configuration(&path, scope.as_deref(), &mut warnings);
         self.watch_context_paths(&context_key, checked_paths);
@@ -646,13 +651,13 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<BuildContextInfo, String> {
         let project_path = project_path(project_uri)?;
-        let context = self.discover_build_context(
+        let project = self.discover_build_context(
             &project_path,
             self.build_selections.clone(),
             None,
             budget,
         )?;
-        Ok(build_context_info(project_uri, &context))
+        Ok(build_context_info(project_uri, &project))
     }
 
     pub fn select_build(
@@ -704,8 +709,8 @@ impl Workspace {
             self.discover_build_context(&project_path, selections.clone(), cancel, budget)?;
         if let Some(value) = value {
             let selection = match field {
-                BuildField::Config => &validation.config_selection,
-                BuildField::Platform => &validation.platform_selection,
+                BuildField::Config => &validation.context.config_selection,
+                BuildField::Platform => &validation.context.platform_selection,
             };
             if !selection
                 .candidates
@@ -756,7 +761,7 @@ impl Workspace {
         build_selections: HashMap<PathBuf, BuildChoice>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         budget: Option<&ReconciliationBudget>,
-    ) -> Result<ProjectContext, String> {
+    ) -> Result<DiscoveredProject, String> {
         self.validate_project_scope(project_path)?;
         check_project_operation_cancel(cancel)?;
         let roots = self.workspace_root_paths_with_control(cancel, budget)?;
@@ -765,7 +770,7 @@ impl Workspace {
             build_selections,
         );
         let fallback_cancel = std::sync::atomic::AtomicBool::new(false);
-        let context = discover_with_selections_and_observations_with_work_budget(
+        let discovery = discover_with_selections_and_observations_with_work_budget(
             project_path,
             &roots,
             &options,
@@ -774,9 +779,9 @@ impl Workspace {
             &self.options.exclude,
             cancel.unwrap_or(&fallback_cancel),
             budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
-        )?
-        .context;
-        if context
+        )?;
+        if discovery
+            .context
             .project_file
             .as_deref()
             .is_none_or(|path| !project_paths_equal(path, project_path))
@@ -786,7 +791,10 @@ impl Workspace {
                 project_path.display()
             ));
         }
-        Ok(context)
+        Ok(DiscoveredProject {
+            context: discovery.context,
+            observations: discovery.context_observations,
+        })
     }
 
     pub fn select_installation(
@@ -852,14 +860,17 @@ impl Workspace {
                 )?
                 .context
             }
-            None => discover_with_selections(
-                &project_path,
-                &roots,
-                &options,
-                &self.project_selections,
-                &self.overrides,
-                &self.options.exclude,
-            )?,
+            None => {
+                discover_with_selections(
+                    &project_path,
+                    &roots,
+                    &options,
+                    &self.project_selections,
+                    &self.overrides,
+                    &self.options.exclude,
+                )?
+                .context
+            }
         };
         if validation
             .project_file
@@ -1459,7 +1470,8 @@ impl Workspace {
     }
 }
 
-fn build_context_info(project_uri: &Url, context: &ProjectContext) -> BuildContextInfo {
+fn build_context_info(project_uri: &Url, project: &DiscoveredProject) -> BuildContextInfo {
+    let context = &project.context;
     let rtl_constants = &context.conditional_closure;
     BuildContextInfo {
         project_uri: canonical_file_uri(project_uri),
@@ -1483,7 +1495,7 @@ fn build_context_info(project_uri: &Url, context: &ProjectContext) -> BuildConte
                 names: rtl_constants.rtl_constants.clone().unwrap_or_default(),
             },
         },
-        warnings: context.warnings.clone(),
+        warnings: project.observations.warnings.clone(),
     }
 }
 

@@ -31,7 +31,7 @@ fn resolve(dir: &std::path::Path, text: &str) -> pascal_core::ResolvedProject {
         ..ProjectOptions::default()
     };
     let mut ctx = ProjectContext::discover(&path, &[dir.into()], &project_options).unwrap();
-    ctx.conditional_context = context();
+    ctx.context.conditional_context = context();
     let sites = text
         .find("uses Types")
         .map(|start| pascal_core::ImportSite {
@@ -42,7 +42,7 @@ fn resolve(dir: &std::path::Path, text: &str) -> pascal_core::ResolvedProject {
         .into_iter()
         .collect::<Vec<_>>();
     UnitResolver::new(
-        ctx,
+        ctx.context,
         vec![dir.into()],
         FilesystemSourceStore::new(),
         ResolverLimits::default(),

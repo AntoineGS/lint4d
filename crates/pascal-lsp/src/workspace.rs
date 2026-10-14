@@ -19,10 +19,11 @@ pub(crate) use pascal_project::content_hash_bytes;
 use pascal_project::delphi_overrides::{EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession};
 use pascal_project::{
     BuildChoice, BuildSelectionMode, CompilerVersion, ConditionalContext, ConditionalFact,
-    ConstantValue, MetadataObservation, PackageMetadata, ProjectCandidateMembership,
-    ProjectCandidates, ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry,
-    ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ProjectSelections,
-    ProjectWorkBudget, ReadPolicy, SystemPasSearchObservation, discover_with_selections,
+    ConstantValue, DiscoveredProject, MetadataObservation, PackageMetadata,
+    ProjectCandidateMembership, ProjectCandidates, ProjectContext, ProjectDiscovery,
+    ProjectObservations, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ProjectWorkBudget, ReadPolicy,
+    SystemPasSearchObservation, discover_with_selections,
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths,
@@ -2221,6 +2222,7 @@ pub(crate) struct LegacyRouteProof {
 #[derive(Debug, Default)]
 pub(crate) struct ContextState {
     context: ProjectContext,
+    context_observations: ProjectObservations,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
@@ -2235,6 +2237,7 @@ impl Clone for ContextState {
     fn clone(&self) -> Self {
         Self {
             context: self.context.clone(),
+            context_observations: self.context_observations.clone(),
             watched_paths: self.watched_paths.clone(),
             project_candidate_memberships: self.project_candidate_memberships.clone(),
             project_read_observations: self.project_read_observations.clone(),
@@ -2248,6 +2251,7 @@ impl PartialEq for ContextState {
     /// against the current directory stamp, so it does not distinguish states.
     fn eq(&self, other: &Self) -> bool {
         self.context == other.context
+            && self.context_observations == other.context_observations
             && self.watched_paths == other.watched_paths
             && self.project_candidate_memberships == other.project_candidate_memberships
             && self.project_read_observations == other.project_read_observations
@@ -2269,6 +2273,7 @@ impl ContextState {
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         self.context.visit_recovery_payload(visit)?;
+        self.context_observations.visit_recovery_payload(visit)?;
         for path in self.watched_paths.keys() {
             visit(path.as_os_str().len())?;
         }
@@ -2302,34 +2307,38 @@ impl ContextState {
                 .entry(path.clone())
                 .or_insert_with(|| membership.clone());
         }
-        for path in &retained.context.metadata_files {
+        for path in &retained.context_observations.metadata_files {
             if !self
-                .context
+                .context_observations
                 .metadata_files
                 .iter()
                 .any(|existing| paths_equal_ci(existing, path))
             {
-                self.context.metadata_files.push(path.clone());
+                self.context_observations.metadata_files.push(path.clone());
             }
         }
-        for observation in &retained.context.metadata_observations {
+        for observation in &retained.context_observations.metadata_observations {
             if !self
-                .context
+                .context_observations
                 .metadata_observations
                 .iter()
                 .any(|existing| existing == observation)
             {
-                self.context.metadata_observations.push(observation.clone());
+                self.context_observations
+                    .metadata_observations
+                    .push(observation.clone());
             }
         }
-        for search in &retained.context.system_pas_searches {
+        for search in &retained.context_observations.system_pas_searches {
             if !self
-                .context
+                .context_observations
                 .system_pas_searches
                 .iter()
                 .any(|existing| existing == search)
             {
-                self.context.system_pas_searches.push(search.clone());
+                self.context_observations
+                    .system_pas_searches
+                    .push(search.clone());
             }
         }
     }
@@ -2972,6 +2981,7 @@ struct SharedLintRequest<'a> {
     config: &'a lint4d::config::Config,
     context_key: &'a ContextKey,
     context: &'a ProjectContext,
+    context_observations: &'a ProjectObservations,
     cancel: &'a AtomicBool,
 }
 
@@ -6293,9 +6303,14 @@ impl Workspace {
             installation_selections: self.installation_selections.clone(),
             build_selections: self.build_selections.clone(),
         };
-        let (context_key, context) =
-            self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
-        if has_invalid_project_selection(&context) {
+        let (
+            context_key,
+            DiscoveredProject {
+                context,
+                observations: context_observations,
+            },
+        ) = self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
+        if has_invalid_project_selection(&context_observations) {
             return Err(format!(
                 "project selection is invalid; select a current project or Automatic for {uri}"
             ));
@@ -6694,12 +6709,17 @@ impl Workspace {
             ));
         }
         let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
-        let context = self
+        let (context, invalid_selection) = self
             .contexts
             .get(&context_key)
-            .map(|state| state.context.clone())
+            .map(|state| {
+                (
+                    state.context.clone(),
+                    has_invalid_project_selection(&state.context_observations),
+                )
+            })
             .ok_or_else(|| format!("project context was not retained for {uri}"))?;
-        if has_invalid_project_selection(&context) {
+        if invalid_selection {
             return Err(format!(
                 "project selection is invalid; select a current project or Automatic for {uri}"
             ));
@@ -7089,10 +7109,10 @@ impl Workspace {
             .get(uri)
             .cloned()
             .unwrap_or_else(|| context_key.clone());
-        let Some(context) = self
+        let Some((context, context_observations)) = self
             .contexts
             .get(&effective_context_key)
-            .map(|state| state.context.clone())
+            .map(|state| (state.context.clone(), state.context_observations.clone()))
         else {
             return Ok(Vec::new());
         };
@@ -7213,6 +7233,7 @@ impl Workspace {
                     let input = self.analysis_input();
                     let mut resolver = resolver::resolver_for_context_with_session_cache(
                         context.clone(),
+                        &context_observations,
                         input.roots.clone(),
                         &input,
                         resolver_session_cache,
@@ -7318,7 +7339,7 @@ impl Workspace {
                     *location = compile_time::selected_import_header(
                         self,
                         uri,
-                        (&effective_context_key, &context),
+                        (&effective_context_key, &context, &context_observations),
                         (&dependency.source, binding),
                         &report,
                         legacy_route.as_ref(),
@@ -9366,7 +9387,7 @@ impl Workspace {
             .map(|context| resolver::report_records(context, report))
             .unwrap_or_default();
         if let Some(state) = self.contexts.get_mut(context_key) {
-            resolver::merge_report_into_context(&mut state.context, report);
+            resolver::merge_report_into_context(&mut state.context_observations, report);
             merge_project_read_observations(
                 &mut state.project_read_observations,
                 report
@@ -9707,12 +9728,13 @@ impl Workspace {
         };
         let ProjectDiscovery {
             context,
+            context_observations,
             observations,
             candidate_memberships,
             project_selection,
             project_scope,
         } = discovery;
-        for warning in context.warnings.iter().cloned() {
+        for warning in context_observations.warnings.iter().cloned() {
             self.warn(warning);
         }
         let key = self.context_key_for_project_discovery(
@@ -9725,6 +9747,7 @@ impl Workspace {
         self.install_context(
             key.clone(),
             context,
+            context_observations,
             observations,
             candidate_memberships,
             &path,
@@ -9778,6 +9801,7 @@ impl Workspace {
         self.install_context(
             key.clone(),
             discovery.context,
+            discovery.context_observations,
             discovery.observations,
             discovery.candidate_memberships,
             path,
@@ -9832,10 +9856,11 @@ impl Workspace {
                     warnings.push(error);
                 }
                 let discovery = ProjectDiscovery {
-                    context: ProjectContext {
+                    context: ProjectContext::default(),
+                    context_observations: ProjectObservations {
                         metadata_files: vec![selected.to_path_buf()],
                         warnings,
-                        ..ProjectContext::default()
+                        ..ProjectObservations::default()
                     },
                     observations: Vec::new(),
                     candidate_memberships: HashMap::new(),
@@ -9962,7 +9987,7 @@ impl Workspace {
         path: &Path,
         roots: &[PathBuf],
         project_options: &ProjectOptions,
-    ) -> Result<(ContextKey, ProjectContext), String> {
+    ) -> Result<(ContextKey, DiscoveredProject), String> {
         if let Some(owner) = self.document_owners.get(uri)
             && owner.origin != OwnerOrigin::Automatic
             && !owner.follow_current_project_file
@@ -9971,13 +9996,25 @@ impl Workspace {
             if !owner.needs_revalidation
                 && self.context_state_is_fresh_with_open_documents(&owner.state, None, None)?
             {
-                return Ok((owner.key.clone(), owner.state.context.clone()));
+                return Ok((
+                    owner.key.clone(),
+                    DiscoveredProject {
+                        context: owner.state.context.clone(),
+                        observations: owner.state.context_observations.clone(),
+                    },
+                ));
             }
-            let discovery =
+            let (key, discovery) =
                 self.rediscover_known_owner(path, owner, roots, project_options, None, None)?;
-            return Ok((discovery.0, discovery.1.context));
+            return Ok((
+                key,
+                DiscoveredProject {
+                    context: discovery.context,
+                    observations: discovery.context_observations,
+                },
+            ));
         }
-        let context = discover_with_selections(
+        let project = discover_with_selections(
             path,
             roots,
             project_options,
@@ -9985,8 +10022,8 @@ impl Workspace {
             &self.overrides,
             &self.options.exclude,
         )?;
-        let key = self.context_key_for_path(path, Some(&context));
-        Ok((key, context))
+        let key = self.context_key_for_path(path, Some(&project.context));
+        Ok((key, project))
     }
 
     fn known_owner_selection_is_current(&self, path: &Path, owner: &KnownDocumentOwner) -> bool {
@@ -10420,13 +10457,14 @@ impl Workspace {
         &mut self,
         key: ContextKey,
         context: ProjectContext,
+        context_observations: ProjectObservations,
         observations: Vec<ProjectReadObservation>,
         mut candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
         file: &Path,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
-        let initial_metadata_count = context.metadata_files.len()
+        let initial_metadata_count = context_observations.metadata_files.len()
             + usize::from(context.project_file.is_some())
             + usize::from(context.main_source.is_some());
         if let Some(budget) = budget {
@@ -10437,7 +10475,7 @@ impl Workspace {
         metadata
             .try_reserve(initial_metadata_count)
             .map_err(|error| format!("could not reserve project metadata paths: {error}"))?;
-        for path in &context.metadata_files {
+        for path in &context_observations.metadata_files {
             check_workspace_cancel(cancel)?;
             metadata.push(path.clone());
         }
@@ -10605,6 +10643,7 @@ impl Workspace {
         }
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
+            state.context_observations = context_observations;
             state.project_read_observations = staged_observations;
             state.watched_paths.extend(staged_watched);
             state.project_candidate_memberships = staged_memberships;
@@ -10618,6 +10657,7 @@ impl Workspace {
                 key,
                 ContextState {
                     context,
+                    context_observations,
                     watched_paths: staged_watched,
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
@@ -10799,7 +10839,7 @@ impl Workspace {
     fn context_has_invalid_project_selection(&self, key: &ContextKey) -> bool {
         self.contexts
             .get(key)
-            .is_some_and(|state| has_invalid_project_selection(&state.context))
+            .is_some_and(|state| has_invalid_project_selection(&state.context_observations))
     }
 
     fn context_has_override_error(&self, key: &ContextKey) -> bool {
@@ -10944,7 +10984,7 @@ impl Workspace {
                     })?;
                     context_sources.push(main_source.clone());
                 }
-                for path in &state.context.metadata_files {
+                for path in &state.context_observations.metadata_files {
                     check_workspace_cancel(cancel)?;
                     if let Some(budget) = budget {
                         budget.charge_path_visits(1)?;
@@ -12138,15 +12178,15 @@ impl Workspace {
             .try_reserve(paths.len())
             .map_err(|error| format!("could not reserve package watch updates: {error}"))?;
         if let Some(budget) = budget {
-            budget.charge_path_visits(state.context.metadata_files.len())?;
+            budget.charge_path_visits(state.context_observations.metadata_files.len())?;
         }
-        charge_path_key_bytes(&state.context.metadata_files, cancel, budget)?;
+        charge_path_key_bytes(&state.context_observations.metadata_files, cancel, budget)?;
         charge_path_key_bytes(paths, cancel, budget)?;
         let mut metadata_index = HashSet::new();
         metadata_index
-            .try_reserve(state.context.metadata_files.len())
+            .try_reserve(state.context_observations.metadata_files.len())
             .map_err(|error| format!("could not reserve package metadata index: {error}"))?;
-        for existing in &state.context.metadata_files {
+        for existing in &state.context_observations.metadata_files {
             check_workspace_cancel(cancel)?;
             metadata_index.insert(path_ci_lookup_key(existing));
         }
@@ -12192,7 +12232,7 @@ impl Workspace {
             budget,
         )?;
         let staged_metadata = merge_metadata_observations_indexed(
-            &state.context.metadata_observations,
+            &state.context_observations.metadata_observations,
             &lookup.metadata_observations,
             cancel,
             budget,
@@ -12209,7 +12249,7 @@ impl Workspace {
                 .get_mut(context_key)
                 .expect("context retained during package lookup");
             state
-                .context
+                .context_observations
                 .metadata_files
                 .try_reserve(prepared_watches.len())
                 .map_err(|error| format!("could not reserve package metadata files: {error}"))?;
@@ -12229,12 +12269,15 @@ impl Workspace {
             .get_mut(context_key)
             .expect("context retained during package lookup");
         state.project_read_observations = staged_reads;
-        state.context.metadata_observations = staged_metadata;
+        state.context_observations.metadata_observations = staged_metadata;
         for watch in prepared_watches {
             if !watch.metadata_known
                 && (extension_is(&watch.path, "dpk") || extension_is(&watch.path, "dproj"))
             {
-                state.context.metadata_files.push(watch.path.clone());
+                state
+                    .context_observations
+                    .metadata_files
+                    .push(watch.path.clone());
             }
             if let Some(stamp) = watch.stamp {
                 state.watched_paths.entry(watch.path).or_insert(stamp);
@@ -13044,6 +13087,7 @@ impl Workspace {
                 self.install_context(
                     key.clone(),
                     discovery.context,
+                    discovery.context_observations,
                     discovery.observations,
                     discovery.candidate_memberships,
                     &path,
@@ -13765,12 +13809,17 @@ impl Workspace {
                     return Ok(single_diagnostic_publication(uri, None, Vec::new()));
                 }
                 let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
-                let context = self
+                let (context, invalid_selection) = self
                     .contexts
                     .get(&context_key)
-                    .map(|state| state.context.clone())
+                    .map(|state| {
+                        (
+                            state.context.clone(),
+                            has_invalid_project_selection(&state.context_observations),
+                        )
+                    })
                     .ok_or_else(|| format!("project context was not retained for {uri}"))?;
-                if has_invalid_project_selection(&context) {
+                if invalid_selection {
                     return Ok(single_diagnostic_publication(
                         uri,
                         None,
@@ -13861,12 +13910,12 @@ impl Workspace {
             ));
         }
         let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
-        let context = self
+        let (context, context_observations) = self
             .contexts
             .get(&context_key)
-            .map(|state| state.context.clone())
+            .map(|state| (state.context.clone(), state.context_observations.clone()))
             .ok_or_else(|| format!("project context was not retained for {uri}"))?;
-        if has_invalid_project_selection(&context) {
+        if has_invalid_project_selection(&context_observations) {
             return Ok(single_diagnostic_publication(
                 uri,
                 version,
@@ -13943,6 +13992,7 @@ impl Workspace {
             config: &config,
             context_key: &context_key,
             context: &context,
+            context_observations: &context_observations,
             cancel,
         })?;
         check_workspace_cancel(Some(cancel))?;
@@ -14146,6 +14196,7 @@ impl Workspace {
             config,
             context_key,
             context,
+            context_observations,
             cancel,
         } = request;
         check_workspace_cancel(Some(cancel))?;
@@ -14202,8 +14253,13 @@ impl Workspace {
         else {
             return Ok(run_file_local(lint_source, false));
         };
-        let mut resolver =
-            resolver::resolver_for_context(context.clone(), input.roots.clone(), &input, cancel);
+        let mut resolver = resolver::resolver_for_context(
+            context.clone(),
+            context_observations,
+            input.roots.clone(),
+            &input,
+            cancel,
+        );
         // An incomplete graph only selects the file-local fallback below, so
         // resolving the rest of the dependency closure is wasted work.
         resolver.stop_project_walk_when_incomplete(true);
@@ -14403,14 +14459,15 @@ impl Workspace {
                     }
                 };
             let context_key = self.context_for_uri_with_cancel(&root_uri, Some(cancel))?;
-            let Some(context) = self
-                .contexts
-                .get(&context_key)
-                .map(|state| state.context.clone())
-            else {
+            let Some((context, invalid_selection)) = self.contexts.get(&context_key).map(|state| {
+                (
+                    state.context.clone(),
+                    has_invalid_project_selection(&state.context_observations),
+                )
+            }) else {
                 continue;
             };
-            if has_invalid_project_selection(&context) || context.override_error.is_some() {
+            if invalid_selection || context.override_error.is_some() {
                 continue;
             }
             let expansion =
@@ -14882,13 +14939,13 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
 
-    for search in &state.context.system_pas_searches {
+    for search in &state.context_observations.system_pas_searches {
         if !system_pas_search_is_current(search, &state.system_pas_search_stamps, cancel, budget)? {
             return Ok(false);
         }
     }
 
-    for observation in &state.context.metadata_observations {
+    for observation in &state.context_observations.metadata_observations {
         check_workspace_cancel(cancel)?;
         let MetadataObservation::Payload { path, .. } = observation else {
             continue;
@@ -16009,6 +16066,23 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn context_states_differing_only_in_observations_are_not_equal() {
+        let state = |warnings: Vec<String>| ContextState {
+            context: ProjectContext::default(),
+            context_observations: pascal_project::ProjectObservations {
+                warnings,
+                ..Default::default()
+            },
+            watched_paths: HashMap::new(),
+            project_candidate_memberships: HashMap::new(),
+            project_read_observations: Vec::new(),
+            system_pas_search_stamps: Mutex::new(HashMap::new()),
+        };
+        assert!(state(Vec::new()) != state(vec!["warning".to_string()]));
+        assert!(state(vec!["warning".to_string()]) == state(vec!["warning".to_string()]));
+    }
+
+    #[test]
     fn normal_body_adapter_inherits_finite_measured_work_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("Dense.pas");
@@ -16117,6 +16191,7 @@ mod tests {
         let route = workspace.legacy_route_for_resolver(&uri, &main, &key, &context);
         let mut resolver = super::resolver::resolver_for_context(
             context.clone(),
+            &workspace.contexts[&key].context_observations,
             input.roots.clone(),
             &input,
             &cancel,
@@ -16279,8 +16354,13 @@ mod tests {
         let key = workspace.document_contexts[&uri].clone();
         let context = workspace.contexts[&key].context.clone();
         let input = workspace.analysis_input();
-        let mut resolver =
-            super::resolver::resolver_for_context(context, input.roots.clone(), &input, &cancel);
+        let mut resolver = super::resolver::resolver_for_context(
+            context,
+            &workspace.contexts[&key].context_observations,
+            input.roots.clone(),
+            &input,
+            &cancel,
+        );
         let root = resolver
             .load_source(&dense, None, pascal_core::SourceKind::Unit, &cancel)
             .unwrap();
@@ -16584,9 +16664,9 @@ mod tests {
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
     use pascal_project::{
-        CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
-        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-        ProjectReadObservation, ProjectReadStamp, ReadPolicy,
+        CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, DiscoveredProject,
+        MetadataObservation, ProjectContext, ProjectObservations, ProjectOptions, ProjectPathEntry,
+        ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ReadPolicy,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -22355,6 +22435,7 @@ BDS = '/fake/37'
             .install_context(
                 key.clone(),
                 ProjectContext::default(),
+                ProjectObservations::default(),
                 Vec::new(),
                 HashMap::new(),
                 &first,
@@ -22374,8 +22455,8 @@ BDS = '/fake/37'
         let state = workspace.contexts.get(&key).expect("context retained");
         assert!(!state.watched_paths.contains_key(&first));
         assert!(!state.watched_paths.contains_key(&second));
-        assert!(!state.context.metadata_files.contains(&first));
-        assert!(!state.context.metadata_files.contains(&second));
+        assert!(!state.context_observations.metadata_files.contains(&first));
+        assert!(!state.context_observations.metadata_files.contains(&second));
     }
 
     #[test]
@@ -22406,6 +22487,7 @@ BDS = '/fake/37'
         let root = temp.path().to_path_buf();
         let state = super::ContextState {
             context: ProjectContext::default(),
+            context_observations: ProjectObservations::default(),
             watched_paths: HashMap::new(),
             project_candidate_memberships: HashMap::from([(
                 root.clone(),
@@ -22460,6 +22542,7 @@ BDS = '/fake/37'
             key,
             super::ContextState {
                 context: ProjectContext::default(),
+                context_observations: ProjectObservations::default(),
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
@@ -22539,9 +22622,9 @@ BDS = '/fake/37'
                 content_bytes: None,
             })
             .collect::<Vec<_>>();
-        let context = ProjectContext {
+        let context_observations = ProjectObservations {
             metadata_files: paths,
-            ..ProjectContext::default()
+            ..ProjectObservations::default()
         };
         let key = ContextKey {
             installation_id: None,
@@ -22564,7 +22647,8 @@ BDS = '/fake/37'
         workspace
             .install_context(
                 key.clone(),
-                context,
+                ProjectContext::default(),
+                context_observations,
                 observations,
                 HashMap::new(),
                 &source,
@@ -22617,6 +22701,7 @@ BDS = '/fake/37'
             .install_context(
                 key.clone(),
                 ProjectContext::default(),
+                ProjectObservations::default(),
                 Vec::new(),
                 HashMap::new(),
                 &source,
@@ -22655,9 +22740,14 @@ BDS = '/fake/37'
         assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
         let state = workspace.contexts.get(&key).expect("context remains");
         assert!(state.project_read_observations.is_empty());
-        assert!(state.context.metadata_observations.is_empty());
+        assert!(state.context_observations.metadata_observations.is_empty());
         assert!(!state.watched_paths.contains_key(&package_path));
-        assert!(!state.context.metadata_files.contains(&package_path));
+        assert!(
+            !state
+                .context_observations
+                .metadata_files
+                .contains(&package_path)
+        );
     }
 
     #[test]
@@ -22690,9 +22780,10 @@ BDS = '/fake/37'
         workspace.contexts.insert(
             key.clone(),
             super::ContextState {
-                context: ProjectContext {
+                context: ProjectContext::default(),
+                context_observations: ProjectObservations {
                     metadata_files,
-                    ..ProjectContext::default()
+                    ..ProjectObservations::default()
                 },
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
@@ -22800,6 +22891,7 @@ BDS = '/fake/37'
             key,
             state: Arc::new(ContextState {
                 context: ProjectContext::default(),
+                context_observations: ProjectObservations::default(),
                 watched_paths: HashMap::new(),
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
@@ -23838,8 +23930,13 @@ BDS = '/fake/37'
             ..ProjectContext::default()
         };
         let cancel = AtomicBool::new(false);
-        let mut resolver =
-            super::resolver::resolver_for_context(context, vec![root], &input, &cancel);
+        let mut resolver = super::resolver::resolver_for_context(
+            context,
+            &ProjectObservations::default(),
+            vec![root],
+            &input,
+            &cancel,
+        );
         let outcome = resolver.resolve_unit(
             pascal_core::UnitResolveRequest {
                 requested_name: "Errors",
@@ -25380,7 +25477,7 @@ BDS = '/fake/37'
             .contexts
             .get(&first_key)
             .expect("initial context state")
-            .context;
+            .context_observations;
         assert!(
             first
                 .warnings
@@ -25449,14 +25546,14 @@ BDS = '/fake/37'
                 .with_compiler_version(CompilerVersion::new(35, 0)),
             ..ProjectOptions::default()
         };
-        let mut context = ProjectContext::discover_with_overrides(
+        let mut project = ProjectContext::discover_with_overrides(
             &main,
             &[root.to_path_buf()],
             &options,
             &OverrideSession::new(None),
         )
         .expect("project context");
-        assert!(context.metadata_observations.iter().any(|observation| {
+        assert!(project.observations.metadata_observations.iter().any(|observation| {
             matches!(observation, MetadataObservation::Payload { path, .. } if path == &system_pas)
         }));
 
@@ -25466,7 +25563,8 @@ BDS = '/fake/37'
         )
         .expect("updated System.pas with same length");
         let state = ContextState {
-            context: std::mem::take(&mut context),
+            context: std::mem::take(&mut project.context),
+            context_observations: std::mem::take(&mut project.observations),
             watched_paths: HashMap::from([(system_pas.clone(), super::path_stamp(&system_pas))]),
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
@@ -25504,20 +25602,24 @@ BDS = '/fake/37'
                 .with_compiler_version(CompilerVersion::new(35, 0)),
             ..ProjectOptions::default()
         };
-        let context = ProjectContext::discover_with_overrides(
+        let DiscoveredProject {
+            context,
+            observations,
+        } = ProjectContext::discover_with_overrides(
             &main,
             &[root.to_path_buf()],
             &options,
             &OverrideSession::new(None),
         )
         .expect("project context");
-        let watched_paths = context
+        let watched_paths = observations
             .metadata_files
             .iter()
             .map(|path| (path.clone(), super::path_stamp(path)))
             .collect();
         let state = ContextState {
             context,
+            context_observations: observations,
             watched_paths,
             ..ContextState::default()
         };
@@ -25558,7 +25660,10 @@ BDS = '/fake/37'
                 .with_compiler_version(CompilerVersion::new(35, 0)),
             ..ProjectOptions::default()
         };
-        let context = ProjectContext::discover_with_overrides(
+        let DiscoveredProject {
+            context,
+            observations,
+        } = ProjectContext::discover_with_overrides(
             &main,
             &[root.to_path_buf()],
             &options,
@@ -25567,6 +25672,7 @@ BDS = '/fake/37'
         .expect("project context");
         let state = ContextState {
             context,
+            context_observations: observations,
             ..ContextState::default()
         };
         let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
@@ -25963,15 +26069,16 @@ BDS = '/fake/37'
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
-        let context = ProjectContext {
+        let context_observations = ProjectObservations {
             metadata_files: vec![upper.clone(), lower.clone()],
-            ..ProjectContext::default()
+            ..ProjectObservations::default()
         };
 
         workspace
             .install_context(
                 key.clone(),
-                context,
+                ProjectContext::default(),
+                context_observations,
                 Vec::new(),
                 std::collections::HashMap::new(),
                 &source,

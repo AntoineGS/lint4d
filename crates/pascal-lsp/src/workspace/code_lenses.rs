@@ -236,7 +236,7 @@ pub(crate) fn discover(
         }
         Err(_) => return computed(&input, Ok(Vec::new()), Vec::new()),
     };
-    if has_invalid_project_selection(&owner.state.context)
+    if has_invalid_project_selection(&owner.state.context_observations)
         || owner.state.context.override_error.is_some()
         || !input_source_is_readable_with_owner(&input, &uri, &owner)
     {

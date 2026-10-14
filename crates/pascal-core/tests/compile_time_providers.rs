@@ -294,8 +294,9 @@ fn filesystem_resolver_imported_ordinal_arrays_are_known() {
         "unit Other; interface type E=(One,Two,Three); R=-2..0; RA=R; implementation end.",
     )
     .unwrap();
-    let mut cx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let mut cx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     cx.conditional_context = context(LayoutPlatform::Win32);
     let mut resolver = UnitResolver::new(
         cx,

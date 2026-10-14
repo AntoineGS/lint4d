@@ -19,7 +19,7 @@ use pascal_core::parser::{node_text, parse_file};
 use pascal_core::resolver::{
     FilesystemSourceStore, ImportSection, ImportSite, NoCancellation, ResolverLimits, UnitResolver,
 };
-use pascal_project::{ConditionalFact, ProjectContext, ProjectOptions};
+use pascal_project::{ConditionalFact, DiscoveredProject, ProjectContext, ProjectOptions};
 use rayon::prelude::*;
 
 /// Exit codes
@@ -532,7 +532,7 @@ fn discover_source_files(cli: &LintArgs, config: &Config) -> Vec<FileInfo> {
 
 #[derive(Debug, Clone)]
 struct SourceProject {
-    context: ProjectContext,
+    project: DiscoveredProject,
     roots: Vec<PathBuf>,
     configuration_id: String,
 }
@@ -550,11 +550,12 @@ fn lint_project_file(
     let sites = resolver_import_sites(tree.root_node(), source);
     let path = lexical_absolute(&file.path);
     let mut resolver = UnitResolver::new(
-        source_project.context.clone(),
+        source_project.project.context.clone(),
         source_project.roots.clone(),
         FilesystemSourceStore::new(),
         ResolverLimits::default(),
-    );
+    )
+    .with_context_observations(&source_project.project.observations);
     let project = match resolver.resolve_project_from_source(
         &path,
         &unit_name,
@@ -572,7 +573,10 @@ fn lint_project_file(
             return None;
         }
     };
-    let conditional_context = source_project.context.effective_conditional_context();
+    let conditional_context = source_project
+        .project
+        .context
+        .effective_conditional_context();
     let options = CfgSnapshotOptions {
         prepare_configured_sources: true,
         configuration_id: Some(source_project.configuration_id.clone()),
@@ -678,8 +682,8 @@ fn resolve_source_project(
         .first()
         .map(|file| lexical_absolute(&file.path))
         .unwrap_or_else(|| root.join("__lint4d_project_probe__.pas"));
-    let context = match ProjectContext::discover(&probe, std::slice::from_ref(&root), &options) {
-        Ok(context) => context,
+    let project = match ProjectContext::discover(&probe, std::slice::from_ref(&root), &options) {
+        Ok(project) => project,
         Err(error) => {
             eprintln!(
                 "lint4d: warning: source project discovery failed for {}: {}; using file-local CFG",
@@ -689,16 +693,16 @@ fn resolve_source_project(
             return None;
         }
     };
-    for warning in &context.warnings {
+    for warning in &project.observations.warnings {
         eprintln!("lint4d: warning: {warning}");
     }
     let configuration_id = format!(
         "config={};platform={}",
-        context.config.as_deref().unwrap_or_default(),
-        context.platform.as_deref().unwrap_or_default()
+        project.context.config.as_deref().unwrap_or_default(),
+        project.context.platform.as_deref().unwrap_or_default()
     );
     Some(SourceProject {
-        context,
+        project,
         roots: vec![root],
         configuration_id,
     })

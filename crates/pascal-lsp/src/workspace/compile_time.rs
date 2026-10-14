@@ -403,13 +403,17 @@ fn header_position(
 pub(super) fn selected_import_header(
     workspace: &mut Workspace,
     importer: &Url,
-    owning_context: (&ContextKey, &pascal_project::ProjectContext),
+    owning_context: (
+        &ContextKey,
+        &pascal_project::ProjectContext,
+        &pascal_project::ProjectObservations,
+    ),
     selected_site: (&LoadedSource, &pascal_core::ResolvedImport),
     selection_report: &pascal_core::ResolutionReport,
     route: Option<&pascal_core::LegacyRoute>,
     cancel: &AtomicBool,
 ) -> Result<Option<lsp_types::Location>, String> {
-    let (key, context) = owning_context;
+    let (key, context, context_observations) = owning_context;
     let (selected, binding) = selected_site;
     use pascal_core::compile_time::{
         CompileTimeLimits, Fact, HEADER_MAX_BRANCH_STATES, HEADER_MAX_BYTE_WORK,
@@ -427,6 +431,7 @@ pub(super) fn selected_import_header(
         lsp_compatibility_retention(input.options.limits, workspace.include_expansion_limits());
     let mut resolver = super::resolver::resolver_for_context_with_limits(
         context.clone(),
+        context_observations,
         input.roots.clone(),
         &input,
         limits,
@@ -751,12 +756,11 @@ pub(super) fn expand_with_limits(
             errors: vec![],
         });
     }
-    let context = workspace
+    let state = workspace
         .contexts
         .get(key)
-        .ok_or("project context was not retained")?
-        .context
-        .clone();
+        .ok_or("project context was not retained")?;
+    let context = state.context.clone();
     let input = workspace.analysis_input();
     let source_hash = if input.overlays.contains_key(uri) {
         crate::project_cache::overlay_content_hash(source)
@@ -810,7 +814,8 @@ pub(super) fn expand_with_limits(
         workspace.workspace_root_paths(),
         store,
         resolver_limits,
-    );
+    )
+    .with_context_observations(&state.context_observations);
     let root = control.finish(resolver.load_source(
         &path,
         route.as_ref(),

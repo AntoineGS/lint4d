@@ -67,8 +67,9 @@ fn include_r18_first_hit_has_no_loaded_source_candidate_vec_allocation() {
     let root = dir.path().join("Main.pas");
     std::fs::write(&root, "unit Main;").unwrap();
     std::fs::write(dir.path().join("body.inc"), "{body}").unwrap();
-    let context =
-        ProjectContext::discover(&root, &[dir.path().into()], &Default::default()).unwrap();
+    let context = ProjectContext::discover(&root, &[dir.path().into()], &Default::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         context,
         vec![dir.path().into()],
@@ -171,8 +172,9 @@ fn task9_b_overlay_directory_refuses_before_unrelated_path_copy() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("Root.pas");
     std::fs::write(&root, "unit Root; interface implementation end.").unwrap();
-    let ctx =
-        ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let ctx = ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut store = FilesystemSourceStore::new();
     store.insert_overlay(dir.path().join("X".repeat(100_000)), 1, &b"ignored"[..]);
     let mut resolver = UnitResolver::new(
@@ -231,8 +233,9 @@ fn task9_b_provider_payload_refuses_before_physical_read_or_decode() {
         ),
     )
     .unwrap();
-    let ctx =
-        ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let ctx = ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -324,8 +327,9 @@ fn fix2_i3b_large_caller_sites_refuse_before_clones_or_child_provider_reads() {
     )
     .unwrap();
     std::fs::write(dir.path().join("forbidden.inc"), "{forbidden}").unwrap();
-    let ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -384,8 +388,9 @@ fn fix2_i3b_cached_parsed_root_sites_refuse_before_vector_copy() {
         names.join(",")
     );
     std::fs::write(&path, &text).unwrap();
-    let ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],

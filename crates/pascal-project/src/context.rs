@@ -153,103 +153,13 @@ pub struct ProjectContext {
     /// Package exports are resolved lazily and are not merged into the unit
     /// search paths or the project-wide unit index.
     pub packages: Vec<String>,
-    /// Project, main-source, imported option-set, and automatic-selection
-    /// candidate files used to build the context. Consumers can revalidate
-    /// these paths without rediscovering or reparsing unrelated source files.
-    pub metadata_files: Vec<PathBuf>,
     /// Exact selected installation environment and imported IDE XML files
     /// consumed while constructing this context.
     pub installation_config_files: Vec<PathBuf>,
-    /// Ordered System.pas directory lookups used to derive RTL constants.
-    pub system_pas_searches: Vec<SystemPasSearchObservation>,
-    /// The authorization provenance for each metadata observation. A path in
-    /// `metadata_files` without a payload observation is stat-only.
-    pub metadata_observations: Vec<MetadataObservation>,
-    pub warnings: Vec<String>,
     pub override_error: Option<String>,
 }
 
 impl ProjectContext {
-    /// Equality without the observations that import resolution appends to a
-    /// worker's copy of a context as it reads project files
-    /// (`metadata_files`, `metadata_observations`, `warnings`). Workers that
-    /// resolved different imports under one project then still agree, while
-    /// every field that shapes parsing or resolution must match.
-    pub fn same_analysis_inputs(&self, other: &Self) -> bool {
-        // Destructured so that a new field must be classified here.
-        let Self {
-            discovery_complete,
-            binding_metadata_complete,
-            path_issues,
-            project_file,
-            installation_evidence,
-            installation_selection,
-            main_source,
-            search_paths,
-            search_path_entries,
-            browsing_path_entries,
-            debug_dcu_path_entries,
-            main_source_entry,
-            explicit_unit_entries,
-            include_paths,
-            include_path_entries,
-            explicit_units,
-            unit_namespaces,
-            unit_aliases,
-            defines,
-            conditional_context,
-            conditional_closure,
-            library_conditional_context,
-            project_source_roots,
-            config,
-            platform,
-            config_selection,
-            platform_selection,
-            overrides,
-            read_policy,
-            packages,
-            metadata_files: _,
-            installation_config_files,
-            system_pas_searches,
-            metadata_observations: _,
-            warnings: _,
-            override_error,
-        } = self;
-        *discovery_complete == other.discovery_complete
-            && *binding_metadata_complete == other.binding_metadata_complete
-            && *path_issues == other.path_issues
-            && *project_file == other.project_file
-            && *installation_evidence == other.installation_evidence
-            && *installation_selection == other.installation_selection
-            && *main_source == other.main_source
-            && *search_paths == other.search_paths
-            && *search_path_entries == other.search_path_entries
-            && *browsing_path_entries == other.browsing_path_entries
-            && *debug_dcu_path_entries == other.debug_dcu_path_entries
-            && *main_source_entry == other.main_source_entry
-            && *explicit_unit_entries == other.explicit_unit_entries
-            && *include_paths == other.include_paths
-            && *include_path_entries == other.include_path_entries
-            && *explicit_units == other.explicit_units
-            && *unit_namespaces == other.unit_namespaces
-            && *unit_aliases == other.unit_aliases
-            && *defines == other.defines
-            && *conditional_context == other.conditional_context
-            && *conditional_closure == other.conditional_closure
-            && *library_conditional_context == other.library_conditional_context
-            && *project_source_roots == other.project_source_roots
-            && *config == other.config
-            && *platform == other.platform
-            && *config_selection == other.config_selection
-            && *platform_selection == other.platform_selection
-            && *overrides == other.overrides
-            && *read_policy == other.read_policy
-            && *packages == other.packages
-            && *installation_config_files == other.installation_config_files
-            && *system_pas_searches == other.system_pas_searches
-            && *override_error == other.override_error
-    }
-
     pub fn can_resolve_units(&self) -> bool {
         self.discovery_complete || self.binding_metadata_complete
     }
@@ -369,18 +279,6 @@ impl ProjectContext {
         for package in &self.packages {
             visit(package.len())?;
         }
-        for path in &self.metadata_files {
-            visit(path.as_os_str().len())?;
-        }
-        for search in &self.system_pas_searches {
-            visit(search.directory.as_os_str().len())?;
-            if let Some(path) = &search.selected_path {
-                visit(path.as_os_str().len())?;
-            }
-        }
-        for observation in &self.metadata_observations {
-            observation.visit_recovery_payload(visit)?;
-        }
         for issue in &self.path_issues {
             visit(issue.source_file.as_os_str().len())?;
             visit(issue.property.len())?;
@@ -394,9 +292,6 @@ impl ProjectContext {
             if let ProjectPathProvenance::Mapped { root } = &issue.provenance {
                 visit(root.as_os_str().len())?;
             }
-        }
-        for warning in &self.warnings {
-            visit(warning.len())?;
         }
         if let Some(error) = &self.override_error {
             visit(error.len())?;
@@ -585,7 +480,7 @@ impl ProjectContext {
         file: &Path,
         workspace_roots: &[PathBuf],
         options: &ProjectOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<DiscoveredProject, String> {
         let (overrides, warnings) = production_override_session();
         discover_context_with_selections(
             file,
@@ -599,7 +494,10 @@ impl ProjectContext {
             None,
             &[],
         )
-        .map(|discovery| discovery.context)
+        .map(|discovery| DiscoveredProject {
+            context: discovery.context,
+            observations: discovery.context_observations,
+        })
     }
 
     /// Discover a project context using an explicitly captured override
@@ -609,7 +507,7 @@ impl ProjectContext {
         workspace_roots: &[PathBuf],
         options: &ProjectOptions,
         overrides: &OverrideSession,
-    ) -> Result<Self, String> {
+    ) -> Result<DiscoveredProject, String> {
         discover_context_with_selections(
             file,
             workspace_roots,
@@ -622,7 +520,10 @@ impl ProjectContext {
             None,
             &[],
         )
-        .map(|discovery| discovery.context)
+        .map(|discovery| DiscoveredProject {
+            context: discovery.context,
+            observations: discovery.context_observations,
+        })
     }
 }
 
@@ -686,32 +587,41 @@ mod tests {
     }
 
     #[test]
-    fn same_analysis_inputs_ignores_only_recorded_observations() {
+    fn equality_is_by_analysis_inputs_and_observations_stay_outside() {
         let base = ProjectContext {
             project_file: Some("A.dproj".into()),
             defines: vec!["DEBUG".to_string()],
             ..ProjectContext::default()
         };
-        let observed = ProjectContext {
-            metadata_files: vec!["Unit.pas".into()],
-            metadata_observations: vec![MetadataObservation::Stat {
-                path: "Unit.pas".into(),
-            }],
-            warnings: vec!["warning".to_string()],
-            ..base.clone()
+        let observed = DiscoveredProject {
+            context: base.clone(),
+            observations: ProjectObservations {
+                metadata_files: vec!["Unit.pas".into()],
+                metadata_observations: vec![MetadataObservation::Stat {
+                    path: "Unit.pas".into(),
+                }],
+                warnings: vec!["warning".to_string()],
+                system_pas_searches: Vec::new(),
+            },
         };
-        assert!(base.same_analysis_inputs(&observed));
-        assert!(observed.same_analysis_inputs(&base));
+        assert_eq!(base, observed.context);
+        assert_ne!(
+            observed,
+            DiscoveredProject {
+                context: base.clone(),
+                observations: ProjectObservations::default(),
+            }
+        );
 
         let other_defines = ProjectContext {
             defines: vec!["RELEASE".to_string()],
-            ..observed.clone()
+            ..base.clone()
         };
         let other_includes = ProjectContext {
             include_paths: vec!["inc".into()],
-            ..observed
+            ..base.clone()
         };
-        assert!(!base.same_analysis_inputs(&other_defines));
-        assert!(!base.same_analysis_inputs(&other_includes));
+        assert_ne!(base, other_defines);
+        assert_ne!(base, other_includes);
     }
 }

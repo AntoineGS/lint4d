@@ -7,7 +7,9 @@ use pascal_core::{
 use pascal_project::{ProjectContext, ProjectOptions};
 
 fn context(root: &std::path::Path, dir: &std::path::Path) -> ProjectContext {
-    ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default()).unwrap()
+    ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default())
+        .unwrap()
+        .context
 }
 
 #[test]

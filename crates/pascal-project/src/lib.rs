@@ -104,6 +104,8 @@ pub use context::{
     ProjectSelections,
 };
 mod context;
+pub use observations::{DiscoveredProject, ProjectObservations};
+mod observations;
 pub use selection::{
     discover, discover_with_selections,
     discover_with_selections_and_observations_with_cancel_and_overrides,

@@ -39,8 +39,8 @@ use pascal_core::resolver::{
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
     BuildChoice, ConditionalContext, MetadataObservation, ProjectCandidateMembership,
-    ProjectContext, ProjectDiscoveryCacheScope, ProjectPathEntry, ProjectPathProvenance,
-    ProjectSelections, ReadPolicy, has_invalid_project_selection,
+    ProjectContext, ProjectDiscoveryCacheScope, ProjectObservations, ProjectPathEntry,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -1156,9 +1156,13 @@ impl Enumeration {
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
                 // Most sources revisit an unchanged context; only differing
-                // contexts need the observation-insensitive comparison.
-                if entry.get().context != state.context
-                    && !evaluated_contexts_equal(&entry.get().context, &state.context)
+                // contexts need the legacy-root-insensitive comparison. Of
+                // the observations, only System.pas lookups must agree.
+                let retained = entry.get();
+                if (retained.context != state.context
+                    && !evaluated_contexts_equal(&retained.context, &state.context))
+                    || retained.context_observations.system_pas_searches
+                        != state.context_observations.system_pas_searches
                 {
                     self.complete = false;
                     self.reason.get_or_insert_with(|| {
@@ -1208,15 +1212,6 @@ impl Enumeration {
 fn evaluated_contexts_equal(left: &ProjectContext, right: &ProjectContext) -> bool {
     let mut left = left.clone();
     let mut right = right.clone();
-    // These fields are observations accumulated while reading, not evaluated
-    // project state. They may legitimately grow as a snapshot discovers more
-    // metadata, while changed search paths/overrides must invalidate it.
-    left.metadata_files.clear();
-    left.metadata_observations.clear();
-    left.warnings.clear();
-    right.metadata_files.clear();
-    right.metadata_observations.clear();
-    right.warnings.clear();
     normalize_standalone_legacy_roots(&mut left);
     normalize_standalone_legacy_roots(&mut right);
     left == right
@@ -2390,7 +2385,7 @@ pub(crate) fn source_for_input_with_owner(
         .to_file_path()
         .map(absolute_path)
         .map_err(|_| format!("not a file URI: {uri}"))?;
-    if has_invalid_project_selection(&owner.state.context) {
+    if has_invalid_project_selection(&owner.state.context_observations) {
         return Err(format!(
             "project selection is invalid; select a current project or Automatic for {uri}"
         ));
@@ -2859,6 +2854,15 @@ pub(crate) fn project_context_and_metadata_for_input(
     uri: &Url,
     cancel: &AtomicBool,
 ) -> Result<(ProjectContext, Vec<SourceRecord>), String> {
+    project_state_and_metadata_for_input(input, uri, cancel)
+        .map(|(state, records)| (state.context, records))
+}
+
+fn project_state_and_metadata_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<(ContextState, Vec<SourceRecord>), String> {
     let mut workspace = Workspace::from_analysis_input(input);
     let context_key = workspace.context_for_uri_with_cancel(uri, Some(cancel))?;
     let state = workspace
@@ -2867,7 +2871,7 @@ pub(crate) fn project_context_and_metadata_for_input(
         .cloned()
         .ok_or_else(|| format!("project context was not retained for {uri}"))?;
     let records = consumed_context_records(&state, cancel)?;
-    Ok((state.context, records))
+    Ok((state, records))
 }
 
 pub(crate) fn project_context_and_metadata_for_owner(
@@ -2882,7 +2886,7 @@ pub(crate) fn consumed_context_records(
     state: &super::ContextState,
     cancel: &AtomicBool,
 ) -> Result<Vec<SourceRecord>, String> {
-    let mut metadata_paths = state.context.metadata_files.clone();
+    let mut metadata_paths = state.context_observations.metadata_files.clone();
     if let Some(project_file) = &state.context.project_file {
         metadata_paths.push(project_file.clone());
     }
@@ -2917,7 +2921,7 @@ pub(crate) fn consumed_context_records(
         let content_hash = observed.map(|observation| observation.content_hash);
         let content_bytes = observed.and_then(|observation| observation.content_bytes.clone());
         let payload = state
-            .context
+            .context_observations
             .metadata_observations
             .iter()
             .find(|observation| path_key(observation.path()) == path_key(&path));
@@ -3698,13 +3702,13 @@ pub(crate) fn symbol_rename_from_input(
         }
     };
     let context_match = (|| {
-        let (query_context, _) = project_context_and_metadata_for_input(&input, uri, cancel)?;
-        let (provider_context, _) =
-            project_context_and_metadata_for_input(&input, &provider_uri, cancel)?;
+        let (query, _) = project_state_and_metadata_for_input(&input, uri, cancel)?;
+        let (provider, _) = project_state_and_metadata_for_input(&input, &provider_uri, cancel)?;
         Ok::<_, String>(
-            query_context.discovery_complete
-                && provider_context.discovery_complete
-                && query_context == provider_context,
+            query.context.discovery_complete
+                && provider.context.discovery_complete
+                && query.context == provider.context
+                && query.context_observations == provider.context_observations,
         )
     })();
     match context_match {
@@ -3907,8 +3911,8 @@ fn rename_from_input_impl(
     }
     let mut selected_provider_context = None;
     if allow_unit {
-        let (context, project_records) =
-            match project_context_and_metadata_for_input(&input, &uri, cancel) {
+        let (state, project_records) =
+            match project_state_and_metadata_for_input(&input, &uri, cancel) {
                 Ok(result) => result,
                 Err(error) => {
                     return failed(
@@ -3924,8 +3928,8 @@ fn rename_from_input_impl(
         // text edit plan. Fail closed instead of leaving `MainSource`, an
         // explicit unit path, or a package `contains ... in` path pointing at
         // the pre-move URI.
-        if unit_provider_path_is_project_metadata(&context, &uri)
-            || !context.packages.is_empty()
+        if unit_provider_path_is_project_metadata(&state.context, &uri)
+            || !state.context.packages.is_empty()
             || project_records.iter().any(|record| {
                 record
                     .path
@@ -3939,7 +3943,7 @@ fn rename_from_input_impl(
                 "unit provider is named by project main/reference/package metadata; updating those path consumers is unsupported".to_string(),
             );
         }
-        selected_provider_context = Some(context);
+        selected_provider_context = Some(state);
         snapshot.baseline_records.extend(project_records);
     }
     if is_cancelled(cancel) {
@@ -4122,7 +4126,7 @@ fn rename_from_input_impl(
                 "unit rename source has multiple hard links".to_string(),
             );
         }
-        let Some(provider_context) = selected_provider_context.as_ref() else {
+        let Some(provider_state) = selected_provider_context.as_ref() else {
             return failed(
                 source_generation,
                 configuration_generation,
@@ -4133,7 +4137,7 @@ fn rename_from_input_impl(
             &input,
             &snapshot,
             &uri,
-            provider_context,
+            provider_state,
             &new_uri,
             cancel,
         ) {
@@ -4450,7 +4454,7 @@ fn selected_explicit_uses_path_edits(
     input: &WorkspaceInput,
     snapshot: &RenameSnapshot,
     provider_uri: &Url,
-    provider_context: &ProjectContext,
+    provider_state: &ContextState,
     new_uri: &Url,
     cancel: &AtomicBool,
 ) -> Result<Vec<(Url, TextEdit)>, String> {
@@ -4532,10 +4536,15 @@ fn selected_explicit_uses_path_edits(
             if canonical_file_uri(&selected_uri) != canonical_file_uri(provider_uri) {
                 continue;
             }
-            let (consumer_context, _) =
-                project_context_and_metadata_for_input(input, source_uri, cancel)?;
-            if !consumer_context.discovery_complete
-                || !project_contexts_match_for_explicit_in_path(&consumer_context, provider_context)
+            let (consumer_state, _) =
+                project_state_and_metadata_for_input(input, source_uri, cancel)?;
+            if !consumer_state.context.discovery_complete
+                || !project_contexts_match_for_explicit_in_path(
+                    &consumer_state.context,
+                    &consumer_state.context_observations,
+                    &provider_state.context,
+                    &provider_state.context_observations,
+                )
             {
                 return Err(
                     "explicit unit in-path consumer and provider contexts are incomplete or differ"
@@ -4561,17 +4570,22 @@ fn selected_explicit_uses_path_edits(
 }
 
 fn project_contexts_match_for_explicit_in_path(
-    left: &pascal_project::ProjectContext,
-    right: &pascal_project::ProjectContext,
+    left: &ProjectContext,
+    left_observations: &ProjectObservations,
+    right: &ProjectContext,
+    right_observations: &ProjectObservations,
 ) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    for context in [&mut left, &mut right] {
-        context.metadata_files.retain(|path| {
+    let mut left_files = left_observations.metadata_files.clone();
+    let mut right_files = right_observations.metadata_files.clone();
+    for (files, observations) in [
+        (&mut left_files, left_observations),
+        (&mut right_files, right_observations),
+    ] {
+        files.retain(|path| {
             let is_absent_local_config_candidate = path
                 .file_name()
                 .is_some_and(|name| name == ".delphilsp.json")
-                && !context
+                && !observations
                     .metadata_observations
                     .iter()
                     .any(|observation| observation.path() == path);
@@ -4579,6 +4593,10 @@ fn project_contexts_match_for_explicit_in_path(
         });
     }
     left == right
+        && left_files == right_files
+        && left_observations.metadata_observations == right_observations.metadata_observations
+        && left_observations.warnings == right_observations.warnings
+        && left_observations.system_pas_searches == right_observations.system_pas_searches
 }
 
 /// Apply the proposed source edits to immutable proof snapshots, reparse every
@@ -5520,14 +5538,15 @@ fn discover_project_metadata_contexts(
         let uri = Url::from_file_path(&descriptor)
             .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
         options.project_file = Some(descriptor.clone());
-        let (key, context) =
+        let (key, project) =
             loader.readonly_context_for_uri(&uri, &descriptor, &roots, &options)?;
-        for warning in context.warnings.iter().cloned() {
+        for warning in project.observations.warnings.iter().cloned() {
             loader.warn(warning);
         }
         loader.install_context(
             key.clone(),
-            context,
+            project.context,
+            project.observations,
             Vec::new(),
             HashMap::new(),
             &descriptor,
@@ -6019,7 +6038,7 @@ fn build_snapshot_with_policy(
             if loader
                 .contexts
                 .get(context_key)
-                .is_some_and(|state| has_invalid_project_selection(&state.context))
+                .is_some_and(|state| has_invalid_project_selection(&state.context_observations))
             {
                 return Err(format!(
                     "project selection is invalid; select a current project or Automatic for {uri}"
@@ -7969,7 +7988,7 @@ fn capture_context_baseline(
                 );
             }
         }
-        for observation in &state.context.metadata_observations {
+        for observation in &state.context_observations.metadata_observations {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
@@ -8309,6 +8328,7 @@ struct IncludeAuditor<'a> {
 struct IncludeInspection<'a> {
     context_key: &'a ContextKey,
     context: &'a ProjectContext,
+    context_observations: &'a ProjectObservations,
     owner_path: &'a Path,
     legacy_route: Option<LegacyRoute>,
     conditional_environment: Option<conditional::ConditionalEnvironment>,
@@ -8343,7 +8363,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         if let Some(expansion) = auditor.loader.expansions.get(&uri)
             && context
                 .as_ref()
-                .is_some_and(|(key, _)| key == &expansion.context_key)
+                .is_some_and(|(key, _, _)| key == &expansion.context_key)
         {
             source = expansion.physical_source.clone();
         }
@@ -8352,7 +8372,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         }
         let conditional_context = context
             .as_ref()
-            .map(|(_, context)| {
+            .map(|(_, context, _)| {
                 if !context.discovery_complete
                     && auditor
                         .allow_incomplete_context_for
@@ -8372,12 +8392,12 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         }
         let incomplete_context = context
             .as_ref()
-            .is_none_or(|(_, context)| !context.discovery_complete);
+            .is_none_or(|(_, context, _)| !context.discovery_complete);
         let allow_incomplete_context = auditor
             .allow_incomplete_context_for
             .iter()
             .any(|allowed_uri| allowed_uri == &uri);
-        let Some((session_key, _)) = context.as_ref() else {
+        let Some((session_key, _, _)) = context.as_ref() else {
             auditor.record_error(format!("include owner {uri} has no project context"));
             auditor.stopped = true;
             break;
@@ -8430,7 +8450,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             break;
         }
 
-        let Some((context_key, context)) = context else {
+        let Some((context_key, context, context_observations)) = context else {
             auditor.record_error(format!(
                 "rename cannot prove completeness because include owner {uri} has no project context"
             ));
@@ -8471,6 +8491,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 &legacy_directive(directive),
                 &context_key,
                 &context,
+                &context_observations,
                 Some(environment.clone()),
             )?;
             if let Some(next) = analysis.environment {
@@ -8509,7 +8530,7 @@ impl IncludeAuditor<'_> {
     fn context_for_source(
         &mut self,
         uri: &Url,
-    ) -> Result<Option<(ContextKey, ProjectContext)>, String> {
+    ) -> Result<Option<(ContextKey, ProjectContext, ProjectObservations)>, String> {
         let context_key = if let Some(context_key) = self.contexts.get(uri).cloned() {
             Some(context_key)
         } else if let Some(context_key) = self.loader.document_contexts.get(uri).cloned() {
@@ -8540,6 +8561,7 @@ impl IncludeAuditor<'_> {
             return Ok(None);
         };
         let context = state.context.clone();
+        let context_observations = state.context_observations.clone();
         let allow_incomplete_context = self
             .allow_incomplete_context_for
             .iter()
@@ -8549,7 +8571,7 @@ impl IncludeAuditor<'_> {
                 format!("project context is ambiguous or incomplete for {uri}")
             });
         }
-        Ok(Some((context_key, context)))
+        Ok(Some((context_key, context, context_observations)))
     }
 
     fn take_directive_budget(&mut self) -> bool {
@@ -8609,6 +8631,7 @@ impl IncludeAuditor<'_> {
         &mut self,
         context_key: &ContextKey,
         context: &ProjectContext,
+        context_observations: &ProjectObservations,
         including_path: &Path,
         directive: &Directive,
         legacy_route: Option<&LegacyRoute>,
@@ -8643,6 +8666,7 @@ impl IncludeAuditor<'_> {
                 .or_insert_with(|| {
                     shared_resolver::resolver_for_context_with_limits(
                         context.clone(),
+                        context_observations,
                         self.input.roots.clone(),
                         self.input,
                         limits,
@@ -8755,6 +8779,7 @@ impl IncludeAuditor<'_> {
         directive: &Directive,
         context_key: &ContextKey,
         context: &ProjectContext,
+        context_observations: &ProjectObservations,
         conditional_environment: Option<conditional::ConditionalEnvironment>,
     ) -> Result<IncludeAnalysis, String> {
         let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
@@ -8784,6 +8809,7 @@ impl IncludeAuditor<'_> {
             self.resolve_include(
                 context_key,
                 context,
+                context_observations,
                 &owner_path,
                 directive,
                 legacy_route.as_ref(),
@@ -8828,6 +8854,7 @@ impl IncludeAuditor<'_> {
         let inspection = IncludeInspection {
             context_key,
             context,
+            context_observations,
             owner_path: &owner_path,
             legacy_route,
             conditional_environment,
@@ -8854,6 +8881,7 @@ impl IncludeAuditor<'_> {
         directive: &Directive,
         context_key: &ContextKey,
         context: &ProjectContext,
+        context_observations: &ProjectObservations,
         inherited_route: Option<LegacyRoute>,
         conditional_environment: conditional::ConditionalEnvironment,
         depth: usize,
@@ -8883,6 +8911,7 @@ impl IncludeAuditor<'_> {
             self.resolve_include(
                 context_key,
                 context,
+                context_observations,
                 owner_path,
                 directive,
                 inherited_route.as_ref(),
@@ -8914,6 +8943,7 @@ impl IncludeAuditor<'_> {
         let inspection = IncludeInspection {
             context_key,
             context,
+            context_observations,
             owner_path,
             legacy_route,
             conditional_environment: Some(conditional_environment),
@@ -9060,6 +9090,7 @@ impl IncludeAuditor<'_> {
                 &legacy_directive(directive),
                 inspection.context_key,
                 inspection.context,
+                inspection.context_observations,
                 inspection.legacy_route.clone(),
                 environment.clone(),
                 depth,
@@ -10541,13 +10572,13 @@ mod tests {
     use super::super::MetadataObservation;
     use super::{
         AssistanceBudget, BaselineAccumulator, ContextKey, ContextState, DirectiveKind,
-        Enumeration, PathStamp, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
-        ProjectPathProvenance, ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions,
-        apply_text_edits_for_proof, build_snapshot, capture_consumed_configuration_baseline,
-        capture_context_baseline, contains_any_identifier, directive_kind,
-        enumerate_external_overlays, install_snapshot_priority_barrier, path_key, path_record_at,
-        read_record_content_hash, rename_from_input, revalidate_input, snapshot_records,
-        test_cancel_in_include_analysis,
+        Enumeration, PathStamp, ProjectCandidateMembership, ProjectContext, ProjectObservations,
+        ProjectPathEntry, ProjectPathProvenance, ReadPolicy, SnapshotMode, Workspace,
+        WorkspaceOptions, apply_text_edits_for_proof, build_snapshot,
+        capture_consumed_configuration_baseline, capture_context_baseline, contains_any_identifier,
+        directive_kind, enumerate_external_overlays, install_snapshot_priority_barrier, path_key,
+        path_record_at, read_record_content_hash, rename_from_input, revalidate_input,
+        snapshot_records, test_cancel_in_include_analysis,
     };
     #[cfg(target_os = "linux")]
     use super::{file_content_hash, read_exact_file_bytes};
@@ -11116,7 +11147,7 @@ mod tests {
         workspace.contexts.insert(
             key.clone(),
             ContextState {
-                context: ProjectContext {
+                context_observations: ProjectObservations {
                     metadata_files: vec![metadata.clone()],
                     metadata_observations: vec![
                         MetadataObservation::Payload {
@@ -11128,7 +11159,7 @@ mod tests {
                         },
                         later,
                     ],
-                    ..ProjectContext::default()
+                    ..ProjectObservations::default()
                 },
                 ..ContextState::default()
             },

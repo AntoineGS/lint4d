@@ -4,7 +4,7 @@ use std::{
 };
 
 use pascal_project::{
-    CompilerVersion, InstallationSelection, ProjectContext, ProjectOptions,
+    CompilerVersion, DiscoveredProject, InstallationSelection, ProjectContext, ProjectOptions,
     delphi_overrides::OverrideSession,
 };
 
@@ -28,7 +28,7 @@ fn discover_fixture(
     version: &str,
     install: &str,
     ide: &str,
-) -> (tempfile::TempDir, ProjectContext) {
+) -> (tempfile::TempDir, DiscoveredProject) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::write(root.join("Probe.dpr"), "program Probe; begin end.").unwrap();
@@ -86,7 +86,13 @@ fn local_delphi_installations_resolve_configured_roots() {
             "missing {version} EnvOptions.proj"
         );
 
-        let (_fixture, context) = discover_fixture(&delphi, &multidev, version, install, ide);
+        let (
+            _fixture,
+            DiscoveredProject {
+                context,
+                observations,
+            },
+        ) = discover_fixture(&delphi, &multidev, version, install, ide);
         if !matches!(&context.installation_selection,
             Some(InstallationSelection::Selected { id, .. }) if id == version)
         {
@@ -104,9 +110,9 @@ fn local_delphi_installations_resolve_configured_roots() {
         eprintln!(
             "Delphi {version}: selection={:?}; metadata={:?}; issues={:?}; warning_count={}",
             context.installation_selection,
-            context.metadata_files,
+            observations.metadata_files,
             context.path_issues,
-            context.warnings.len()
+            observations.warnings.len()
         );
         if !context
             .search_paths
@@ -147,7 +153,13 @@ fn local_delphi_installations_resolve_configured_roots() {
 
     // The 23.0 tree is known to be partial. Discovery must retain scoped
     // availability information rather than treating that profile as fatal.
-    let (_fixture, partial) = discover_fixture(
+    let (
+        _fixture,
+        DiscoveredProject {
+            context: partial,
+            observations: partial_observations,
+        },
+    ) = discover_fixture(
         &delphi,
         &multidev,
         "23.0",
@@ -162,15 +174,22 @@ fn local_delphi_installations_resolve_configured_roots() {
             partial.installation_selection
         ));
     }
-    if partial.discovery_complete && partial.path_issues.is_empty() && partial.warnings.is_empty() {
+    if partial.discovery_complete
+        && partial.path_issues.is_empty()
+        && partial_observations.warnings.is_empty()
+    {
         failures.push("23.0: no scoped partial-availability signal".to_string());
     }
     eprintln!(
         "Delphi 23.0 partial profile: complete={}, issues={:?}, warning_count={}, first_warnings={:?}",
         partial.discovery_complete,
         partial.path_issues,
-        partial.warnings.len(),
-        partial.warnings.iter().take(3).collect::<Vec<_>>()
+        partial_observations.warnings.len(),
+        partial_observations
+            .warnings
+            .iter()
+            .take(3)
+            .collect::<Vec<_>>()
     );
 
     // Validate ChainDriveAPI as a separate real-project discovery operation,
@@ -196,7 +215,8 @@ fn local_delphi_installations_resolve_configured_roots() {
         },
         &OverrideSession::new(Some(chain_config_path)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     if !matches!(&chain.installation_selection,
         Some(InstallationSelection::Selected { id, .. }) if id == "37.0")
     {

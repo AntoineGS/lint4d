@@ -933,7 +933,7 @@ pub(crate) fn references_from_input(
         Ok(owner) => owner,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    if has_invalid_project_selection(&owner.state.context) {
+    if has_invalid_project_selection(&owner.state.context_observations) {
         return failed(
             source_generation,
             configuration_generation,
@@ -1023,7 +1023,7 @@ pub(crate) fn highlights_from_input(
         Ok(owner) => owner,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
-    if has_invalid_project_selection(&owner.state.context) {
+    if has_invalid_project_selection(&owner.state.context_observations) {
         return failed(
             source_generation,
             configuration_generation,

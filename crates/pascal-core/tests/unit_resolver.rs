@@ -1,14 +1,46 @@
 use pascal_core::resolver::{
     CancellationToken, DirectoryListing, DirectoryRequest, FilesystemSourceStore, LoadedSource,
-    NoCancellation, Resolution, ResolverError, ResolverLimits, ResolverSessionCache, SourceId,
-    SourceKind, SourceRequest, SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest,
-    UnitResolver,
+    NoCancellation, Resolution, ResolutionObservation, ResolverError, ResolverLimits,
+    ResolverSessionCache, SourceId, SourceKind, SourceRequest, SourceRevision, SourceStore,
+    SourceStoreError, UnitResolveRequest, UnitResolver,
 };
 use pascal_project::{
-    CompilerVersion, ConditionalContext, ConditionalFact, ProjectContext, ProjectOptions,
-    ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy,
-    SourceOrigin, content_hash_bytes, delphi_overrides::OverrideSession,
+    CompilerVersion, ConditionalContext, ConditionalFact, MetadataObservation, ProjectContext,
+    ProjectObservations, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
+    ProjectPathProvenance, ReadPolicy, SourceOrigin, content_hash_bytes,
+    delphi_overrides::OverrideSession,
 };
+
+#[test]
+fn context_observations_seed_the_resolution_report() {
+    let observations = ProjectObservations {
+        metadata_observations: vec![MetadataObservation::Stat {
+            path: PathBuf::from("/workspace/App.dproj"),
+        }],
+        warnings: vec!["project warning".to_string()],
+        ..ProjectObservations::default()
+    };
+    let resolver = UnitResolver::new(
+        ProjectContext::default(),
+        vec![PathBuf::from("/workspace")],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    )
+    .with_context_observations(&observations);
+
+    let report = resolver.report();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning == "project warning")
+    );
+    assert!(report.observations.iter().any(|observation| matches!(
+        observation,
+        ResolutionObservation::Metadata(MetadataObservation::Stat { path })
+            if path == Path::new("/workspace/App.dproj")
+    )));
+}
 
 #[test]
 fn explicit_retention_selection_reaches_the_shared_session_without_a_default_clamp() {
@@ -26,7 +58,8 @@ fn explicit_retention_selection_reaches_the_shared_session_without_a_default_cla
     ] {
         let context =
             ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-                .unwrap();
+                .unwrap()
+                .context;
         let mut resolver = UnitResolver::new(
             context,
             vec![dir.path().into()],
@@ -69,8 +102,9 @@ fn large_plain_comment_import_projection_charges_scanner_steps_not_eight_times_s
     );
     std::fs::write(&path, &text).unwrap();
     std::fs::write(dir.path().join("Body.inc"), "const Value=1;").unwrap();
-    let context =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let context = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         context,
         vec![dir.path().into()],
@@ -115,7 +149,9 @@ fn task11_fix1_resolver(
         conditional_context: conditional.clone(),
         ..ProjectOptions::default()
     };
-    let mut context = ProjectContext::discover(path, &[root.into()], &options).unwrap();
+    let mut context = ProjectContext::discover(path, &[root.into()], &options)
+        .unwrap()
+        .context;
     context.conditional_context = conditional;
     UnitResolver::new(
         context,
@@ -777,27 +813,33 @@ fn local_delphi_rtl_unit_resolution() {
         .unwrap();
         eprintln!(
             "Delphi {version}: discovery_complete={}, search_paths={:?}, browsing_paths={:?}, path_issues={:?}, warning_count={}, first_warnings={:?}",
-            context.discovery_complete,
-            context.search_paths,
+            context.context.discovery_complete,
+            context.context.search_paths,
             context
+                .context
                 .browsing_path_entries
                 .iter()
                 .map(|entry| &entry.path)
                 .collect::<Vec<_>>(),
-            context.path_issues,
-            context.warnings.len(),
-            context.warnings.iter().take(5).collect::<Vec<_>>(),
+            context.context.path_issues,
+            context.observations.warnings.len(),
+            context
+                .observations
+                .warnings
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>(),
         );
-        if context.conditional_context.compiler_version
+        if context.context.conditional_context.compiler_version
             != Some(pascal_project::CompilerVersion::new(compiler, 0))
         {
             failures.push(format!(
                 "Delphi {version}: compiler version {:?}",
-                context.conditional_context.compiler_version
+                context.context.conditional_context.compiler_version
             ));
         }
         let mut resolver = UnitResolver::new(
-            context,
+            context.context,
             vec![root.to_path_buf()],
             FilesystemSourceStore::new(),
             ResolverLimits::default(),
@@ -898,7 +940,8 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
         &ProjectOptions::default(),
         &OverrideSession::new(None),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert!(matches!(
         &context.installation_selection,
         Some(pascal_project::InstallationSelection::Selected { id, .. }) if id == "37.0"

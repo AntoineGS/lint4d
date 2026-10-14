@@ -27,7 +27,7 @@ pub(super) fn build_standalone_context_with_overrides(
     metadata_observations: Vec<MetadataObservation>,
     session: &OverrideSession,
     exclusions: &[String],
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     let (mut effective_overrides, override_error) = match standalone_overrides(file, roots, session)
     {
         Ok(overrides) => (overrides, None),
@@ -52,7 +52,7 @@ pub(super) fn build_standalone_context_with_overrides(
                 crate::installations::compiler_version_for_installation(&installation.id);
         }
     }
-    let mut context = build_standalone_context(
+    let mut project = build_standalone_context(
         file,
         roots,
         &options,
@@ -64,8 +64,8 @@ pub(super) fn build_standalone_context_with_overrides(
         exclusions,
         None,
     )?;
-    context.override_error = override_error;
-    Ok(context)
+    project.context.override_error = override_error;
+    Ok(project)
 }
 
 /// A source inside exactly one configured installation's `BDS` tree (its RTL
@@ -256,7 +256,7 @@ pub(super) fn build_project_context(
     exclusions: &[String],
     tracker: &mut ProjectReadTracker<'_>,
     cancel: Option<&AtomicBool>,
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     check_project_scan_cancel(cancel)?;
     #[cfg(any(test, feature = "test-support"))]
     test_record_project_discovery(true);
@@ -953,47 +953,51 @@ pub(super) fn build_project_context(
         rtl_constants,
     };
 
-    Ok(ProjectContext {
-        discovery_complete,
-        binding_metadata_complete: !builder.incomplete
-            && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
-        path_issues: builder.path_issues.clone(),
-        project_file: Some(project_file.clone()),
-        installation_evidence: installation_evidence.clone(),
-        installation_selection,
-        main_source,
-        search_paths,
-        project_source_roots,
-        search_path_entries,
-        browsing_path_entries: ide_paths.browsing,
-        debug_dcu_path_entries: ide_paths.debug_dcu,
-        main_source_entry,
-        explicit_unit_entries,
-        include_paths,
-        include_path_entries,
-        explicit_units,
-        unit_namespaces: property_list(&builder, "dcc_namespace")
-            .into_iter()
-            .chain(ide_paths.namespaces)
-            .collect(),
-        unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
-        defines,
-        conditional_context,
-        conditional_closure,
-        library_conditional_context,
-        config,
-        platform,
-        config_selection,
-        platform_selection,
-        overrides,
-        read_policy,
-        packages: package_list(&builder),
-        metadata_files,
-        installation_config_files,
-        system_pas_searches: builder.system_pas_searches,
-        metadata_observations,
-        warnings: builder.warnings,
-        override_error: None,
+    Ok(DiscoveredProject {
+        context: ProjectContext {
+            discovery_complete,
+            binding_metadata_complete: !builder.incomplete
+                && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
+            path_issues: builder.path_issues.clone(),
+            project_file: Some(project_file.clone()),
+            installation_evidence: installation_evidence.clone(),
+            installation_selection,
+            main_source,
+            search_paths,
+            project_source_roots,
+            search_path_entries,
+            browsing_path_entries: ide_paths.browsing,
+            debug_dcu_path_entries: ide_paths.debug_dcu,
+            main_source_entry,
+            explicit_unit_entries,
+            include_paths,
+            include_path_entries,
+            explicit_units,
+            unit_namespaces: property_list(&builder, "dcc_namespace")
+                .into_iter()
+                .chain(ide_paths.namespaces)
+                .collect(),
+            unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
+            defines,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages: package_list(&builder),
+            installation_config_files,
+            override_error: None,
+        },
+        observations: ProjectObservations {
+            metadata_files,
+            metadata_observations,
+            warnings: builder.warnings,
+            system_pas_searches: builder.system_pas_searches,
+        },
     })
 }
 
@@ -1009,7 +1013,7 @@ fn build_standalone_context(
     metadata_observations: Vec<MetadataObservation>,
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     check_project_scan_cancel(cancel)?;
     let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut search_path_entries = Vec::new();
@@ -1096,43 +1100,47 @@ fn build_standalone_context(
     let metadata_observations =
         complete_metadata_observations(&metadata_files, metadata_observations);
 
-    Ok(ProjectContext {
-        discovery_complete,
-        binding_metadata_complete: discovery_complete,
-        path_issues: Vec::new(),
-        project_file: None,
-        installation_evidence: InstallationEvidence::default(),
-        installation_selection: None,
-        main_source: None,
-        search_paths,
-        project_source_roots,
-        search_path_entries,
-        browsing_path_entries: Vec::new(),
-        debug_dcu_path_entries: Vec::new(),
-        main_source_entry: None,
-        explicit_unit_entries: HashMap::new(),
-        include_paths: Vec::new(),
-        include_path_entries: Vec::new(),
-        explicit_units: HashMap::new(),
-        unit_namespaces: Vec::new(),
-        unit_aliases: HashMap::new(),
-        defines,
-        conditional_context,
-        conditional_closure,
-        library_conditional_context,
-        config,
-        platform,
-        config_selection,
-        platform_selection,
-        overrides,
-        read_policy,
-        packages: Vec::new(),
-        metadata_files,
-        installation_config_files: Vec::new(),
-        system_pas_searches: Vec::new(),
-        metadata_observations,
-        warnings,
-        override_error: None,
+    Ok(DiscoveredProject {
+        context: ProjectContext {
+            discovery_complete,
+            binding_metadata_complete: discovery_complete,
+            path_issues: Vec::new(),
+            project_file: None,
+            installation_evidence: InstallationEvidence::default(),
+            installation_selection: None,
+            main_source: None,
+            search_paths,
+            project_source_roots,
+            search_path_entries,
+            browsing_path_entries: Vec::new(),
+            debug_dcu_path_entries: Vec::new(),
+            main_source_entry: None,
+            explicit_unit_entries: HashMap::new(),
+            include_paths: Vec::new(),
+            include_path_entries: Vec::new(),
+            explicit_units: HashMap::new(),
+            unit_namespaces: Vec::new(),
+            unit_aliases: HashMap::new(),
+            defines,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages: Vec::new(),
+            installation_config_files: Vec::new(),
+            override_error: None,
+        },
+        observations: ProjectObservations {
+            metadata_files,
+            metadata_observations,
+            warnings,
+            system_pas_searches: Vec::new(),
+        },
     })
 }
 
@@ -2220,7 +2228,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .search_path_entries
             .iter()
@@ -2273,7 +2282,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .explicit_unit_entries
             .values()
@@ -2314,7 +2324,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .search_path_entries
             .iter()
@@ -2359,7 +2370,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let configured = context
             .search_path_entries
             .iter()
@@ -2435,7 +2447,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
 
         let search_entry = |path: &Path| {
             context
@@ -2556,7 +2569,8 @@ mod tests {
                 &ProjectOptions::default(),
                 &OverrideSession::new(None),
             )
-            .expect("discover project");
+            .expect("discover project")
+            .context;
 
             for name in configured_names {
                 let path = outside.join(name);

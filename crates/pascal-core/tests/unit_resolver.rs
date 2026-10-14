@@ -448,7 +448,6 @@ fn fixround1_ordinary_header_search_work_is_cumulative_and_blocks_later_reads() 
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("Main.pas");
         std::fs::write(&path, format!("{}unit {name};", " ".repeat(3000))).unwrap();
-        context.search_paths.push(directory.clone());
         context
             .search_path_entries
             .push(ProjectPathEntry::legacy(directory));
@@ -625,7 +624,6 @@ fn firedac_unknown_header_blocks_lower_priority_source() {
     .unwrap();
     std::fs::write(lower.join("FireDAC.Phys.IB.pas"), "unit FireDAC.Phys.IB;").unwrap();
     let mut context = configured_disk_context(root);
-    context.search_paths.push(lower.clone());
     context
         .search_path_entries
         .push(ProjectPathEntry::legacy(lower));
@@ -720,7 +718,6 @@ fn firedac_candidate_acceptance_uses_source_local_library_context() {
     let mut context = fixture_context();
     context.project_file = Some("/workspace/App.dproj".into());
     context.project_source_roots = vec!["/workspace".into()];
-    context.search_paths.push("/sdk/lib".into());
     context
         .search_path_entries
         .push(ProjectPathEntry::legacy("/sdk/lib".into()));
@@ -814,7 +811,7 @@ fn local_delphi_rtl_unit_resolution() {
         eprintln!(
             "Delphi {version}: discovery_complete={}, search_paths={:?}, browsing_paths={:?}, path_issues={:?}, warning_count={}, first_warnings={:?}",
             context.context.discovery_complete,
-            context.context.search_paths,
+            context.context.search_paths(),
             context
                 .context
                 .browsing_path_entries
@@ -1028,7 +1025,6 @@ fn missing_explicit_reference_reserves_name_without_blocking_other_units() {
     let mut context = ProjectContext {
         discovery_complete: false,
         binding_metadata_complete: true,
-        search_paths: vec![root.clone(), root.join("later")],
         search_path_entries: vec![
             ProjectPathEntry::legacy(root.clone()),
             ProjectPathEntry::legacy(root.join("later")),
@@ -1044,9 +1040,6 @@ fn missing_explicit_reference_reserves_name_without_blocking_other_units() {
         }],
         ..ProjectContext::default()
     };
-    context
-        .explicit_units
-        .insert("good".to_string(), vec![good.clone()]);
     context.explicit_unit_entries.insert(
         "good".to_string(),
         vec![ProjectPathEntry::legacy(good.clone())],
@@ -1093,7 +1086,6 @@ fn absent_search_directory_does_not_hide_later_provider() {
     let provider_dir = root.join("provider");
     let context = ProjectContext {
         discovery_complete: true,
-        search_paths: vec![missing.clone(), provider_dir.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(missing),
             ProjectPathEntry::legacy(provider_dir),
@@ -1124,7 +1116,6 @@ fn unreadable_higher_priority_directory_blocks_later_provider() {
     let provider_dir = root.join("provider");
     let context = ProjectContext {
         discovery_complete: true,
-        search_paths: vec![unavailable.clone(), provider_dir.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(unavailable.clone()),
             ProjectPathEntry::legacy(provider_dir),
@@ -1257,11 +1248,6 @@ fn ambiguity_at_current_tier_blocks_search_path_fallback() {
         ProjectPathEntry::legacy(PathBuf::from("/workspace/App")),
         ProjectPathEntry::legacy(PathBuf::from("/workspace/Later")),
     ];
-    context.search_paths = context
-        .search_path_entries
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect();
     let loads = Arc::new(Mutex::new(Vec::new()));
     let mut store = MemoryStore::with_log(loads.clone());
     store.add(
@@ -1526,7 +1512,6 @@ fn package_lookup_prefers_dpk_descriptor_over_dproj() {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         packages: vec!["Core".to_string()],
-        search_paths: vec![root.to_path_buf()],
         search_path_entries: vec![entry],
         read_policy: ReadPolicy::default(),
         ..ProjectContext::default()
@@ -2103,8 +2088,7 @@ fn untagged_search_paths_do_not_gain_legacy_read_authority() {
         "unit Errors; interface implementation end.",
     )
     .expect("outside unit");
-    let mut context = configured_disk_context(allowed.path());
-    context.search_paths = vec![outside.path().to_path_buf()];
+    let context = configured_disk_context(allowed.path());
     let mut resolver = UnitResolver::new(
         context,
         vec![allowed.path().to_path_buf()],
@@ -2234,7 +2218,9 @@ fn unknown_conditional_without_include_makes_project_incomplete() {
 #[test]
 fn nested_include_inherits_parent_undef_without_resurrecting_project_defines() {
     let mut context = fixture_context();
-    context.defines = vec!["FEATURE".to_string()];
+    context
+        .conditional_context
+        .set_define("FEATURE", ConditionalFact::True);
     let mut store = MemoryStore::default();
     store.add(
         "/workspace/Main.pas",
@@ -2723,7 +2709,6 @@ fn higher_precedence_match_does_not_scan_failing_lower_directory() {
     context
         .search_path_entries
         .push(ProjectPathEntry::legacy(lower.clone()));
-    context.search_paths.push(lower.clone());
     let mut store = FailingDirectoryStore {
         inner: MemoryStore::default(),
         failing_directory: lower,
@@ -3145,12 +3130,11 @@ fn cached_legacy_symlink_payload_cannot_bypass_a_later_strict_lookup() {
     let link = root.join("Link.inc");
     fs::write(&target, "const Included = 1;").expect("target include");
     std::os::unix::fs::symlink(&target, &link).expect("legacy include symlink");
-    let mut context = ProjectContext {
+    let context = ProjectContext {
         discovery_complete: true,
         search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
         ..ProjectContext::default()
     };
-    context.search_paths = vec![root.to_path_buf()];
     let route = pascal_core::LegacyRoute {
         source_path: root.join("Main.pas"),
         sibling_directory: root.to_path_buf(),
@@ -3276,14 +3260,12 @@ fn library_source_keeps_unknown_project_define_activity_incomplete() {
     let mut context = ProjectContext {
         discovery_complete: true,
         project_file: Some(project_root.join("App.dproj")),
-        main_source: Some(project_root.join("Main.pas")),
+        main_source_entry: Some(ProjectPathEntry::legacy(project_root.join("Main.pas"))),
         project_source_roots: vec![project_root.clone()],
-        search_paths: vec![project_root.clone(), library_root.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(project_root.clone()),
             ProjectPathEntry::legacy(library_root.clone()),
         ],
-        defines: vec!["DEBUG".to_string()],
         read_policy: ReadPolicy::default(),
         ..ProjectContext::default()
     };
@@ -3352,7 +3334,6 @@ fn compile_time_unit_capability_uses_selected_library_context() {
     let mut context = fixture_context();
     context.project_file = Some("/workspace/App.dproj".into());
     context.project_source_roots = vec!["/workspace".into()];
-    context.search_paths.push("/sdk/lib".into());
     context
         .search_path_entries
         .push(ProjectPathEntry::legacy("/sdk/lib".into()));
@@ -3411,7 +3392,6 @@ fn fixture_context() -> ProjectContext {
     };
     ProjectContext {
         discovery_complete: true,
-        search_paths: vec![root.clone()],
         search_path_entries: vec![entry],
         read_policy: ReadPolicy::default(),
         ..ProjectContext::default()
@@ -3456,10 +3436,6 @@ fn fixture_context_with_alias(alias: &str, target: &str) -> ProjectContext {
     context
         .unit_aliases
         .insert(alias.to_string(), target.to_string());
-    context.explicit_units.insert(
-        target.to_ascii_lowercase(),
-        vec![PathBuf::from("/workspace/Vendor.Errors.pas")],
-    );
     context.explicit_unit_entries.insert(
         target.to_ascii_lowercase(),
         vec![ProjectPathEntry::legacy(PathBuf::from(

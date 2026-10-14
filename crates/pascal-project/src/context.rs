@@ -1,4 +1,4 @@
-use super::assembly::path_starts_with_ci;
+use super::assembly::{path_starts_with_ci, paths_from_entries};
 use super::authorization::lexical_normalize;
 use super::selection::{discover_context_with_selections, production_override_session};
 use super::*;
@@ -102,11 +102,9 @@ pub struct ProjectContext {
     pub installation_evidence: InstallationEvidence,
     /// The project-scoped installation result, if profile selection applies.
     pub installation_selection: Option<InstallationSelection>,
-    pub main_source: Option<PathBuf>,
-    /// Ordered project and caller-provided unit search paths.
-    pub search_paths: Vec<PathBuf>,
-    /// The same search paths tagged with their source provenance. This keeps
-    /// legacy native roots distinct from configured and mapped roots.
+    /// Ordered project and caller-provided unit search paths, tagged with their
+    /// source provenance. This keeps legacy native roots distinct from
+    /// configured and mapped roots.
     pub search_path_entries: Vec<ProjectPathEntry>,
     /// Source-navigation-only fallbacks from the selected IDE installation.
     pub browsing_path_entries: Vec<ProjectPathEntry>,
@@ -121,15 +119,11 @@ pub struct ProjectContext {
     ///
     /// Include paths are kept separate from unit search paths because include
     /// lookup must not make an arbitrary directory a Pascal unit candidate.
-    pub include_paths: Vec<PathBuf>,
     /// Include paths retain their source provenance for read authorization.
     pub include_path_entries: Vec<ProjectPathEntry>,
-    pub explicit_units: HashMap<String, Vec<PathBuf>>,
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
-    pub defines: Vec<String>,
     /// Effective compiler/version/options/constants used by source analysis.
-    /// `defines` remains as a compatibility projection for existing callers.
     pub conditional_context: ConditionalContext,
     /// Whether project sources can close their define set and resolved RTL constants.
     pub conditional_closure: ConditionalClosure,
@@ -160,6 +154,40 @@ pub struct ProjectContext {
 }
 
 impl ProjectContext {
+    /// Ordered unit search paths, without provenance.
+    pub fn search_paths(&self) -> Vec<PathBuf> {
+        paths_from_entries(&self.search_path_entries)
+    }
+
+    /// Ordered include paths, without provenance.
+    pub fn include_paths(&self) -> Vec<PathBuf> {
+        paths_from_entries(&self.include_path_entries)
+    }
+
+    /// Explicit unit references by unit name, without provenance.
+    pub fn explicit_units(&self) -> HashMap<String, Vec<PathBuf>> {
+        self.explicit_unit_entries
+            .iter()
+            .map(|(name, entries)| (name.clone(), paths_from_entries(entries)))
+            .collect()
+    }
+
+    pub fn main_source(&self) -> Option<&Path> {
+        self.main_source_entry
+            .as_ref()
+            .map(|entry| entry.path.as_path())
+    }
+
+    /// Defines that are True in the effective conditional context, sorted.
+    pub fn defines(&self) -> Vec<String> {
+        self.conditional_context
+            .defines
+            .iter()
+            .filter(|(_, fact)| **fact == ConditionalFact::True)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn can_resolve_units(&self) -> bool {
         self.discovery_complete || self.binding_metadata_complete
     }
@@ -183,9 +211,6 @@ impl ProjectContext {
         if let Some(path) = &self.project_file {
             visit(path.as_os_str().len())?;
         }
-        if let Some(path) = &self.main_source {
-            visit(path.as_os_str().len())?;
-        }
         if let Some(version) = &self.installation_evidence.project_version {
             visit(version.len())?;
         }
@@ -201,9 +226,6 @@ impl ProjectContext {
                 }
             }
             Some(InstallationSelection::Legacy) | None => {}
-        }
-        for path in &self.search_paths {
-            visit(path.as_os_str().len())?;
         }
         for path in &self.project_source_roots {
             visit(path.as_os_str().len())?;
@@ -227,17 +249,8 @@ impl ProjectContext {
                 entry.visit_recovery_payload(visit)?;
             }
         }
-        for path in &self.include_paths {
-            visit(path.as_os_str().len())?;
-        }
         for entry in &self.include_path_entries {
             entry.visit_recovery_payload(visit)?;
-        }
-        for (name, paths) in &self.explicit_units {
-            visit(name.len())?;
-            for path in paths {
-                visit(path.as_os_str().len())?;
-            }
         }
         for namespace in &self.unit_namespaces {
             visit(namespace.len())?;
@@ -245,9 +258,6 @@ impl ProjectContext {
         for (alias, unit) in &self.unit_aliases {
             visit(alias.len())?;
             visit(unit.len())?;
-        }
-        for define in &self.defines {
-            visit(define.len())?;
         }
         self.conditional_context.visit_recovery_payload(visit)?;
         self.library_conditional_context
@@ -349,22 +359,8 @@ impl ProjectContext {
     pub fn include_search_entries(&self, owner: &Path) -> Vec<ProjectPathEntry> {
         let owner_directory = owner.parent().unwrap_or(owner);
         let owner_directory = lexical_normalize(owner_directory);
-        let include_paths = if self.include_path_entries.is_empty() {
-            self.include_paths
-                .iter()
-                .filter_map(|path| self.path_entry_for(path))
-                .collect::<Vec<_>>()
-        } else {
-            self.include_path_entries.clone()
-        };
-        let search_paths = if self.search_path_entries.is_empty() {
-            self.search_paths
-                .iter()
-                .filter_map(|path| self.path_entry_for(path))
-                .collect::<Vec<_>>()
-        } else {
-            self.search_path_entries.clone()
-        };
+        let include_paths = self.include_path_entries.clone();
+        let search_paths = self.search_path_entries.clone();
         let mut entries = Vec::new();
         for entry in self
             .path_entry_for(&owner_directory)
@@ -401,17 +397,10 @@ impl ProjectContext {
         }
     }
 
-    /// Return the effective conditional context, including compatibility
-    /// define values retained in older manually-constructed contexts.
+    /// Return the effective conditional context, with absent defines unknown.
     pub fn effective_conditional_context(&self) -> ConditionalContext {
         let mut context = self.conditional_context.clone();
         context.absent_define = ConditionalFact::Unknown;
-        for define in &self.defines {
-            let name = define.trim().trim_start_matches('&').to_ascii_uppercase();
-            if !name.is_empty() && !context.defines.contains_key(&name) {
-                context.set_define(name, ConditionalFact::True);
-            }
-        }
         context
     }
 
@@ -429,8 +418,7 @@ impl ProjectContext {
         }
 
         if self
-            .main_source
-            .as_deref()
+            .main_source()
             .is_some_and(|main| project_paths_equal(main, path))
         {
             return SourceOrigin::ProjectCompiled;
@@ -442,12 +430,7 @@ impl ProjectContext {
             .explicit_unit_entries
             .values()
             .flatten()
-            .any(|entry| project_paths_equal(&entry.path, path))
-            || self
-                .explicit_units
-                .values()
-                .flatten()
-                .any(|unit| project_paths_equal(unit, path));
+            .any(|entry| project_paths_equal(&entry.path, path));
         if is_explicit {
             SourceOrigin::ProjectCompiled
         } else {
@@ -590,7 +573,7 @@ mod tests {
     fn equality_is_by_analysis_inputs_and_observations_stay_outside() {
         let base = ProjectContext {
             project_file: Some("A.dproj".into()),
-            defines: vec!["DEBUG".to_string()],
+            conditional_context: ConditionalContext::from_defines(&["DEBUG".to_string()]),
             ..ProjectContext::default()
         };
         let observed = DiscoveredProject {
@@ -614,14 +597,61 @@ mod tests {
         );
 
         let other_defines = ProjectContext {
-            defines: vec!["RELEASE".to_string()],
+            conditional_context: ConditionalContext::from_defines(&["RELEASE".to_string()]),
             ..base.clone()
         };
         let other_includes = ProjectContext {
-            include_paths: vec!["inc".into()],
+            include_path_entries: vec![ProjectPathEntry::configured("inc".into())],
             ..base.clone()
         };
         assert_ne!(base, other_defines);
         assert_ne!(base, other_includes);
+    }
+
+    #[test]
+    fn bare_path_views_are_derived_from_entries() {
+        let a = PathBuf::from("/w/a");
+        let b = PathBuf::from("/w/b");
+        let unit = PathBuf::from("/w/Unit1.pas");
+        let context = ProjectContext {
+            search_path_entries: vec![
+                ProjectPathEntry::legacy(a.clone()),
+                ProjectPathEntry::configured(a.clone()),
+                ProjectPathEntry::configured(b.clone()),
+            ],
+            include_path_entries: vec![ProjectPathEntry::configured(b.clone())],
+            main_source_entry: Some(ProjectPathEntry::configured("/w/App.dpr".into())),
+            explicit_unit_entries: [(
+                "Unit1".to_string(),
+                vec![
+                    ProjectPathEntry::legacy(unit.clone()),
+                    ProjectPathEntry::configured(unit.clone()),
+                ],
+            )]
+            .into_iter()
+            .collect(),
+            ..ProjectContext::default()
+        };
+        assert_eq!(context.search_paths(), vec![a, b.clone()]);
+        assert_eq!(context.include_paths(), vec![b]);
+        assert_eq!(context.main_source(), Some(Path::new("/w/App.dpr")));
+        assert_eq!(context.explicit_units()["Unit1"], vec![unit]);
+    }
+
+    #[test]
+    fn defines_are_the_true_facts_in_sorted_order() {
+        let mut conditional = ConditionalContext::default();
+        conditional.set_define("ZED", ConditionalFact::True);
+        conditional.set_define("ALPHA", ConditionalFact::True);
+        conditional.set_define("OFF", ConditionalFact::False);
+        conditional.set_define("MAYBE", ConditionalFact::Unknown);
+        let context = ProjectContext {
+            conditional_context: conditional,
+            ..ProjectContext::default()
+        };
+        assert_eq!(
+            context.defines(),
+            vec!["ALPHA".to_string(), "ZED".to_string()]
+        );
     }
 }

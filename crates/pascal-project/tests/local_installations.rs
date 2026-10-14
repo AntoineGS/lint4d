@@ -115,13 +115,13 @@ fn local_delphi_installations_resolve_configured_roots() {
             observations.warnings.len()
         );
         if !context
-            .search_paths
+            .search_paths()
             .iter()
             .any(|path| path.starts_with(&sdk) && path.is_dir())
         {
             failures.push(format!(
                 "{version}: no existing SDK search path; selected paths {:?}",
-                context.search_paths
+                context.search_paths()
             ));
         }
         if !context
@@ -138,7 +138,7 @@ fn local_delphi_installations_resolve_configured_roots() {
             "Delphi {version}: selected {:?}; existing search paths: {:?}; browsing paths: {:?}",
             context.installation_selection,
             context
-                .search_paths
+                .search_paths()
                 .iter()
                 .filter(|p| p.starts_with(&sdk) && p.is_dir())
                 .collect::<Vec<_>>(),

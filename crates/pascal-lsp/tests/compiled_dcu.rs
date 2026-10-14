@@ -32,7 +32,6 @@ fn selected_context(search_paths: &[PathBuf]) -> ProjectContext {
     let read_policy = ReadPolicy::new(&search_paths, &[], &[], &EffectiveOverrides::default());
     ProjectContext {
         discovery_complete: true,
-        search_paths,
         search_path_entries,
         read_policy,
         ..ProjectContext::default()
@@ -51,7 +50,7 @@ fn d13_win64_compiled_unit_is_read_only_navigation_completion_and_hover_provider
             .read_policy
             .allows_location(&selected.search_path_entries[0])
     );
-    let fixture_path = selected.search_paths[0].join("Lint4dFixture.Classes.dcu");
+    let fixture_path = selected.search_paths()[0].join("Lint4dFixture.Classes.dcu");
     let fixture_entry = selected
         .read_policy
         .entry_for_path(&fixture_path)

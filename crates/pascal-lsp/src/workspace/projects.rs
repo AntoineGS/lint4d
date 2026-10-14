@@ -545,7 +545,7 @@ impl Workspace {
             ),
             installation_selection_mode,
             installation_candidates,
-            main_source_uri: context.main_source.as_deref().and_then(file_uri),
+            main_source_uri: context.main_source().and_then(file_uri),
             installation_config_uris: context
                 .installation_config_files
                 .iter()

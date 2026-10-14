@@ -2811,7 +2811,7 @@ mod tests {
             project_context_and_metadata_for_input(&input, &source_uri(&source), &cancel)
                 .expect("automatic project discovery");
         assert_eq!(context.project_file, Some(project));
-        assert_eq!(context.defines, vec!["CAPTURED"]);
+        assert_eq!(context.defines(), vec!["CAPTURED"]);
     }
 
     #[test]
@@ -3040,8 +3040,8 @@ mod tests {
             .get_mut(&uri)
             .expect("cached document")
             .context
-            .defines
-            .push("CONTEXT_CHANGED".to_owned());
+            .conditional_context
+            .set_define("CONTEXT_CHANGED", pascal_project::ConditionalFact::True);
         crate::navigation::test_reset_document_parse_count();
         let computed =
             selection_ranges_from_input(changed_context, &uri, vec![Position::new(0, 0)], &cancel);

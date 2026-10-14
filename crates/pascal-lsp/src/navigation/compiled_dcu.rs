@@ -298,7 +298,7 @@ fn safe_unit_name(name: &str) -> bool {
 pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
     let mut hasher = DefaultHasher::new();
     context.project_file.hash(&mut hasher);
-    context.main_source.hash(&mut hasher);
+    context.main_source().hash(&mut hasher);
     context.search_path_entries.hash(&mut hasher);
     context.debug_dcu_path_entries.hash(&mut hasher);
     context.browsing_path_entries.hash(&mut hasher);
@@ -337,7 +337,7 @@ pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
         alias.hash(&mut hasher);
         unit.hash(&mut hasher);
     }
-    context.defines.hash(&mut hasher);
+    context.defines().hash(&mut hasher);
     context.conditional_context.fingerprint().hash(&mut hasher);
     context
         .library_conditional_context

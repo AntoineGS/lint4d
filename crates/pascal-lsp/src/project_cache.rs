@@ -709,7 +709,9 @@ mod cache_tests {
         // Include paths are not part of the fingerprint, so only the
         // context comparison tells these apart.
         let other = ProjectContext {
-            include_paths: vec![PathBuf::from("inc")],
+            include_path_entries: vec![pascal_project::ProjectPathEntry::configured(
+                PathBuf::from("inc"),
+            )],
             ..ctx.clone()
         };
 
@@ -3098,10 +3100,10 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.installation_selection != right.installation_selection {
         fields.push("installation_selection".to_string());
     }
-    if left.main_source != right.main_source {
+    if left.main_source() != right.main_source() {
         fields.push("main_source".to_string());
     }
-    if left.search_paths != right.search_paths {
+    if left.search_paths() != right.search_paths() {
         fields.push("search_paths".to_string());
     }
     if left.search_path_entries != right.search_path_entries {
@@ -3119,13 +3121,13 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.explicit_unit_entries != right.explicit_unit_entries {
         fields.push("explicit_unit_entries".to_string());
     }
-    if left.include_paths != right.include_paths {
+    if left.include_paths() != right.include_paths() {
         fields.push("include_paths".to_string());
     }
     if left.include_path_entries != right.include_path_entries {
         fields.push("include_path_entries".to_string());
     }
-    if left.explicit_units != right.explicit_units {
+    if left.explicit_units() != right.explicit_units() {
         fields.push("explicit_units".to_string());
     }
     if left.unit_namespaces != right.unit_namespaces {
@@ -3134,7 +3136,7 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.unit_aliases != right.unit_aliases {
         fields.push("unit_aliases".to_string());
     }
-    if left.defines != right.defines {
+    if left.defines() != right.defines() {
         fields.push("defines".to_string());
     }
     if left.conditional_context != right.conditional_context {

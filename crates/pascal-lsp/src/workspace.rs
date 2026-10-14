@@ -10466,7 +10466,7 @@ impl Workspace {
     ) -> Result<(), String> {
         let initial_metadata_count = context_observations.metadata_files.len()
             + usize::from(context.project_file.is_some())
-            + usize::from(context.main_source.is_some());
+            + usize::from(context.main_source().is_some());
         if let Some(budget) = budget {
             budget.charge_path_visits(initial_metadata_count)?;
         }
@@ -10483,9 +10483,9 @@ impl Workspace {
             check_workspace_cancel(cancel)?;
             metadata.push(project_file.clone());
         }
-        if let Some(main_source) = &context.main_source {
+        if let Some(main_source) = context.main_source() {
             check_workspace_cancel(cancel)?;
-            metadata.push(main_source.clone());
+            metadata.push(main_source.to_path_buf());
         }
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         let directories = self.discovery_directories_with_control(file, cancel, budget)?;
@@ -10978,11 +10978,11 @@ impl Workspace {
                     .try_reserve(1)
                     .map_err(|error| format!("could not reserve invalidated contexts: {error}"))?;
                 retained_keys.push(key.clone());
-                if let Some(main_source) = state.context.main_source.as_ref() {
+                if let Some(main_source) = state.context.main_source() {
                     context_sources.try_reserve(1).map_err(|error| {
                         format!("could not reserve changed project sources: {error}")
                     })?;
-                    context_sources.push(main_source.clone());
+                    context_sources.push(main_source.to_path_buf());
                 }
                 for path in &state.context_observations.metadata_files {
                     check_workspace_cancel(cancel)?;
@@ -11537,8 +11537,14 @@ impl Workspace {
     ) -> Result<Option<Url>, String> {
         check_workspace_cancel(cancel)?;
         let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
-        if let Some(explicit) = context.explicit_units.get(lookup_name) {
-            groups.push((explicit.clone(), false));
+        if let Some(entries) = context.explicit_unit_entries.get(lookup_name) {
+            let mut explicit = Vec::new();
+            for entry in entries {
+                if !explicit.contains(&entry.path) {
+                    explicit.push(entry.path.clone());
+                }
+            }
+            groups.push((explicit, false));
         }
 
         let current_path = current_uri.to_file_path().ok().map(absolute_path);
@@ -11576,7 +11582,7 @@ impl Workspace {
                 .map(|paths| (paths, false)),
             );
         }
-        for directory in &context.search_paths {
+        for directory in &context.search_paths() {
             check_workspace_cancel(cancel)?;
             let legacy_search_path = context.search_path_entries.iter().any(|entry| {
                 matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
@@ -11719,8 +11725,8 @@ impl Workspace {
             }
         }
         if context.project_file.is_some()
-            && !context.explicit_units.is_empty()
-            && !context.explicit_units.contains_key(lookup_name)
+            && !context.explicit_unit_entries.is_empty()
+            && !context.explicit_unit_entries.contains_key(lookup_name)
         {
             self.warn(format!(
                 "unsupported unit filename mapping for {requested_name}: no explicit project filename mapping; declaration filename mismatch cannot be inferred safely"
@@ -12756,13 +12762,14 @@ impl Workspace {
             .into_iter()
             .map(|name| name.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        let roots = if context.search_paths.is_empty() {
+        let search_paths = context.search_paths();
+        let roots = if search_paths.is_empty() {
             self.roots
                 .iter()
                 .map(|root| root.path.clone())
                 .collect::<Vec<_>>()
         } else {
-            context.search_paths.clone()
+            search_paths
         };
         let entry_limit = filename_catalogue_entry_limit();
         let mut result = Vec::new();
@@ -14680,11 +14687,11 @@ fn project_unit_stems(context: &ProjectContext, current_path: &Path) -> HashSet<
         }
     };
     add_stem(current_path);
-    if let Some(main_source) = &context.main_source {
+    if let Some(main_source) = context.main_source() {
         add_stem(main_source);
     }
-    for path in context.explicit_units.values().flatten() {
-        add_stem(path);
+    for entry in context.explicit_unit_entries.values().flatten() {
+        add_stem(&entry.path);
     }
     // DCC_UnitSearchPath is a compiler lookup path, not a project-file list.
     // Libraries commonly share it with project sources, so only the current
@@ -17483,8 +17490,12 @@ mod tests {
             .expect("cached parsed document");
         let mut context = pascal_project::ProjectContext::default();
         context
-            .search_paths
-            .extend((0..=65_536).map(|index| temp.path().join(format!("search-{index:05}"))));
+            .search_path_entries
+            .extend((0..=65_536).map(|index| {
+                pascal_project::ProjectPathEntry::configured(
+                    temp.path().join(format!("search-{index:05}")),
+                )
+            }));
         workspace.cached_documents.insert(
             uri,
             crate::workspace::rename::CachedDocument { context, parsed },
@@ -19236,7 +19247,7 @@ mod tests {
         );
         assert!(
             left_context
-                .explicit_units
+                .explicit_units()
                 .get("shared")
                 .is_some_and(|paths| paths.iter().any(|path| path == &shared_source))
         );
@@ -21129,11 +21140,11 @@ BDS = '/fake/37'
             .clone();
         let before_b_context = workspace.contexts.get(&b_key).unwrap().context.clone();
         assert_eq!(
-            before_b_context.explicit_units.get("provider"),
+            before_b_context.explicit_units().get("provider"),
             Some(&vec![provider_b.clone()])
         );
         assert_eq!(
-            before_b_context.explicit_units.get("shared"),
+            before_b_context.explicit_units().get("shared"),
             Some(&vec![shared.clone()])
         );
         let before_b = workspace.installation_context(&uri_b).unwrap();
@@ -21164,7 +21175,7 @@ BDS = '/fake/37'
                 .get(&b_key)
                 .unwrap()
                 .context
-                .explicit_units
+                .explicit_units()
                 .get("provider"),
             Some(&vec![provider_b])
         );
@@ -21174,7 +21185,7 @@ BDS = '/fake/37'
                 .get(&b_key)
                 .unwrap()
                 .context
-                .explicit_units
+                .explicit_units()
                 .get("shared"),
             Some(&vec![shared])
         );
@@ -21690,7 +21701,6 @@ BDS = '/fake/37'
         fs::copy(&fixture_source, &fixture_path).expect("copy fixture into authorized path");
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![fixture_root.clone()],
             search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
             read_policy: ReadPolicy::new(
                 std::slice::from_ref(&fixture_root),
@@ -21821,7 +21831,6 @@ BDS = '/fake/37'
 
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![fixture_root.clone()],
             search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
             read_policy: ReadPolicy::new(
                 &[temp.path().to_path_buf(), fixture_root.clone()],
@@ -22260,18 +22269,12 @@ BDS = '/fake/37'
         let importer_uri = Url::from_file_path(&importer_path).expect("importer URI");
         let provider_uri = Url::from_file_path(&provider_path).expect("provider URI");
 
-        let search_paths = [&source_dir, &dcu_dir]
+        let search_path_entries = [&source_dir, &dcu_dir]
             .into_iter()
-            .map(|path| path.to_path_buf())
-            .collect::<Vec<_>>();
-        let search_path_entries = search_paths
-            .iter()
-            .cloned()
-            .map(ProjectPathEntry::legacy)
+            .map(|path| ProjectPathEntry::legacy(path.to_path_buf()))
             .collect();
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths,
             search_path_entries,
             read_policy: ReadPolicy::new(
                 &[
@@ -23919,7 +23922,6 @@ BDS = '/fake/37'
         };
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![entry],
             read_policy: ReadPolicy::new(
                 std::slice::from_ref(&root),

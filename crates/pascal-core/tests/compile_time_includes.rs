@@ -1093,7 +1093,6 @@ fn fix_i2_same_id_text_and_path_do_not_replay_a_revoked_legacy_route() {
     std::os::unix::fs::symlink(root.join("actual.inc"), root.join("Link.inc")).unwrap();
     let ctx = ProjectContext {
         discovery_complete: true,
-        search_paths: vec![root.into()],
         search_path_entries: vec![ProjectPathEntry::legacy(root.into())],
         conditional_context: context(LayoutPlatform::Win32),
         ..Default::default()

@@ -215,12 +215,12 @@ fn project_bds_override_selects_its_installation_root_and_ide_paths() {
     );
     assert!(
         context
-            .search_paths
+            .search_paths()
             .contains(&project_sdk.path().join("source"))
     );
     assert!(
         !context
-            .search_paths
+            .search_paths()
             .contains(&profile_sdk.path().join("source"))
     );
     assert!(context.read_policy.allows_location(&ProjectPathEntry {

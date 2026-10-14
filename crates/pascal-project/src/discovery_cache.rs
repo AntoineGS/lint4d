@@ -882,7 +882,7 @@ mod tests {
 
         for expected in expected_paths {
             assert!(
-                context.context.search_paths.contains(&expected),
+                context.context.search_paths().contains(&expected),
                 "case-insensitive discovery should retain on-disk spelling for {}",
                 expected.display()
             );
@@ -924,7 +924,7 @@ mod tests {
         )
         .expect("first discovery")
         .context;
-        assert!(first.search_paths.contains(&requested));
+        assert!(first.search_paths().contains(&requested));
         fs::create_dir_all(&expected).expect("create directory between discovery calls");
 
         let second = ProjectContext::discover_with_overrides(
@@ -937,7 +937,7 @@ mod tests {
         .context;
 
         assert!(
-            second.search_paths.contains(&expected),
+            second.search_paths().contains(&expected),
             "a later discovery must observe newly-created entries and their on-disk spelling"
         );
     }

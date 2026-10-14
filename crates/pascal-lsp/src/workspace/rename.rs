@@ -1221,20 +1221,9 @@ fn normalize_standalone_legacy_roots(context: &mut ProjectContext) {
     if context.project_file.is_some() {
         return;
     }
-    let legacy_roots = context
-        .search_path_entries
-        .iter()
-        .filter(|entry| matches!(entry.provenance, ProjectPathProvenance::LegacyNative))
-        .map(|entry| entry.path.clone())
-        .collect::<Vec<_>>();
     context
         .search_path_entries
         .retain(|entry| !matches!(entry.provenance, ProjectPathProvenance::LegacyNative));
-    context.search_paths.retain(|path| {
-        !legacy_roots
-            .iter()
-            .any(|legacy_root| paths_equal_ci(path, legacy_root))
-    });
 }
 
 #[derive(Debug, Clone)]
@@ -2890,8 +2879,8 @@ pub(crate) fn consumed_context_records(
     if let Some(project_file) = &state.context.project_file {
         metadata_paths.push(project_file.clone());
     }
-    if let Some(main_source) = &state.context.main_source {
-        metadata_paths.push(main_source.clone());
+    if let Some(main_source) = state.context.main_source() {
+        metadata_paths.push(main_source.to_path_buf());
     }
     metadata_paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
     metadata_paths.dedup_by(|left, right| path_key(left) == path_key(right));
@@ -3452,14 +3441,13 @@ fn unit_provider_path_is_project_metadata(context: &ProjectContext, provider_uri
     };
     let provider_key = path_key(&provider_path);
     context
-        .main_source
-        .as_deref()
+        .main_source()
         .is_some_and(|path| path_key(&absolute_path(path.to_path_buf())) == provider_key)
         || context
-            .explicit_units
+            .explicit_unit_entries
             .values()
             .flatten()
-            .any(|path| path_key(&absolute_path(path.clone())) == provider_key)
+            .any(|entry| path_key(&absolute_path(entry.path.clone())) == provider_key)
 }
 
 fn is_package_descriptor_path(path: &Path) -> bool {
@@ -5610,7 +5598,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
     // Include paths intentionally retain their historical untagged API. Tie
     // them back to an effective mapping by destination containment so an
     // absolute mapped include can also contribute its consumer root.
-    for include_path in &context.include_paths {
+    for include_path in &context.include_paths() {
         for mapping in &context.overrides.path_mappings {
             let root = super::native_mapping_root(&mapping.to);
             if super::path_starts_with_native(include_path, &root) {
@@ -7392,7 +7380,7 @@ fn assistance_auto_import_scopes(
         else {
             continue;
         };
-        let mut roots = context.search_paths.clone();
+        let mut roots = context.search_paths();
         roots.extend(
             context
                 .main_source_entry
@@ -7745,7 +7733,7 @@ fn enumerate_assistance_provider_sources(
             enumeration.auto_import_complete = false;
             continue;
         };
-        let mut context_roots = context.search_paths.clone();
+        let mut context_roots = context.search_paths();
         context_roots.extend(
             context
                 .main_source_entry
@@ -9292,10 +9280,10 @@ fn include_search_directories(owner_path: &Path, context: Option<&ProjectContext
         add_include_directory(&mut directories, parent);
     }
     if let Some(context) = context {
-        for path in &context.include_paths {
+        for path in &context.include_paths() {
             add_include_directory(&mut directories, path.clone());
         }
-        for path in &context.search_paths {
+        for path in &context.search_paths() {
             add_include_directory(&mut directories, path.clone());
         }
     }
@@ -10746,7 +10734,6 @@ mod tests {
         };
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![root_entry],
             read_policy: ReadPolicy::new(
                 std::slice::from_ref(&root),
@@ -10838,8 +10825,8 @@ mod tests {
             .get_mut(&uri)
             .expect("cached context")
             .context
-            .defines
-            .push("FEATURE".to_owned());
+            .conditional_context
+            .set_define("FEATURE", pascal_project::ConditionalFact::True);
         let cancel = AtomicBool::new(false);
 
         let snapshot = build_snapshot(
@@ -10990,14 +10977,14 @@ mod tests {
         };
         let old = ContextState {
             context: ProjectContext {
-                search_paths: vec![PathBuf::from("/sdk/old")],
+                search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/old"))],
                 ..ProjectContext::default()
             },
             ..ContextState::default()
         };
         let new = ContextState {
             context: ProjectContext {
-                search_paths: vec![PathBuf::from("/sdk/new")],
+                search_path_entries: vec![ProjectPathEntry::configured(PathBuf::from("/sdk/new"))],
                 ..ProjectContext::default()
             },
             ..ContextState::default()
@@ -11507,7 +11494,6 @@ mod tests {
         let state = ContextState {
             context: ProjectContext {
                 discovery_complete: false,
-                search_paths: vec![external.clone()],
                 search_path_entries: vec![super::super::super::project::ProjectPathEntry {
                     path: external,
                     provenance: super::super::super::project::ProjectPathProvenance::LegacyNative,

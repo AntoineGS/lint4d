@@ -237,8 +237,8 @@ fn session_build_choice_selects_debug_and_overrides_project_configuration() {
 
     assert_eq!(context.config_selection.mode, BuildSelectionMode::Session);
     assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
-    assert!(context.defines.iter().any(|define| define == "DEBUG"));
-    assert!(!context.defines.iter().any(|define| define == "RELEASE"));
+    assert!(context.defines().iter().any(|define| define == "DEBUG"));
+    assert!(!context.defines().iter().any(|define| define == "RELEASE"));
 }
 
 #[test]
@@ -271,8 +271,8 @@ fn config_toml_build_choice_selects_debug_over_global_option() {
         context.platform_selection.selected.as_deref(),
         Some("Win32")
     );
-    assert!(context.defines.iter().any(|define| define == "DEBUG"));
-    assert!(!context.defines.iter().any(|define| define == "RELEASE"));
+    assert!(context.defines().iter().any(|define| define == "DEBUG"));
+    assert!(!context.defines().iter().any(|define| define == "RELEASE"));
 }
 
 #[test]
@@ -774,7 +774,7 @@ fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
         Some("Win32")
     );
     assert!(
-        context.search_paths.contains(&fixture.shared),
+        context.search_paths().contains(&fixture.shared),
         "warnings: {:?}",
         observations.warnings
     );
@@ -804,8 +804,8 @@ fn ide_library_path_sources_are_project_compiled_except_inside_the_installation(
         "open reasons: {:?}; warnings: {:?}",
         context.conditional_closure.open_reasons, observations.warnings
     );
-    assert!(context.search_paths.contains(&fixture.shared));
-    assert!(context.search_paths.contains(&rtl));
+    assert!(context.search_paths().contains(&fixture.shared));
+    assert!(context.search_paths().contains(&rtl));
     assert_project_compiled(&context, &shared_file);
     assert_library(&context, &rtl_file);
     assert_library(&context, &browsing_file);
@@ -831,7 +831,7 @@ fn library_path_under_an_imported_bdscommondir_stays_library_code() {
     );
 
     assert!(
-        context.search_paths.contains(&common.join("Dcp")),
+        context.search_paths().contains(&common.join("Dcp")),
         "warnings: {:?}",
         observations.warnings
     );
@@ -858,7 +858,7 @@ fn library_path_under_an_unmapped_installation_root_stays_library_code() {
     );
 
     assert!(
-        context.search_paths.contains(&mapped_source),
+        context.search_paths().contains(&mapped_source),
         "warnings: {:?}",
         observations.warnings
     );
@@ -885,7 +885,7 @@ fn library_path_with_dot_dot_segments_under_an_unmapped_root_stays_library_code(
     );
 
     assert!(
-        context.search_paths.contains(&mapped_source),
+        context.search_paths().contains(&mapped_source),
         "warnings: {:?}",
         observations.warnings
     );
@@ -914,7 +914,7 @@ fn any_installation_spelling_of_a_duplicate_library_entry_keeps_it_library_code(
         );
 
         assert!(
-            context.search_paths.contains(&mapped_source),
+            context.search_paths().contains(&mapped_source),
             "{library}: warnings: {:?}",
             observations.warnings
         );
@@ -2062,4 +2062,32 @@ fn session_build_choice_still_overrides_the_configured_choice_with_the_cache() {
     );
     assert_eq!(session.config_selection.selected.as_deref(), Some("Debug"));
     assert_eq!(session.config_selection.mode, BuildSelectionMode::Session);
+}
+
+#[test]
+fn defines_follow_effective_facts_when_the_caller_sets_a_project_define_false() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let mut conditional = ConditionalContext::default();
+    conditional.set_define("NOSF", ConditionalFact::False);
+    let options = ProjectOptions {
+        build_config: Some("Debug".into()),
+        conditional_context: conditional,
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(
+        context.conditional_context.define("NOSF"),
+        ConditionalFact::False
+    );
+    let defines = context.defines();
+    assert!(defines.iter().any(|define| define == "DEBUG"));
+    assert!(!defines.iter().any(|define| define == "NOSF"));
+    let mut sorted = defines.clone();
+    sorted.sort();
+    assert_eq!(defines, sorted);
 }

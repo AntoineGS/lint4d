@@ -3888,29 +3888,6 @@ impl<S: SourceStore> UnitResolver<S> {
             {
                 return Ok(result);
             }
-        } else if let Some(paths) = self
-            .context
-            .explicit_units
-            .get(&lookup.to_ascii_lowercase())
-        {
-            let paths: Vec<_> = paths
-                .iter()
-                .filter_map(|path| {
-                    self.context
-                        .path_entry_for(path)
-                        .or_else(|| self.legacy_entry_for_path(path, request.legacy_route))
-                        .map(|entry| (path.clone(), entry))
-                })
-                .collect();
-            let group = CandidateGroup {
-                paths: paths.into(),
-                legacy_route: request.legacy_route,
-            };
-            if let Some(result) =
-                self.resolve_candidate_group(&group, requested, &lookup, cancel)?
-            {
-                return Ok(result);
-            }
         }
 
         if let Some(directory) = request.importer_path.parent()
@@ -3926,15 +3903,7 @@ impl<S: SourceStore> UnitResolver<S> {
         {
             return Ok(result);
         }
-        let search_entries = if self.context.search_path_entries.is_empty() {
-            self.context
-                .search_paths
-                .iter()
-                .filter_map(|path| self.context.path_entry_for(path))
-                .collect::<Vec<_>>()
-        } else {
-            self.context.search_path_entries.clone()
-        };
+        let search_entries = self.context.search_path_entries.clone();
         for entry in search_entries {
             if let Some(result) = self.resolve_directory(
                 &entry.path,
@@ -5746,7 +5715,7 @@ impl<S: SourceStore> UnitResolver<S> {
             || ResolverError::InvalidRequest("provider construction bound overflow".into());
         let scan_count = self
             .context
-            .defines
+            .defines()
             .len()
             .checked_add(self.context.conditional_context.defines.len())
             .and_then(|n| n.checked_add(self.context.conditional_context.options.len()))
@@ -5882,12 +5851,12 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         self.check_cancel(cancel)?;
+        let include_paths = self.context.include_paths();
+        let search_paths = self.context.search_paths();
         if self.owning_include_callback {
-            let count = self
-                .context
-                .include_paths
+            let count = include_paths
                 .len()
-                .checked_add(self.context.search_paths.len())
+                .checked_add(search_paths.len())
                 .ok_or_else(|| {
                     ResolverError::InvalidRequest("include path sizing work overflow".into())
                 })?;
@@ -5896,11 +5865,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 .charge(count, 0, 0)
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
         }
-        let paths = self
-            .context
-            .include_paths
+        let paths = include_paths
             .iter()
-            .chain(&self.context.search_paths)
+            .chain(&search_paths)
             .try_fold(0usize, |sum, path| {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
@@ -7993,7 +7960,7 @@ fn conditional_context_reserve_polled(
             )
             .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
     }
-    for define in &context.defines {
+    for define in &context.defines() {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
@@ -9556,7 +9523,6 @@ mod tests {
         UnitResolver::new(
             ProjectContext {
                 discovery_complete: true,
-                search_paths: vec![PathBuf::from("/workspace")],
                 search_path_entries: vec![ProjectPathEntry::legacy(PathBuf::from("/workspace"))],
                 ..Default::default()
             },
@@ -11507,7 +11473,6 @@ mod tests {
             let later = dir.path().join("later");
             fs::create_dir(&later).unwrap();
             fs::write(later.join("value.inc"), "{later physical include}").unwrap();
-            resolver.context.include_paths = vec![later.clone(), later.clone()];
             resolver.context.include_path_entries =
                 vec![resolver.context.path_entry_for(&later).unwrap(); 2];
             if overlay {
@@ -15108,10 +15073,11 @@ mod tests {
                 .is_some(),
             "existing actual legacy builder authorizes relative route"
         );
+        let entry = resolver.legacy_entry_for_path(&unit, Some(&route)).unwrap();
         resolver
             .context
-            .explicit_units
-            .insert("selected".into(), vec![unit.clone()]);
+            .explicit_unit_entries
+            .insert("selected".into(), vec![entry]);
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let outcome = resolver
             .unit_report_capability(
@@ -19464,7 +19430,6 @@ mod tests {
         }
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,
@@ -19514,7 +19479,6 @@ mod tests {
         }
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,
@@ -19589,7 +19553,6 @@ mod tests {
             let root = PathBuf::from("/workspace");
             let context = ProjectContext {
                 discovery_complete: true,
-                search_paths: vec![root.clone()],
                 search_path_entries: vec![ProjectPathEntry {
                     path: root.clone(),
                     provenance: ProjectPathProvenance::LegacyNative,
@@ -19705,7 +19668,6 @@ mod tests {
         }
         let context = ProjectContext {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,

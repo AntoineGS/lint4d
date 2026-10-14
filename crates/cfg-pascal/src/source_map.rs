@@ -525,6 +525,35 @@ pub struct SourceMap {
     prepared_len: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MapRangeWork {
+    seek_comparisons: usize,
+    contributions: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MAP_RANGE_WORK: std::cell::Cell<MapRangeWork> =
+        std::cell::Cell::new(MapRangeWork::default());
+}
+
+#[cfg(test)]
+fn record_map_range_work(work: MapRangeWork) {
+    MAP_RANGE_WORK.with(|total| {
+        let previous = total.get();
+        total.set(MapRangeWork {
+            seek_comparisons: previous.seek_comparisons + work.seek_comparisons,
+            contributions: previous.contributions + work.contributions,
+        });
+    });
+}
+
+#[cfg(test)]
+fn take_map_range_work() -> MapRangeWork {
+    MAP_RANGE_WORK.with(|total| total.replace(MapRangeWork::default()))
+}
+
 impl SourceMap {
     /// Validate a complete mapping for `prepared_bytes`.
     ///
@@ -791,8 +820,23 @@ impl SourceMap {
             return Ok(Vec::new());
         }
 
+        #[cfg(test)]
+        let mut seek_comparisons = 0;
+        #[cfg(test)]
+        let mut contributions = 0;
+
+        // `new` validates contiguous ordered coverage, so segment ends are
+        // monotonic and the segments ending at/before the query start form a prefix.
+        let first_segment = self.segments.partition_point(|segment| {
+            #[cfg(test)]
+            {
+                seek_comparisons += 1;
+            }
+            segment.prepared_range.end <= prepared_range.start
+        });
+
         let mut mapped = Vec::new();
-        for segment in &self.segments {
+        for segment in &self.segments[first_segment..] {
             if segment.prepared_range.end <= prepared_range.start {
                 continue;
             }
@@ -816,7 +860,18 @@ impl SourceMap {
                 expansion_id: segment.expansion_id.clone(),
                 kind: segment.kind,
             });
+            #[cfg(test)]
+            {
+                contributions += 1;
+            }
         }
+
+        #[cfg(test)]
+        record_map_range_work(MapRangeWork {
+            seek_comparisons,
+            contributions,
+        });
+
         Ok(mapped)
     }
 }
@@ -862,4 +917,217 @@ fn validate_mask(
 
 fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mixed_source_map() -> SourceMap {
+        let root_id = ProjectSourceId::new("root-source");
+        let include_id = ProjectSourceId::new("include-source");
+        let prepared = b"AB \r\n !!xyxyzz";
+        let segments = vec![
+            SourceMapSegment::copied(0..2, root_id.clone(), 0..2, ExpansionId::root()),
+            SourceMapSegment::masked(2..6, root_id.clone(), 2..6, ExpansionId::root()),
+            SourceMapSegment::synthetic(6..8, ExpansionId::new("generated")),
+            SourceMapSegment::copied(8..10, include_id.clone(), 0..2, "include-1".into()),
+            SourceMapSegment::copied(10..12, include_id.clone(), 0..2, "include-2".into()),
+            SourceMapSegment::copied(12..14, root_id.clone(), 6..8, ExpansionId::root()),
+        ];
+
+        let map = SourceMap::new(
+            prepared,
+            vec![
+                SourceSnapshot::new(root_id, b"ABC\r\nDzz"),
+                SourceSnapshot::new(include_id, b"xy"),
+            ],
+            segments,
+        )
+        .unwrap();
+        assert!(map.segments().windows(2).all(|pair| {
+            pair[0].prepared_range.end == pair[1].prepared_range.start
+                && pair[0].prepared_range.end <= pair[1].prepared_range.end
+        }));
+        map
+    }
+
+    fn map_with_empty_segment() -> SourceMap {
+        let source_id = ProjectSourceId::new("zero-source");
+        SourceMap {
+            prepared_bytes: std::sync::Arc::from(&b"ab"[..]),
+            original_sources: vec![SourceSnapshot::new(source_id.clone(), b"ab")],
+            segments: vec![
+                SourceMapSegment::copied(0..1, source_id.clone(), 0..1, ExpansionId::root()),
+                SourceMapSegment::synthetic(1..1, ExpansionId::new("empty")),
+                SourceMapSegment::copied(1..2, source_id, 1..2, ExpansionId::root()),
+            ],
+            prepared_len: 2,
+        }
+    }
+
+    fn old_linear_map_range(
+        map: &SourceMap,
+        prepared_range: Range<usize>,
+    ) -> Result<Vec<MappedSourceSpan>, SourceMapError> {
+        if prepared_range.start > prepared_range.end {
+            return Err(SourceMapError::InvalidRange {
+                range: prepared_range,
+                space: "mapping",
+            });
+        }
+        if prepared_range.end > map.prepared_len {
+            return Err(SourceMapError::MapRangeOutOfBounds {
+                range: prepared_range,
+                prepared_len: map.prepared_len,
+            });
+        }
+        if prepared_range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut mapped = Vec::new();
+        for segment in &map.segments {
+            if segment.prepared_range.end <= prepared_range.start {
+                continue;
+            }
+            if segment.prepared_range.start >= prepared_range.end {
+                break;
+            }
+
+            let start = segment.prepared_range.start.max(prepared_range.start);
+            let end = segment.prepared_range.end.min(prepared_range.end);
+            let original = segment.original.as_ref().map(|original| {
+                let offset = start - segment.prepared_range.start;
+                SourceSpan::new(
+                    original.source_id.clone(),
+                    (original.byte_range.start + offset)
+                        ..(original.byte_range.start + offset + (end - start)),
+                )
+            });
+            mapped.push(MappedSourceSpan {
+                prepared_range: start..end,
+                original,
+                expansion_id: segment.expansion_id.clone(),
+                kind: segment.kind,
+            });
+        }
+        Ok(mapped)
+    }
+
+    #[test]
+    fn map_range_matches_old_linear_oracle_for_all_fixture_ranges() {
+        for map in [mixed_source_map(), map_with_empty_segment()] {
+            let max = map.prepared_len + 1;
+            for start in 0..=max {
+                for end in 0..=max {
+                    let range = start..end;
+                    assert_eq!(
+                        map.map_range(range.clone()),
+                        old_linear_map_range(&map, range.clone()),
+                        "range {range:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_empty_segments_without_changing_end_order_invariant() {
+        let error = SourceMap::new(
+            b"a",
+            Vec::new(),
+            vec![
+                SourceMapSegment::synthetic(0..1, ExpansionId::root()),
+                SourceMapSegment::synthetic(1..1, ExpansionId::root()),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, SourceMapError::EmptySegment { range: 1..1 });
+        let map = mixed_source_map();
+        assert!(map
+            .segments()
+            .windows(2)
+            .all(|pair| { pair[0].prepared_range.end <= pair[1].prepared_range.end }));
+    }
+
+    #[test]
+    fn zero_length_segment_crossed_by_query_still_emits_empty_span() {
+        let map = map_with_empty_segment();
+        let mapped = map.map_range(0..2).unwrap();
+        assert_eq!(mapped, old_linear_map_range(&map, 0..2).unwrap());
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(mapped[1].prepared_range, 1..1);
+    }
+
+    #[test]
+    fn empty_and_invalid_ranges_do_not_scan_segments() {
+        let map = mixed_source_map();
+        take_map_range_work();
+        let reversed_range = Range { start: 4, end: 3 };
+
+        for range in [
+            map.prepared_len..map.prepared_len,
+            reversed_range,
+            0..map.prepared_len + 1,
+        ] {
+            assert_eq!(
+                map.map_range(range.clone()),
+                old_linear_map_range(&map, range)
+            );
+        }
+
+        assert_eq!(take_map_range_work(), MapRangeWork::default());
+    }
+
+    #[test]
+    fn late_queries_use_bounded_seek_work_on_large_maps() {
+        const SEGMENT_COUNT: usize = 10_000;
+        const QUERY_COUNT: usize = 10_000;
+
+        let source_id = ProjectSourceId::new("large-source");
+        let bytes = vec![b'x'; SEGMENT_COUNT];
+        let segments = (0..SEGMENT_COUNT)
+            .map(|offset| {
+                SourceMapSegment::copied(
+                    offset..offset + 1,
+                    source_id.clone(),
+                    offset..offset + 1,
+                    ExpansionId::root(),
+                )
+            })
+            .collect();
+        let map = SourceMap::new(
+            &bytes,
+            vec![SourceSnapshot::new(source_id, &bytes)],
+            segments,
+        )
+        .unwrap();
+        let queries: Vec<_> = (0..QUERY_COUNT)
+            .map(|index| {
+                let start = 8_000 + (index * 137 % 2_000);
+                start..start + 1
+            })
+            .collect();
+        let modeled_old_skip_iterations: usize = queries.iter().map(|range| range.start).sum();
+
+        take_map_range_work();
+        for range in &queries {
+            let mapped = map.map_range(range.clone()).unwrap();
+            assert_eq!(mapped.len(), 1);
+            assert_eq!(mapped[0].prepared_range, *range);
+        }
+        let work = take_map_range_work();
+        let measured_work = work.seek_comparisons + work.contributions;
+        eprintln!(
+            "map_range work: segments={SEGMENT_COUNT}, queries={QUERY_COUNT}, modeled_old_skip_iterations={modeled_old_skip_iterations}, measured_seek_comparisons={}, measured_contributions={}, measured_work={measured_work}",
+            work.seek_comparisons, work.contributions
+        );
+
+        assert_eq!(work.contributions, QUERY_COUNT);
+        assert!(
+            work.seek_comparisons > 0 && measured_work < modeled_old_skip_iterations / 100,
+            "expected measured logarithmic seek work below 1% of modeled old skips; measured {work:?}, measured_work={measured_work}, modeled_old_skip_iterations={modeled_old_skip_iterations}"
+        );
+    }
 }

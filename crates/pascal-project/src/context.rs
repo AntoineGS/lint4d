@@ -27,6 +27,40 @@ pub struct ProjectOptions {
     pub conditional_context: ConditionalContext,
 }
 
+/// The session choices that apply to one project file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) struct SessionSelections {
+    pub(crate) installation: Option<String>,
+    pub(crate) build: Option<BuildChoice>,
+}
+
+impl ProjectOptions {
+    /// Look up this project's session choices. Construction and the context
+    /// cache key both use this, so they cannot disagree.
+    pub(crate) fn session_selections_for(&self, project_file: &Path) -> SessionSelections {
+        SessionSelections {
+            installation: selection_for_project(&self.installation_selections, project_file)
+                .cloned(),
+            build: selection_for_project(&self.build_selections, project_file).cloned(),
+        }
+    }
+}
+
+/// An exact key wins; otherwise the smallest equivalent key by bytes, so the
+/// result never depends on `HashMap` iteration order.
+fn selection_for_project<'a, T>(
+    selections: &'a HashMap<PathBuf, T>,
+    project_file: &Path,
+) -> Option<&'a T> {
+    selections.get(project_file).or_else(|| {
+        selections
+            .iter()
+            .filter(|(path, _)| project_paths_equal(path, project_file))
+            .min_by(|left, right| left.0.as_os_str().cmp(right.0.as_os_str()))
+            .map(|(_, value)| value)
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct LocalProjectConfig {
@@ -595,6 +629,61 @@ impl ProjectContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_selections_prefer_the_exact_project_path() {
+        let exact = PathBuf::from("/work/App.dproj");
+        let dotted = PathBuf::from("/work/./App.dproj");
+        let doubly_dotted = PathBuf::from("/work/././App.dproj");
+        let debug = BuildChoice {
+            config: Some("Debug".into()),
+            ..BuildChoice::default()
+        };
+        let release = BuildChoice {
+            config: Some("Release".into()),
+            ..BuildChoice::default()
+        };
+        let options = ProjectOptions {
+            installation_selections: [
+                (dotted.clone(), "dotted".to_string()),
+                (exact.clone(), "exact".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            build_selections: [
+                (dotted.clone(), release.clone()),
+                (exact.clone(), debug.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            ..ProjectOptions::default()
+        };
+        let selections = options.session_selections_for(&exact);
+        assert_eq!(selections.installation.as_deref(), Some("exact"));
+        assert_eq!(selections.build, Some(debug));
+
+        let variants_only = ProjectOptions {
+            build_selections: [
+                (dotted, BuildChoice::default()),
+                (doubly_dotted, release.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            ..ProjectOptions::default()
+        };
+        // Neither key is exact; the smaller key by bytes wins in every run.
+        // "/work/././App.dproj" < "/work/./App.dproj" because '.' < 'A'.
+        for _ in 0..16 {
+            assert_eq!(
+                variants_only.session_selections_for(&exact).build,
+                Some(release.clone())
+            );
+        }
+        assert_eq!(
+            ProjectOptions::default().session_selections_for(&exact),
+            SessionSelections::default()
+        );
+    }
 
     #[test]
     fn same_analysis_inputs_ignores_only_recorded_observations() {

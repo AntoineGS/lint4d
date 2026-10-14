@@ -266,11 +266,8 @@ pub(super) fn build_project_context(
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
-    let session_build_choice = options
-        .build_selections
-        .iter()
-        .find(|(path, _)| project_paths_equal(path, &project_file))
-        .map(|(_, choice)| choice);
+    let session_selections = options.session_selections_for(&project_file);
+    let session_build_choice = session_selections.build.as_ref();
     let configured_build_choice = installation_config.configured_build_for(&project_file);
     let config_selected_in_session = session_build_choice
         .and_then(|choice| choice.config.as_ref())
@@ -348,11 +345,7 @@ pub(super) fn build_project_context(
         &installation_config,
         &project_file,
         &selection_evidence,
-        evaluation_options
-            .installation_selections
-            .iter()
-            .find(|(path, _)| project_paths_equal(path, &project_file))
-            .map(|(_, id)| id.as_str()),
+        session_selections.installation.as_deref(),
     ));
     let mut installation_environment = None;
     let mut installation_config_files = Vec::new();

@@ -803,7 +803,7 @@ fn discover_context_with_selections_inner(
                 roots: roots.clone(),
                 deleted_paths: cache_path_list(deleted_paths),
                 option_base,
-                options: ProjectOptionsCacheKey::from(&options),
+                options: ProjectOptionsCacheKey::new(&options, &project_file),
                 overrides: effective_overrides.clone(),
                 exclusions: exclusions.to_vec(),
                 warnings: warnings.clone(),

@@ -4,7 +4,11 @@
   "description": "Tree sitter grammar for Pascal (Delphi, Freepascal)",
   "main": "bindings/node",
   "types": "bindings/node",
-  "repository": null,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AntoineGS/lint4d",
+    "directory": "crates/tree-sitter-pascal"
+  },
   "author": "Benjamin Gray",
   "license": "MIT",
   "devDependencies": {

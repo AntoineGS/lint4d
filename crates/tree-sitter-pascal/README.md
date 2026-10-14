@@ -2,6 +2,29 @@
 
 Grammar for Pascal and its dialects Delphi and Freepascal.
 
+## Upstream and repository
+
+This grammar originated as a fork of [Isopod/tree-sitter-pascal]. It is now
+maintained in the canonical [lint4d monorepo], in `crates/tree-sitter-pascal`;
+the workspace builds this in-tree crate. The former standalone
+[`AntoineGS/tree-sitter-pascal`](https://github.com/AntoineGS/tree-sitter-pascal)
+repository is not the canonical package repository and is no longer used by
+the build.
+
+The imported fork history was 56 commits beyond the upstream revision
+`042119eca2e18a60e56317fb06ee3ba5c32cb447` at imported revision
+`22cf861dc87bde0dd0b0d6397dd85dbef375006e`. This is a historical comparison
+of those two revisions, not a claim that the current monorepo is 56 commits
+ahead of upstream. Reproduce the count from a full-history clone containing
+both revisions with:
+
+```sh
+git rev-list --count 042119eca2e18a60e56317fb06ee3ba5c32cb447..22cf861dc87bde0dd0b0d6397dd85dbef375006e
+```
+
+[Isopod/tree-sitter-pascal]: https://github.com/Isopod/tree-sitter-pascal
+[lint4d monorepo]: https://github.com/AntoineGS/lint4d
+
 ## Supported language features
 - Classes, records, interfaces, class helpers
 - Nested declarations

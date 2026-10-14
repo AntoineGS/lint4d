@@ -6,14 +6,15 @@ description, acceptance criteria and dependencies carry the task-specific detail
 
 ## Scope and method
 
-- **Scope:** the lint4d workspace (`pascal-project`, `pascal-core`, `lint4d`, `fmt4d`,
-  `pascal-lsp`) and the sibling repos it pins: `../tree-sitter-pascal`, `../cfg-core`,
-  `../cfg-pascal`.
-- **Method:** static review by five reviewers, one per domain, plus build timings taken on the
-  maintainer's machine. Runtime claims describe algorithmic shape, not measured timings, unless a
-  number is given.
-- **Citations:** every `file:line` was spot-checked at commit `8af7498`. Line numbers drift; grep
-  for the quoted identifiers if a citation no longer lands, and fix the citation in the task.
+- **Current scope:** the lint4d workspace, including the in-tree grammar and CFG crates at
+  `crates/tree-sitter-pascal`, `crates/cfg-core` and `crates/cfg-pascal`. The original review's
+  scope included these as sibling repositories; that layout is historical.
+- **Historical method:** the 2026-10-02 review used static review by five reviewers, one per domain,
+  plus build timings taken on the maintainer's machine. Runtime claims describe algorithmic shape,
+  not measured timings, unless a number is given.
+- **Historical citations:** every `file:line` was spot-checked at commit `8af7498`. Line numbers
+  drift; grep for the quoted identifiers if a citation no longer lands, and fix the citation in the
+  task.
 - **Task conventions:** "Done when" became acceptance criterion #1. "Tests first" lists the
   regression or characterization tests to add before changing behaviour; for pure refactors it names
   the suites that must stay green. "Depends on" in the description includes soft or optional
@@ -30,21 +31,29 @@ Every arch-review task's requirements implicitly include these.
 - Toolchain: `rust-toolchain.toml` pins `1.99.0`. `cargo fmt --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` must pass.
 - `warnings = "deny"` and `clippy::dbg_macro = "deny"` are workspace lints.
-- Sibling repos are git dependencies pinned by rev. The tree-sitter-pascal rev must be identical in
-  `crates/lint4d/Cargo.toml`, `crates/pascal-core/Cargo.toml` and `../cfg-pascal/Cargo.toml`.
-  Bump cfg-pascal first, push, then bump here. A gitignored `.cargo/config.toml` with `paths`
-  overrides builds against the checkouts; it cannot change a crate's dependency list. See
-  `CLAUDE.md`, section "Editable dependencies".
+- **Editable dependencies:** as accepted in
+  [`docs/decisions/0001-monorepo.md`](decisions/0001-monorepo.md) and documented in `AGENTS.md`,
+  the grammar and CFG crates are workspace path dependencies. Edit the in-tree crates directly and
+  include each dependency fix in the same change as the code that needs it. `lint4d` uses
+  `cfg-core` only through the `cfg_pascal::cfg_core` re-export. There are no dependency revisions
+  to bump and no `.cargo/config.toml` path overrides.
+- **Grammar edits:** edit `crates/tree-sitter-pascal/grammar.js`; from that directory, run
+  `tree-sitter generate` and `tree-sitter test` with tree-sitter CLI 0.24. The pinned CLI is
+  available as `npx tree-sitter` after `npm install` there. Include regenerated
+  `src/parser.c`, `src/grammar.json` and `src/node-types.json` with the grammar change.
 - No new git dependencies: `.cargo/deny.toml` has `unknown-git = "deny"`.
-- Some tests and clippy lints already fail on master; they are listed in l4d-1.1. Do not count those
-  as regressions you caused, but do not add to them.
+- The original review recorded tests and clippy lints failing on its master baseline in l4d-1.1.
+  This is historical context; verify the current baseline before attributing failures.
 - Bug-shaped tasks follow the TDD rule in `CLAUDE.md`: failing regression test first, minimal fix,
   refactor.
 
-## Measured baselines
+## Historical baselines
 
-Re-run these after any task that claims a build or test win, and record before and after numbers in
-the task's final summary. Several tasks refer to this as "the baseline table".
+The measurements and size facts below were recorded for the 2026-10-02 architecture review at
+commit `8af7498`. They are historical evidence, not current workspace measurements. Original
+commands are retained for reproduction; re-measure at the relevant commit and record the date and
+environment before making a current performance claim. References in the original review tasks to
+"the baseline table" refer to these historical values unless explicitly re-measured.
 
 | Measurement | Value | Command |
 |---|---|---|
@@ -53,7 +62,7 @@ the task's final summary. Several tasks refer to this as "the baseline table".
 | Touch one leaf file in pascal-project, rebuild workspace | 9.7s wall | `touch crates/pascal-project/src/path_issues.rs && time cargo build --workspace --all-targets --locked` |
 | Test executables produced | 72 | `cargo test --workspace --no-run 2>&1 \| grep -c Executable` |
 
-Size facts at commit `8af7498` that motivate the structural tasks:
+Historical size facts at commit `8af7498` that motivated the structural tasks:
 
 | File or count | Value | Notes |
 |---|---|---|
@@ -68,12 +77,14 @@ Size facts at commit `8af7498` that motivate the structural tasks:
 
 ## Why the LSP tasks matter
 
-The `lsp` tasks in milestones M2, M3 and M6 explain the symptoms seen on the 24,050-file production
-repository: workspace-wide requests burn a core for 8+ minutes and then fail, RSS grows by gigabytes
-during indexing, and "analysis result became stale" is frequent. The review traced these to three
-compounding choices: workspace semantics rebuilt per request instead of indexed (LSP-16 and its
-consumers), every result requiring global completeness (LSP-1, LSP-2), and bounding machinery that
-does not bound actual memory or latency (LSP-3, LSP-4, LSP-5, LSP-9).
+The `lsp` tasks in milestones M2, M3 and M6 address historical observations reported in the
+2026-10-02 architecture review, not current measurements. That review described a 24,050-file
+production repository and reported that workspace-wide requests could burn a core for 8+ minutes
+before failing, RSS grew by gigabytes during indexing, and "analysis result became stale" was
+frequent. The review traced those reported symptoms to three compounding choices: workspace
+semantics rebuilt per request instead of indexed (LSP-16 and its consumers), every result requiring
+global completeness (LSP-1, LSP-2), and bounding machinery that does not bound actual memory or
+latency (LSP-3, LSP-4, LSP-5, LSP-9).
 
 ## Order and parallel work
 

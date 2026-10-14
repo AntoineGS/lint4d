@@ -84,7 +84,7 @@ fn workspace_fifo_probe_from_environment(
     )))
 }
 
-fn test_barrier_config() -> Result<TestBarrierConfig, String> {
+fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, String> {
     Ok(TestBarrierConfig::new(
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
@@ -123,18 +123,22 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
     .with_workspace_fifo_probe(workspace_fifo_probe_from_environment(
         TEST_WORKSPACE_FIFO_PROBE_ENV,
     )?)
-    .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from)))
+    .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from))
+    .with_analysis_metrics(analysis_metrics))
 }
 
 fn main() {
-    let barriers = match test_barrier_config() {
+    let profiling = pascal_lsp::analysis_metrics::initialize_profiling();
+    let barriers = match test_barrier_config(profiling) {
         Ok(barriers) => barriers,
         Err(error) => {
             eprintln!("pascal-lsp-test-server: {error}");
             std::process::exit(1);
         }
     };
-    match run_stdio_with_test_barriers(barriers) {
+    let result = run_stdio_with_test_barriers(barriers);
+    pascal_lsp::analysis_metrics::finish_profiling(profiling, matches!(&result, Ok(true)));
+    match result {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {

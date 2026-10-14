@@ -16937,3 +16937,60 @@ end.
         .expect("hover for an inherited routine");
     assert!(hover_text(&hover).contains("procedure Open;"), "{hover:?}");
 }
+
+/// dcc searches used units in reverse insertion order (GetUnitSym @ 0x87d888
+/// prepends each used unit), so a name exported by two used units binds to
+/// the last uses entry, and implementation uses are searched before interface
+/// uses. pascal-lsp currently returns both declarations (l4d-9je.7); when
+/// l4d-94dv is fixed, assert the compiler's choice instead: SecondExporter for
+/// `SameSection`, FirstExporter for `SplitSections`.
+#[test]
+fn a_global_exported_by_two_used_units_returns_both_declarations() {
+    let exporter = |name: &str| {
+        format!(
+            "unit {name};\ninterface\ntype\n  TShared = class\n  end;\nconst\n  Limit = 1;\nprocedure Ping;\nimplementation\nprocedure Ping;\nbegin\nend;\nend.\n"
+        )
+    };
+    let same_section = "unit SameSection;\ninterface\nuses FirstExporter, SecondExporter;\nprocedure Run;\nimplementation\nprocedure Run;\nvar\n  Item: TShared;\nbegin\n  Ping;\n  Item := nil;\n  if Limit > 0 then;\nend;\nend.\n";
+    let split_sections = "unit SplitSections;\ninterface\nuses SecondExporter;\nprocedure Run;\nimplementation\nuses FirstExporter;\nprocedure Run;\nvar\n  Item: TShared;\nbegin\n  Ping;\n  Item := nil;\n  if Limit > 0 then;\nend;\nend.\n";
+
+    let first_uri = uri("FirstExporter");
+    let second_uri = uri("SecondExporter");
+    let same_uri = uri("SameSection");
+    let split_uri = uri("SplitSections");
+    let mut index = NavigationIndex::new();
+    index
+        .update(first_uri.clone(), exporter("FirstExporter"))
+        .expect("first parses");
+    index
+        .update(second_uri.clone(), exporter("SecondExporter"))
+        .expect("second parses");
+    index
+        .update(same_uri.clone(), same_section.to_owned())
+        .expect("same-section consumer parses");
+    index
+        .update(split_uri.clone(), split_sections.to_owned())
+        .expect("split-section consumer parses");
+
+    for (consumer_uri, consumer) in [(&same_uri, same_section), (&split_uri, split_sections)] {
+        for name in ["TShared", "Ping", "Limit"] {
+            let mut targets: Vec<Url> = locations_at(
+                &index,
+                consumer_uri,
+                consumer,
+                name,
+                0,
+                NavigationTarget::Definition,
+            )
+            .into_iter()
+            .map(|location| location.uri)
+            .collect();
+            targets.sort();
+            assert_eq!(
+                targets,
+                [first_uri.clone(), second_uri.clone()],
+                "{consumer_uri}: {name}"
+            );
+        }
+    }
+}

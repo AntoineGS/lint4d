@@ -5,8 +5,10 @@
 //! unconditionally while walking a source buffer; anything else remains
 //! [`Truth::Unknown`].
 
+use crate::compile_time::{AdmittedOwned, CompileTimeBudget, IncompleteReason, SourceAnchor};
 use crate::resolver::{CancellationToken, NoCancellation};
 use pascal_project::canonical_option_name;
+use pascal_project::{LayoutContext, LayoutPlatform};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -16,9 +18,9 @@ use std::ops::Range;
 #[cfg(test)]
 use std::cell::Cell;
 
-const MAX_DIRECTIVES: usize = 16_384;
-const MAX_CONDITIONAL_DEPTH: usize = 256;
-const MAX_EXPRESSION_TOKENS: usize = 256;
+pub(crate) const MAX_DIRECTIVES: usize = 16_384;
+pub(crate) const MAX_CONDITIONAL_DEPTH: usize = 256;
+pub(crate) const MAX_EXPRESSION_TOKENS: usize = 256;
 const MAX_EXPRESSION_BYTES: usize = 4_096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 32_768;
 const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
@@ -229,12 +231,15 @@ struct LexResult {
 
 #[derive(Debug, Clone)]
 pub struct ConditionalEnvironment {
+    pub(crate) typed_state: Option<Box<crate::compile_time::CompileTimeState>>,
     values: HashMap<String, Truth>,
     options: HashMap<String, Truth>,
     constants: BTreeMap<String, ConstantValue>,
     source_constants: BTreeSet<String>,
     source_declarations: BTreeMap<String, Truth>,
     compiler_version: Option<CompilerVersion>,
+    layout: LayoutContext,
+    layout_explicit: bool,
     absent_define: Truth,
     rtl_constants_known: bool,
     bytes: usize,
@@ -244,12 +249,15 @@ pub struct ConditionalEnvironment {
 impl Default for ConditionalEnvironment {
     fn default() -> Self {
         Self {
+            typed_state: None,
             values: HashMap::new(),
             options: HashMap::new(),
             constants: BTreeMap::new(),
             source_constants: BTreeSet::new(),
             source_declarations: BTreeMap::new(),
             compiler_version: None,
+            layout: LayoutContext::default(),
+            layout_explicit: false,
             absent_define: Truth::Unknown,
             rtl_constants_known: false,
             bytes: 0,
@@ -259,6 +267,112 @@ impl Default for ConditionalEnvironment {
 }
 
 impl ConditionalEnvironment {
+    // Low-level declaration graphs have no source-session scalar history. Their
+    // immutable context is still authoritative, but must be admitted before copy.
+    pub(crate) fn context_snapshot(
+        context: &ConditionalContext,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        use crate::compile_time::IncompleteReason;
+        let before = budget.manual_retained();
+        let result = (|| {
+            let entries = context
+                .defines
+                .len()
+                .checked_add(context.options.len())
+                .and_then(|n| n.checked_add(context.constants.len()))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let metadata = entries
+                .checked_mul(size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>())
+                .and_then(|n| n.checked_add(size_of::<Self>()))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            budget.charge(
+                entries
+                    .checked_add(1)
+                    .ok_or(IncompleteReason::MalformedSource)?,
+                0,
+                metadata,
+            )?;
+            let mut failure = None;
+            context
+                .visit_recovery_payload(&mut |bytes| {
+                    budget.charge(1, bytes, bytes).map_err(|reason| {
+                        failure = Some(reason);
+                        String::new()
+                    })
+                })
+                .map_err(|_| failure.unwrap_or(IncompleteReason::MalformedSource))?;
+            Self::try_from_context(context).ok_or(IncompleteReason::MalformedSource)
+        })();
+        if result.is_err() {
+            budget.release(budget.manual_retained().saturating_sub(before));
+        }
+        result
+    }
+
+    pub(crate) fn snapshot_scalar(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        self.admit_scalar_snapshot(budget)?;
+        Ok(self.clone_scalar())
+    }
+
+    fn admit_scalar_snapshot(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        let bytes = size_of::<Self>()
+            + self.bytes
+            + (self.scalar_len() + self.source_constants.len())
+                * (size_of::<String>() + 4 * size_of::<usize>());
+        budget.charge(
+            self.scalar_len() + self.source_constants.len() + 1,
+            bytes,
+            bytes,
+        )
+    }
+
+    fn clone_scalar(&self) -> Self {
+        Self {
+            typed_state: None,
+            values: self.values.clone(),
+            options: self.options.clone(),
+            constants: self.constants.clone(),
+            source_constants: self.source_constants.clone(),
+            source_declarations: self.source_declarations.clone(),
+            compiler_version: self.compiler_version,
+            layout: self.layout.clone(),
+            layout_explicit: self.layout_explicit,
+            absent_define: self.absent_define,
+            rtl_constants_known: self.rtl_constants_known,
+            bytes: self.bytes,
+            rejected_context: self.rejected_context,
+        }
+    }
+
+    pub(crate) fn snapshot_typed(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        // Admit both complete owners before any copied payload is constructed.
+        let before = budget.manual_retained();
+        let result = (|| {
+            self.admit_scalar_snapshot(budget)?;
+            let state = self
+                .typed_state
+                .as_deref()
+                .map(|state| state.snapshot(budget))
+                .transpose()?;
+            let mut snapshot = self.clone_scalar();
+            snapshot.typed_state = state.map(Box::new);
+            Ok(snapshot)
+        })();
+        if result.is_err() {
+            budget.release(budget.manual_retained().saturating_sub(before));
+        }
+        result
+    }
     fn new() -> Self {
         Self::default()
     }
@@ -293,6 +407,18 @@ impl ConditionalEnvironment {
         let mut environment = Self::new();
         environment.absent_define = context.absent_define;
         environment.rtl_constants_known = context.rtl_constants_known;
+        // Other targets retain an owned spelling even though they have no
+        // verified ABI. Admit that payload before cloning it into the evaluator.
+        let layout_bytes = layout_entry_size(&context.layout, context.layout_explicit);
+        if layout_bytes > MAX_ENVIRONMENT_BYTES
+            || !budget.charge(usize::from(layout_bytes > 0))
+            || !budget.charge_bytes(layout_bytes)
+        {
+            return None;
+        }
+        environment.layout = context.layout.clone();
+        environment.layout_explicit = context.layout_explicit;
+        environment.bytes = layout_bytes;
         if let Some(version) = context.compiler_version {
             if !budget.charge(1) || !budget.charge_bytes(size_of::<CompilerVersion>()) {
                 return None;
@@ -362,11 +488,16 @@ impl ConditionalEnvironment {
         Some(environment)
     }
 
+    /// Data-only projection of conditional facts and source-entry layout.
+    ///
+    /// This is not a typed-state snapshot: declaration identities, scopes,
+    /// occurrence continuation and pending lexical state are not represented by
+    /// `ConditionalContext` and cannot be restored from this projection.
     pub fn to_context(&self) -> ConditionalContext {
         ConditionalContext {
             compiler_version: self.compiler_version,
-            layout: Default::default(),
-            layout_explicit: false,
+            layout: self.layout.clone(),
+            layout_explicit: self.layout_explicit,
             defines: self
                 .values
                 .iter()
@@ -381,6 +512,24 @@ impl ConditionalEnvironment {
             absent_define: self.absent_define,
             rtl_constants_known: self.rtl_constants_known,
         }
+    }
+
+    pub(crate) fn recovery_payload_bytes(&self) -> usize {
+        let mut typed_bytes = 0usize;
+        if let Some(state) = &self.typed_state {
+            let _ = state.visit_recovery_payload(&mut |bytes| {
+                typed_bytes = typed_bytes.saturating_add(bytes);
+                Ok(())
+            });
+        }
+        typed_bytes
+            .saturating_add(size_of::<Self>())
+            .saturating_add(self.bytes)
+            .saturating_add(
+                self.scalar_len()
+                    .saturating_add(self.source_constants.len())
+                    .saturating_mul(size_of::<String>() + 4 * size_of::<usize>()),
+            )
     }
 
     fn insert_value(&mut self, key: String, value: Truth) {
@@ -571,13 +720,15 @@ impl ConditionalEnvironment {
 
     /// Whether this environment carries any inherited DEFINE/UNDEF facts.
     pub fn has_facts(&self) -> bool {
-        !self.values.is_empty()
+        self.typed_state.is_some()
+            || !self.values.is_empty()
             || !self.options.is_empty()
             || !self.constants.is_empty()
             || !self.source_declarations.is_empty()
             || self.compiler_version.is_some()
             || self.absent_define != Truth::Unknown
             || self.rtl_constants_known
+            || layout_entry_size(&self.layout, self.layout_explicit) > 0
     }
 
     /// Return a stable identity for the currently established facts.
@@ -623,16 +774,34 @@ impl ConditionalEnvironment {
         self.rtl_constants_known.hash(&mut hasher);
         8_u8.hash(&mut hasher);
         self.source_declarations.hash(&mut hasher);
+        9_u8.hash(&mut hasher);
+        self.layout.hash(&mut hasher);
+        self.layout_explicit.hash(&mut hasher);
+        self.typed_state
+            .as_ref()
+            .map(|state| state.fingerprint())
+            .hash(&mut hasher);
         hasher.finish()
     }
 
     fn len(&self) -> usize {
+        self.scalar_len().saturating_add(
+            self.typed_state
+                .as_deref()
+                .map_or(0, |state| state.retained_entries()),
+        )
+    }
+
+    fn scalar_len(&self) -> usize {
         self.values
             .len()
             .saturating_add(self.options.len())
             .saturating_add(self.constants.len())
             .saturating_add(self.source_declarations.len())
             .saturating_add(usize::from(self.compiler_version.is_some()))
+            .saturating_add(usize::from(
+                layout_entry_size(&self.layout, self.layout_explicit) > 0,
+            ))
     }
     fn contains_key(&self, key: &str) -> bool {
         self.values.contains_key(key)
@@ -652,10 +821,18 @@ impl ConditionalEnvironment {
         self.values.keys()
     }
     fn bytes(&self) -> usize {
-        self.bytes
+        let mut bytes = self.bytes;
+        if let Some(state) = &self.typed_state {
+            let _ = state.visit_recovery_payload(&mut |payload| {
+                bytes = bytes.saturating_add(payload);
+                Ok(())
+            });
+        }
+        bytes
     }
 
     fn clear(&mut self) {
+        self.typed_state = None;
         self.values.clear();
         self.options.clear();
         self.clear_constants();
@@ -741,6 +918,7 @@ impl ConditionalEnvironment {
         } else {
             0
         };
+        bytes = bytes.saturating_add(layout_entry_size(&self.layout, self.layout_explicit));
         for key in self.values.keys() {
             bytes = bytes.saturating_add(self.value_entry_size(key));
         }
@@ -758,6 +936,19 @@ impl ConditionalEnvironment {
         }
         self.bytes = bytes;
     }
+}
+
+fn layout_entry_size(layout: &LayoutContext, explicit: bool) -> usize {
+    if !explicit && *layout == LayoutContext::default() {
+        return 0;
+    }
+    let payload = match &layout.platform {
+        Some(LayoutPlatform::Other(name)) => name.len(),
+        _ => 0,
+    };
+    size_of::<LayoutContext>()
+        .saturating_add(size_of::<bool>())
+        .saturating_add(payload)
 }
 
 #[derive(Debug)]
@@ -924,9 +1115,21 @@ fn analyze_inner(
             ConditionalEnvironment::new()
         }
     };
-    analyze_lexed(source, lexed, &mut environment, cancel, None, complete)
+    analyze_lexed(
+        source,
+        lexed,
+        &mut environment,
+        cancel,
+        None,
+        complete,
+        None,
+    )
 }
 
+/// Compatibility scalar callback. Its signature cannot carry physical source
+/// identities or a shared typed declaration continuation. Potentially active
+/// includes therefore make `complete` false even when scalar effects are known;
+/// source-backed clients should use `compile_time::analyze_source` instead.
 pub fn analyze_with_include_callback(
     source: &str,
     environment: &mut ConditionalEnvironment,
@@ -947,6 +1150,7 @@ pub fn analyze_with_include_callback(
         Some(cancel),
         Some(include),
         initial_complete,
+        None,
     )
 }
 
@@ -965,6 +1169,833 @@ pub fn analyze_with_include_callback_context(
     analyze_with_include_callback(source, environment, cancel, include)
 }
 
+/// Internal source-backed extension of the same directive interpreter. The
+/// session owns admission, lexical declarations, and unavailable-fact reasons.
+pub(crate) trait SourceOrder {
+    fn stop_source(&self) -> bool {
+        false
+    }
+    fn continue_source(&self, _end: usize, _length: usize) -> bool {
+        false
+    }
+    fn projection_end(&self, length: usize) -> usize {
+        length
+    }
+    fn output_budget(
+        &mut self,
+        action: &mut dyn FnMut(&mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason>,
+    ) -> Result<(), ()>;
+    fn next_directive(&mut self, source: &str, cursor: usize) -> Result<SourceOrderStep, ()>;
+    fn activity(&self) -> Truth;
+    fn admit_directive(&mut self, body_bytes: usize) -> bool;
+    fn admit_environment(&mut self, environment: &ConditionalEnvironment) -> bool;
+    fn feed(&mut self, range: Range<usize>, activity: Truth);
+    fn condition(
+        &mut self,
+        body: &str,
+        start: usize,
+        environment: &ConditionalEnvironment,
+        complete: &mut bool,
+    ) -> Truth;
+    fn directive(&mut self, directive: &ConditionalDirective);
+}
+
+pub(crate) struct SourceOrderStep {
+    pub text_end: usize,
+    pub directive: Option<AdmittedOwned<ConditionalDirective>>,
+}
+
+fn output_action<T>(
+    order: &mut dyn SourceOrder,
+    action: impl FnOnce(&mut CompileTimeBudget<'_>) -> Result<T, IncompleteReason>,
+) -> Result<T, ()> {
+    let mut action = Some(action);
+    let mut result = None;
+    order.output_budget(&mut |budget| {
+        result = Some(action.take().expect("one output action")(budget)?);
+        Ok(())
+    })?;
+    Ok(result.expect("completed output action"))
+}
+
+/// Reserve replacement backing at its full live peak. Retire only the named
+/// prior slot invoice after Vec reallocation; removal never refunds live capacity.
+pub(crate) fn output_slot<T>(
+    values: &mut Vec<T>,
+    slots: &mut usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    if values.len() == values.capacity() {
+        let count = values
+            .len()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let replacement = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(IncompleteReason::MalformedSource)?;
+        budget.charge(1, *slots, replacement)?;
+        values.reserve_exact(count - values.len());
+        budget.release(std::mem::replace(slots, replacement));
+    }
+    Ok(())
+}
+
+pub(crate) fn empty_output() -> ConditionalAnalysis {
+    ConditionalAnalysis {
+        projected_source: String::new(),
+        directives: Vec::new(),
+        inactive_spans: Vec::new(),
+        unknown_spans: Vec::new(),
+        complete: true,
+    }
+}
+
+pub(crate) fn analyze_with_source_order(
+    source: &str,
+    context: &ConditionalContext,
+    cancel: &dyn CancellationToken,
+    order: &mut dyn SourceOrder,
+) -> Result<AdmittedOwned<ConditionalAnalysis>, ()> {
+    // Lex only as far as the next directive. An include callback can change the
+    // lexical continuation before the parent resumes (including opening a
+    // literal/comment). Prelexing the whole physical parent is not sound.
+    let _ = context;
+    let environment = ConditionalEnvironment::default();
+    let mut complete = true;
+    let mut cursor = 0;
+    let mut output = output_action(order, |budget| budget.admit_owned(0, 0, 0, empty_output))?;
+    let mut masks = output_action(order, |budget| budget.admit_owned(0, 0, 0, Vec::new))?;
+    let (mut directive_slots, mut inactive_slots, mut unknown_slots, mut mask_slots) = (0, 0, 0, 0);
+    loop {
+        if cancel.is_cancelled() {
+            complete = false;
+            break;
+        }
+        let next = match order.next_directive(source, cursor) {
+            Ok(next) => next,
+            Err(()) => {
+                complete = false;
+                break;
+            }
+        };
+        let end = next.text_end;
+        let active = order.activity();
+        order.feed(cursor..end, active);
+        let activity = order.activity();
+        output_action(order, |budget| {
+            output.with_budget_mut(budget, |output, budget| {
+                if cursor < end {
+                    match activity {
+                        Truth::False => {
+                            output_slot(&mut output.inactive_spans, &mut inactive_slots, budget)?
+                        }
+                        Truth::Unknown => {
+                            output_slot(&mut output.unknown_spans, &mut unknown_slots, budget)?
+                        }
+                        Truth::True => {}
+                    }
+                }
+                add_activity_span(
+                    &mut output.inactive_spans,
+                    &mut output.unknown_spans,
+                    cursor,
+                    end,
+                    activity,
+                );
+                Ok(())
+            })?
+        })?;
+        if order.stop_source() {
+            break;
+        }
+        let Some(mut directive) = next.directive else {
+            if order.continue_source(end, source.len()) {
+                cursor = end;
+                continue;
+            }
+            break;
+        };
+        directive.value_mut().activity = order.activity();
+        order.directive(&directive);
+        if matches!(
+            directive.kind,
+            DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+        ) && !is_else_directive(&directive.body)
+        {
+            directive.value_mut().condition = Some(order.condition(
+                &directive.body,
+                directive.start,
+                &environment,
+                &mut complete,
+            ));
+        }
+        cursor = directive.end;
+        let range = directive.start..directive.end;
+        output_action(order, |budget| {
+            masks.with_budget_mut(budget, |masks, budget| {
+                output_slot(masks, &mut mask_slots, budget)?;
+                masks.push(range.clone());
+                Ok(())
+            })?
+        })?;
+        output_action(order, |budget| {
+            output.with_budget_mut(budget, |output, budget| {
+                output_slot(&mut output.directives, &mut directive_slots, budget)
+            })??;
+            output.move_field(directive, budget, |output, directive| {
+                output.directives.push(directive)
+            })
+        })?;
+    }
+    let end = order.projection_end(source.len());
+    let projection = &source[..end];
+    output_action(order, |budget| {
+        output.grow(budget, 1, projection.len(), projection.len(), |output| {
+            output.projected_source = project_source(projection, &output.inactive_spans, &masks);
+            output.complete = complete;
+        })
+    })?;
+    Ok(output)
+}
+
+/// The same physical directive lexical rules as `lex_directives_inner`, but
+/// suspended at each directive and at child EOF rather than finalizing a root.
+pub(crate) struct DirectiveScanner {
+    stop_at_semicolon: bool,
+    mode: DirectiveLex,
+    pending: AdmittedOwned<String>,
+    fragments: AdmittedOwned<Vec<SourceAnchor>>,
+    // Exact backing invoice minted at the last replacement, not a final len
+    // estimate. Anchor payload invoices stay with the independently owned Vec.
+    fragment_slots: usize,
+    prefix: usize,
+    body_mode: DirectiveLex,
+    shape_probe: Option<LayoutShapeProbe>,
+}
+
+#[derive(Default)]
+struct LayoutShapeProbe {
+    word_end: usize,
+    pending: bool,
+    found: bool,
+}
+
+impl LayoutShapeProbe {
+    fn normal_byte(
+        &mut self,
+        source: &str,
+        i: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        let bytes = source.as_bytes();
+        if i < self.word_end {
+            return Ok(());
+        }
+        budget.charge(1, 2, 0)?; // Current byte and bounded comment-opener lookahead.
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            return Ok(());
+        }
+        // Comments may separate the intrinsic identifier from its opening
+        // parenthesis. They do not turn escaped/larger names into intrinsics.
+        if byte == b'{'
+            || (byte == b'/' && bytes.get(i + 1) == Some(&b'/'))
+            || (byte == b'(' && bytes.get(i + 1) == Some(&b'*'))
+        {
+            return Ok(());
+        }
+        if byte == b'(' && self.pending {
+            self.found = true;
+        }
+        self.pending = false;
+        if matches!(byte, b's' | b'S') {
+            budget.charge(1, 8, 0)?;
+        }
+        if matches!(byte, b's' | b'S')
+            && bytes
+                .get(i..i + 6)
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"sizeof"))
+            && (i == 0 || !shape_identifier_byte(bytes[i - 1]))
+            && bytes
+                .get(i + 6)
+                .is_none_or(|byte| !shape_identifier_byte(*byte))
+        {
+            self.pending = true;
+            self.word_end = i + 6;
+        }
+        Ok(())
+    }
+}
+
+fn shape_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'&') || !byte.is_ascii()
+}
+#[derive(Default)]
+enum DirectiveLex {
+    #[default]
+    Normal,
+    Slash,
+    Paren,
+    BraceOpen,
+    StarOpen,
+    DirectiveBrace,
+    DirectiveParen,
+    DirectiveStar,
+    Brace,
+    Line,
+    StarComment,
+    StarEnd,
+    String,
+    Quote,
+}
+
+pub(crate) struct ScannedDirective {
+    pub range: Range<usize>,
+    pub body: AdmittedOwned<String>,
+    pub fragments: AdmittedOwned<Vec<SourceAnchor>>,
+    pub body_fragments: AdmittedOwned<Vec<SourceAnchor>>,
+}
+pub(crate) struct ScannerStep {
+    pub text_end: usize,
+    pub directive: Option<ScannedDirective>,
+    pub deferred: AdmittedOwned<Vec<(SourceAnchor, String)>>,
+}
+impl DirectiveScanner {
+    pub(crate) fn new(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
+        let pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        Ok(Self {
+            stop_at_semicolon: false,
+            mode: DirectiveLex::default(),
+            pending,
+            fragments,
+            fragment_slots: 0,
+            prefix: 0,
+            body_mode: DirectiveLex::Normal,
+            shape_probe: None,
+        })
+    }
+    pub(crate) fn complete(&self) -> bool {
+        matches!(
+            self.mode,
+            DirectiveLex::Normal | DirectiveLex::Slash | DirectiveLex::Line | DirectiveLex::Quote
+        )
+    }
+    pub(crate) fn prefix(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
+        let mut scanner = Self::new(budget)?;
+        scanner.stop_at_semicolon = true;
+        Ok(scanner)
+    }
+    pub(crate) fn next(
+        &mut self,
+        source: &str,
+        cursor: usize,
+        id: &crate::SourceId,
+        occurrence: crate::compile_time::OccurrenceId,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<ScannerStep, crate::compile_time::IncompleteReason> {
+        use crate::compile_time::IncompleteReason;
+        let bytes = source.as_bytes();
+        use DirectiveLex::*;
+        let mut i = cursor;
+        let mut deferred = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let mut deferred_slots = 0;
+        while i < bytes.len() {
+            if cancel.is_cancelled() {
+                return Err(IncompleteReason::Cancelled);
+            }
+            let delimiter = match self.mode {
+                Brace => Some('}'),
+                Line => Some('\n'),
+                StarComment => Some('*'),
+                _ => None,
+            };
+            if let Some(delimiter) = delimiter {
+                let skip = bounded_trivia_run(source, i, delimiter, budget)?;
+                if skip > 0 {
+                    i += skip;
+                    continue;
+                }
+            }
+            budget.charge(1, 1, 0)?;
+            let b = bytes[i];
+            if matches!(self.mode, Normal)
+                && let Some(probe) = &mut self.shape_probe
+                && (probe.pending || matches!(b, b's' | b'S'))
+            {
+                probe.normal_byte(source, i, budget)?;
+            }
+            if self.stop_at_semicolon && b == b';' && matches!(self.mode, Normal) {
+                return Ok(ScannerStep {
+                    text_end: i + 1,
+                    directive: None,
+                    deferred,
+                });
+            }
+            match self.mode {
+                Slash => {
+                    self.mode = if b == b'/' { Line } else { Normal };
+                    if b != b'/' {
+                        continue;
+                    }
+                }
+                Paren => {
+                    if b == b'*' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.mode = StarOpen;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
+                        self.mode = Normal;
+                        continue;
+                    }
+                }
+                BraceOpen => {
+                    if b == b'$' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.prefix = 2;
+                        self.mode = DirectiveBrace;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
+                        self.mode = Brace;
+                        continue;
+                    }
+                }
+                StarOpen => {
+                    if b == b'$' {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                        self.prefix = 3;
+                        self.mode = DirectiveParen;
+                    } else {
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
+                        self.mode = StarComment;
+                        continue;
+                    }
+                }
+                DirectiveBrace | DirectiveParen | DirectiveStar => {
+                    let len = source[i..]
+                        .chars()
+                        .next()
+                        .expect("byte in UTF-8 source")
+                        .len_utf8();
+                    let protected = self.body_byte(b)?;
+                    let closed = !protected
+                        && (matches!(self.mode, DirectiveBrace) && b == b'}'
+                            || matches!(self.mode, DirectiveStar) && b == b')');
+                    let suffix = if matches!(self.mode, DirectiveBrace) {
+                        1
+                    } else {
+                        2
+                    };
+                    self.append(source, i..i + len, id, occurrence, budget)?;
+                    i += len;
+                    if closed {
+                        let directive = self.finish(suffix, budget)?;
+                        self.mode = Normal;
+                        self.body_mode = Normal;
+                        return Ok(ScannerStep {
+                            text_end: directive.range.start,
+                            directive: Some(directive),
+                            deferred,
+                        });
+                    }
+                    if !matches!(self.mode, DirectiveBrace) {
+                        self.mode = if b == b'*' {
+                            DirectiveStar
+                        } else {
+                            DirectiveParen
+                        };
+                    }
+                    continue;
+                }
+                Brace => {
+                    if b == b'}' {
+                        self.mode = Normal;
+                    }
+                }
+                Line => {
+                    if b == b'\n' {
+                        self.mode = Normal;
+                    }
+                }
+                StarComment => {
+                    if b == b'*' {
+                        self.mode = StarEnd;
+                    }
+                }
+                StarEnd => {
+                    if b == b')' {
+                        self.mode = Normal;
+                    } else if b == b'*' {
+                        self.mode = StarEnd;
+                    } else {
+                        // Do not consume just the leading byte of a scalar.
+                        // Re-enter the plain-comment search at this physical
+                        // character boundary, including across source fragments.
+                        self.mode = StarComment;
+                        continue;
+                    }
+                }
+                String => {
+                    if b == b'\'' {
+                        self.mode = Quote;
+                    } else if b == b'\n' {
+                        return Err(IncompleteReason::MalformedSource);
+                    }
+                }
+                Quote => {
+                    self.mode = if b == b'\'' { String } else { Normal };
+                    if b != b'\'' {
+                        continue;
+                    }
+                }
+                Normal => {
+                    if matches!(b, b'{' | b'(') {
+                        self.append(source, i..i + 1, id, occurrence, budget)?;
+                    }
+                    self.mode = match b {
+                        b'/' => Slash,
+                        b'(' => Paren,
+                        b'{' => BraceOpen,
+                        b'\'' => String,
+                        _ => Normal,
+                    };
+                    if b == b'"' {
+                        i = skip_assembler_string(bytes, i);
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        let text_end = if self.pending.is_empty() {
+            source.len()
+        } else {
+            self.fragments
+                .last()
+                .filter(|a| a.occurrence == occurrence)
+                .map_or(cursor, |a| a.range.start)
+        };
+        Ok(ScannerStep {
+            text_end,
+            directive: None,
+            deferred,
+        })
+    }
+
+    // The outer directive delimiter is not an expression delimiter while in
+    // Pascal trivia or a quoted literal. State survives physical include EOF.
+    fn body_byte(&mut self, byte: u8) -> Result<bool, IncompleteReason> {
+        use DirectiveLex::*;
+        let protected = match self.body_mode {
+            Brace => {
+                if byte == b'}' {
+                    self.body_mode = Normal;
+                }
+                true
+            }
+            Line => {
+                if byte == b'\n' {
+                    self.body_mode = Normal;
+                }
+                true
+            }
+            StarComment => {
+                if byte == b'*' {
+                    self.body_mode = StarEnd;
+                }
+                true
+            }
+            StarEnd => {
+                self.body_mode = if byte == b')' {
+                    Normal
+                } else if byte == b'*' {
+                    StarEnd
+                } else {
+                    StarComment
+                };
+                true
+            }
+            String => {
+                if byte == b'\'' {
+                    self.body_mode = Quote;
+                } else if matches!(byte, b'\r' | b'\n') {
+                    return Err(IncompleteReason::MalformedSource);
+                }
+                true
+            }
+            Quote if byte == b'\'' => {
+                self.body_mode = String;
+                true
+            }
+            Paren if byte == b'*' => {
+                self.body_mode = StarComment;
+                true
+            }
+            Slash if byte == b'/' => {
+                self.body_mode = Line;
+                true
+            }
+            _ => false,
+        };
+        if !protected {
+            self.body_mode = match byte {
+                b'{' => Brace,
+                b'(' => Paren,
+                b'/' => Slash,
+                b'\'' => String,
+                _ => Normal,
+            };
+        }
+        Ok(protected)
+    }
+
+    fn append(
+        &mut self,
+        source: &str,
+        range: Range<usize>,
+        id: &crate::SourceId,
+        occurrence: crate::compile_time::OccurrenceId,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        use crate::compile_time::IncompleteReason;
+        let maximum = budget.limits().max_pending_bytes;
+        if self.pending.len().saturating_add(range.len()) > maximum {
+            return Err(IncompleteReason::Limit {
+                name: "max_pending_bytes",
+                maximum,
+            });
+        }
+        budget.charge(1, range.len(), 0)?;
+        let needed = self.pending.len() + range.len();
+        if needed > self.pending.capacity() {
+            let capacity = self
+                .pending
+                .capacity()
+                .max(8)
+                .saturating_mul(2)
+                .min(maximum)
+                .max(needed);
+            // Admit the full replacement peak while the old String is live.
+            // The old owner drops its actual backing before refunding credits.
+            let replacement = budget.admit_owned(1, self.pending.len(), capacity, || {
+                let mut text = String::with_capacity(capacity);
+                text.push_str(&self.pending);
+                text
+            })?;
+            self.pending = replacement;
+        }
+        if let Some(last) =
+            self.fragments.value_mut().last_mut().filter(|a| {
+                a.source == *id && a.occurrence == occurrence && a.range.end == range.start
+            })
+        {
+            last.range.end = range.end;
+        } else {
+            append_scanner_anchor(
+                &mut self.fragments,
+                &mut self.fragment_slots,
+                id,
+                occurrence,
+                range.clone(),
+                budget,
+            )?;
+        }
+        self.pending.value_mut().push_str(&source[range]);
+        Ok(())
+    }
+
+    fn flush_prefix(
+        &mut self,
+        current: crate::compile_time::OccurrenceId,
+        deferred: &mut AdmittedOwned<Vec<(SourceAnchor, String)>>,
+        deferred_slots: &mut usize,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        let count = self
+            .fragments
+            .iter()
+            .filter(|a| a.occurrence != current)
+            .count();
+        let text_bytes = self
+            .fragments
+            .iter()
+            .filter(|a| a.occurrence != current)
+            .map(|a| a.range.len())
+            .sum::<usize>();
+        let needed = deferred
+            .len()
+            .checked_add(count)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let slots = if needed > deferred.capacity() {
+            needed
+                .checked_mul(size_of::<(SourceAnchor, String)>())
+                .ok_or(IncompleteReason::MalformedSource)?
+        } else {
+            0
+        };
+        let copy_slots = if slots != 0 { *deferred_slots } else { 0 };
+        deferred.grow(
+            budget,
+            count,
+            text_bytes
+                .checked_add(copy_slots)
+                .ok_or(IncompleteReason::MalformedSource)?,
+            text_bytes
+                .checked_add(slots)
+                .ok_or(IncompleteReason::MalformedSource)?,
+            |values| {
+                if slots != 0 {
+                    values.reserve_exact(needed - values.len());
+                }
+            },
+        )?;
+        if slots != 0 {
+            deferred.retire_storage(*deferred_slots)?;
+            *deferred_slots = slots;
+        }
+        let empty_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let empty_pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let fragments = std::mem::replace(&mut self.fragments, empty_fragments);
+        let fragment_slots = std::mem::replace(&mut self.fragment_slots, 0);
+        // The fragment payload and its credits move together. Current-source
+        // anchors die here; their conservative credits die with the deferred
+        // owner too, never by a guessed length refund.
+        deferred.move_field(fragments, budget, |values, fragments| {
+            let mut offset = 0;
+            for anchor in fragments {
+                let end = offset + anchor.range.len();
+                if anchor.occurrence != current {
+                    values.push((anchor, self.pending[offset..end].to_owned()));
+                }
+                offset = end;
+            }
+        })?;
+        // The consumed source Vec's backing is now dead, not its moved anchors.
+        deferred.retire_storage(fragment_slots)?;
+        let pending = std::mem::replace(&mut self.pending, empty_pending);
+        drop(pending);
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        suffix: usize,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<ScannedDirective, crate::compile_time::IncompleteReason> {
+        let body_end = self.pending.len() - suffix;
+        let mut logical = 0;
+        let mut body_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let mut body_slots = 0;
+        for anchor in self.fragments.iter() {
+            let end = logical + anchor.range.len();
+            let a = logical.max(self.prefix);
+            let b = end.min(body_end);
+            if a < b {
+                append_scanner_anchor(
+                    &mut body_fragments,
+                    &mut body_slots,
+                    &anchor.source,
+                    anchor.occurrence,
+                    anchor.range.start + a - logical..anchor.range.start + b - logical,
+                    budget,
+                )?;
+            }
+            logical = end;
+        }
+        let body = budget.admit_owned(1, body_end - self.prefix, body_end - self.prefix, || {
+            self.pending[self.prefix..body_end].to_owned()
+        })?;
+        let range = self
+            .fragments
+            .last()
+            .expect("directive delimiter")
+            .range
+            .clone();
+        let empty_pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let empty_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let pending = std::mem::replace(&mut self.pending, empty_pending);
+        drop(pending);
+        let fragments = std::mem::replace(&mut self.fragments, empty_fragments);
+        self.fragment_slots = 0;
+        Ok(ScannedDirective {
+            range,
+            body,
+            fragments,
+            body_fragments,
+        })
+    }
+}
+
+/// One bounded standard-library delimiter search, never crossing a UTF-8
+/// boundary. Admit a search step and a visited-byte upper bound before each
+/// chunk; the delimiter itself remains for the normal lexical machine.
+pub(crate) fn bounded_trivia_run(
+    source: &str,
+    start: usize,
+    delimiter: char,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<usize, IncompleteReason> {
+    let mut end = source.len().min(start.saturating_add(4096));
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let chunk = &source[start..end];
+    // Admit the bounded visited-byte upper bound BEFORE the search. Work is
+    // one actual library search operation, not one evaluator step per byte.
+    budget.charge(1, chunk.len(), 0)?;
+    Ok(chunk.find(delimiter).unwrap_or(chunk.len()))
+}
+
+/// Scanner-only vector growth. Payload invoices attach before cloning identity
+/// metadata; a replacement admits its whole backing peak. The previous named
+/// slot invoice retires only after reserve has destroyed/replaced that backing.
+fn append_scanner_anchor(
+    target: &mut AdmittedOwned<Vec<SourceAnchor>>,
+    slot_invoice: &mut usize,
+    source: &crate::SourceId,
+    occurrence: crate::compile_time::OccurrenceId,
+    range: Range<usize>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    let slots = if target.len() == target.capacity() {
+        (target.len() + 1)
+            .checked_mul(size_of::<SourceAnchor>())
+            .ok_or(IncompleteReason::MalformedSource)?
+    } else {
+        0
+    };
+    let copy_slots = if slots != 0 { *slot_invoice } else { 0 };
+    target.grow(
+        budget,
+        1,
+        source
+            .as_str()
+            .len()
+            .checked_add(copy_slots)
+            .ok_or(IncompleteReason::MalformedSource)?,
+        slots
+            .checked_add(source.as_str().len())
+            .ok_or(IncompleteReason::MalformedSource)?,
+        |anchors| {
+            if slots != 0 {
+                anchors.reserve_exact(1);
+            }
+            anchors.push(SourceAnchor {
+                source: source.clone(),
+                occurrence,
+                range,
+            });
+        },
+    )?;
+    if slots != 0 {
+        target.retire_storage(*slot_invoice)?;
+        *slot_invoice = slots;
+    }
+    Ok(())
+}
+
 fn analyze_lexed(
     source: &str,
     lexed: LexResult,
@@ -972,6 +2003,7 @@ fn analyze_lexed(
     cancel: Option<&dyn CancellationToken>,
     mut include: Option<IncludeCallback<'_>>,
     initial_complete: bool,
+    mut order: Option<&mut dyn SourceOrder>,
 ) -> ConditionalAnalysis {
     let mut budget = AnalysisBudget {
         cancel,
@@ -998,7 +2030,11 @@ fn analyze_lexed(
             complete = false;
             break;
         }
-        if !observe_source_constants(
+        if let Some(order) = order.as_deref_mut() {
+            active = order.activity();
+            order.feed(cursor..raw.start, active);
+            active = order.activity();
+        } else if !observe_source_constants(
             source,
             cursor..raw.start,
             active,
@@ -1026,6 +2062,23 @@ fn analyze_lexed(
             activity: active,
             condition: None,
         });
+        if let Some(order) = order.as_deref_mut() {
+            order.directive(directives.last().expect("directive recorded"));
+            // The source-backed owner keeps independent correlated environments.
+            // Do not also run the legacy single-environment fork/merge below:
+            // its scalar projection cannot select typed paths after a join.
+            if matches!(
+                kind,
+                DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+            ) && !is_else_directive(&raw.body)
+            {
+                let condition = order.condition(&raw.body, raw.start, environment, &mut complete);
+                directives.last_mut().expect("directive recorded").condition = Some(condition);
+            }
+            active = order.activity();
+            cursor = raw.end;
+            continue;
+        }
 
         match kind {
             DirectiveKind::ConditionalStart => {
@@ -1033,9 +2086,21 @@ fn analyze_lexed(
                     complete = false;
                     active = Truth::Unknown;
                 } else {
-                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    let condition = if let Some(order) = order.as_deref_mut() {
+                        order.condition(&raw.body, raw.start, environment, &mut complete)
+                    } else {
+                        evaluate_condition(&raw.body, environment, &mut complete)
+                    };
                     if let Some(directive) = directives.last_mut() {
                         directive.condition = Some(condition);
+                    }
+                    if order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_environment(environment))
+                    {
+                        complete = false;
+                        cursor = raw.end;
+                        break;
                     }
                     let Some(before_environment) = clone_environment(environment, &mut budget)
                     else {
@@ -1072,7 +2137,24 @@ fn analyze_lexed(
                     complete = false;
                 }
                 if frame.current_active != Truth::False
+                    && order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_environment(environment))
+                {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
+                if frame.current_active != Truth::False
                     && !merge_environment(&mut frame.merged_environment, environment, &mut budget)
+                {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
+                if order
+                    .as_deref_mut()
+                    .is_some_and(|order| !order.admit_environment(&frame.before_environment))
                 {
                     complete = false;
                     cursor = raw.end;
@@ -1092,7 +2174,11 @@ fn analyze_lexed(
                     frame.current_active = frame.parent_active.and(frame.remaining);
                     frame.remaining = Truth::False;
                 } else {
-                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    let condition = if let Some(order) = order.as_deref_mut() {
+                        order.condition(&raw.body, raw.start, environment, &mut complete)
+                    } else {
+                        evaluate_condition(&raw.body, environment, &mut complete)
+                    };
                     if let Some(directive) = directives.last_mut() {
                         directive.condition = Some(condition);
                     }
@@ -1108,6 +2194,14 @@ fn analyze_lexed(
                     cursor = raw.end;
                     continue;
                 };
+                if order.as_deref_mut().is_some_and(|order| {
+                    !order.admit_environment(environment)
+                        || !order.admit_environment(&frame.before_environment)
+                }) {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
                 let Some(merged_environment) =
                     merge_conditional_environment(&mut frame, environment, &mut budget)
                 else {
@@ -1137,6 +2231,9 @@ fn analyze_lexed(
                 // directives. Unless their contents have been soundly
                 // processed, no previously known fact survives an active
                 // include boundary.
+                if active != Truth::False && include.is_some() {
+                    complete = false;
+                }
                 if active == Truth::True {
                     if let Some(include) = include.as_deref_mut() {
                         let source_constants_before = environment.source_constants_fingerprint();
@@ -1157,6 +2254,11 @@ fn analyze_lexed(
                             // it back to the including frame without a full
                             // binding identity proof.
                             environment.remove_source_constants();
+                            // The scalar callback cannot carry lexical binding
+                            // identities or a pending declaration across EOF.
+                            // Report missing typed continuation, not a complete
+                            // analysis with include-derived facts silently lost.
+                            complete = false;
                         }
                     } else {
                         environment.clear();
@@ -1177,7 +2279,10 @@ fn analyze_lexed(
         cursor = raw.end;
     }
 
-    if cursor < source.len()
+    if let Some(order) = order {
+        active = order.activity();
+        order.feed(cursor..source.len(), active);
+    } else if cursor < source.len()
         && !observe_source_constants(
             source,
             cursor..source.len(),
@@ -1414,9 +2519,91 @@ fn supported_option_name(name: &str) -> Option<String> {
     let name = canonical_option_name(name)?;
     matches!(
         name.as_str(),
-        "R" | "O" | "Q" | "C" | "B" | "I" | "X" | "T" | "D" | "Y" | "RUNTIME_CHECKS"
+        "R" | "O" | "Q" | "C" | "B" | "I" | "X" | "T" | "D" | "Y" | "H" | "RUNTIME_CHECKS"
     )
     .then_some(name)
+}
+
+/// Apply one reachable arm's scalar directive using the existing decoder.
+pub(crate) fn apply_source_directive(
+    environment: &mut ConditionalEnvironment,
+    directive: &ConditionalDirective,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<(), crate::compile_time::IncompleteReason> {
+    // Admit decoding/key growth before the existing mutator allocates.
+    budget.charge(
+        1,
+        directive.body.len(),
+        directive.body.len().saturating_mul(4) + 128,
+    )?;
+    let mut legacy = AnalysisBudget {
+        cancel: None,
+        work: 0,
+        byte_work: 0,
+        exhausted: false,
+    };
+    let ok = match directive.kind {
+        DirectiveKind::Define | DirectiveKind::Undef => directive_symbol(&directive.body)
+            .is_some_and(|symbol| {
+                apply_fact(
+                    environment,
+                    &symbol,
+                    if directive.kind == DirectiveKind::Define {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    },
+                    Truth::True,
+                    &mut legacy,
+                )
+            }),
+        _ if is_option_directive(&directive.body) => {
+            apply_option_directive(environment, &directive.body, Truth::True, &mut legacy)
+        }
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::compile_time::IncompleteReason::MalformedSource)
+    }
+}
+
+pub(crate) fn restore_source_options(
+    environment: &mut ConditionalEnvironment,
+    saved: Option<&ConditionalEnvironment>,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<(), crate::compile_time::IncompleteReason> {
+    // Restore option facts only: PUSHOPT never restores DEFINEs or constants.
+    for key in [
+        "R",
+        "O",
+        "Q",
+        "C",
+        "B",
+        "I",
+        "X",
+        "T",
+        "D",
+        "Y",
+        "H",
+        "RUNTIME_CHECKS",
+    ] {
+        budget.charge(1, key.len(), key.len() + size_of::<Truth>() + 64)?;
+        let value = saved.map_or(Truth::Unknown, |saved| {
+            if key == "RUNTIME_CHECKS" {
+                // This legacy carrier has no verified Florence OPT mapping.
+                // Only a value unchanged by either possible restore behavior
+                // can remain proven. Documented TYPEDADDRESS/T and REFERENCEINFO/Y
+                // are eligible and restore the saved fact, including unknown.
+                saved.option(key).merge(environment.option(key))
+            } else {
+                saved.option(key)
+            }
+        });
+        environment.insert_option_value(key.to_owned(), value);
+    }
+    Ok(())
 }
 
 fn apply_option_directive(
@@ -1514,7 +2701,7 @@ fn apply_option_directive(
     apply_option_fact(environment, &canonical_name, value, activity, budget)
 }
 
-fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
+pub(crate) fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     if !body.contains(',') {
         return None;
     }
@@ -1526,7 +2713,7 @@ fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     valid.then_some(members)
 }
 
-fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
+pub(crate) fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
     if !body.contains(',') {
         return None;
     }
@@ -1941,6 +3128,22 @@ fn merge_environment(
         .filter(|(left, right)| left == right)
         .map(|_| size_of::<CompilerVersion>())
         .unwrap_or(0);
+    // Equality can scan an unsupported target's owned spelling. Charge the
+    // complete layout comparison before inspecting those bytes.
+    if !budget.charge_bytes(
+        layout_entry_size(&current.layout, current.layout_explicit).saturating_add(
+            layout_entry_size(&incoming.layout, incoming.layout_explicit),
+        ),
+    ) {
+        return false;
+    }
+    let common_layout = current.layout == incoming.layout;
+    let common_explicit = current.layout_explicit && incoming.layout_explicit;
+    merged_bytes = merged_bytes.saturating_add(if common_layout {
+        layout_entry_size(&current.layout, common_explicit)
+    } else {
+        layout_entry_size(&LayoutContext::default(), common_explicit)
+    });
     for key in &keys {
         let Some(bytes) = merged_bytes.checked_add(current.value_entry_size(key)) else {
             budget.exhausted = true;
@@ -2052,6 +3255,10 @@ fn merge_environment(
     } else {
         None
     };
+    if !common_layout {
+        current.layout = LayoutContext::default();
+    }
+    current.layout_explicit = common_explicit;
     current.absent_define = current.absent_define.merge(incoming.absent_define);
     current.rtl_constants_known &= incoming.rtl_constants_known;
     current
@@ -2109,6 +3316,181 @@ fn project_source(source: &str, inactive: &[Range<usize>], directives: &[Range<u
 }
 
 fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexResult {
+    lex_directives_inner(source, cancel, None)
+}
+
+/// Allocation-free root classification/admission shape. This performs no
+/// conditional evaluation and cannot authorize a child. Actual include roots
+/// and layout-query roots are interpreted only by the shared source-order
+/// session. The returned flags are (include, layout call, directive count).
+#[cfg(test)]
+fn source_directive_shape(source: &str, cancel: &dyn CancellationToken) -> (bool, bool, usize) {
+    source_shape_inner(source, cancel, false)
+}
+
+/// Admission-aware shape probe for resolver dispatch. Reuse the shared lexical
+/// scanner so ordinary comment bytes cost bounded search steps, not an
+/// eight-times-source-size evaluator estimate. Directive bodies retain their
+/// conservative expression-work admission before shape inspection.
+pub(crate) fn source_directive_shape_in_session(
+    source: &str,
+    id: &crate::SourceId,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<(bool, bool, usize), IncompleteReason> {
+    let mut scanner = DirectiveScanner::new(budget)?;
+    scanner.shape_probe = Some(LayoutShapeProbe::default());
+    let mut cursor = 0;
+    let mut count = 0;
+    let mut includes = false;
+    let mut layout = false;
+    while cursor < source.len() && count < MAX_DIRECTIVES {
+        let step = scanner.next(
+            source,
+            cursor,
+            id,
+            crate::compile_time::OccurrenceId(0),
+            budget,
+            cancel,
+        )?;
+        if let Some(directive) = step.directive {
+            budget.charge(
+                directive.body.len().saturating_mul(8),
+                directive.body.len(),
+                0,
+            )?;
+            includes |= include_shape(&directive.body);
+            layout |= directive_layout_shape(&directive.body, cancel);
+            count += 1;
+            cursor = directive.range.end;
+        } else {
+            break;
+        }
+    }
+    Ok((
+        includes,
+        layout
+            || scanner
+                .shape_probe
+                .as_ref()
+                .is_some_and(|probe| probe.found),
+        count,
+    ))
+}
+
+// Expression bodies reuse the same borrowed lexical boundaries but never
+// recurse into directives: only root IF/ELSEIF/ELIF bodies are expressions.
+fn source_shape_inner(
+    source: &str,
+    cancel: &dyn CancellationToken,
+    expression_body: bool,
+) -> (bool, bool, usize) {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+    let mut includes = false;
+    let mut layout_call = false;
+    let mut pending_sizeof = false;
+    while i < bytes.len() && count < MAX_DIRECTIVES {
+        if cancel.is_cancelled() {
+            break;
+        }
+        match bytes[i] {
+            b'\'' => {
+                pending_sizeof = false;
+                let Some(next) = skip_string(bytes, i) else {
+                    break;
+                };
+                i = next;
+            }
+            b'"' => {
+                pending_sizeof = false;
+                i = skip_assembler_string(bytes, i);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => i = skip_line_comment(bytes, i),
+            b'{' => {
+                let Some(close) = find_byte(bytes, i + 1, b'}') else {
+                    break;
+                };
+                if !expression_body && bytes.get(i + 1) == Some(&b'$') {
+                    count += 1;
+                    let body = &source[i + 2..close];
+                    includes |= include_shape(body);
+                    layout_call |= directive_layout_shape(body, cancel);
+                }
+                i = close + 1;
+            }
+            b'(' if bytes.get(i + 1) == Some(&b'*') => {
+                let Some(close) = find_sequence(bytes, i + 2, b"*)") else {
+                    break;
+                };
+                if !expression_body && bytes.get(i + 2) == Some(&b'$') {
+                    count += 1;
+                    let body = &source[i + 3..close];
+                    includes |= include_shape(body);
+                    layout_call |= directive_layout_shape(body, cancel);
+                }
+                i = close + 2;
+            }
+            byte if byte.is_ascii_whitespace() => i += 1,
+            b'(' => {
+                layout_call |= pending_sizeof;
+                pending_sizeof = false;
+                i += 1;
+            }
+            // Escaped names and larger identifiers are not the intrinsic call.
+            b'&' => {
+                pending_sizeof = false;
+                i = shape_identifier_end(source, i + 1);
+            }
+            _ => {
+                let end = shape_identifier_end(source, i);
+                if end > i {
+                    pending_sizeof = source[i..end].eq_ignore_ascii_case("sizeof");
+                    i = end;
+                } else {
+                    pending_sizeof = false;
+                    i += source[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+        }
+    }
+    (includes, layout_call, count)
+}
+
+fn shape_identifier_end(source: &str, start: usize) -> usize {
+    let mut end = start;
+    for ch in source[start..].chars() {
+        if ch != '_' && !ch.is_alphanumeric() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+fn directive_layout_shape(body: &str, cancel: &dyn CancellationToken) -> bool {
+    directive_keyword(body).is_some_and(|keyword| {
+        (keyword.eq_ignore_ascii_case("if")
+            || keyword.eq_ignore_ascii_case("elseif")
+            || keyword.eq_ignore_ascii_case("elif"))
+            && source_shape_inner(directive_arguments(body), cancel, true).1
+    })
+}
+
+/// Shape classification needs no owned keyword or switch/condition decoder.
+/// Exact borrowed keywords also exclude I+/I- and comma switch lists.
+fn include_shape(body: &str) -> bool {
+    directive_keyword(body).is_some_and(|keyword| {
+        keyword.eq_ignore_ascii_case("i") || keyword.eq_ignore_ascii_case("include")
+    })
+}
+
+fn lex_directives_inner(
+    source: &str,
+    cancel: Option<&dyn CancellationToken>,
+    mut order: Option<&mut dyn SourceOrder>,
+) -> LexResult {
     let bytes = source.as_bytes();
     let mut result = LexResult {
         directives: Vec::new(),
@@ -2141,6 +3523,13 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
                     result.complete = false;
                     break;
                 }
+                if order
+                    .as_deref_mut()
+                    .is_some_and(|order| !order.admit_directive(close - index - 2))
+                {
+                    result.complete = false;
+                    break;
+                }
                 result.directives.push(RawDirective {
                     start: index,
                     end: close + 1,
@@ -2162,6 +3551,13 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
                         break;
                     };
                     if result.directives.len() >= MAX_DIRECTIVES {
+                        result.complete = false;
+                        break;
+                    }
+                    if order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_directive(close - index - 3))
+                    {
                         result.complete = false;
                         break;
                     }
@@ -2235,7 +3631,7 @@ fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
     index
 }
 
-fn directive_kind(body: &str) -> DirectiveKind {
+pub(crate) fn directive_kind(body: &str) -> DirectiveKind {
     if switch_list_members(body).is_some() {
         return DirectiveKind::Harmless;
     }
@@ -2368,6 +3764,94 @@ fn evaluate_condition(
     }
 }
 
+pub(crate) fn condition_expression(body: &str) -> Option<&str> {
+    match directive_keyword(body)?.to_ascii_lowercase().as_str() {
+        "if" | "elseif" | "elif" => Some(directive_arguments(body)),
+        _ => None,
+    }
+}
+
+// These aliases preserve the callbacks' independent query/budget lifetimes and
+// borrowed trait-object lifetime. They add neither an owner nor an allocation.
+type BudgetQueryLookup<'a> = dyn FnMut(
+        ExpressionQuery<'_>,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>
+    + 'a;
+type BudgetNameLookup<'a> = dyn FnMut(
+        &str,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>
+    + 'a;
+type NameLookup<'a> = dyn FnMut(&str) -> Option<BoundValue> + 'a;
+type QueryLookup<'a> = dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue> + 'a;
+
+pub(crate) fn evaluate_source_condition(
+    body: &str,
+    environment: &ConditionalEnvironment,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut BudgetQueryLookup<'_>,
+) -> Result<Truth, crate::compile_time::IncompleteReason> {
+    if let Some(expression) = condition_expression(body) {
+        Ok(
+            match evaluate_layout_expression(expression, environment, budget, lookup, false, true)?
+            {
+                Some(BoundValue::Constant(ConstantValue::Boolean(value))) => {
+                    if value {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    }
+                }
+                _ => Truth::Unknown,
+            },
+        )
+    } else {
+        budget.charge(1, body.len(), 0)?;
+        let mut complete = true;
+        let value = evaluate_condition(body, environment, &mut complete);
+        if complete {
+            Ok(value)
+        } else {
+            Err(crate::compile_time::IncompleteReason::MalformedSource)
+        }
+    }
+}
+
+pub(crate) fn bound_define(
+    environment: &ConditionalEnvironment,
+    name: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    budget.charge(1, name.len(), name.len())?;
+    let key = canonical_symbol(name);
+    let value = key
+        .as_ref()
+        .and_then(|key| environment.values.get(key))
+        .and_then(|value| match value {
+            Truth::True => Some(BoundValue::Constant(ConstantValue::Boolean(true))),
+            Truth::False => Some(BoundValue::Constant(ConstantValue::Boolean(false))),
+            Truth::Unknown => None,
+        });
+    budget.release(name.len());
+    Ok(value)
+}
+
+pub(crate) fn bound_defined(
+    environment: &ConditionalEnvironment,
+    name: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    budget.charge(1, name.len(), name.len())?;
+    let value = match environment_value(environment, name) {
+        Truth::True => BoundValue::Constant(ConstantValue::Boolean(true)),
+        Truth::False => BoundValue::Constant(ConstantValue::Boolean(false)),
+        Truth::Unknown => BoundValue::Unproven,
+    };
+    budget.release(name.len());
+    Ok(Some(value))
+}
+
 fn evaluate_expression(
     expression: &str,
     environment: &ConditionalEnvironment,
@@ -2381,22 +3865,79 @@ fn evaluate_typed_expression(
     environment: &ConditionalEnvironment,
     complete: &mut bool,
 ) -> Value {
+    evaluate_typed_expression_with_lookup(expression, environment, complete, None)
+}
+
+fn evaluate_typed_expression_with_lookup<'a>(
+    expression: &str,
+    environment: &'a ConditionalEnvironment,
+    complete: &mut bool,
+    mut lookup: Option<&'a mut NameLookup<'a>>,
+) -> Value {
+    if lookup.is_none() {
+        return parse_bound_expression(expression, environment, complete, None, false);
+    }
+    let mut adapter = |query: ExpressionQuery<'_>| match query {
+        ExpressionQuery::Name(name, _) => lookup.as_mut().and_then(|lookup| lookup(name)),
+        _ => None,
+    };
+    parse_bound_expression(expression, environment, complete, Some(&mut adapter), false)
+}
+
+/// Argument ranges are relative to the original expression, not a normalized
+/// synthetic wrapper. A source-backed caller maps them with its captured site.
+pub(crate) enum ExpressionQuery<'a> {
+    Name(&'a str, Range<usize>),
+    /// Check only source lexical bindings before intrinsic metadata/literals.
+    /// An absent binding is different from a visible unproven variable value.
+    LexicalName(&'a str, Range<usize>),
+    Declared(&'a str, Range<usize>),
+    Defined(&'a str, Range<usize>),
+    SizeOf {
+        argument: &'a str,
+        range: Range<usize>,
+    },
+}
+
+impl ExpressionQuery<'_> {
+    pub(crate) fn range(&self) -> &Range<usize> {
+        match self {
+            Self::Name(_, range)
+            | Self::LexicalName(_, range)
+            | Self::Declared(_, range)
+            | Self::Defined(_, range)
+            | Self::SizeOf { range, .. } => range,
+        }
+    }
+}
+
+fn parse_bound_expression<'a>(
+    expression: &'a str,
+    environment: &'a ConditionalEnvironment,
+    complete: &mut bool,
+    lookup: Option<&'a mut QueryLookup<'a>>,
+    static_only: bool,
+) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
         return Value::Unknown;
     }
-    let tokens = tokenize_expression(expression);
+    let (tokens, spans) = tokenize_expression_spanned(expression);
     if tokens.len() > MAX_EXPRESSION_TOKENS {
         *complete = false;
         return Value::Unknown;
     }
     let mut parser = ExpressionParser {
         tokens,
+        spans,
+        expression,
         index: 0,
         environment,
+        lookup,
         malformed: false,
         depth: 0,
         work: 0,
+        static_only,
     };
     let result = parser.parse_comparison();
     if !matches!(parser.peek(), ExprToken::End) {
@@ -2410,6 +3951,131 @@ fn evaluate_typed_expression(
         *complete = false;
     }
     result
+}
+
+/// Type-only interpretation of the existing expression grammar. Number(0),
+/// Truth(Unknown), String and EnumOrdinal(0,key) are category carriers here,
+/// never variable values. No numeric operation or callable is evaluated.
+pub(crate) fn type_bound_expression(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut BudgetNameLookup<'_>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    bound_expression_mode(expression, budget, lookup, true)
+}
+
+fn bound_expression_mode(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut BudgetNameLookup<'_>,
+    static_only: bool,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Ok(None);
+    }
+    evaluate_layout_expression(
+        expression,
+        &ConditionalEnvironment::default(),
+        budget,
+        &mut |query, budget| match query {
+            ExpressionQuery::Name(name, _) => lookup(name, budget),
+            _ => Ok(None),
+        },
+        static_only,
+        false,
+    )
+}
+
+pub(crate) fn evaluate_layout_expression(
+    expression: &str,
+    environment: &ConditionalEnvironment,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut BudgetQueryLookup<'_>,
+    static_only: bool,
+    strict: bool,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    use crate::compile_time::IncompleteReason;
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(IncompleteReason::Limit {
+            name: "max_expression_bytes",
+            maximum: MAX_EXPRESSION_BYTES,
+        });
+    }
+    // Each byte can produce a token; reserve token capacity, token clones and
+    // string intermediates before tokenization. Existing parser work/depth caps
+    // remain in force. Lookup payloads are admitted by the callback.
+    let before = budget.manual_retained();
+    let scratch = expression
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(4 * std::mem::size_of::<ExprToken>() + 8))
+        .ok_or(IncompleteReason::MalformedSource)?;
+    let work = expression
+        .len()
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(IncompleteReason::MalformedSource)?;
+    // String concatenation/comparison can revisit a growing value at each
+    // bounded parser operation, so linear byte accounting is insufficient.
+    let byte_work = expression
+        .len()
+        .checked_mul(MAX_EXPRESSION_TOKENS)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(work, byte_work, scratch)?;
+    let mut failure = None;
+    let result = {
+        let mut bounded_lookup = |query: ExpressionQuery<'_>| match lookup(query, budget) {
+            Ok(value) => value,
+            Err(reason) => {
+                failure = Some(reason);
+                None
+            }
+        };
+        let mut complete = true;
+        let value = parse_bound_expression(
+            expression,
+            environment,
+            &mut complete,
+            Some(&mut bounded_lookup),
+            static_only,
+        );
+        if !complete && strict && failure.is_none() {
+            failure = Some(IncompleteReason::MalformedSource);
+        }
+        if complete { value } else { Value::Unknown }
+    };
+    // Charge surviving string/nominal-identity payload before copying it out
+    // of parser scratch.
+    let output_bytes = match &result {
+        Value::String(s) => s.len(),
+        Value::EnumOrdinal(_, identity) => {
+            std::mem::size_of::<crate::compile_time::DefinitionKey>()
+                .checked_add(identity.anchor.source.as_str().len())
+                .ok_or(IncompleteReason::MalformedSource)?
+        }
+        _ => 0,
+    };
+    let output_charge = budget.charge(1, output_bytes, output_bytes);
+    let output = if failure.is_none() && output_charge.is_ok() {
+        if static_only && matches!(result, Value::Truth(_)) {
+            Some(BoundValue::Constant(ConstantValue::Boolean(false)))
+        } else {
+            result.to_bound_value()
+        }
+    } else {
+        None
+    };
+    budget.release(
+        budget
+            .manual_retained()
+            .saturating_sub(before)
+            .saturating_sub(if output.is_some() { output_bytes } else { 0 }),
+    );
+    if let Some(reason) = failure {
+        return Err(reason);
+    }
+    output_charge?;
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2437,14 +4103,32 @@ enum ExprToken {
 }
 
 fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
+    tokenize_expression_spanned(expression).0
+}
+
+fn tokenize_expression_spanned(expression: &str) -> (Vec<ExprToken>, Vec<Range<usize>>) {
     let bytes = expression.as_bytes();
     let mut tokens = Vec::new();
+    let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
+        match expression_trivia_end(bytes, index) {
+            Ok(Some(end)) => {
+                index = end;
+                continue;
+            }
+            Err(()) => {
+                tokens.push(ExprToken::Invalid);
+                spans.push(index..bytes.len());
+                break;
+            }
+            Ok(None) => {}
+        }
         if bytes[index].is_ascii_whitespace() {
             index += 1;
             continue;
         }
+        let token_start = index;
         match bytes[index] {
             b'(' => {
                 tokens.push(ExprToken::LParen);
@@ -2512,6 +4196,9 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                 let mut value = String::new();
                 let mut closed = false;
                 while index < bytes.len() {
+                    if matches!(bytes[index], b'\r' | b'\n') {
+                        break;
+                    }
                     if bytes[index] == b'\'' {
                         if bytes.get(index + 1) == Some(&b'\'') {
                             value.push('\'');
@@ -2531,6 +4218,7 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                     tokens.push(ExprToken::String(value));
                 } else {
                     tokens.push(ExprToken::Invalid);
+                    spans.push(token_start..index);
                     break;
                 }
             }
@@ -2587,21 +4275,77 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                 index += 1;
             }
         }
+        spans.push(token_start..index);
     }
     tokens.push(ExprToken::End);
-    tokens
+    spans.push(expression.len()..expression.len());
+    (tokens, spans)
+}
+
+/// Shared expression/access lexer trivia. Keep original byte spans and reject
+/// unfinished comments rather than manufacturing a complete operand at EOF.
+pub(crate) fn expression_trivia_end(bytes: &[u8], start: usize) -> Result<Option<usize>, ()> {
+    if bytes.get(start) == Some(&b'{') {
+        if bytes.get(start + 1) == Some(&b'$') {
+            return Err(());
+        }
+        return find_byte(bytes, start + 1, b'}')
+            .map(|end| Some(end + 1))
+            .ok_or(());
+    }
+    if bytes.get(start..start + 2) == Some(b"(*") {
+        if bytes.get(start + 2) == Some(&b'$') {
+            return Err(());
+        }
+        return find_sequence(bytes, start + 2, b"*)")
+            .map(|end| Some(end + 2))
+            .ok_or(());
+    }
+    if bytes.get(start..start + 2) == Some(b"//") {
+        return Ok(Some(skip_line_comment(bytes, start)));
+    }
+    Ok(None)
+}
+
+/// Reserve tokenizer scratch before the shared lexical count; no index grammar
+/// or payload normalization is added by the operand parser.
+pub(crate) fn expression_token_count(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<usize, crate::compile_time::IncompleteReason> {
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(crate::compile_time::IncompleteReason::Limit {
+            name: "max_expression_bytes",
+            maximum: MAX_EXPRESSION_BYTES,
+        });
+    }
+    let scratch = (expression.len() + 1) * (4 * std::mem::size_of::<ExprToken>() + 8);
+    budget.charge(expression.len() + 1, expression.len(), scratch)?;
+    let count = tokenize_expression(expression).len();
+    budget.release(scratch);
+    Ok(count)
 }
 
 struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
+    spans: Vec<Range<usize>>,
+    expression: &'a str,
     index: usize,
     environment: &'a ConditionalEnvironment,
+    lookup: Option<&'a mut QueryLookup<'a>>,
     malformed: bool,
     depth: usize,
     work: usize,
+    static_only: bool,
 }
 
 impl ExpressionParser<'_> {
+    fn current_range(&self) -> Range<usize> {
+        self.spans
+            .get(self.index)
+            .cloned()
+            .unwrap_or(self.expression.len()..self.expression.len())
+    }
     fn peek(&self) -> &ExprToken {
         self.tokens.get(self.index).unwrap_or(&ExprToken::End)
     }
@@ -2642,11 +4386,20 @@ impl ExpressionParser<'_> {
             };
             self.take();
             let right = self.parse_multiplicative();
-            value = match operator {
-                BinaryAdditive::Add => value.add(right),
-                BinaryAdditive::Subtract => value.subtract(right),
-                BinaryAdditive::Or => value.or(right),
-                BinaryAdditive::Xor => value.xor(right),
+            value = if self.static_only {
+                static_binary(
+                    value,
+                    right,
+                    matches!(operator, BinaryAdditive::Or | BinaryAdditive::Xor),
+                    false,
+                )
+            } else {
+                match operator {
+                    BinaryAdditive::Add => value.add(right),
+                    BinaryAdditive::Subtract => value.subtract(right),
+                    BinaryAdditive::Or => value.or(right),
+                    BinaryAdditive::Xor => value.xor(right),
+                }
             };
         }
         value
@@ -2681,14 +4434,49 @@ impl ExpressionParser<'_> {
             };
             self.take();
             let right = self.parse_unary();
-            value = value.arithmetic(right, operator);
+            // Bound evaluation must not turn discarded shift bits into a
+            // cardinality. Leave legacy conditional shift semantics unchanged.
+            value = if self.static_only {
+                if matches!(operator, BinaryArithmetic::RealDivide) {
+                    Value::Error
+                } else {
+                    static_binary(
+                        value,
+                        right,
+                        matches!(operator, BinaryArithmetic::And),
+                        false,
+                    )
+                }
+            } else if self.lookup.is_some() && matches!(operator, BinaryArithmetic::ShiftLeft) {
+                match (value, right) {
+                    (Value::Number(left), Value::Number(right)) => u32::try_from(right)
+                        .ok()
+                        .filter(|shift| *shift < 64)
+                        .and_then(|shift| i128::from(left).checked_shl(shift))
+                        .and_then(|n| i64::try_from(n).ok())
+                        .map(Value::Number)
+                        .unwrap_or(Value::Error),
+                    (left, right) => left.arithmetic(right, operator),
+                }
+            } else {
+                value.arithmetic(right, operator)
+            };
         }
         value
     }
 
     fn parse_unary(&mut self) -> Value {
         if self.consume_identifier("not") {
-            self.parse_unary().not()
+            let value = self.parse_unary();
+            if self.static_only {
+                match value {
+                    Value::Number(_) => Value::Number(0),
+                    Value::Truth(_) => Value::Truth(Truth::Unknown),
+                    _ => Value::Error,
+                }
+            } else {
+                value.not()
+            }
         } else if matches!(self.peek(), ExprToken::Plus) {
             self.take();
             match self.parse_unary() {
@@ -2699,7 +4487,15 @@ impl ExpressionParser<'_> {
             }
         } else if matches!(self.peek(), ExprToken::Minus) {
             self.take();
-            self.parse_unary().negate()
+            let value = self.parse_unary();
+            if self.static_only {
+                match value {
+                    Value::Number(_) => Value::Number(0),
+                    _ => Value::Error,
+                }
+            } else {
+                value.negate()
+            }
         } else {
             self.parse_primary()
         }
@@ -2746,11 +4542,125 @@ impl ExpressionParser<'_> {
         };
         self.take();
         let right = self.parse_additive();
-        left = compare_values(left, right, operator);
+        left = if self.static_only {
+            static_binary(left, right, false, true)
+        } else {
+            compare_values(left, right, operator)
+        };
         left
     }
 
+    fn parse_sizeof(&mut self) -> Value {
+        let start = self.spans[self.index].end;
+        let bytes = self.expression.as_bytes();
+        let mut pos = start;
+        let mut depth = 1usize;
+        let mut brackets = 0usize;
+        let mut quoted = false;
+        let mut comma = false;
+        let mut end = None;
+        while pos < bytes.len() {
+            if !quoted {
+                match expression_trivia_end(bytes, pos) {
+                    Ok(Some(next)) => {
+                        pos = next;
+                        continue;
+                    }
+                    Err(()) => {
+                        self.malformed = true;
+                        return Value::Error;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            let ch = bytes[pos];
+            if ch == b'\'' {
+                if quoted && bytes.get(pos + 1) == Some(&b'\'') {
+                    pos += 2;
+                    continue;
+                }
+                quoted = !quoted;
+            } else if !quoted {
+                match ch {
+                    b'(' => {
+                        depth += 1;
+                        if depth > MAX_CONDITIONAL_DEPTH {
+                            self.malformed = true;
+                            return Value::Error;
+                        }
+                    }
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(pos);
+                            break;
+                        }
+                    }
+                    b'[' => brackets += 1,
+                    b']' if brackets > 0 => brackets -= 1,
+                    b']' => {
+                        self.malformed = true;
+                    }
+                    b',' if depth == 1 && brackets == 0 => comma = true,
+                    _ => {}
+                }
+            }
+            pos += 1;
+        }
+        let Some(end) = end else {
+            self.malformed = true;
+            return Value::Error;
+        };
+        while !matches!(self.peek(), ExprToken::End) && self.spans[self.index].end <= end + 1 {
+            self.take();
+        }
+        let argument = &self.expression[start..end];
+        if comma || quoted || brackets != 0 || argument.trim().is_empty() {
+            self.malformed = true;
+            return Value::Error;
+        }
+        if let Some(lookup) = &mut self.lookup {
+            lookup(ExpressionQuery::SizeOf {
+                argument,
+                range: start..end,
+            })
+            .map(Value::from_bound_value)
+            .unwrap_or(Value::Unknown)
+        } else {
+            // Preserve the context-only evaluator's fail-closed semantics when
+            // no lexical/type capability exists. Source sessions supply it.
+            Value::Error
+        }
+    }
+
     fn parse_value(&mut self) -> Value {
+        let identifier_range = self.current_range();
+        if self.static_only {
+            return match self.take() {
+                ExprToken::Number(_) => Value::Number(0),
+                ExprToken::String(s) if s.chars().count() == 1 => Value::String(s),
+                ExprToken::Identifier(name) if matches!(self.peek(), ExprToken::LParen) => {
+                    // Calls, casts and conditional intrinsics are not type proof.
+                    let _ = name;
+                    Value::Error
+                }
+                ExprToken::Identifier(name) => {
+                    // A lexical binding can block a familiar literal spelling.
+                    if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                        lookup(ExpressionQuery::Name(&name, identifier_range.clone()))
+                    }) {
+                        Value::from_bound_value(value)
+                    } else if name.eq_ignore_ascii_case("true")
+                        || name.eq_ignore_ascii_case("false")
+                    {
+                        Value::Truth(Truth::Unknown)
+                    } else {
+                        Value::Unknown
+                    }
+                }
+                _ => Value::Error,
+            };
+        }
         match self.take() {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("defined") => {
                 if !matches!(self.peek(), ExprToken::LParen) {
@@ -2758,6 +4668,7 @@ impl ExpressionParser<'_> {
                     return Value::Error;
                 }
                 self.take();
+                let symbol_range = self.current_range();
                 let symbol = match self.take() {
                     ExprToken::Identifier(value) => Some(value),
                     _ => None,
@@ -2768,7 +4679,15 @@ impl ExpressionParser<'_> {
                     self.take();
                 }
                 symbol
-                    .map(|symbol| Value::Truth(environment_value(self.environment, &symbol)))
+                    .map(|symbol| {
+                        if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                            lookup(ExpressionQuery::Defined(&symbol, symbol_range))
+                        }) {
+                            Value::from_bound_value(value)
+                        } else {
+                            Value::Truth(environment_value(self.environment, &symbol))
+                        }
+                    })
                     .unwrap_or_else(|| {
                         self.malformed = true;
                         Value::Unknown
@@ -2777,7 +4696,10 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("declared") => {
                 let symbol = self.parse_function_identifier();
                 symbol
-                    .map(|symbol| {
+                    .map(|(symbol, range)| {
+                        if let Some(lookup) = &mut self.lookup {
+                            return lookup(ExpressionQuery::Declared(&symbol, range)).map(Value::from_bound_value).unwrap_or(Value::Unknown);
+                        }
                         Value::Truth(
                             if self.environment.constant(&symbol).is_some() {
                                 Truth::True
@@ -2804,19 +4726,57 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier)
                 if identifier.eq_ignore_ascii_case("compilerVersion") =>
             {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
+                    return Value::from_bound_value(value);
+                }
                 self.environment
                     .compiler_version
                     .map(Value::Version)
                     .unwrap_or(Value::Unknown)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("true") => {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
+                    return Value::from_bound_value(value);
+                }
                 Value::Truth(Truth::True)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("false") => {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
+                    return Value::from_bound_value(value);
+                }
                 Value::Truth(Truth::False)
             }
             ExprToken::Identifier(identifier) => {
                 if matches!(self.peek(), ExprToken::LParen) {
+                    let blocked = self
+                        .lookup
+                        .as_mut()
+                        .and_then(|lookup| {
+                            lookup(ExpressionQuery::LexicalName(
+                                &identifier,
+                                identifier_range.clone(),
+                            ))
+                        })
+                        .is_some();
+                    if identifier.eq_ignore_ascii_case("sizeof") {
+                        let value = self.parse_sizeof();
+                        return if blocked { Value::Unknown } else { value };
+                    }
                     self.take();
                     let mut argument = None;
                     let mut arity = 0usize;
@@ -2842,6 +4802,9 @@ impl ExpressionParser<'_> {
                         self.malformed = true;
                         return Value::Error;
                     }
+                    if blocked {
+                        return Value::Unknown;
+                    }
                     match identifier.to_ascii_lowercase().as_str() {
                         "length" => match argument {
                             Some(Value::String(value)) if value.is_ascii() => {
@@ -2853,6 +4816,10 @@ impl ExpressionParser<'_> {
                             _ => Value::Error,
                         },
                         "ord" => match argument {
+                            // Explicit ordinal projection only: other operators
+                            // retain nominal identity. The consumed identity is
+                            // evaluator scratch, released by its output cleanup.
+                            Some(Value::EnumOrdinal(value, _identity)) => Value::Number(value),
                             Some(Value::String(value)) if value.is_ascii() => {
                                 let mut chars = value.chars();
                                 match (chars.next(), chars.next()) {
@@ -2869,12 +4836,14 @@ impl ExpressionParser<'_> {
                             }
                             _ => Value::Error,
                         },
-                        // No type/width information is carried by the
-                        // bounded context, so SizeOf is never a proven fact.
-                        "sizeof" => Value::Error,
                         _ => Value::Error,
                     }
                 } else {
+                    if let Some(lookup) = &mut self.lookup {
+                        return lookup(ExpressionQuery::Name(&identifier, identifier_range))
+                            .map(Value::from_bound_value)
+                            .unwrap_or(Value::Unknown);
+                    }
                     let key = canonical_symbol(&identifier);
                     key.and_then(|key| {
                         self.environment
@@ -2928,14 +4897,15 @@ impl ExpressionParser<'_> {
         }
     }
 
-    fn parse_function_identifier(&mut self) -> Option<String> {
+    fn parse_function_identifier(&mut self) -> Option<(String, Range<usize>)> {
         if !matches!(self.peek(), ExprToken::LParen) {
             self.malformed = true;
             return None;
         }
         self.take();
+        let range = self.current_range();
         let value = match self.take() {
-            ExprToken::Identifier(value) => Some(canonical_symbol(&value)?),
+            ExprToken::Identifier(value) => Some((canonical_symbol(&value)?, range)),
             _ => None,
         };
         if !matches!(self.peek(), ExprToken::RParen) {
@@ -2953,11 +4923,66 @@ enum Value {
     Number(i64),
     String(String),
     Version(CompilerVersion),
+    EnumOrdinal(i64, crate::compile_time::DefinitionKey),
+    StaticCharacter(crate::compile_time::BuiltinType),
     Unknown,
     Error,
 }
 
+/// Bound-only nominal metadata travels through the same parser as constants.
+/// Grouping preserves it; unsupported arithmetic cannot silently turn it into
+/// an integer. The legacy conditional environment never constructs this variant.
+pub(crate) enum BoundValue {
+    Unproven,
+    Constant(ConstantValue),
+    EnumOrdinal(i64, crate::compile_time::DefinitionKey),
+    StaticCharacter(crate::compile_time::BuiltinType),
+    /// Visible lexical binding without a supported expression type. In static
+    /// mode this must block literal/intrinsic fallback rather than look absent.
+    InvalidType,
+}
+
+fn static_binary(left: Value, right: Value, logical: bool, comparison: bool) -> Value {
+    let compatible = match (&left, &right) {
+        (Value::Number(_), Value::Number(_)) => true,
+        (Value::Truth(_), Value::Truth(_)) => logical || comparison,
+        (Value::String(a), Value::String(b)) => {
+            comparison && a.chars().count() == 1 && b.chars().count() == 1
+        }
+        (Value::EnumOrdinal(_, a), Value::EnumOrdinal(_, b)) => comparison && a == b,
+        (Value::StaticCharacter(a), Value::StaticCharacter(b)) => comparison && a == b,
+        _ => false,
+    };
+    if !compatible {
+        Value::Error
+    } else if comparison || matches!(left, Value::Truth(_)) {
+        Value::Truth(Truth::Unknown)
+    } else {
+        Value::Number(0)
+    }
+}
+
 impl Value {
+    fn from_bound_value(value: BoundValue) -> Self {
+        match value {
+            BoundValue::Unproven => Self::Unknown,
+            BoundValue::Constant(value) => Self::from_constant(value),
+            BoundValue::EnumOrdinal(value, identity) => Self::EnumOrdinal(value, identity),
+            BoundValue::StaticCharacter(ty) => Self::StaticCharacter(ty),
+            BoundValue::InvalidType => Self::Error,
+        }
+    }
+
+    fn to_bound_value(&self) -> Option<BoundValue> {
+        match self {
+            Self::EnumOrdinal(value, identity) => {
+                Some(BoundValue::EnumOrdinal(*value, identity.clone()))
+            }
+            Self::StaticCharacter(ty) => Some(BoundValue::StaticCharacter(*ty)),
+            _ => self.to_constant().map(BoundValue::Constant),
+        }
+    }
+
     fn from_constant(value: ConstantValue) -> Self {
         match value {
             ConstantValue::Boolean(value) => {
@@ -2973,7 +4998,11 @@ impl Value {
         match self {
             Self::Truth(Truth::True) => Some(ConstantValue::Boolean(true)),
             Self::Truth(Truth::False) => Some(ConstantValue::Boolean(false)),
-            Self::Truth(Truth::Unknown) | Self::Unknown | Self::Error => None,
+            Self::Truth(Truth::Unknown)
+            | Self::Unknown
+            | Self::Error
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => None,
             Self::Number(value) => Some(ConstantValue::Integer(*value)),
             Self::String(value) => Some(ConstantValue::String(value.clone())),
             Self::Version(value) => Some(ConstantValue::Version(*value)),
@@ -2983,9 +5012,13 @@ impl Value {
     fn as_truth(&self) -> Truth {
         match self {
             Self::Truth(value) => *value,
-            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::Unknown | Self::Error => {
-                Truth::Unknown
-            }
+            Self::Number(_)
+            | Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_)
+            | Self::Unknown
+            | Self::Error => Truth::Unknown,
         }
     }
 
@@ -2993,7 +5026,11 @@ impl Value {
         match self {
             Self::Truth(value) => Some(*value),
             Self::Unknown => Some(Truth::Unknown),
-            Self::Number(_) | Self::String(_) | Self::Version(_) => None,
+            Self::Number(_)
+            | Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => None,
             Self::Error => None,
         }
     }
@@ -3143,7 +5180,10 @@ impl Value {
         match self {
             Self::Truth(value) => Self::Truth(value.not()),
             Self::Number(value) => Self::Number(!value),
-            Self::String(_) | Self::Version(_) => Self::Error,
+            Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => Self::Error,
             Self::Unknown => Self::Unknown,
             Self::Error => Self::Error,
         }
@@ -3352,7 +5392,664 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expression_cleanup_is_owner_local_on_add_replace_drop_and_failure() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, IncompleteReason};
+        for construction in [false, true] {
+            for action in ["add", "replace", "drop"] {
+                for fail in [false, true] {
+                    let mut budget = CompileTimeBudget::new(
+                        CompileTimeLimits::default(),
+                        &crate::NoCancellation,
+                    );
+                    let observer = budget.admit_owned(0, 0, 0, || ()).unwrap();
+                    let mut held = if action == "add" {
+                        None
+                    } else {
+                        Some(
+                            budget
+                                .admit_owned(1, 17, 100_000, || vec![0u8; 100_000])
+                                .unwrap(),
+                        )
+                    };
+                    let mut run = |budget: &mut CompileTimeBudget<'_>| {
+                        budget.charge(1, 13, 70_000).unwrap();
+                        let manual = budget.manual_retained();
+                        let before = budget.snapshot();
+                        let result = super::evaluate_layout_expression(
+                            "Value",
+                            &super::ConditionalEnvironment::default(),
+                            budget,
+                            &mut |_, b| {
+                                match action {
+                                    "add" | "replace" => {
+                                        held =
+                                            Some(b.admit_owned(1, 19, 100_000, || {
+                                                vec![0u8; 100_000]
+                                            })?)
+                                    }
+                                    "drop" => drop(held.take()),
+                                    _ => unreachable!(),
+                                }
+                                if fail {
+                                    return Err(IncompleteReason::MalformedSource);
+                                }
+                                // Nested expression scratch shares this owner, but its
+                                // surviving output is explicitly handed to the parent.
+                                super::evaluate_layout_expression(
+                                    "'kept'",
+                                    &super::ConditionalEnvironment::default(),
+                                    b,
+                                    &mut |_, _| Ok(None),
+                                    false,
+                                    false,
+                                )
+                            },
+                            false,
+                            false,
+                        );
+                        if fail {
+                            assert!(result.is_err());
+                        } else {
+                            assert!(
+                                matches!(result.unwrap(), Some(super::BoundValue::Constant(super::ConstantValue::String(s))) if s == "kept")
+                            );
+                        }
+                        assert_eq!(budget.manual_retained(), manual + if fail { 0 } else { 4 });
+                        assert!(budget.snapshot().work > before.work);
+                        assert!(budget.snapshot().byte_work > before.byte_work);
+                        budget.release(70_000 + if fail { 0 } else { 4 });
+                        Ok(())
+                    };
+                    if construction {
+                        drop(budget.admit_compilation(0, &mut run).unwrap());
+                    } else {
+                        run(&mut budget).unwrap();
+                    }
+                    let live = observer.budget_snapshot();
+                    drop(held);
+                    let dead = observer.budget_snapshot();
+                    assert_eq!(live.work, dead.work);
+                    assert_eq!(live.byte_work, dead.byte_work);
+                    assert_eq!(budget.manual_retained(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task13_fix1_expression_lexer_rejects_physical_newlines_in_ordinary_literals() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let expression = format!("'a}}{newline}b'='a}}{newline}b'");
+            let (tokens, spans) = super::tokenize_expression_spanned(&expression);
+            assert!(
+                tokens.contains(&super::ExprToken::Invalid),
+                "{expression:?}"
+            );
+            assert_eq!(spans[0].start, 0);
+            let mut complete = true;
+            assert_eq!(
+                super::evaluate_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut complete
+                ),
+                super::Truth::Unknown
+            );
+            assert!(!complete);
+            let mut budget = super::CompileTimeBudget::new(
+                crate::compile_time::CompileTimeLimits::default(),
+                &crate::NoCancellation,
+            );
+            assert!(
+                super::evaluate_layout_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut budget,
+                    &mut |_, _| panic!("malformed literal must not need binding lookup"),
+                    false,
+                    false
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(matches!(
+                super::evaluate_layout_expression(
+                    &expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut budget,
+                    &mut |_, _| panic!("malformed literal must not need binding lookup"),
+                    false,
+                    true
+                ),
+                Err(crate::compile_time::IncompleteReason::MalformedSource)
+            ));
+        }
+        for expression in [
+            "'é😀''}*)'='é😀''}*)'",
+            "'a}'\n='a}'",
+            "'a}'\r\n='a}'",
+            "'a}'\r='a}'",
+            "1 { a\nb } = 1",
+            "1 (* a\r\nb *) = 1",
+        ] {
+            let mut complete = true;
+            assert_eq!(
+                super::evaluate_expression(
+                    expression,
+                    &super::ConditionalEnvironment::default(),
+                    &mut complete
+                ),
+                super::Truth::True,
+                "{expression:?}"
+            );
+            assert!(complete);
+        }
+    }
+    #[test]
+    fn admitted_shape_probe_charges_plain_steps_without_inspecting_every_byte_for_sizeof() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits};
+        let source = "x:=1;\n".repeat(16_000);
+        let id = crate::SourceId::new("shape-counter");
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: source.len() + 64,
+                ..Default::default()
+            },
+            &crate::NoCancellation,
+        );
+        assert_eq!(
+            super::source_directive_shape_in_session(
+                &source,
+                &id,
+                &mut budget,
+                &crate::NoCancellation
+            )
+            .unwrap(),
+            (false, false, 0)
+        );
+        assert_eq!(budget.snapshot().work, source.len());
+        assert_eq!(budget.snapshot().byte_work, source.len());
+        let source = "const N=SizeOf(Integer); {$IF N=4}{$DEFINE HIT}{$ENDIF}";
+        let before = budget.snapshot();
+        // Reuse the same budget: no reset/refund of the plain scan's work.
+        assert!(
+            super::source_directive_shape_in_session(
+                source,
+                &id,
+                &mut budget,
+                &crate::NoCancellation
+            )
+            .is_err()
+        );
+        assert!(budget.snapshot().work >= before.work);
+    }
+    #[test]
+    fn task11_fix1_shape_distinguishes_layout_calls_from_lexical_mentions() {
+        for source in [
+            "// SizeOf(LongWord)\n",
+            "{SizeOf(LongWord)}",
+            "(*SizeOf(LongWord)*)",
+            "'SizeOf(LongWord)'",
+            "'escaped '' SizeOf(LongWord)'",
+            "\"SizeOf\"",
+            "MySizeOf(T)",
+            "SizeOfValue(T)",
+            "αSizeOf(T)",
+            "SizeOfα(T)",
+            "&SizeOf(T)",
+            "{$HPPEMIT 'SizeOf(LongWord)'}",
+            "{$HPPEMIT SizeOf(T)}",
+            "{$DEFINE SizeOf} {$IFDEF SizeOf} {$ENDIF}",
+            "{$IFNDEF SizeOf} {$ENDIF}",
+            "{$IFOPT SizeOf} {$ENDIF}",
+            "{$IF 'SizeOf(T)' = 'SizeOf(T)'} {$ENDIF}",
+            "{$IF MySizeOf=1} {$ENDIF}",
+            "const SizeOf=1;",
+        ] {
+            assert!(
+                !super::source_directive_shape(source, &crate::NoCancellation).1,
+                "fake call: {source}"
+            );
+        }
+        for source in [
+            "{$IF SizeOf(Types.T)=4}",
+            "(*$IF sIzEoF ( Types.T ) = 4 *)",
+            "{$ELSEIF SizeOf(T)>0}",
+            "(*$ELIF sizeof(T)=4*)",
+            "const N=SizeOf(LongWord); {$IF N=4}",
+            "const N=SizeOf { trivia } (LongWord);",
+            "const N=SizeOf (* trivia *) (LongWord);",
+            "const N=SizeOf // trivia\n (LongWord);",
+        ] {
+            assert!(
+                super::source_directive_shape(source, &crate::NoCancellation).1,
+                "missed call: {source}"
+            );
+        }
+        assert_eq!(
+            super::source_directive_shape(
+                "'{$I fake.inc}' {$I real.inc} (*$IF SizeOf(T)=4*)",
+                &crate::NoCancellation
+            ),
+            (true, true, 2)
+        );
+        struct Cancelled;
+        impl crate::CancellationToken for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        assert_eq!(
+            super::source_directive_shape("{$IF SizeOf(T)=4} {$I body.inc}", &Cancelled),
+            (false, false, 0)
+        );
+    }
+
+    #[test]
+    fn scanner_split_emission_keeps_physical_owners_after_reuse_and_budget_exit() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        for pieces in [vec!["{", "$H", "+", "}"], vec!["(", "*", "$H+", "*", ")"]] {
+            let mut budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = observer.budget_snapshot().retained_bytes;
+            let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+            let mut emitted = None;
+            let mut sources = Vec::new();
+            for (n, piece) in pieces.iter().enumerate() {
+                let id = crate::SourceId::new(format!("physical-{n}.inc"));
+                let step = scanner
+                    .next(
+                        piece,
+                        0,
+                        &id,
+                        OccurrenceId(n as u64 + 1),
+                        &mut budget,
+                        &crate::NoCancellation,
+                    )
+                    .unwrap();
+                assert!(step.deferred.is_empty());
+                assert_eq!(step.directive.is_some(), n + 1 == pieces.len());
+                emitted = step.directive.or(emitted);
+                sources.push(id);
+            }
+            let emitted = emitted.unwrap();
+            assert_eq!(&*emitted.body, "H+");
+            assert_eq!(emitted.fragments.len(), pieces.len());
+            for (n, anchor) in emitted.fragments.iter().enumerate() {
+                assert_eq!(anchor.source, sources[n]);
+                assert_eq!(anchor.occurrence, OccurrenceId(n as u64 + 1));
+                assert_eq!(anchor.range, 0..pieces[n].len());
+            }
+            let mapped = emitted
+                .body_fragments
+                .iter()
+                .map(|a| {
+                    let n = a.occurrence.0 as usize - 1;
+                    &pieces[n][a.range.clone()]
+                })
+                .collect::<String>();
+            assert_eq!(mapped, "H+");
+            let saved = emitted.fragments.as_ptr();
+            let reused = scanner
+                .next(
+                    "ordinary",
+                    0,
+                    &sources[0],
+                    OccurrenceId(99),
+                    &mut budget,
+                    &crate::NoCancellation,
+                )
+                .unwrap();
+            assert!(reused.directive.is_none());
+            drop(reused);
+            drop(scanner);
+            drop(budget);
+            assert_eq!(emitted.fragments.as_ptr(), saved);
+            assert_eq!(&*emitted.body, "H+");
+            let live = observer.budget_snapshot();
+            assert!(live.retained_bytes > baseline);
+            drop(emitted);
+            let dead = observer.budget_snapshot();
+            assert_eq!(dead.retained_bytes, baseline);
+            assert_eq!(dead.work, live.work);
+            assert_eq!(dead.byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn scanner_finish_cancellation_keeps_pending_owner_and_drops_partial_emission() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        struct CancelAt(Cell<usize>, usize);
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= self.1
+            }
+        }
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        scanner
+            .append(
+                "{$H+}",
+                0..5,
+                &crate::SourceId::new("pending.inc"),
+                OccurrenceId(4),
+                &mut budget,
+            )
+            .unwrap();
+        scanner.prefix = 2;
+        let pending = scanner.pending.as_ptr();
+        let fragments = scanner.fragments.as_ptr();
+        for allowed in 0..5 {
+            let before = observer.budget_snapshot();
+            let cancel = CancelAt(Cell::new(0), allowed);
+            let mut cancelled = observer.store_budget(CompileTimeLimits::default(), &cancel);
+            assert!(
+                matches!(
+                    scanner.finish(1, &mut cancelled),
+                    Err(IncompleteReason::Cancelled)
+                ),
+                "boundary {allowed}"
+            );
+            assert_eq!(scanner.pending.as_ptr(), pending);
+            assert_eq!(scanner.fragments.as_ptr(), fragments);
+            assert_eq!(&*scanner.pending, "{$H+}");
+            let after = observer.budget_snapshot();
+            assert_eq!(
+                after.retained_bytes, before.retained_bytes,
+                "partial emission must die at boundary {allowed}"
+            );
+            assert!(after.work >= before.work);
+            assert!(after.byte_work >= before.byte_work);
+        }
+        drop(scanner);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn scanner_pending_replacement_refuses_full_peak_before_copy() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let text = "{$123456789012345}";
+        let id = crate::SourceId::new("peak.inc");
+        scanner
+            .append(text, 0..16, &id, OccurrenceId(2), &mut budget)
+            .unwrap();
+        let before = budget.snapshot();
+        let backing = scanner.pending.as_ptr();
+        let capacity = scanner.pending.capacity();
+        assert_eq!(capacity, 16);
+        // One byte below the actual new String/carrier invoice, while the old
+        // String remains live. A delta-capacity invoice would incorrectly fit.
+        budget
+            .constrain_retained(
+                before.retained_bytes + size_of::<AdmittedOwned<String>>() + 2 * capacity - 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            scanner.append(text, 16..17, &id, OccurrenceId(2), &mut budget),
+            Err(IncompleteReason::Limit {
+                name: "max_retained_bytes",
+                ..
+            })
+        ));
+        assert_eq!(scanner.pending.as_ptr(), backing);
+        assert_eq!(&*scanner.pending, &text[..16]);
+        assert_eq!(scanner.fragments[0].range, 0..16);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        drop(scanner);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn scanner_next_unwind_keeps_actual_partial_pending_credits_until_drop() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        struct PanicAt(Cell<usize>);
+        impl CancellationToken for PanicAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                assert_ne!(n, 12, "actual scanner cancellation callback unwind");
+                false
+            }
+        }
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let before = budget.snapshot();
+        let panic = PanicAt(Cell::new(0));
+        let mut callback_budget = observer.store_budget(CompileTimeLimits::default(), &panic);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner
+                    .next(
+                        "{$H+}",
+                        0,
+                        &crate::SourceId::new("unwind.inc"),
+                        OccurrenceId(3),
+                        &mut callback_budget,
+                        &panic,
+                    )
+                    .unwrap();
+            }))
+            .is_err()
+        );
+        assert!(!scanner.pending.is_empty());
+        assert!(!scanner.fragments.is_empty());
+        let live = observer.budget_snapshot();
+        assert!(
+            live.retained_bytes > before.retained_bytes,
+            "surviving partial scanner retains its allocations"
+        );
+        drop(scanner);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn scanner_deferred_prefix_owns_moved_anchor_and_text_until_feed_drop() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let child = crate::SourceId::new("ordinary-prefix.inc");
+        let first = scanner
+            .next(
+                "(",
+                0,
+                &child,
+                OccurrenceId(6),
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+        assert!(first.directive.is_none());
+        drop(first);
+        let step = scanner
+            .next(
+                "1)",
+                0,
+                &crate::SourceId::new("parent.pas"),
+                OccurrenceId(0),
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+        assert_eq!(step.deferred.len(), 1);
+        assert_eq!(step.deferred[0].0.source, child);
+        assert_eq!(step.deferred[0].0.occurrence, OccurrenceId(6));
+        assert_eq!(step.deferred[0].0.range, 0..1);
+        assert_eq!(step.deferred[0].1, "(");
+        drop(scanner);
+        drop(budget);
+        // RootSession consumes these same coordinates/text through feed before
+        // dropping this owner. The integration test exercises that real path.
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        drop(step);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn scanner_emission_moves_fragments_and_refunds_only_dead_owners() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let source = crate::SourceId::new("child.inc");
+        scanner
+            .append("{$H+}", 0..5, &source, OccurrenceId(7), &mut budget)
+            .unwrap();
+        scanner.prefix = 2;
+        let fragments = scanner.fragments.as_ptr();
+        let before = budget.snapshot();
+        let emitted = scanner.finish(1, &mut budget).unwrap();
+        assert_eq!(
+            emitted.fragments.as_ptr(),
+            fragments,
+            "finish moves original vector backing"
+        );
+        assert_eq!(
+            budget.snapshot().byte_work - before.byte_work,
+            2 + source.as_str().len(),
+            "only body and body-anchor identity are copied"
+        );
+        drop(scanner);
+        drop(budget);
+        assert_eq!(&*emitted.body, "H+");
+        assert_eq!(emitted.fragments[0].occurrence, OccurrenceId(7));
+        assert_eq!(emitted.body_fragments[0].range, 2..4);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        let cumulative = observer.budget_snapshot();
+        drop(emitted);
+        let dead = observer.budget_snapshot();
+        assert_eq!(
+            dead.retained_bytes, baseline,
+            "last emitted owner releases its live payload"
+        );
+        assert_eq!(dead.work, cumulative.work);
+        assert_eq!(dead.byte_work, cumulative.byte_work);
+    }
+    #[test]
+    fn fix2_include_shape_uses_borrowed_keywords_not_switch_decoders() {
+        for (body, include) in [
+            ("i child.inc", true),
+            ("  InClUdE: child.inc", true),
+            ("I+", false),
+            ("I-", false),
+            ("I+,R-,Q+", false),
+            ("I+ , R-", false),
+            ("IF false", false),
+            ("unknown", false),
+            ("I ,R-", true),
+        ] {
+            assert_eq!(super::include_shape(body), include, "{body}");
+            assert_eq!(
+                super::include_shape(body),
+                super::directive_kind(body) == super::DirectiveKind::Include,
+                "shape must preserve existing classification: {body}"
+            );
+        }
+    }
     use super::*;
+
+    #[test]
+    fn fix2_i4_explicit_ord_consumes_nominal_identity_scratch_without_coercing_comparisons() {
+        use crate::compile_time::{
+            CompileTimeBudget, CompileTimeLimits, DefinitionKey, IncompleteReason, OccurrenceId,
+            ScopeId, SourceAnchor,
+        };
+        let identity = DefinitionKey {
+            anchor: SourceAnchor {
+                source: crate::SourceId::new("captured-enum.pas"),
+                occurrence: OccurrenceId(1),
+                range: 4..5,
+            },
+            scope: ScopeId(0),
+        };
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        budget.charge(1, 0, 17).unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        for expression in ["Ord(e)", "Ord((e))+Ord(e)", "Ord()", "Ord(e,e)", "e=7"] {
+            let result = evaluate_layout_expression(
+                expression,
+                &ConditionalEnvironment::default(),
+                &mut budget,
+                &mut |query, budget| {
+                    if let ExpressionQuery::Name("e", _) = query {
+                        let bytes = std::mem::size_of::<DefinitionKey>()
+                            + identity.anchor.source.as_str().len();
+                        budget.charge(1, identity.anchor.source.as_str().len(), bytes)?;
+                        return Ok(Some(BoundValue::EnumOrdinal(7, identity.clone())));
+                    }
+                    Ok(None)
+                },
+                false,
+                true,
+            );
+            assert_eq!(budget.snapshot().retained_bytes, baseline, "{expression}");
+            match expression {
+                "Ord(e)" => assert!(matches!(
+                    result,
+                    Ok(Some(BoundValue::Constant(ConstantValue::Integer(7))))
+                )),
+                "Ord((e))+Ord(e)" => assert!(matches!(
+                    result,
+                    Ok(Some(BoundValue::Constant(ConstantValue::Integer(14))))
+                )),
+                _ => assert!(
+                    matches!(result, Err(IncompleteReason::MalformedSource)),
+                    "{expression}"
+                ),
+            }
+        }
+    }
 
     struct AlreadyCancelled;
 

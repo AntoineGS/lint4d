@@ -139,6 +139,7 @@ mod tests {
             end_line,
             byte_range: 0..0,
             objects: Vec::new(),
+            frequent_calls: Vec::new(),
             body: Vec::new(),
             degraded: Vec::new(),
         }

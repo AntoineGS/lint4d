@@ -19,10 +19,21 @@ fn verdict(body: &str, routine: &str) -> Verdict {
 }
 
 fn object(var: &str, class: &str, line: usize, verdict: Verdict) -> ObjectVerdict {
+    object_v(var, class, line, verdict, None)
+}
+
+fn object_v(
+    var: &str,
+    class: &str,
+    line: usize,
+    verdict: Verdict,
+    verify_lines: Option<[usize; 2]>,
+) -> ObjectVerdict {
     ObjectVerdict {
         var: var.into(),
         class: class.into(),
         line,
+        verify_lines,
         verdict,
     }
 }
@@ -208,13 +219,14 @@ end;
                     why: NotFreedReason::NonLocal
                 }
             ),
-            object(
+            object_v(
                 "L",
                 "TList",
                 10,
                 Verdict::NotFreedHere {
                     why: NotFreedReason::NeverFreed
-                }
+                },
+                Some([10, 11])
             ),
         ]
     );
@@ -404,4 +416,364 @@ end;
             why: "reassigned at L9".into()
         }
     );
+}
+
+#[test]
+fn free_inside_with_body_is_unknown() {
+    let body = "procedure Wi;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    with Obj do
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wi"),
+        Verdict::Unknown {
+            why: "named inside with at L13".into()
+        }
+    );
+}
+
+#[test]
+fn creation_inside_with_body_is_unknown() {
+    let body = "procedure Wc;
+var
+  L: TStringList;
+begin
+  with Obj do
+    L := TStringList.Create;
+  L.Free;
+end;
+";
+    assert_eq!(
+        verdict(body, "Wc"),
+        Verdict::Unknown {
+            why: "named inside with at L9".into()
+        }
+    );
+}
+
+#[test]
+fn with_subject_is_not_ambiguous() {
+    let body = "procedure Ws;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    with L do
+      Add('x');
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Ws"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_initialization_before_creation_is_not_a_reassignment() {
+    let body = "procedure Ni;
+var
+  L: TStringList;
+begin
+  L := nil;
+  try
+    L := TStringList.Create;
+    Work;
+  finally
+    L.Free;
+  end;
+  L := nil;
+end;
+";
+    assert_eq!(verdict(body, "Ni"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_assignment_reachable_from_the_creation_is_a_reassignment() {
+    let body = "procedure Nr2;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  L := nil;
+  L.Free;
+end;
+";
+    assert_eq!(
+        verdict(body, "Nr2"),
+        Verdict::Unknown {
+            why: "reassigned at L9".into()
+        }
+    );
+}
+
+#[test]
+fn assigned_guarded_free_covers_the_nil_path() {
+    let body = "procedure Ag;
+var
+  L: TStringList;
+begin
+  L := nil;
+  try
+    L := TStringList.Create;
+    Work;
+  finally
+    if Assigned(L) then
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Ag"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn nil_comparison_guarded_free_covers_the_nil_path() {
+    let body = "procedure Nc;
+var
+  M: TStringList;
+begin
+  M := TStringList.Create;
+  try
+    Work;
+  finally
+    if not (M = nil) then
+      M.Free;
+  end;
+end;
+";
+    assert_eq!(verdict(body, "Nc"), Verdict::FreedAllPaths);
+}
+
+#[test]
+fn guard_on_another_variable_does_not_cover_the_free() {
+    let body = "procedure Go(M: TObject);
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    if Assigned(M) then
+      L.Free;
+  end;
+end;
+";
+    assert!(
+        matches!(verdict(body, "Go"), Verdict::Escapes { .. }),
+        "the false branch of Assigned(M) skips the free of L"
+    );
+}
+
+fn verify_lines(body: &str, routine: &str) -> Vec<Option<[usize; 2]>> {
+    objects(body, routine)
+        .into_iter()
+        .map(|o| o.verify_lines)
+        .collect()
+}
+
+#[test]
+fn escapes_verify_from_creation_to_last_escape() {
+    let body = "procedure W;
+var
+  L: TStringList;
+begin
+  try
+    L := TStringList.Create;
+    Db.Open;
+    try
+      L.Add('x');
+    finally
+      L.Free;
+    end;
+  except
+    on E: Exception do
+      Log(E.Message);
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "W"), vec![Some([9, 10])]);
+}
+
+#[test]
+fn reassigned_verifies_from_creation_to_reassignment() {
+    let body = "procedure R;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    L := nil;
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "R"), vec![Some([8, 10])]);
+}
+
+#[test]
+fn reference_before_creation_is_ordered() {
+    let body = "procedure H;
+var
+  L: TStringList;
+begin
+  {$IF DEFINED(X)}
+  rappel: developper en 32 bits pour plus de stabilite
+  {$IFEND}
+  L := TStringList.Create;
+end;
+";
+    assert_eq!(verify_lines(body, "H"), vec![Some([8, 11])]);
+}
+
+#[test]
+fn named_inside_with_verifies_to_the_with_line() {
+    let body = "procedure Wi;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    with Obj do
+      L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(body, "Wi"), vec![Some([8, 13])]);
+}
+
+#[test]
+fn parse_errors_verify_to_the_first_error_line() {
+    let body = "procedure Pe;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  Foo(;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Pe");
+    assert_eq!(objects.len(), 1);
+    assert_eq!(
+        objects[0].verdict,
+        Verdict::Unknown {
+            why: "parse errors".into()
+        }
+    );
+    assert_eq!(objects[0].verify_lines, Some([8, 9]));
+}
+
+#[test]
+fn never_freed_verifies_to_the_routine_end() {
+    let body = "procedure Nf;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  Work;
+end;
+";
+    assert_eq!(verify_lines(body, "Nf"), vec![Some([8, 10])]);
+}
+
+#[test]
+fn result_non_local_and_freed_have_no_verify_lines() {
+    let body = "function F: TList;
+begin
+  Result := TList.Create;
+  FItems := TList.Create;
+end;
+";
+    assert_eq!(verify_lines(body, "F"), vec![None, None]);
+    let freed = "procedure Ok;
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  try
+    Work;
+  finally
+    L.Free;
+  end;
+end;
+";
+    assert_eq!(verify_lines(freed, "Ok"), vec![None]);
+}
+
+#[test]
+fn escape_before_the_creation_widens_the_verify_range() {
+    let body = "procedure Lp;
+var L: TStringList;
+begin
+  while More do
+  begin
+    Db.Open;
+    L := TStringList.Create;
+  end;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Lp");
+    assert_eq!(objects.len(), 1);
+    let Verdict::Escapes { via, .. } = &objects[0].verdict else {
+        panic!("expected escapes, got {:?}", objects[0].verdict);
+    };
+    assert_eq!(
+        via,
+        &vec![
+            esc(7, EscapeKind::Exception),
+            esc(9, EscapeKind::Exception),
+            esc(10, EscapeKind::ReCreated)
+        ]
+    );
+    assert_eq!(objects[0].line, 10);
+    assert_eq!(objects[0].verify_lines, Some([7, 10]));
+}
+
+#[test]
+fn verify_range_reaches_escapes_behind_the_ellipsis() {
+    let body = "procedure Foo(a: Integer);
+var
+  L: TStringList;
+begin
+  L := TStringList.Create;
+  if a = 1 then
+    Log('x');
+  if a = 2 then
+    Log('y');
+  if a = 3 then
+    Log('z');
+  DoA;
+  DoB;
+  DoC;
+  DoD;
+  DoE;
+  L.Free;
+end;
+";
+    let objects = objects(body, "Foo");
+    let Verdict::Escapes { via, more } = &objects[0].verdict else {
+        panic!("expected escapes, got {:?}", objects[0].verdict);
+    };
+    assert!(more);
+    assert_eq!(via.len(), 3);
+    let verify = objects[0].verify_lines.expect("verify_lines");
+    assert!(
+        verify[1] > via.iter().map(|e| e.line).max().unwrap(),
+        "{verify:?} {via:?}"
+    );
+    assert_eq!(verify, [8, 19]);
 }

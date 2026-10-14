@@ -18,6 +18,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
+fn map_verified_header_location(uri: &Url, range: Range) -> Location {
+    Location::new(uri.clone(), range)
+}
+
 mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
@@ -962,12 +966,30 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        self.update_with_session(uri, source, context, cached, cancel, None)
+    }
+
+    pub(crate) fn update_with_session(
+        &mut self,
+        uri: Url,
+        source: String,
+        context: &ConditionalContext,
+        cached: Option<Arc<ParsedDocument>>,
+        cancel: &AtomicBool,
+        expansion: Option<&crate::include_expansion::ExpandedSource>,
+    ) -> Result<(), String> {
         let previous = self
             .documents
             .get(&uri)
             .map(|document| document.parsed.clone());
-        let document =
-            Document::parse_with_cancel(uri.clone(), source, context, cancel, previous.or(cached))?;
+        let document = Document::parse_with_session(
+            uri.clone(),
+            source,
+            context,
+            cancel,
+            previous.or(cached),
+            expansion,
+        )?;
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
         }
@@ -1939,9 +1961,14 @@ impl NavigationIndex {
     where
         I: IntoIterator<Item = (String, Url)>,
     {
+        use pascal_project::analysis_metrics::{self, Metric};
+        analysis_metrics::record(Metric::ImportBindingCalls, 1);
         let bindings = bindings
             .into_iter()
-            .map(|(name, uri)| (canonical_name(&name), uri))
+            .map(|(name, uri)| {
+                analysis_metrics::record(Metric::ImportBindingPairs, 1);
+                (canonical_name(&name), uri)
+            })
             .collect();
         if let Some(document) = self.documents.get_mut(uri) {
             document.import_binding_fingerprint = Some(import_binding_fingerprint(
@@ -6443,6 +6470,16 @@ impl NavigationIndex {
         self.query_identifier(uri, position).is_some()
     }
 
+    pub(crate) fn import_site_at(&self, uri: &Url, position: Position) -> Option<ImportMetadata> {
+        let (document, offset, identifier) = self.query_identifier(uri, position)?;
+        let name = use_name_at(identifier, &document.source)?;
+        self.imports(uri).into_iter().find(|site| {
+            site.span.start <= offset
+                && offset < site.span.end
+                && site.name.eq_ignore_ascii_case(&name)
+        })
+    }
+
     fn query_identifier(
         &self,
         uri: &Url,
@@ -6472,6 +6509,17 @@ impl NavigationIndex {
         let mut state = ResolutionState::new();
         let mut references =
             self.resolve_candidates_at_with_state(uri, document, offset, identifier, &mut state);
+        if target == NavigationTarget::Definition
+            && let Some(name) = use_name_at(identifier, &document.source)
+        {
+            let providers = self.unit_urls_for_import(document, &canonical_name(&name));
+            if providers.len() == 1
+                && let Some(selected) = self.documents.get(&providers[0])
+                && let Some(range) = selected.current_verified_header()
+            {
+                return vec![map_verified_header_location(&providers[0], range)];
+            }
+        }
         if references
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -6572,6 +6620,23 @@ impl NavigationIndex {
             uri, document, offset, identifier, &mut state, 0, cancel, budget,
         )?;
         budget.require_work(references.len(), cancel)?;
+        if target == NavigationTarget::Definition
+            && let Some(name) =
+                use_name_at_with_budget(identifier, &document.source, cancel, budget)?
+        {
+            let providers = self.unit_urls_for_import_with_budget(
+                document,
+                &canonical_name(&name),
+                cancel,
+                budget,
+            )?;
+            if providers.len() == 1
+                && let Some(selected) = self.documents.get(&providers[0])
+                && let Some(range) = selected.current_verified_header()
+            {
+                return Ok(vec![map_verified_header_location(&providers[0], range)]);
+            }
+        }
         if references
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -15738,6 +15803,8 @@ pub(crate) struct ParsedDocument {
     symbols: Vec<Symbol>,
     opaque_ranges: Vec<Span>,
     conditionals: ConditionalAnalysis,
+    verified_header: Option<Range>,
+    compile_time_session: Option<Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
     conditional_unknown_symbols: Vec<bool>,
     has_initialization: bool,
     has_finalization: bool,
@@ -15765,6 +15832,10 @@ pub(crate) struct ParsedDocument {
 }
 
 impl ParsedDocument {
+    fn current_verified_header(&self) -> Option<Range> {
+        self.compile_time_session.as_ref()?;
+        self.verified_header
+    }
     pub(crate) fn unit_name(&self) -> &str {
         &self.unit_name
     }
@@ -16128,6 +16199,7 @@ impl Deref for Document {
 }
 
 impl Document {
+    #[cfg(test)]
     fn parse_with_cancel(
         uri: Url,
         source: String,
@@ -16135,9 +16207,31 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
+        Self::parse_with_session(uri, source, context, cancel, previous, None)
+    }
+
+    fn parse_with_session(
+        uri: Url,
+        source: String,
+        context: &ConditionalContext,
+        cancel: &AtomicBool,
+        previous: Option<Arc<ParsedDocument>>,
+        expansion: Option<&crate::include_expansion::ExpandedSource>,
+    ) -> Result<Self, String> {
         if let Some(previous) = previous.as_ref()
             && previous.source.as_ref() == source.as_str()
             && previous.conditional_context == *context
+            && expansion
+                .and_then(|e| e.conditionals.as_ref())
+                .is_none_or(|c| *c == previous.conditionals)
+            && match (
+                expansion.and_then(|e| e.session.as_ref()),
+                previous.compile_time_session.as_ref(),
+            ) {
+                (Some(current), Some(prior)) => Arc::ptr_eq(current, prior),
+                (None, _) => true,
+                _ => false,
+            }
         {
             if cancel.load(Ordering::Relaxed) {
                 return Err("request cancelled".to_string());
@@ -16150,11 +16244,49 @@ impl Document {
         }
         #[cfg(test)]
         TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(value.get().saturating_add(1)));
+        pascal_project::analysis_metrics::record(
+            pascal_project::analysis_metrics::Metric::LspDocumentPreparations,
+            1,
+        );
         let path = uri
             .to_file_path()
             .unwrap_or_else(|_| PathBuf::from(uri.path()));
         let info = FileInfo::new(path);
-        let conditionals = conditional::analyze_with_context_and_cancel(&source, context, cancel);
+        let conditionals = expansion
+            .and_then(|e| e.conditionals.clone())
+            .unwrap_or_else(|| {
+                conditional::analyze_with_context_and_cancel(&source, context, cancel)
+            });
+        let compile_time_session = expansion.and_then(|e| e.session.clone());
+        let verified_header = expansion.and_then(|e| {
+            let session = e.session.as_ref()?;
+            let pascal_core::compile_time::Fact::Known(header) = &session.header else {
+                return None;
+            };
+            let first = header.name_parts.first()?;
+            let last = header.name_parts.last()?;
+            if header
+                .name_parts
+                .iter()
+                .any(|part| part.source != first.source || part.occurrence != first.occurrence)
+            {
+                return None;
+            }
+            let physical = session
+                .occurrences
+                .iter()
+                .find(|o| o.id == first.occurrence)?;
+            let physical_uri = Url::from_file_path(&physical.source.path).ok()?;
+            let ranges = e.reverse_range(&physical_uri, first.range.start..last.range.end);
+            if ranges.len() != 1 {
+                return None;
+            }
+            let range = &ranges[0];
+            Some(Range::new(
+                text::offset_to_position(&source, range.start)?,
+                text::offset_to_position(&source, range.end)?,
+            ))
+        });
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
         }
@@ -16531,6 +16663,8 @@ impl Document {
             symbols,
             opaque_ranges,
             conditionals,
+            verified_header,
+            compile_time_session,
             conditional_unknown_symbols,
             has_initialization,
             has_finalization,
@@ -27293,6 +27427,75 @@ mod tests {
                 "unexpected auto-import context for {name}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_document_reuse_skips_preparation_and_parser() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let uri = Url::parse("file:///tmp/metrics-reuse.pas").expect("fixture URI");
+        let cancel = AtomicBool::new(false);
+        let context = ConditionalContext::default();
+        let source = "unit MetricsReuse;\ninterface\nimplementation\nend.\n";
+        let scope = TestScope::new();
+        let first =
+            Document::parse_with_cancel(uri.clone(), source.to_owned(), &context, &cancel, None)
+                .expect("first parse");
+        let after_first = scope.snapshot();
+        assert_eq!(after_first.value(Metric::LspDocumentPreparations), 1);
+        let parser_calls = after_first.value(Metric::CoreParserInvocations);
+        assert!(parser_calls >= 1);
+
+        let reused = Document::parse_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &context,
+            &cancel,
+            Some(first.parsed.clone()),
+        )
+        .expect("reused document");
+        assert!(Arc::ptr_eq(&reused.parsed, &first.parsed));
+        let after_reuse = scope.snapshot();
+        assert_eq!(after_reuse.value(Metric::LspDocumentPreparations), 1);
+        assert_eq!(
+            after_reuse.value(Metric::CoreParserInvocations),
+            parser_calls
+        );
+
+        Document::parse_with_cancel(
+            uri,
+            format!("{source}// changed\n"),
+            &context,
+            &cancel,
+            Some(first.parsed.clone()),
+        )
+        .expect("changed document");
+        let after_change = scope.snapshot();
+        assert_eq!(after_change.value(Metric::LspDocumentPreparations), 2);
+        assert!(after_change.value(Metric::CoreParserInvocations) > parser_calls);
+    }
+
+    #[test]
+    fn metrics_bind_imports_counts_calls_and_pairs() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let uri = Url::parse("file:///tmp/metrics-bind.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(
+                uri.clone(),
+                "unit MetricsBind;\ninterface\nimplementation\nend.\n".to_owned(),
+            )
+            .expect("fixture parses");
+        let scope = TestScope::new();
+        index.bind_imports(
+            &uri,
+            [
+                ("A".to_owned(), Url::parse("file:///tmp/a.pas").unwrap()),
+                ("B".to_owned(), Url::parse("file:///tmp/b.pas").unwrap()),
+            ],
+        );
+        let s = scope.snapshot();
+        assert_eq!(s.value(Metric::ImportBindingCalls), 1);
+        assert_eq!(s.value(Metric::ImportBindingPairs), 2);
     }
 
     #[test]

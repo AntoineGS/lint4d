@@ -45,9 +45,11 @@ fn finally_copies_are_grouped_by_statement() {
         frees.len() >= 2,
         "finally is copied per continuation: {frees:?}"
     );
-    assert!(frees
-        .iter()
-        .all(|b| cfg.graph[b.index()].kind == BasicBlockKind::FinallyHandler));
+    assert!(
+        frees
+            .iter()
+            .all(|b| cfg.graph[b.index()].kind == BasicBlockKind::FinallyHandler)
+    );
 
     let create = cfg.blocks_for_stmt(range_of("L := TStringList.Create"));
     assert_eq!(create.len(), 1);

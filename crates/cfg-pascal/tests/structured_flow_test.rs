@@ -379,7 +379,9 @@ end.
     let first_raise = block_with_stmt(raise_cfg, &source, "raise", "raise FirstError");
     let second_raise = block_with_stmt(raise_cfg, &source, "raise", "raise SecondError");
     let raise_handler = block_with_stmt(raise_cfg, &source, "statement", "HandleRaise");
-    assert!(successors(raise_cfg, first_raise).contains(&(raise_handler, EdgeKind::ExceptionThrow)));
+    assert!(
+        successors(raise_cfg, first_raise).contains(&(raise_handler, EdgeKind::ExceptionThrow))
+    );
     assert!(
         successors(raise_cfg, second_raise).contains(&(raise_handler, EdgeKind::ExceptionThrow))
     );
@@ -399,12 +401,16 @@ end.
     let branch_work = block_with_stmt(skip_cfg, &source, "statement", "BranchWork");
     let after_skip = block_with_stmt(skip_cfg, &source, "statement", "AfterSkip");
     let before_successors = successors(skip_cfg, before_skip);
-    assert!(before_successors
-        .iter()
-        .any(|(_, kind)| *kind == EdgeKind::ConditionalTrue));
-    assert!(before_successors
-        .iter()
-        .any(|(_, kind)| *kind == EdgeKind::ConditionalFalse));
+    assert!(
+        before_successors
+            .iter()
+            .any(|(_, kind)| *kind == EdgeKind::ConditionalTrue)
+    );
+    assert!(
+        before_successors
+            .iter()
+            .any(|(_, kind)| *kind == EdgeKind::ConditionalFalse)
+    );
     assert!(can_reach(skip_cfg, branch_work, after_skip));
 
     let nested_cfg = cfg_for(&cfgs, "NestedConditional");
@@ -1408,9 +1414,11 @@ end.
     assert!(
         successors(leaving_cfg, leaving_cleanup).contains(&(outside_body, EdgeKind::FinallyExit))
     );
-    assert!(!successors(leaving_cfg, leaving_goto)
-        .iter()
-        .any(|(target, kind)| *target == outside_body && *kind == EdgeKind::Goto));
+    assert!(
+        !successors(leaving_cfg, leaving_goto)
+            .iter()
+            .any(|(target, kind)| *target == outside_body && *kind == EdgeKind::Goto)
+    );
 }
 
 #[test]

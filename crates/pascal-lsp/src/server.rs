@@ -1177,6 +1177,7 @@ pub struct TestBarrierConfig {
     outbound_control_limit: Option<usize>,
     workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
     dispatch: Option<PathBuf>,
+    analysis_metrics: bool,
 }
 
 #[cfg(feature = "test-support")]
@@ -1230,7 +1231,14 @@ impl TestBarrierConfig {
             outbound_control_limit: None,
             workspace_fifo_probe: None,
             dispatch: None,
+            analysis_metrics: false,
         }
+    }
+
+    /// Serves `pascal/testAnalysisMetrics`; never enabled by `run_stdio`.
+    pub fn with_analysis_metrics(mut self, enabled: bool) -> Self {
+        self.analysis_metrics = enabled;
+        self
     }
 
     pub fn with_outbound_writer(
@@ -10465,10 +10473,15 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
     }
 }
 
+#[cfg(feature = "test-support")]
+const TEST_ANALYSIS_METRICS_METHOD: &str = "pascal/testAnalysisMetrics";
+
 fn run_connection(
     connection: &ProtocolConnection,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-support")]
+    let analysis_metrics_endpoint = test_barriers.analysis_metrics;
     let (initialize_id, initialize, options, initialize_value) = loop {
         let (initialize_id, initialize_value) = connection.initialize_start()?;
         let initialize: InitializeParams = match serde_json::from_value(initialize_value.clone()) {
@@ -10561,6 +10574,8 @@ fn run_connection(
         watch_events,
         work_done_progress_supported,
         jobs,
+        #[cfg(feature = "test-support")]
+        analysis_metrics_endpoint,
     )
 }
 
@@ -10921,6 +10936,7 @@ fn event_loop(
     watch_events: crate::file_watch::WatchEvents,
     work_done_progress_supported: bool,
     mut jobs: AnalysisJobs,
+    #[cfg(feature = "test-support")] analysis_metrics_endpoint: bool,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
@@ -11412,6 +11428,28 @@ fn event_loop(
                 deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if analysis_metrics_endpoint
+                    && request.method == TEST_ANALYSIS_METRICS_METHOD
+                    && !shutdown_received
+                    && file_notification_worker.is_none() =>
+            {
+                let report = crate::analysis_metrics::bounded_report(
+                    &pascal_project::analysis_metrics::PROCESS_COUNTERS.snapshot(),
+                    crate::analysis_metrics::ReportMoment::WindowEndpoint,
+                )
+                .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()));
+                match report {
+                    Ok(report) => send_ok(connection, request.id, report)?,
+                    Err(error) => send_error(
+                        connection,
+                        request.id,
+                        ErrorCode::InternalError,
+                        format!("analysis metrics unavailable: {error}"),
+                    )?,
+                }
             }
             Message::Request(request) if file_notification_worker.is_some() => {
                 queue_workspace_message(
@@ -13692,21 +13730,46 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
     Ok(())
 }
 
+/// An ambiguous rename batch (an endpoint reused, a chain or a cycle) cannot
+/// be replayed pair by pair, so every endpoint's open overlay is rejected and
+/// derived state is invalidated. Old endpoints are recorded as Deleted and
+/// new ones as Created. An endpoint that is both (a chain or a cycle) has no
+/// reliable final state in the batch; the disk, which the notification
+/// follows, decides.
 fn invalidate_ambiguous_file_notification(
     workspace: &mut Workspace,
     budget: Option<&ReconciliationBudget>,
+    events: Vec<(Url, FileChange)>,
     endpoints: impl IntoIterator<Item = Url>,
     push_diagnostics_supported: bool,
 ) -> DiagnosticNotificationEffect {
     let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
     let budget = budget.unwrap_or(&fallback_budget);
+    let mut old_endpoints = HashSet::new();
+    let mut new_endpoints = HashSet::new();
+    for (uri, kind) in events {
+        match kind {
+            FileChange::Deleted => old_endpoints.insert(uri),
+            _ => new_endpoints.insert(uri),
+        };
+    }
+    for uri in &old_endpoints {
+        let recreated =
+            new_endpoints.contains(uri) && uri.to_file_path().is_ok_and(|path| path.exists());
+        if !recreated {
+            budget.record_file_event(uri.clone(), FileChange::Deleted);
+        }
+    }
+    for uri in &new_endpoints {
+        let gone =
+            old_endpoints.contains(uri) && !uri.to_file_path().is_ok_and(|path| path.exists());
+        if !gone {
+            budget.record_file_event(uri.clone(), FileChange::Created);
+        }
+    }
     let mut unique_endpoints = HashSet::new();
     for uri in endpoints {
         if unique_endpoints.insert(uri.clone()) {
-            // For an ambiguous event, no endpoint is allowed to retain a
-            // positive disk observation. Recovery keeps these as tombstones
-            // until a later verified file event supersedes them.
-            budget.record_file_event(uri.clone(), FileChange::Deleted);
             budget.record_rename_endpoint(uri);
         }
     }
@@ -14433,6 +14496,7 @@ fn handle_notification_with_control_inner(
                 return Ok(invalidate_ambiguous_file_notification(
                     workspace,
                     budget,
+                    recovery_events,
                     recoverable_endpoints,
                     push_diagnostics_supported,
                 ));
@@ -16567,6 +16631,8 @@ mod tests {
             crate::file_watch::WatchEvents::channel().1,
             false,
             AnalysisJobs::new(),
+            #[cfg(feature = "test-support")]
+            false,
         )
         .expect("event loop completes");
         assert!(result);

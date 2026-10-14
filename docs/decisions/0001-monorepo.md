@@ -66,9 +66,12 @@ changes, and the non-Rust bindings stay where tree-sitter tooling expects them.
   gitignored override file in existing checkouts must be deleted, or it will
   shadow the in-tree crates with the old sibling checkouts.
 - `cargo fmt`, `cargo clippy --workspace` and `cargo test --workspace` now
-  cover the three crates (their own unit and integration tests included). They
-  keep their own editions and do not opt into the workspace lint table; doing
-  so is a separate change.
+  cover the three crates (their own unit and integration tests included).
+  cfg-core and cfg-pascal later moved to the workspace package fields
+  (edition 2024) and lint table (l4d-113). tree-sitter-pascal keeps the
+  manifest upstream ships (edition 2018, no workspace lints): it is generated C
+  plus a small binding, and an unchanged manifest keeps `git subtree pull`
+  from `Isopod/tree-sitter-pascal` free of conflicts.
 - `.cargo/deny.toml` no longer allows any git source (`unknown-git = "deny"`
   with an empty allow list).
 - The imported crates set `publish = false`, like the rest of the workspace.

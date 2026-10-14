@@ -18,6 +18,8 @@ pub struct RoutineDigest {
     pub end_line: usize,
     pub byte_range: Range<usize>,
     pub objects: Vec<ObjectVerdict>,
+    /// Calls found in three or more separate runs, removed from those runs.
+    pub frequent_calls: Vec<CallCount>,
     pub body: Vec<DigestNode>,
     pub degraded: Vec<Degradation>,
 }
@@ -132,6 +134,9 @@ pub struct ObjectVerdict {
     pub class: String,
     pub line: usize,
     pub verdict: Verdict,
+    /// First and last line to read to confirm or refute the verdict; absent
+    /// when the verdict needs no checking.
+    pub verify_lines: Option<[usize; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

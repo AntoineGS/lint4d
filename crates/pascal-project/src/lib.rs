@@ -11,6 +11,7 @@
 //! `pascal-lsp` owns stateful workspace orchestration, overlays, indexes, and
 //! the include/rename resolver that consumes this crate's bounded results.
 
+pub mod analysis_metrics;
 pub mod build_selection;
 pub mod compiler_defines;
 pub mod conditional;

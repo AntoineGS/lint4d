@@ -28,7 +28,10 @@ fn main() {
         }
     }
 
-    match pascal_lsp::server::run_stdio() {
+    let profiling = pascal_lsp::analysis_metrics::initialize_profiling();
+    let result = pascal_lsp::server::run_stdio();
+    pascal_lsp::analysis_metrics::finish_profiling(profiling, matches!(&result, Ok(true)));
+    match result {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {

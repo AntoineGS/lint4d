@@ -2,10 +2,10 @@ use std::{ops::Range, sync::Arc};
 
 use cfg_core::{BlockId, Cfg, EdgeKind, StmtRef};
 use cfg_pascal::{
-    build_file_cfgs, build_file_cfgs_in_project, ExpansionId, ImportBinding, ImportTarget,
-    PreparationFidelity, PreparationProvenance, PreparedSource, ProjectSnapshot,
-    ProjectSnapshotError, ProjectSourceId, ProjectUnitId, ProjectUnitInput, SourceMap,
-    SourceMapError, SourceMapSegment, SourceSegmentKind, SourceSnapshot, SourceSpan, UsesSite,
+    ExpansionId, ImportBinding, ImportTarget, PreparationFidelity, PreparationProvenance,
+    PreparedSource, ProjectSnapshot, ProjectSnapshotError, ProjectSourceId, ProjectUnitId,
+    ProjectUnitInput, SourceMap, SourceMapError, SourceMapSegment, SourceSegmentKind,
+    SourceSnapshot, SourceSpan, UsesSite, build_file_cfgs, build_file_cfgs_in_project,
 };
 use tree_sitter::{Node, Parser, Tree};
 
@@ -881,9 +881,11 @@ end.
                     .map(|stmt| stmt.byte_range.clone())
             })
             .collect::<Vec<_>>(),
-        vec![prepared_cfg.graph[prepared_raise.index()].stmts[0]
-            .byte_range
-            .clone()]
+        vec![
+            prepared_cfg.graph[prepared_raise.index()].stmts[0]
+                .byte_range
+                .clone()
+        ]
     );
 
     let raw_snapshot = ProjectSnapshot::new(vec![consumer, raw_unit], vec![import]).unwrap();

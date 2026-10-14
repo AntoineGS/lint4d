@@ -90,34 +90,33 @@ Each is its own issue, test-first.
 ## 5. Output format
 
 Line numbers are absolute and 1-based (`L2417`). Indentation is nesting.
-Conditions and `case` labels are truncated to about 70 characters with `…`.
+Conditions and `case` labels are truncated to about 50 characters with `…`; so is the text after `raise`.
 
 ### 5.1 Routine digest
 
 ```
 TBusinessObject.WriteToDB  BusinessObject.pas:2333-2574 (242 lines)
 objects: params TParams L2417 freed on all paths; fieldsMessages TStringList L2455 freed on all paths
-L2351 calls LogToConsoleBOF, GetBofSync, aBofSync.BeginWrite
+frequent calls: LogToConsoleBOF ×9, RefreshDBStatus ×3
+L2351 calls GetBofSync, aBofSync.BeginWrite
 L2356 try
   L2358 if checkAndClipStringFieldsToMaxCapacityIfNecessary
     L2360 for i := 0 to Fields.Count - 1
-      L2364 if (aBOField.isInitialized) and (not aBOField.isReadOnly) and (not aBOFie…
+      L2364 if (aBOField.isInitialized) and (not aBOField.isReadO…
         …
-  L2385 if aBOUpdateKind = boukUnknown
-    L2387 if DBStatus = dsUnknown
-      L2388 calls RefreshDBStatus
   L2417 new TParams -> params
   L2418 try
     L2419 case aBOUpdateKind
       boukUpdate: L2420 calls GenerateUpdateSQL
       boukInsert: L2421 calls GenerateInsertSQL
       boukDelete: L2422 calls GenerateDeleteSQL
-      else: L2424 raise EBOException.Create('Unknown operation to perform to w…
+      else: L2424 raise EBOException.Create('Unknown operation to perform …
     …
   L2504 finally
     L2505 free params
 L2570 finally
   L2571 calls aBofSync.EndWrite
+note: calls are names only; callees not analysed
 ```
 
 Fact lines:
@@ -132,16 +131,57 @@ Fact lines:
 
 Runs with no facts and no calls (assignments only) are omitted.
 
+A call name found in three or more separate runs of one routine is removed
+from those runs and listed once, with its total count, on a `frequent calls:`
+line after `objects:` (before the body): `frequent calls: LogToConsoleBOF ×9,
+GetBofSync ×3`. The count is always shown, names keep first-use order, runs
+left empty disappear, and calls inside anonymous methods are not counted. The
+line is omitted when nothing qualifies.
+
+In the text output, a chain of single-child controls (`if`, `else`, `case`
+arm, `for`, `while`, `with`, `on`) that ends in one fact renders on one line,
+joined by ` → ` with every line number kept: `L463 if aDataset is TIBQuery →
+L465 calls TIBQuery(aDataset).ExecSQL`, or `hoExecSQL: L463 if … → L465 calls
+…` for an arm. A chain ending in a control with several children, or passing
+through `try`, `case`, `repeat`, `{$IF}` or `asm`, is not folded, and a
+control that `--max-lines` collapses renders its collapse line instead. JSON
+and the model are not affected.
+
+A control with no fact anywhere below it and no call in its own condition or
+label is omitted, bottom-up (an `if` whose only child was such a `for` goes
+too). Exceptions: an `if` stays when the `else` right after it is kept; an
+empty `else` is dropped; empty `case` arms are dropped, and a `case` with no
+arm left goes unless its selector holds a call; a `try` is dropped only when
+its body and every `finally`, `except`, `on` and `else` handler are empty, and
+a kept `try` keeps all its handlers, so an empty `except` that swallows
+exceptions stays visible; likewise a kept `{$IF}` keeps all its branches, and
+`asm` blocks are always kept. Routine-index markers count facts only, so this
+does not change them.
+
 The `objects:` line holds one verdict per local variable assigned from a
-constructor:
+constructor. Verdicts that are leads rather than facts carry the lines to read,
+`— verify L4399-4402` (`L4399` when both ends are the same line):
 
 - `freed on all paths`
-- `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …)`: up to
-  three escape points ordered by line, then `…`; `re-created at L…` for a
-  creation reached again before its free
-- `not freed in this routine`: assigned to `Result`, a field, or never freed;
-  a description, not a leak claim
-- `unknown (<reason>)`
+- `NOT freed on all paths (escapes via L4400 exception, L4410 exit, …) — verify
+  L4399-4410`: up to three escape points ordered by line, then `…`;
+  `re-created` for a creation reached again before its free. The range spans the
+  creation and every escape, including those behind `…` and those above the
+  creation (a loop back edge).
+- `not freed in this routine (returned as Result: caller owns)` and
+  `(assigned to a non-local: owner frees)`: ownership moves elsewhere; no range
+- `not freed in this routine (no free found: leak candidate) — verify L9-40`:
+  a local never freed; the range runs from the creation to the routine end
+- `unknown (<reason>) — verify L9-12`: the range joins the creation and the line
+  the reason names (reassignment, `with`, hidden directive block, first parse
+  error); with no such line (`creation not in CFG`, parse errors without a
+  line) it runs from the creation to the routine end
+
+When the routine has an `objects:` line and any call (a `calls` fact, a
+`frequent calls:` line or an anonymous method with calls), the last line is
+`note: calls are names only; callees not analysed`. The header, degradation,
+`objects:` and `frequent calls:` lines and this footer are never collapsed by
+`--max-lines`; the footer counts toward its budget.
 
 ### 5.2 Routine index
 
@@ -157,7 +197,11 @@ object is NOT freed on all paths), `?` (some verdict is unknown).
 ### 5.3 JSON
 
 `--format json` serializes the data model of section 6 with lines and byte
-ranges. Text is the default.
+ranges. Text is the default. Every field is always present: each object verdict
+carries `verify_lines`, a `[first, last]` pair exactly when the text shows
+`— verify` and `null` otherwise, and `frequent_calls` is an empty array when
+nothing is hoisted. The notices and the footer are text only. The JSON contract is
+pinned by an insta snapshot of one routine holding every variant.
 
 ## 6. Data model and analysis
 
@@ -165,17 +209,18 @@ ranges. Text is the default.
 
 ```rust
 FileDigest     { path, routines: Vec<RoutineDigest> }
-RoutineDigest  { name, lines, bytes, objects: Vec<ObjectVerdict>, body: Vec<Node>, degraded: Vec<Degradation> }
+RoutineDigest  { name, lines, bytes, objects: Vec<ObjectVerdict>, frequent_calls: Vec<(name, count)>, body: Vec<Node>, degraded: Vec<Degradation> }
 Node           = Control { kind, line, label, children }   // if/else/case/arm/loop/try/finally/except/on/with/$IFDEF
                | Fact { line, fact }
 Fact           = New { class, target } | Free { var } | Tx { op, receiver, method }
                | Raise { text } | ReRaise | Exit { runs_finally: Option<line> }
                | Calls(Vec<(name, count)>) | Nested { name } | Lambda { calls }
-ObjectVerdict  { var, class, line, verdict }
+ObjectVerdict  { var, class, line, verdict, verify_lines: Option<[line, line]> }  // null in JSON when absent
 Verdict        = FreedAllPaths | Escapes(Vec<Escape>) | NotFreedHere { why } | Unknown { why }
 ```
 
-The index and the text and JSON renderers are pure functions of
+JSON always serialises `frequent_calls` and `verify_lines` (`[]` / `null` when
+absent). The index and the text and JSON renderers are pure functions of
 `FileDigest`.
 
 ### 6.2 Tree (`digest/tree.rs`)
@@ -206,9 +251,15 @@ For each local variable assigned from a constructor:
 2. Walk forward from the creating statement, never entering F. Reaching Exit
    yields `Escapes`, reporting the statement where each path leaves (source of
    an exception edge, an `exit`, or falling off the end). Reaching the creating
-   statement again yields `Escapes (re-created at L…)`.
+   statement again yields `Escapes (re-created at L…)`. The variable is
+   non-nil after the creation, so the walk never takes the nil branch of an
+   `if`/`while` condition that is exactly a nil test of it (`Assigned(L)`,
+   `L <> nil`, `L = nil`, negated or parenthesized), and such a test of a
+   local raises no exception (l4d-rqmx).
 3. Any other assignment to the variable in the routine yields
-   `Unknown (reassigned at L…)`.
+   `Unknown (reassigned at L…)`, except `L := nil` where no path from the
+   creation reaches it without a free: initialization before the `try`, or
+   clearing after the free (l4d-rqmx).
 4. Assignment to `Result` yields `NotFreedHere (returned as Result)`. A
    non-local target (field, global or parameter) with no free in the routine
    yields `NotFreedHere (assigned to a non-local)`; a local with no free
@@ -217,6 +268,9 @@ For each local variable assigned from a constructor:
 5. Parse errors in the routine yield `Unknown (parse errors)` for every
    verdict; a hidden directive block (6.5) between a creation and its free
    yields `Unknown (hidden directive block at L…)`.
+6. A creation, assignment or free of the variable inside a `with` body yields
+   `Unknown (named inside with at L…)`: the name may denote a member of the
+   `with` subject (l4d-pwvv). Such a free never joins F.
 
 `Exit { runs_finally }` records the first `finally` on the exit's path.
 

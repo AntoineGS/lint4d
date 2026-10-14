@@ -16,6 +16,7 @@ fn source(id: &str, path: &str, bytes: &[u8]) -> LoadedSource {
         path: PathBuf::from(path),
         bytes: Arc::from(bytes.to_vec()),
         decoded_text: None,
+        compile_time_backing: None,
         revision: SourceRevision::Overlay {
             version: 1,
             content_hash: 1,
@@ -54,6 +55,7 @@ fn project_with_import(target: ResolutionTarget<SourceId>) -> ResolvedProject {
         .position(|window| window == b"Errors")
         .expect("fixture uses site");
     ResolvedProject {
+        conditional_contexts: Default::default(),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -205,6 +207,10 @@ fn adapter_prepares_configured_includes_and_preserves_their_origin() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -233,7 +239,11 @@ fn adapter_prepares_configured_includes_and_preserves_their_origin() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("target unit");
     assert!(target.is_prepared());
     let included_start = target
@@ -262,6 +272,10 @@ fn adapter_routes_compiler_context_into_configured_cfg_preparation() {
     let root_bytes = b"unit App; interface {$IF CompilerVersion >= 24} const Enabled = 1; {$ENDIF} implementation end.";
     let root_id = SourceId::new("source:/workspace/App.pas");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(24, 0)),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -305,6 +319,12 @@ fn adapter_projects_compiler_context_in_cross_unit_cfg_inputs() {
         "/workspace/Errors.pas",
         dependency_source,
     );
+    for unit in std::iter::once(&project.root).chain(project.units.iter()) {
+        project.conditional_contexts.insert(
+            unit.source.id.clone(),
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(24, 0)),
+        );
+    }
 
     let options = CfgSnapshotOptions {
         prepare_configured_sources: true,
@@ -349,6 +369,11 @@ fn adapter_projects_root_define_into_the_include_cfg_context() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(root_id.clone(), {
+            let mut context = ConditionalContext::default();
+            context.set_define("ENABLED", pascal_project::ConditionalFact::False);
+            context
+        })]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -380,7 +405,11 @@ fn adapter_projects_root_define_into_the_include_cfg_context() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(
         target
@@ -410,6 +439,10 @@ fn adapter_projects_root_option_transition_into_the_include_cfg_context() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            ConditionalContext::default().with_option("R", pascal_project::ConditionalFact::True),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -440,7 +473,11 @@ fn adapter_projects_root_option_transition_into_the_include_cfg_context() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(
         target
@@ -477,6 +514,10 @@ fn adapter_rejects_one_physical_include_reached_with_two_entry_contexts() {
         .collect::<Vec<_>>();
     assert_eq!(ranges.len(), 2);
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -535,6 +576,10 @@ fn adapter_prepares_short_nested_conditionals_and_includes_with_exact_spans() {
         .position(|window| window == include_directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -563,7 +608,11 @@ fn adapter_prepares_short_nested_conditionals_and_includes_with_exact_spans() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(target.is_prepared());
     assert!(

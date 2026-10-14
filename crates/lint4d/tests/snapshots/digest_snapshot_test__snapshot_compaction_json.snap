@@ -1,0 +1,194 @@
+---
+source: crates/lint4d/tests/digest_snapshot_test.rs
+expression: "render::render_json(&file.path, &routines)"
+---
+{
+  "path": "compaction.pas",
+  "routines": [
+    {
+      "name": "Compact",
+      "start_line": 4,
+      "end_line": 38,
+      "byte_range": {
+        "start": 42,
+        "end": 682
+      },
+      "objects": [
+        {
+          "var": "Q",
+          "class": "TQuery",
+          "line": 33,
+          "verdict": {
+            "status": "not_freed_here",
+            "why": "never_freed"
+          },
+          "verify_lines": [
+            33,
+            38
+          ]
+        }
+      ],
+      "frequent_calls": [
+        {
+          "name": "Log",
+          "count": 3
+        }
+      ],
+      "body": [
+        {
+          "node": "fact",
+          "line": 8,
+          "fact": {
+            "kind": "calls",
+            "calls": [
+              {
+                "name": "Open",
+                "count": 1
+              }
+            ]
+          }
+        },
+        {
+          "node": "control",
+          "kind": "if",
+          "line": 15,
+          "end_line": 16,
+          "label": "Ready(A)",
+          "children": []
+        },
+        {
+          "node": "control",
+          "kind": "if",
+          "line": 17,
+          "end_line": 18,
+          "label": "(SomeVeryLongVariableName > 0) and (AnotherVeryLon… [calls IsReady]",
+          "children": []
+        },
+        {
+          "node": "control",
+          "kind": "if",
+          "line": 19,
+          "end_line": 20,
+          "label": "A = 1",
+          "children": [
+            {
+              "node": "fact",
+              "line": 20,
+              "fact": {
+                "kind": "calls",
+                "calls": [
+                  {
+                    "name": "Items.Clear",
+                    "count": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "else",
+          "line": 22,
+          "end_line": 22,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 22,
+              "fact": {
+                "kind": "calls",
+                "calls": [
+                  {
+                    "name": "Items.Sort",
+                    "count": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "case",
+          "line": 23,
+          "end_line": 27,
+          "label": "A",
+          "children": [
+            {
+              "node": "control",
+              "kind": "arm",
+              "line": 25,
+              "end_line": 25,
+              "label": "2",
+              "children": [
+                {
+                  "node": "control",
+                  "kind": "if",
+                  "line": 25,
+                  "end_line": 25,
+                  "label": "Items.Count > 0",
+                  "children": [
+                    {
+                      "node": "fact",
+                      "line": 25,
+                      "fact": {
+                        "kind": "calls",
+                        "calls": [
+                          {
+                            "name": "Items.Delete",
+                            "count": 1
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "try",
+          "line": 32,
+          "end_line": 34,
+          "label": "",
+          "children": [
+            {
+              "node": "fact",
+              "line": 33,
+              "fact": {
+                "kind": "new",
+                "class": "TQuery",
+                "target": "Q"
+              }
+            },
+            {
+              "node": "fact",
+              "line": 34,
+              "fact": {
+                "kind": "calls",
+                "calls": [
+                  {
+                    "name": "Save",
+                    "count": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "node": "control",
+          "kind": "except",
+          "line": 35,
+          "end_line": 36,
+          "label": "",
+          "children": []
+        }
+      ],
+      "degraded": []
+    }
+  ]
+}

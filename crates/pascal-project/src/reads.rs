@@ -93,6 +93,24 @@ impl ReadPolicy {
         limit: u64,
         allow_legacy_symlink: bool,
     ) -> Result<Vec<u8>, String> {
+        analysis_metrics::record(analysis_metrics::Metric::AuthorizedPayloadReadAttempts, 1);
+        let result =
+            self.read_authorized_payload_counting_bytes(entry, limit, allow_legacy_symlink);
+        if result.is_err() {
+            analysis_metrics::record(analysis_metrics::Metric::AuthorizedPayloadReadFailures, 1);
+        }
+        result
+    }
+
+    /// Bytes are counted right after `read_to_end`, so a partial or
+    /// over-limit prefix is included. Other raw reads (for example content
+    /// probes in the LSP project cache) are outside this counter.
+    fn read_authorized_payload_counting_bytes(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+        allow_legacy_symlink: bool,
+    ) -> Result<Vec<u8>, String> {
         let metadata = fs::symlink_metadata(&entry.path)
             .map_err(|error| format!("could not inspect file: {error}"))?;
         if metadata.file_type().is_symlink() && !allow_legacy_symlink {
@@ -110,9 +128,12 @@ impl ReadPolicy {
             return Err("opened path is not a regular file".to_string());
         }
         let mut bytes = Vec::new();
-        file.take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("could not read file: {error}"))?;
+        let read_result = file.take(limit.saturating_add(1)).read_to_end(&mut bytes);
+        analysis_metrics::record(
+            analysis_metrics::Metric::AuthorizedPayloadBytes,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        );
+        read_result.map_err(|error| format!("could not read file: {error}"))?;
         if bytes.len() as u64 > limit {
             return Err(format!("file exceeds the {limit} byte safety limit"));
         }
@@ -716,6 +737,10 @@ fn project_content_hash(bytes: &[u8]) -> u64 {
 }
 
 pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    analysis_metrics::record(
+        analysis_metrics::Metric::LegacyHashBytes,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    );
     project_content_hash(bytes)
 }
 
@@ -758,6 +783,7 @@ pub fn metadata_payload_is_current(
 }
 
 pub fn path_stamp_result(path: &Path) -> io::Result<Option<ProjectReadStamp>> {
+    analysis_metrics::record(analysis_metrics::Metric::ProjectStampProbes, 1);
     let link_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),

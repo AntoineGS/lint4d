@@ -230,6 +230,7 @@ pub(crate) fn expansion_probes(expansion: &ExpansionResult) -> Vec<Probe> {
         .dependencies
         .iter()
         .flat_map(|include| include.observations.iter())
+        .chain(expansion.expanded.observations.iter())
         .filter_map(|observation| {
             let path = observation.path.clone();
             if let (Some(version), Some(content_hash)) =
@@ -263,7 +264,12 @@ fn current_stamp(path: &Path) -> Result<Option<ProjectReadStamp>, ()> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput>) -> bool {
-    probes.iter().all(|probe| match probe {
+    use pascal_project::analysis_metrics::{self, Metric};
+    analysis_metrics::record(Metric::ProjectCacheProbeCalls, 1);
+    // The raw `fs::read` in content probes below is not an authorized payload
+    // read and is deliberately outside the payload counters.
+    let started = analysis_metrics::enabled().then(std::time::Instant::now);
+    let held = probes.iter().all(|probe| match probe {
         Probe::Stamp { path, expected } => current_stamp(path).is_ok_and(|now| now == *expected),
         Probe::Content {
             path,
@@ -296,7 +302,14 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
         } => overlays.get(uri).is_some_and(|overlay| {
             overlay.version == *version && overlay_content_hash(&overlay.text) == *content_hash
         }),
-    })
+    });
+    if let Some(started) = started {
+        analysis_metrics::record(
+            Metric::ProjectCacheProbeNanos,
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    held
 }
 
 #[cfg(test)]
@@ -358,6 +371,30 @@ mod probe_tests {
 
     fn stamp(path: &Path) -> Option<ProjectReadStamp> {
         pascal_project::path_stamp_result(path).ok().flatten()
+    }
+
+    #[test]
+    fn metrics_probe_wrapper_preserves_outcome() {
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.pas");
+        std::fs::write(&file, "unit A;").unwrap();
+        let removed = vec![Probe::Stamp {
+            path: file.clone(),
+            expected: stamp(&file),
+        }];
+        std::fs::remove_file(&file).unwrap();
+        let scope = TestScope::new();
+        assert!(probes_hold(&[], &HashMap::new()));
+        let after_empty = scope.snapshot();
+        assert!(!probes_hold(&removed, &HashMap::new()));
+        let after_removed = scope.snapshot();
+        assert_eq!(after_removed.value(Metric::ProjectCacheProbeCalls), 2);
+        assert!(
+            after_removed.value(Metric::ProjectCacheProbeNanos)
+                >= after_empty.value(Metric::ProjectCacheProbeNanos)
+        );
+        after_removed.checked_delta(&after_empty).unwrap();
     }
 
     #[test]
@@ -918,6 +955,7 @@ mod cache_tests {
                     path: PathBuf::from("/ws/Provider.pas"),
                     bytes: raw.clone(),
                     decoded_text: Some(decoded.clone()),
+                    compile_time_backing: None,
                     revision: pascal_core::SourceRevision::Overlay {
                         version: 1,
                         content_hash: 2,

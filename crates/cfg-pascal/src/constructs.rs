@@ -22,10 +22,9 @@ pub(crate) fn is_exit_call(node: Node, source: &[u8]) -> bool {
             // `Exit(value);`. Delegate to the expression classifier so the
             // latter is not mistaken for an ordinary fallthrough statement.
             let mut cursor = node.walk();
-            let is_exit = node
-                .children(&mut cursor)
-                .any(|child| is_exit_call(child, source));
-            is_exit
+
+            node.children(&mut cursor)
+                .any(|child| is_exit_call(child, source))
         }
         "identifier" => {
             let text = node_text(node, source);
@@ -33,11 +32,11 @@ pub(crate) fn is_exit_call(node: Node, source: &[u8]) -> bool {
         }
         "exprCall" => {
             // Exit(...) with a return value
-            if let Some(entity) = node.child_by_field_name("entity") {
-                if entity.kind() == "identifier" {
-                    let text = node_text(entity, source);
-                    return text.eq_ignore_ascii_case("exit");
-                }
+            if let Some(entity) = node.child_by_field_name("entity")
+                && entity.kind() == "identifier"
+            {
+                let text = node_text(entity, source);
+                return text.eq_ignore_ascii_case("exit");
             }
             false
         }
@@ -54,10 +53,9 @@ pub(crate) fn exit_has_argument(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "statement" => {
             let mut cursor = node.walk();
-            let has_argument = node
-                .children(&mut cursor)
-                .any(|child| exit_has_argument(child, source));
-            has_argument
+
+            node.children(&mut cursor)
+                .any(|child| exit_has_argument(child, source))
         }
         "exprCall" => is_exit_call(node, source) && node.child_by_field_name("args").is_some(),
         _ => false,
@@ -69,10 +67,9 @@ pub(crate) fn is_break_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "statement" => {
             let mut cursor = node.walk();
-            let result = node
-                .children(&mut cursor)
-                .any(|child| is_break_call(child, source));
-            result
+
+            node.children(&mut cursor)
+                .any(|child| is_break_call(child, source))
         }
         "exprCall" => {
             let Some(entity) = node.child_by_field_name("entity") else {
@@ -95,10 +92,9 @@ pub(crate) fn is_continue_call(node: Node, source: &[u8]) -> bool {
     match node.kind() {
         "statement" => {
             let mut cursor = node.walk();
-            let result = node
-                .children(&mut cursor)
-                .any(|child| is_continue_call(child, source));
-            result
+
+            node.children(&mut cursor)
+                .any(|child| is_continue_call(child, source))
         }
         "exprCall" => {
             let Some(entity) = node.child_by_field_name("entity") else {
@@ -121,8 +117,8 @@ fn call_has_no_arguments(node: Node) -> bool {
         return true;
     };
     let mut cursor = args.walk();
-    let result = args.named_children(&mut cursor).next().is_none();
-    result
+
+    args.named_children(&mut cursor).next().is_none()
 }
 
 /// Identifier for a cleanup scope that may need to be unwound by a control
@@ -289,7 +285,8 @@ pub(crate) fn raised_exception_parts(node: Node, source: &[u8]) -> Option<Vec<St
         "exprDot" => constructor_type_parts_from_entity(exception, source),
         "exprParens" => {
             let mut cursor = exception.walk();
-            let exception_type = exception
+
+            exception
                 .named_children(&mut cursor)
                 .find(|child| matches!(child.kind(), "exprCall" | "exprDot"))
                 .and_then(|child| {
@@ -298,8 +295,7 @@ pub(crate) fn raised_exception_parts(node: Node, source: &[u8]) -> Option<Vec<St
                     } else {
                         constructor_type_parts_from_entity(child, source)
                     }
-                });
-            exception_type
+                })
         }
         _ => None,
     }
@@ -372,11 +368,10 @@ fn qualified_parts(node: Node, source: &[u8]) -> Option<Vec<String>> {
             }),
         "exprParens" => {
             let mut cursor = node.walk();
-            let child = node
-                .named_children(&mut cursor)
+
+            node.named_children(&mut cursor)
                 .next()
-                .and_then(|child| qualified_parts(child, source));
-            child
+                .and_then(|child| qualified_parts(child, source))
         }
         _ => None,
     }

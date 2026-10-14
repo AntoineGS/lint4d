@@ -1,7 +1,7 @@
 use crate::types::*;
+use petgraph::Direction;
 use petgraph::algo::dominators::simple_fast;
 use petgraph::visit::{Dfs, EdgeRef};
-use petgraph::Direction;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
@@ -353,17 +353,19 @@ mod tests {
             .expect("the else arm bypasses then");
         assert_eq!(path.first().map(|e| e.to), Some(else_blk));
         assert_eq!(path.last().map(|e| e.to), Some(exit));
-        assert!(cfg
-            .path_avoiding(entry, exit, &set(&[then_blk, else_blk]), &[])
-            .is_none());
+        assert!(
+            cfg.path_avoiding(entry, exit, &set(&[then_blk, else_blk]), &[])
+                .is_none()
+        );
     }
 
     #[test]
     fn path_avoiding_skips_edge_kinds_leaving_from() {
         let (cfg, entry, try_body, finally, exit) = build_try_finally_cfg();
-        assert!(cfg
-            .path_avoiding(entry, exit, &set(&[finally]), &[EdgeKind::ExceptionThrow])
-            .is_none());
+        assert!(
+            cfg.path_avoiding(entry, exit, &set(&[finally]), &[EdgeKind::ExceptionThrow])
+                .is_none()
+        );
         let path = cfg
             .path_avoiding(entry, exit, &set(&[try_body]), &[])
             .expect("the exception edge reaches finally then exit");

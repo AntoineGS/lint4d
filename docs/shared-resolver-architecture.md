@@ -2,9 +2,8 @@
 
 This is the current integration boundary between `pascal-project`,
 `pascal-core`, `cfg-pascal`, lint4d, and pascal-lsp. It describes the APIs in
-the `shared-resolver` worktree. It is not a promise of full Delphi compiler or
-MSBuild fidelity, and the Git revisions below are pins rather than crates.io
-release claims.
+this workspace. It is not a promise of full Delphi compiler or MSBuild fidelity
+or a crates.io release claim.
 
 For user-facing behavior, see the [pascal-lsp README](../crates/pascal-lsp/README.md)
 and the [pascal-project README](../crates/pascal-project/README.md).
@@ -39,7 +38,7 @@ observations. The resolver-facing helpers are:
   and platform.
 
 Discovery examines bounded metadata (`.dproj`, `.dpr`, `.dpk`, and supported
-`.optset` inputs) and directory entries in ancestors up to the workspace
+`.optset`/`.props` inputs) and directory entries in ancestors up to the workspace
 boundary. It prefers `.dproj` candidates, then a `.dpr`/`.dpk` fallback;
 multiple candidates are ownership-probed within fixed limits. Ambiguous,
 unreadable, unsafe, unsupported, or otherwise incomplete selection is retained
@@ -95,8 +94,9 @@ directive metadata, and `complete`. The bounded analyzer understands `IFDEF`,
 `IFNDEF`, boolean `IF`/`ELSEIF`/`ELIF`, `ELSE`, `ENDIF`/`IFEND`, `DEFINE`,
 `UNDEF`, and `I`/`INCLUDE` directives in the supported Pascal directive comment
 forms. Expressions cover defined/true/false values, `NOT`/`AND`/`OR`,
-parentheses, and bounded numeric/string/boolean comparisons. `IFOPT` is
-recognized but remains unknown because compiler-option facts are not inferred.
+parentheses, and bounded numeric/string/boolean comparisons. `IFOPT` uses
+explicit named compiler-option facts; absent facts remain unknown because
+compiler-option state is not inferred from the host.
 
 Known-inactive branches can be excluded. Unknown activity remains potentially
 active. Malformed nesting, unsupported active directives, cancellation, encoding
@@ -112,11 +112,131 @@ retained as unavailable without requiring a payload. Repeated and nested include
 occurrences keep their exact owner source ID and directive range, and successful
 non-unit payloads remain in `ResolvedProject::include_sources`.
 
-The conservative resolver does not propagate symbols defined inside includes
-back into the parent's initial conditional analysis. Such patterns can remain
-incomplete even when the lower-level configured preparer could evaluate them.
-The shared lint pipeline then uses its file-local fallback; it does not claim
-full compiler preprocessing or MSBuild fidelity.
+The resolver's compile-time session now continues active include declarations,
+supported initializer values, lexer state, scopes, branch correlations and
+layout switches into the parent in source order. It does not require a second
+import pass to see a supported included `SizeOf` constant. Physical occurrence
+and definition identities are retained across nested/repeated includes and
+split tokens, operands and initializers. Unknown include activity is not read
+authority. A missing/ambiguous/denied/cyclic/over-budget include is a required
+failure, never an empty fragment or an initializer value of one. Scalar-only
+legacy callbacks cannot claim typed include continuation. Unsupported cases
+remain incomplete and keep the established file-local lint fallback; this is
+not full compiler preprocessing or MSBuild fidelity.
+
+## Compile-time storage facts
+
+`pascal-core::compile_time` owns declaration ingestion, binding, layout and
+source-order sessions. `pascal-project` owns target/settings metadata, not a
+second layout engine. `Fact::Known` requires proven storage and alignment;
+`Unknown` preserves unsupported/ambiguous/cyclic/overflow facts, and
+`Incomplete` preserves cancellation, required-source, malformed-source or
+limit failures. Declaration identity is physical source + include occurrence +
+scope, with sequence-sensitive queries and definition-site settings. Local
+shadowing blocks intrinsic/provider guessing; same-width candidates do not
+establish unique identity.
+
+Supported operands comprise intrinsic scalar/pointer/string/reference types,
+ordinary and strong aliases, source-backed imported/qualified types, ordinal
+enums/subranges, static multidimensional arrays and dynamic-array references,
+nested/packed records with final padding and proven variant parts, source
+global/local variables and parameters, record fields, typed array selectors
+and pointer dereferences. Index expressions prove static ordinal category;
+they do not evaluate runtime values or dereference memory. Open-array parameters
+are not dynamic-array variables. Routine/nested scopes, declaration order,
+interface/implementation visibility, qualified unit/project aliases and lexical
+intrinsic shadows remain binding constraints. An unsupported declaration does
+not authorize a built-in fallback.
+
+Windows ABI profiles admit Delphi 2007/18.5 Win32 and exact 20.0–37.0 versions,
+with Win64 from 23.0; widths and inherent alignments are reference-derived,
+not local compiler measurements. The complete
+[ABI registry](../crates/pascal-core/tests/fixtures/compile_time/abi.toml)
+contains official Delphi data-format/switch/Extended references and the
+Delphi/MSVC correspondence plus Microsoft's mapped alignment rules. Host
+`sizeof`/alignment and mutable conditional defines are never ABI evidence.
+Pointers and managed-reference variables are 4/8 bytes on Win32/Win64, not
+their payloads. `Extended` is 10/8 bytes with inherent alignment 8; Win64
+`Real48` remains unknown because alignment is unverified. Only Athens/36.0
+has referenced A8/H+ defaults; enum size, OLDTYPELAYOUT and REALCOMPATIBILITY
+defaults remain unproven, including Florence/37.0 defaults. Project DCC
+alignment/enum/long-string settings apply only to project sources; library
+sources and explicit whole-layout overrides retain their independent state.
+Explicit A1/2/4/8, Z1/2/4, H and supported legacy switches are captured at
+definition sites. No-argument 37.0 Windows PUSHOPT/POPOPT preserves their state;
+unsupported/subset/malformed restores are not proof.
+
+Generic/DCU/function/property storage operands, class/interface instances,
+sets, Variant, unverified grouped-field legacy layouts and ALIGN 16 remain
+unknown. Variant alternatives also require proven unmanaged eligibility;
+managed data is not accepted just because its reference has a width. Supported
+`SizeOf` constants use the existing bounded expression grammar, including
+source-backed whitespace/plain-comment trivia. This is not a general evaluator
+(TASK-47), an exhaustive Delphi type checker or a compiler-parity promise.
+
+Unit candidate verification and LSP `uses` definition fallback share a bounded
+source-backed header proof. The proof can stop at an authorized, active,
+uniquely matching unit header before an unsupported body; it returns physical
+name fragments/URI/ranges, including include-owned spans. It does not promote
+that body to complete analysis, fabricate a DCU layout, authorize a rename or
+change search precedence. Missing/ambiguous/denied providers stay fail-closed.
+Payload revisions, negative directory/candidate probes, read policy, physical
+root/route, project/library contexts and all layout settings remain freshness
+inputs. Revoked routes cannot be replayed from an older session.
+
+Regression evidence lives in `pascal-core/tests/compile_time_{abi,bindings,
+arrays,records,operands,conditionals,includes,providers,headers,admission,
+ownership,task13_bounds}.rs`, `pascal-core/tests/unit_resolver.rs`,
+`pascal-project/tests/layout_context.rs`, `pascal-lsp/tests/compile_time_layout.rs`
+and `lint4d/tests/cfg_compile_time_layout.rs`. These cover positive storage,
+shadowing/ambiguity/authorization controls, physical coordinates, include
+continuation, checked overflow, budgets, cancellation and cold/warm freshness.
+Release validation and the actual unchanged-config ChainDriveAPI 13-import
+probe remain pending; fixture evidence does not establish those results.
+
+## Compile-time resource boundary
+
+The ordinary source/include/depth/retention defaults remain unchanged. Compile-time
+declaration, provider, include, branch, query, copy and recovery work uses a
+shared request budget; live admitted owners retain storage receipts until their
+actual storage dies. Releasing live scratch does not refund work or byte-work.
+Admission refusal is transactional, cancellation cannot publish partial known
+facts, and checked layout arithmetic cannot wrap to a known size.
+
+| Core compile-time default | Value |
+| --- | ---: |
+| Definitions / fields / variant alternatives (each) | 32,768 |
+| Pending fragment bytes / retained storage bytes (each) | 1 MiB |
+| Scope / type depth / array dimensions (each) | 256 |
+| Branch states | 64 |
+| Provider queries | 256 |
+| Work units | 2,000,000 |
+| Byte-work | 64 MiB |
+
+These are refusal ceilings, not promises that every input at the dimensional
+maximum fits. The finite work profile has measured 1.681x operation and 1.704x
+byte headroom over bounded SysUtils/base outputs, which still report a genuine
+64-state branch Limit; neither resource-free processing nor all-Known semantic
+facts is promised. Header-purpose selection/reproof retain 256 states /64 MiB
+and inherit the common 2,000,000-operation policy. Explicit tighter callers and
+spent shared counters are never replaced or reset. Isolated Task13 probes safely
+refuse default include chains
+before depth 256 at retention limits, and 10,000 simple declarations also
+refuse under unchanged defaults. Neither is maximum-depth/count success.
+
+The LSP deliberately retains the existing finite compatibility policy in
+`workspace/compile_time.rs::lsp_compatibility_retention`: the sum of document,
+total-source, expanded-output and cache byte ceilings, each clamped to existing
+runtime maxima (document/expanded also clamped to total source). This avoids
+applying the standalone 1 MiB fuse to LSP-owned source/output domains; it is
+**not strict aggregate heap certification**. Universal resolver/LSP allocation
+accounting, native parser storage, native cwd/macOS cache migration and sparse
+receiving APIs remain deferred. Two strict historical projection-retention
+tests remain visibly failing under `l4d-cnm`:
+`fix_i3_versions_replace_temporary_projection_and_share_work` and
+`fix_i3_repeated_project_outputs_are_admitted_not_free_replays` in
+`compile_time_includes.rs`. No process-heap/RSS bound or all-tests-green claim
+follows from the finite resource policy.
 
 The default shared-resolver bounds are:
 
@@ -145,9 +265,14 @@ source identities and import decisions into the caller-owned
 `cfg_pascal::ProjectSnapshot`; it does not rediscover files or infer imports.
 
 With `CfgSnapshotOptions::prepare_configured_sources = true`, the adapter passes
-the selected configuration ID, project defines, and
-`cfg_pascal::PreparationLimits` to `cfg_pascal::prepare_source`. Preparation is
-all-or-nothing. Missing configuration identity, unknown active directives,
+each unit's resolver-retained conditional context through the shared
+compile-time session over already resolved sources. It then passes proven
+offset-preserving projections, exact active include decisions, the selected
+configuration ID and `cfg_pascal::PreparationLimits` to the CFG preparer;
+there is no duplicate `SizeOf` evaluator or new filesystem lookup. The strict
+CFG splicer rejects repeated physical sources with multiple entry occurrences
+and fragmented include directive spans rather than reusing another lexical
+context. Preparation is all-or-nothing. Missing configuration identity, unknown active directives,
 unresolved/ambiguous active includes, or source-map validation failures retain
 the raw snapshot with `CfgSnapshotStatus::Incomplete` rather than mixing precise
 and partial prepared units. Only found resolver includes become

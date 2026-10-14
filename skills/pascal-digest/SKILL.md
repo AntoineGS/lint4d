@@ -27,22 +27,27 @@ raises, exits and calls, each with its source line.
 - `--max-lines N` (default 300) applies to `--routine` and `--line` text output
   only; `--all`, the index and `--format json` are never collapsed. A collapsed
   block reads `L4430-4441 while not aQry.Eof … (12 lines, calls …)`: the head
-  text, then the line count, then `calls …` only when the subtree has calls.
+  text, then the line count, then `calls …` only when the subtree has calls
+  (hoisted `frequent calls` are not listed).
 
 ## Reading a digest
 
-- Read only the source lines the digest points to.
-- `NOT freed on all paths (escapes via L… exception)` and `unknown (…)` are
-  leads: verify them in the source before calling them bugs.
+- Read only the source lines the digest points to. A verdict with
+  `— verify L…-…` names the lines to read; the digest does not prove it.
+- The digest compacts output: a `frequent calls:` line after `objects:` lists
+  calls found in three or more separate runs, with total counts, and removes
+  them from those runs; runs and controls with no fact and no call are omitted; a chain of
+  single-child controls with one fact reads on one line joined by ` → `
+  (`L463 if … → L465 calls …`); long labels and raise text end in `…`.
+- Escape and `verify` lines can fall in code the body omits (factless
+  controls, hoisted calls): read the source range.
+- Verdict lines carry their own interpretation (`— verify L…` ranges,
+  ownership notes such as `caller owns`); read them literally.
+- A final `note:` line says calls are names only. Digest or read the callee
+  when its effect matters.
 - `unknown (hidden directive block at L…)`: the routine contains a
-  `{$IF}…{$IFEND}` block the parser had to blank out, so object verdicts other
-  than `returned as Result` cannot be proven and are reported `unknown`; read
-  that block yourself.
-- `not freed in this routine (returned as Result)` and `(assigned to a
-  non-local)` describe ownership transfer, not leaks. `(no free found)` on a
-  local object is a leak candidate to verify.
-- Facts are file-local: a call is a name, not the callee's behaviour. Digest
-  or read the callee when its effect matters.
+  `{$IF}…{$IFEND}` block the parser had to blank out; read that block yourself.
+  `unknown (named inside with at L…)`: read that statement yourself.
 - `!` lines warn about parse errors, `! hidden directive block at L…`,
   conditional code (every `{$IF}` branch is shown) and anonymous methods (not
   analysed).

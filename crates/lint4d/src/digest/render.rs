@@ -52,7 +52,7 @@ pub fn render_index(file: &FileDigest) -> String {
     out
 }
 
-/// Header, degradation lines, objects line, then the body. With
+/// Header, degradation lines, objects line, frequent calls line, then the body. With
 /// `max_lines`, the deepest control subtrees collapse on a best-effort basis;
 /// collapsing stops at the top level, so the output can still exceed
 /// `max_lines`. The header lines are never collapsed.
@@ -78,10 +78,22 @@ pub fn render_routine(
         let objects: Vec<String> = routine.objects.iter().map(object_text).collect();
         head.push(format!("objects: {}", objects.join("; ")));
     }
+    if !routine.frequent_calls.is_empty() {
+        head.push(format!(
+            "frequent calls: {}",
+            routine
+                .frequent_calls
+                .iter()
+                .map(|call| format!("{} ×{}", call.name, call.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let footer = has_objects_and_calls(routine).then_some(CALLS_NOTE);
     let mut body = Vec::new();
     render_nodes(&routine.body, 0, usize::MAX, &mut body);
     if let Some(limit) = max_lines {
-        let budget = limit.saturating_sub(head.len());
+        let budget = limit.saturating_sub(head.len() + usize::from(footer.is_some()));
         let mut depth = max_depth(&routine.body, 0);
         while body.len() > budget {
             body.clear();
@@ -93,9 +105,28 @@ pub fn render_routine(
         }
     }
     head.extend(body);
+    head.extend(footer.map(str::to_string));
     let mut out = head.join("\n");
     out.push('\n');
     out
+}
+
+const CALLS_NOTE: &str = "note: calls are names only; callees not analysed";
+
+/// Whether the routine lists objects and shows any call.
+fn has_objects_and_calls(routine: &RoutineDigest) -> bool {
+    !routine.objects.is_empty() && (!routine.frequent_calls.is_empty() || any_calls(&routine.body))
+}
+
+fn any_calls(nodes: &[DigestNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        DigestNode::Control { children, .. } => any_calls(children),
+        DigestNode::Fact {
+            fact: Fact::Calls { calls } | Fact::Lambda { calls },
+            ..
+        } => !calls.is_empty(),
+        DigestNode::Fact { .. } => false,
+    })
 }
 
 /// The uncollapsed body only.
@@ -118,7 +149,9 @@ fn max_depth(nodes: &[DigestNode], depth: usize) -> usize {
     nodes
         .iter()
         .filter_map(|node| match node {
-            DigestNode::Control { children, .. } if !children.is_empty() => {
+            DigestNode::Control { children, .. }
+                if !children.is_empty() && fold_chain(node).is_none() =>
+            {
                 Some(max_depth(children, depth + 1).max(depth))
             }
             _ => None,
@@ -141,7 +174,9 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
                 label,
                 children,
             } => {
-                if depth >= collapse_at && !children.is_empty() {
+                if let Some(folded) = fold_chain(node) {
+                    out.push(format!("{indent}{folded}"));
+                } else if depth >= collapse_at && !children.is_empty() {
                     let lines = end_line + 1 - line;
                     out.push(format!(
                         "{indent}L{line}-{end_line} {} … ({lines} line{}{})",
@@ -150,12 +185,8 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
                         calls_suffix(children)
                     ));
                 } else if *kind == ControlKind::Arm {
-                    if let [DigestNode::Fact { line, fact }] = children.as_slice() {
-                        out.push(format!("{indent}{label}: L{line} {}", fact_text(fact)));
-                    } else {
-                        out.push(format!("{indent}{label}:"));
-                        render_nodes(children, depth + 1, collapse_at, out);
-                    }
+                    out.push(format!("{indent}{label}:"));
+                    render_nodes(children, depth + 1, collapse_at, out);
                 } else {
                     out.push(format!("{indent}L{line} {}", head_text(*kind, label)));
                     render_nodes(children, depth + 1, collapse_at, out);
@@ -163,6 +194,56 @@ fn render_nodes(nodes: &[DigestNode], depth: usize, collapse_at: usize, out: &mu
             }
         }
     }
+}
+
+fn foldable(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::If
+            | ControlKind::Else
+            | ControlKind::Arm
+            | ControlKind::For
+            | ControlKind::While
+            | ControlKind::With
+            | ControlKind::On
+    )
+}
+
+/// One line for a chain of single-child controls ending in a single fact.
+/// It is one line already, so `--max-lines` never collapses it.
+fn fold_chain(node: &DigestNode) -> Option<String> {
+    let mut prefix = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node;
+    loop {
+        match current {
+            DigestNode::Fact { line, fact } => {
+                parts.push(format!("L{line} {}", fact_text(fact)));
+                break;
+            }
+            DigestNode::Control {
+                kind,
+                line,
+                label,
+                children,
+                ..
+            } => {
+                if !foldable(*kind) {
+                    return None;
+                }
+                let [only] = children.as_slice() else {
+                    return None;
+                };
+                if *kind == ControlKind::Arm {
+                    prefix = format!("{label}: ");
+                } else {
+                    parts.push(format!("L{line} {}", head_text(*kind, label)));
+                }
+                current = only;
+            }
+        }
+    }
+    Some(format!("{prefix}{}", parts.join(" → ")))
 }
 
 fn calls_suffix(nodes: &[DigestNode]) -> String {
@@ -279,6 +360,14 @@ fn degradation_text(degradation: &Degradation) -> String {
     }
 }
 
+fn line_range([first, last]: [usize; 2]) -> String {
+    if first == last {
+        format!("L{first}")
+    } else {
+        format!("L{first}-{last}")
+    }
+}
+
 fn object_text(object: &ObjectVerdict) -> String {
     let verdict = match &object.verdict {
         Verdict::FreedAllPaths => "freed on all paths".to_string(),
@@ -302,15 +391,22 @@ fn object_text(object: &ObjectVerdict) -> String {
         }
         Verdict::NotFreedHere { why } => {
             let why = match why {
-                NotFreedReason::Result => "returned as Result",
-                NotFreedReason::NonLocal => "assigned to a non-local",
-                NotFreedReason::NeverFreed => "no free found",
+                NotFreedReason::Result => "returned as Result: caller owns",
+                NotFreedReason::NonLocal => "assigned to a non-local: owner frees",
+                NotFreedReason::NeverFreed => "no free found: leak candidate",
             };
             format!("not freed in this routine ({why})")
         }
         Verdict::Unknown { why } => format!("unknown ({why})"),
     };
-    format!("{} {} L{} {verdict}", object.var, object.class, object.line)
+    let verify = object
+        .verify_lines
+        .map(|range| format!(" — verify {}", line_range(range)))
+        .unwrap_or_default();
+    format!(
+        "{} {} L{} {verdict}{verify}",
+        object.var, object.class, object.line
+    )
 }
 
 #[cfg(test)]
@@ -344,17 +440,20 @@ mod tests {
             start_line: 10,
             end_line: 30,
             byte_range: 0..100,
+            frequent_calls: Vec::new(),
             objects: vec![
                 ObjectVerdict {
                     var: "L".into(),
                     class: "TStringList".into(),
                     line: 12,
+                    verify_lines: None,
                     verdict: Verdict::FreedAllPaths,
                 },
                 ObjectVerdict {
                     var: "Q".into(),
                     class: "TQuery".into(),
                     line: 13,
+                    verify_lines: Some([13, 16]),
                     verdict: Verdict::Escapes {
                         via: vec![
                             Escape {
@@ -377,6 +476,7 @@ mod tests {
                     var: "Result".into(),
                     class: "TList".into(),
                     line: 17,
+                    verify_lines: None,
                     verdict: Verdict::NotFreedHere {
                         why: NotFreedReason::Result,
                     },
@@ -385,6 +485,7 @@ mod tests {
                     var: "M".into(),
                     class: "TList".into(),
                     line: 18,
+                    verify_lines: Some([18, 20]),
                     verdict: Verdict::Unknown {
                         why: "reassigned at L20".into(),
                     },
@@ -444,8 +545,9 @@ mod tests {
     const HEAD: &str = "TFoo.Run  Foo.pas:10-30 (21 lines)
 ! conditional code: 2 {$IF…} regions, all branches shown
 ! anonymous methods not analysed
-objects: L TStringList L12 freed on all paths; Q TQuery L13 NOT freed on all paths (escapes via L14 exception, L15 exit, L16 falls off end, …); Result TList L17 not freed in this routine (returned as Result); M TList L18 unknown (reassigned at L20)
+objects: L TStringList L12 freed on all paths; Q TQuery L13 NOT freed on all paths (escapes via L14 exception, L15 exit, L16 falls off end, …) — verify L13-16; Result TList L17 not freed in this routine (returned as Result: caller owns); M TList L18 unknown (reassigned at L20) — verify L18-20
 ";
+    const FOOTER: &str = "note: calls are names only; callees not analysed\n";
 
     #[test]
     fn renders_a_full_routine() {
@@ -457,7 +559,7 @@ L19 case A
     L22 free L
     L23 re-raise
 L25 exit (runs finally L28)
-"
+{FOOTER}"
         );
         assert_eq!(render_routine(&sample(), "Foo.pas", None), expected);
     }
@@ -468,7 +570,7 @@ L25 exit (runs finally L28)
             "{HEAD}L11 calls Log ×2, Prepare
 L19-24 case A … (6 lines)
 L25 exit (runs finally L28)
-"
+{FOOTER}"
         );
         assert_eq!(render_routine(&sample(), "Foo.pas", Some(8)), expected);
     }
@@ -498,5 +600,393 @@ L25 exit (runs finally L28)
         assert_eq!(r["body"][0]["fact"]["kind"], "calls");
         assert_eq!(r["body"][1]["kind"], "case");
         assert_eq!(r["degraded"][1]["kind"], "anonymous_methods");
+    }
+
+    fn verdict_text(verdict: Verdict, verify_lines: Option<[usize; 2]>) -> String {
+        object_text(&ObjectVerdict {
+            var: "L".into(),
+            class: "TList".into(),
+            line: 9,
+            verify_lines,
+            verdict,
+        })
+    }
+
+    #[test]
+    fn notices_follow_each_verdict() {
+        let escapes = |lines: &[usize]| Verdict::Escapes {
+            via: lines
+                .iter()
+                .map(|&line| Escape {
+                    line,
+                    how: EscapeKind::Exception,
+                })
+                .collect(),
+            more: false,
+        };
+        assert_eq!(
+            verdict_text(escapes(&[10, 11]), Some([9, 11])),
+            "L TList L9 NOT freed on all paths (escapes via L10 exception, L11 exception) — verify L9-11"
+        );
+        assert_eq!(
+            verdict_text(escapes(&[9]), Some([9, 9])),
+            "L TList L9 NOT freed on all paths (escapes via L9 exception) — verify L9"
+        );
+        assert_eq!(
+            verdict_text(
+                Verdict::Unknown {
+                    why: "reassigned at L12".into()
+                },
+                Some([9, 12])
+            ),
+            "L TList L9 unknown (reassigned at L12) — verify L9-12"
+        );
+        assert_eq!(
+            verdict_text(
+                Verdict::NotFreedHere {
+                    why: NotFreedReason::Result
+                },
+                None
+            ),
+            "L TList L9 not freed in this routine (returned as Result: caller owns)"
+        );
+        assert_eq!(
+            verdict_text(
+                Verdict::NotFreedHere {
+                    why: NotFreedReason::NonLocal
+                },
+                None
+            ),
+            "L TList L9 not freed in this routine (assigned to a non-local: owner frees)"
+        );
+        assert_eq!(
+            verdict_text(
+                Verdict::NotFreedHere {
+                    why: NotFreedReason::NeverFreed
+                },
+                Some([9, 40])
+            ),
+            "L TList L9 not freed in this routine (no free found: leak candidate) — verify L9-40"
+        );
+        assert_eq!(
+            verdict_text(Verdict::FreedAllPaths, None),
+            "L TList L9 freed on all paths"
+        );
+    }
+
+    fn with_body(objects: bool, body: Vec<DigestNode>, frequent: Vec<CallCount>) -> RoutineDigest {
+        let mut routine = sample();
+        if !objects {
+            routine.objects.clear();
+        }
+        routine.body = body;
+        routine.frequent_calls = frequent;
+        routine
+    }
+
+    fn has_footer(routine: &RoutineDigest) -> bool {
+        render_routine(routine, "Foo.pas", None).ends_with(FOOTER)
+    }
+
+    #[test]
+    fn footer_needs_objects_and_calls() {
+        let calls = || {
+            vec![fact(
+                11,
+                Fact::Calls {
+                    calls: vec![call("Log", 1)],
+                },
+            )]
+        };
+        assert!(has_footer(&with_body(true, calls(), Vec::new())));
+        assert!(!has_footer(&with_body(false, calls(), Vec::new())));
+        assert!(!has_footer(&with_body(
+            true,
+            vec![fact(11, Fact::ReRaise)],
+            Vec::new()
+        )));
+        assert!(has_footer(&with_body(
+            true,
+            vec![fact(11, Fact::ReRaise)],
+            vec![call("Log", 3)]
+        )));
+        assert!(has_footer(&with_body(
+            true,
+            vec![fact(
+                11,
+                Fact::Lambda {
+                    calls: vec![call("Log", 1)]
+                }
+            )],
+            Vec::new()
+        )));
+        assert!(!has_footer(&with_body(
+            true,
+            vec![fact(11, Fact::Lambda { calls: Vec::new() })],
+            Vec::new()
+        )));
+    }
+
+    #[test]
+    fn footer_is_never_collapsed_away() {
+        let text = render_routine(&sample(), "Foo.pas", Some(1));
+        assert!(text.ends_with(FOOTER), "{text}");
+    }
+
+    /// One routine holding every variant of the model, so that a change to
+    /// the JSON or text contract shows up in the snapshots.
+    fn every_variant() -> RoutineDigest {
+        let control = |kind, line, end_line, label: &str, children| DigestNode::Control {
+            kind,
+            line,
+            end_line,
+            label: label.to_string(),
+            children,
+        };
+        let object = |var: &str, line, verify_lines, verdict| ObjectVerdict {
+            var: var.into(),
+            class: "TObj".into(),
+            line,
+            verify_lines,
+            verdict,
+        };
+        let escape = |line, how| Escape { line, how };
+        let tx = |op, method: &str| Fact::Tx {
+            op,
+            receiver: "Db".into(),
+            method: method.into(),
+        };
+        RoutineDigest {
+            name: "TAll.Every".to_string(),
+            start_line: 1,
+            end_line: 90,
+            byte_range: 0..900,
+            objects: vec![
+                object("A", 5, None, Verdict::FreedAllPaths),
+                object(
+                    "B",
+                    6,
+                    Some([6, 20]),
+                    Verdict::Escapes {
+                        via: vec![
+                            escape(10, EscapeKind::Exception),
+                            escape(15, EscapeKind::Exit),
+                            escape(18, EscapeKind::FallsOffEnd),
+                            escape(20, EscapeKind::ReCreated),
+                        ],
+                        more: true,
+                    },
+                ),
+                object(
+                    "Result",
+                    7,
+                    None,
+                    Verdict::NotFreedHere {
+                        why: NotFreedReason::Result,
+                    },
+                ),
+                object(
+                    "FItems",
+                    8,
+                    None,
+                    Verdict::NotFreedHere {
+                        why: NotFreedReason::NonLocal,
+                    },
+                ),
+                object(
+                    "C",
+                    9,
+                    Some([9, 90]),
+                    Verdict::NotFreedHere {
+                        why: NotFreedReason::NeverFreed,
+                    },
+                ),
+                object(
+                    "D",
+                    10,
+                    Some([10, 12]),
+                    Verdict::Unknown {
+                        why: "reassigned at L12".into(),
+                    },
+                ),
+                object(
+                    "E",
+                    11,
+                    Some([11, 90]),
+                    Verdict::Unknown {
+                        why: "creation not in CFG".into(),
+                    },
+                ),
+            ],
+            frequent_calls: vec![call("Log", 4)],
+            body: vec![
+                fact(
+                    20,
+                    Fact::New {
+                        class: "TObj".into(),
+                        target: Some("A".into()),
+                    },
+                ),
+                fact(
+                    21,
+                    Fact::New {
+                        class: "TObj".into(),
+                        target: None,
+                    },
+                ),
+                fact(22, Fact::Free { var: "A".into() }),
+                fact(23, tx(TxOp::Start, "StartTransaction")),
+                fact(24, tx(TxOp::Commit, "Commit")),
+                fact(25, tx(TxOp::Rollback, "Rollback")),
+                fact(26, tx(TxOp::InTransaction, "InTransaction")),
+                fact(
+                    27,
+                    Fact::Raise {
+                        text: "Exception.Create('x')".into(),
+                    },
+                ),
+                fact(28, Fact::ReRaise),
+                fact(29, Fact::Exit { runs_finally: None }),
+                fact(
+                    30,
+                    Fact::Exit {
+                        runs_finally: Some(60),
+                    },
+                ),
+                fact(
+                    31,
+                    Fact::Calls {
+                        calls: vec![call("One", 1), call("Two", 3)],
+                    },
+                ),
+                fact(
+                    32,
+                    Fact::Nested {
+                        name: "Inner".into(),
+                    },
+                ),
+                fact(33, Fact::Lambda { calls: Vec::new() }),
+                fact(
+                    34,
+                    Fact::Lambda {
+                        calls: vec![call("Cb", 2)],
+                    },
+                ),
+                control(
+                    ControlKind::If,
+                    35,
+                    36,
+                    "A > 0",
+                    vec![fact(36, Fact::ReRaise)],
+                ),
+                control(ControlKind::Else, 37, 38, "", vec![fact(38, Fact::ReRaise)]),
+                control(
+                    ControlKind::Case,
+                    39,
+                    44,
+                    "N",
+                    vec![
+                        control(ControlKind::Arm, 40, 41, "1", vec![fact(41, Fact::ReRaise)]),
+                        control(
+                            ControlKind::Arm,
+                            42,
+                            44,
+                            "else",
+                            vec![fact(43, Fact::ReRaise)],
+                        ),
+                    ],
+                ),
+                control(
+                    ControlKind::For,
+                    45,
+                    47,
+                    "for I := 0 to 3",
+                    vec![fact(46, Fact::ReRaise), fact(47, Fact::ReRaise)],
+                ),
+                control(
+                    ControlKind::While,
+                    48,
+                    50,
+                    "while X",
+                    vec![fact(49, Fact::ReRaise), fact(50, Fact::ReRaise)],
+                ),
+                control(
+                    ControlKind::Repeat,
+                    51,
+                    53,
+                    "Done",
+                    vec![fact(52, Fact::ReRaise), fact(53, Fact::ReRaise)],
+                ),
+                control(ControlKind::Try, 54, 55, "", vec![fact(55, Fact::ReRaise)]),
+                control(
+                    ControlKind::Finally,
+                    56,
+                    58,
+                    "",
+                    vec![fact(57, Fact::ReRaise), fact(58, Fact::ReRaise)],
+                ),
+                control(
+                    ControlKind::Except,
+                    59,
+                    69,
+                    "",
+                    vec![
+                        control(
+                            ControlKind::On,
+                            60,
+                            62,
+                            "E: EAbort",
+                            vec![fact(61, Fact::ReRaise), fact(62, Fact::ReRaise)],
+                        ),
+                        control(
+                            ControlKind::ExceptElse,
+                            63,
+                            65,
+                            "",
+                            vec![fact(64, Fact::ReRaise), fact(65, Fact::ReRaise)],
+                        ),
+                    ],
+                ),
+                control(
+                    ControlKind::With,
+                    71,
+                    73,
+                    "Obj",
+                    vec![fact(72, Fact::ReRaise), fact(73, Fact::ReRaise)],
+                ),
+                control(
+                    ControlKind::Conditional,
+                    74,
+                    76,
+                    "",
+                    vec![fact(75, Fact::ReRaise), fact(76, Fact::ReRaise)],
+                ),
+                control(
+                    ControlKind::Branch,
+                    77,
+                    79,
+                    "{$IF X}",
+                    vec![fact(78, Fact::ReRaise), fact(79, Fact::ReRaise)],
+                ),
+                control(ControlKind::Asm, 80, 82, "", Vec::new()),
+            ],
+            degraded: vec![
+                Degradation::ParseErrors { lines: vec![3, 4] },
+                Degradation::Conditional { regions: 2 },
+                Degradation::HiddenDirective { line: 12 },
+                Degradation::AnonymousMethods,
+            ],
+        }
+    }
+
+    #[test]
+    fn json_contract_covers_every_variant() {
+        let routine = every_variant();
+        insta::assert_snapshot!(render_json("src/All.pas", &[&routine]));
+    }
+
+    #[test]
+    fn text_covers_every_variant() {
+        insta::assert_snapshot!(render_routine(&every_variant(), "All.pas", None));
     }
 }

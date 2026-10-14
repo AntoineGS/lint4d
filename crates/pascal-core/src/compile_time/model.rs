@@ -35,7 +35,7 @@ pub enum UnknownReason {
     HeaderNotAnalyzed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IncompleteReason {
     Cancelled,
     Limit { name: &'static str, maximum: usize },

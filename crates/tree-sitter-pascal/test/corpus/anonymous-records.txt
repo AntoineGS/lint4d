@@ -1,0 +1,52 @@
+===
+Anonymous ordinary record field preserves named record shape
+===
+
+type R=record Inner:record B:Byte; I:LongWord; end; end;
+
+---
+
+(root
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (declField
+          (identifier)
+          (type
+            (declClass
+              (kRecord)
+              (declField (identifier) (type (typeref (identifier))))
+              (declField (identifier) (type (typeref (identifier))))
+              (kEnd))))
+        (kEnd)))))
+
+===
+Packed anonymous record inside packed named record
+===
+
+type P=packed record Inner:packed record B:Byte; end; end;
+
+---
+
+(root
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kPacked)
+        (kRecord)
+        (declField
+          (identifier)
+          (type
+            (declClass
+              (kPacked)
+              (kRecord)
+              (declField (identifier) (type (typeref (identifier))))
+              (kEnd))))
+        (kEnd)))))

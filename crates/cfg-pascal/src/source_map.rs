@@ -1045,10 +1045,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, SourceMapError::EmptySegment { range: 1..1 });
         let map = mixed_source_map();
-        assert!(map
-            .segments()
-            .windows(2)
-            .all(|pair| { pair[0].prepared_range.end <= pair[1].prepared_range.end }));
+        assert!(
+            map.segments()
+                .windows(2)
+                .all(|pair| { pair[0].prepared_range.end <= pair[1].prepared_range.end })
+        );
     }
 
     #[test]

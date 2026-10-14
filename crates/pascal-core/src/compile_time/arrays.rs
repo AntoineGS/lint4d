@@ -1,0 +1,1290 @@
+//! Checked ordinal domains and array storage. A domain is not an enum's ABI width.
+use super::bindings::{
+    Binding, EnumMember, IndexExpr, TypeExpr, intrinsic, lookup, same_name, storage_type,
+};
+use super::declarations::{initializer_expression, limit};
+use super::*;
+use crate::conditional::{BoundValue, ConstantValue, MAX_EXPRESSION_TOKENS};
+use pascal_project::{LayoutPlatform, LayoutSettings};
+use std::mem::size_of;
+
+type Domain = (i64, i64);
+
+/// Validate dimension count/domains and expression *types*, not variable values.
+pub(super) fn operand_indices<'a>(
+    state: &CompileTimeState,
+    declaration_site: &BindingSite,
+    query_state: &CompileTimeState,
+    query_site: &BindingSite,
+    dimensions: &[IndexExpr],
+    indices: impl Iterator<Item = &'a str>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let before = budget.manual_retained();
+    let result = (|| {
+        if !dimensions.is_empty()
+            && !matches!(
+                array_count(state, declaration_site, dimensions, 0, budget)?,
+                Fact::Known(_)
+            )
+        {
+            return Ok(false);
+        }
+        let mut count = 0;
+        for expression in indices {
+            budget.charge(1, 0, 0)?;
+            let expected = if dimensions.is_empty() {
+                if count > 0 {
+                    return Ok(false);
+                }
+                Some(OrdinalKind::Integer)
+            } else {
+                let Some(dimension) = dimensions.get(count) else {
+                    return Ok(false);
+                };
+                match dimension {
+                    IndexExpr::Domain(name) => {
+                        budget.charge(1, name.len(), name.len() + size_of::<TypeExpr>())?;
+                        let ty = TypeExpr::Named(name.to_ascii_lowercase());
+                        let kind = selector_kind(state, declaration_site, &ty, None, 0, budget)?;
+                        budget.release(name.len() + size_of::<TypeExpr>());
+                        kind
+                    }
+                    IndexExpr::Bounds { lower, .. } => {
+                        ordinal_expression(state, declaration_site, lower, 0, budget)?
+                            .map(|(_, kind)| kind)
+                    }
+                }
+            };
+            let Some(expected) = expected else {
+                return Ok(false);
+            };
+            let value = crate::conditional::type_bound_expression(
+                expression,
+                budget,
+                &mut |name, budget| {
+                    let Some(binding) = lookup(query_state, query_site, name, budget)? else {
+                        return Ok(None);
+                    };
+                    match binding {
+                        Binding::Declaration(decl) if decl.is_routine => {
+                            Ok(Some(BoundValue::InvalidType))
+                        }
+                        Binding::EnumMember { owner, .. } => {
+                            let bytes =
+                                size_of::<DefinitionKey>() + owner.key.anchor.source.as_str().len();
+                            budget.charge(1, bytes * MAX_EXPRESSION_TOKENS, bytes)?;
+                            Ok(Some(BoundValue::EnumOrdinal(0, owner.key.clone())))
+                        }
+                        Binding::Declaration(decl) if !decl.is_type && decl.is_constant => {
+                            Ok(Some(
+                                constant_expression(
+                                    query_state,
+                                    &decl.site,
+                                    initializer_expression(
+                                        decl.initializer.as_deref().unwrap_or(""),
+                                    ),
+                                    0,
+                                    budget,
+                                )?
+                                .unwrap_or(BoundValue::InvalidType),
+                            ))
+                        }
+                        Binding::Declaration(decl) if !decl.is_type => {
+                            // Domain admission excludes floats, strings and pointers even
+                            // when selector_kind's broad intrinsic category is integer.
+                            if type_domain(query_state, &decl.type_site, &decl.ty, 0, budget)?
+                                .is_none()
+                            {
+                                return Ok(Some(BoundValue::InvalidType));
+                            }
+                            let Some(kind) = selector_kind(
+                                query_state,
+                                &decl.type_site,
+                                &decl.ty,
+                                Some(&decl.key),
+                                0,
+                                budget,
+                            )?
+                            else {
+                                return Ok(Some(BoundValue::InvalidType));
+                            };
+                            let value = match &kind {
+                                OrdinalKind::Integer => {
+                                    BoundValue::Constant(ConstantValue::Integer(0))
+                                }
+                                OrdinalKind::Boolean => {
+                                    BoundValue::Constant(ConstantValue::Boolean(false))
+                                }
+                                OrdinalKind::Character(ty) => BoundValue::StaticCharacter(*ty),
+                                OrdinalKind::Enum(key) => {
+                                    let bytes = size_of::<DefinitionKey>()
+                                        + key.anchor.source.as_str().len();
+                                    budget.charge(1, bytes * MAX_EXPRESSION_TOKENS, bytes)?;
+                                    BoundValue::EnumOrdinal(0, key.clone())
+                                }
+                            };
+                            kind.release(budget);
+                            Ok(Some(value))
+                        }
+                        _ => Ok(Some(BoundValue::InvalidType)),
+                    }
+                },
+            )?;
+            let actual = match value {
+                Some(BoundValue::Constant(ConstantValue::Integer(_))) => Some(OrdinalKind::Integer),
+                Some(BoundValue::Constant(ConstantValue::Boolean(_))) => Some(OrdinalKind::Boolean),
+                Some(BoundValue::Constant(ConstantValue::String(s))) => {
+                    let kind = character_ordinal(query_state, &s, budget)?.map(|(_, kind)| kind);
+                    budget.release(s.len());
+                    kind
+                }
+                Some(BoundValue::EnumOrdinal(_, key)) => Some(OrdinalKind::Enum(key)),
+                Some(BoundValue::StaticCharacter(ty)) => Some(OrdinalKind::Character(ty)),
+                _ => None,
+            };
+            let valid = if let Some(actual) = actual {
+                let valid = expected.compatible(&actual, budget)?;
+                actual.release(budget);
+                valid
+            } else {
+                false
+            };
+            expected.release(budget);
+            if !valid {
+                return Ok(false);
+            }
+            count += 1;
+        }
+        Ok(count == dimensions.len().max(1))
+    })();
+    budget.release(budget.manual_retained().saturating_sub(before));
+    result
+}
+
+enum OrdinalKind {
+    Integer,
+    Boolean,
+    Character(BuiltinType),
+    Enum(DefinitionKey),
+}
+impl OrdinalKind {
+    fn compatible(
+        &self,
+        other: &Self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        budget.charge(1, 0, 0)?;
+        Ok(match (self, other) {
+            (Self::Integer, Self::Integer) | (Self::Boolean, Self::Boolean) => true,
+            (Self::Character(a), Self::Character(b)) => a == b,
+            (Self::Enum(a), Self::Enum(b)) => {
+                budget.charge(
+                    1,
+                    a.anchor
+                        .source
+                        .as_str()
+                        .len()
+                        .min(b.anchor.source.as_str().len()),
+                    0,
+                )?;
+                a == b
+            }
+            _ => false,
+        })
+    }
+    fn release(&self, budget: &mut CompileTimeBudget<'_>) {
+        if let Self::Enum(key) = self {
+            budget.release(size_of::<DefinitionKey>());
+            budget.release(key.anchor.source.as_str().len());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn array_layout<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    dimensions: &[IndexExpr],
+    element: &TypeExpr,
+    open: bool,
+    settings: &LayoutSettings,
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Fact<StorageLayout>, IncompleteReason> {
+    if open {
+        return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
+    }
+    if dimensions.is_empty() {
+        // The descriptor retains its element independently; SizeOf never queries
+        // the heap elements to establish the variable's reference storage.
+        if !element_valid(state, site, element, visited, depth + 1, budget)? {
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        }
+        return Ok(builtin_layout(
+            BuiltinType::DynamicArrayReference,
+            &state.context,
+            settings,
+        ));
+    }
+    let count = match array_count(state, site, dimensions, depth, budget)? {
+        Fact::Known(count) => count,
+        Fact::Unknown(reason) => return Ok(Fact::Unknown(reason)),
+        Fact::Incomplete(reason) => return Ok(Fact::Incomplete(reason)),
+    };
+    match storage_type(state, site, element, settings, visited, depth + 1, budget)? {
+        Fact::Known(element) => {
+            budget.charge(1, 0, 0)?;
+            Ok(element.size.checked_mul(count).map_or(
+                Fact::Unknown(UnknownReason::Overflow),
+                |size| {
+                    Fact::Known(StorageLayout {
+                        size,
+                        alignment: element.alignment,
+                    })
+                },
+            ))
+        }
+        Fact::Unknown(r) => Ok(Fact::Unknown(r)),
+        Fact::Incomplete(r) => Ok(Fact::Incomplete(r)),
+    }
+}
+
+/// Cardinality proof is shared by storage and element-type validity. Neither
+/// may accept overflowing bounds/products merely because stride is not needed.
+fn array_count(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    dimensions: &[IndexExpr],
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Fact<u64>, IncompleteReason> {
+    limit(
+        dimensions.len(),
+        budget.limits().max_array_dimensions,
+        "max_array_dimensions",
+    )?;
+    let mut count = 1u64;
+    for dimension in dimensions {
+        budget.charge(1, 0, 0)?;
+        let Some((lower, upper)) = index_domain(state, site, dimension, depth + 1, budget)? else {
+            return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+        };
+        if upper < lower {
+            return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+        }
+        let n = upper
+            .checked_sub(lower)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u64::try_from(n).ok());
+        let Some(product) = n.and_then(|n| count.checked_mul(n)) else {
+            return Ok(Fact::Unknown(UnknownReason::Overflow));
+        };
+        count = product;
+    }
+    Ok(Fact::Known(count))
+}
+
+/// Establish a valid element binding/shape, not its size or record stride.
+pub(super) fn element_valid<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            let Some(binding) = lookup(state, site, name, budget)? else {
+                return Ok(intrinsic(name).is_some());
+            };
+            let Some(decl) = binding.type_declaration() else {
+                return Ok(false);
+            };
+            for key in visited.iter() {
+                budget.charge(
+                    1,
+                    key.anchor
+                        .source
+                        .as_str()
+                        .len()
+                        .min(decl.key.anchor.source.as_str().len()),
+                    0,
+                )?;
+                if *key == &decl.key {
+                    return Ok(false);
+                }
+            }
+            budget.charge(1, 0, size_of::<&DefinitionKey>())?;
+            visited.push(&decl.key);
+            let result = element_valid(state, &decl.site, &decl.ty, visited, depth + 1, budget);
+            visited.pop();
+            budget.release(size_of::<&DefinitionKey>());
+            result
+        }
+        TypeExpr::OpaqueNominal(_) | TypeExpr::Pointer(_) => Ok(true),
+        TypeExpr::Record(record) => {
+            super::records::record_element_valid(state, record, visited, depth + 1, budget)
+        }
+        TypeExpr::Array {
+            dimensions,
+            element,
+            open,
+            ..
+        } => {
+            if *open {
+                return Ok(false);
+            }
+            if !dimensions.is_empty()
+                && !matches!(
+                    array_count(state, site, dimensions, depth, budget)?,
+                    Fact::Known(_)
+                )
+            {
+                return Ok(false);
+            }
+            element_valid(state, site, element, visited, depth + 1, budget)
+        }
+        TypeExpr::Range(_) | TypeExpr::Enum(_) => {
+            Ok(type_domain(state, site, ty, depth + 1, budget)?
+                .is_some_and(|(lower, upper)| upper >= lower))
+        }
+        TypeExpr::Unsupported(_) => Ok(false),
+    }
+}
+
+/// Char is AnsiChar before Delphi 2009, and a UTF-16 WideChar afterwards.
+/// Reuse verified target/compiler profiles. A supplementary scalar occupies two
+/// code units, not one Char. Legacy non-ASCII bytes need code-page evidence.
+fn character_ordinal(
+    state: &CompileTimeState,
+    text: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<(i64, OrdinalKind)>, IncompleteReason> {
+    budget.charge(1, text.len(), 0)?;
+    if !matches!(
+        state.context.layout.platform,
+        Some(LayoutPlatform::Win32 | LayoutPlatform::Win64)
+    ) {
+        return Ok(None);
+    }
+    let Some(storage) = builtin_layout(
+        BuiltinType::Char,
+        &state.context,
+        &state.context.layout.defaults,
+    )
+    .known() else {
+        return Ok(None);
+    };
+    Ok(match storage.size {
+        1 => match text.as_bytes() {
+            [value] if value.is_ascii() => Some((
+                i64::from(*value),
+                OrdinalKind::Character(BuiltinType::AnsiChar),
+            )),
+            _ => None,
+        },
+        2 => {
+            let mut units = text.encode_utf16();
+            match (units.next(), units.next()) {
+                (Some(value), None) => Some((
+                    i64::from(value),
+                    OrdinalKind::Character(BuiltinType::WideChar),
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+pub(super) fn ordinal_layout(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    settings: &LayoutSettings,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Fact<StorageLayout>, IncompleteReason> {
+    let Some((lower, upper)) = type_domain(state, site, ty, depth + 1, budget)? else {
+        return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+    };
+    if upper < lower {
+        return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+    }
+    let enum_based = match ty {
+        TypeExpr::Enum(_) => true,
+        TypeExpr::Range(IndexExpr::Bounds { lower, .. }) => {
+            let value = ordinal_expression(state, site, lower, depth + 1, budget)?;
+            let enum_based = value
+                .as_ref()
+                .is_some_and(|(_, kind)| matches!(kind, OrdinalKind::Enum(_)));
+            if let Some((_, kind)) = value {
+                kind.release(budget);
+            }
+            enum_based
+        }
+        _ => false,
+    };
+    let builtin = if enum_based {
+        let Some(minimum @ (1 | 2 | 4)) = settings.minimum_enum_size else {
+            return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+        };
+        if lower < 0 || upper > i64::from(i32::MAX) {
+            return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+        }
+        match (minimum, upper) {
+            (1, 0..=255) => BuiltinType::Byte,
+            (1 | 2, 0..=65535) => BuiltinType::Word,
+            _ => BuiltinType::Integer,
+        }
+    } else if lower >= 0 && upper <= 255 {
+        BuiltinType::Byte
+    } else if lower >= -128 && upper <= 127 {
+        BuiltinType::ShortInt
+    } else if lower >= 0 && upper <= 65535 {
+        BuiltinType::Word
+    } else if lower >= -32768 && upper <= 32767 {
+        BuiltinType::SmallInt
+    } else if lower >= i64::from(i32::MIN) && upper <= i64::from(i32::MAX) {
+        BuiltinType::Integer
+    } else {
+        return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+    };
+    Ok(builtin_layout(builtin, &state.context, settings))
+}
+
+fn index_domain(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    index: &IndexExpr,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    match index {
+        IndexExpr::Bounds { lower, upper } => {
+            let lower = ordinal_expression(state, site, lower, depth + 1, budget)?;
+            let result = (|| {
+                let upper = ordinal_expression(state, site, upper, depth + 1, budget)?;
+                let result = match (&lower, &upper) {
+                    (Some((lower, lower_kind)), Some((upper, upper_kind))) => lower_kind
+                        .compatible(upper_kind, budget)
+                        .map(|valid| valid.then_some((*lower, *upper))),
+                    _ => Ok(None),
+                };
+                if let Some((_, kind)) = upper {
+                    kind.release(budget);
+                }
+                result
+            })();
+            if let Some((_, kind)) = lower {
+                kind.release(budget);
+            }
+            result
+        }
+        IndexExpr::Domain(name) => {
+            if let Some(binding) = lookup(state, site, name, budget)? {
+                let Some(decl) = binding.type_declaration() else {
+                    return Ok(None);
+                };
+                return type_domain(state, &decl.type_site, &decl.ty, depth + 1, budget);
+            }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) if decl.is_type => {
+                        type_domain(provider, &decl.type_site, &decl.ty, depth + 1, budget)
+                    }
+                    Fact::Incomplete(reason) => Err(reason),
+                    _ => Ok(None),
+                };
+            }
+            budget.charge(1, name.len(), name.len())?;
+            let canonical = name.to_ascii_lowercase();
+            let builtin = intrinsic(&canonical);
+            budget.release(name.len());
+            let domain = match builtin {
+                Some(BuiltinType::Boolean) => (0, 1),
+                Some(BuiltinType::Byte | BuiltinType::AnsiChar) => (0, 255),
+                Some(BuiltinType::ShortInt) => (-128, 127),
+                Some(BuiltinType::Word | BuiltinType::WideChar) => (0, 65535),
+                Some(BuiltinType::SmallInt) => (-32768, 32767),
+                Some(BuiltinType::Integer | BuiltinType::LongInt) => {
+                    (i64::from(i32::MIN), i64::from(i32::MAX))
+                }
+                Some(BuiltinType::Cardinal | BuiltinType::LongWord) => (0, i64::from(u32::MAX)),
+                Some(BuiltinType::Int64) => (i64::MIN, i64::MAX),
+                Some(BuiltinType::Char | BuiltinType::NativeInt | BuiltinType::NativeUInt) => {
+                    let ty = builtin.unwrap();
+                    let Some(storage) =
+                        builtin_layout(ty, &state.context, &state.context.layout.defaults).known()
+                    else {
+                        return Ok(None);
+                    };
+                    match (ty, storage.size) {
+                        (BuiltinType::Char, 1) => (0, 255),
+                        (BuiltinType::Char, 2) => (0, 65535),
+                        (BuiltinType::NativeInt, 4) => (i64::from(i32::MIN), i64::from(i32::MAX)),
+                        (BuiltinType::NativeInt, 8) => (i64::MIN, i64::MAX),
+                        (BuiltinType::NativeUInt, 4) => (0, i64::from(u32::MAX)),
+                        _ => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(domain))
+        }
+    }
+}
+
+pub(super) fn type_domain(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            index_domain_name(state, site, name, depth + 1, budget)
+        }
+        TypeExpr::Range(index) => index_domain(state, site, index, depth + 1, budget),
+        TypeExpr::Enum(members) => {
+            enum_values(state, site, members, members.len(), depth + 1, budget)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn index_domain_name(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    // Resolve aliases at their definition sites, independently of storage width.
+    if let Some(binding) = lookup(state, site, name, budget)? {
+        let Some(decl) = binding.type_declaration() else {
+            return Ok(None);
+        };
+        return type_domain(state, &decl.type_site, &decl.ty, depth + 1, budget);
+    }
+    if let Some(imported) = super::bindings::imported_declaration(state, site, name, budget)? {
+        return match imported {
+            Fact::Known((provider, decl)) if decl.is_type => {
+                type_domain(provider, &decl.type_site, &decl.ty, depth + 1, budget)
+            }
+            Fact::Incomplete(reason) => Err(reason),
+            _ => Ok(None),
+        };
+    }
+    budget.charge(1, name.len(), size_of::<IndexExpr>() + name.len())?;
+    let index = IndexExpr::Domain(name.to_owned());
+    let result = index_domain(state, site, &index, depth + 1, budget);
+    budget.release(size_of::<IndexExpr>() + name.len());
+    result
+}
+
+fn ordinal_expression(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<(i64, OrdinalKind)>, IncompleteReason> {
+    let value = constant_expression(state, site, text, depth, budget)?;
+    Ok(match value {
+        Some(BoundValue::Constant(ConstantValue::Integer(n))) => Some((n, OrdinalKind::Integer)),
+        Some(BoundValue::EnumOrdinal(n, identity)) => Some((n, OrdinalKind::Enum(identity))),
+        Some(BoundValue::Constant(ConstantValue::Boolean(b))) => {
+            Some((i64::from(b), OrdinalKind::Boolean))
+        }
+        Some(BoundValue::Constant(ConstantValue::String(s))) => {
+            let result = character_ordinal(state, &s, budget);
+            budget.release(s.len());
+            result?
+        }
+        _ => None,
+    })
+}
+
+/// Shared typed ordinal admission for record labels. Resolve nominal enum
+/// identity through definition-site aliases; never compare enum values alone.
+fn selector_kind(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    owner: Option<&DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<OrdinalKind>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            if let Some(binding) = lookup(state, site, name, budget)? {
+                let Some(decl) = binding.type_declaration() else {
+                    return Ok(None);
+                };
+                return selector_kind(
+                    state,
+                    &decl.type_site,
+                    &decl.ty,
+                    Some(&decl.key),
+                    depth + 1,
+                    budget,
+                );
+            }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) if decl.is_type => selector_kind(
+                        provider,
+                        &decl.type_site,
+                        &decl.ty,
+                        Some(&decl.key),
+                        depth + 1,
+                        budget,
+                    ),
+                    Fact::Incomplete(reason) => Err(reason),
+                    _ => Ok(None),
+                };
+            }
+            Ok(match intrinsic(name) {
+                Some(BuiltinType::Boolean) => Some(OrdinalKind::Boolean),
+                Some(BuiltinType::AnsiChar) => Some(OrdinalKind::Character(BuiltinType::AnsiChar)),
+                Some(BuiltinType::WideChar) => Some(OrdinalKind::Character(BuiltinType::WideChar)),
+                Some(BuiltinType::Char) => builtin_layout(
+                    BuiltinType::Char,
+                    &state.context,
+                    &state.context.layout.defaults,
+                )
+                .known()
+                .and_then(|s| match s.size {
+                    1 => Some(OrdinalKind::Character(BuiltinType::AnsiChar)),
+                    2 => Some(OrdinalKind::Character(BuiltinType::WideChar)),
+                    _ => None,
+                }),
+                // The separate domain admission determines which integer intrinsics
+                // are actually supported; this does not invent their bounds.
+                Some(_) => Some(OrdinalKind::Integer),
+                None => None,
+            })
+        }
+        TypeExpr::Enum(_) => {
+            let Some(key) = owner else {
+                return Ok(None);
+            };
+            budget.charge(
+                1,
+                key.anchor.source.as_str().len(),
+                size_of::<DefinitionKey>() + key.anchor.source.as_str().len(),
+            )?;
+            Ok(Some(OrdinalKind::Enum(key.clone())))
+        }
+        TypeExpr::Range(IndexExpr::Bounds { lower, .. }) => {
+            Ok(ordinal_expression(state, site, lower, depth + 1, budget)?.map(|(_, kind)| kind))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn label_interval(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    label: &IndexExpr,
+    expected: &OrdinalKind,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    let (lower, upper) = match label {
+        IndexExpr::Domain(text) => (text.as_str(), None),
+        IndexExpr::Bounds { lower, upper } => (lower.as_str(), Some(upper.as_str())),
+    };
+    let Some((lower, kind)) = ordinal_expression(state, site, lower, depth + 1, budget)? else {
+        return Ok(None);
+    };
+    let result = (|| {
+        if !expected.compatible(&kind, budget)? {
+            return Ok(None);
+        }
+        let Some(text) = upper else {
+            return Ok(Some((lower, lower)));
+        };
+        let Some((upper, upper_kind)) = ordinal_expression(state, site, text, depth + 1, budget)?
+        else {
+            return Ok(None);
+        };
+        let result = expected
+            .compatible(&upper_kind, budget)
+            .map(|valid| (valid && lower <= upper).then_some((lower, upper)));
+        upper_kind.release(budget);
+        result
+    })();
+    kind.release(budget);
+    result
+}
+
+pub(super) fn validate_variant_labels<'a>(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    selector: &TypeExpr,
+    labels: impl Iterator<Item = &'a IndexExpr>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let Some((minimum, maximum)) = type_domain(state, site, selector, depth + 1, budget)? else {
+        return Ok(false);
+    };
+    if minimum > maximum {
+        return Ok(false);
+    }
+    let Some(kind) = selector_kind(state, site, selector, None, depth + 1, budget)? else {
+        return Ok(false);
+    };
+    let mut intervals: Vec<Domain> = Vec::new();
+    let result = (|| {
+        for label in labels {
+            budget.charge(1, 0, 0)?;
+            let Some((lower, upper)) =
+                label_interval(state, site, label, &kind, depth + 1, budget)?
+            else {
+                return Ok(false);
+            };
+            if lower < minimum || upper > maximum {
+                return Ok(false);
+            }
+            for (a, b) in &intervals {
+                budget.charge(1, 0, 0)?;
+                if lower <= *b && *a <= upper {
+                    return Ok(false);
+                }
+            }
+            // Retain intervals, never enumerate values of a possibly huge range.
+            budget.charge(1, 0, size_of::<Domain>())?;
+            intervals.push((lower, upper));
+        }
+        Ok(!intervals.is_empty())
+    })();
+    kind.release(budget);
+    budget.release(intervals.len() * size_of::<Domain>());
+    result
+}
+
+fn constant_expression(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    constant_expression_at(state, site, text, None, depth, budget)
+}
+
+fn constant_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    logical: Option<usize>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    captured_expression_at(state, site, text, logical, &[], &[], depth, budget)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Captured lexical site, source offset and prior enum members/values share the caller's depth and admission budget; keep these borrowed inputs without a new owning carrier"
+)]
+fn captured_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    logical: Option<usize>,
+    previous_members: &[EnumMember],
+    previous_values: &[i64],
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    let before = budget.manual_retained();
+    let fallback = if state.scalar_history.is_empty() {
+        crate::conditional::ConditionalEnvironment::context_snapshot(&state.context, budget)?
+    } else {
+        crate::conditional::ConditionalEnvironment::default()
+    };
+    let fallback_bytes = budget.manual_retained().saturating_sub(before);
+    let result = (|| {
+        let initial = expression_query_site(state, site, logical, text, 0, budget)?;
+        let environment = scalar_environment_at(state, &initial, &fallback, budget)?;
+        crate::conditional::evaluate_layout_expression(
+            text,
+            environment,
+            budget,
+            &mut |query, budget| {
+                use crate::conditional::ExpressionQuery;
+                let captured =
+                    expression_query_site(state, site, logical, text, query.range().start, budget)?;
+                let environment = scalar_environment_at(state, &captured, &fallback, budget)?;
+                let name = match &query {
+                    ExpressionQuery::Name(name, _)
+                    | ExpressionQuery::LexicalName(name, _)
+                    | ExpressionQuery::Declared(name, _) => Some(*name),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let head = name.split_once('.').map(|(head, _)| head);
+                    for (previous, value) in previous_members.iter().zip(previous_values) {
+                        budget.charge(1, previous.name.len().min(name.len()), 0)?;
+                        if same_name(&previous.name, name) {
+                            return Ok(Some(BoundValue::Constant(match query {
+                                ExpressionQuery::Declared(_, _) => ConstantValue::Boolean(true),
+                                _ => ConstantValue::Integer(*value),
+                            })));
+                        }
+                        if let Some(head) = head {
+                            budget.charge(1, previous.name.len().min(head.len()), 0)?;
+                            if same_name(&previous.name, head) {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+                if let ExpressionQuery::SizeOf { argument, range } = query {
+                    return sizeof_expression_at(
+                        state, &captured, argument, range, logical, budget,
+                    );
+                }
+                scalar_query(state, &captured, environment, query, depth + 1, budget)
+            },
+            false,
+            false,
+        )
+    })();
+    budget.release(fallback_bytes);
+    result
+}
+
+fn expression_query_site(
+    state: &CompileTimeState,
+    fallback: &BindingSite,
+    logical: Option<usize>,
+    text: &str,
+    offset: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<BindingSite, IncompleteReason> {
+    let Some(logical) = logical else {
+        return Ok(fallback.clone());
+    };
+    let tail = text
+        .get(offset..)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(1, tail.len(), 0)?;
+    let Some(skip) = tail.find(|ch: char| !ch.is_whitespace()) else {
+        return Ok(fallback.clone());
+    };
+    state.site_at_logical(
+        logical
+            .checked_add(offset)
+            .and_then(|n| n.checked_add(skip))
+            .ok_or(IncompleteReason::MalformedSource)?,
+        budget,
+    )
+}
+
+fn scalar_environment_at<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    fallback: &'a crate::conditional::ConditionalEnvironment,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<&'a crate::conditional::ConditionalEnvironment, IncompleteReason> {
+    budget.charge(state.scalar_history.len(), 0, 0)?;
+    Ok(state
+        .scalar_history
+        .iter()
+        .rev()
+        .find(|(sequence, _)| sequence.0 <= site.sequence.0)
+        .map_or(fallback, |(_, environment)| environment))
+}
+
+/// One bounded lexical/context/define policy for direct conditions and captured
+/// declaration expressions. The caller supplies the actual query's path/site.
+pub(super) fn scalar_query(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    environment: &crate::conditional::ConditionalEnvironment,
+    query: crate::conditional::ExpressionQuery<'_>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    use crate::conditional::ExpressionQuery;
+    match query {
+        ExpressionQuery::LexicalName(name, _) => {
+            lexical_constant_name(state, site, name, depth, budget)
+        }
+        ExpressionQuery::Name(name, _) => {
+            if lookup(state, site, name, budget)?.is_some() {
+                return constant_name(state, site, name, depth, budget);
+            }
+            if qualifier_blocked(state, site, name, budget)? {
+                return Ok(None);
+            }
+            if let Some(imported) =
+                super::bindings::imported_declaration(state, site, name, budget)?
+            {
+                return match imported {
+                    Fact::Known((provider, decl)) => {
+                        constant_name(provider, &provider.site(), &decl.name, depth + 1, budget)
+                    }
+                    Fact::Unknown(_) => Ok(None),
+                    Fact::Incomplete(reason) => Err(reason),
+                };
+            }
+            let value = constant_name(state, site, name, depth, budget)?;
+            if value.is_some() {
+                Ok(value)
+            } else {
+                crate::conditional::bound_define(environment, name, budget)
+            }
+        }
+        ExpressionQuery::Declared(name, _) => {
+            let mut known = lookup(state, site, name, budget)?.is_some();
+            if !known && qualifier_blocked(state, site, name, budget)? {
+                return Ok(None);
+            }
+            if !known {
+                for key in state.context.constants.keys() {
+                    budget.charge(1, key.len().min(name.len()), 0)?;
+                    if same_name(key, name) {
+                        known = true;
+                        break;
+                    }
+                }
+            }
+            budget.charge(1, name.len(), 0)?;
+            Ok(if known {
+                Some(BoundValue::Constant(ConstantValue::Boolean(true)))
+            } else if state.context.rtl_constants_known
+                && pascal_project::ConditionalContext::is_rtl_version_constant(name)
+            {
+                Some(BoundValue::Constant(ConstantValue::Boolean(false)))
+            } else {
+                None
+            })
+        }
+        ExpressionQuery::Defined(name, _) => {
+            crate::conditional::bound_defined(environment, name, budget)
+        }
+        ExpressionQuery::SizeOf { argument, .. } => {
+            super::session::sizeof_value(state, site, argument, budget)
+        }
+    }
+}
+
+pub(super) fn lexical_constant_name(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    if lookup(state, site, name, budget)?.is_some() {
+        return Ok(Some(
+            constant_name(state, site, name, depth + 1, budget)?.unwrap_or(BoundValue::Unproven),
+        ));
+    }
+    if qualifier_blocked(state, site, name, budget)?
+        || super::bindings::imported_declaration(state, site, name, budget)?.is_some()
+    {
+        // A declaration or an uncertain import blocks intrinsic execution. This
+        // is not an attempt to execute user functions or overloads.
+        return Ok(Some(BoundValue::Unproven));
+    }
+    // CompilerVersion is an explicit immutable context fact, but source lexical
+    // bindings must win. Keep its existing Version category, not an integer cast.
+    budget.charge(1, name.len(), 0)?;
+    Ok(if name.eq_ignore_ascii_case("CompilerVersion") {
+        state
+            .context
+            .compiler_version
+            .map(|version| BoundValue::Constant(ConstantValue::Version(version)))
+    } else {
+        None
+    })
+}
+
+fn sizeof_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    argument: &str,
+    range: std::ops::Range<usize>,
+    logical: Option<usize>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    let mut captured = site.clone();
+    if let Some(logical) = logical {
+        let start = logical
+            .checked_add(range.start)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let end = logical
+            .checked_add(range.end)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        // Map actual declaration fragments, including gaps around directives.
+        // Never invent one editable contiguous range or parser-wrapper offset.
+        let before = budget.manual_retained();
+        let mapped = state.provenance(start, end, budget);
+        let result = (|| {
+            let mapped = mapped?;
+            budget.charge(mapped.len(), 0, 0)?;
+            if mapped.iter().map(|a| a.range.len()).sum::<usize>() != argument.len() {
+                return Err(IncompleteReason::MalformedSource);
+            }
+            budget.charge(1, argument.len(), 0)?;
+            let skip = argument
+                .find(|ch: char| !ch.is_whitespace())
+                .ok_or(IncompleteReason::MalformedSource)?;
+            captured = state.site_at_logical(
+                start
+                    .checked_add(skip)
+                    .ok_or(IncompleteReason::MalformedSource)?,
+                budget,
+            )?;
+            Ok(())
+        })();
+        budget.release(budget.manual_retained().saturating_sub(before));
+        result?;
+    }
+    super::session::sizeof_value(state, &captured, argument, budget)
+}
+
+pub(super) fn constant_name(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    if let Some(binding) = lookup(state, site, name, budget)? {
+        match binding {
+            Binding::Declaration(decl) => {
+                if !decl.is_constant {
+                    return Ok(None);
+                }
+                let prior = BindingSite {
+                    scope: decl.site.scope,
+                    sequence: Sequence(
+                        decl.site
+                            .sequence
+                            .0
+                            .checked_sub(1)
+                            .ok_or(IncompleteReason::MalformedSource)?,
+                    ),
+                };
+                return decl
+                    .initializer
+                    .as_deref()
+                    .map(|s| {
+                        budget.charge(
+                            1,
+                            s.len()
+                                .checked_mul(3)
+                                .ok_or(IncompleteReason::MalformedSource)?,
+                            0,
+                        )?;
+                        let expression = initializer_expression(s);
+                        let offset = (expression.as_ptr() as usize)
+                            .checked_sub(s.as_ptr() as usize)
+                            .ok_or(IncompleteReason::MalformedSource)?;
+                        let logical = decl
+                            .initializer_logical
+                            .map(|n| {
+                                n.checked_add(offset)
+                                    .ok_or(IncompleteReason::MalformedSource)
+                            })
+                            .transpose()?;
+                        constant_expression_at(
+                            state,
+                            &prior,
+                            expression,
+                            logical,
+                            depth + 1,
+                            budget,
+                        )
+                    })
+                    .unwrap_or(Ok(None));
+            }
+            Binding::EnumMember { owner, index } => {
+                let TypeExpr::Enum(members) = &owner.ty else {
+                    return Err(IncompleteReason::MalformedSource);
+                };
+                // Preserve a member's nominal kind only after its complete
+                // owning declaration establishes a valid domain, not its prefix.
+                if enum_values(
+                    state,
+                    &owner.site,
+                    members,
+                    members.len(),
+                    depth + 1,
+                    budget,
+                )?
+                .is_none()
+                {
+                    return Ok(None);
+                }
+                let Some((_, value)) =
+                    enum_values(state, &owner.site, members, index + 1, depth + 1, budget)?
+                else {
+                    return Ok(None);
+                };
+                let bytes = size_of::<DefinitionKey>()
+                    .checked_add(owner.key.anchor.source.as_str().len())
+                    .ok_or(IncompleteReason::MalformedSource)?;
+                budget.charge(1, owner.key.anchor.source.as_str().len(), bytes)?;
+                return Ok(Some(BoundValue::EnumOrdinal(value, owner.key.clone())));
+            }
+        }
+    }
+    if qualifier_blocked(state, site, name, budget)? {
+        return Ok(None);
+    }
+    // Immutable explicit context facts are admitted only after lexical blockers.
+    if let Some(imported) = super::bindings::imported_declaration(state, site, name, budget)? {
+        return match imported {
+            Fact::Known((provider, decl)) => {
+                constant_name(provider, &provider.site(), &decl.name, depth + 1, budget)
+            }
+            Fact::Unknown(_) => Ok(None),
+            Fact::Incomplete(reason) => Err(reason),
+        };
+    }
+    let mut found = None;
+    for (key, value) in &state.context.constants {
+        budget.charge(1, key.len().min(name.len()), 0)?;
+        if same_name(key, name) {
+            if let Some(previous) = found {
+                let bytes = match value {
+                    ConstantValue::String(s) => s.len(),
+                    _ => 0,
+                };
+                budget.charge(1, bytes, 0)?;
+                if previous != value {
+                    return Ok(None);
+                }
+            }
+            found = Some(value);
+        }
+    }
+    let Some(value) = found else {
+        return Ok(None);
+    };
+    let bytes = match value {
+        ConstantValue::String(s) => s.len(),
+        _ => 0,
+    };
+    let byte_work = bytes
+        .checked_mul(MAX_EXPRESSION_TOKENS)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(1, byte_work, bytes)?;
+    Ok(Some(BoundValue::Constant(value.clone())))
+}
+
+pub(super) fn qualifier_blocked(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    budget.charge(1, name.len(), 0)?;
+    match name.split_once('.') {
+        Some((head, _)) => Ok(lookup(state, site, head, budget)?.is_some()),
+        None => Ok(false),
+    }
+}
+
+fn enum_values(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    members: &[EnumMember],
+    take: usize,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    let bytes = take
+        .checked_mul(size_of::<i64>())
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(take, 0, bytes)?;
+    let mut values: Vec<i64> = Vec::with_capacity(take);
+    let result = (|| {
+        for member in &members[..take] {
+            let n = if let Some(text) = &member.value {
+                let prior = BindingSite {
+                    scope: site.scope,
+                    sequence: Sequence(
+                        site.sequence
+                            .0
+                            .checked_sub(1)
+                            .ok_or(IncompleteReason::MalformedSource)?,
+                    ),
+                };
+                let value = captured_expression_at(
+                    state,
+                    &prior,
+                    text,
+                    member.value_logical,
+                    members,
+                    &values,
+                    depth + 1,
+                    budget,
+                )?;
+                match value {
+                    Some(BoundValue::Constant(ConstantValue::Integer(n))) => n,
+                    Some(BoundValue::EnumOrdinal(_, identity)) => {
+                        OrdinalKind::Enum(identity).release(budget);
+                        return Ok(false);
+                    }
+                    Some(BoundValue::Constant(ConstantValue::String(s))) => {
+                        budget.release(s.len());
+                        return Ok(false);
+                    }
+                    _ => return Ok(false),
+                }
+            } else {
+                let Some(n) = values.last().map_or(Some(0), |n| n.checked_add(1)) else {
+                    return Ok(false);
+                };
+                n
+            };
+            if n < 0
+                || n > i64::from(i32::MAX)
+                || values.last().is_some_and(|previous| n <= *previous)
+            {
+                return Ok(false);
+            }
+            values.push(n);
+        }
+        Ok(true)
+    })();
+    // These values are query scratch only; callers consume them immediately.
+    budget.release(bytes);
+    result.map(|valid| {
+        if valid {
+            values.first().copied().zip(values.last().copied())
+        } else {
+            None
+        }
+    })
+}

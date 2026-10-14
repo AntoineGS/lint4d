@@ -16,14 +16,14 @@ L10 try
     1: L12 calls Bar
     2: L13 calls Baz, Qux
     else: L15 raise Exception.Create('bad')
-  L17 if A > 0
-    L18 exit (runs finally L22)
+  L17 if A > 0 → L18 exit (runs finally L22)
   L19 tx start DB.StartTransaction
 L21 finally
   L22 free L
+note: calls are names only; callees not analysed
 
 W  lifecycle.pas:25-41 (17 lines)
-objects: L TStringList L30 NOT freed on all paths (escapes via L31 exception)
+objects: L TStringList L30 NOT freed on all paths (escapes via L31 exception) — verify L30-31
 L29 try
   L30 new TStringList -> L
   L31 calls Db.Open
@@ -32,11 +32,11 @@ L29 try
   L34 finally
     L35 free L
 L37 except
-  L38 on E: Exception
-    L39 calls Log
+  L38 on E: Exception → L39 calls Log
+note: calls are names only; callees not analysed
 
 F  lifecycle.pas:42-49 (8 lines)
-objects: Result TList L46 not freed in this routine (returned as Result); FItems TList L47 not freed in this routine (assigned to a non-local); L TList L48 not freed in this routine (no free found)
+objects: Result TList L46 not freed in this routine (returned as Result: caller owns); FItems TList L47 not freed in this routine (assigned to a non-local: owner frees); L TList L48 not freed in this routine (no free found: leak candidate) — verify L48-49
 L46 new TList -> Result
 L47 new TList -> FItems
 L48 new TList -> L

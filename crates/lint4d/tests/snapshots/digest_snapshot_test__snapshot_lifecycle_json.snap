@@ -20,9 +20,11 @@ expression: "render::render_json(&file.path, &routines)"
           "line": 9,
           "verdict": {
             "status": "freed_all_paths"
-          }
+          },
+          "verify_lines": null
         }
       ],
+      "frequent_calls": [],
       "body": [
         {
           "node": "fact",
@@ -202,9 +204,14 @@ expression: "render::render_json(&file.path, &routines)"
               }
             ],
             "more": false
-          }
+          },
+          "verify_lines": [
+            30,
+            31
+          ]
         }
       ],
+      "frequent_calls": [],
       "body": [
         {
           "node": "control",
@@ -326,7 +333,8 @@ expression: "render::render_json(&file.path, &routines)"
           "verdict": {
             "status": "not_freed_here",
             "why": "result"
-          }
+          },
+          "verify_lines": null
         },
         {
           "var": "FItems",
@@ -335,7 +343,8 @@ expression: "render::render_json(&file.path, &routines)"
           "verdict": {
             "status": "not_freed_here",
             "why": "non_local"
-          }
+          },
+          "verify_lines": null
         },
         {
           "var": "L",
@@ -344,9 +353,14 @@ expression: "render::render_json(&file.path, &routines)"
           "verdict": {
             "status": "not_freed_here",
             "why": "never_freed"
-          }
+          },
+          "verify_lines": [
+            48,
+            49
+          ]
         }
       ],
+      "frequent_calls": [],
       "body": [
         {
           "node": "fact",

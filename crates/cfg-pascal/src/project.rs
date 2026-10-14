@@ -479,12 +479,11 @@ impl ProjectSnapshot {
 
             if let Some(previous) =
                 original_bytes.insert(unit.source_id.clone(), Arc::clone(&unit.source))
+                && previous.as_ref() != unit.source()
             {
-                if previous.as_ref() != unit.source() {
-                    return Err(ProjectSnapshotError::ConflictingOriginalSource {
-                        source_id: unit.source_id.clone(),
-                    });
-                }
+                return Err(ProjectSnapshotError::ConflictingOriginalSource {
+                    source_id: unit.source_id.clone(),
+                });
             }
             for original in unit.original_sources() {
                 if let Some(previous) = original_bytes.get(original.source_id()) {
@@ -526,13 +525,13 @@ impl ProjectSnapshot {
                 });
             }
 
-            if let ImportTarget::Loaded(target) = import.target() {
-                if !unit_indices.contains_key(target) {
-                    return Err(ProjectSnapshotError::DanglingLoadedTarget {
-                        importer: unit_id.clone(),
-                        target: target.clone(),
-                    });
-                }
+            if let ImportTarget::Loaded(target) = import.target()
+                && !unit_indices.contains_key(target)
+            {
+                return Err(ProjectSnapshotError::DanglingLoadedTarget {
+                    importer: unit_id.clone(),
+                    target: target.clone(),
+                });
             }
 
             for qualifier in import.authorized_qualifiers() {

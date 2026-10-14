@@ -27,3 +27,4 @@ TODOS.md
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+__pycache__/

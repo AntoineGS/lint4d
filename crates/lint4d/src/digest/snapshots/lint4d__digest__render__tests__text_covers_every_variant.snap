@@ -1,0 +1,63 @@
+---
+source: crates/lint4d/src/digest/render.rs
+expression: "render_routine(&every_variant(), \"All.pas\", None)"
+---
+TAll.Every  All.pas:1-90 (90 lines)
+! parse errors at L3, L4
+! conditional code: 2 {$IF…} regions, all branches shown
+! hidden directive block at L12
+! anonymous methods not analysed
+objects: A TObj L5 freed on all paths; B TObj L6 NOT freed on all paths (escapes via L10 exception, L15 exit, L18 falls off end, L20 re-created, …) — verify L6-20; Result TObj L7 not freed in this routine (returned as Result: caller owns); FItems TObj L8 not freed in this routine (assigned to a non-local: owner frees); C TObj L9 not freed in this routine (no free found: leak candidate) — verify L9-90; D TObj L10 unknown (reassigned at L12) — verify L10-12; E TObj L11 unknown (creation not in CFG) — verify L11-90
+frequent calls: Log ×4
+L20 new TObj -> A
+L21 new TObj
+L22 free A
+L23 tx start Db.StartTransaction
+L24 tx commit Db.Commit
+L25 tx rollback Db.Rollback
+L26 tx in-transaction Db.InTransaction
+L27 raise Exception.Create('x')
+L28 re-raise
+L29 exit
+L30 exit (runs finally L60)
+L31 calls One, Two ×3
+L32 nested routine Inner
+L33 anonymous method
+L34 anonymous method calls Cb ×2
+L35 if A > 0 → L36 re-raise
+L37 else → L38 re-raise
+L39 case N
+  1: L41 re-raise
+  else: L43 re-raise
+L45 for I := 0 to 3
+  L46 re-raise
+  L47 re-raise
+L48 while X
+  L49 re-raise
+  L50 re-raise
+L51 repeat until Done
+  L52 re-raise
+  L53 re-raise
+L54 try
+  L55 re-raise
+L56 finally
+  L57 re-raise
+  L58 re-raise
+L59 except
+  L60 on E: EAbort
+    L61 re-raise
+    L62 re-raise
+  L63 else
+    L64 re-raise
+    L65 re-raise
+L71 with Obj
+  L72 re-raise
+  L73 re-raise
+L74 conditional
+  L75 re-raise
+  L76 re-raise
+L77 {$IF X}
+  L78 re-raise
+  L79 re-raise
+L80 asm
+note: calls are names only; callees not analysed

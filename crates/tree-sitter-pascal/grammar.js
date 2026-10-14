@@ -870,7 +870,11 @@ module.exports = grammar({
 			$.declString,
 			$.declProcRef,
 			$.declSubRange,
+			// Anonymous record types only; named declarations retain declClass.
+			alias($._anonymousRecord, $.declClass),
 		)),
+
+		_anonymousRecord: $ => prec(-1, seq(optional($.kPacked), $.kRecord, $._declClass)),
 
 		// Pascal subrange type alias: `TDigit = 0..9;` or
 		// `TMultiPayProcs = sppShift4 .. sppTenderRetail;`. Bounds are

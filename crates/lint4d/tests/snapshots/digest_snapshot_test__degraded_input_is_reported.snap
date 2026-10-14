@@ -8,7 +8,7 @@ L14-17   4  Broken
 
 Hidden  degraded.pas:4-13 (10 lines)
 ! hidden directive block at L9
-objects: L TStringList L8 unknown (hidden directive block at L9)
+objects: L TStringList L8 unknown (hidden directive block at L9) — verify L8-9
 L8 new TStringList -> L
 L12 free L
 

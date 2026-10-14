@@ -14218,3 +14218,92 @@ fn begin_configuration_preparation(
     )));
     barrier.wait_until_entered();
 }
+
+// Moved from protocol/cache_baseline.rs: feature-gated metrics endpoint tests
+// run in this opt-in target with the other test-support cases.
+#[cfg(feature = "test-support")]
+fn metrics_counters(server: &mut TestServer, id: &str) -> Value {
+    let id = RequestId::from(id.to_string());
+    server.send_request(id.clone(), "pascal/testAnalysisMetrics", json!({}));
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("metrics result");
+    assert_eq!(result["schema"], 1);
+    assert_eq!(result["countScope"], "process_window_endpoint");
+    assert!(result["orderlyShutdown"].is_null());
+    result["counters"].clone()
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn metrics_test_snapshot_is_monotonic_across_worker_requests() {
+    let (temp, main, provider, _main_source, provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root").to_path_buf();
+    let mut server = TestServer::launch_with_analysis_metrics(tempfile::tempdir().unwrap());
+    server.initialize(&root, Value::Null);
+
+    let before = metrics_counters(&mut server, "metrics-before");
+    let references_id = RequestId::from("metrics-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(&provider_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(references.error.is_none(), "{references:?}");
+    let after = metrics_counters(&mut server, "metrics-after");
+
+    // Independent process-wide atomics: this is a window, not an exclusive
+    // per-request count, and may include background work.
+    let before = before.as_object().expect("before counters");
+    for (name, value) in after.as_object().expect("after counters") {
+        assert!(
+            value.as_u64().unwrap() >= before[name].as_u64().unwrap(),
+            "{name} regressed"
+        );
+    }
+    assert!(
+        after["coreParserInvocations"].as_u64().unwrap()
+            > before["coreParserInvocations"].as_u64().unwrap(),
+        "references must have parsed at least one document: {before:?} -> {after:?}"
+    );
+    server.shutdown();
+    drop(temp);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn metrics_test_endpoint_is_rejected_after_shutdown() {
+    let (temp, main, _provider, _main_source, _provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root").to_path_buf();
+    let mut server = TestServer::launch_with_analysis_metrics(tempfile::tempdir().unwrap());
+    server.initialize(&root, Value::Null);
+
+    let shutdown_id = RequestId::from("metrics-shutdown".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server.response(&shutdown_id);
+    assert!(shutdown.error.is_none(), "{shutdown:?}");
+
+    let id = RequestId::from("metrics-after-shutdown".to_string());
+    server.send_request(id.clone(), "pascal/testAnalysisMetrics", json!({}));
+    let response = server.response(&id);
+    assert_eq!(
+        response.error.expect("post-shutdown rejection").code,
+        -32600,
+        "{:?}",
+        response.result
+    );
+
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for LSP server");
+    assert!(
+        status.success(),
+        "LSP server exited unsuccessfully: {status}"
+    );
+    drop(temp);
+}

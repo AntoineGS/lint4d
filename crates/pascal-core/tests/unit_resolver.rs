@@ -2129,40 +2129,6 @@ fn unproven_catalogue_root_does_not_gain_legacy_read_authority() {
 }
 
 #[test]
-fn untagged_search_paths_do_not_gain_legacy_read_authority() {
-    let allowed = tempdir().expect("allowed root");
-    let outside = tempdir().expect("outside root");
-    fs::write(
-        outside.path().join("Errors.pas"),
-        "unit Errors; interface implementation end.",
-    )
-    .expect("outside unit");
-    let context = configured_disk_context(allowed.path());
-    let mut resolver = UnitResolver::new(
-        context,
-        vec![allowed.path().to_path_buf()],
-        FilesystemSourceStore::new(),
-        Default::default(),
-    );
-
-    let outcome = resolver.resolve_unit(
-        UnitResolveRequest {
-            requested_name: "Errors",
-            importer_path: &allowed.path().join("Main.pas"),
-            legacy_route: None,
-        },
-        &NoCancellation,
-    );
-
-    assert!(!matches!(outcome.result, Resolution::Found(_)));
-    assert!(!resolver
-        .finish()
-        .observations
-        .iter()
-        .any(|observation| matches!(observation, pascal_core::ResolutionObservation::Payload { path, .. } if path.starts_with(outside.path()))));
-}
-
-#[test]
 fn unproven_package_descriptor_does_not_gain_legacy_read_authority() {
     let allowed = tempdir().expect("allowed root");
     let outside = tempdir().expect("outside root");

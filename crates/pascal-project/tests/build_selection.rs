@@ -1834,7 +1834,7 @@ fn cached_discovery_returns_the_construction_observations() {
     let root = temp.path();
     write_webquery_fixture(root);
     let overrides = OverrideSession::new(Some(root.join("config.toml")));
-    let _scope = ProjectDiscoveryCacheScope::new();
+    let scope = ProjectDiscoveryCacheScope::new();
 
     let built = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
     let cached = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
@@ -1848,6 +1848,7 @@ fn cached_discovery_returns_the_construction_observations() {
     );
     assert_eq!(built.observations, cached.observations);
     assert_eq!(built.context, cached.context);
+    assert_eq!(scope.stats().project_context_cache_hits, 1);
 }
 
 #[test]

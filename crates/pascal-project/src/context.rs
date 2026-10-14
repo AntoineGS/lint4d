@@ -566,8 +566,10 @@ impl ProjectContext {
         }
     }
 
-    /// Return the source-specific context without changing the compatibility
-    /// behavior of `effective_conditional_context` for older call sites.
+    /// Return the conditional context for the source at `path`. Library sources
+    /// get the library context; project-compiled sources get the effective
+    /// context, with absent defines treated as false when the define set is
+    /// closed.
     pub fn conditional_context_for(&self, path: &Path) -> ConditionalContext {
         if self.project_file.is_none() {
             return self.effective_conditional_context();

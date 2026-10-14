@@ -1,4 +1,5 @@
 use super::authorization::extension_is;
+use super::context::SessionSelections;
 use super::selection::push_bounded_candidate;
 use super::*;
 
@@ -89,29 +90,18 @@ pub struct ProjectDiscoveryCacheStats {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProjectOptionsCacheKey {
     pub(super) project_file: Option<PathBuf>,
-    pub(super) installation_selections: Vec<(PathBuf, String)>,
+    pub(super) selections: SessionSelections,
     pub(super) build_config: Option<String>,
     pub(super) platform: Option<String>,
     pub(super) source_paths: Vec<String>,
     pub(super) conditional_context: ConditionalContext,
 }
 
-impl From<&ProjectOptions> for ProjectOptionsCacheKey {
-    fn from(options: &ProjectOptions) -> Self {
-        let mut installation_selections = options
-            .installation_selections
-            .iter()
-            .map(|(path, selection)| (path.clone(), selection.clone()))
-            .collect::<Vec<_>>();
-        installation_selections.sort_by(|left, right| {
-            left.0
-                .to_string_lossy()
-                .cmp(&right.0.to_string_lossy())
-                .then_with(|| left.1.cmp(&right.1))
-        });
+impl ProjectOptionsCacheKey {
+    pub(super) fn new(options: &ProjectOptions, project_file: &Path) -> Self {
         Self {
             project_file: options.project_file.clone(),
-            installation_selections,
+            selections: options.session_selections_for(project_file),
             build_config: options.build_config.clone(),
             platform: options.platform.clone(),
             source_paths: options.source_paths.clone(),

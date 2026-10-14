@@ -5,7 +5,7 @@ use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::rtl_constants::RtlConstantSource;
 use pascal_project::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, OpenReason,
-    ProjectContext, ProjectOptions, ProjectPathEntry, SourceOrigin,
+    ProjectContext, ProjectDiscoveryCacheScope, ProjectOptions, ProjectPathEntry, SourceOrigin,
 };
 use std::fs;
 use std::path::Path;
@@ -1857,4 +1857,109 @@ fn entity_references_keep_the_spaces_around_them() {
 
     assert_eq!(candidates.configs, ["R & D"]);
     assert_eq!(candidates.default_config.as_deref(), Some("R & D"));
+}
+
+#[test]
+fn cached_discovery_honours_a_changed_session_build_choice() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let choose = |config: &str| ProjectOptions {
+        build_selections: [(
+            root.join("App.dproj"),
+            BuildChoice {
+                config: Some(config.into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+    let scope = ProjectDiscoveryCacheScope::new();
+
+    let debug = discover_webquery_at(root, &choose("Debug"), &overrides);
+    let release = discover_webquery_at(root, &choose("Release"), &overrides);
+
+    assert_eq!(debug.config_selection.selected.as_deref(), Some("Debug"));
+    assert_eq!(
+        release.config_selection.selected.as_deref(),
+        Some("Release")
+    );
+    assert_eq!(release.config_selection.mode, BuildSelectionMode::Session);
+    assert_eq!(scope.stats().project_context_builds, 2);
+}
+
+#[test]
+fn another_projects_selection_change_reuses_this_projects_cached_context() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let other = root.join("Other").join("Other.dproj");
+    let other_build = ProjectOptions {
+        build_selections: [(
+            other.clone(),
+            BuildChoice {
+                config: Some("Debug".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+    let other_installation = ProjectOptions {
+        installation_selections: [(other, "other-installation".to_string())]
+            .into_iter()
+            .collect(),
+        ..ProjectOptions::default()
+    };
+    let scope = ProjectDiscoveryCacheScope::new();
+
+    let first = discover_webquery_at(root, &ProjectOptions::default(), &overrides);
+    let after_build = discover_webquery_at(root, &other_build, &overrides);
+    let after_installation = discover_webquery_at(root, &other_installation, &overrides);
+
+    let stats = scope.stats();
+    assert_eq!(stats.project_context_builds, 1);
+    assert_eq!(stats.project_context_cache_hits, 2);
+    assert_eq!(first, after_build);
+    assert_eq!(first, after_installation);
+}
+
+#[test]
+fn session_build_choice_still_overrides_the_configured_choice_with_the_cache() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nconfig = 'Release'\n",
+    );
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let options = ProjectOptions {
+        build_selections: [(
+            root.join("App.dproj"),
+            BuildChoice {
+                config: Some("Debug".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+    let _scope = ProjectDiscoveryCacheScope::new();
+
+    let configured = discover_webquery_at(root, &ProjectOptions::default(), &overrides);
+    let session = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(
+        configured.config_selection.selected.as_deref(),
+        Some("Release")
+    );
+    assert_eq!(session.config_selection.selected.as_deref(), Some("Debug"));
+    assert_eq!(session.config_selection.mode, BuildSelectionMode::Session);
 }

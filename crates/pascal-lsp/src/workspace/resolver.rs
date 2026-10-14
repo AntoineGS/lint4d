@@ -882,6 +882,7 @@ pub(crate) fn source_record_for_loaded(
             include_payload,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -914,6 +915,7 @@ pub(crate) fn source_record_for_loaded(
             include_payload,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -956,6 +958,7 @@ fn payload_record(
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -985,6 +988,7 @@ fn payload_record(
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -1042,6 +1046,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         include_payload: false,
         missing_provider_candidate,
         document_link_missing_candidate: false,
+        document_link_case_variant: None,
         directory_observation,
         document_link_ancestor: false,
         missing_provider_scope: None,
@@ -1150,6 +1155,7 @@ pub(crate) fn report_records(
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -1244,6 +1250,16 @@ pub(crate) fn merge_source_record(
     existing.open |= incoming.open;
     existing.include_payload |= incoming.include_payload;
     existing.missing_provider_candidate |= incoming.missing_provider_candidate;
+    // Two witnesses for one spelling must agree on the accepted case variant.
+    if incoming.document_link_missing_candidate {
+        existing.document_link_case_variant = if existing.document_link_missing_candidate
+            && existing.document_link_case_variant != incoming.document_link_case_variant
+        {
+            None
+        } else {
+            incoming.document_link_case_variant.clone()
+        };
+    }
     existing.document_link_missing_candidate |= incoming.document_link_missing_candidate;
     existing.directory_observation |= incoming.directory_observation;
     // Any other observation of the same directory keeps the strict check.

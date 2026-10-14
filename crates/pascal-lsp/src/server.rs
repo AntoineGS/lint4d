@@ -2303,6 +2303,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.include_payload.hash(&mut hasher);
     record.missing_provider_candidate.hash(&mut hasher);
     record.document_link_missing_candidate.hash(&mut hasher);
+    record.document_link_case_variant.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
     record.document_link_ancestor.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
@@ -17822,6 +17823,7 @@ mod tests {
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -18026,6 +18028,7 @@ mod tests {
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -18140,6 +18143,10 @@ mod tests {
             source.document_link_missing_candidate
         );
         assert_eq!(
+            compacted.document_link_case_variant,
+            source.document_link_case_variant
+        );
+        assert_eq!(
             compacted.directory_observation,
             source.directory_observation
         );
@@ -18219,6 +18226,7 @@ mod tests {
             include_payload: true,
             missing_provider_candidate: true,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: true,
             document_link_ancestor: false,
             missing_provider_scope: Some(missing_provider_scope),

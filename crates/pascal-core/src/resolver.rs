@@ -8560,7 +8560,8 @@ fn filename_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {
     tiers
 }
 
-pub(crate) fn include_name(body: &str) -> Option<String> {
+/// The file name an include directive body requests, as the resolver looks it up.
+pub fn include_name(body: &str) -> Option<String> {
     let raw = body
         .trim_start()
         .split_once(|character: char| character.is_ascii_whitespace() || character == ':')
@@ -16242,7 +16243,9 @@ mod tests {
         }
         let mut complete = false;
         let mut cancelled = 0;
-        for stop in 0..500 {
+        // About 500 polls, plus two per ancestor of the temporary directory;
+        // the bound only stops a runaway loop.
+        for stop in 0..2_000 {
             let (dir, root, mut resolver) = physical_report_resolver();
             fs::write(
                 dir.path().join("Other.pas"),

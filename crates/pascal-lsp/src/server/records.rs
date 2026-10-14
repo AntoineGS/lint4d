@@ -57,6 +57,7 @@ fn compact_source_record(
         include_payload: record.include_payload,
         missing_provider_candidate: record.missing_provider_candidate,
         document_link_missing_candidate: record.document_link_missing_candidate,
+        document_link_case_variant: record.document_link_case_variant.clone(),
         directory_observation: record.directory_observation,
         document_link_ancestor: record.document_link_ancestor,
         missing_provider_scope: record.missing_provider_scope.clone(),

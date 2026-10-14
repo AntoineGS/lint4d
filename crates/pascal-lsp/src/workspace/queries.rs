@@ -1802,6 +1802,7 @@ pub(crate) fn document_links_from_input(
     if let Err(error) = workspace.record_document_link_expansion_sources(
         &expansion,
         &context,
+        &context_key,
         cancel,
         MAX_DOCUMENT_LINK_FRESHNESS_RECORDS,
         MAX_DOCUMENT_LINK_FRESHNESS_BYTES,
@@ -1931,6 +1932,7 @@ pub(crate) fn document_links_from_input(
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -2089,6 +2091,7 @@ fn record_document_link_ancestors(
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: true,
             document_link_ancestor: true,
             missing_provider_scope: None,
@@ -2508,6 +2511,7 @@ fn completion_observations_equal(
         && left.include_payload == right.include_payload
         && left.missing_provider_candidate == right.missing_provider_candidate
         && left.document_link_missing_candidate == right.document_link_missing_candidate
+        && left.document_link_case_variant == right.document_link_case_variant
         && left.missing_provider_scope == right.missing_provider_scope
         && left.auto_import_provider_observation == right.auto_import_provider_observation
         && left.auto_import_scopes == right.auto_import_scopes

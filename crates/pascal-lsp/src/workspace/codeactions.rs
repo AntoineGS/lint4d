@@ -6031,6 +6031,7 @@ fn lint_configuration_for_input(
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,

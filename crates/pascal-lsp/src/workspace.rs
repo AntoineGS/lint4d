@@ -8686,6 +8686,7 @@ impl Workspace {
         &mut self,
         expansion: &crate::include_expansion::ExpansionResult,
         context: &pascal_project::ProjectContext,
+        context_key: &ContextKey,
         cancel: &AtomicBool,
         max_records: usize,
         max_observation_bytes: usize,
@@ -8728,6 +8729,7 @@ impl Workspace {
                 self.record_include_analysis_observation(observation, context, true);
             }
         }
+        self.record_document_link_case_variants(expansion, context_key, cancel)?;
 
         let mut dependencies = expansion.dependencies.iter().collect::<Vec<_>>();
         dependencies.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
@@ -8802,6 +8804,86 @@ impl Workspace {
         Ok((record_count, observation_bytes))
     }
 
+    /// Attaches to each missing document-link candidate the case variant that
+    /// the includes which may have probed it selected, so delivery can tell
+    /// that selection apart from a variant that appeared afterwards. Anything
+    /// that cannot be attributed leaves no variant, which fails closed.
+    fn record_document_link_case_variants(
+        &mut self,
+        expansion: &crate::include_expansion::ExpansionResult,
+        context_key: &ContextKey,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let Some(session) = expansion.expanded.session.as_deref() else {
+            return Ok(());
+        };
+        // The session resolved includes with this context.
+        let Some(context) = self.contexts.get(context_key).map(|state| &state.context) else {
+            return Ok(());
+        };
+        let mut probing = HashMap::<PathBuf, Vec<Option<&Path>>>::new();
+        for include in &session.includes {
+            check_workspace_cancel(Some(cancel))?;
+            let Some(directive) = session
+                .directive_fragments
+                .iter()
+                .find(|mapping| mapping.fragments.first() == Some(&include.directive))
+                .map(|mapping| &mapping.directive)
+            else {
+                return Ok(());
+            };
+            // Unknown activity and unnamed directives never reach the resolver.
+            if directive.activity != pascal_core::conditional::Truth::True {
+                continue;
+            }
+            let Some(requested) = pascal_core::resolver::include_name(&directive.body) else {
+                continue;
+            };
+            let Some(including) = session
+                .occurrences
+                .iter()
+                .find(|occurrence| occurrence.id == include.owner)
+                .map(|occurrence| &occurrence.source.path)
+            else {
+                return Ok(());
+            };
+            let mut directories = context
+                .include_search_entries(including)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            directories.extend(
+                including
+                    .parent()
+                    .map(|parent| absolute_path(parent.into())),
+            );
+            let target = match &include.target {
+                pascal_core::resolver::Resolution::Found(source) => Some(source.path.as_path()),
+                _ => None,
+            };
+            for probe in rename::include_probe_paths(&requested, &directories, &context.overrides) {
+                probing.entry(probe).or_default().push(target);
+            }
+        }
+        let Some(records) = self.analysis_records.as_mut() else {
+            return Ok(());
+        };
+        for record in records.values_mut() {
+            check_workspace_cancel(Some(cancel))?;
+            if let Some(path) = record
+                .path
+                .as_deref()
+                .filter(|_| record.document_link_missing_candidate)
+            {
+                record.document_link_case_variant = rename::document_link_case_variant(
+                    path,
+                    probing.get(path).into_iter().flatten().copied(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn record_include_analysis_observation(
         &mut self,
         observation: &crate::include_expansion::IncludeObservation,
@@ -8846,6 +8928,7 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: !observation.present,
                 document_link_missing_candidate: document_link_candidate && !observation.present,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -9285,6 +9368,7 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -9328,6 +9412,7 @@ impl Workspace {
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -9514,6 +9599,7 @@ impl Workspace {
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -12554,6 +12640,7 @@ impl Workspace {
                         include_payload: false,
                         missing_provider_candidate: true,
                         document_link_missing_candidate: false,
+                        document_link_case_variant: None,
                         directory_observation: false,
                         document_link_ancestor: false,
                         missing_provider_scope: None,
@@ -12612,6 +12699,7 @@ impl Workspace {
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: Some(scope),
@@ -17784,6 +17872,7 @@ mod tests {
                     include_payload: false,
                     missing_provider_candidate: true,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -17876,6 +17965,7 @@ mod tests {
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -17965,6 +18055,7 @@ mod tests {
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -21345,6 +21436,7 @@ BDS = '/fake/37'
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -23894,6 +23986,7 @@ BDS = '/fake/37'
             include_payload: false,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,

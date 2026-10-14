@@ -328,6 +328,10 @@ pub(crate) struct SourceRecord {
     /// against the filesystem at delivery so a higher-priority include cannot
     /// appear unnoticed when directory metadata is restored.
     pub(crate) document_link_missing_candidate: bool,
+    /// The case variant of a missing document-link candidate that every
+    /// include probing this spelling selected. Only that variant may match
+    /// the candidate case-insensitively at delivery.
+    pub(crate) document_link_case_variant: Option<PathBuf>,
     /// The resolver observed the directory contents while resolving a source.
     /// A child create/delete/rename invalidates this record, but unrelated
     /// source records remain exact-path dependencies.
@@ -361,6 +365,12 @@ pub(crate) fn source_record_owned_bytes(record: &SourceRecord) -> usize {
                 .map_or(0, |path| path.as_os_str().len()),
         )
         .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::len))
+        .saturating_add(
+            record
+                .document_link_case_variant
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len()),
+        )
         .saturating_add(
             record
                 .candidate_observations
@@ -1855,7 +1865,10 @@ fn revalidate_path_record(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        if actual.is_some() || case_insensitive_document_link_candidate_exists(path, cancel)? {
+        if actual.is_some()
+            || case_insensitive_document_link_candidate(path, cancel)?
+                != record.document_link_case_variant
+        {
             return Err(format!(
                 "include candidate appeared while resolving {}; retry the request",
                 path.display()
@@ -1972,13 +1985,53 @@ fn revalidate_path_record(
     Ok(())
 }
 
+/// Every path an include request could have probed: the request resolved
+/// against each directory the include can search, mapped and normalized as
+/// the resolver does. Callers pass a superset of the searched directories.
+pub(super) fn include_probe_paths(
+    requested: &str,
+    directories: &[PathBuf],
+    overrides: &EffectiveOverrides,
+) -> Vec<PathBuf> {
+    directories
+        .iter()
+        .filter_map(|directory| overrides.resolve_path(requested, directory).ok())
+        .map(|resolved| absolute_path(resolved.path))
+        .collect()
+}
+
+/// The case variant of `missing` (an absent include probe) that every include
+/// which may have probed it selected, given those includes' targets. With no
+/// such include, or any disagreement, there is none and any variant is new.
+pub(super) fn document_link_case_variant<'a>(
+    missing: &Path,
+    probing_targets: impl IntoIterator<Item = Option<&'a Path>>,
+) -> Option<PathBuf> {
+    let name = missing.file_name()?;
+    let directory = missing.parent()?;
+    let mut selected = None;
+    for target in probing_targets {
+        let target = target?;
+        let variant = target != missing
+            && target.parent() == Some(directory)
+            && target
+                .file_name()
+                .is_some_and(|target| target.eq_ignore_ascii_case(name));
+        if !variant || selected.is_some_and(|selected| selected != target) {
+            return None;
+        }
+        selected = Some(target);
+    }
+    selected.map(Path::to_path_buf)
+}
+
 /// A missing include candidate is also a negative witness for the resolver's
 /// case-insensitive search, not just for its exact spelling. Directory stamps
 /// alone cannot prove this: a replacement entry can preserve size and mtime.
-fn case_insensitive_document_link_candidate_exists(
+fn case_insensitive_document_link_candidate(
     path: &Path,
     cancel: &AtomicBool,
-) -> Result<bool, String> {
+) -> Result<Option<PathBuf>, String> {
     let mut base = path.to_path_buf();
     while !base.exists() {
         if is_cancelled(cancel) {
@@ -2029,10 +2082,10 @@ fn case_insensitive_document_link_candidate_exists(
                 return Err("ambiguous case-insensitive include candidate".to_string());
             }
         }
-        let Some(next) = found else { return Ok(false) };
+        let Some(next) = found else { return Ok(None) };
         current = next;
     }
-    Ok(true)
+    Ok(Some(current))
 }
 
 fn effective_overlay_text_changed(
@@ -2225,6 +2278,7 @@ pub(super) fn path_record_at(
         include_payload,
         missing_provider_candidate: false,
         document_link_missing_candidate: false,
+        document_link_case_variant: None,
         directory_observation: false,
         document_link_ancestor: false,
         missing_provider_scope: None,
@@ -2330,6 +2384,7 @@ pub(crate) fn source_for_input_with_cancel(
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -2378,6 +2433,7 @@ pub(crate) fn source_for_input_with_owner(
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -2440,6 +2496,7 @@ pub(crate) fn source_for_input_with_owner(
         include_payload: false,
         missing_provider_candidate: false,
         document_link_missing_candidate: false,
+        document_link_case_variant: None,
         directory_observation: false,
         document_link_ancestor: false,
         missing_provider_scope: None,
@@ -6312,6 +6369,7 @@ fn build_snapshot_with_policy(
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -6403,6 +6461,7 @@ fn build_snapshot_with_policy(
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -6906,6 +6965,7 @@ fn build_snapshot_with_policy(
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -6950,6 +7010,7 @@ fn build_snapshot_with_policy(
                     include_payload: false,
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
+                    document_link_case_variant: None,
                     directory_observation: false,
                     document_link_ancestor: false,
                     missing_provider_scope: None,
@@ -7222,6 +7283,7 @@ fn retain_expansion_dependencies(
                 include_payload: false,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -7274,6 +7336,7 @@ fn retain_expansion_dependencies(
                 include_payload: true,
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
+                document_link_case_variant: None,
                 directory_observation: false,
                 document_link_ancestor: false,
                 missing_provider_scope: None,
@@ -12979,6 +13042,7 @@ mod tests {
             include_payload: true,
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
+            document_link_case_variant: None,
             directory_observation: false,
             document_link_ancestor: false,
             missing_provider_scope: None,
@@ -12992,5 +13056,118 @@ mod tests {
             error.contains("requester-scoped") || error.contains("authorization"),
             "unexpected missing authorization error: {error}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn document_link_missing_candidate_accepts_only_its_recorded_case_variant() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let requested = temp.path().join("Selected.inc");
+        let selected = temp.path().join("selected.inc");
+        fs::write(&selected, "const Selected = 1;\n").expect("selected include");
+        let mut missing = path_record_at(requested, None, None, None, None, None, None, false)
+            .expect("missing candidate record");
+        missing.missing_provider_candidate = true;
+        missing.document_link_missing_candidate = true;
+        let validate = |record: &super::SourceRecord| {
+            super::revalidate_records(
+                &WorkspaceOptions::default(),
+                &HashMap::new(),
+                &[],
+                std::slice::from_ref(record),
+                &AtomicBool::new(false),
+                true,
+            )
+        };
+
+        let error = validate(&missing).expect_err("an unrecorded case variant must stale the link");
+        assert!(error.contains("include candidate appeared"), "{error}");
+        missing.document_link_case_variant = Some(selected.clone());
+        validate(&missing).expect("the recorded case variant is not a newly appeared candidate");
+
+        fs::write(temp.path().join("SELECTED.INC"), "").expect("second case variant");
+        assert!(
+            validate(&missing).is_err(),
+            "a second case variant must stale the link"
+        );
+        fs::remove_file(temp.path().join("SELECTED.INC")).expect("remove second variant");
+        fs::remove_file(&selected).expect("remove recorded variant");
+        let error = validate(&missing).expect_err("a vanished case variant must stale the link");
+        assert!(error.contains("include candidate"), "{error}");
+    }
+
+    #[test]
+    fn document_link_case_variant_requires_every_probing_include_to_select_it() {
+        use std::path::Path;
+        let root = Path::new("/workspace");
+        let library = root.join("lib");
+        let missing = root.join("Selected.inc");
+        let variant = root.join("selected.inc");
+        let library_target = library.join("Selected.inc");
+        let directories = [root.to_path_buf(), library.clone()];
+        let overrides = EffectiveOverrides {
+            path_mappings: vec![pascal_project::delphi_overrides::PathMapping {
+                from: "C:/Alias/Selected.inc".to_string(),
+                to: variant.clone(),
+                config_file: root.join("overrides.toml"),
+            }],
+            ..EffectiveOverrides::default()
+        };
+        // (request, selected target) for each include, as the session records them.
+        let variant_for = |includes: &[(&str, Option<&Path>)]| {
+            let probing = includes.iter().filter_map(|(requested, target)| {
+                super::include_probe_paths(requested, &directories, &overrides)
+                    .contains(&missing)
+                    .then_some(*target)
+            });
+            super::document_link_case_variant(&missing, probing)
+        };
+
+        assert_eq!(
+            variant_for(&[("Selected.inc", Some(&variant))]),
+            Some(variant.clone())
+        );
+        // An include selecting the variant by its exact spelling, directly or
+        // through a path mapping, never probed the missing path and cannot
+        // vouch for it.
+        for vouching in ["selected.inc", "C:/Alias/Selected.inc"] {
+            assert_eq!(
+                variant_for(&[(vouching, Some(&variant))]),
+                None,
+                "{vouching}"
+            );
+            assert_eq!(
+                variant_for(&[
+                    ("Selected.inc", Some(&library_target)),
+                    (vouching, Some(&variant)),
+                ]),
+                None,
+                "{vouching}"
+            );
+        }
+        // A request normalized onto the missing path probed it too.
+        assert_eq!(
+            variant_for(&[
+                ("Selected.inc/unused/..", Some(&library_target)),
+                ("C:/Alias/Selected.inc", Some(&variant)),
+            ]),
+            None
+        );
+        assert_eq!(
+            variant_for(&[
+                ("Selected.inc", Some(&variant)),
+                ("Selected.inc", Some(&library_target)),
+            ]),
+            None
+        );
+        assert_eq!(
+            variant_for(&[("Selected.inc", Some(&variant)), ("Selected.inc", None)]),
+            None
+        );
+        assert_eq!(
+            variant_for(&[("Selected.inc", Some(&library_target))]),
+            None
+        );
+        assert_eq!(variant_for(&[("selected.inc", Some(&variant))]), None);
     }
 }

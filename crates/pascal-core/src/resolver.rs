@@ -8543,7 +8543,8 @@ fn filename_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {
     tiers
 }
 
-pub(crate) fn include_name(body: &str) -> Option<String> {
+/// The file name an include directive body requests, as the resolver looks it up.
+pub fn include_name(body: &str) -> Option<String> {
     let raw = body
         .trim_start()
         .split_once(|character: char| character.is_ascii_whitespace() || character == ':')

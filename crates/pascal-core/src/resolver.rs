@@ -16217,7 +16217,9 @@ mod tests {
         }
         let mut complete = false;
         let mut cancelled = 0;
-        for stop in 0..500 {
+        // About 500 polls, plus two per ancestor of the temporary directory;
+        // the bound only stops a runaway loop.
+        for stop in 0..2_000 {
             let (dir, root, mut resolver) = physical_report_resolver();
             fs::write(
                 dir.path().join("Other.pas"),

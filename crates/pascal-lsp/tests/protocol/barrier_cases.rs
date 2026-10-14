@@ -2508,11 +2508,21 @@ fn cancelling_partial_delivery_stops_future_chunks_and_returns_request_canceled(
     let first = server.notification("$/progress");
     assert_eq!(first["token"], "cancel-partial");
     assert!(first["value"].as_array().is_some());
+    // A chunk sent before the server reads the cancel is still delivered.
+    let second = server.notification("$/progress");
+    assert_eq!(second["token"], "cancel-partial");
+    server.pending.push_back(Message::Notification(Notification::new(
+        "$/progress".to_string(),
+        second,
+    )));
 
     server.send_notification("$/cancelRequest", json!({"id": id}));
     let response = server.response(&id);
     let error = response.error.expect("partial cancellation error");
     assert_eq!(error.code, -32800);
+    // Output is ordered, so chunks that arrived before the cancellation
+    // response were sent before the server read the cancel.
+    server.take_partial_items("cancel-partial");
     server.assert_no_progress();
     server.shutdown();
 }

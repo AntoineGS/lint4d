@@ -1,4 +1,4 @@
-use pascal_core::node_kind as K;
+use crate::trivia::TriviaIndex;
 use std::collections::HashMap;
 use std::ops::Range;
 use tree_sitter::Node;
@@ -33,24 +33,26 @@ pub struct CommentMap {
 
 impl CommentMap {
     /// Scan all comment nodes in the tree and attach them to nearby code nodes.
+    #[allow(dead_code)]
     pub fn build(root: Node, source: &[u8]) -> Self {
-        let mut comments = Vec::new();
-        collect_comments(root, source, &mut comments);
+        let trivia = TriviaIndex::build(root, source);
+        Self::build_from_trivia(&trivia)
+    }
 
-        // Build the leaf index once — O(n) — instead of per-comment.
-        let mut leaves = Vec::new();
-        collect_leaves(root, &mut leaves);
+    pub(crate) fn build_from_trivia(trivia: &TriviaIndex<'_>) -> Self {
+        let comments = &trivia.comments;
+        let leaves = &trivia.leaves;
 
         let mut leading: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
         let mut trailing: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
         let mut eof = Vec::new();
 
-        for (comment_node, text) in &comments {
+        for (comment_node, text) in comments {
             let comment_line = comment_node.start_position().row;
 
             // Check if there is a non-comment token on the same line before
             // the comment — that makes it a trailing comment.
-            if let Some(prev) = find_prev_leaf_in(&leaves, *comment_node)
+            if let Some(prev) = find_prev_leaf_in(leaves, *comment_node)
                 && prev.end_position().row == comment_line
             {
                 let gap = comment_node.start_byte().saturating_sub(prev.end_byte());
@@ -76,7 +78,7 @@ impl CommentMap {
                 gap: 0,
                 span: comment_node.byte_range(),
             };
-            match find_next_code_node_in(&leaves, *comment_node) {
+            match find_next_code_node_in(leaves, *comment_node) {
                 Some(next) => leading.entry(next.id()).or_default().push(comment),
                 None => eof.push(comment),
             }
@@ -105,22 +107,6 @@ impl CommentMap {
     }
 }
 
-/// Collect all `comment` (extra) nodes from the tree.
-fn collect_comments<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, String)>) {
-    if node.is_extra() && node.kind() == K::COMMENT {
-        // Use encoding-tolerant decoding so Latin-1 / Windows-1252 comments
-        // (common in legacy Delphi sources) are preserved instead of silently
-        // becoming empty strings.
-        let text = pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()])
-            .replace('\r', "");
-        out.push((node, text));
-        return;
-    }
-    for child in node.children(&mut node.walk()) {
-        collect_comments(child, source, out);
-    }
-}
-
 /// Find the previous leaf node (non-extra) before `target` using a pre-built index.
 fn find_prev_leaf_in<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<Node<'a>> {
     let target_start = target.start_byte();
@@ -134,20 +120,6 @@ fn find_next_code_node_in<'a>(leaves: &[Node<'a>], target: Node<'a>) -> Option<N
     let target_end = target.end_byte();
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_end);
     leaves.get(idx).copied()
-}
-
-/// Collect all leaf nodes (child_count == 0, not extra) in source order.
-fn collect_leaves<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
-    if node.is_extra() {
-        return;
-    }
-    if node.child_count() == 0 {
-        out.push(node);
-        return;
-    }
-    for child in node.children(&mut node.walk()) {
-        collect_leaves(child, out);
-    }
 }
 
 #[cfg(test)]

@@ -47,6 +47,9 @@ pub(crate) mod indent;
 pub(crate) mod line_break;
 pub(crate) mod renderer;
 pub(crate) mod spacing;
+pub(crate) mod trivia;
+#[cfg(test)]
+pub(crate) mod trivia_test_support;
 
 // ── Public modules ───────────────────────────────────────────────────
 pub mod config;

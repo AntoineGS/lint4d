@@ -1,5 +1,5 @@
+use crate::trivia::TriviaIndex;
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
-use pascal_core::node_kind as K;
 use std::collections::HashMap;
 use std::ops::Range;
 use tree_sitter::Node;
@@ -53,16 +53,18 @@ impl DirectiveMap {
     /// from the partial-control-flow rewrite pass into the map as virtual
     /// directives.
     pub fn build_with_patches(root: Node, source: &[u8], patches: &[DirectivePatch]) -> Self {
-        let mut directives = Vec::new();
-        collect_directives(root, source, &mut directives);
+        let trivia = TriviaIndex::build(root, source);
+        Self::build_from_trivia(&trivia, patches)
+    }
 
-        let mut leaves = Vec::new();
-        collect_leaves(root, &mut leaves);
+    pub(crate) fn build_from_trivia(trivia: &TriviaIndex<'_>, patches: &[DirectivePatch]) -> Self {
+        let directives = &trivia.directives;
+        let leaves = &trivia.leaves;
 
         let mut map = DirectiveMap::empty();
-        for (dir_node, text) in &directives {
+        for (dir_node, text) in directives {
             map.attach(
-                &leaves,
+                leaves,
                 dir_node.start_byte(),
                 dir_node.end_byte(),
                 dir_node.start_position().row,
@@ -73,7 +75,7 @@ impl DirectiveMap {
         // Fold virtual directives derived from patches.
         let virtuals = patches_to_virtuals(patches);
         for v in &virtuals {
-            map.attach(&leaves, v.start_byte, v.end_byte, v.row, v.text.clone());
+            map.attach(leaves, v.start_byte, v.end_byte, v.row, v.text.clone());
         }
 
         map.eof.sort_by_key(|d| d.span.start);
@@ -143,19 +145,6 @@ impl DirectiveMap {
     }
 }
 
-/// Collect all `ppDirective` extra nodes from the tree.
-fn collect_directives<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>, String)>) {
-    if node.is_extra() && node.kind() == K::PP_DIRECTIVE {
-        let text = pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()])
-            .replace('\r', "");
-        out.push((node, text));
-        return;
-    }
-    for child in node.children(&mut node.walk()) {
-        collect_directives(child, source, out);
-    }
-}
-
 fn find_prev_leaf_at<'a>(leaves: &[Node<'a>], target_start: usize) -> Option<Node<'a>> {
     let idx = leaves.partition_point(|leaf| leaf.start_byte() < target_start);
     if idx > 0 { Some(leaves[idx - 1]) } else { None }
@@ -195,18 +184,4 @@ fn patches_to_virtuals(patches: &[DirectivePatch]) -> Vec<VirtualDirective> {
         }
     }
     v
-}
-
-/// Collect all leaf nodes (child_count == 0, not extra) in source order.
-fn collect_leaves<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
-    if node.is_extra() {
-        return;
-    }
-    if node.child_count() == 0 {
-        out.push(node);
-        return;
-    }
-    for child in node.children(&mut node.walk()) {
-        collect_leaves(child, out);
-    }
 }

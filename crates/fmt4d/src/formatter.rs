@@ -4,6 +4,7 @@ use crate::config::FmtConfig;
 use crate::directive_map::DirectiveMap;
 use crate::doc_builder::DocBuilder;
 use crate::renderer::Renderer;
+use crate::trivia::TriviaIndex;
 use pascal_core::directives::parse_format_regions;
 use pascal_core::{FileInfo, SourceEncoding, detect_encoding, encode_as};
 use std::collections::HashSet;
@@ -49,8 +50,14 @@ pub fn format_source(
     }
 
     let resolved_eol = config.end_of_line.resolve(source);
-    let comment_map = CommentMap::build(tree.root_node(), source);
-    let directive_map = DirectiveMap::build_with_patches(tree.root_node(), source, &patches);
+    let root = tree.root_node();
+    let (comment_map, directive_map) = {
+        let trivia = TriviaIndex::build(root, source);
+        (
+            CommentMap::build_from_trivia(&trivia),
+            DirectiveMap::build_from_trivia(&trivia, &patches),
+        )
+    };
     let format_regions = parse_format_regions(source);
 
     let builder = DocBuilder::new(
@@ -61,7 +68,7 @@ pub fn format_source(
         format_regions,
         external_units,
     );
-    let doc = builder.build(tree.root_node());
+    let doc = builder.build(root);
     // Source length is a good upper bound for output length (the
     // formatter mostly adds/removes whitespace). Slight overshoot
     // avoids the final realloc. Review PERF-H4.
@@ -120,4 +127,28 @@ pub fn format_bytes(
         formatted
     };
     Ok(encode_as(&formatted, encoding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_source;
+    use crate::config::FmtConfig;
+    use crate::trivia_test_support::{leaf_index_build_count, reset_leaf_index_build_count};
+    use pascal_core::FileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn formatter_preserves_comment_directive_output_with_one_leaf_index() {
+        let source = b"unit T;\ninterface\n// implementation marker\nimplementation\nend.\n// trailing note\n{$ENDREGION}\n";
+        let expected = "unit T;\n\ninterface\n\n// implementation marker\nimplementation\n\nend.\n// trailing note\n{$ENDREGION}\n";
+        let info = FileInfo::new(PathBuf::from("test.pas"));
+        let config = FmtConfig::default();
+
+        reset_leaf_index_build_count();
+        let formatted = format_source(source, &info, &config, &HashSet::new()).unwrap();
+
+        assert_eq!(formatted, expected);
+        assert_eq!(leaf_index_build_count(), 1);
+    }
 }

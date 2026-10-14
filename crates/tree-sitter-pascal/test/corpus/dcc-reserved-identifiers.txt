@@ -1,0 +1,1033 @@
+===
+DCC reserved identifier rejection: AND
+===
+
+var AND: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kAnd))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: ARRAY
+===
+
+var ARRAY: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kArray))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: AS
+===
+
+var AS: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kAs))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: ASM
+===
+
+var ASM: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (ppIf
+      (MISSING "ppUsesBlock_token1"))
+    (kAsm)
+    (identifier)))
+
+===
+DCC reserved identifier rejection: BEGIN
+===
+
+var BEGIN: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (blockTr
+    (kBegin)
+    (ERROR)
+    (statement
+      (identifier))
+    (MISSING kEnd)))
+
+===
+DCC reserved identifier rejection: CASE
+===
+
+var CASE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kCase))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: CLASS
+===
+
+var CLASS: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kClass)
+    (identifier)))
+
+===
+DCC reserved identifier rejection: CONST
+===
+
+var CONST: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declConsts
+    (kConst))
+  (ERROR)
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: CONSTRUCTOR
+===
+
+var CONSTRUCTOR: Integer;
+
+---
+
+(ERROR
+  (declVars
+    (kVar))
+  (declProc
+    (kConstructor)
+    (ERROR)
+    name: (identifier)))
+
+===
+DCC reserved identifier rejection: DESTRUCTOR
+===
+
+var DESTRUCTOR: Integer;
+
+---
+
+(ERROR
+  (declVars
+    (kVar))
+  (declProc
+    (kDestructor)
+    (ERROR)
+    name: (identifier)))
+
+===
+DCC reserved identifier rejection: DISPINTERFACE
+===
+
+var DISPINTERFACE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kDispInterface))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: DIV
+===
+
+var DIV: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kDiv))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: DO
+===
+
+var DO: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kDo))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: DOWNTO
+===
+
+var DOWNTO: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kDownto))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: ELSE
+===
+
+var ELSE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kElse))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: END
+===
+
+var END: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kEnd))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: EXCEPT
+===
+
+var EXCEPT: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kExcept))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: EXPORTS
+===
+
+var EXPORTS: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declExports
+    (kExports)
+    (ERROR)
+    (declExport
+      (identifier))))
+
+===
+DCC reserved identifier rejection: FILE
+===
+
+var FILE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kFile))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: FINALIZATION
+===
+
+var FINALIZATION: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kFinalization))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: FINALLY
+===
+
+var FINALLY: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kFinally))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: FOR
+===
+
+var FOR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kFor))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: FUNCTION
+===
+
+var FUNCTION: Integer;
+
+---
+
+(ERROR
+  (declVars
+    (kVar))
+  (declProc
+    (kFunction)
+    (ERROR)
+    name: (identifier)))
+
+===
+DCC reserved identifier rejection: GOTO
+===
+
+var GOTO: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kGoto))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: IF
+===
+
+var IF: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kIf))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: IMPLEMENTATION
+===
+
+var IMPLEMENTATION: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kImplementation))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: IN
+===
+
+var IN: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kIn))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: INHERITED
+===
+
+var INHERITED: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kInherited))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: INITIALIZATION
+===
+
+var INITIALIZATION: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kInitialization))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: INLINE
+===
+
+var INLINE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kInline))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: INTERFACE
+===
+
+var INTERFACE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kInterface))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: IS
+===
+
+var IS: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kIs))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: LABEL
+===
+
+var LABEL: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declLabels
+    (kLabel)
+    (ERROR)
+    (declLabel
+      name: (identifier))))
+
+===
+DCC reserved identifier rejection: LIBRARY
+===
+
+var LIBRARY: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kLibrary))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: MOD
+===
+
+var MOD: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kMod))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: NIL
+===
+
+var NIL: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kNil))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: NOT
+===
+
+var NOT: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kNot))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: OBJECT
+===
+
+var OBJECT: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kObject))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: OF
+===
+
+var OF: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kOf))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: OR
+===
+
+var OR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kOr))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: PACKED
+===
+
+var PACKED: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kPacked))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: PROCEDURE
+===
+
+var PROCEDURE: Integer;
+
+---
+
+(ERROR
+  (declVars
+    (kVar))
+  (declProc
+    (kProcedure)
+    (ERROR)
+    name: (identifier)))
+
+===
+DCC reserved identifier rejection: PROGRAM
+===
+
+var PROGRAM: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kProgram))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: PROPERTY
+===
+
+var PROPERTY: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kProperty))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: RAISE
+===
+
+var RAISE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kRaise))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: RECORD
+===
+
+var RECORD: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kRecord))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: REPEAT
+===
+
+var REPEAT: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kRepeat))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: RESOURCESTRING
+===
+
+var RESOURCESTRING: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declConsts
+    (kResourcestring))
+  (ERROR)
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: SET
+===
+
+var SET: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kSet))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: SHL
+===
+
+var SHL: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kShl))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: SHR
+===
+
+var SHR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kShr))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: STRING
+===
+
+var STRING: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kString))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: THEN
+===
+
+var THEN: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kThen))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: THREADVAR
+===
+
+var THREADVAR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declVars
+    (kThreadvar))
+  (ERROR)
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: TO
+===
+
+var TO: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kTo))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: TRY
+===
+
+var TRY: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kTry))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: TYPE
+===
+
+var TYPE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declTypes
+    (kType))
+  (ERROR)
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: UNIT
+===
+
+var UNIT: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kUnit))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: UNTIL
+===
+
+var UNTIL: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kUntil))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: USES
+===
+
+var USES: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declUses
+    (kUses)
+    (ERROR)
+    (moduleName
+      (identifier))))
+
+===
+DCC reserved identifier rejection: VAR
+===
+
+var VAR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (declVars
+    (kVar))
+  (ERROR)
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: WHILE
+===
+
+var WHILE: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kWhile))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: WITH
+===
+
+var WITH: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kWith))
+  (ERROR
+    (identifier)))
+
+===
+DCC reserved identifier rejection: XOR
+===
+
+var XOR: Integer;
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ERROR
+    (kXor))
+  (ERROR
+    (identifier)))

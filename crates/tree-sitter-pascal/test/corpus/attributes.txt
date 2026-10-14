@@ -376,17 +376,22 @@ type
 
 ---
 
-(ERROR
-  (kType)
-  (identifier)
-  (kEq)
-  (kClass)
-  (declProc
-    (kProcedure)
-    (identifier))
-  (ppIf)
-  (statement
-    (identifier)
-    (ppDirective))
-  (statement
-    (identifier)))
+(root
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declProc
+          (kProcedure)
+          (identifier))
+        (ppBlock
+          (ppIf)
+          (statement
+            (identifier)
+            (ppDirective))
+          (ppEndIf
+            (MISSING "ppUsesBlock_token3")))
+        (kEnd)))))

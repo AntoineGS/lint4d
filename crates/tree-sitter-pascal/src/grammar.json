@@ -2843,11 +2843,47 @@
           "type": "FIELD",
           "name": "type",
           "content": {
-            "type": "SYMBOL",
-            "name": "typeref"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "typeref"
+              },
+              {
+                "type": "PREC",
+                "value": 1,
+                "content": {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "inlineVarStringTyperef"
+                  },
+                  "named": true,
+                  "value": "typeref"
+                }
+              }
+            ]
           }
         }
       ]
+    },
+    "inlineVarStringTyperef": {
+      "type": "PREC",
+      "value": 1,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "ALIAS",
+            "content": {
+              "type": "SYMBOL",
+              "name": "kString"
+            },
+            "named": true,
+            "value": "identifier"
+          }
+        ]
+      }
     },
     "constDef": {
       "type": "SEQ",
@@ -3656,8 +3692,22 @@
             "type": "FIELD",
             "name": "entity",
             "content": {
-              "type": "SYMBOL",
-              "name": "_ref"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_ref"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "kString"
+                  },
+                  "named": true,
+                  "value": "identifier"
+                }
+              ]
             }
           },
           {
@@ -5205,6 +5255,19 @@
           "name": "identifier"
         },
         {
+          "type": "PREC",
+          "value": -1,
+          "content": {
+            "type": "ALIAS",
+            "content": {
+              "type": "SYMBOL",
+              "name": "kString"
+            },
+            "named": true,
+            "value": "identifier"
+          }
+        },
+        {
           "type": "SYMBOL",
           "name": "typerefDot"
         },
@@ -5528,8 +5591,22 @@
                     "value": ":"
                   },
                   {
-                    "type": "SYMBOL",
-                    "name": "typeref"
+                    "type": "CHOICE",
+                    "members": [
+                      {
+                        "type": "SYMBOL",
+                        "name": "typeref"
+                      },
+                      {
+                        "type": "ALIAS",
+                        "content": {
+                          "type": "SYMBOL",
+                          "name": "_genericKeywordConstraintTyperef"
+                        },
+                        "named": true,
+                        "value": "typeref"
+                      }
+                    ]
                   }
                 ]
               },
@@ -5554,6 +5631,47 @@
               }
             ]
           }
+        }
+      ]
+    },
+    "_genericKeywordConstraintTyperef": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kClass"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kRecord"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kInterface"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kConstructor"
+          },
+          "named": true,
+          "value": "identifier"
         }
       ]
     },
@@ -7155,7 +7273,7 @@
                                 "type": "ALIAS",
                                 "content": {
                                   "type": "SYMBOL",
-                                  "name": "kInline"
+                                  "name": "kOperator"
                                 },
                                 "named": true,
                                 "value": "identifier"
@@ -7291,6 +7409,15 @@
                                 "content": {
                                   "type": "SYMBOL",
                                   "name": "kMessage"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kAlias"
                                 },
                                 "named": true,
                                 "value": "identifier"
@@ -7573,7 +7700,7 @@
                     "type": "ALIAS",
                     "content": {
                       "type": "SYMBOL",
-                      "name": "kInline"
+                      "name": "kOperator"
                     },
                     "named": true,
                     "value": "identifier"
@@ -7709,6 +7836,15 @@
                     "content": {
                       "type": "SYMBOL",
                       "name": "kMessage"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kAlias"
                     },
                     "named": true,
                     "value": "identifier"
@@ -8349,8 +8485,50 @@
           "name": "kOf"
         },
         {
-          "type": "SYMBOL",
-          "name": "type"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "type"
+            },
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "SYMBOL",
+                "name": "arrayOfConstType"
+              },
+              "named": true,
+              "value": "type"
+            }
+          ]
+        }
+      ]
+    },
+    "arrayOfConstType": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "arrayOfConstTyperef"
+          },
+          "named": true,
+          "value": "typeref"
+        }
+      ]
+    },
+    "arrayOfConstTyperef": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kConst"
+          },
+          "named": true,
+          "value": "identifier"
         }
       ]
     },
@@ -11554,239 +11732,9 @@
         ]
       }
     },
-    "kProgram": {
-      "type": "PATTERN",
-      "value": "program",
-      "flags": "i"
-    },
-    "kLibrary": {
-      "type": "PATTERN",
-      "value": "library",
-      "flags": "i"
-    },
-    "kUnit": {
-      "type": "PATTERN",
-      "value": "unit",
-      "flags": "i"
-    },
-    "kUses": {
-      "type": "PATTERN",
-      "value": "uses",
-      "flags": "i"
-    },
-    "kInterface": {
-      "type": "PATTERN",
-      "value": "interface",
-      "flags": "i"
-    },
-    "kDispInterface": {
-      "type": "PATTERN",
-      "value": "dispinterface",
-      "flags": "i"
-    },
-    "kImplementation": {
-      "type": "PATTERN",
-      "value": "implementation",
-      "flags": "i"
-    },
-    "kInitialization": {
-      "type": "PATTERN",
-      "value": "initialization",
-      "flags": "i"
-    },
-    "kFinalization": {
-      "type": "PATTERN",
-      "value": "finalization",
-      "flags": "i"
-    },
     "kEndDot": {
       "type": "STRING",
       "value": "."
-    },
-    "kBegin": {
-      "type": "PATTERN",
-      "value": "begin",
-      "flags": "i"
-    },
-    "kEnd": {
-      "type": "PATTERN",
-      "value": "end",
-      "flags": "i"
-    },
-    "kAsm": {
-      "type": "PATTERN",
-      "value": "asm",
-      "flags": "i"
-    },
-    "kVar": {
-      "type": "PATTERN",
-      "value": "var",
-      "flags": "i"
-    },
-    "kThreadvar": {
-      "type": "PATTERN",
-      "value": "threadvar",
-      "flags": "i"
-    },
-    "kConst": {
-      "type": "PATTERN",
-      "value": "const",
-      "flags": "i"
-    },
-    "kConstref": {
-      "type": "PATTERN",
-      "value": "constref",
-      "flags": "i"
-    },
-    "kResourcestring": {
-      "type": "PATTERN",
-      "value": "resourcestring",
-      "flags": "i"
-    },
-    "kOut": {
-      "type": "PATTERN",
-      "value": "out",
-      "flags": "i"
-    },
-    "kType": {
-      "type": "PATTERN",
-      "value": "type",
-      "flags": "i"
-    },
-    "kLabel": {
-      "type": "PATTERN",
-      "value": "label",
-      "flags": "i"
-    },
-    "kExports": {
-      "type": "PATTERN",
-      "value": "exports",
-      "flags": "i"
-    },
-    "kAbsolute": {
-      "type": "PATTERN",
-      "value": "absolute",
-      "flags": "i"
-    },
-    "kProperty": {
-      "type": "PATTERN",
-      "value": "property",
-      "flags": "i"
-    },
-    "kRead": {
-      "type": "PATTERN",
-      "value": "read",
-      "flags": "i"
-    },
-    "kWrite": {
-      "type": "PATTERN",
-      "value": "write",
-      "flags": "i"
-    },
-    "kImplements": {
-      "type": "PATTERN",
-      "value": "implements",
-      "flags": "i"
-    },
-    "kDefault": {
-      "type": "PATTERN",
-      "value": "default",
-      "flags": "i"
-    },
-    "kNodefault": {
-      "type": "PATTERN",
-      "value": "nodefault",
-      "flags": "i"
-    },
-    "kStored": {
-      "type": "PATTERN",
-      "value": "stored",
-      "flags": "i"
-    },
-    "kIndex": {
-      "type": "PATTERN",
-      "value": "index",
-      "flags": "i"
-    },
-    "kDispId": {
-      "type": "PATTERN",
-      "value": "dispid",
-      "flags": "i"
-    },
-    "kClass": {
-      "type": "PATTERN",
-      "value": "class",
-      "flags": "i"
-    },
-    "kObject": {
-      "type": "PATTERN",
-      "value": "object",
-      "flags": "i"
-    },
-    "kRecord": {
-      "type": "PATTERN",
-      "value": "record",
-      "flags": "i"
-    },
-    "kObjcclass": {
-      "type": "PATTERN",
-      "value": "objcclass",
-      "flags": "i"
-    },
-    "kObjccategory": {
-      "type": "PATTERN",
-      "value": "objccategory",
-      "flags": "i"
-    },
-    "kObjcprotocol": {
-      "type": "PATTERN",
-      "value": "objcprotocol",
-      "flags": "i"
-    },
-    "kArray": {
-      "type": "PATTERN",
-      "value": "array",
-      "flags": "i"
-    },
-    "kFile": {
-      "type": "PATTERN",
-      "value": "file",
-      "flags": "i"
-    },
-    "kString": {
-      "type": "PATTERN",
-      "value": "string",
-      "flags": "i"
-    },
-    "kSet": {
-      "type": "PATTERN",
-      "value": "set",
-      "flags": "i"
-    },
-    "kOf": {
-      "type": "PATTERN",
-      "value": "of",
-      "flags": "i"
-    },
-    "kHelper": {
-      "type": "PATTERN",
-      "value": "helper",
-      "flags": "i"
-    },
-    "kPacked": {
-      "type": "PATTERN",
-      "value": "packed",
-      "flags": "i"
-    },
-    "kGeneric": {
-      "type": "PATTERN",
-      "value": "generic",
-      "flags": "i"
-    },
-    "kSpecialize": {
-      "type": "PATTERN",
-      "value": "specialize",
-      "flags": "i"
     },
     "kDot": {
       "type": "STRING",
@@ -11860,466 +11808,6 @@
       "type": "STRING",
       "value": "/="
     },
-    "kOr": {
-      "type": "PATTERN",
-      "value": "or",
-      "flags": "i"
-    },
-    "kXor": {
-      "type": "PATTERN",
-      "value": "xor",
-      "flags": "i"
-    },
-    "kDiv": {
-      "type": "PATTERN",
-      "value": "div",
-      "flags": "i"
-    },
-    "kMod": {
-      "type": "PATTERN",
-      "value": "mod",
-      "flags": "i"
-    },
-    "kAnd": {
-      "type": "PATTERN",
-      "value": "and",
-      "flags": "i"
-    },
-    "kShl": {
-      "type": "PATTERN",
-      "value": "shl",
-      "flags": "i"
-    },
-    "kShr": {
-      "type": "PATTERN",
-      "value": "shr",
-      "flags": "i"
-    },
-    "kNot": {
-      "type": "PATTERN",
-      "value": "not",
-      "flags": "i"
-    },
-    "kIs": {
-      "type": "PATTERN",
-      "value": "is",
-      "flags": "i"
-    },
-    "kAs": {
-      "type": "PATTERN",
-      "value": "as",
-      "flags": "i"
-    },
-    "kIn": {
-      "type": "PATTERN",
-      "value": "in",
-      "flags": "i"
-    },
-    "kFor": {
-      "type": "PATTERN",
-      "value": "for",
-      "flags": "i"
-    },
-    "kTo": {
-      "type": "PATTERN",
-      "value": "to",
-      "flags": "i"
-    },
-    "kDownto": {
-      "type": "PATTERN",
-      "value": "downto",
-      "flags": "i"
-    },
-    "kIf": {
-      "type": "PATTERN",
-      "value": "if",
-      "flags": "i"
-    },
-    "kThen": {
-      "type": "PATTERN",
-      "value": "then",
-      "flags": "i"
-    },
-    "kElse": {
-      "type": "PATTERN",
-      "value": "else",
-      "flags": "i"
-    },
-    "kOtherwise": {
-      "type": "PATTERN",
-      "value": "otherwise",
-      "flags": "i"
-    },
-    "kDo": {
-      "type": "PATTERN",
-      "value": "do",
-      "flags": "i"
-    },
-    "kWhile": {
-      "type": "PATTERN",
-      "value": "while",
-      "flags": "i"
-    },
-    "kRepeat": {
-      "type": "PATTERN",
-      "value": "repeat",
-      "flags": "i"
-    },
-    "kUntil": {
-      "type": "PATTERN",
-      "value": "until",
-      "flags": "i"
-    },
-    "kTry": {
-      "type": "PATTERN",
-      "value": "try",
-      "flags": "i"
-    },
-    "kExcept": {
-      "type": "PATTERN",
-      "value": "except",
-      "flags": "i"
-    },
-    "kFinally": {
-      "type": "PATTERN",
-      "value": "finally",
-      "flags": "i"
-    },
-    "kRaise": {
-      "type": "PATTERN",
-      "value": "raise",
-      "flags": "i"
-    },
-    "kRaiseAt": {
-      "type": "PATTERN",
-      "value": "at",
-      "flags": "i"
-    },
-    "kOn": {
-      "type": "PATTERN",
-      "value": "on",
-      "flags": "i"
-    },
-    "kCase": {
-      "type": "PATTERN",
-      "value": "case",
-      "flags": "i"
-    },
-    "kWith": {
-      "type": "PATTERN",
-      "value": "with",
-      "flags": "i"
-    },
-    "kGoto": {
-      "type": "PATTERN",
-      "value": "goto",
-      "flags": "i"
-    },
-    "kFunction": {
-      "type": "PATTERN",
-      "value": "function",
-      "flags": "i"
-    },
-    "kProcedure": {
-      "type": "PATTERN",
-      "value": "procedure",
-      "flags": "i"
-    },
-    "kConstructor": {
-      "type": "PATTERN",
-      "value": "constructor",
-      "flags": "i"
-    },
-    "kDestructor": {
-      "type": "PATTERN",
-      "value": "destructor",
-      "flags": "i"
-    },
-    "kOperator": {
-      "type": "PATTERN",
-      "value": "operator",
-      "flags": "i"
-    },
-    "kReference": {
-      "type": "PATTERN",
-      "value": "reference",
-      "flags": "i"
-    },
-    "kPublished": {
-      "type": "PATTERN",
-      "value": "published",
-      "flags": "i"
-    },
-    "kPublic": {
-      "type": "PATTERN",
-      "value": "public",
-      "flags": "i"
-    },
-    "kProtected": {
-      "type": "PATTERN",
-      "value": "protected",
-      "flags": "i"
-    },
-    "kPrivate": {
-      "type": "PATTERN",
-      "value": "private",
-      "flags": "i"
-    },
-    "kStrict": {
-      "type": "PATTERN",
-      "value": "strict",
-      "flags": "i"
-    },
-    "kRequired": {
-      "type": "PATTERN",
-      "value": "required",
-      "flags": "i"
-    },
-    "kOptional": {
-      "type": "PATTERN",
-      "value": "optional",
-      "flags": "i"
-    },
-    "kForward": {
-      "type": "PATTERN",
-      "value": "forward",
-      "flags": "i"
-    },
-    "kStatic": {
-      "type": "PATTERN",
-      "value": "static",
-      "flags": "i"
-    },
-    "kVirtual": {
-      "type": "PATTERN",
-      "value": "virtual",
-      "flags": "i"
-    },
-    "kAbstract": {
-      "type": "PATTERN",
-      "value": "abstract",
-      "flags": "i"
-    },
-    "kSealed": {
-      "type": "PATTERN",
-      "value": "sealed",
-      "flags": "i"
-    },
-    "kDynamic": {
-      "type": "PATTERN",
-      "value": "dynamic",
-      "flags": "i"
-    },
-    "kOverride": {
-      "type": "PATTERN",
-      "value": "override",
-      "flags": "i"
-    },
-    "kOverload": {
-      "type": "PATTERN",
-      "value": "overload",
-      "flags": "i"
-    },
-    "kReintroduce": {
-      "type": "PATTERN",
-      "value": "reintroduce",
-      "flags": "i"
-    },
-    "kInherited": {
-      "type": "PATTERN",
-      "value": "inherited",
-      "flags": "i"
-    },
-    "kInline": {
-      "type": "PATTERN",
-      "value": "inline",
-      "flags": "i"
-    },
-    "kStdcall": {
-      "type": "PATTERN",
-      "value": "stdcall",
-      "flags": "i"
-    },
-    "kCdecl": {
-      "type": "PATTERN",
-      "value": "cdecl",
-      "flags": "i"
-    },
-    "kCppdecl": {
-      "type": "PATTERN",
-      "value": "cppdecl",
-      "flags": "i"
-    },
-    "kPascal": {
-      "type": "PATTERN",
-      "value": "pascal",
-      "flags": "i"
-    },
-    "kRegister": {
-      "type": "PATTERN",
-      "value": "register",
-      "flags": "i"
-    },
-    "kMwpascal": {
-      "type": "PATTERN",
-      "value": "mwpascal",
-      "flags": "i"
-    },
-    "kExternal": {
-      "type": "PATTERN",
-      "value": "external",
-      "flags": "i"
-    },
-    "kName": {
-      "type": "PATTERN",
-      "value": "name",
-      "flags": "i"
-    },
-    "kMessage": {
-      "type": "PATTERN",
-      "value": "message",
-      "flags": "i"
-    },
-    "kDeprecated": {
-      "type": "PATTERN",
-      "value": "deprecated",
-      "flags": "i"
-    },
-    "kExperimental": {
-      "type": "PATTERN",
-      "value": "experimental",
-      "flags": "i"
-    },
-    "kPlatform": {
-      "type": "PATTERN",
-      "value": "platform",
-      "flags": "i"
-    },
-    "kUnimplemented": {
-      "type": "PATTERN",
-      "value": "unimplemented",
-      "flags": "i"
-    },
-    "kCvar": {
-      "type": "PATTERN",
-      "value": "cvar",
-      "flags": "i"
-    },
-    "kExport": {
-      "type": "PATTERN",
-      "value": "export",
-      "flags": "i"
-    },
-    "kFar": {
-      "type": "PATTERN",
-      "value": "far",
-      "flags": "i"
-    },
-    "kNear": {
-      "type": "PATTERN",
-      "value": "near",
-      "flags": "i"
-    },
-    "kSafecall": {
-      "type": "PATTERN",
-      "value": "safecall",
-      "flags": "i"
-    },
-    "kAssembler": {
-      "type": "PATTERN",
-      "value": "assembler",
-      "flags": "i"
-    },
-    "kNostackframe": {
-      "type": "PATTERN",
-      "value": "nostackframe",
-      "flags": "i"
-    },
-    "kInterrupt": {
-      "type": "PATTERN",
-      "value": "interrupt",
-      "flags": "i"
-    },
-    "kNoreturn": {
-      "type": "PATTERN",
-      "value": "noreturn",
-      "flags": "i"
-    },
-    "kIocheck": {
-      "type": "PATTERN",
-      "value": "iocheck",
-      "flags": "i"
-    },
-    "kLocal": {
-      "type": "PATTERN",
-      "value": "local",
-      "flags": "i"
-    },
-    "kHardfloat": {
-      "type": "PATTERN",
-      "value": "hardfloat",
-      "flags": "i"
-    },
-    "kSoftfloat": {
-      "type": "PATTERN",
-      "value": "softfloat",
-      "flags": "i"
-    },
-    "kMs_abi_default": {
-      "type": "PATTERN",
-      "value": "ms_abi_default",
-      "flags": "i"
-    },
-    "kMs_abi_cdecl": {
-      "type": "PATTERN",
-      "value": "ms_abi_cdecl",
-      "flags": "i"
-    },
-    "kSaveregisters": {
-      "type": "PATTERN",
-      "value": "saveregisters",
-      "flags": "i"
-    },
-    "kSysv_abi_default": {
-      "type": "PATTERN",
-      "value": "sysv_abi_default",
-      "flags": "i"
-    },
-    "kSysv_abi_cdecl": {
-      "type": "PATTERN",
-      "value": "sysv_abi_cdecl",
-      "flags": "i"
-    },
-    "kVectorcall": {
-      "type": "PATTERN",
-      "value": "vectorcall",
-      "flags": "i"
-    },
-    "kVarargs": {
-      "type": "PATTERN",
-      "value": "varargs",
-      "flags": "i"
-    },
-    "kWinapi": {
-      "type": "PATTERN",
-      "value": "winapi",
-      "flags": "i"
-    },
-    "kAlias": {
-      "type": "PATTERN",
-      "value": "alias",
-      "flags": "i"
-    },
-    "kDelayed": {
-      "type": "PATTERN",
-      "value": "delayed",
-      "flags": "i"
-    },
-    "kNil": {
-      "type": "PATTERN",
-      "value": "nil",
-      "flags": "i"
-    },
     "kTrue": {
       "type": "PATTERN",
       "value": "true",
@@ -12329,10 +11817,6 @@
       "type": "PATTERN",
       "value": "false",
       "flags": "i"
-    },
-    "identifier": {
-      "type": "PATTERN",
-      "value": "[&]?[a-zA-Z_]+[0-9_a-zA-Z$]*"
     },
     "labelNumber": {
       "type": "TOKEN",
@@ -12572,6 +12056,570 @@
     {
       "type": "SYMBOL",
       "name": "_literalStringMultiline"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "identifier"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kConstref"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOut"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAbsolute"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRead"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWrite"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kImplements"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDefault"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNodefault"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kStored"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kIndex"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDispId"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kObjcclass"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kObjccategory"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kObjcprotocol"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kHelper"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kGeneric"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSpecialize"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOtherwise"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRaiseAt"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOn"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOperator"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kReference"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPublished"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPublic"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kProtected"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPrivate"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kStrict"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRequired"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOptional"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kForward"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kStatic"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kVirtual"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAbstract"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSealed"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDynamic"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOverride"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOverload"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kReintroduce"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kStdcall"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kCdecl"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kCppdecl"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPascal"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRegister"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kMwpascal"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kExternal"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kName"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kMessage"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDeprecated"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kExperimental"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPlatform"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kUnimplemented"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kCvar"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kExport"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFar"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNear"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSafecall"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAssembler"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNostackframe"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kInterrupt"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNoreturn"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kIocheck"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kLocal"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kHardfloat"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSoftfloat"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kMs_abi_default"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kMs_abi_cdecl"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSaveregisters"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSysv_abi_default"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSysv_abi_cdecl"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kVectorcall"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kVarargs"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWinapi"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAlias"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDelayed"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kTrue"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFalse"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAnd"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kArray"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAs"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kAsm"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kBegin"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kCase"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kClass"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kConst"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kConstructor"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDestructor"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDispInterface"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDiv"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDo"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kDownto"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kElse"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kEnd"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kExcept"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kExports"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFile"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFinalization"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFinally"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFor"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kFunction"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kGoto"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kIf"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kImplementation"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kIn"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kInherited"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kInitialization"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kInline"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kInterface"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kIs"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kLabel"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kLibrary"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kMod"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNil"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kNot"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kObject"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOf"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kOr"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPacked"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kProcedure"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kProgram"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kProperty"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRaise"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRecord"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRepeat"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kResourcestring"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kSet"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kShl"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kShr"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kString"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kThen"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kThreadvar"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kTo"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kTry"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kType"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kUnit"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kUntil"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kUses"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kVar"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWhile"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWith"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kXor"
     }
   ],
   "inline": [],

@@ -804,8 +804,13 @@ var
     (declVar (identifier) (type (typeref (identifier))))
     (declVar (identifier) (type (typeref (identifier))))
     (declVar (identifier) (type (typeref (identifier))))
-    (declVar (identifier) (identifier) (type (declString (kString))))
-    (declVar (identifier) (type (typeref (identifier)))
+    (declVar
+      (identifier)
+      (ERROR
+        (kInline)
+        (kString))
+      (identifier)
+      (type (typeref (identifier)))
       (procAttribute (kCvar))
       (procExternal (kExternal) (identifier)))))
 

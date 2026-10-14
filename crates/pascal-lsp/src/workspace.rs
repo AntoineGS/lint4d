@@ -8881,7 +8881,8 @@ impl Workspace {
                 pascal_core::resolver::Resolution::Found(source) => Some(source.path.as_path()),
                 _ => None,
             };
-            for probe in rename::include_probe_paths(&requested, &directories, &context.overrides) {
+            for probe in rename::include_probe_paths(&requested, &directories, context.overrides())
+            {
                 probing.entry(probe).or_default().push(target);
             }
         }

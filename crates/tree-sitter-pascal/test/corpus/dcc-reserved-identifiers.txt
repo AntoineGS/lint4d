@@ -1031,3 +1031,82 @@ var XOR: Integer;
     (kXor))
   (ERROR
     (identifier)))
+
+================================================================================
+String as a type argument in expressions
+================================================================================
+
+unit T;
+interface
+const
+  N = SizeOf(String);
+  L = Low(string);
+implementation
+procedure P;
+begin
+  X := TypeInfo(String);
+  Y := Default(String) + SizeOf(String) * 2;
+end;
+end.
+
+--------------------------------------------------------------------------------
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declConsts
+        (kConst)
+        (declConst
+          name: (identifier)
+          defaultValue: (defaultValue
+            (kEq)
+            (exprCall
+              entity: (identifier)
+              args: (exprArgs
+                (identifier)))))
+        (declConst
+          name: (identifier)
+          defaultValue: (defaultValue
+            (kEq)
+            (exprCall
+              entity: (identifier)
+              args: (exprArgs
+                (identifier)))))))
+    (implementation
+      (kImplementation)
+      (defProc
+        header: (declProc
+          (kProcedure)
+          name: (identifier))
+        body: (block
+          (kBegin)
+          (assignment
+            lhs: (identifier)
+            operator: (kAssign)
+            rhs: (exprCall
+              entity: (identifier)
+              args: (exprArgs
+                (identifier))))
+          (assignment
+            lhs: (identifier)
+            operator: (kAssign)
+            rhs: (exprBinary
+              lhs: (exprCall
+                entity: (identifier)
+                args: (exprArgs
+                  (identifier)))
+              operator: (kAdd)
+              rhs: (exprBinary
+                lhs: (exprCall
+                  entity: (identifier)
+                  args: (exprArgs
+                    (identifier)))
+                operator: (kMul)
+                rhs: (literalNumber))))
+          (kEnd))))
+    (kEnd)
+    (kEndDot)))

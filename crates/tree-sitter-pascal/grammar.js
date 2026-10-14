@@ -811,7 +811,12 @@ module.exports = grammar({
 		// Pascal legacy string formatting for WriteLn(foo:4:3) etc.
 		legacyFormat:    $ => repeat1(seq(':', $._expr)),
 
-		exprArgs:        $ => delimited1(seq($._expr, optional($.legacyFormat))),
+		// A bare `String` argument is a type reference: SizeOf(String),
+		// Default(String), TypeInfo(String).
+		exprArgs:        $ => delimited1(choice(
+			seq($._expr, optional($.legacyFormat)),
+			prec(-1, alias($.kString, $.identifier)),
+		)),
 		// A separate reduction distinguishes `is not T` from `is (not T)`.
 		_exprIsNot:      $ => prec(5, seq($.kIs, $.kNot)),
 

@@ -3768,23 +3768,41 @@
                   "type": "SEQ",
                   "members": [
                     {
-                      "type": "SEQ",
+                      "type": "CHOICE",
                       "members": [
                         {
-                          "type": "SYMBOL",
-                          "name": "_expr"
-                        },
-                        {
-                          "type": "CHOICE",
+                          "type": "SEQ",
                           "members": [
                             {
                               "type": "SYMBOL",
-                              "name": "legacyFormat"
+                              "name": "_expr"
                             },
                             {
-                              "type": "BLANK"
+                              "type": "CHOICE",
+                              "members": [
+                                {
+                                  "type": "SYMBOL",
+                                  "name": "legacyFormat"
+                                },
+                                {
+                                  "type": "BLANK"
+                                }
+                              ]
                             }
                           ]
+                        },
+                        {
+                          "type": "PREC",
+                          "value": -1,
+                          "content": {
+                            "type": "ALIAS",
+                            "content": {
+                              "type": "SYMBOL",
+                              "name": "kString"
+                            },
+                            "named": true,
+                            "value": "identifier"
+                          }
                         }
                       ]
                     },
@@ -3802,23 +3820,41 @@
           ]
         },
         {
-          "type": "SEQ",
+          "type": "CHOICE",
           "members": [
             {
-              "type": "SYMBOL",
-              "name": "_expr"
-            },
-            {
-              "type": "CHOICE",
+              "type": "SEQ",
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "legacyFormat"
+                  "name": "_expr"
                 },
                 {
-                  "type": "BLANK"
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "legacyFormat"
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
                 }
               ]
+            },
+            {
+              "type": "PREC",
+              "value": -1,
+              "content": {
+                "type": "ALIAS",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "kString"
+                },
+                "named": true,
+                "value": "identifier"
+              }
             }
           ]
         }

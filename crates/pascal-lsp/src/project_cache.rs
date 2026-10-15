@@ -523,10 +523,10 @@ mod cache_tests {
     use std::sync::atomic::AtomicBool;
 
     fn context(name: &str) -> ProjectContext {
-        ProjectContext {
+        ProjectContext::from_parts(pascal_project::ProjectContextParts {
             project_file: Some(PathBuf::from(name)),
-            ..ProjectContext::default()
-        }
+            ..pascal_project::ProjectContextParts::default()
+        })
     }
 
     fn import_value(probes: Vec<Probe>) -> ImportValue {
@@ -701,59 +701,6 @@ mod cache_tests {
         );
     }
 
-    /// `ctx` after a worker's import resolution recorded what it read.
-    fn with_recorded_observations(ctx: &ProjectContext) -> ProjectContext {
-        let read = PathBuf::from("Auth.Types.pas");
-        ProjectContext {
-            metadata_files: vec![read.clone()],
-            metadata_observations: vec![pascal_project::MetadataObservation::Stat { path: read }],
-            warnings: vec!["unit Auth.Types was read for its DCCReference".to_string()],
-            ..ctx.clone()
-        }
-    }
-
-    #[test]
-    fn entries_are_shared_by_contexts_that_differ_only_in_recorded_observations() {
-        let cache = ProjectCache::new(usize::MAX);
-        let warmer = context("A.dproj");
-        let requester = with_recorded_observations(&warmer);
-        fill_unit(&cache, "Base.pas", &warmer, 7, vec![]);
-        cache.put_interface_imports(
-            &uri("Base.pas"),
-            &warmer,
-            7,
-            interface_value(&[], true),
-            None,
-        );
-
-        assert!(matches!(
-            cache.unit(
-                &uri("Base.pas"),
-                &requester,
-                7,
-                &HashMap::new(),
-                &no_cancel()
-            ),
-            Lookup::Hit(_)
-        ));
-        assert!(
-            cache
-                .peek_unit(&uri("Base.pas"), &requester, 7, &HashMap::new())
-                .is_some()
-        );
-        assert!(
-            cache
-                .peek_interface_imports(&uri("Base.pas"), &requester, 7, &HashMap::new())
-                .is_some()
-        );
-        // The entry stored first stays a hit for its own context too.
-        assert!(
-            cache
-                .peek_unit(&uri("Base.pas"), &warmer, 7, &HashMap::new())
-                .is_some()
-        );
-    }
-
     #[test]
     fn entries_are_not_shared_by_contexts_that_differ_in_analysis_inputs() {
         let cache = ProjectCache::new(usize::MAX);
@@ -761,10 +708,12 @@ mod cache_tests {
         fill_unit(&cache, "Base.pas", &ctx, 7, vec![]);
         // Include paths are not part of the fingerprint, so only the
         // context comparison tells these apart.
-        let other = ProjectContext {
-            include_paths: vec![PathBuf::from("inc")],
-            ..with_recorded_observations(&ctx)
-        };
+        let other = ProjectContext::from_parts(pascal_project::ProjectContextParts {
+            include_path_entries: vec![pascal_project::ProjectPathEntry::configured(
+                PathBuf::from("inc"),
+            )],
+            ..ctx.clone().into_parts()
+        });
 
         assert!(
             cache
@@ -2717,7 +2666,7 @@ impl ProjectCache {
                 context: entry_context,
                 input_hash,
                 ..
-            })) if entry_context.same_analysis_inputs(context) && same_file(unit) => *input_hash,
+            })) if **entry_context == *context && same_file(unit) => *input_hash,
             _ => return None,
         };
         let unit = self.peek_unit(uri, context, content_hash, overlays)?;
@@ -2785,7 +2734,7 @@ impl ProjectCache {
                 context: old_context,
                 input_hash,
                 ..
-            })) if old_context.same_analysis_inputs(context)
+            })) if **old_context == *context
                 && *input_hash == content_hash
                 && old.bindings == value.bindings
                 && old.complete == value.complete
@@ -2824,8 +2773,7 @@ impl ProjectCache {
             let state = lock(&self.inner);
             match state.slots.get(&key) {
                 Some(Slot::Ready(entry))
-                    if entry.context.same_analysis_inputs(context)
-                        && entry.input_hash == input_hash =>
+                    if *entry.context == *context && entry.input_hash == input_hash =>
                 {
                     extract(&entry.value)?
                 }
@@ -3041,8 +2989,7 @@ impl ProjectCache {
                     };
                 }
                 Some(Slot::Ready(entry))
-                    if entry.context.same_analysis_inputs(context)
-                        && entry.input_hash == input_hash =>
+                    if *entry.context == *context && entry.input_hash == input_hash =>
                 {
                     let Some(value) = extract(&entry.value) else {
                         break;
@@ -3058,8 +3005,7 @@ impl ProjectCache {
                     state = lock(&self.inner);
                     let same_entry = match state.slots.get(&key) {
                         Some(Slot::Ready(entry))
-                            if entry.context.same_analysis_inputs(context)
-                                && entry.input_hash == input_hash =>
+                            if *entry.context == *context && entry.input_hash == input_hash =>
                         {
                             extract(&entry.value)
                                 .is_some_and(|current| Arc::ptr_eq(&current, &value))
@@ -3093,7 +3039,7 @@ impl ProjectCache {
                 Some(Slot::Ready(entry)) if entry.input_hash != input_hash => {
                     "input changed".to_string()
                 }
-                Some(Slot::Ready(entry)) if !entry.context.same_analysis_inputs(context) => {
+                Some(Slot::Ready(entry)) if *entry.context != *context => {
                     format!(
                         "context differs in {}",
                         context_differences(&entry.context, context)
@@ -3136,135 +3082,100 @@ impl ProjectCache {
 /// Names the fields in which two contexts with one fingerprint differ.
 fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String {
     let mut fields = Vec::new();
-    if left.discovery_complete != right.discovery_complete {
+    if left.discovery_complete() != right.discovery_complete() {
         fields.push("discovery_complete".to_string());
     }
-    if left.binding_metadata_complete != right.binding_metadata_complete {
+    if left.binding_metadata_complete() != right.binding_metadata_complete() {
         fields.push("binding_metadata_complete".to_string());
     }
-    if left.path_issues != right.path_issues {
+    if left.path_issues() != right.path_issues() {
         fields.push("path_issues".to_string());
     }
-    if left.project_file != right.project_file {
+    if left.project_file() != right.project_file() {
         fields.push("project_file".to_string());
     }
-    if left.installation_evidence != right.installation_evidence {
+    if left.installation_evidence() != right.installation_evidence() {
         fields.push("installation_evidence".to_string());
     }
-    if left.installation_selection != right.installation_selection {
+    if left.installation_selection() != right.installation_selection() {
         fields.push("installation_selection".to_string());
     }
-    if left.main_source != right.main_source {
+    if left.main_source() != right.main_source() {
         fields.push("main_source".to_string());
     }
-    if left.search_paths != right.search_paths {
+    if left.search_paths() != right.search_paths() {
         fields.push("search_paths".to_string());
     }
-    if left.search_path_entries != right.search_path_entries {
+    if left.search_path_entries() != right.search_path_entries() {
         fields.push("search_path_entries".to_string());
     }
-    if left.browsing_path_entries != right.browsing_path_entries {
+    if left.browsing_path_entries() != right.browsing_path_entries() {
         fields.push("browsing_path_entries".to_string());
     }
-    if left.debug_dcu_path_entries != right.debug_dcu_path_entries {
+    if left.debug_dcu_path_entries() != right.debug_dcu_path_entries() {
         fields.push("debug_dcu_path_entries".to_string());
     }
-    if left.main_source_entry != right.main_source_entry {
+    if left.main_source_entry() != right.main_source_entry() {
         fields.push("main_source_entry".to_string());
     }
-    if left.explicit_unit_entries != right.explicit_unit_entries {
+    if left.explicit_unit_entries() != right.explicit_unit_entries() {
         fields.push("explicit_unit_entries".to_string());
     }
-    if left.include_paths != right.include_paths {
+    if left.include_paths() != right.include_paths() {
         fields.push("include_paths".to_string());
     }
-    if left.include_path_entries != right.include_path_entries {
+    if left.include_path_entries() != right.include_path_entries() {
         fields.push("include_path_entries".to_string());
     }
-    if left.explicit_units != right.explicit_units {
+    if left.explicit_units() != right.explicit_units() {
         fields.push("explicit_units".to_string());
     }
-    if left.unit_namespaces != right.unit_namespaces {
+    if left.unit_namespaces() != right.unit_namespaces() {
         fields.push("unit_namespaces".to_string());
     }
-    if left.unit_aliases != right.unit_aliases {
+    if left.unit_aliases() != right.unit_aliases() {
         fields.push("unit_aliases".to_string());
     }
-    if left.defines != right.defines {
+    if left.defines() != right.defines() {
         fields.push("defines".to_string());
     }
-    if left.conditional_context != right.conditional_context {
+    if left.conditional_context() != right.conditional_context() {
         fields.push("conditional_context".to_string());
     }
-    if left.conditional_closure != right.conditional_closure {
+    if left.conditional_closure() != right.conditional_closure() {
         fields.push("conditional_closure".to_string());
     }
-    if left.library_conditional_context != right.library_conditional_context {
+    if left.library_conditional_context() != right.library_conditional_context() {
         fields.push("library_conditional_context".to_string());
     }
-    if left.project_source_roots != right.project_source_roots {
+    if left.project_source_roots() != right.project_source_roots() {
         fields.push("project_source_roots".to_string());
     }
-    if left.config != right.config {
+    if left.config() != right.config() {
         fields.push("config".to_string());
     }
-    if left.platform != right.platform {
+    if left.platform() != right.platform() {
         fields.push("platform".to_string());
     }
-    if left.config_selection != right.config_selection {
+    if left.config_selection() != right.config_selection() {
         fields.push("config_selection".to_string());
     }
-    if left.platform_selection != right.platform_selection {
+    if left.platform_selection() != right.platform_selection() {
         fields.push("platform_selection".to_string());
     }
-    if left.overrides != right.overrides {
+    if left.overrides() != right.overrides() {
         fields.push("overrides".to_string());
     }
-    if left.read_policy != right.read_policy {
+    if left.read_policy() != right.read_policy() {
         fields.push("read_policy".to_string());
     }
-    if left.packages != right.packages {
+    if left.packages() != right.packages() {
         fields.push("packages".to_string());
     }
-    if left.metadata_files != right.metadata_files {
-        let only_left = left
-            .metadata_files
-            .iter()
-            .filter(|path| !right.metadata_files.contains(path))
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>();
-        let only_right = right
-            .metadata_files
-            .iter()
-            .filter(|path| !left.metadata_files.contains(path))
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>();
-        fields.push(format!(
-            "metadata_files ({} vs {}; only stored: {only_left:?}; only looked up: {only_right:?})",
-            left.metadata_files.len(),
-            right.metadata_files.len()
-        ));
-    }
-    if left.metadata_observations != right.metadata_observations {
-        fields.push(format!(
-            "metadata_observations ({} vs {})",
-            left.metadata_observations.len(),
-            right.metadata_observations.len()
-        ));
-    }
-    if left.installation_config_files != right.installation_config_files {
+    if left.installation_config_files() != right.installation_config_files() {
         fields.push("installation_config_files".to_string());
     }
-    if left.system_pas_searches != right.system_pas_searches {
-        fields.push("system_pas_searches".to_string());
-    }
-    if left.metadata_observations != right.metadata_observations {
-        fields.push("metadata_observations".to_string());
-    }
-    if left.warnings != right.warnings {
-        fields.push("warnings".to_string());
-    }
-    if left.override_error != right.override_error {
+    if left.override_error() != right.override_error() {
         fields.push("override_error".to_string());
     }
     fields.join(", ")
@@ -3448,7 +3359,7 @@ fn intern_context(
     context: &ProjectContext,
 ) -> Arc<ProjectContext> {
     if let Some(shared) = state.contexts.get(&fingerprint)
-        && shared.same_analysis_inputs(context)
+        && **shared == *context
     {
         return shared.clone();
     }

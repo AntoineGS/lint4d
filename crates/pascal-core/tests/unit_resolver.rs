@@ -1,14 +1,47 @@
 use pascal_core::resolver::{
     CancellationToken, DirectoryListing, DirectoryRequest, FilesystemSourceStore, LoadedSource,
-    NoCancellation, Resolution, ResolverError, ResolverLimits, ResolverSessionCache, SourceId,
-    SourceKind, SourceRequest, SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest,
-    UnitResolver,
+    NoCancellation, Resolution, ResolutionObservation, ResolverError, ResolverLimits,
+    ResolverSessionCache, SourceId, SourceKind, SourceRequest, SourceRevision, SourceStore,
+    SourceStoreError, UnitResolveRequest, UnitResolver,
 };
+use pascal_project::ProjectContextParts;
 use pascal_project::{
-    CompilerVersion, ConditionalContext, ConditionalFact, ProjectContext, ProjectOptions,
-    ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy,
-    SourceOrigin, content_hash_bytes, delphi_overrides::OverrideSession,
+    CompilerVersion, ConditionalContext, ConditionalFact, MetadataObservation, ProjectContext,
+    ProjectObservations, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
+    ProjectPathProvenance, ReadPolicy, SourceOrigin, content_hash_bytes,
+    delphi_overrides::OverrideSession,
 };
+
+#[test]
+fn context_observations_seed_the_resolution_report() {
+    let observations = ProjectObservations {
+        metadata_observations: vec![MetadataObservation::Stat {
+            path: PathBuf::from("/workspace/App.dproj"),
+        }],
+        warnings: vec!["project warning".to_string()],
+        ..ProjectObservations::default()
+    };
+    let resolver = UnitResolver::new(
+        ProjectContext::default(),
+        vec![PathBuf::from("/workspace")],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    )
+    .with_context_observations(&observations);
+
+    let report = resolver.report();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning == "project warning")
+    );
+    assert!(report.observations.iter().any(|observation| matches!(
+        observation,
+        ResolutionObservation::Metadata(MetadataObservation::Stat { path })
+            if path == Path::new("/workspace/App.dproj")
+    )));
+}
 
 #[test]
 fn explicit_retention_selection_reaches_the_shared_session_without_a_default_clamp() {
@@ -26,7 +59,8 @@ fn explicit_retention_selection_reaches_the_shared_session_without_a_default_cla
     ] {
         let context =
             ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-                .unwrap();
+                .unwrap()
+                .context;
         let mut resolver = UnitResolver::new(
             context,
             vec![dir.path().into()],
@@ -69,8 +103,9 @@ fn large_plain_comment_import_projection_charges_scanner_steps_not_eight_times_s
     );
     std::fs::write(&path, &text).unwrap();
     std::fs::write(dir.path().join("Body.inc"), "const Value=1;").unwrap();
-    let context =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let context = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
     let mut resolver = UnitResolver::new(
         context,
         vec![dir.path().into()],
@@ -115,8 +150,10 @@ fn task11_fix1_resolver(
         conditional_context: conditional.clone(),
         ..ProjectOptions::default()
     };
-    let mut context = ProjectContext::discover(path, &[root.into()], &options).unwrap();
-    context.conditional_context = conditional;
+    let mut context = ProjectContext::discover(path, &[root.into()], &options)
+        .unwrap()
+        .context;
+    edit_context(&mut context, |p| p.conditional_context = conditional);
     UnitResolver::new(
         context,
         vec![root.into()],
@@ -412,10 +449,10 @@ fn fixround1_ordinary_header_search_work_is_cumulative_and_blocks_later_reads() 
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("Main.pas");
         std::fs::write(&path, format!("{}unit {name};", " ".repeat(3000))).unwrap();
-        context.search_paths.push(directory.clone());
-        context
-            .search_path_entries
-            .push(ProjectPathEntry::legacy(directory));
+        edit_context(&mut context, |p| {
+            p.search_path_entries
+                .push(ProjectPathEntry::legacy(directory))
+        });
         paths.push(path);
     }
     let mut resolver = UnitResolver::new(
@@ -589,10 +626,9 @@ fn firedac_unknown_header_blocks_lower_priority_source() {
     .unwrap();
     std::fs::write(lower.join("FireDAC.Phys.IB.pas"), "unit FireDAC.Phys.IB;").unwrap();
     let mut context = configured_disk_context(root);
-    context.search_paths.push(lower.clone());
-    context
-        .search_path_entries
-        .push(ProjectPathEntry::legacy(lower));
+    edit_context(&mut context, |p| {
+        p.search_path_entries.push(ProjectPathEntry::legacy(lower))
+    });
     let mut resolver = UnitResolver::new(
         context,
         vec![root.to_path_buf()],
@@ -682,17 +718,23 @@ fn firedac_prefix_include_changes_invalidate_selected_names() {
 #[test]
 fn firedac_candidate_acceptance_uses_source_local_library_context() {
     let mut context = fixture_context();
-    context.project_file = Some("/workspace/App.dproj".into());
-    context.project_source_roots = vec!["/workspace".into()];
-    context.search_paths.push("/sdk/lib".into());
-    context
-        .search_path_entries
-        .push(ProjectPathEntry::legacy("/sdk/lib".into()));
-    context
-        .conditional_context
-        .set_define("PRIVATE", ConditionalFact::True);
-    context.library_conditional_context =
-        support_context().with_absent_define(ConditionalFact::False);
+    edit_context(&mut context, |p| {
+        p.project_file = Some("/workspace/App.dproj".into())
+    });
+    edit_context(&mut context, |p| {
+        p.project_source_roots = vec!["/workspace".into()]
+    });
+    edit_context(&mut context, |p| {
+        p.search_path_entries
+            .push(ProjectPathEntry::legacy("/sdk/lib".into()))
+    });
+    edit_context(&mut context, |p| {
+        p.conditional_context
+            .set_define("PRIVATE", ConditionalFact::True)
+    });
+    edit_context(&mut context, |p| {
+        p.library_conditional_context = support_context().with_absent_define(ConditionalFact::False)
+    });
     let mut store = MemoryStore::default();
     store.add(
         "/sdk/lib/FireDAC.Phys.IB.pas",
@@ -777,27 +819,33 @@ fn local_delphi_rtl_unit_resolution() {
         .unwrap();
         eprintln!(
             "Delphi {version}: discovery_complete={}, search_paths={:?}, browsing_paths={:?}, path_issues={:?}, warning_count={}, first_warnings={:?}",
-            context.discovery_complete,
-            context.search_paths,
+            context.context.discovery_complete(),
+            context.context.search_paths(),
             context
-                .browsing_path_entries
+                .context
+                .browsing_path_entries()
                 .iter()
                 .map(|entry| &entry.path)
                 .collect::<Vec<_>>(),
-            context.path_issues,
-            context.warnings.len(),
-            context.warnings.iter().take(5).collect::<Vec<_>>(),
+            context.context.path_issues(),
+            context.observations.warnings.len(),
+            context
+                .observations
+                .warnings
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>(),
         );
-        if context.conditional_context.compiler_version
+        if context.context.conditional_context().compiler_version
             != Some(pascal_project::CompilerVersion::new(compiler, 0))
         {
             failures.push(format!(
                 "Delphi {version}: compiler version {:?}",
-                context.conditional_context.compiler_version
+                context.context.conditional_context().compiler_version
             ));
         }
         let mut resolver = UnitResolver::new(
-            context,
+            context.context,
             vec![root.to_path_buf()],
             FilesystemSourceStore::new(),
             ResolverLimits::default(),
@@ -898,20 +946,21 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
         &ProjectOptions::default(),
         &OverrideSession::new(None),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert!(matches!(
-        &context.installation_selection,
+        &context.installation_selection(),
         Some(pascal_project::InstallationSelection::Selected { id, .. }) if id == "37.0"
     ));
     assert!(
         context
-            .search_path_entries
+            .search_path_entries()
             .iter()
             .any(|entry| entry.path == sdk.join("lib"))
     );
     assert_eq!(
         context
-            .search_path_entries
+            .search_path_entries()
             .iter()
             .filter(|entry| entry.path == sdk.join("lib"))
             .count(),
@@ -920,7 +969,7 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
     );
     assert!(matches!(
         context
-            .search_path_entries
+            .search_path_entries()
             .iter()
             .find(|entry| entry.path == sdk.join("lib"))
             .map(|entry| &entry.provenance),
@@ -928,13 +977,13 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
     ));
     assert!(
         context
-            .browsing_path_entries
+            .browsing_path_entries()
             .iter()
             .any(|entry| entry.path == sdk.join("source"))
     );
     assert!(
         context
-            .debug_dcu_path_entries
+            .debug_dcu_path_entries()
             .iter()
             .any(|entry| entry.path == sdk.join("debug"))
     );
@@ -982,10 +1031,9 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
 fn missing_explicit_reference_reserves_name_without_blocking_other_units() {
     let root = PathBuf::from("/workspace");
     let good = root.join("Good.pas");
-    let mut context = ProjectContext {
+    let mut context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: false,
         binding_metadata_complete: true,
-        search_paths: vec![root.clone(), root.join("later")],
         search_path_entries: vec![
             ProjectPathEntry::legacy(root.clone()),
             ProjectPathEntry::legacy(root.join("later")),
@@ -999,15 +1047,14 @@ fn missing_explicit_reference_reserves_name_without_blocking_other_units() {
             unit_name: Some("missing".to_string()),
             provenance: ProjectPathProvenance::LegacyNative,
         }],
-        ..ProjectContext::default()
-    };
-    context
-        .explicit_units
-        .insert("good".to_string(), vec![good.clone()]);
-    context.explicit_unit_entries.insert(
-        "good".to_string(),
-        vec![ProjectPathEntry::legacy(good.clone())],
-    );
+        ..ProjectContextParts::default()
+    });
+    edit_context(&mut context, |p| {
+        p.explicit_unit_entries.insert(
+            "good".to_string(),
+            vec![ProjectPathEntry::legacy(good.clone())],
+        )
+    });
     let mut store = MemoryStore::default();
     store.add(
         "/workspace/later/Missing.pas",
@@ -1048,15 +1095,14 @@ fn absent_search_directory_does_not_hide_later_provider() {
     let root = PathBuf::from("/workspace");
     let missing = root.join("not-installed");
     let provider_dir = root.join("provider");
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
-        search_paths: vec![missing.clone(), provider_dir.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(missing),
             ProjectPathEntry::legacy(provider_dir),
         ],
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let mut store = MemoryStore::default();
     store.add(
         "/workspace/provider/Later.pas",
@@ -1079,15 +1125,14 @@ fn unreadable_higher_priority_directory_blocks_later_provider() {
     let root = PathBuf::from("/workspace");
     let unavailable = root.join("restricted");
     let provider_dir = root.join("provider");
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
-        search_paths: vec![unavailable.clone(), provider_dir.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(unavailable.clone()),
             ProjectPathEntry::legacy(provider_dir),
         ],
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let mut inner = MemoryStore::default();
     inner.add(
         "/workspace/provider/Later.pas",
@@ -1115,17 +1160,51 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
+trait ContextSlot: Default {
+    fn into_context(self) -> pascal_project::ProjectContext;
+    fn from_context(context: pascal_project::ProjectContext) -> Self;
+}
+
+impl ContextSlot for pascal_project::ProjectContext {
+    fn into_context(self) -> pascal_project::ProjectContext {
+        self
+    }
+
+    fn from_context(context: pascal_project::ProjectContext) -> Self {
+        context
+    }
+}
+
+impl ContextSlot for Arc<pascal_project::ProjectContext> {
+    fn into_context(self) -> pascal_project::ProjectContext {
+        Arc::unwrap_or_clone(self)
+    }
+
+    fn from_context(context: pascal_project::ProjectContext) -> Self {
+        Arc::new(context)
+    }
+}
+
+fn edit_context<C: ContextSlot, R>(
+    context: &mut C,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_context().into_parts();
+    edit(&mut parts);
+    *context = C::from_context(pascal_project::ProjectContext::from_parts(parts));
+}
+
 #[test]
 fn legacy_disk_source_uses_decoded_analysis_bytes_but_keeps_raw_revision_payload() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("Main.pas");
     let raw = b"unit Main;\n// caf\xe9\ninterface implementation end.\n";
     fs::write(&path, raw).unwrap();
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         read_policy: ReadPolicy::new(&[temp.path().to_path_buf()], &[], &[], &Default::default()),
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let mut resolver = UnitResolver::new(
         context,
         vec![temp.path().to_path_buf()],
@@ -1210,15 +1289,12 @@ fn ambiguity_at_current_tier_blocks_search_path_fallback() {
         return;
     }
     let mut context = fixture_context();
-    context.search_path_entries = vec![
-        ProjectPathEntry::legacy(PathBuf::from("/workspace/App")),
-        ProjectPathEntry::legacy(PathBuf::from("/workspace/Later")),
-    ];
-    context.search_paths = context
-        .search_path_entries
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect();
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![
+            ProjectPathEntry::legacy(PathBuf::from("/workspace/App")),
+            ProjectPathEntry::legacy(PathBuf::from("/workspace/Later")),
+        ]
+    });
     let loads = Arc::new(Mutex::new(Vec::new()));
     let mut store = MemoryStore::with_log(loads.clone());
     store.add(
@@ -1261,7 +1337,9 @@ fn ambiguity_at_current_tier_blocks_search_path_fallback() {
 #[test]
 fn namespace_candidates_are_tried_only_for_unqualified_names() {
     let mut context = fixture_context();
-    context.unit_namespaces = vec!["Alpha".to_string(), "Beta".to_string()];
+    edit_context(&mut context, |p| {
+        p.unit_namespaces = vec!["Alpha".to_string(), "Beta".to_string()]
+    });
     let loads = Arc::new(Mutex::new(Vec::new()));
     let mut store = MemoryStore::with_log(loads.clone());
     store.add(
@@ -1479,15 +1557,14 @@ fn package_lookup_prefers_dpk_descriptor_over_dproj() {
     fs::write(&unit, "unit Errors; interface implementation end.").expect("unit");
 
     let entry = ProjectPathEntry::legacy(root.to_path_buf());
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         packages: vec!["Core".to_string()],
-        search_paths: vec![root.to_path_buf()],
         search_path_entries: vec![entry],
         read_policy: ReadPolicy::default(),
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let mut resolver = UnitResolver::new(
         context,
         vec![root.to_path_buf()],
@@ -1524,14 +1601,14 @@ fn shared_session_cache_reuses_package_catalogues_between_resolvers() {
     fs::write(root.join("pkg/Another.pas"), "unit Another; interface end.")
         .expect("Another source");
 
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         packages: vec!["Core".to_string()],
         search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
         read_policy: ReadPolicy::default(),
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let directory_reads = Arc::new(AtomicUsize::new(0));
     let session_cache = ResolverSessionCache::default();
     let resolve = |name: &str, session_cache: ResolverSessionCache| {
@@ -1591,7 +1668,7 @@ fn shared_session_cache_does_not_cross_read_policies() {
     .expect("package descriptor");
     fs::write(root.join("pkg/Errors.pas"), "unit Errors; interface end.").expect("Errors source");
 
-    let restricted_context = ProjectContext {
+    let restricted_context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         packages: vec!["Core".to_string()],
@@ -1602,12 +1679,12 @@ fn shared_session_cache_does_not_cross_read_policies() {
             &["pkg/**".to_string()],
             &Default::default(),
         ),
-        ..ProjectContext::default()
-    };
-    let allowed_context = ProjectContext {
+        ..ProjectContextParts::default()
+    });
+    let allowed_context = ProjectContext::from_parts(ProjectContextParts {
         read_policy: ReadPolicy::default(),
-        ..restricted_context.clone()
-    };
+        ..restricted_context.clone().into_parts()
+    });
     let session_cache = ResolverSessionCache::default();
     let resolve = |context, session_cache| {
         let mut resolver = UnitResolver::new_with_session_cache(
@@ -1649,14 +1726,14 @@ fn shared_session_cache_does_not_bypass_stricter_catalogue_limits() {
     .expect("package descriptor");
     fs::write(root.join("pkg/Errors.pas"), "unit Errors; interface end.").expect("Errors source");
 
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         packages: vec!["Core".to_string()],
         search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
         read_policy: ReadPolicy::default(),
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
     let session_cache = ResolverSessionCache::default();
     let resolve = |limits, session_cache| {
         let mut resolver = UnitResolver::new_with_session_cache(
@@ -2026,7 +2103,7 @@ fn unproven_catalogue_root_does_not_gain_legacy_read_authority() {
     )
     .expect("outside unit");
     let mut context = configured_disk_context(allowed.path());
-    context.project_file = None;
+    edit_context(&mut context, |p| p.project_file = None);
     let mut resolver = UnitResolver::new(
         context,
         vec![outside.path().to_path_buf()],
@@ -2038,41 +2115,6 @@ fn unproven_catalogue_root_does_not_gain_legacy_read_authority() {
         UnitResolveRequest {
             requested_name: "Errors",
             importer_path: &outside.path().join("Main.pas"),
-            legacy_route: None,
-        },
-        &NoCancellation,
-    );
-
-    assert!(!matches!(outcome.result, Resolution::Found(_)));
-    assert!(!resolver
-        .finish()
-        .observations
-        .iter()
-        .any(|observation| matches!(observation, pascal_core::ResolutionObservation::Payload { path, .. } if path.starts_with(outside.path()))));
-}
-
-#[test]
-fn untagged_search_paths_do_not_gain_legacy_read_authority() {
-    let allowed = tempdir().expect("allowed root");
-    let outside = tempdir().expect("outside root");
-    fs::write(
-        outside.path().join("Errors.pas"),
-        "unit Errors; interface implementation end.",
-    )
-    .expect("outside unit");
-    let mut context = configured_disk_context(allowed.path());
-    context.search_paths = vec![outside.path().to_path_buf()];
-    let mut resolver = UnitResolver::new(
-        context,
-        vec![allowed.path().to_path_buf()],
-        FilesystemSourceStore::new(),
-        Default::default(),
-    );
-
-    let outcome = resolver.resolve_unit(
-        UnitResolveRequest {
-            requested_name: "Errors",
-            importer_path: &allowed.path().join("Main.pas"),
             legacy_route: None,
         },
         &NoCancellation,
@@ -2101,7 +2143,7 @@ fn unproven_package_descriptor_does_not_gain_legacy_read_authority() {
     )
     .expect("outside unit");
     let mut context = configured_disk_context(allowed.path());
-    context.packages = vec!["Core".to_string()];
+    edit_context(&mut context, |p| p.packages = vec!["Core".to_string()]);
     let mut resolver = UnitResolver::new(
         context,
         vec![outside.path().to_path_buf()],
@@ -2191,7 +2233,10 @@ fn unknown_conditional_without_include_makes_project_incomplete() {
 #[test]
 fn nested_include_inherits_parent_undef_without_resurrecting_project_defines() {
     let mut context = fixture_context();
-    context.defines = vec!["FEATURE".to_string()];
+    edit_context(&mut context, |p| {
+        p.conditional_context
+            .set_define("FEATURE", ConditionalFact::True)
+    });
     let mut store = MemoryStore::default();
     store.add(
         "/workspace/Main.pas",
@@ -2419,7 +2464,7 @@ fn unsafe_package_omission_is_incomplete_before_unique_selection() {
     )
     .expect("package descriptor");
     let mut context = configured_disk_context(root);
-    context.packages = vec!["Core".to_string()];
+    edit_context(&mut context, |p| p.packages = vec!["Core".to_string()]);
     let mut resolver = UnitResolver::new(
         context,
         vec![root.to_path_buf()],
@@ -2463,7 +2508,7 @@ fn unsafe_package_windows_omission_is_incomplete_before_unique_selection() {
     )
     .expect("package descriptor");
     let mut context = configured_disk_context(root);
-    context.packages = vec!["Core".to_string()];
+    edit_context(&mut context, |p| p.packages = vec!["Core".to_string()]);
     let mut resolver = UnitResolver::new(
         context,
         vec![root.to_path_buf()],
@@ -2495,7 +2540,7 @@ fn authorized_package_overlay_can_supply_a_disk_absent_unit() {
     )
     .expect("package descriptor");
     let mut context = configured_disk_context(root);
-    context.packages = vec!["Core".to_string()];
+    edit_context(&mut context, |p| p.packages = vec!["Core".to_string()]);
     let mut store = FilesystemSourceStore::new();
     store.insert_overlay(
         root.join("pkg/Errors.pas"),
@@ -2532,10 +2577,12 @@ fn descendant_overlay_does_not_enter_an_immediate_directory_tier() {
     )
     .expect("later unit");
     let mut context = configured_disk_context(root);
-    context.search_path_entries = vec![ProjectPathEntry {
-        path: root.join("later"),
-        provenance: ProjectPathProvenance::Configured,
-    }];
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![ProjectPathEntry {
+            path: root.join("later"),
+            provenance: ProjectPathProvenance::Configured,
+        }]
+    });
     let mut store = FilesystemSourceStore::new();
     store.insert_overlay(
         root.join("unsearched/Errors.pas"),
@@ -2576,10 +2623,12 @@ fn overlay_under_another_letter_case_replaces_the_disk_file() {
     )
     .expect("disk unit");
     let mut context = configured_disk_context(root);
-    context.search_path_entries = vec![ProjectPathEntry {
-        path: root.join("later"),
-        provenance: ProjectPathProvenance::Configured,
-    }];
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![ProjectPathEntry {
+            path: root.join("later"),
+            provenance: ProjectPathProvenance::Configured,
+        }]
+    });
     let mut store = FilesystemSourceStore::new();
     store.insert_overlay(
         PathBuf::from(
@@ -2652,10 +2701,13 @@ fn unsaved_overlay_has_one_identity_under_every_spelling() {
 #[test]
 fn qualifiers_name_the_selected_alias_and_declaration_only() {
     let mut context = fixture_context();
-    context
-        .unit_aliases
-        .insert("Compat".to_string(), "Vendor.Errors".to_string());
-    context.unit_namespaces = vec!["Alpha".to_string(), "Beta".to_string()];
+    edit_context(&mut context, |p| {
+        p.unit_aliases
+            .insert("Compat".to_string(), "Vendor.Errors".to_string())
+    });
+    edit_context(&mut context, |p| {
+        p.unit_namespaces = vec!["Alpha".to_string(), "Beta".to_string()]
+    });
     let mut store = MemoryStore::default();
     store.add(
         "/workspace/Main.pas",
@@ -2677,10 +2729,10 @@ fn qualifiers_name_the_selected_alias_and_declaration_only() {
 fn higher_precedence_match_does_not_scan_failing_lower_directory() {
     let mut context = fixture_context();
     let lower = PathBuf::from("/workspace/lower");
-    context
-        .search_path_entries
-        .push(ProjectPathEntry::legacy(lower.clone()));
-    context.search_paths.push(lower.clone());
+    edit_context(&mut context, |p| {
+        p.search_path_entries
+            .push(ProjectPathEntry::legacy(lower.clone()))
+    });
     let mut store = FailingDirectoryStore {
         inner: MemoryStore::default(),
         failing_directory: lower,
@@ -2719,7 +2771,7 @@ fn projectless_catalogue_skips_excluded_subtrees_after_local_match() {
     )
     .expect("local unit");
     let mut context = configured_disk_context(root);
-    context.project_file = None;
+    edit_context(&mut context, |p| p.project_file = None);
     let mut resolver = UnitResolver::new(
         context,
         vec![root.to_path_buf()],
@@ -2782,11 +2834,16 @@ fn exact_restricted_provenance_is_not_downgraded_by_directory_candidates() {
         provenance: ProjectPathProvenance::Configured,
     };
     let mut context = configured_disk_context(root);
-    context
-        .explicit_unit_entries
-        .insert("vendor.errors".to_string(), vec![restricted.clone()]);
-    context.unit_namespaces = vec!["Vendor".to_string()];
-    context.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())];
+    edit_context(&mut context, |p| {
+        p.explicit_unit_entries
+            .insert("vendor.errors".to_string(), vec![restricted.clone()])
+    });
+    edit_context(&mut context, |p| {
+        p.unit_namespaces = vec!["Vendor".to_string()]
+    });
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())]
+    });
     assert_eq!(context.path_entry_for(&link), Some(restricted));
     let route = pascal_core::LegacyRoute {
         source_path: root.join("Main.pas"),
@@ -2823,14 +2880,18 @@ fn case_adjusted_include_reapplies_exact_restricted_provenance() {
         .expect("target include");
     std::os::unix::fs::symlink(&target, &link).expect("restricted include symlink");
     let mut context = configured_disk_context(root);
-    context.explicit_unit_entries.insert(
-        "vendor.errors".to_string(),
-        vec![ProjectPathEntry {
-            path: link.clone(),
-            provenance: ProjectPathProvenance::Configured,
-        }],
-    );
-    context.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())];
+    edit_context(&mut context, |p| {
+        p.explicit_unit_entries.insert(
+            "vendor.errors".to_string(),
+            vec![ProjectPathEntry {
+                path: link.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            }],
+        )
+    });
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())]
+    });
     let route = pascal_core::LegacyRoute {
         source_path: root.join("Main.pas"),
         sibling_directory: root.to_path_buf(),
@@ -2874,9 +2935,13 @@ fn case_adjusted_mapped_include_retains_mapping_restriction() {
         ..Default::default()
     };
     let mut context = configured_disk_context(root);
-    context.read_policy = ReadPolicy::new(&[root.to_path_buf()], &[], &[], &overrides);
-    context.overrides = overrides;
-    context.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())];
+    edit_context(&mut context, |p| {
+        p.read_policy = ReadPolicy::new(&[root.to_path_buf()], &[], &[], &overrides)
+    });
+    edit_context(&mut context, |p| p.overrides = overrides);
+    edit_context(&mut context, |p| {
+        p.search_path_entries = vec![ProjectPathEntry::legacy(root.to_path_buf())]
+    });
     let route = pascal_core::LegacyRoute {
         source_path: root.join("Main.pas"),
         sibling_directory: root.to_path_buf(),
@@ -3019,10 +3084,10 @@ fn project_walk_preserves_a_proven_legacy_route_for_imports() {
         sibling_directory: root.to_path_buf(),
     };
     let mut resolver = UnitResolver::new(
-        ProjectContext {
+        ProjectContext::from_parts(ProjectContextParts {
             discovery_complete: true,
-            ..ProjectContext::default()
-        },
+            ..ProjectContextParts::default()
+        }),
         vec![],
         FilesystemSourceStore::new(),
         Default::default(),
@@ -3064,10 +3129,10 @@ fn project_walk_preserves_a_proven_legacy_route_for_includes() {
         sibling_directory: root.to_path_buf(),
     };
     let mut resolver = UnitResolver::new(
-        ProjectContext {
+        ProjectContext::from_parts(ProjectContextParts {
             discovery_complete: true,
-            ..ProjectContext::default()
-        },
+            ..ProjectContextParts::default()
+        }),
         vec![],
         FilesystemSourceStore::new(),
         Default::default(),
@@ -3102,12 +3167,11 @@ fn cached_legacy_symlink_payload_cannot_bypass_a_later_strict_lookup() {
     let link = root.join("Link.inc");
     fs::write(&target, "const Included = 1;").expect("target include");
     std::os::unix::fs::symlink(&target, &link).expect("legacy include symlink");
-    let mut context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
-        ..ProjectContext::default()
-    };
-    context.search_paths = vec![root.to_path_buf()];
+        ..ProjectContextParts::default()
+    });
     let route = pascal_core::LegacyRoute {
         source_path: root.join("Main.pas"),
         sibling_directory: root.to_path_buf(),
@@ -3230,32 +3294,34 @@ fn incomplete_outcome_taints_the_final_report() {
 fn library_source_keeps_unknown_project_define_activity_incomplete() {
     let project_root = PathBuf::from("/workspace");
     let library_root = PathBuf::from("/sdk/lib");
-    let mut context = ProjectContext {
+    let mut context = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(project_root.join("App.dproj")),
-        main_source: Some(project_root.join("Main.pas")),
+        main_source_entry: Some(ProjectPathEntry::legacy(project_root.join("Main.pas"))),
         project_source_roots: vec![project_root.clone()],
-        search_paths: vec![project_root.clone(), library_root.clone()],
         search_path_entries: vec![
             ProjectPathEntry::legacy(project_root.clone()),
             ProjectPathEntry::legacy(library_root.clone()),
         ],
-        defines: vec!["DEBUG".to_string()],
         read_policy: ReadPolicy::default(),
-        ..ProjectContext::default()
-    };
-    context.conditional_closure.closed = true;
-    context.conditional_context.compiler_version = Some(CompilerVersion::new(21, 0));
-    context
-        .conditional_context
-        .set_define("DEBUG", ConditionalFact::True);
-    context.conditional_context = context
-        .conditional_context
-        .with_absent_define(ConditionalFact::False);
-    context.library_conditional_context = ConditionalContext {
-        compiler_version: Some(CompilerVersion::new(21, 0)),
-        ..ConditionalContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
+    edit_context(&mut context, |p| {
+        p.conditional_closure.closed = true;
+        p.conditional_context.compiler_version = Some(CompilerVersion::new(21, 0));
+        p.conditional_context
+            .set_define("DEBUG", ConditionalFact::True);
+        p.conditional_context = p
+            .conditional_context
+            .clone()
+            .with_absent_define(ConditionalFact::False)
+    });
+    edit_context(&mut context, |p| {
+        p.library_conditional_context = ConditionalContext {
+            compiler_version: Some(CompilerVersion::new(21, 0)),
+            ..ConditionalContext::default()
+        }
+    });
     assert_eq!(
         context.source_origin(&library_root.join("External.pas")),
         SourceOrigin::Library
@@ -3307,15 +3373,20 @@ fn library_source_keeps_unknown_project_define_activity_incomplete() {
 #[test]
 fn compile_time_unit_capability_uses_selected_library_context() {
     let mut context = fixture_context();
-    context.project_file = Some("/workspace/App.dproj".into());
-    context.project_source_roots = vec!["/workspace".into()];
-    context.search_paths.push("/sdk/lib".into());
-    context
-        .search_path_entries
-        .push(ProjectPathEntry::legacy("/sdk/lib".into()));
-    context.conditional_context = support_context();
-    context.library_conditional_context =
-        support_context().with_absent_define(ConditionalFact::False);
+    edit_context(&mut context, |p| {
+        p.project_file = Some("/workspace/App.dproj".into())
+    });
+    edit_context(&mut context, |p| {
+        p.project_source_roots = vec!["/workspace".into()]
+    });
+    edit_context(&mut context, |p| {
+        p.search_path_entries
+            .push(ProjectPathEntry::legacy("/sdk/lib".into()))
+    });
+    edit_context(&mut context, |p| p.conditional_context = support_context());
+    edit_context(&mut context, |p| {
+        p.library_conditional_context = support_context().with_absent_define(ConditionalFact::False)
+    });
     let mut store = MemoryStore::default();
     store.add("/sdk/lib/Types.pas", "unit Types; interface {$IFDEF PRIVATE} type Export=Byte; {$ELSE} type Export=Int64; {$ENDIF} implementation end.");
     store.add("/workspace/Main.pas", "unit Main; interface uses Types; {$DEFINE PRIVATE} {$IF SizeOf(Types.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.");
@@ -3366,27 +3437,28 @@ fn fixture_context() -> ProjectContext {
         path: root.clone(),
         provenance: ProjectPathProvenance::LegacyNative,
     };
-    ProjectContext {
+    ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
-        search_paths: vec![root.clone()],
         search_path_entries: vec![entry],
         read_policy: ReadPolicy::default(),
-        ..ProjectContext::default()
-    }
+        ..ProjectContextParts::default()
+    })
 }
 
 fn configured_disk_context(root: &Path) -> ProjectContext {
-    ProjectContext {
+    ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
         project_file: Some(root.join("App.dproj")),
         read_policy: ReadPolicy::new(&[root.to_path_buf()], &[], &[], &Default::default()),
-        ..ProjectContext::default()
-    }
+        ..ProjectContextParts::default()
+    })
 }
 
 fn review_like_context() -> ProjectContext {
     let mut context = fixture_context();
-    context.project_file = Some(PathBuf::from("/workspace/App.dproj"));
+    edit_context(&mut context, |p| {
+        p.project_file = Some(PathBuf::from("/workspace/App.dproj"))
+    });
     context
 }
 
@@ -3410,19 +3482,17 @@ fn resolve_memory_project(
 
 fn fixture_context_with_alias(alias: &str, target: &str) -> ProjectContext {
     let mut context = fixture_context();
-    context
-        .unit_aliases
-        .insert(alias.to_string(), target.to_string());
-    context.explicit_units.insert(
-        target.to_ascii_lowercase(),
-        vec![PathBuf::from("/workspace/Vendor.Errors.pas")],
-    );
-    context.explicit_unit_entries.insert(
-        target.to_ascii_lowercase(),
-        vec![ProjectPathEntry::legacy(PathBuf::from(
-            "/workspace/Vendor.Errors.pas",
-        ))],
-    );
+    edit_context(&mut context, |p| {
+        p.unit_aliases.insert(alias.to_string(), target.to_string())
+    });
+    edit_context(&mut context, |p| {
+        p.explicit_unit_entries.insert(
+            target.to_ascii_lowercase(),
+            vec![ProjectPathEntry::legacy(PathBuf::from(
+                "/workspace/Vendor.Errors.pas",
+            ))],
+        )
+    });
     context
 }
 

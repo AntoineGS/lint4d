@@ -48,7 +48,7 @@ struct SyntheticProject {
     _directory: TempDir,
     files: Vec<FileInfo>,
     source_roots: Vec<PathBuf>,
-    context: ProjectContext,
+    context: std::sync::Arc<ProjectContext>,
     dcu_context: DcuProjectContext,
     config: Config,
     registry: RuleRegistry,
@@ -179,9 +179,10 @@ fn synthetic_project() -> SyntheticProject {
         &options,
         &OverrideSession::new(None),
     )
-    .expect("synthetic project context should be discoverable");
-    assert!(context.discovery_complete);
-    assert_eq!(context.project_file, options.project_file);
+    .expect("synthetic project context should be discoverable")
+    .context;
+    assert!(context.discovery_complete());
+    assert_eq!(context.project_file(), options.project_file.as_deref());
 
     SyntheticProject {
         _directory: directory,

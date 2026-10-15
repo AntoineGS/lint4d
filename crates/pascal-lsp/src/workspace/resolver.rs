@@ -10,7 +10,8 @@ use pascal_core::resolver::{
     UnitResolver,
 };
 use pascal_project::{
-    ProjectContext, ProjectPathEntry, ProjectPathProvenance, ReadPolicy, content_hash_bytes,
+    ProjectContext, ProjectObservations, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
+    content_hash_bytes,
 };
 #[cfg(test)]
 use std::cell::RefCell;
@@ -91,7 +92,7 @@ pub(crate) struct LspSourceStore {
     pub(crate) paths_to_uris: HashMap<PathBuf, Url>,
     deleted_overrides: HashMap<PathBuf, Option<DiskStamp>>,
     rejected_paths: std::collections::HashSet<PathBuf>,
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     project_cache: crate::project_cache::ProjectCache,
     disk: FilesystemSourceStore,
 }
@@ -279,7 +280,7 @@ fn admit_decoded_source(
 }
 
 impl LspSourceStore {
-    pub(crate) fn from_input(context: ProjectContext, input: &WorkspaceInput) -> Self {
+    pub(crate) fn from_input(context: Arc<ProjectContext>, input: &WorkspaceInput) -> Self {
         let mut overlays = HashMap::new();
         let mut paths_to_uris = HashMap::new();
         for (uri, overlay) in &input.overlays {
@@ -369,7 +370,7 @@ impl LspSourceStore {
                 path: path.clone(),
                 reason: "source is outside the requester-scoped project roots".to_string(),
             })?;
-        let read_policy = self.context.read_policy.clone();
+        let read_policy = self.context.read_policy().clone();
         self.load(
             SourceRequest {
                 path: &path,
@@ -764,7 +765,8 @@ fn with_decoded_text(mut source: LoadedSource) -> LoadedSource {
 }
 
 pub(crate) fn resolver_for_context(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
+    observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
     _cancel: &AtomicBool,
@@ -776,11 +778,12 @@ pub(crate) fn resolver_for_context(
         input.options.limits,
         crate::include_expansion::ExpansionLimits::default(),
     );
-    resolver_for_context_with_limits(context, roots, input, limits)
+    resolver_for_context_with_limits(context, observations, roots, input, limits)
 }
 
 pub(crate) fn resolver_for_context_with_limits(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
+    observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
     mut limits: ResolverLimits,
@@ -792,10 +795,12 @@ pub(crate) fn resolver_for_context_with_limits(
         LspSourceStore::from_input(context, input),
         limits,
     )
+    .with_context_observations(observations)
 }
 
 pub(crate) fn resolver_for_context_with_session_cache(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
+    observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     input: &WorkspaceInput,
     session_cache: ResolverSessionCache,
@@ -810,11 +815,19 @@ pub(crate) fn resolver_for_context_with_session_cache(
         input.options.limits,
         crate::include_expansion::ExpansionLimits::default(),
     );
-    resolver_for_context_with_limits_and_session_cache(context, roots, limits, input, session_cache)
+    resolver_for_context_with_limits_and_session_cache(
+        context,
+        observations,
+        roots,
+        limits,
+        input,
+        session_cache,
+    )
 }
 
 fn resolver_for_context_with_limits_and_session_cache(
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
+    observations: &ProjectObservations,
     roots: Vec<PathBuf>,
     mut limits: ResolverLimits,
     input: &WorkspaceInput,
@@ -828,6 +841,7 @@ fn resolver_for_context_with_limits_and_session_cache(
         limits,
         session_cache,
     )
+    .with_context_observations(observations)
 }
 
 pub(crate) fn source_record_for_loaded(
@@ -863,7 +877,7 @@ pub(crate) fn source_record_for_loaded(
             content_bytes: None,
             candidate_membership: None,
             candidate_observations: Vec::new(),
-            read_policy: Some(context.read_policy.clone()),
+            read_policy: Some(context.read_policy().clone()),
             path_entry: context.path_entry_for(&source.path),
             include_payload,
             missing_provider_candidate: false,
@@ -969,7 +983,7 @@ fn payload_record(
             content_bytes: None,
             candidate_membership: None,
             candidate_observations: Vec::new(),
-            read_policy: Some(context.read_policy.clone()),
+            read_policy: Some(context.read_policy().clone()),
             path_entry: context.path_entry_for(path),
             include_payload: false,
             missing_provider_candidate: false,
@@ -1114,7 +1128,7 @@ pub(crate) fn report_records(
                         Some(read.stamp.clone()),
                         Some(read.content_hash),
                         read.content_bytes.clone(),
-                        Some(context.read_policy.clone()),
+                        Some(context.read_policy().clone()),
                         context.path_entry_for(&read.path),
                     )
                 }
@@ -1272,31 +1286,34 @@ fn merge_candidate_observations(
     }
 }
 
-pub(crate) fn merge_report_into_context(context: &mut ProjectContext, report: &ResolutionReport) {
+pub(crate) fn merge_report_into_context(
+    observations: &mut ProjectObservations,
+    report: &ResolutionReport,
+) {
     for observation in &report.observations {
         match observation {
             pascal_core::ResolutionObservation::Metadata(observation) => {
                 pascal_project::add_metadata_observation(
-                    &mut context.metadata_observations,
+                    &mut observations.metadata_observations,
                     observation.clone(),
                 );
-                if !context
+                if !observations
                     .metadata_files
                     .iter()
                     .any(|path| path_equivalent(path, observation.path()))
                 {
-                    context
+                    observations
                         .metadata_files
                         .push(observation.path().to_path_buf());
                 }
             }
             pascal_core::ResolutionObservation::ProjectRead(observation) => {
-                if !context
+                if !observations
                     .metadata_files
                     .iter()
                     .any(|path| path_equivalent(path, &observation.path))
                 {
-                    context.metadata_files.push(observation.path.clone());
+                    observations.metadata_files.push(observation.path.clone());
                 }
             }
             pascal_core::ResolutionObservation::Directory { .. }
@@ -1305,8 +1322,12 @@ pub(crate) fn merge_report_into_context(context: &mut ProjectContext, report: &R
         }
     }
     for warning in &report.warnings {
-        if !context.warnings.iter().any(|existing| existing == warning) {
-            context.warnings.push(warning.clone());
+        if !observations
+            .warnings
+            .iter()
+            .any(|existing| existing == warning)
+        {
+            observations.warnings.push(warning.clone());
         }
     }
 }
@@ -1356,9 +1377,10 @@ mod admitted_encoding_tests {
         );
         let context =
             ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-                .unwrap();
+                .unwrap()
+                .context;
         let entry = context.path_entry_for(&path).unwrap();
-        let policy = context.read_policy.clone();
+        let policy = context.read_policy().clone();
         let mut store = LspSourceStore::from_input(context, &workspace.analysis_input());
         let mut budget = CompileTimeBudget::new(
             CompileTimeLimits {

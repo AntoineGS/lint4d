@@ -3,8 +3,8 @@ use std::{fs, path::Path};
 use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
 use pascal_project::installations::InstallationEvidence;
 use pascal_project::{
-    ConditionalFact, InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions,
-    ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    ConditionalFact, DiscoveredProject, InstallationOrigin, InstallationSelection, ProjectContext,
+    ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
     discover_with_selections,
 };
 
@@ -65,7 +65,10 @@ fn invalid_selected_ide_path_is_reported_and_keeps_context_incomplete() {
         ),
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions::default(),
@@ -73,12 +76,12 @@ fn invalid_selected_ide_path_is_reported_and_keeps_context_incomplete() {
     )
     .unwrap();
     assert!(
-        context
+        observations
             .warnings
             .iter()
             .any(|warning| warning.contains("outside selected installation read roots"))
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.discovery_complete());
 }
 
 #[test]
@@ -111,17 +114,17 @@ fn selected_profile_config_and_platform_precede_project_xml_defaults() {
         .unwrap()
     };
 
-    let profile_context = discover(None, None);
+    let profile_context = discover(None, None).context;
     assert!(matches!(
-        profile_context.installation_selection,
-        Some(InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+        profile_context.installation_selection(),
+        Some(InstallationSelection::Selected { id, .. }) if id == "37.0"
     ));
-    assert_eq!(profile_context.config.as_deref(), Some("Release"));
-    assert_eq!(profile_context.platform.as_deref(), Some("Win64"));
+    assert_eq!(profile_context.config(), Some("Release"));
+    assert_eq!(profile_context.platform(), Some("Win64"));
 
-    let client_context = discover(Some("Client"), Some("Linux64"));
-    assert_eq!(client_context.config.as_deref(), Some("Client"));
-    assert_eq!(client_context.platform.as_deref(), Some("Linux64"));
+    let client_context = discover(Some("Client"), Some("Linux64")).context;
+    assert_eq!(client_context.config(), Some("Client"));
+    assert_eq!(client_context.platform(), Some("Linux64"));
 }
 
 #[test]
@@ -170,7 +173,10 @@ fn project_bds_override_selects_its_installation_root_and_ide_paths() {
         &format!("[properties]\nBDS='{}'\n", project_sdk.path().display()),
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("projects/App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions {
@@ -182,46 +188,46 @@ fn project_bds_override_selects_its_installation_root_and_ide_paths() {
     .unwrap();
 
     assert_eq!(
-        context.overrides.properties.get("bds"),
+        context.overrides().properties.get("bds"),
         Some(&project_sdk.path().display().to_string())
     );
     assert!(
         context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .any(|name| name == "LOCAL_SDK")
     );
     assert!(
         !context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .any(|name| name == "PROFILE_SDK")
     );
     assert!(
-        context
+        observations
             .metadata_files
             .contains(&project_sdk.path().join("bin/rsvars.bat"))
     );
     assert!(
-        !context
+        !observations
             .metadata_files
             .contains(&profile_sdk.path().join("bin/rsvars.bat"))
     );
     assert!(
         context
-            .search_paths
+            .search_paths()
             .contains(&project_sdk.path().join("source"))
     );
     assert!(
         !context
-            .search_paths
+            .search_paths()
             .contains(&profile_sdk.path().join("source"))
     );
-    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(context.read_policy().allows_location(&ProjectPathEntry {
         path: project_sdk.path().join("source"),
         provenance: ProjectPathProvenance::Configured,
     }));
-    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(!context.read_policy().allows_location(&ProjectPathEntry {
         path: profile_sdk.path().join("source"),
         provenance: ProjectPathProvenance::Configured,
     }));
@@ -262,7 +268,10 @@ fn configured_bdslib_and_bdscommondir_are_selected_read_roots() {
             ),
         );
 
-        let context = ProjectContext::discover_with_overrides(
+        let DiscoveredProject {
+            context,
+            observations,
+        } = ProjectContext::discover_with_overrides(
             &root.join("App.dpr"),
             &[root.to_path_buf()],
             &ProjectOptions {
@@ -273,15 +282,15 @@ fn configured_bdslib_and_bdscommondir_are_selected_read_roots() {
         )
         .unwrap();
         assert!(
-            context.read_policy.allows_location(&ProjectPathEntry {
+            context.read_policy().allows_location(&ProjectPathEntry {
                 path: selected_root.join("units/Selected.pas"),
                 provenance: ProjectPathProvenance::Configured,
             }),
             "selected {property} root should be readable; warnings: {:?}",
-            context.warnings
+            observations.warnings
         );
         assert!(
-            !context.read_policy.allows_location(&ProjectPathEntry {
+            !context.read_policy().allows_location(&ProjectPathEntry {
                 path: unrelated.join("units/Other.pas"),
                 provenance: ProjectPathProvenance::Configured,
             }),
@@ -319,7 +328,10 @@ fn explicit_external_envoptions_locator_authorizes_only_that_file() {
         ),
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions {
@@ -329,12 +341,12 @@ fn explicit_external_envoptions_locator_authorizes_only_that_file() {
         &OverrideSession::new(None),
     )
     .unwrap();
-    assert!(context.metadata_files.contains(&external));
-    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(observations.metadata_files.contains(&external));
+    assert!(context.read_policy().allows_location(&ProjectPathEntry {
         path: external,
         provenance: ProjectPathProvenance::Configured,
     }));
-    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(!context.read_policy().allows_location(&ProjectPathEntry {
         path: sibling,
         provenance: ProjectPathProvenance::Configured,
     }));
@@ -366,7 +378,10 @@ fn explicit_external_environmentsettings_locator_authorizes_only_that_file() {
         ),
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions {
@@ -376,12 +391,12 @@ fn explicit_external_environmentsettings_locator_authorizes_only_that_file() {
         &OverrideSession::new(None),
     )
     .unwrap();
-    assert!(context.metadata_files.contains(&external));
-    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(observations.metadata_files.contains(&external));
+    assert!(context.read_policy().allows_location(&ProjectPathEntry {
         path: external,
         provenance: ProjectPathProvenance::Configured,
     }));
-    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+    assert!(!context.read_policy().allows_location(&ProjectPathEntry {
         path: sibling,
         provenance: ProjectPathProvenance::Configured,
     }));
@@ -429,10 +444,13 @@ fn explicit_external_locators_respect_directory_and_filename_exclusions() {
         .unwrap();
 
         assert!(
-            !context.read_policy.allows_location(&ProjectPathEntry {
-                path: external,
-                provenance: ProjectPathProvenance::Configured,
-            }),
+            !context
+                .context
+                .read_policy()
+                .allows_location(&ProjectPathEntry {
+                    path: external,
+                    provenance: ProjectPathProvenance::Configured,
+                }),
             "exclusion {exclusion:?} should block explicit locator {relative_locator:?}"
         );
     }
@@ -477,10 +495,13 @@ fn explicit_external_locators_under_default_excluded_directories_are_denied() {
         .unwrap();
 
         assert!(
-            !context.read_policy.allows_location(&ProjectPathEntry {
-                path: external,
-                provenance: ProjectPathProvenance::Configured,
-            }),
+            !context
+                .context
+                .read_policy()
+                .allows_location(&ProjectPathEntry {
+                    path: external,
+                    provenance: ProjectPathProvenance::Configured,
+                }),
             "default-excluded directory {directory:?} must not be authorized"
         );
     }
@@ -825,20 +846,21 @@ fn project_bootstrap_reads_direct_identity_and_configuration_defaults() {
         },
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Release"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    .unwrap()
+    .context;
+    assert_eq!(context.config(), Some("Release"));
+    assert_eq!(context.platform(), Some("Win32"));
     assert_eq!(
-        context.conditional_context.compiler_version,
+        context.conditional_context().compiler_version,
         Some(pascal_project::CompilerVersion::new(24, 0))
     );
     assert_eq!(
-        context.installation_evidence.project_version.as_deref(),
+        context.installation_evidence().project_version.as_deref(),
         Some("20.3")
     );
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "7.0".into(),
             origin: InstallationOrigin::Session,
         })
@@ -872,11 +894,12 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
         },
         &OverrideSession::new(Some(configuration.clone())),
     )
-    .unwrap();
-    assert_eq!(false_context.installation_evidence.compiler_version, None);
+    .unwrap()
+    .context;
+    assert_eq!(false_context.installation_evidence().compiler_version, None);
     assert_eq!(
-        false_context.installation_selection,
-        Some(InstallationSelection::NeedsChoice {
+        false_context.installation_selection(),
+        Some(&InstallationSelection::NeedsChoice {
             candidates: vec!["10.0".into()]
         })
     );
@@ -898,10 +921,11 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
         },
         &OverrideSession::new(Some(configuration.clone())),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
         false_property_context
-            .installation_evidence
+            .installation_evidence()
             .compiler_version,
         None
     );
@@ -922,12 +946,16 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
         },
         &OverrideSession::new(Some(configuration.clone())),
     )
-    .unwrap();
-    assert_eq!(unknown_context.installation_evidence.compiler_version, None);
-    assert!(unknown_context.installation_evidence.conflicting);
+    .unwrap()
+    .context;
     assert_eq!(
-        unknown_context.installation_selection,
-        Some(InstallationSelection::NeedsChoice {
+        unknown_context.installation_evidence().compiler_version,
+        None
+    );
+    assert!(unknown_context.installation_evidence().conflicting);
+    assert_eq!(
+        unknown_context.installation_selection(),
+        Some(&InstallationSelection::NeedsChoice {
             candidates: vec!["10.0".into()]
         })
     );
@@ -953,10 +981,11 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
         },
         &OverrideSession::new(Some(configuration.clone())),
     )
-    .unwrap();
-    assert_eq!(defaulted_context.config.as_deref(), Some("Debug"));
+    .unwrap()
+    .context;
+    assert_eq!(defaulted_context.config(), Some("Debug"));
     assert_eq!(
-        defaulted_context.installation_evidence.compiler_version,
+        defaulted_context.installation_evidence().compiler_version,
         Some(pascal_project::CompilerVersion::new(24, 0))
     );
 }
@@ -992,14 +1021,15 @@ fn explicit_conditional_compiler_version_overrides_project_identity_for_selectio
         },
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
-        context.conditional_context.compiler_version,
+        context.conditional_context().compiler_version,
         Some(explicit_version)
     );
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "23.0".into(),
             origin: InstallationOrigin::Metadata,
         })
@@ -1036,7 +1066,10 @@ fn imported_compiler_metadata_does_not_supply_bootstrap_installation_identity() 
         &bds.join("Version.props"),
         "<Project><PropertyGroup><CompilerVersion>36.0</CompilerVersion></PropertyGroup></Project>",
     );
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &source,
         &[temp.path().to_path_buf()],
         &ProjectOptions {
@@ -1046,18 +1079,22 @@ fn imported_compiler_metadata_does_not_supply_bootstrap_installation_identity() 
         &OverrideSession::new(Some(configuration)),
     )
     .unwrap();
-    assert!(context.metadata_files.contains(&bds.join("Version.props")));
+    assert!(
+        observations
+            .metadata_files
+            .contains(&bds.join("Version.props"))
+    );
     assert_eq!(
-        context.installation_evidence.compiler_version,
+        context.installation_evidence().compiler_version,
         Some(pascal_project::CompilerVersion::new(24, 0))
     );
     assert_eq!(
-        context.installation_evidence.bds_root.as_deref(),
+        context.installation_evidence().bds_root.as_deref(),
         Some(bds.to_str().unwrap())
     );
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "10.0".into(),
             origin: InstallationOrigin::Metadata,
         })
@@ -1099,13 +1136,14 @@ fn import_may_set_config_so_empty_config_identity_condition_is_unknown() {
         },
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Release"));
-    assert_eq!(context.installation_evidence.compiler_version, None);
-    assert!(context.installation_evidence.conflicting);
+    .unwrap()
+    .context;
+    assert_eq!(context.config(), Some("Release"));
+    assert_eq!(context.installation_evidence().compiler_version, None);
+    assert!(context.installation_evidence().conflicting);
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::NeedsChoice {
+        context.installation_selection(),
+        Some(&InstallationSelection::NeedsChoice {
             candidates: vec!["10.0".into(), "23.0".into()]
         })
     );
@@ -1142,15 +1180,16 @@ fn false_conditional_import_does_not_make_later_empty_config_condition_unknown()
         },
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
-        context.installation_evidence.compiler_version,
+        context.installation_evidence().compiler_version,
         Some(pascal_project::CompilerVersion::new(24, 0))
     );
-    assert!(!context.installation_evidence.conflicting);
+    assert!(!context.installation_evidence().conflicting);
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "10.0".into(),
             origin: InstallationOrigin::Metadata,
         })
@@ -1190,14 +1229,15 @@ fn direct_compiler_fact_survives_unrelated_imported_config_uncertainty() {
         },
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
-        context.installation_evidence.compiler_version,
+        context.installation_evidence().compiler_version,
         Some(pascal_project::CompilerVersion::new(24, 0))
     );
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "10.0".into(),
             origin: InstallationOrigin::Metadata,
         })
@@ -1237,11 +1277,12 @@ fn explicit_compiler_resolves_compiler_conflicts_but_not_bds_conflicts() {
         &options,
         &OverrideSession::new(Some(configuration.clone())),
     )
-    .unwrap();
-    assert!(context.installation_evidence.conflicting);
+    .unwrap()
+    .context;
+    assert!(context.installation_evidence().conflicting);
     assert_eq!(
-        context.installation_selection,
-        Some(InstallationSelection::Selected {
+        context.installation_selection(),
+        Some(&InstallationSelection::Selected {
             id: "23.0".into(),
             origin: InstallationOrigin::Metadata,
         })
@@ -1259,10 +1300,11 @@ fn explicit_compiler_resolves_compiler_conflicts_but_not_bds_conflicts() {
         &options,
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
-        independent_conflict.installation_selection,
-        Some(InstallationSelection::NeedsChoice {
+        independent_conflict.installation_selection(),
+        Some(&InstallationSelection::NeedsChoice {
             candidates: vec!["10.0".into(), "23.0".into()]
         })
     );
@@ -1296,7 +1338,8 @@ fn standalone_source_under_an_installation_uses_its_compiler_and_platform() {
         &ProjectOptions::default(),
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     let conditionals = context.conditional_context_for(&classes);
 
     assert_eq!(
@@ -1333,7 +1376,8 @@ fn standalone_source_under_an_installation_without_platform_keeps_platform_unkno
         &ProjectOptions::default(),
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     let conditionals = context.conditional_context_for(&classes);
 
     assert_eq!(conditionals.define("VER240"), ConditionalFact::True);
@@ -1360,7 +1404,8 @@ fn standalone_source_outside_installations_keeps_unknown_compiler() {
         &ProjectOptions::default(),
         &OverrideSession::new(Some(configuration)),
     )
-    .unwrap();
+    .unwrap()
+    .context;
     let conditionals = context.conditional_context_for(&source);
 
     assert_eq!(conditionals.compiler_version, None);

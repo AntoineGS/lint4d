@@ -1,13 +1,24 @@
+use pascal_project::ProjectContextParts;
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
-    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
-    ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectSelections,
-    ReadPolicy, discover_with_selections_and_observations_with_cancel_and_overrides,
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, DiscoveredProject,
+    MetadataObservation, ProjectContext, ProjectObservations, ProjectOptions, ProjectPathEntry,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    discover_with_selections_and_observations_with_cancel_and_overrides,
 };
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use tempfile::tempdir;
+
+fn edit_context<R>(
+    context: &mut ProjectContext,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_parts();
+    edit(&mut parts);
+    *context = ProjectContext::from_parts(parts);
+}
 
 fn write(path: &std::path::Path, contents: &str) {
     if let Some(parent) = path.parent() {
@@ -29,24 +40,26 @@ fn public_api_discovers_a_standalone_pascal_source() {
         &ProjectOptions::default(),
         &overrides,
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
 
-    assert!(context.discovery_complete);
-    assert_eq!(context.main_source, None);
-    assert_eq!(context.search_paths, vec![directory.path().to_path_buf()]);
+    assert!(context.discovery_complete());
+    assert_eq!(context.main_source(), None);
+    assert_eq!(context.search_paths(), vec![directory.path().to_path_buf()]);
 }
 
 #[test]
 fn effective_conditional_context_is_open_even_when_stored_context_is_closed() {
-    let context = ProjectContext {
-        defines: vec!["LEGACY".into()],
-        conditional_context: ConditionalContext {
-            absent_define: ConditionalFact::False,
-            rtl_constants_known: true,
-            ..ConditionalContext::default()
-        },
-        ..ProjectContext::default()
+    let mut conditional_context = ConditionalContext {
+        absent_define: ConditionalFact::False,
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
     };
+    conditional_context.set_define("LEGACY", ConditionalFact::True);
+    let context = ProjectContext::from_parts(ProjectContextParts {
+        conditional_context,
+        ..ProjectContextParts::default()
+    });
 
     let effective = context.effective_conditional_context();
 
@@ -73,7 +86,10 @@ fn msbuild_project_name_absent_deployment_import_keeps_bindings_available() {
         </Project>"#,
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("Good.pas"),
         &[root.to_path_buf()],
         &ProjectOptions::default(),
@@ -81,11 +97,11 @@ fn msbuild_project_name_absent_deployment_import_keeps_bindings_available() {
     )
     .unwrap();
 
-    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert!(context.discovery_complete(), "{:?}", observations.warnings);
     assert!(context.can_resolve_units());
-    assert_eq!(context.explicit_units["good"], [root.join("Good.pas")]);
+    assert_eq!(context.explicit_units()["good"], [root.join("Good.pas")]);
     assert!(
-        context
+        observations
             .metadata_files
             .contains(&root.join("App.deployproj"))
     );
@@ -107,7 +123,10 @@ fn msbuild_project_name_present_deployment_import_is_not_evaluated() {
         </Project>"#,
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions::default(),
@@ -115,15 +134,20 @@ fn msbuild_project_name_present_deployment_import_is_not_evaluated() {
     )
     .unwrap();
 
-    assert!(context.discovery_complete, "{:?}", context.warnings);
-    assert_eq!(context.defines, ["KNOWN"]);
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(context.discovery_complete(), "{:?}", observations.warnings);
+    assert_eq!(context.defines(), ["KNOWN"]);
+    assert!(observations.warnings.iter().any(|warning| {
         warning.contains("ignored unsupported MSBuild import") && warning.contains("deployproj")
     }));
-    assert!(!context.metadata_observations.iter().any(|observation| {
-        matches!(observation, MetadataObservation::Payload { path, .. }
+    assert!(
+        !observations
+            .metadata_observations
+            .iter()
+            .any(|observation| {
+                matches!(observation, MetadataObservation::Payload { path, .. }
             if path == &root.join("App.deployproj"))
-    }));
+            })
+    );
 }
 
 #[test]
@@ -146,7 +170,10 @@ fn msbuild_project_name_stays_the_root_identity_in_imported_properties() {
         </PropertyGroup></Project>"#,
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("Shop.Service.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions::default(),
@@ -154,9 +181,12 @@ fn msbuild_project_name_stays_the_root_identity_in_imported_properties() {
     )
     .unwrap();
 
-    assert!(context.discovery_complete, "{:?}", context.warnings);
-    assert_eq!(context.main_source, Some(root.join("Shop.Service.dpr")));
-    assert_eq!(context.defines, ["ROOT_NAME"]);
+    assert!(context.discovery_complete(), "{:?}", observations.warnings);
+    assert_eq!(
+        context.main_source(),
+        Some(root.join("Shop.Service.dpr").as_path())
+    );
+    assert_eq!(context.defines(), ["ROOT_NAME"]);
 }
 
 #[test]
@@ -175,7 +205,10 @@ fn missing_reference_keeps_independent_metadata_usable() {
       <DCCReference Include="Missing.pas"/><DCCReference Include="Good.pas"/>
       </ItemGroup></Project>"#,
     );
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &root.join("App.dpr"),
         &[root.to_path_buf()],
         &ProjectOptions::default(),
@@ -183,10 +216,10 @@ fn missing_reference_keeps_independent_metadata_usable() {
     )
     .unwrap();
     assert!(context.can_resolve_units());
-    assert!(!context.discovery_complete);
+    assert!(!context.discovery_complete());
     assert!(context.missing_explicit_unit("missing").is_some());
-    assert!(context.explicit_units.contains_key("good"));
-    assert!(context.metadata_observations.iter().any(|observation| {
+    assert!(context.explicit_units().contains_key("good"));
+    assert!(observations.metadata_observations.iter().any(|observation| {
         matches!(observation, MetadataObservation::Stat { path } if path.ends_with("Missing.pas"))
     }));
 
@@ -200,8 +233,9 @@ fn missing_reference_keeps_independent_metadata_usable() {
         &ProjectOptions::default(),
         &OverrideSession::new(None),
     )
-    .unwrap();
-    assert!(refreshed.explicit_units.contains_key("missing"));
+    .unwrap()
+    .context;
+    assert!(refreshed.explicit_units().contains_key("missing"));
     assert!(refreshed.missing_explicit_unit("missing").is_none());
 }
 
@@ -222,9 +256,10 @@ fn inaccessible_reference_parent_is_not_a_proven_missing_unit() {
         &ProjectOptions::default(),
         &OverrideSession::new(None),
     )
-    .unwrap();
+    .unwrap()
+    .context;
 
-    assert!(context.path_issues.is_empty());
+    assert!(context.path_issues().is_empty());
     assert!(!context.can_resolve_units());
 }
 
@@ -284,36 +319,41 @@ fn public_api_resolves_dproj_optset_configuration_and_metadata() {
         ..ProjectOptions::default()
     };
     let overrides = OverrideSession::new(None);
-    let context =
-        ProjectContext::discover_with_overrides(&main, &[root.to_path_buf()], &options, &overrides)
-            .expect("project discovery");
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(&main, &[root.to_path_buf()], &options, &overrides)
+        .expect("project discovery");
 
-    assert_eq!(context.project_file, Some(project.clone()));
-    assert_eq!(context.main_source, Some(main));
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win64"));
-    assert!(context.defines.contains(&"PUBLIC_DEFINE".to_string()));
-    assert!(context.include_paths.contains(&include_path));
-    assert!(context.search_paths.contains(&unit_path));
+    assert_eq!(context.project_file(), Some(project.as_path()));
+    assert_eq!(context.main_source(), Some(main.as_path()));
+    assert_eq!(context.config(), Some("Debug"));
+    assert_eq!(context.platform(), Some("Win64"));
+    assert!(context.defines().contains(&"PUBLIC_DEFINE".to_string()));
+    assert!(context.include_paths().contains(&include_path));
+    assert!(context.search_paths().contains(&unit_path));
     assert_eq!(
-        context.unit_aliases.get("LegacyUnit"),
+        context.unit_aliases().get("LegacyUnit"),
         Some(&"ModernUnit".to_string())
     );
-    assert!(context.metadata_files.contains(&project));
-    assert!(context.metadata_files.contains(&option_set));
+    assert!(observations.metadata_files.contains(&project));
+    assert!(observations.metadata_files.contains(&option_set));
     for expected in [&project, &option_set] {
         assert!(
-            context.metadata_observations.iter().any(|observation| {
-                observation.path() == expected
-                    && matches!(observation, MetadataObservation::Payload { .. })
-            }),
+            observations
+                .metadata_observations
+                .iter()
+                .any(|observation| {
+                    observation.path() == expected
+                        && matches!(observation, MetadataObservation::Payload { .. })
+                }),
             "missing payload observation for {expected:?}: {:?}",
-            context.metadata_observations
+            observations.metadata_observations
         );
     }
     assert!(
         context
-            .search_path_entries
+            .search_path_entries()
             .iter()
             .any(|entry| entry.path == unit_path
                 && entry.provenance == ProjectPathProvenance::LegacyNative)
@@ -355,25 +395,31 @@ fn public_api_evaluates_nested_relative_props_import_with_property_condition() {
         ..ProjectOptions::default()
     };
 
-    let context = ProjectContext::discover(&source, &[root.to_path_buf()], &options)
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover(&source, &[root.to_path_buf()], &options)
         .expect("project discovery");
 
-    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert!(context.discovery_complete(), "{:?}", observations.warnings);
     assert!(
-        context.include_paths.contains(&include),
+        context.include_paths().contains(&include),
         "paths={:?}; warnings={:?}",
-        context.include_paths,
-        context.warnings
+        context.include_paths(),
+        observations.warnings
     );
-    assert!(context.defines.contains(&"NESTED_IMPORT".to_string()));
-    assert!(context.metadata_files.contains(&nested));
-    assert!(context.metadata_files.contains(&paths));
+    assert!(context.defines().contains(&"NESTED_IMPORT".to_string()));
+    assert!(observations.metadata_files.contains(&nested));
+    assert!(observations.metadata_files.contains(&paths));
     for imported in [&nested, &paths] {
         assert!(
-            context.metadata_observations.iter().any(|observation| {
-                observation.path() == imported
-                    && matches!(observation, MetadataObservation::Payload { .. })
-            }),
+            observations
+                .metadata_observations
+                .iter()
+                .any(|observation| {
+                    observation.path() == imported
+                        && matches!(observation, MetadataObservation::Payload { .. })
+                }),
             "imported props file must retain the bytes actually consumed: {imported:?}"
         );
     }
@@ -405,18 +451,20 @@ fn public_api_applies_versioned_local_configuration_without_overriding_explicit_
         r#"{"version":1,"project":"Configured.dproj","sourcePaths":["ConfiguredUnits"],"defines":["LOCAL_CONFIG"]}"#,
     );
 
-    let context =
-        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
-            .expect("discovery with local configuration");
-    assert_eq!(context.project_file, Some(configured_project));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+        .expect("discovery with local configuration");
+    assert_eq!(context.project_file(), Some(configured_project.as_path()));
     assert!(
-        context.search_paths.contains(&configured_units),
+        context.search_paths().contains(&configured_units),
         "paths={:?}; metadata={:?}; warnings={:?}",
-        context.search_paths,
-        context.metadata_files,
-        context.warnings
+        context.search_paths(),
+        observations.metadata_files,
+        observations.warnings
     );
-    assert!(context.defines.contains(&"LOCAL_CONFIG".to_string()));
+    assert!(context.defines().contains(&"LOCAL_CONFIG".to_string()));
 
     let mut conditional_context = ConditionalContext::default();
     conditional_context.set_define("CLIENT_DEFINE", ConditionalFact::True);
@@ -431,18 +479,30 @@ fn public_api_applies_versioned_local_configuration_without_overriding_explicit_
         },
     )
     .expect("discovery with explicit client options");
-    assert!(explicit.search_paths.contains(&client_units));
-    assert!(explicit.defines.contains(&"CLIENT_DEFINE".to_string()));
-    assert_eq!(explicit.project_file, Some(project));
+    assert!(explicit.context.search_paths().contains(&client_units));
     assert!(
         explicit
+            .context
+            .defines()
+            .contains(&"CLIENT_DEFINE".to_string())
+    );
+    assert_eq!(explicit.context.project_file(), Some(project.as_path()));
+    assert!(
+        explicit
+            .observations
             .metadata_files
             .contains(&project_dir.join(".delphilsp.json"))
     );
-    assert!(explicit.metadata_observations.iter().any(|observation| {
-        observation.path() == project_dir.join(".delphilsp.json")
-            && matches!(observation, MetadataObservation::Payload { .. })
-    }));
+    assert!(
+        explicit
+            .observations
+            .metadata_observations
+            .iter()
+            .any(|observation| {
+                observation.path() == project_dir.join(".delphilsp.json")
+                    && matches!(observation, MetadataObservation::Payload { .. })
+            })
+    );
 }
 
 #[test]
@@ -484,8 +544,9 @@ fn local_project_selection_is_scoped_to_the_current_requester() {
         &[],
         &AtomicBool::new(false),
     )
-    .expect("requester A discovery");
-    assert_eq!(selected.context.project_file, Some(selected_a));
+    .expect("requester A discovery")
+    .context;
+    assert_eq!(selected.project_file(), Some(selected_a.as_path()));
 
     let independent = discover_with_selections_and_observations_with_cancel_and_overrides(
         &source_b,
@@ -496,8 +557,9 @@ fn local_project_selection_is_scoped_to_the_current_requester() {
         &[],
         &AtomicBool::new(false),
     )
-    .expect("requester B discovery");
-    assert_eq!(independent.context.project_file, Some(configured_b));
+    .expect("requester B discovery")
+    .context;
+    assert_eq!(independent.project_file(), Some(configured_b.as_path()));
 }
 
 #[test]
@@ -737,15 +799,21 @@ fn public_api_configuration_delete_stops_contributing_local_defines() {
     write(&config, r#"{"version":1,"defines":["LOCAL_CONFIG"]}"#);
     let before =
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
-            .expect("configured discovery");
-    assert!(before.defines.contains(&"LOCAL_CONFIG".to_string()));
+            .expect("configured discovery")
+            .context;
+    assert!(before.defines().contains(&"LOCAL_CONFIG".to_string()));
 
     fs::remove_file(&config).expect("delete local configuration");
     let after =
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("discovery after config deletion");
-    assert!(!after.defines.contains(&"LOCAL_CONFIG".to_string()));
-    assert!(after.metadata_files.contains(&config));
+    assert!(
+        !after
+            .context
+            .defines()
+            .contains(&"LOCAL_CONFIG".to_string())
+    );
+    assert!(after.observations.metadata_files.contains(&config));
 }
 
 #[test]
@@ -764,9 +832,10 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
     let missing =
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("incomplete context is still reported");
-    assert!(!missing.discovery_complete);
+    assert!(!missing.context.discovery_complete());
     assert!(
         missing
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("does not exist"))
@@ -783,10 +852,16 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
     let unknown =
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("unknown condition context is reported");
-    assert!(!unknown.discovery_complete);
-    assert!(!unknown.defines.contains(&"MUST_NOT_BE_ASSUMED".to_string()));
+    assert!(!unknown.context.discovery_complete());
+    assert!(
+        !unknown
+            .context
+            .defines()
+            .contains(&"MUST_NOT_BE_ASSUMED".to_string())
+    );
     assert!(
         unknown
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unknown project condition"))
@@ -799,14 +874,16 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
     let outside_exists =
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("outside Exists condition stays conservative");
-    assert!(!outside_exists.discovery_complete);
+    assert!(!outside_exists.context.discovery_complete());
     assert!(
         !outside_exists
-            .defines
+            .context
+            .defines()
             .contains(&"OUTSIDE_EXISTS".to_string())
     );
     assert!(
         outside_exists
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unknown project condition"))
@@ -828,17 +905,18 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("cycle is handled conservatively");
     assert!(
-        !cyclic.discovery_complete,
+        !cyclic.context.discovery_complete(),
         "a cyclic import must not advertise prior partial properties as complete"
     );
     assert!(
         cyclic
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("project import cycle"))
     );
     assert!(
-        !cyclic.defines.contains(&"SECOND".to_string()),
+        !cyclic.context.defines().contains(&"SECOND".to_string()),
         "properties read before the cycle must not be exposed as authoritative"
     );
 }
@@ -869,8 +947,7 @@ fn public_api_rejects_a_precancelled_discovery() {
 fn public_api_prefers_exact_mapped_provenance_for_a_source() {
     let root = PathBuf::from("/workspace");
     let source = root.join("src/Main.pas");
-    let mut context = ProjectContext {
-        main_source: Some(source.clone()),
+    let mut context = ProjectContext::from_parts(ProjectContextParts {
         main_source_entry: Some(ProjectPathEntry {
             path: source.clone(),
             provenance: ProjectPathProvenance::Mapped {
@@ -881,13 +958,13 @@ fn public_api_prefers_exact_mapped_provenance_for_a_source() {
             path: root.clone(),
             provenance: ProjectPathProvenance::LegacyNative,
         }],
-        ..ProjectContext::default()
-    };
-    context.read_policy = ReadPolicy::default();
+        ..ProjectContextParts::default()
+    });
+    edit_context(&mut context, |p| p.read_policy = ReadPolicy::default());
 
     assert_eq!(
         context.path_entry_for(&source),
-        context.main_source_entry.clone()
+        context.main_source_entry().cloned()
     );
 }
 
@@ -904,10 +981,10 @@ fn public_api_uses_the_most_specific_search_root_before_policy_fallback() {
             root: PathBuf::from("/mapped/vendor"),
         },
     };
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         search_path_entries: vec![broad, specific.clone()],
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
 
     assert_eq!(
         context.path_entry_for(&path),
@@ -924,7 +1001,7 @@ fn public_api_orders_include_owner_then_include_then_unit_paths_without_duplicat
     let include = PathBuf::from("/workspace/include");
     let duplicate = PathBuf::from("/workspace/src/../include");
     let unit = PathBuf::from("/workspace/units");
-    let context = ProjectContext {
+    let context = ProjectContext::from_parts(ProjectContextParts {
         include_path_entries: vec![
             ProjectPathEntry::legacy(include.clone()),
             ProjectPathEntry::legacy(duplicate),
@@ -933,8 +1010,8 @@ fn public_api_orders_include_owner_then_include_then_unit_paths_without_duplicat
             ProjectPathEntry::legacy(owner.clone()),
             ProjectPathEntry::legacy(unit.clone()),
         ],
-        ..ProjectContext::default()
-    };
+        ..ProjectContextParts::default()
+    });
 
     let paths = context
         .include_search_entries(&owner.join("Main.pas"))
@@ -947,14 +1024,17 @@ fn public_api_orders_include_owner_then_include_then_unit_paths_without_duplicat
 #[test]
 fn public_api_does_not_turn_a_stat_observation_into_payload_authorization() {
     let path = PathBuf::from("/workspace/generated/Unit.pas");
-    let context = ProjectContext {
-        metadata_observations: vec![MetadataObservation::Stat { path: path.clone() }],
-        ..ProjectContext::default()
+    let project = DiscoveredProject {
+        observations: ProjectObservations {
+            metadata_observations: vec![MetadataObservation::Stat { path: path.clone() }],
+            ..ProjectObservations::default()
+        },
+        ..DiscoveredProject::default()
     };
 
-    assert!(context.path_entry_for(&path).is_none());
+    assert!(project.context.path_entry_for(&path).is_none());
     assert!(matches!(
-        context.metadata_observations.as_slice(),
+        project.observations.metadata_observations.as_slice(),
         [MetadataObservation::Stat { path: observed }] if observed == &path
     ));
 }
@@ -977,14 +1057,15 @@ fn explicit_conditional_context_survives_project_discovery_without_platform_infe
         },
         &OverrideSession::new(None),
     )
-    .expect("standalone discovery");
+    .expect("standalone discovery")
+    .context;
 
     assert_eq!(
-        context.conditional_context.compiler_version,
+        context.conditional_context().compiler_version,
         explicit.compiler_version
     );
-    assert_eq!(context.conditional_context.options, explicit.options);
-    assert_eq!(context.conditional_context.constants, explicit.constants);
+    assert_eq!(context.conditional_context().options, explicit.options);
+    assert_eq!(context.conditional_context().constants, explicit.constants);
 }
 
 #[test]
@@ -1019,26 +1100,27 @@ fn project_conditional_metadata_fills_only_unknown_explicit_facts() {
         },
         &OverrideSession::new(None),
     )
-    .expect("project discovery");
+    .expect("project discovery")
+    .context;
 
     assert_eq!(
-        context.conditional_context.compiler_version,
+        context.conditional_context().compiler_version,
         Some(CompilerVersion::new(23, 0))
     );
     assert_eq!(
-        context.conditional_context.option("R"),
+        context.conditional_context().option("R"),
         ConditionalFact::False
     );
     assert_eq!(
-        context.conditional_context.option("RANGE_CHECKS"),
+        context.conditional_context().option("RANGE_CHECKS"),
         ConditionalFact::False
     );
     assert_eq!(
-        context.conditional_context.constant("BuildLevel"),
+        context.conditional_context().constant("BuildLevel"),
         Some(&ConstantValue::Integer(7))
     );
     assert_eq!(
-        context.conditional_context.define("PROJECT_DEFINE"),
+        context.conditional_context().define("PROJECT_DEFINE"),
         ConditionalFact::True
     );
 }
@@ -1063,10 +1145,11 @@ fn documented_compiler_version_property_is_discovered() {
         },
         &OverrideSession::new(None),
     )
-    .expect("project discovery");
+    .expect("project discovery")
+    .context;
 
     assert_eq!(
-        context.conditional_context.compiler_version,
+        context.conditional_context().compiler_version,
         Some(CompilerVersion::parse("18.5").expect("version"))
     );
 }
@@ -1082,7 +1165,10 @@ fn conflicting_compiler_version_properties_remain_unknown() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><CompilerVersion>18.5</CompilerVersion><DCC_CompilerVersion>24.0</DCC_CompilerVersion></PropertyGroup></Project>",
     );
 
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &source,
         &[directory.path().to_path_buf()],
         &ProjectOptions {
@@ -1093,9 +1179,9 @@ fn conflicting_compiler_version_properties_remain_unknown() {
     )
     .expect("project discovery");
 
-    assert_eq!(context.conditional_context.compiler_version, None);
+    assert_eq!(context.conditional_context().compiler_version, None);
     assert!(
-        context
+        observations
             .warnings
             .iter()
             .any(|warning| warning.contains("conflicting CompilerVersion"))

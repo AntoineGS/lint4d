@@ -7,6 +7,15 @@ use pascal_project::{
     LayoutSettings, ProjectContext, ProjectOptions,
 };
 
+fn edit_context<R>(
+    context: &mut std::sync::Arc<pascal_project::ProjectContext>,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(context)).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts).into();
+}
+
 fn context() -> ConditionalContext {
     ConditionalContext::default()
         .with_compiler_version(CompilerVersion::new(37, 0))
@@ -31,7 +40,7 @@ fn resolve(dir: &std::path::Path, text: &str) -> pascal_core::ResolvedProject {
         ..ProjectOptions::default()
     };
     let mut ctx = ProjectContext::discover(&path, &[dir.into()], &project_options).unwrap();
-    ctx.conditional_context = context();
+    edit_context(&mut ctx.context, |p| p.conditional_context = context());
     let sites = text
         .find("uses Types")
         .map(|start| pascal_core::ImportSite {
@@ -42,7 +51,7 @@ fn resolve(dir: &std::path::Path, text: &str) -> pascal_core::ResolvedProject {
         .into_iter()
         .collect::<Vec<_>>();
     UnitResolver::new(
-        ctx,
+        ctx.context,
         vec![dir.into()],
         FilesystemSourceStore::new(),
         ResolverLimits::default(),

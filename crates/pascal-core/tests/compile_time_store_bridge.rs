@@ -6,8 +6,21 @@ use pascal_core::{
 };
 use pascal_project::{ProjectContext, ProjectOptions};
 
+fn edit_context<R>(
+    context: &mut pascal_project::ProjectContext,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts);
+}
+
 fn context(root: &std::path::Path, dir: &std::path::Path) -> ProjectContext {
-    ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default()).unwrap()
+    std::sync::Arc::unwrap_or_clone(
+        ProjectContext::discover(root, &[dir.into()], &ProjectOptions::default())
+            .unwrap()
+            .context,
+    )
 }
 
 #[test]
@@ -93,7 +106,7 @@ fn admitted_directory_and_overlay_growth_refund_after_payload_drop() {
             DirectoryRequest {
                 directory: dir.path(),
                 entry: &entry,
-                read_policy: &ctx.read_policy,
+                read_policy: ctx.read_policy(),
             },
             &mut budget,
             &NoCancellation,
@@ -142,7 +155,7 @@ fn denied_payload_is_rejected_before_root_admission_or_payload_read() {
         SourceRequest {
             path: &path,
             entry: &entry,
-            read_policy: &ctx.read_policy,
+            read_policy: ctx.read_policy(),
             legacy_route: None,
             kind: SourceKind::Unit,
             max_bytes: 1024,
@@ -294,7 +307,7 @@ fn cancellation_during_incremental_directory_construction_refunds_partial_payloa
         DirectoryRequest {
             directory: dir.path(),
             entry: &entry,
-            read_policy: &ctx.read_policy,
+            read_policy: ctx.read_policy(),
         },
         &mut budget,
         &cancel,
@@ -322,13 +335,17 @@ fn actual_filesystem_provider_layout_is_positive_and_retains_payload_dependency(
     )
     .unwrap();
     let mut ctx = context(&root, dir.path());
-    ctx.conditional_context = pascal_project::ConditionalContext::default()
-        .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-        .with_layout(pascal_project::LayoutContext {
-            platform: Some(pascal_project::LayoutPlatform::Win32),
-            defaults: pascal_project::LayoutSettings::default(),
-        });
-    ctx.library_conditional_context = ctx.conditional_context.clone();
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = pascal_project::ConditionalContext::default()
+            .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+            .with_layout(pascal_project::LayoutContext {
+                platform: Some(pascal_project::LayoutPlatform::Win32),
+                defaults: pascal_project::LayoutSettings::default(),
+            })
+    });
+    edit_context(&mut ctx, |p| {
+        p.library_conditional_context = p.conditional_context.clone()
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],

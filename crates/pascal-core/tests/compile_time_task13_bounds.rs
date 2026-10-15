@@ -6,6 +6,15 @@ use pascal_core::{NoCancellation, ResolverError};
 use pascal_project::LayoutPlatform;
 use support::{Fixture, activity, context};
 
+fn edit_context<R>(
+    context: &mut std::sync::Arc<pascal_project::ProjectContext>,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(context)).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts).into();
+}
+
 #[test]
 fn task13_depth_boundaries_are_safe_in_isolated_default_stack_processes() {
     for case in [
@@ -147,9 +156,12 @@ fn task13_include_boundary(case: &str) {
         };
         std::fs::write(root.join(format!("f{i}.inc")), body).unwrap();
     }
-    let mut ctx =
-        ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut limits = ResolverLimits::default();
     assert_eq!(limits.max_include_depth, 256);
     if depth <= 5 {
@@ -367,9 +379,12 @@ fn task13_failed_include_probes_recover_without_resetting_work_or_publishing_par
     let path = root.join("T.pas");
     let text = "unit T; interface const Width=SizeOf({$I operand.inc}); {$IF Width=1}{$DEFINE HIT}{$ENDIF} implementation end.";
     std::fs::write(&path, text).unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[root.into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![root.into()],

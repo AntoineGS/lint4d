@@ -4,7 +4,7 @@ use std::{
 };
 
 use pascal_project::{
-    CompilerVersion, InstallationSelection, ProjectContext, ProjectOptions,
+    CompilerVersion, DiscoveredProject, InstallationSelection, ProjectContext, ProjectOptions,
     delphi_overrides::OverrideSession,
 };
 
@@ -28,7 +28,7 @@ fn discover_fixture(
     version: &str,
     install: &str,
     ide: &str,
-) -> (tempfile::TempDir, ProjectContext) {
+) -> (tempfile::TempDir, DiscoveredProject) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::write(root.join("Probe.dpr"), "program Probe; begin end.").unwrap();
@@ -86,58 +86,65 @@ fn local_delphi_installations_resolve_configured_roots() {
             "missing {version} EnvOptions.proj"
         );
 
-        let (_fixture, context) = discover_fixture(&delphi, &multidev, version, install, ide);
-        if !matches!(&context.installation_selection,
+        let (
+            _fixture,
+            DiscoveredProject {
+                context,
+                observations,
+            },
+        ) = discover_fixture(&delphi, &multidev, version, install, ide);
+        if !matches!(&context.installation_selection(),
             Some(InstallationSelection::Selected { id, .. }) if id == version)
         {
             failures.push(format!(
                 "{version}: unexpected selection {:?}",
-                context.installation_selection
+                context.installation_selection()
             ));
         }
-        if context.conditional_context.compiler_version != Some(CompilerVersion::new(compiler, 0)) {
+        if context.conditional_context().compiler_version != Some(CompilerVersion::new(compiler, 0))
+        {
             failures.push(format!(
                 "{version}: compiler version {:?}",
-                context.conditional_context.compiler_version
+                context.conditional_context().compiler_version
             ));
         }
         eprintln!(
             "Delphi {version}: selection={:?}; metadata={:?}; issues={:?}; warning_count={}",
-            context.installation_selection,
-            context.metadata_files,
-            context.path_issues,
-            context.warnings.len()
+            context.installation_selection(),
+            observations.metadata_files,
+            context.path_issues(),
+            observations.warnings.len()
         );
         if !context
-            .search_paths
+            .search_paths()
             .iter()
             .any(|path| path.starts_with(&sdk) && path.is_dir())
         {
             failures.push(format!(
                 "{version}: no existing SDK search path; selected paths {:?}",
-                context.search_paths
+                context.search_paths()
             ));
         }
         if !context
-            .browsing_path_entries
+            .browsing_path_entries()
             .iter()
             .any(|entry| entry.path.starts_with(&sdk) && entry.path.is_dir())
         {
             failures.push(format!(
                 "{version}: no existing SDK browsing path; entries {:?}",
-                context.browsing_path_entries
+                context.browsing_path_entries()
             ));
         }
         eprintln!(
             "Delphi {version}: selected {:?}; existing search paths: {:?}; browsing paths: {:?}",
-            context.installation_selection,
+            context.installation_selection(),
             context
-                .search_paths
+                .search_paths()
                 .iter()
                 .filter(|p| p.starts_with(&sdk) && p.is_dir())
                 .collect::<Vec<_>>(),
             context
-                .browsing_path_entries
+                .browsing_path_entries()
                 .iter()
                 .filter(|p| p.path.starts_with(&sdk) && p.path.is_dir())
                 .map(|p| &p.path)
@@ -147,30 +154,43 @@ fn local_delphi_installations_resolve_configured_roots() {
 
     // The 23.0 tree is known to be partial. Discovery must retain scoped
     // availability information rather than treating that profile as fatal.
-    let (_fixture, partial) = discover_fixture(
+    let (
+        _fixture,
+        DiscoveredProject {
+            context: partial,
+            observations: partial_observations,
+        },
+    ) = discover_fixture(
         &delphi,
         &multidev,
         "23.0",
         "Studio/23.0",
         "AppData/Embarcadero/BDS/23.0",
     );
-    if !matches!(&partial.installation_selection,
+    if !matches!(&partial.installation_selection(),
         Some(InstallationSelection::Selected { id, .. }) if id == "23.0")
     {
         failures.push(format!(
             "23.0: unexpected selection {:?}",
-            partial.installation_selection
+            partial.installation_selection()
         ));
     }
-    if partial.discovery_complete && partial.path_issues.is_empty() && partial.warnings.is_empty() {
+    if partial.discovery_complete()
+        && partial.path_issues().is_empty()
+        && partial_observations.warnings.is_empty()
+    {
         failures.push("23.0: no scoped partial-availability signal".to_string());
     }
     eprintln!(
         "Delphi 23.0 partial profile: complete={}, issues={:?}, warning_count={}, first_warnings={:?}",
-        partial.discovery_complete,
-        partial.path_issues,
-        partial.warnings.len(),
-        partial.warnings.iter().take(3).collect::<Vec<_>>()
+        partial.discovery_complete(),
+        partial.path_issues(),
+        partial_observations.warnings.len(),
+        partial_observations
+            .warnings
+            .iter()
+            .take(3)
+            .collect::<Vec<_>>()
     );
 
     // Validate ChainDriveAPI as a separate real-project discovery operation,
@@ -196,17 +216,18 @@ fn local_delphi_installations_resolve_configured_roots() {
         },
         &OverrideSession::new(Some(chain_config_path)),
     )
-    .unwrap();
-    if !matches!(&chain.installation_selection,
+    .unwrap()
+    .context;
+    if !matches!(&chain.installation_selection(),
         Some(InstallationSelection::Selected { id, .. }) if id == "37.0")
     {
         failures.push(format!(
             "ChainDriveAPI: expected profile 37.0, got {:?}",
-            chain.installation_selection
+            chain.installation_selection()
         ));
     }
     let third_party_missing = chain
-        .path_issues
+        .path_issues()
         .iter()
         .filter(|issue| {
             issue
@@ -217,7 +238,9 @@ fn local_delphi_installations_resolve_configured_roots() {
         .collect::<Vec<_>>();
     eprintln!(
         "ChainDriveAPI 37.0: selected {:?}; issues={:?}; missing third-party roots={:?}",
-        chain.installation_selection, chain.path_issues, third_party_missing
+        chain.installation_selection(),
+        chain.path_issues(),
+        third_party_missing
     );
     assert!(
         failures.is_empty(),

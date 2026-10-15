@@ -25,6 +25,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+pascal-project = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

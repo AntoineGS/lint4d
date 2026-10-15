@@ -3405,6 +3405,7 @@ pub(super) fn sizeof_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::edit_context;
 
     #[test]
     fn normal_work_defaults_fit_actual_dense_processing_with_finite_retention() {
@@ -3614,7 +3615,8 @@ mod tests {
             &[dir.path().into()],
             &Default::default(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         let context = ConditionalContext::default();
         let prove = |limits| {
             let mut resolver = crate::UnitResolver::new(
@@ -4000,15 +4002,20 @@ mod tests {
                     &[dir.path().into()],
                     &Default::default(),
                 )
-                .unwrap();
-                project.conditional_context = ConditionalContext::default()
-                    .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-                    .with_layout(pascal_project::LayoutContext {
-                        platform: Some(pascal_project::LayoutPlatform::Win32),
-                        defaults: Default::default(),
-                    });
-                project.library_conditional_context = project.conditional_context.clone();
-                let context = project.conditional_context.clone();
+                .unwrap()
+                .context;
+                edit_context(&mut project, |p| {
+                    p.conditional_context = ConditionalContext::default()
+                        .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                        .with_layout(pascal_project::LayoutContext {
+                            platform: Some(pascal_project::LayoutPlatform::Win32),
+                            defaults: Default::default(),
+                        })
+                });
+                edit_context(&mut project, |p| {
+                    p.library_conditional_context = p.conditional_context.clone()
+                });
+                let context = project.conditional_context().clone();
                 let mut inner = crate::UnitResolver::new(
                     project,
                     vec![dir.path().into()],
@@ -4187,18 +4194,20 @@ mod tests {
                 &[dir.path().into()],
                 &Default::default(),
             )
-            .unwrap();
-            project
-                .unit_aliases
-                .insert("Alias".into(), "Space.Other".into());
-            project.unit_namespaces = vec!["Space".into()];
+            .unwrap()
+            .context;
+            edit_context(&mut project, |p| {
+                p.unit_aliases.insert("Alias".into(), "Space.Other".into())
+            });
+            edit_context(&mut project, |p| p.unit_namespaces = vec!["Space".into()]);
             let entries = [&z, &a]
                 .into_iter()
                 .map(|p| project.path_entry_for(p).unwrap())
                 .collect();
-            project
-                .explicit_unit_entries
-                .insert("space.other".into(), entries);
+            edit_context(&mut project, |p| {
+                p.explicit_unit_entries
+                    .insert("space.other".into(), entries)
+            });
             let context = ConditionalContext::default()
                 .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
                 .with_layout(pascal_project::LayoutContext {
@@ -4336,13 +4345,14 @@ mod tests {
                 &[dir.path().into()],
                 &Default::default(),
             )
-            .unwrap();
+            .unwrap()
+            .context;
             if failed {
                 let bad = dir.path().join("Broken.pas");
                 let entry = project.path_entry_for(&bad).unwrap();
-                project
-                    .explicit_unit_entries
-                    .insert("broken".into(), vec![entry]);
+                edit_context(&mut project, |p| {
+                    p.explicit_unit_entries.insert("broken".into(), vec![entry])
+                });
             }
             let context = ConditionalContext::default()
                 .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
@@ -4491,18 +4501,23 @@ mod tests {
             &[dir.path().into()],
             &Default::default(),
         )
-        .unwrap();
-        project
-            .unit_aliases
-            .insert("Alias".into(), "Space.Other".into());
-        project.conditional_context = ConditionalContext::default()
-            .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-            .with_layout(pascal_project::LayoutContext {
-                platform: Some(pascal_project::LayoutPlatform::Win32),
-                defaults: Default::default(),
-            });
-        project.library_conditional_context = project.conditional_context.clone();
-        let context = project.conditional_context.clone();
+        .unwrap()
+        .context;
+        edit_context(&mut project, |p| {
+            p.unit_aliases.insert("Alias".into(), "Space.Other".into())
+        });
+        edit_context(&mut project, |p| {
+            p.conditional_context = ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                })
+        });
+        edit_context(&mut project, |p| {
+            p.library_conditional_context = p.conditional_context.clone()
+        });
+        let context = project.conditional_context().clone();
         let mut inner = crate::UnitResolver::new(
             project,
             vec![dir.path().into()],

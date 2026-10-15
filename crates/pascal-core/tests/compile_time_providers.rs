@@ -4,6 +4,15 @@ use pascal_core::conditional::Truth;
 use pascal_project::LayoutPlatform;
 use support::{Fixture, activity, context};
 
+fn edit_context<R>(
+    context: &mut std::sync::Arc<pascal_project::ProjectContext>,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(context)).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts).into();
+}
+
 fn assert_qualified_export_fact(
     fixture: &Fixture,
     analysis: &pascal_core::compile_time::CompileTimeAnalysis,
@@ -294,9 +303,12 @@ fn filesystem_resolver_imported_ordinal_arrays_are_known() {
         "unit Other; interface type E=(One,Two,Three); R=-2..0; RA=R; implementation end.",
     )
     .unwrap();
-    let mut cx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    cx.conditional_context = context(LayoutPlatform::Win32);
+    let mut cx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut cx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         cx,
         vec![dir.path().into()],

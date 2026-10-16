@@ -12,6 +12,7 @@ mod member_key;
 mod path;
 mod project;
 mod source;
+mod store;
 
 pub use artifact_key::{
     ExpandedArtifactKey, IncludeOccurrence, IncludeOutcome, KeyError, LocalArtifactKey,
@@ -32,3 +33,7 @@ pub use manifest::{
     ManifestHeader, Mismatch,
 };
 pub use namespace::{BUILD_FINGERPRINT, Namespace};
+pub use store::{
+    Bypass, DATABASE_FILE, Integrity, LimitsError, LocationIssue, Lookup, Malformed, Miss,
+    Published, StoreLocation, TooLarge, default_directory,
+};

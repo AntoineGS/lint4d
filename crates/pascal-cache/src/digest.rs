@@ -38,8 +38,6 @@ impl Digest {
         Some(Self(bytes))
     }
 
-    // Unused outside tests until the key manifest digest is added; remove then.
-    #[allow(dead_code)]
     pub(crate) fn derive(context: &'static str, material: &[u8]) -> Self {
         Self(blake3::derive_key(context, material))
     }

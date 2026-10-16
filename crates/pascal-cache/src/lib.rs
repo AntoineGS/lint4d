@@ -10,3 +10,14 @@ mod path;
 
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
+
+#[cfg(test)]
+mod build_fingerprint;
+mod manifest;
+mod namespace;
+
+pub use manifest::{
+    CanonicalKey, KeyKind, KeyRecord, MANIFEST_HEADER_LEN, MANIFEST_MAGIC, ManifestError,
+    ManifestHeader, Mismatch,
+};
+pub use namespace::{BUILD_FINGERPRINT, Namespace};

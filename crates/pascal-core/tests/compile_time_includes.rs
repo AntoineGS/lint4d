@@ -1168,15 +1168,23 @@ fn fix_i3_versions_replace_temporary_projection_and_share_work() {
         FilesystemSourceStore, NoCancellation, ResolvedImports, ResolvedUnit, ResolverLimits,
         UnitResolver,
     };
+    use pascal_project::delphi_overrides::OverrideSession;
     use pascal_project::{ProjectContext, ProjectOptions};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("T.pas");
     let base = "unit T; interface {$I value.inc} implementation end.";
     std::fs::write(&path, base).unwrap();
     std::fs::write(dir.path().join("value.inc"), "{body}").unwrap();
-    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-        .unwrap()
-        .context;
+    // The empty override session keeps the user's path mappings out of every
+    // retained read policy.
+    let mut ctx = ProjectContext::discover_with_overrides(
+        &path,
+        &[dir.path().into()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap()
+    .context;
     edit_context(&mut ctx, |p| {
         p.conditional_context = context(LayoutPlatform::Win32)
     });
@@ -1223,15 +1231,23 @@ fn fix_i3_repeated_project_outputs_are_admitted_not_free_replays() {
     use pascal_core::{
         FilesystemSourceStore, NoCancellation, ResolverLimits, UnitResolveRequest, UnitResolver,
     };
+    use pascal_project::delphi_overrides::OverrideSession;
     use pascal_project::{ProjectContext, ProjectOptions};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("T.pas");
     let text = "unit T; interface {$I value.inc} implementation end.";
     std::fs::write(&path, text).unwrap();
     std::fs::write(dir.path().join("value.inc"), "type R=Byte;").unwrap();
-    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-        .unwrap()
-        .context;
+    // The empty override session keeps the user's path mappings out of every
+    // retained read policy.
+    let mut ctx = ProjectContext::discover_with_overrides(
+        &path,
+        &[dir.path().into()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap()
+    .context;
     edit_context(&mut ctx, |p| {
         p.conditional_context = context(LayoutPlatform::Win32)
     });

@@ -1,0 +1,17 @@
+[package]
+name = "pascal-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Canonical durable keys for the lint4d persistent analysis cache"
+
+[dependencies]
+blake3 = "1.8.7"
+
+[lints]
+workspace = true

@@ -248,7 +248,9 @@ pub(crate) fn retire_obsolete(
                 .map_err(fail)?;
         }
         transaction.commit().map_err(fail)?;
-        lock.remove()?;
+        // The scope is retired either way. A lock file that cannot be
+        // removed is reused if the namespace is registered again.
+        let _ = lock.remove();
         report.retired += changed;
     }
     Ok(report)
@@ -324,4 +326,37 @@ pub(crate) fn reclaim(
         rows,
         complete: remaining == 0,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sharer_that_opened_a_removed_lock_file_starts_again() {
+        let root = tempfile::tempdir().unwrap();
+        let location = StoreLocation::prepare(&root.path().join("cache")).unwrap();
+        location.prepare_namespace_locks().unwrap();
+        let path = location.namespace_lock(Digest::from_bytes([3; 32]));
+        let retiring = NamespaceLock::try_exclusive(path.clone())
+            .unwrap()
+            .expect("nobody holds it");
+        // A sharer opened the file before the retirer removed it.
+        let stale = open_lock_file(&path).unwrap();
+        retiring.remove().unwrap();
+        stale.try_lock_shared().unwrap();
+        assert!(!still_linked(&stale, &path).unwrap());
+        // `share` opens again and holds the fresh, linked file.
+        let lock =
+            NamespaceLock::share(path.clone(), Deadline::after(Duration::from_secs(1))).unwrap();
+        assert!(still_linked(&lock._file, &path).unwrap());
+        assert!(
+            NamespaceLock::try_exclusive(path.clone())
+                .unwrap()
+                .is_none()
+        );
+        // The stale handle's lock is on the removed file and blocks nothing.
+        drop(lock);
+        assert!(NamespaceLock::try_exclusive(path).unwrap().is_some());
+    }
 }

@@ -14,6 +14,10 @@ use std::process::{Command, Stdio};
 const ROLE: &str = "PASCAL_CACHE_CHILD_ROLE";
 const DIRECTORY: &str = "PASCAL_CACHE_CHILD_DIRECTORY";
 const ARTIFACT: &str = "PASCAL_CACHE_CHILD_ARTIFACT";
+/// The namespace every role but "hold" opens.
+const SHARED_NAMESPACE: u8 = 1;
+/// The namespace the "hold" child keeps live while the parent retires.
+const HOLD_NAMESPACE: u8 = 9;
 
 fn namespace(byte: u8) -> Namespace {
     Namespace::new(Digest::from_bytes([byte; 32]))
@@ -79,7 +83,11 @@ fn child_process_entry() {
     };
     let directory = std::env::var_os(DIRECTORY).expect("directory");
     let artifact = std::env::var(ARTIFACT).unwrap_or_default();
-    let byte = if role == "hold" { 9 } else { 1 };
+    let byte = if role == "hold" {
+        HOLD_NAMESPACE
+    } else {
+        SHARED_NAMESPACE
+    };
     let store = Store::open(
         Path::new(&directory),
         &namespace(byte),
@@ -148,7 +156,12 @@ fn private_directory(root: &Path) -> std::path::PathBuf {
 fn two_processes_share_published_records() {
     let root = tempfile::tempdir().unwrap();
     let directory = private_directory(root.path());
-    let store = Store::open(&directory, &namespace(1), StoreLimits::default()).unwrap();
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
     // Published by another process, read and verified here.
     assert_eq!(result("publish", &directory, "Alpha"), "Inserted");
     assert_eq!(read(&store, "Alpha"), Some(payloads("Alpha")));
@@ -163,7 +176,14 @@ fn two_processes_share_published_records() {
 fn a_process_aborted_before_commit_leaves_no_partial_artifact() {
     let root = tempfile::tempdir().unwrap();
     let directory = private_directory(root.path());
-    drop(Store::open(&directory, &namespace(1), StoreLimits::default()).unwrap());
+    drop(
+        Store::open(
+            &directory,
+            &namespace(SHARED_NAMESPACE),
+            StoreLimits::default(),
+        )
+        .unwrap(),
+    );
     let status = child("abort-before-commit", &directory, "Gamma")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -172,7 +192,12 @@ fn a_process_aborted_before_commit_leaves_no_partial_artifact() {
     // Death by SIGABRT proves the child reached the hook.
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
     // A new process recovers the WAL and sees no trace of the aborted write.
-    let store = Store::open(&directory, &namespace(1), StoreLimits::default()).unwrap();
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
     assert_eq!(
         store
             .open_artifact(ArtifactKeyRef::local(&key("Gamma")))
@@ -208,8 +233,15 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
             "child exited early"
         );
     }
-    let store = Store::open(&directory, &namespace(1), StoreLimits::default()).unwrap();
-    let lock = store.location().namespace_lock(namespace(9).id());
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let lock = store
+        .location()
+        .namespace_lock(namespace(HOLD_NAMESPACE).id());
     assert_eq!(
         store.retire_obsolete(),
         Ok(RetireReport {

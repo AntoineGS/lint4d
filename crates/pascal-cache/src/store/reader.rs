@@ -205,6 +205,8 @@ impl ArtifactReader<'_> {
         // Copy the `&'a Store` out of `self`, so the leased connection does
         // not borrow `self` and `self.fail` stays callable below.
         let store = self.store;
+        // A batch's size is known only once its rows are read, so reserve
+        // the whole batch allowance up front and shrink to what was used.
         let Some(mut scratch) = store.scratch.reserve(MAX_ROW_BATCH_BYTES as u64) else {
             return Err(Bypass::ScratchExhausted);
         };

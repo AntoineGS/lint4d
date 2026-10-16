@@ -384,4 +384,97 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("CHECK"), "{error}");
     }
+
+    #[test]
+    fn prepare_classifies_a_damaged_file_itself() {
+        let root = tempfile::tempdir().unwrap();
+        // A raw connection runs no pragmas, so `prepare_container` is the
+        // first to read the file.
+        let garbage = root.path().join("garbage.sqlite3");
+        std::fs::write(&garbage, vec![0x5a; 8192]).unwrap();
+        assert_eq!(
+            prepare_container(&mut Connection::open(&garbage).unwrap(), deadline()),
+            Err(Bypass::Corrupt)
+        );
+        // A valid header over a damaged schema page.
+        let damaged = root.path().join("damaged.sqlite3");
+        prepare_container(&mut connect(&damaged), deadline()).unwrap();
+        let mut bytes = std::fs::read(&damaged).unwrap();
+        bytes[100..1024].fill(0xff);
+        std::fs::write(&damaged, &bytes).unwrap();
+        assert_eq!(
+            prepare_container(&mut Connection::open(&damaged).unwrap(), deadline()),
+            Err(Bypass::Corrupt)
+        );
+    }
+
+    #[test]
+    fn a_database_without_wal_support_is_bypassed() {
+        // An in-memory database keeps its `memory` journal.
+        let mut connection = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            prepare_container(&mut connection, deadline()),
+            Err(Bypass::WalUnavailable)
+        );
+    }
+
+    #[test]
+    fn schema_bounds_match_the_store_limits() {
+        use crate::store::limits::{
+            MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES,
+            MAX_ROW_BATCH_BYTES, MAX_SUPPLEMENTAL_BYTES,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = connect(&root.path().join("a.sqlite3"));
+        prepare_container(&mut connection, deadline()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
+                 INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
+                 INSERT INTO artifacts VALUES
+                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');",
+            )
+            .unwrap();
+        // Each statement takes the bound as ?1: accepted at the limit,
+        // refused by a CHECK one past it.
+        let cases = [
+            (
+                "UPDATE namespaces SET manifest = zeroblob(?1)",
+                MAX_MANIFEST_BYTES,
+            ),
+            (
+                "UPDATE key_manifests SET manifest = zeroblob(?1)",
+                MAX_MANIFEST_BYTES,
+            ),
+            ("UPDATE artifacts SET row_count = ?1", MAX_ARTIFACT_ROWS),
+            (
+                "UPDATE artifacts SET content_bytes = ?1",
+                MAX_ARTIFACT_CONTENT_BYTES,
+            ),
+            (
+                "UPDATE artifacts SET supplemental = zeroblob(?1)",
+                MAX_SUPPLEMENTAL_BYTES,
+            ),
+            (
+                "INSERT INTO artifact_rows VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, zeroblob(?1), x'', zeroblob(32))",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "INSERT INTO artifact_rows VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, NULL, zeroblob(?1), zeroblob(32))",
+                MAX_ROW_BATCH_BYTES,
+            ),
+        ];
+        for (sql, limit) in cases {
+            let at = connection.execute(sql, [limit as i64]);
+            assert!(at.is_ok(), "{sql} at {limit}: {at:?}");
+            connection.execute("DELETE FROM artifact_rows", []).unwrap();
+            let past = connection.execute(sql, [limit as i64 + 1]).unwrap_err();
+            assert!(
+                past.to_string().contains("CHECK"),
+                "{sql} past {limit}: {past}"
+            );
+        }
+    }
 }

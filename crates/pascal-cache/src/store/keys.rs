@@ -52,17 +52,23 @@ impl<'a> ArtifactKeyRef<'a> {
     }
 }
 
-/// Insert `key`'s manifest unless the identical manifest is stored.
+/// Refuse a manifest over the admission limit before any lock is taken.
+pub(crate) fn check_manifest_size(key: &CanonicalKey) -> Result<(), Bypass> {
+    let bytes = key.manifest().len();
+    if bytes > MAX_MANIFEST_BYTES {
+        return Err(Bypass::TooLarge(TooLarge::Manifest { bytes }));
+    }
+    Ok(())
+}
+
+/// Insert `key`'s manifest unless the identical manifest is stored. Callers
+/// check its size with [`check_manifest_size`] before taking the write lock.
 pub(crate) fn put_manifest(
     connection: &Connection,
     scope: Scope,
     key: &CanonicalKey,
 ) -> Result<Published, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let bytes = key.manifest().len();
-    if bytes > MAX_MANIFEST_BYTES {
-        return Err(Bypass::TooLarge(TooLarge::Manifest { bytes }));
-    }
     let stored: Option<Vec<u8>> = connection
         .query_row(
             "SELECT manifest FROM key_manifests \
@@ -136,6 +142,7 @@ pub(crate) fn admit_manifest(
 impl Store {
     /// Retain `key`'s manifest, for example a context key's.
     pub fn publish_key(&self, key: &CanonicalKey) -> Result<Published, Bypass> {
+        check_manifest_size(key)?;
         let mut writer = self.writer()?;
         let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
         ensure_live(&transaction, self.scope)?;

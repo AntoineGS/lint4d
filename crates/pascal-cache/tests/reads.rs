@@ -502,3 +502,120 @@ fn a_header_from_another_store_is_fenced() {
     assert_eq!(reader.next_batch(), Err(Bypass::Fenced));
     assert!(!reader.is_verified());
 }
+
+const MIXED: [ArtifactRow<'static>; 3] = [
+    ArtifactRow {
+        row_kind: 1,
+        index_key: None,
+        payload: b"a",
+    },
+    ArtifactRow {
+        row_kind: 1,
+        index_key: Some(b""),
+        payload: b"b",
+    },
+    ArtifactRow {
+        row_kind: 2,
+        index_key: Some(b"name"),
+        payload: b"c",
+    },
+];
+
+/// Publish `rows`, apply `tamper` through a raw connection with CHECK
+/// constraints off, then read the artifact to the end.
+fn read_tampered(rows: &[ArtifactRow<'_>], tamper: &str) -> Result<Vec<usize>, Miss> {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let key = key("unit A;");
+    let write = ArtifactWrite {
+        key: ArtifactKeyRef::local(&key),
+        supplemental: b"s",
+        rows,
+    };
+    store.publish_artifact(&write).unwrap();
+    let Lookup::Hit(header) = store.open_artifact(ArtifactKeyRef::local(&key)).unwrap() else {
+        panic!("a published artifact opens");
+    };
+    let connection = raw(root.path());
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .unwrap();
+    connection.execute_batch(tamper).unwrap();
+    read_all(&store, &header)
+}
+
+#[test]
+fn tampered_row_fields_are_misses() {
+    assert_eq!(read_tampered(&MIXED, ""), Ok(vec![3]));
+    for (tamper, expected) in [
+        (
+            "UPDATE artifact_rows SET row_kind = 3 WHERE ordinal = 2",
+            Miss::ChecksumMismatch,
+        ),
+        // No index key and an empty one are different rows.
+        (
+            "UPDATE artifact_rows SET index_key = x'' WHERE ordinal = 0",
+            Miss::ChecksumMismatch,
+        ),
+        (
+            "UPDATE artifact_rows SET index_key = NULL WHERE ordinal = 1",
+            Miss::ChecksumMismatch,
+        ),
+        (
+            "UPDATE artifact_rows SET row_kind = 0 WHERE ordinal = 2",
+            Miss::ChecksumMismatch,
+        ),
+        (
+            "UPDATE artifact_rows SET row_kind = 256 WHERE ordinal = 2",
+            Miss::Malformed(Malformed::Row),
+        ),
+        (
+            "UPDATE artifact_rows SET row_kind = -1 WHERE ordinal = 2",
+            Miss::Malformed(Malformed::Row),
+        ),
+    ] {
+        assert_eq!(read_tampered(&MIXED, tamper), Err(expected), "{tamper}");
+    }
+}
+
+#[test]
+fn a_row_copied_from_another_artifact_is_a_checksum_miss() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let a = publish(&store, &key("unit A;"), &small(3));
+    let b = publish(&store, &key("unit B;"), &small(3));
+    // Same payloads in both, so only the checksum's artifact binding differs.
+    raw(root.path())
+        .execute(
+            "UPDATE artifact_rows SET (row_kind, index_key, payload, row_checksum) = \
+             (SELECT row_kind, index_key, payload, row_checksum FROM artifact_rows \
+              WHERE artifact_id = ?2 AND ordinal = 1) \
+             WHERE artifact_id = ?1 AND ordinal = 1",
+            params![
+                a.artifact_id().as_bytes().as_slice(),
+                b.artifact_id().as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    assert_eq!(read_all(&store, &a), Err(Miss::ChecksumMismatch));
+    assert_eq!(read_all(&store, &b), Ok(vec![3]));
+}
+
+#[test]
+fn an_artifact_retired_between_batches_is_a_miss() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let header = publish(&store, &key("unit A;"), &small(300));
+    let mut reader = store.read_artifact(&header);
+    assert!(matches!(reader.next_batch().unwrap(), Lookup::Hit(Some(_))));
+    raw(root.path())
+        .execute("UPDATE artifacts SET lifecycle = 2", [])
+        .unwrap();
+    assert_eq!(reader.next_batch().unwrap(), Lookup::Miss(Miss::Retired));
+    assert!(!reader.is_verified());
+    assert_eq!(
+        reader.next_batch().unwrap(),
+        Lookup::Miss(Miss::Retired),
+        "a failed read stays failed"
+    );
+}

@@ -1,9 +1,10 @@
 #![cfg(unix)]
 
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, ExpandedArtifactKey, Integrity,
-    LocalArtifactKey, Lookup, Malformed, Mismatch, Miss, Namespace, Published, RootMismatch,
-    SourceContent, Store, StoreLimits, TooLarge,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, ExpandedArtifactKey,
+    IncludeOccurrence, IncludeOutcome, Integrity, LocalArtifactKey, Lookup, MAX_MANIFEST_BYTES,
+    Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
+    StoreLimits, TooLarge,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use rusqlite::{Connection, params};
@@ -87,7 +88,9 @@ fn a_published_artifact_opens_with_its_header() {
     assert_eq!(header.artifact_id(), key.digest());
     assert_eq!(header.row_count(), 3);
     assert_eq!(header.content_bytes(), (4 + 15 + 7 + 4 + 15) as u64);
-    assert_eq!(header.supplemental(), b"coverage");
+    let mut reader = store.read_artifact(&header);
+    while let Lookup::Hit(Some(_)) = reader.next_batch().unwrap() {}
+    assert_eq!(reader.supplemental(), Some(b"coverage".as_slice()));
 }
 
 #[test]
@@ -435,5 +438,82 @@ fn a_fenced_store_neither_publishes_nor_reads() {
     assert_eq!(
         store.open_artifact(ArtifactKeyRef::local(&key)),
         Err(Bypass::Fenced)
+    );
+}
+
+#[test]
+fn an_oversized_manifest_is_refused_before_taking_the_write_lock() {
+    let root_dir = private_tempdir();
+    let store = open(root_dir.path());
+    let root = key("unit Root;");
+    let occurrence = IncludeOccurrence {
+        parent: None,
+        directive_range: 0..12,
+        directive: "x".repeat(MAX_MANIFEST_BYTES + 1),
+        inherited: ConditionalContext::default(),
+        outcome: IncludeOutcome::Unresolved {
+            searched: Vec::new(),
+            reason: String::new(),
+        },
+    };
+    let expanded = ExpandedArtifactKey::new(&root, &[occurrence]).unwrap();
+    let bytes = expanded.key().manifest().len();
+    assert!(bytes > MAX_MANIFEST_BYTES);
+    let refused = Err(Bypass::TooLarge(TooLarge::Manifest { bytes }));
+    // Holding the writer turns any lock wait into `Busy`.
+    let _writer = store.hold_writer_for_test().unwrap();
+    assert_eq!(store.publish_key(expanded.key()), refused);
+    let write = ArtifactWrite {
+        key: ArtifactKeyRef::expanded(&expanded, &root).unwrap(),
+        supplemental: b"",
+        rows: &ROWS,
+    };
+    assert_eq!(store.publish_artifact(&write), refused);
+}
+
+#[test]
+fn a_tampered_root_key_is_a_malformed_header() {
+    let root_dir = private_tempdir();
+    let store = open(root_dir.path());
+    let root = key("unit Root;");
+    let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
+    let reference = ArtifactKeyRef::expanded(&expanded, &root).unwrap();
+    let write = ArtifactWrite {
+        key: reference,
+        supplemental: b"",
+        rows: &ROWS,
+    };
+    store.publish_artifact(&write).unwrap();
+    // Another retained manifest (the artifact's own), so foreign keys hold.
+    raw(root_dir.path())
+        .execute("UPDATE artifacts SET root_key = artifact_id", [])
+        .unwrap();
+    assert_eq!(
+        store.open_artifact(reference).unwrap(),
+        Lookup::Miss(Miss::Malformed(Malformed::Header))
+    );
+}
+
+#[test]
+fn republishing_over_a_conflicting_root_manifest_is_an_integrity_failure() {
+    let root_dir = private_tempdir();
+    let store = open(root_dir.path());
+    let root = key("unit Root;");
+    let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
+    let write = ArtifactWrite {
+        key: ArtifactKeyRef::expanded(&expanded, &root).unwrap(),
+        supplemental: b"",
+        rows: &ROWS,
+    };
+    store.publish_artifact(&write).unwrap();
+    raw(root_dir.path())
+        .execute(
+            "UPDATE key_manifests SET manifest = CAST(manifest || x'00' AS BLOB) WHERE digest = ?1",
+            [root.digest().as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.publish_artifact(&write),
+        Err(Bypass::Integrity(Integrity::ConflictingManifest))
     );
 }

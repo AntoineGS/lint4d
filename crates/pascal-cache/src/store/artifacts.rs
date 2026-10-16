@@ -1,5 +1,5 @@
 use super::Store;
-use super::keys::{ArtifactKeyRef, admit_manifest, put_manifest};
+use super::keys::{ArtifactKeyRef, admit_manifest, check_manifest_size, put_manifest};
 use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
     MAX_SUPPLEMENTAL_BYTES,
@@ -36,10 +36,10 @@ pub struct ArtifactWrite<'a> {
     pub rows: &'a [ArtifactRow<'a>],
 }
 
-/// An admitted artifact header. Its supplemental bytes, counts and rows are
-/// all unverified until [`Store::read_artifact`] has streamed and checked
-/// every row and the reader reports `is_verified()`; callers must not trust
-/// coverage or counts before then.
+/// An admitted artifact header. Its counts and rows are unverified until
+/// [`Store::read_artifact`] has streamed and checked every row and the reader
+/// reports `is_verified()`; its supplemental bytes are available only then,
+/// through `ArtifactReader::supplemental`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHeader {
     pub(crate) scope: Scope,
@@ -62,12 +62,6 @@ impl ArtifactHeader {
     /// Bytes of payloads and index keys over all rows.
     pub fn content_bytes(&self) -> u64 {
         self.content_bytes
-    }
-
-    /// Unverified: the fact checksum covers these bytes, but it is checked
-    /// only at the end of the read. Prefer `ArtifactReader::supplemental`.
-    pub fn supplemental(&self) -> &[u8] {
-        &self.supplemental
     }
 }
 
@@ -146,6 +140,10 @@ impl FactHasher {
 /// Check every admission limit before any work: an oversized artifact is
 /// simply not persisted (spec §6.2, §10).
 fn admit_write(write: &ArtifactWrite<'_>) -> Result<u64, Bypass> {
+    check_manifest_size(write.key.key())?;
+    if let Some(root) = write.key.root() {
+        check_manifest_size(root)?;
+    }
     let too_large = |limit| Err(Bypass::TooLarge(limit));
     if write.supplemental.len() > MAX_SUPPLEMENTAL_BYTES {
         return too_large(TooLarge::Supplemental {

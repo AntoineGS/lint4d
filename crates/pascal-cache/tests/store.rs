@@ -472,4 +472,9 @@ fn a_lock_file_that_cannot_be_removed_does_not_undo_retirement() {
         })
     );
     assert_eq!(state(&directory, 1), Some((0, 2)));
+    let lock = store.location().namespace_lock(namespace(1).id());
+    assert!(lock.exists(), "the removal failed, so the file is left");
+    drop(open(&directory, 1));
+    assert_eq!(state(&directory, 1), Some((1, 1)));
+    assert!(lock.exists());
 }

@@ -9,7 +9,7 @@ use pascal_cache::{
     MAX_WAIT, Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
     StoreLimits, TooLarge,
 };
-use pascal_project::{ConditionalContext, SourceOrigin};
+use pascal_project::{ConditionalContext, ConditionalFact, SourceOrigin};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -459,6 +459,34 @@ fn an_oversized_manifest_is_refused_before_taking_the_write_lock() {
         rows: &ROWS,
     };
     assert_eq!(store.publish_artifact(&write), refused);
+}
+
+#[test]
+fn an_oversized_root_manifest_is_refused_before_taking_the_write_lock() {
+    let root_dir = private_tempdir();
+    let store = open(root_dir.path());
+    let mut context = ConditionalContext::default();
+    context.set_define("D".repeat(MAX_MANIFEST_BYTES + 1), ConditionalFact::True);
+    let root = LocalArtifactKey::new(
+        &SourceContent::from_bytes(b"unit Root;"),
+        &context,
+        SourceOrigin::ProjectCompiled,
+    );
+    let bytes = root.key().manifest().len();
+    assert!(bytes > MAX_MANIFEST_BYTES);
+    let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
+    assert!(expanded.key().manifest().len() <= MAX_MANIFEST_BYTES);
+    let write = ArtifactWrite {
+        key: ArtifactKeyRef::expanded(&expanded, &root).unwrap(),
+        supplemental: b"",
+        rows: &ROWS,
+    };
+    // Holding the writer turns any lock wait into `Busy`.
+    let _writer = store.hold_writer_for_test().unwrap();
+    assert_eq!(
+        store.publish_artifact(&write),
+        Err(Bypass::TooLarge(TooLarge::Manifest { bytes }))
+    );
 }
 
 #[test]

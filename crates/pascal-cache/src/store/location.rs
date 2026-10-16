@@ -39,8 +39,10 @@ pub struct StoreLocation {
 impl StoreLocation {
     /// Create `directory` and its missing parents (mode `0700`), then check
     /// it. An existing directory is checked, never modified.
-    /// Only the final component must not be a symlink: the ancestors are
-    /// the user's own path (`/home` -> `/var/home`, `/var` -> `/private/var`).
+    ///
+    /// Only the final component must not be a symlink: the ancestors are part
+    /// of the path the user chose (`/home` -> `/var/home`, `/var` ->
+    /// `/private/var`).
     pub fn prepare(directory: &Path) -> Result<Self, Bypass> {
         if !directory.is_absolute() {
             return Err(Bypass::Location(LocationIssue::NotAbsolute));
@@ -80,6 +82,7 @@ impl StoreLocation {
     }
 
     /// Accept a store file that is absent, or a regular file of this user.
+    ///
     /// Modes and link counts are not checked: SQLite creates its files with
     /// the umask, and the private directory keeps other users out of them.
     pub fn check_file(path: &Path) -> Result<(), Bypass> {
@@ -114,6 +117,7 @@ fn check_directory_metadata(
 
 /// Filesystems known to be local disks or memory, by `statfs` magic.
 /// Anything else, including NFS, SMB, FUSE and 9p, is not local.
+///
 /// overlayfs and ecryptfs stack on another filesystem and could in theory
 /// hide a network one; they are kept because they are the devcontainer root
 /// and the legacy encrypted home, both local in practice (l4d-8k0b).

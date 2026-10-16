@@ -134,6 +134,59 @@ impl PartialEq for ReadPolicy {
 
 impl Eq for ReadPolicy {}
 
+/// Everything [`ReadPolicy`] equality compares, borrowed for canonical
+/// encodings. The compiled exclusion matcher is derived from `exclusions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPolicyView<'a> {
+    pub configured_roots: Vec<ReadRootView<'a>>,
+    pub mapped_roots: Vec<ReadRootView<'a>>,
+    pub authorized_files: &'a [PathBuf],
+    pub exclusions: &'a [String],
+    pub exclusion_bases: &'a [PathBuf],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadRootView<'a> {
+    pub path: &'a Path,
+    pub pattern_exclusion_bases: &'a [PathBuf],
+}
+
+fn root_views(roots: &[AuthorizedReadRoot]) -> Vec<ReadRootView<'_>> {
+    roots
+        .iter()
+        .map(|root| {
+            let AuthorizedReadRoot {
+                path,
+                pattern_exclusion_bases,
+            } = root;
+            ReadRootView {
+                path,
+                pattern_exclusion_bases,
+            }
+        })
+        .collect()
+}
+
+impl ReadPolicy {
+    pub fn view(&self) -> ReadPolicyView<'_> {
+        let Self {
+            configured_roots,
+            mapped_roots,
+            authorized_files,
+            exclusions,
+            exclusion_bases,
+            compiled_exclusions: _,
+        } = self;
+        ReadPolicyView {
+            configured_roots: root_views(configured_roots),
+            mapped_roots: root_views(mapped_roots),
+            authorized_files: authorized_files.as_slice(),
+            exclusions,
+            exclusion_bases,
+        }
+    }
+}
+
 impl ReadPolicy {
     /// Owned storage copied by `Clone`. The authorization-file table and the
     /// compiled matcher are shared Arc backing, not copied parser/cache payload.
@@ -1606,5 +1659,39 @@ mod tests {
         let s = scope.snapshot();
         assert_eq!(s.value(Metric::LegacyHashBytes), 5);
         assert_eq!(s.value(Metric::ProjectStampProbes), 1);
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn read_policy_view_follows_policy_equality() {
+        let overrides = EffectiveOverrides::default();
+        let first = ReadPolicy::new(
+            &[PathBuf::from("/w")],
+            &[],
+            &["*.bak".to_string()],
+            &overrides,
+        );
+        let same = ReadPolicy::new(
+            &[PathBuf::from("/w")],
+            &[],
+            &["*.bak".to_string()],
+            &overrides,
+        );
+        let other_root = ReadPolicy::new(
+            &[PathBuf::from("/v")],
+            &[],
+            &["*.bak".to_string()],
+            &overrides,
+        );
+        let other_exclusion = ReadPolicy::new(&[PathBuf::from("/w")], &[], &[], &overrides);
+        assert_eq!(first, same);
+        assert_eq!(first.view(), same.view());
+        assert_ne!(first.view(), other_root.view());
+        assert_ne!(first.view(), other_exclusion.view());
+        assert_eq!(first.view().exclusions, ["*.bak".to_string()]);
     }
 }

@@ -1,25 +1,18 @@
 #![cfg(unix)]
 
+mod common;
+use common::private_tempdir;
+
 use pascal_cache::{
     ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, ExpandedArtifactKey,
     IncludeOccurrence, IncludeOutcome, Integrity, LocalArtifactKey, Lookup, MAX_MANIFEST_BYTES,
-    Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
+    MAX_WAIT, Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
     StoreLimits, TooLarge,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{Duration, Instant};
-
-fn private_tempdir() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(
-        root.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
-    root
-}
 
 fn namespace(byte: u8) -> Namespace {
     Namespace::new(Digest::from_bytes([byte; 32]))
@@ -413,11 +406,8 @@ fn a_held_write_lock_bypasses_writes_but_not_reads() {
         store.publish_artifact(&write(&key("unit B;"), &ROWS)),
         Err(Bypass::Busy)
     );
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        start.elapsed()
-    );
+    // 10x the allowance: a lost bound (seconds) fails, scheduling slack does not.
+    assert!(start.elapsed() < MAX_WAIT * 10, "{:?}", start.elapsed());
     assert!(matches!(header(&store, &a), Lookup::Hit(_)));
     other.execute_batch("ROLLBACK").unwrap();
 }

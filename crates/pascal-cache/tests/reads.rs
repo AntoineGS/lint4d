@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+mod common;
+use common::private_tempdir;
+
 use pascal_cache::{
     ArtifactHeader, ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, IndexHit,
     LocalArtifactKey, Lookup, Malformed, Miss, Namespace, RowBatch, SourceContent, Store,
@@ -432,16 +435,6 @@ fn index_lookup_uses_the_index_without_sorting() {
     let plan = plan.join("\n");
     assert!(plan.contains("artifact_rows_by_index_key"), "{plan}");
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-}
-
-fn private_tempdir() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(
-        root.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
-    root
 }
 
 #[test]

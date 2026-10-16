@@ -1,23 +1,15 @@
 #![cfg(unix)]
 
+mod common;
+use common::private_tempdir;
+
 use pascal_cache::{
-    Bypass, Digest, LimitsError, LocationIssue, Namespace, Reclaimed, RetireReport, Store,
-    StoreLimits,
+    Bypass, Digest, LimitsError, LocationIssue, MAX_WAIT, Namespace, Reclaimed, RetireReport,
+    Store, StoreLimits,
 };
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{Duration, Instant};
-
-/// `tempfile::tempdir` honours the umask; the store requires a private root.
-fn private_tempdir() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(
-        root.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
-    root
-}
 
 fn namespace(byte: u8) -> Namespace {
     Namespace::new(Digest::from_bytes([byte; 32]))
@@ -303,11 +295,8 @@ fn pool_waits_end_in_busy_within_the_allowance() {
     let second = store.hold_reader_for_test().unwrap();
     let start = Instant::now();
     assert_eq!(store.hold_reader_for_test().err(), Some(Bypass::Busy));
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        start.elapsed()
-    );
+    // 10x the allowance: a lost bound (seconds) fails, scheduling slack does not.
+    assert!(start.elapsed() < MAX_WAIT * 10, "{:?}", start.elapsed());
     drop(second);
     assert!(store.hold_reader_for_test().is_ok());
 }
@@ -320,11 +309,7 @@ fn a_held_write_lock_bypasses_maintenance_within_the_allowance() {
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
     let start = Instant::now();
     assert_eq!(store.reclaim(10), Err(Bypass::Busy));
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        start.elapsed()
-    );
+    assert!(start.elapsed() < MAX_WAIT * 10, "{:?}", start.elapsed());
     other.execute_batch("ROLLBACK").unwrap();
     assert!(store.reclaim(10).is_ok());
 }
@@ -398,8 +383,11 @@ fn the_store_is_shareable_between_threads() {
     assert_send_sync::<Store>();
 }
 
+/// The first BEGIN already fails here, so this bounds one wait; that waits
+/// add up across transactions is pinned by `sqlite.rs`'s
+/// `begin_within_replaces_a_longer_busy_timeout_with_what_remains`.
 #[test]
-fn retirement_waits_are_cumulative_not_per_transaction() {
+fn retirement_under_a_held_write_lock_ends_within_the_open_wait() {
     let root = private_tempdir();
     let wait = Duration::from_millis(200);
     let limits = StoreLimits {
@@ -455,11 +443,7 @@ fn a_fresh_connection_waits_within_the_allowance() {
         Store::open(root.path(), &namespace(1), limits).err(),
         Some(Bypass::Busy)
     );
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        start.elapsed()
-    );
+    assert!(start.elapsed() < wait * 2, "{:?}", start.elapsed());
 }
 
 #[test]

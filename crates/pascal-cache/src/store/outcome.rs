@@ -6,7 +6,7 @@ use std::io;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bypass {
     Location(LocationIssue),
-    InvalidLimits(crate::store::LimitsError),
+    InvalidLimits(super::LimitsError),
     SqliteTooOld {
         version_number: i32,
     },

@@ -1,11 +1,13 @@
 use pascal_cache::{ContextKey, KeyKind, ManifestHeader};
+use pascal_project::ProjectOptions;
 use pascal_project::build_selection::BuildSelectionMode;
 use pascal_project::delphi_overrides::EffectiveOverrides;
+use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
     CompilerVersion, ConditionalFact, InstallationSelection, ProjectContext, ProjectContextParts,
     ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type Mutation = fn(&mut ProjectContextParts);
 
@@ -291,5 +293,143 @@ fn context_key_manifest_has_a_context_header() {
     assert_eq!(
         ManifestHeader::parse(key.key().manifest()).unwrap().kind,
         KeyKind::Context
+    );
+}
+
+fn policy_key(policy: &ReadPolicy) -> ContextKey {
+    with(|parts| parts.read_policy = policy.clone())
+}
+
+fn mapping(to: &str) -> EffectiveOverrides {
+    EffectiveOverrides {
+        path_mappings: vec![pascal_project::delphi_overrides::PathMapping {
+            from: "C:\\SDK".into(),
+            to: to.into(),
+            config_file: "/w/config.toml".into(),
+        }],
+        ..EffectiveOverrides::default()
+    }
+}
+
+#[test]
+fn mapped_roots_change_the_key() {
+    let roots = [PathBuf::from("/w")];
+    let first = ReadPolicy::new(&roots, &[], &[], &mapping("/sdk/a"));
+    let second = ReadPolicy::new(&roots, &[], &[], &mapping("/sdk/b"));
+    assert_ne!(first.view().mapped_roots, second.view().mapped_roots);
+    assert_eq!(first.view().configured_roots[0].path, Path::new("/w"));
+    assert_ne!(policy_key(&first), policy_key(&second));
+}
+
+#[test]
+fn pattern_exclusion_bases_change_the_key() {
+    // Every root carries the policy's full exclusion-base list, so only the
+    // list of roots can vary it through the public constructors.
+    let first = ReadPolicy::new(
+        &[PathBuf::from("/w")],
+        &[],
+        &[],
+        &EffectiveOverrides::default(),
+    );
+    let second = ReadPolicy::new(&[PathBuf::from("/w")], &[], &[], &mapping("/sdk/a"));
+    assert_eq!(
+        first.view().configured_roots[0].path,
+        second.view().configured_roots[0].path
+    );
+    assert_ne!(
+        first.view().configured_roots[0].pattern_exclusion_bases,
+        second.view().configured_roots[0].pattern_exclusion_bases
+    );
+    assert_ne!(policy_key(&first), policy_key(&second));
+}
+
+#[test]
+fn exclusion_bases_change_the_key() {
+    let first = ReadPolicy::new(
+        &[PathBuf::from("/w")],
+        &[],
+        &[],
+        &EffectiveOverrides::default(),
+    );
+    let second = ReadPolicy::new(
+        &[PathBuf::from("/w")],
+        &["lib".to_string()],
+        &[],
+        &EffectiveOverrides::default(),
+    );
+    assert_ne!(first.view().exclusion_bases, second.view().exclusion_bases);
+    assert_ne!(policy_key(&first), policy_key(&second));
+}
+
+#[test]
+fn exclusions_change_the_key() {
+    let roots = [PathBuf::from("/w")];
+    let first = ReadPolicy::new(&roots, &[], &[], &EffectiveOverrides::default());
+    let second = ReadPolicy::new(
+        &roots,
+        &[],
+        &["**/*.tmp".to_string()],
+        &EffectiveOverrides::default(),
+    );
+    let (left, right) = (first.view(), second.view());
+    assert_ne!(left.exclusions, right.exclusions);
+    assert_eq!(left.configured_roots, right.configured_roots);
+    assert_eq!(left.mapped_roots, right.mapped_roots);
+    assert_eq!(left.authorized_files, right.authorized_files);
+    assert_eq!(left.exclusion_bases, right.exclusion_bases);
+    assert_ne!(policy_key(&first), policy_key(&second));
+}
+
+#[test]
+fn authorized_files_change_the_key() {
+    // Only discovery populates authorized files: an explicit EnvOptions
+    // locator outside the installation authorizes exactly that file.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let appdata = root.join("ide");
+    let write = |path: &Path, contents: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+    write(&appdata.join("EnvOptions.proj"), "<Project/>");
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win64</Platform></PropertyGroup></Project>",
+    );
+    let discover = |locator: &Path| {
+        write(locator, "<Project/>");
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\nEnvOptions='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                appdata.display(),
+                locator.display()
+            ),
+        );
+        ProjectContext::discover_with_overrides(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(root.join("App.dproj")),
+                ..ProjectOptions::default()
+            },
+            &OverrideSession::new(None),
+        )
+        .unwrap()
+        .context
+    };
+    let first = discover(&root.join("one.proj"));
+    let second = discover(&root.join("two.proj"));
+    let (left, right) = (first.read_policy().view(), second.read_policy().view());
+    assert!(!left.authorized_files.is_empty());
+    assert_ne!(left.authorized_files, right.authorized_files);
+    assert_eq!(left.exclusions, right.exclusions);
+    assert_ne!(
+        policy_key(first.read_policy()),
+        policy_key(second.read_policy())
     );
 }

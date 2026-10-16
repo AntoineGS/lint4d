@@ -154,9 +154,15 @@ pub struct ReadRootView<'a> {
 fn root_views(roots: &[AuthorizedReadRoot]) -> Vec<ReadRootView<'_>> {
     roots
         .iter()
-        .map(|root| ReadRootView {
-            path: &root.path,
-            pattern_exclusion_bases: &root.pattern_exclusion_bases,
+        .map(|root| {
+            let AuthorizedReadRoot {
+                path,
+                pattern_exclusion_bases,
+            } = root;
+            ReadRootView {
+                path,
+                pattern_exclusion_bases,
+            }
         })
         .collect()
 }

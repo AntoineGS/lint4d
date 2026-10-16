@@ -62,8 +62,11 @@ pub fn fingerprint(
         }
         for name in CRATE_DIRECTORIES {
             let path = crate_directory.join(name);
-            if path.exists() {
-                collect_files(&path, &mut files)?;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => collect_files(&path, &mut files)?,
+                Ok(_) => return Err(format!("{} is not a directory", path.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", path.display())),
             }
         }
     }
@@ -106,9 +109,13 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Strin
     for entry in
         fs::read_dir(directory).map_err(|error| format!("{}: {error}", directory.display()))?
     {
-        let path = entry
-            .map_err(|error| format!("{}: {error}", directory.display()))?
-            .path();
+        let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
+        // Editor lock files (`.#lib.rs`) and other dot entries are never
+        // compiled implicitly.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
         let file_type = fs::symlink_metadata(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?
             .file_type();
@@ -273,6 +280,35 @@ mod tests {
             root.path().join("crates/a/src/link.rs"),
         )
         .unwrap();
+        assert!(digest_result(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_editor_lock_symlinks_are_ignored() {
+        let root = workspace();
+        let base = digest(root.path());
+        std::os::unix::fs::symlink("user@host.1234", root.path().join("crates/a/src/.#lib.rs"))
+            .unwrap();
+        assert_eq!(digest(root.path()), base);
+    }
+
+    #[test]
+    fn hidden_files_and_directories_are_ignored() {
+        let root = workspace();
+        let base = digest(root.path());
+        write(root.path(), "crates/a/src/.hidden.rs", "fn hidden() {}");
+        write(root.path(), "crates/a/src/.cache/x.rs", "fn cached() {}");
+        assert_eq!(digest(root.path()), base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_top_level_directories_are_errors() {
+        let root = workspace();
+        let source = root.path().join("crates/a/src");
+        fs::rename(&source, root.path().join("crates/a/real")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("crates/a/real"), &source).unwrap();
         assert!(digest_result(root.path()).is_err());
     }
 

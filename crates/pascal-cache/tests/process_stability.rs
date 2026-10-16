@@ -3,15 +3,69 @@ use pascal_cache::{
     LocalArtifactKey, MANIFEST_DIGEST_CONTEXT, MemberInputs, MemberKey, Namespace,
     SOURCE_DIGEST_CONTEXT, SourceContent, SourceIdentity,
 };
+use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
-    ConditionalContext, ConditionalFact, ProjectContext, ProjectContextParts, ProjectPathEntry,
-    SourceOrigin,
+    ConditionalContext, ConditionalFact, ProjectContext, ProjectContextParts, ProjectOptions,
+    ProjectPathEntry, SourceOrigin,
 };
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 const CHILD: &str = "PASCAL_CACHE_VECTOR_CHILD";
+const FIXTURE: &str = "PASCAL_CACHE_VECTOR_FIXTURE";
 
-fn vectors() -> Vec<(String, String)> {
+const WEBQUERY_DPROJ: &str = r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+	<PropertyGroup>
+		<ProjectVersion>12.0</ProjectVersion>
+		<MainSource>App.dpr</MainSource>
+		<Config Condition="'$(Config)'==''">Release</Config>
+		<DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+	<PropertyGroup Condition="'$(Base)'!=''"><DCC_Define>NOSF;$(DCC_Define)</DCC_Define><DCC_Platform>x86</DCC_Platform></PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_1)'!=''"><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define></PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define></PropertyGroup>
+	<ItemGroup>
+		<DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+		<DCCReference Include="SvcMain.pas"/>
+		<BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+		<BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+		<BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+	</ItemGroup>
+</Project>"#;
+
+const MAIN: &str = "program App; uses SvcMain in 'SvcMain.pas'; begin end.";
+const UNIT: &str = "unit SvcMain; interface implementation end.";
+
+fn write_fixture(root: &Path) {
+    for (name, contents) in [
+        ("App.dproj", format!("\u{feff}{WEBQUERY_DPROJ}")),
+        ("App.dpr", MAIN.to_string()),
+        ("SvcMain.pas", UNIT.to_string()),
+    ] {
+        fs::write(root.join(name), contents).unwrap();
+    }
+}
+
+fn discovered_context(root: &Path) -> ContextKey {
+    let options = ProjectOptions {
+        build_config: Some("Debug".into()),
+        ..ProjectOptions::default()
+    };
+    let discovered = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &options,
+        &OverrideSession::new(Some(root.join("config.toml"))),
+    )
+    .expect("discovery");
+    ContextKey::new(&discovered.context)
+}
+
+fn vectors(fixture: &Path) -> Vec<(String, String)> {
     let mut parts = ProjectContextParts {
         project_file: Some("/w/App.dproj".into()),
         search_path_entries: vec![
@@ -88,6 +142,7 @@ fn vectors() -> Vec<(String, String)> {
         ),
         ("source", content.digest()),
         ("context", context.digest()),
+        ("discovered", discovered_context(fixture).digest()),
         ("local", local.digest()),
         ("expanded", expanded.digest()),
         ("member", member.digest()),
@@ -103,13 +158,16 @@ fn print_vectors_for_child_process() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    for (name, hex) in vectors() {
+    let fixture = std::env::var_os(FIXTURE).expect("fixture root");
+    for (name, hex) in vectors(Path::new(&fixture)) {
         println!("vector {name} {hex}");
     }
 }
 
 #[test]
 fn vectors_are_identical_in_a_separate_process() {
+    let fixture = tempfile::tempdir().unwrap();
+    write_fixture(fixture.path());
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -119,6 +177,7 @@ fn vectors_are_identical_in_a_separate_process() {
             "--test-threads=1",
         ])
         .env(CHILD, "1")
+        .env(FIXTURE, fixture.path())
         .output()
         .unwrap();
     assert!(
@@ -136,8 +195,8 @@ fn vectors_are_identical_in_a_separate_process() {
             (name.to_string(), hex.to_string())
         })
         .collect::<Vec<_>>();
-    assert_eq!(child.len(), 6);
-    assert_eq!(child, vectors());
+    assert_eq!(child.len(), 7);
+    assert_eq!(child, vectors(fixture.path()));
 }
 
 const DEFAULT_CONDITIONAL_CONTEXT: &[u8] = &[

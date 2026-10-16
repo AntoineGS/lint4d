@@ -6,7 +6,8 @@ use pascal_project::{
     BuildSelection, BuildSelectionMode, CompilerVersion, ConditionalClosure, ConditionalContext,
     ConditionalFact, ConstantValue, InstallationOrigin, InstallationSelection, LayoutContext,
     LayoutPlatform, LayoutSettings, OpenReason, ProjectPathEntry, ProjectPathIssue,
-    ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy, ReadRootView, SourceOrigin,
+    ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy, ReadPolicyView, ReadRootView,
+    SourceOrigin,
 };
 
 fn strings(encoder: &mut Encoder, values: &[String]) {
@@ -399,7 +400,13 @@ impl CanonicalEncode for EffectiveOverrides {
 
 impl CanonicalEncode for ReadPolicy {
     fn encode(&self, encoder: &mut Encoder) {
-        let view = self.view();
+        let ReadPolicyView {
+            configured_roots,
+            mapped_roots,
+            authorized_files,
+            exclusions,
+            exclusion_bases,
+        } = self.view();
         let roots = |encoder: &mut Encoder, roots: &[ReadRootView<'_>]| {
             encoder.seq(roots, |encoder, root| {
                 let ReadRootView {
@@ -415,17 +422,17 @@ impl CanonicalEncode for ReadPolicy {
             });
         };
         encoder.field(1);
-        roots(encoder, &view.configured_roots);
+        roots(encoder, &configured_roots);
         encoder.field(2);
-        roots(encoder, &view.mapped_roots);
+        roots(encoder, &mapped_roots);
         encoder.field(3);
-        encoder.seq(view.authorized_files, |encoder, path| {
+        encoder.seq(authorized_files, |encoder, path| {
             encoder.encode(path.as_path())
         });
         encoder.field(4);
-        encoder.seq(view.exclusions, |encoder, exclusion| encoder.str(exclusion));
+        encoder.seq(exclusions, |encoder, exclusion| encoder.str(exclusion));
         encoder.field(5);
-        encoder.seq(view.exclusion_bases, |encoder, base| {
+        encoder.seq(exclusion_bases, |encoder, base| {
             encoder.encode(base.as_path())
         });
     }

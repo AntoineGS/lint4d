@@ -1,7 +1,7 @@
 use super::location::StoreLocation;
 use super::outcome::{Bypass, Integrity};
 use super::pool::Deadline;
-use super::sqlite::{begin, classify};
+use super::sqlite::{begin_within, classify, limit_wait};
 use crate::{Digest, Namespace};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -124,9 +124,10 @@ pub(crate) fn register(
     connection: &mut Connection,
     namespace: &Namespace,
     now_unix_seconds: u64,
+    deadline: Deadline,
 ) -> Result<Scope, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let transaction = begin(connection, TransactionBehavior::Immediate)?;
+    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
     let id = namespace.id();
     let existing: Option<(Vec<u8>, i64, i64)> = transaction
         .query_row(
@@ -196,8 +197,10 @@ pub(crate) fn retire_obsolete(
     connection: &mut Connection,
     location: &StoreLocation,
     current: Digest,
+    deadline: Deadline,
 ) -> Result<RetireReport, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
+    limit_wait(connection, deadline)?;
     let candidates: Vec<(Vec<u8>, i64)> = {
         let mut statement = connection
             .prepare(
@@ -221,11 +224,14 @@ pub(crate) fn retire_obsolete(
     let mut report = RetireReport::default();
     for (id, reset_epoch) in candidates {
         let namespace = digest_from(&id)?;
+        // Never hold the lock file across a SQLite wait: take the write
+        // lock first, then try the (non-blocking) exclusive lock.
+        let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
         let Some(lock) = NamespaceLock::try_exclusive(location.namespace_lock(namespace))? else {
+            drop(transaction);
             report.in_use += 1;
             continue;
         };
-        let transaction = begin(connection, TransactionBehavior::Immediate)?;
         let changed = transaction
             .execute(
                 "UPDATE namespaces SET state = ?3 \
@@ -250,9 +256,13 @@ pub(crate) fn retire_obsolete(
 
 /// Delete at most `max_rows` rows of retired scopes in one short write
 /// transaction (spec §10: no unbounded cascades).
-pub(crate) fn reclaim(connection: &mut Connection, max_rows: usize) -> Result<Reclaimed, Bypass> {
+pub(crate) fn reclaim(
+    connection: &mut Connection,
+    max_rows: usize,
+    deadline: Deadline,
+) -> Result<Reclaimed, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let transaction = begin(connection, TransactionBehavior::Immediate)?;
+    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
     let scopes: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
             .prepare(

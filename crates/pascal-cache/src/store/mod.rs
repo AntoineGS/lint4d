@@ -66,8 +66,8 @@ impl Store {
         let pool = Pool::new(location.database(), limits);
         let scope = {
             let mut writer = pool.acquire(Role::Writer, deadline)?;
-            container::prepare_container(&mut writer)?;
-            namespaces::register(&mut writer, namespace, unix_seconds())?
+            container::prepare_container(&mut writer, deadline)?;
+            namespaces::register(&mut writer, namespace, unix_seconds(), deadline)?
         };
         let store = Self {
             location,
@@ -80,7 +80,7 @@ impl Store {
             hooks: testing::Hooks::default(),
         };
         // Best effort: whatever is left is retired by a later start.
-        let _ = store.retire_obsolete();
+        let _ = store.retire_within(deadline);
         Ok(store)
     }
 
@@ -108,19 +108,26 @@ impl Store {
     }
 
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
-        let mut writer = self
-            .pool
-            .acquire(Role::Writer, Deadline::after(self.limits.open_wait))?;
-        namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace)
+        self.retire_within(Deadline::after(self.limits.open_wait))
+    }
+
+    fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
+        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+        namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace, deadline)
     }
 
     /// Delete at most `max_rows` rows of retired scopes. Run off
     /// interactive paths and repeat until `complete`.
     pub fn reclaim(&self, max_rows: usize) -> Result<Reclaimed, Bypass> {
-        let mut writer = self.writer()?;
-        namespaces::reclaim(&mut writer, max_rows)
+        let deadline = Deadline::after(self.limits.wait);
+        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+        namespaces::reclaim(&mut writer, max_rows, deadline)
     }
 
+    #[cfg_attr(
+        not(feature = "test-support"),
+        expect(dead_code, reason = "called by artifact publication (Task 4)")
+    )]
     pub(crate) fn writer(&self) -> Result<Lease<'_>, Bypass> {
         self.pool
             .acquire(Role::Writer, Deadline::after(self.limits.wait))
@@ -132,13 +139,13 @@ impl Store {
     }
 
     #[cfg(feature = "test-support")]
-    #[allow(dead_code)] // first caller arrives with the publish path (Task 4)
+    #[expect(dead_code, reason = "called by artifact publication (Task 4)")]
     pub(crate) fn before_commit(&self) {
         self.hooks.before_commit();
     }
 
     #[cfg(not(feature = "test-support"))]
-    #[allow(dead_code)] // first caller arrives with the publish path (Task 4)
+    #[expect(dead_code, reason = "called by artifact publication (Task 4)")]
     pub(crate) fn before_commit(&self) {}
 }
 

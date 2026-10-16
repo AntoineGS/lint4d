@@ -2,11 +2,13 @@
 
 use super::limits::SQLITE_LENGTH_LIMIT;
 use super::outcome::{Bypass, Malformed, Miss};
+use super::pool::Deadline;
 use rusqlite::config::DbConfig;
 use rusqlite::ffi::ErrorCode;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::path::Path;
+use std::time::Duration;
 
 /// SQLite 3.51.3, the first release with the WAL-reset fix (spec §6).
 pub const MIN_SQLITE_VERSION_NUMBER: i32 = 3_051_003;
@@ -64,13 +66,22 @@ pub(crate) fn classify_read(error: &rusqlite::Error) -> Result<Miss, Bypass> {
 }
 
 /// Open `path` (never through a symlink) and apply the store's settings.
-pub(crate) fn open_connection(path: &Path, page_cache_bytes: u64) -> Result<Connection, Bypass> {
+/// `busy` bounds every lock wait from the first statement on, including the
+/// header reads `configure` makes.
+pub(crate) fn open_connection(
+    path: &Path,
+    page_cache_bytes: u64,
+    busy: Duration,
+) -> Result<Connection, Bypass> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     let connection = Connection::open_with_flags(path, flags).map_err(|error| classify(&error))?;
+    connection
+        .busy_timeout(busy)
+        .map_err(|error| classify(&error))?;
     configure(&connection, page_cache_bytes)?;
     Ok(connection)
 }
@@ -118,6 +129,28 @@ pub(crate) fn begin(
     connection
         .transaction_with_behavior(behavior)
         .map_err(|error| classify(&error))
+}
+
+/// Bound the SQLite lock waits of the next statements by what is left of
+/// `deadline`, so waits add up across an operation's transactions.
+pub(crate) fn limit_wait(connection: &Connection, deadline: Deadline) -> Result<(), Bypass> {
+    connection
+        .busy_timeout(deadline.remaining())
+        .map_err(|error| classify(&error))
+}
+
+/// [`begin`] within an operation's cumulative allowance: no attempt once
+/// nothing remains.
+pub(crate) fn begin_within(
+    connection: &mut Connection,
+    behavior: TransactionBehavior,
+    deadline: Deadline,
+) -> Result<Transaction<'_>, Bypass> {
+    if deadline.remaining().is_zero() {
+        return Err(Bypass::Busy);
+    }
+    limit_wait(connection, deadline)?;
+    begin(connection, behavior)
 }
 
 #[cfg(test)]
@@ -179,7 +212,12 @@ mod tests {
     #[test]
     fn connections_are_configured_defensively() {
         let root = tempfile::tempdir().unwrap();
-        let connection = open_connection(&root.path().join("a.sqlite3"), 5_592_405).unwrap();
+        let connection = open_connection(
+            &root.path().join("a.sqlite3"),
+            5_592_405,
+            Duration::from_secs(2),
+        )
+        .unwrap();
         let pragma = |name: &str| -> i64 {
             connection
                 .pragma_query_value(None, name, |row| row.get(0))
@@ -207,14 +245,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn begin_within_replaces_a_longer_busy_timeout_with_what_remains() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        let mut first = open_connection(&path, 1 << 20, Duration::from_secs(5)).unwrap();
+        first
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+            .unwrap();
+        let mut second = open_connection(&path, 1 << 20, Duration::from_secs(5)).unwrap();
+        let holder = begin(&mut first, TransactionBehavior::Immediate).unwrap();
+        let start = std::time::Instant::now();
+        let spent = Deadline::after(Duration::ZERO);
+        assert_eq!(
+            begin_within(&mut second, TransactionBehavior::Immediate, spent).err(),
+            Some(Bypass::Busy)
+        );
+        let short = Deadline::after(Duration::from_millis(100));
+        assert_eq!(
+            begin_within(&mut second, TransactionBehavior::Immediate, short).err(),
+            Some(Bypass::Busy)
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(holder);
+        let live = Deadline::after(Duration::from_secs(1));
+        assert!(begin_within(&mut second, TransactionBehavior::Immediate, live).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_symlinked_database_is_not_opened() {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target.sqlite3");
-        drop(open_connection(&target, 1 << 20).unwrap());
+        drop(open_connection(&target, 1 << 20, Duration::from_secs(2)).unwrap());
         let link = root.path().join("link.sqlite3");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(matches!(
-            open_connection(&link, 1 << 20),
+            open_connection(&link, 1 << 20, Duration::from_secs(2)),
             Err(Bypass::Sqlite { .. })
         ));
     }
@@ -230,14 +300,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.sqlite3");
         {
-            let connection = open_connection(&path, 1 << 20).unwrap();
+            let connection = open_connection(&path, 1 << 20, Duration::from_secs(2)).unwrap();
             connection
                 .execute_batch("CREATE TABLE t (a INTEGER) STRICT;")
                 .unwrap();
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(
-            open_connection(&path, 1 << 20).err(),
+            open_connection(&path, 1 << 20, Duration::from_secs(2)).err(),
             Some(Bypass::ReadOnly)
         );
     }

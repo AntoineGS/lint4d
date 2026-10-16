@@ -8,7 +8,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The cumulative wait allowance of one cache operation (spec §10): time
-/// spent waiting for a pooled connection and for SQLite locks.
+/// spent waiting for a pooled connection and for SQLite locks. Every wait
+/// of the operation is bounded by what remains, so waits add up.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline(Instant);
 
@@ -115,7 +116,11 @@ impl Pool {
     }
 
     fn open(&self, role: Role, deadline: Deadline) -> Result<Lease<'_>, Bypass> {
-        match open_connection(&self.database, self.limits.connection_page_cache_bytes()) {
+        match open_connection(
+            &self.database,
+            self.limits.connection_page_cache_bytes(),
+            deadline.remaining(),
+        ) {
             Ok(connection) => self.lease(role, connection, deadline),
             Err(bypass) => {
                 let mut state = self.lock();

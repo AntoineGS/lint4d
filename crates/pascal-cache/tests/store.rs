@@ -353,3 +353,67 @@ fn the_store_is_shareable_between_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Store>();
 }
+
+#[test]
+fn retirement_waits_are_cumulative_not_per_transaction() {
+    let root = private_tempdir();
+    let wait = Duration::from_millis(200);
+    let limits = StoreLimits {
+        open_wait: wait,
+        ..StoreLimits::default()
+    };
+    let store = Store::open(root.path(), &namespace(1), limits).unwrap();
+    let other = raw(root.path());
+    for byte in 10..18u8 {
+        other
+            .execute(
+                "INSERT INTO namespaces VALUES (?1, x'00', 0, 1, 0)",
+                [[byte; 32].as_slice()],
+            )
+            .unwrap();
+    }
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = Instant::now();
+    assert_eq!(store.retire_obsolete(), Err(Bypass::Busy));
+    assert!(start.elapsed() < wait * 2, "{:?}", start.elapsed());
+    other.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        store.retire_obsolete(),
+        Ok(RetireReport {
+            retired: 8,
+            in_use: 0
+        })
+    );
+}
+
+#[test]
+fn a_fresh_connection_waits_within_the_allowance() {
+    let root = private_tempdir();
+    drop(open(root.path(), 1));
+    // Alone on the database, so exclusive locking mode shuts every other
+    // connection out, including the header read of a new one.
+    let exclusive = raw(root.path());
+    exclusive
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .unwrap();
+    exclusive
+        .query_row("SELECT count(*) FROM namespaces", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let wait = Duration::from_millis(200);
+    let limits = StoreLimits {
+        open_wait: wait,
+        ..StoreLimits::default()
+    };
+    let start = Instant::now();
+    assert_eq!(
+        Store::open(root.path(), &namespace(1), limits).err(),
+        Some(Bypass::Busy)
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}

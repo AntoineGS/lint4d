@@ -1,5 +1,6 @@
 use super::outcome::Bypass;
-use super::sqlite::{begin, classify};
+use super::pool::Deadline;
+use super::sqlite::{begin_within, classify, limit_wait};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
@@ -135,15 +136,21 @@ fn inspect(connection: &Connection) -> Result<Container, Bypass> {
 
 /// Validate the container, creating it in a new or empty file. WAL mode is
 /// confirmed, not assumed.
-pub(crate) fn prepare_container(connection: &mut Connection) -> Result<(), Bypass> {
+pub(crate) fn prepare_container(
+    connection: &mut Connection,
+    deadline: Deadline,
+) -> Result<(), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
+    limit_wait(connection, deadline)?;
     let container = inspect(connection)?;
     if container == Container::Fresh {
         // Takes effect only before the first table exists.
+        limit_wait(connection, deadline)?;
         connection
             .pragma_update(None, "auto_vacuum", "INCREMENTAL")
             .map_err(fail)?;
     }
+    limit_wait(connection, deadline)?;
     let mode: String = connection
         .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
         .map_err(fail)?;
@@ -151,14 +158,14 @@ pub(crate) fn prepare_container(connection: &mut Connection) -> Result<(), Bypas
         return Err(Bypass::WalUnavailable);
     }
     if container == Container::Fresh {
-        create(connection)?;
+        create(connection, deadline)?;
     }
     Ok(())
 }
 
-fn create(connection: &mut Connection) -> Result<(), Bypass> {
+fn create(connection: &mut Connection, deadline: Deadline) -> Result<(), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let transaction = begin(connection, TransactionBehavior::Immediate)?;
+    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
     // Another process may have created the container since `inspect`.
     if inspect(&transaction)? == Container::Current {
         return Ok(());
@@ -191,8 +198,12 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    fn deadline() -> Deadline {
+        Deadline::after(Duration::from_secs(2))
+    }
+
     fn connect(path: &Path) -> Connection {
-        let connection = open_connection(path, 1 << 20).unwrap();
+        let connection = open_connection(path, 1 << 20, Duration::from_secs(2)).unwrap();
         connection.busy_timeout(Duration::from_secs(2)).unwrap();
         connection
     }
@@ -212,7 +223,7 @@ mod tests {
     fn a_fresh_file_gets_the_current_schema() {
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
-        prepare_container(&mut connection).unwrap();
+        prepare_container(&mut connection, deadline()).unwrap();
         let pragma = |name: &str| -> i64 {
             connection
                 .pragma_query_value(None, name, |row| row.get(0))
@@ -259,9 +270,9 @@ mod tests {
     fn reopening_an_existing_container_changes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.sqlite3");
-        prepare_container(&mut connect(&path)).unwrap();
+        prepare_container(&mut connect(&path), deadline()).unwrap();
         let mut again = connect(&path);
-        prepare_container(&mut again).unwrap();
+        prepare_container(&mut again, deadline()).unwrap();
         let rows: i64 = again
             .query_row("SELECT count(*) FROM store_state", [], |row| row.get(0))
             .unwrap();
@@ -274,12 +285,12 @@ mod tests {
         let path = root.path().join("a.sqlite3");
         {
             let mut connection = connect(&path);
-            prepare_container(&mut connection).unwrap();
+            prepare_container(&mut connection, deadline()).unwrap();
             connection.pragma_update(None, "user_version", 2).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            prepare_container(&mut connect(&path)),
+            prepare_container(&mut connect(&path), deadline()),
             Err(Bypass::UnsupportedContainer { version: 2 })
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -293,7 +304,7 @@ mod tests {
             .execute_batch("CREATE TABLE other (a INTEGER);")
             .unwrap();
         assert_eq!(
-            prepare_container(&mut connect(&path)),
+            prepare_container(&mut connect(&path), deadline()),
             Err(Bypass::ForeignDatabase)
         );
         let other = root.path().join("b.sqlite3");
@@ -301,7 +312,7 @@ mod tests {
             .pragma_update(None, "application_id", 7)
             .unwrap();
         assert_eq!(
-            prepare_container(&mut connect(&other)),
+            prepare_container(&mut connect(&other), deadline()),
             Err(Bypass::ForeignDatabase)
         );
     }
@@ -312,10 +323,11 @@ mod tests {
         let path = root.path().join("a.sqlite3");
         std::fs::write(&path, vec![0x5a; 8192]).unwrap();
         // The connection settings already read the header, so either step reports it.
-        let opened = open_connection(&path, 1 << 20).and_then(|mut connection| {
-            connection.busy_timeout(Duration::from_secs(2)).unwrap();
-            prepare_container(&mut connection)
-        });
+        let opened =
+            open_connection(&path, 1 << 20, Duration::from_secs(2)).and_then(|mut connection| {
+                connection.busy_timeout(Duration::from_secs(2)).unwrap();
+                prepare_container(&mut connection, deadline())
+            });
         assert_eq!(opened, Err(Bypass::Corrupt));
     }
 
@@ -323,11 +335,14 @@ mod tests {
     fn a_container_without_its_state_row_is_corrupt() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.sqlite3");
-        prepare_container(&mut connect(&path)).unwrap();
+        prepare_container(&mut connect(&path), deadline()).unwrap();
         connect(&path)
             .execute_batch("DELETE FROM store_state;")
             .unwrap();
-        assert_eq!(prepare_container(&mut connect(&path)), Err(Bypass::Corrupt));
+        assert_eq!(
+            prepare_container(&mut connect(&path), deadline()),
+            Err(Bypass::Corrupt)
+        );
     }
 
     #[test]
@@ -341,7 +356,7 @@ mod tests {
                     scope.spawn(|| {
                         let mut connection = connect(&path);
                         barrier.wait();
-                        prepare_container(&mut connection)
+                        prepare_container(&mut connection, deadline())
                     })
                 })
                 .collect();
@@ -360,7 +375,7 @@ mod tests {
     fn the_schema_rejects_out_of_range_rows() {
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
-        prepare_container(&mut connection).unwrap();
+        prepare_container(&mut connection, deadline()).unwrap();
         let error = connection
             .execute(
                 "INSERT INTO namespaces VALUES (?1, x'00', 0, 3, 0)",

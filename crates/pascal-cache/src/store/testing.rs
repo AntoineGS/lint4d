@@ -14,7 +14,7 @@ pub(crate) struct Hooks {
 }
 
 impl Hooks {
-    #[allow(dead_code)] // first caller arrives with the publish path (Task 4)
+    #[expect(dead_code, reason = "called by artifact publication (Task 4)")]
     pub(crate) fn before_commit(&self) {
         let hook = self
             .before_commit

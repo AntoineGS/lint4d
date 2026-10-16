@@ -461,3 +461,31 @@ fn a_fresh_connection_waits_within_the_allowance() {
         start.elapsed()
     );
 }
+
+#[test]
+fn a_lock_file_that_cannot_be_removed_does_not_undo_retirement() {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory permissions
+    }
+    let root = private_tempdir();
+    let directory = root.path().join("cache");
+    let store = open(&directory, 2);
+    drop(open(&directory, 1)); // namespace 2 is held, so it stays live
+    let locks = directory.join("namespaces");
+    let mode = |mode| {
+        std::fs::set_permissions(&locks, std::os::unix::fs::PermissionsExt::from_mode(mode))
+            .unwrap()
+    };
+    mode(0o500);
+    let report = store.retire_obsolete();
+    mode(0o700);
+    assert_eq!(
+        report,
+        Ok(RetireReport {
+            retired: 1,
+            in_use: 0
+        })
+    );
+    assert_eq!(state(&directory, 1), Some((0, 2)));
+}

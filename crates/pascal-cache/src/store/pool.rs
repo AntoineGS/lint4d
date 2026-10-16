@@ -151,6 +151,19 @@ impl Pool {
             .map_err(|error| classify(&error))?;
         Ok(lease)
     }
+
+    /// Return a leased connection, or discard one that cannot leave its
+    /// transaction so a fresh one can open in its place.
+    fn give_back(&self, role: Role, connection: Connection, reusable: bool) {
+        let mut state = self.lock();
+        match (role, reusable) {
+            (Role::Writer, true) => state.writer = Some(connection),
+            (Role::Reader, true) => state.idle_readers.push(connection),
+            (Role::Writer, false) => state.writer_open = false,
+            (Role::Reader, false) => state.open_readers -= 1,
+        }
+        self.returned.notify_all();
+    }
 }
 
 impl Deref for Lease<'_> {
@@ -174,14 +187,7 @@ impl Drop for Lease<'_> {
             // BEGIN, so roll it back or discard it.
             let reusable = connection.is_autocommit()
                 || (connection.execute_batch("ROLLBACK").is_ok() && connection.is_autocommit());
-            let mut state = self.pool.lock();
-            match (self.role, reusable) {
-                (Role::Writer, true) => state.writer = Some(connection),
-                (Role::Reader, true) => state.idle_readers.push(connection),
-                (Role::Writer, false) => state.writer_open = false,
-                (Role::Reader, false) => state.open_readers -= 1,
-            }
-            self.pool.returned.notify_all();
+            self.pool.give_back(self.role, connection, reusable);
         }
     }
 }
@@ -203,6 +209,31 @@ mod tests {
             let lease = pool.acquire(role, deadline()).unwrap();
             assert!(lease.is_autocommit(), "{role:?}");
             lease.execute_batch("BEGIN").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_discarded_connection_frees_its_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = StoreLimits {
+            readers: 1,
+            ..StoreLimits::default()
+        };
+        let pool = Pool::new(root.path().join("pool.sqlite3"), limits);
+        let open = |pool: &Pool| {
+            let state = pool.lock();
+            state.open_readers + usize::from(state.writer_open)
+        };
+        let deadline = || Deadline::after(Duration::from_millis(50));
+        for role in [Role::Reader, Role::Writer] {
+            let before = open(&pool);
+            let mut lease = pool.acquire(role, deadline()).unwrap();
+            let connection = lease.connection.take().unwrap();
+            drop(lease);
+            pool.give_back(role, connection, false);
+            assert_eq!(open(&pool), before, "{role:?}");
+            // The slot is free: a fresh connection opens at once.
+            assert!(pool.acquire(role, deadline()).is_ok(), "{role:?}");
         }
     }
 }

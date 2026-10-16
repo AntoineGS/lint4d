@@ -12,12 +12,14 @@ description = "Canonical durable keys for the lint4d persistent analysis cache"
 
 [dependencies]
 blake3 = "1.8.7"
+pascal-project = { path = "../pascal-project" }
 
 [build-dependencies]
 blake3 = "1.8.7"
 
 [dev-dependencies]
 tempfile = "3"
+pascal-project = { path = "../pascal-project", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -4,10 +4,13 @@
 //! manifests that are retained and compared exactly; BLAKE3 digests of those
 //! manifests only narrow a lookup.
 
+mod context_key;
 mod digest;
 mod encoding;
 mod path;
+mod project;
 
+pub use context_key::ContextKey;
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
 

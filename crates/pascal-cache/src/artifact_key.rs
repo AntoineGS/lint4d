@@ -156,7 +156,10 @@ impl CanonicalEncode for IncludeOccurrence {
 
 /// A root's local key plus its ordered include occurrences and topology.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExpandedArtifactKey(CanonicalKey);
+pub struct ExpandedArtifactKey {
+    key: CanonicalKey,
+    root: Digest,
+}
 
 impl ExpandedArtifactKey {
     pub fn new(
@@ -183,17 +186,22 @@ impl ExpandedArtifactKey {
         encoder.seq(occurrences, |encoder, occurrence| {
             encoder.encode(occurrence)
         });
-        Ok(Self(CanonicalKey::finish(
-            KeyKind::ExpandedArtifact,
-            encoder,
-        )))
+        Ok(Self {
+            key: CanonicalKey::finish(KeyKind::ExpandedArtifact, encoder),
+            root: root.digest(),
+        })
     }
 
     pub fn key(&self) -> &CanonicalKey {
-        &self.0
+        &self.key
     }
 
     pub fn digest(&self) -> Digest {
-        self.0.digest()
+        self.key.digest()
+    }
+
+    /// The digest of the root local key embedded in the manifest.
+    pub fn root_digest(&self) -> Digest {
+        self.root
     }
 }

@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::limits::SQLITE_LENGTH_LIMIT;
 use super::outcome::{Bypass, Malformed, Miss};
 use super::pool::Deadline;

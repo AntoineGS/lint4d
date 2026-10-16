@@ -2,7 +2,9 @@
 //! directory (spec §6, §9-§11). Every operation returns an admitted result,
 //! a typed [`Miss`] or a [`Bypass`]; none is a semantic claim.
 
+mod artifacts;
 mod container;
+mod keys;
 mod limits;
 mod location;
 mod namespaces;
@@ -12,6 +14,10 @@ mod sqlite;
 #[cfg(feature = "test-support")]
 mod testing;
 
+pub use artifacts::{
+    ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
+};
+pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
 
@@ -124,10 +130,6 @@ impl Store {
         namespaces::reclaim(&mut writer, max_rows, deadline)
     }
 
-    #[cfg_attr(
-        not(feature = "test-support"),
-        expect(dead_code, reason = "called by artifact publication (Task 4)")
-    )]
     pub(crate) fn writer(&self) -> Result<Lease<'_>, Bypass> {
         self.pool
             .acquire(Role::Writer, Deadline::after(self.limits.wait))
@@ -139,13 +141,11 @@ impl Store {
     }
 
     #[cfg(feature = "test-support")]
-    #[expect(dead_code, reason = "called by artifact publication (Task 4)")]
     pub(crate) fn before_commit(&self) {
         self.hooks.before_commit();
     }
 
     #[cfg(not(feature = "test-support"))]
-    #[expect(dead_code, reason = "called by artifact publication (Task 4)")]
     pub(crate) fn before_commit(&self) {}
 }
 

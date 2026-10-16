@@ -239,6 +239,29 @@ fn fallback_main_source(
     }
 }
 
+/// The bootstrap payload that root evaluation reuses, so both see one
+/// snapshot. Its stamp is the one taken before the read, or right after it
+/// when the descriptor was briefly missing; a descriptor gone by then fails.
+fn root_evaluation_payload(
+    project_file: &Path,
+    contents: String,
+    pre_read_stamp: Option<ProjectReadStamp>,
+) -> Result<ReadPayload, String> {
+    let stamp = match pre_read_stamp {
+        Some(stamp) => stamp,
+        None => path_stamp_result(project_file)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                format!(
+                    "could not read project bootstrap metadata: {} changed while it was read",
+                    project_file.display()
+                )
+            })?,
+    };
+    Ok(ReadPayload { stamp, contents })
+}
+
 // Context construction keeps the selected project, requesting file, roots,
 // evaluator options, and immutable effective settings explicit for callers.
 #[allow(clippy::too_many_arguments)]
@@ -300,11 +323,16 @@ pub(super) fn build_project_context(
     let mut installation_evidence = InstallationEvidence::default();
     let mut compiler_identity_conflicting = false;
     let mut other_identity_conflicting = false;
+    let mut root_payload = None;
     if extension_is(&project_file, "dproj") {
         let bootstrap_entry = ProjectPathEntry::legacy(project_file.clone());
         let (bootstrap_payload, observation) = read_policy
             .read_payload_with_observation(&bootstrap_entry, MAX_PROJECT_BYTES)
             .map_err(|error| format!("could not read project bootstrap metadata: {error}"))?;
+        let bootstrap_stamp = match &observation {
+            MetadataObservation::Payload { stamp, .. } => stamp.clone(),
+            MetadataObservation::Stat { .. } => None,
+        };
         tracker.record_metadata_path(project_file.clone());
         tracker.record_metadata_observation(observation);
         build_candidates = build_selection::parse_build_candidates(&bootstrap_payload);
@@ -323,6 +351,11 @@ pub(super) fn build_project_context(
         other_identity_conflicting = bootstrap.other_conflicting;
         bootstrap_config = bootstrap.config;
         bootstrap_platform = bootstrap.platform;
+        root_payload = Some(root_evaluation_payload(
+            &project_file,
+            bootstrap_payload,
+            bootstrap_stamp,
+        )?);
         if evaluation_options
             .conditional_context
             .compiler_version
@@ -494,7 +527,7 @@ pub(super) fn build_project_context(
     builder.warnings.extend(ide_path_warnings.iter().cloned());
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
-        builder.process_root_dproj(&project_file, tracker)?;
+        builder.process_root_dproj(&project_file, root_payload, tracker)?;
         check_project_scan_cancel(cancel)?;
     }
 
@@ -2155,6 +2188,127 @@ pub(super) fn canonical_package_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_reads_the_root_project_descriptor_once() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("App.dpr");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        let descriptor = format!(
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>ROOT_EVALUATED</DCC_Define></PropertyGroup><!--{}--></Project>",
+            "x".repeat(64 * 1024)
+        );
+        fs::write(root.join("App.dproj"), &descriptor).expect("project descriptor");
+
+        let scope = TestScope::new();
+        let discovered = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+        assert!(
+            discovered
+                .context
+                .defines()
+                .iter()
+                .any(|define| define == "ROOT_EVALUATED"),
+            "the descriptor must be fully evaluated, not only bootstrapped"
+        );
+        let bytes = scope.snapshot().value(Metric::AuthorizedPayloadBytes);
+        let descriptor_bytes = descriptor.len() as u64;
+        assert!(
+            bytes >= descriptor_bytes && bytes < 2 * descriptor_bytes,
+            "one discovery must read its {descriptor_bytes}-byte descriptor once, read {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn bootstrap_payload_is_kept_for_root_evaluation_even_without_a_pre_read_stamp() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let project = temp.path().join("App.dproj");
+        fs::write(&project, "<Project />").expect("project descriptor");
+        let current = path_stamp_result(&project)
+            .expect("descriptor stamp")
+            .expect("descriptor exists");
+        let mut earlier = current.clone();
+        earlier.bytes += 1;
+
+        let kept =
+            root_evaluation_payload(&project, "<Project />".to_string(), Some(earlier.clone()))
+                .expect("pre-read stamp");
+        assert_eq!(kept.stamp, earlier, "the pre-read stamp is kept");
+        assert_eq!(kept.contents, "<Project />");
+        let kept = root_evaluation_payload(&project, "<Project />".to_string(), None)
+            .expect("stamp after the read");
+        assert_eq!(
+            kept.stamp, current,
+            "a missing pre-read stamp uses the current one"
+        );
+
+        fs::remove_file(&project).expect("remove descriptor");
+        let error = root_evaluation_payload(&project, "<Project />".to_string(), None)
+            .expect_err("a vanished descriptor has no stamp");
+        assert!(error.contains("changed while it was read"), "{error}");
+    }
+
+    #[test]
+    fn descriptor_edit_before_root_evaluation_keeps_the_read_snapshot_and_stales() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("App.dpr");
+        let project = root.join("App.dproj");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>BEFORE</DCC_Define></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+
+        // Runs after the bootstrap read and before root evaluation; the edit
+        // keeps the descriptor's length.
+        let edited = project.clone();
+        let _hook = crate::test_before_project_read_at(project.clone(), move |_| {
+            fs::write(
+                &edited,
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>EDITED</DCC_Define></PropertyGroup></Project>",
+            )
+            .expect("edit descriptor before root evaluation");
+        });
+        let discovered = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("discover project");
+
+        let defines = discovered.context.defines();
+        assert!(
+            defines.iter().any(|define| define == "BEFORE")
+                && !defines.iter().any(|define| define == "EDITED"),
+            "root evaluation must use the bootstrap bytes: {defines:?}"
+        );
+        let payloads = discovered
+            .observations
+            .metadata_observations
+            .iter()
+            .filter(|observation| {
+                matches!(observation, MetadataObservation::Payload { path, .. } if path == &project)
+            })
+            .collect::<Vec<_>>();
+        assert!(!payloads.is_empty(), "the descriptor read must be observed");
+        for observation in payloads {
+            assert!(
+                !metadata_payload_is_current(observation, MAX_PROJECT_BYTES, None)
+                    .expect("revalidate descriptor"),
+                "an edit after the bootstrap read must stale {observation:?}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

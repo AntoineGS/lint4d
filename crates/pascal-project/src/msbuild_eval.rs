@@ -263,16 +263,23 @@ impl ProjectBuilder {
         result
     }
 
+    /// `bootstrap` is the descriptor payload discovery already read, if any.
     pub(super) fn process_root_dproj(
         &mut self,
         path: &Path,
+        bootstrap: Option<ReadPayload>,
         tracker: &mut ProjectReadTracker<'_>,
     ) -> Result<(), String> {
         self.metadata_files.push(path.to_path_buf());
         let entry = ProjectPathEntry::legacy(path.to_path_buf());
-        let (contents, observation) =
-            read_payload_with_tracker(&self.read_policy, &entry, MAX_PROJECT_BYTES, tracker)
-                .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
+        let (contents, observation) = read_payload_with_tracker_reusing(
+            &self.read_policy,
+            &entry,
+            MAX_PROJECT_BYTES,
+            tracker,
+            bootstrap,
+        )
+        .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
         self.record_payload_observation(observation);
         let operations = parse_xml_operations(&contents, path)?;
         // MSBuild's project identity belongs to the root project, not to an

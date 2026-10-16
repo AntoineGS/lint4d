@@ -646,6 +646,27 @@ pub(super) fn read_payload_with_tracker(
     limit: u64,
     tracker: &mut ProjectReadTracker<'_>,
 ) -> Result<(String, MetadataObservation), String> {
+    read_payload_with_tracker_reusing(read_policy, entry, limit, tracker, None)
+}
+
+/// A payload this discovery already read, with the stamp taken before reading.
+#[derive(Debug)]
+pub(super) struct ReadPayload {
+    pub(super) stamp: ProjectReadStamp,
+    pub(super) contents: String,
+}
+
+/// [`read_payload_with_tracker`] that accounts `retained` instead of reading
+/// the file again, with the same checks, budget charges and observations.
+/// The retained stamp predates its read, so any change since then, including
+/// one made during that read, leaves the recorded observations stale.
+pub(super) fn read_payload_with_tracker_reusing(
+    read_policy: &ReadPolicy,
+    entry: &ProjectPathEntry,
+    limit: u64,
+    tracker: &mut ProjectReadTracker<'_>,
+    retained: Option<ReadPayload>,
+) -> Result<(String, MetadataObservation), String> {
     if is_deleted_path(&entry.path, tracker.deleted_paths) {
         return Err(format!(
             "metadata path is tombstoned by a delete notification: {}",
@@ -663,8 +684,15 @@ pub(super) fn read_payload_with_tracker(
         budget.check_cancelled()?;
         budget.charge_path_visits(1)?;
     }
-    let stamp = project_read_stamp(&entry.path)?;
-    let read_limit = stamp.bytes.min(limit);
+    let retained = retained.filter(|payload| payload.contents.len() as u64 <= limit);
+    let (stamp, read_limit) = match &retained {
+        Some(payload) => (payload.stamp.clone(), payload.contents.len() as u64),
+        None => {
+            let stamp = project_read_stamp(&entry.path)?;
+            let read_limit = stamp.bytes.min(limit);
+            (stamp, read_limit)
+        }
+    };
     if let Some(budget) = tracker.work_budget {
         let estimate = usize::try_from(read_limit)
             .map_err(|_| "metadata file size does not fit the work budget".to_string())?;
@@ -674,40 +702,67 @@ pub(super) fn read_payload_with_tracker(
         budget.ensure_file_read_fits(estimate.saturating_add(1))?;
         budget.check_cancelled()?;
     }
-    let bytes = match read_policy.read_payload_bytes(entry, read_limit) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            if let Some(budget) = tracker.work_budget {
-                // A failed over-limit stream may have consumed the full
-                // `limit + 1` probe. Debit the reserved maximum rather than
-                // losing those bytes from the cumulative account.
-                let reserved = usize::try_from(read_limit)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1);
-                budget.charge_file_bytes(reserved)?;
+    run_before_project_read(&entry.path);
+    let payload = match retained {
+        Some(payload) => TrackedPayload::Retained(payload.contents),
+        None => match read_policy.read_payload_bytes(entry, read_limit) {
+            Ok(bytes) => TrackedPayload::Read(bytes),
+            Err(error) => {
+                if let Some(budget) = tracker.work_budget {
+                    // A failed over-limit stream may have consumed the full
+                    // `limit + 1` probe. Debit the reserved maximum rather than
+                    // losing those bytes from the cumulative account.
+                    let reserved = usize::try_from(read_limit)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1);
+                    budget.charge_file_bytes(reserved)?;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        },
     };
+    let bytes = payload.bytes();
     run_after_project_read(&entry.path);
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
         budget.charge_file_bytes(bytes.len())?;
         budget.charge_path_visits(1)?;
     }
-    tracker.record(&entry.path, stamp, &bytes);
+    let observed_stamp = match payload {
+        TrackedPayload::Retained(_) => Some(stamp.clone()),
+        TrackedPayload::Read(_) => path_stamp_result(&entry.path).ok().flatten(),
+    };
+    tracker.record(&entry.path, stamp, bytes);
     let observation = MetadataObservation::Payload {
         path: entry.path.clone(),
         read_policy: read_policy.clone(),
         path_entry: entry.clone(),
-        stamp: path_stamp_result(&entry.path).ok().flatten(),
-        content_hash: project_content_hash(&bytes),
+        stamp: observed_stamp,
+        content_hash: project_content_hash(bytes),
     };
     // Source payloads use the same lossless UTF-8/Latin-1 boundary as the
     // resolver.  Project discovery still records the original bytes and hash
     // above; this decoded string is only the parser coordinate representation.
-    let contents = decode_source_payload(&bytes);
+    let contents = match payload {
+        TrackedPayload::Read(bytes) => decode_source_payload(&bytes),
+        TrackedPayload::Retained(contents) => contents,
+    };
     Ok((contents, observation))
+}
+
+enum TrackedPayload {
+    Read(Vec<u8>),
+    /// Already-decoded UTF-8, so its bytes are the bytes that were read.
+    Retained(String),
+}
+
+impl TrackedPayload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Read(bytes) => bytes,
+            Self::Retained(contents) => contents.as_bytes(),
+        }
+    }
 }
 
 fn decode_source_payload(bytes: &[u8]) -> String {
@@ -824,6 +879,83 @@ pub(super) fn is_pascal_source_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_payload_is_charged_like_a_fresh_read_without_reading_again() {
+        use crate::analysis_metrics::{Metric, TestScope};
+        use std::cell::Cell;
+
+        #[derive(Default)]
+        struct TotalsBudget {
+            visits: Cell<usize>,
+            ensured: Cell<usize>,
+            charged: Cell<usize>,
+        }
+
+        impl crate::ProjectWorkBudget for TotalsBudget {
+            fn check_cancelled(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+                self.visits.set(self.visits.get() + amount);
+                Ok(())
+            }
+
+            fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+                self.ensured.set(self.ensured.get() + max_bytes);
+                Ok(())
+            }
+
+            fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+                self.charged.set(self.charged.get() + amount);
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let path = root.join("App.dproj");
+        let descriptor = "<Project><PropertyGroup /></Project>";
+        fs::write(&path, descriptor).expect("descriptor");
+        let policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let entry = ProjectPathEntry::legacy(path.clone());
+        let tracked = |retained: Option<ReadPayload>| {
+            let budget = TotalsBudget::default();
+            let scope = TestScope::new();
+            let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+            let result =
+                read_payload_with_tracker_reusing(&policy, &entry, 1024, &mut tracker, retained)
+                    .expect("tracked payload");
+            let totals = (
+                budget.visits.get(),
+                budget.ensured.get(),
+                budget.charged.get(),
+            );
+            let read = scope.snapshot().value(Metric::AuthorizedPayloadBytes);
+            (result, totals, tracker.observations, read)
+        };
+
+        let (fresh, fresh_totals, fresh_reads, fresh_read) = tracked(None);
+        let stamp = path_stamp_result(&path)
+            .expect("descriptor stamp")
+            .expect("descriptor exists");
+        let (reused, reused_totals, reused_reads, reused_read) = tracked(Some(ReadPayload {
+            stamp,
+            contents: descriptor.to_string(),
+        }));
+
+        assert_eq!(reused, fresh, "same contents and observation");
+        assert_eq!(reused_totals, fresh_totals, "same budget charges");
+        assert_eq!(reused_reads, fresh_reads, "same tracked read");
+        assert_eq!(fresh_read, descriptor.len() as u64);
+        assert_eq!(reused_read, 0, "a retained payload is not read again");
+    }
 
     #[test]
     fn project_read_tracker_preserves_the_first_observation() {

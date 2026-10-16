@@ -138,5 +138,7 @@ mod packages;
 use assembly::add_unique_path;
 use authorization::{ExistingPathStatus, resolve_existing_path_status};
 use msbuild_eval::{ProjectBuilder, local_name, xml_attributes, xml_reference_text};
-use reads::{ProjectReadTracker, read_payload_with_tracker};
+use reads::{
+    ProjectReadTracker, ReadPayload, read_payload_with_tracker, read_payload_with_tracker_reusing,
+};
 use selection::{project_path_starts_with, project_paths_equal};

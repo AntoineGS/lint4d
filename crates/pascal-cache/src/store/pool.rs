@@ -170,12 +170,39 @@ impl DerefMut for Lease<'_> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
+            // A connection left inside a transaction would fail every later
+            // BEGIN, so roll it back or discard it.
+            let reusable = connection.is_autocommit()
+                || (connection.execute_batch("ROLLBACK").is_ok() && connection.is_autocommit());
             let mut state = self.pool.lock();
-            match self.role {
-                Role::Writer => state.writer = Some(connection),
-                Role::Reader => state.idle_readers.push(connection),
+            match (self.role, reusable) {
+                (Role::Writer, true) => state.writer = Some(connection),
+                (Role::Reader, true) => state.idle_readers.push(connection),
+                (Role::Writer, false) => state.writer_open = false,
+                (Role::Reader, false) => state.open_readers -= 1,
             }
             self.pool.returned.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lease_dropped_inside_a_transaction_returns_a_clean_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = Pool::new(root.path().join("pool.sqlite3"), StoreLimits::default());
+        let deadline = || Deadline::after(Duration::from_secs(5));
+        for role in [Role::Reader, Role::Writer] {
+            let lease = pool.acquire(role, deadline()).unwrap();
+            lease.execute_batch("BEGIN").unwrap();
+            assert!(!lease.is_autocommit());
+            drop(lease);
+            let lease = pool.acquire(role, deadline()).unwrap();
+            assert!(lease.is_autocommit(), "{role:?}");
+            lease.execute_batch("BEGIN").unwrap();
         }
     }
 }

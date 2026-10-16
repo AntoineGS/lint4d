@@ -152,40 +152,47 @@ fn a_different_manifest_under_the_same_id_is_an_integrity_failure() {
 
 /// Plant `artifacts` artifacts of `rows` rows each in the namespace's epoch 0.
 fn plant(directory: &Path, byte: u8, artifacts: u8, rows: i64) {
+    plant_at(directory, byte, 0, artifacts, rows);
+}
+
+fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
     let connection = raw(directory);
     let ns = namespace(byte).id();
     for artifact in 0..artifacts {
         let id = [artifact; 32];
         connection
             .execute(
-                "INSERT INTO key_manifests VALUES (?1, 0, ?2, 2, ?3)",
+                "INSERT INTO key_manifests VALUES (?1, ?4, ?2, 2, ?3)",
                 params![
                     ns.as_bytes().as_slice(),
                     id.as_slice(),
-                    b"L4DC\x01\x00\x00\x00\x02".as_slice()
+                    b"L4DC\x01\x00\x00\x00\x02".as_slice(),
+                    epoch
                 ],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO artifacts VALUES (?1, 0, ?2, 2, NULL, 1, ?3, 0, ?4, x'')",
+                "INSERT INTO artifacts VALUES (?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'')",
                 params![
                     ns.as_bytes().as_slice(),
                     id.as_slice(),
                     rows,
-                    [0u8; 32].as_slice()
+                    [0u8; 32].as_slice(),
+                    epoch
                 ],
             )
             .unwrap();
         for ordinal in 0..rows {
             connection
                 .execute(
-                    "INSERT INTO artifact_rows VALUES (?1, 0, ?2, ?3, 1, NULL, x'', ?4)",
+                    "INSERT INTO artifact_rows VALUES (?1, ?5, ?2, ?3, 1, NULL, x'', ?4)",
                     params![
                         ns.as_bytes().as_slice(),
                         id.as_slice(),
                         ordinal,
-                        [0u8; 32].as_slice()
+                        [0u8; 32].as_slice(),
+                        epoch
                     ],
                 )
                 .unwrap();
@@ -233,6 +240,43 @@ fn reclaim_deletes_retired_scopes_in_bounded_batches() {
             complete: true
         })
     );
+}
+
+#[test]
+fn reclaim_spares_a_namespace_that_is_live_again_at_a_later_epoch() {
+    let root = private_tempdir();
+    drop(open(root.path(), 1));
+    plant(root.path(), 1, 2, 3); // epoch 0: 6 rows + 2 headers + 2 manifests
+    drop(open(root.path(), 2)); // retires namespace 1 at epoch 0
+    let store = open(root.path(), 1); // live again at epoch 1
+    assert_eq!(store.scope().reset_epoch, 1);
+    plant_at(root.path(), 1, 1, 1, 2);
+    loop {
+        if store.reclaim(5).unwrap().complete {
+            break;
+        }
+    }
+    let connection = raw(root.path());
+    let epochs = |table: &str| -> Vec<i64> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT DISTINCT reset_epoch FROM {table} ORDER BY 1"
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    for table in ["artifact_rows", "artifacts", "key_manifests"] {
+        assert_eq!(epochs(table), vec![1], "{table}");
+    }
+    let rows: i64 = connection
+        .query_row("SELECT count(*) FROM artifact_rows", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+    assert_eq!(state(root.path(), 1), Some((1, 1)));
 }
 
 #[test]

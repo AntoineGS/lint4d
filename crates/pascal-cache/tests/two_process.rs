@@ -7,6 +7,7 @@ use pascal_cache::{
 use pascal_project::{ConditionalContext, SourceOrigin};
 use rusqlite::Connection;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -168,7 +169,8 @@ fn a_process_aborted_before_commit_leaves_no_partial_artifact() {
         .stderr(Stdio::null())
         .status()
         .unwrap();
-    assert!(!status.success());
+    // Death by SIGABRT proves the child reached the hook.
+    assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
     // A new process recovers the WAL and sees no trace of the aborted write.
     let store = Store::open(&directory, &namespace(1), StoreLimits::default()).unwrap();
     assert_eq!(

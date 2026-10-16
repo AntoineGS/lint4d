@@ -141,6 +141,13 @@ impl ArtifactReader<'_> {
         self.state == State::Verified
     }
 
+    /// The artifact's supplemental bytes, once the whole read verified.
+    /// Before that they are as unverified as the rows.
+    pub fn supplemental(&self) -> Option<&[u8]> {
+        self.is_verified()
+            .then_some(self.header.supplemental.as_slice())
+    }
+
     fn fail(&mut self, miss: Miss) -> Result<Lookup<Option<RowBatch>>, Bypass> {
         self.state = State::Failed(miss);
         Ok(Lookup::Miss(miss))
@@ -172,8 +179,12 @@ impl ArtifactReader<'_> {
     }
 
     /// The next batch, or `Hit(None)` once every row was read and verified.
-    /// Rows are unverified until then.
+    /// Rows are unverified until then. A header from another store (another
+    /// scope) is fenced before any SQL.
     pub fn next_batch(&mut self) -> Result<Lookup<Option<RowBatch>>, Bypass> {
+        if self.header.scope != self.store.scope() {
+            return Err(Bypass::Fenced);
+        }
         match self.state {
             State::Verified => return Ok(Lookup::Hit(None)),
             State::Failed(miss) => return Ok(Lookup::Miss(miss)),

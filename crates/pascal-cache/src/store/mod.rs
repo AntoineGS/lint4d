@@ -46,6 +46,10 @@ use std::path::Path;
 
 /// One process's handle on a store directory, scoped to one namespace.
 /// While it exists the namespace is held live (spec §10).
+///
+/// The scratch budget, the page cache and the 2+1 connection pool belong to
+/// each `Store`, while the spec states them per process. One store per
+/// process is expected: every additional `Store` adds its own budgets.
 pub struct Store {
     location: StoreLocation,
     limits: StoreLimits,

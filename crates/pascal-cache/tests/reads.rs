@@ -443,3 +443,62 @@ fn private_tempdir() -> tempfile::TempDir {
     .unwrap();
     root
 }
+
+#[test]
+fn supplemental_is_trusted_only_once_the_read_verifies() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let header = publish(&store, &key("unit A;"), &small(3));
+    let mut reader = store.read_artifact(&header);
+    assert_eq!(reader.supplemental(), None);
+    while let Lookup::Hit(Some(_)) = reader.next_batch().unwrap() {
+        assert_eq!(reader.supplemental(), None);
+    }
+    assert!(reader.is_verified());
+    assert_eq!(reader.supplemental(), Some(b"s".as_slice()));
+}
+
+#[test]
+fn tampered_supplemental_is_a_checksum_miss_and_stays_untrusted() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let stored = publish(&store, &key("unit A;"), &small(3));
+    raw(root.path())
+        .execute("UPDATE artifacts SET supplemental = x'01'", [])
+        .unwrap();
+    let header = match store
+        .open_artifact(ArtifactKeyRef::local(&key("unit A;")))
+        .unwrap()
+    {
+        Lookup::Hit(header) => header,
+        miss => panic!("{miss:?}"),
+    };
+    assert_ne!(header, stored);
+    let mut reader = store.read_artifact(&header);
+    let miss = loop {
+        match reader.next_batch().unwrap() {
+            Lookup::Hit(Some(_)) => {}
+            Lookup::Hit(None) => panic!("a tampered supplemental must not verify"),
+            Lookup::Miss(miss) => break miss,
+        }
+    };
+    assert_eq!(miss, Miss::ChecksumMismatch);
+    assert_eq!(reader.supplemental(), None);
+}
+
+#[test]
+fn a_header_from_another_store_is_fenced() {
+    let first = private_tempdir();
+    let second = private_tempdir();
+    let store = open(first.path(), StoreLimits::default());
+    let other = Store::open(
+        second.path(),
+        &Namespace::new(Digest::from_bytes([2; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let header = publish(&other, &key("unit A;"), &small(3));
+    let mut reader = store.read_artifact(&header);
+    assert_eq!(reader.next_batch(), Err(Bypass::Fenced));
+    assert!(!reader.is_verified());
+}

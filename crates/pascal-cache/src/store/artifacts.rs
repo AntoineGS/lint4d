@@ -36,8 +36,10 @@ pub struct ArtifactWrite<'a> {
     pub rows: &'a [ArtifactRow<'a>],
 }
 
-/// An admitted artifact header. Its rows are unverified until
-/// [`Store::read_artifact`] has streamed and checked all of them.
+/// An admitted artifact header. Its supplemental bytes, counts and rows are
+/// all unverified until [`Store::read_artifact`] has streamed and checked
+/// every row and the reader reports `is_verified()`; callers must not trust
+/// coverage or counts before then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHeader {
     pub(crate) scope: Scope,
@@ -62,6 +64,8 @@ impl ArtifactHeader {
         self.content_bytes
     }
 
+    /// Unverified: the fact checksum covers these bytes, but it is checked
+    /// only at the end of the read. Prefer `ArtifactReader::supplemental`.
     pub fn supplemental(&self) -> &[u8] {
         &self.supplemental
     }

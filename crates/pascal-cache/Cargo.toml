@@ -14,13 +14,22 @@ description = "Canonical durable keys for the lint4d persistent analysis cache"
 blake3 = "1.8.7"
 pascal-core = { path = "../pascal-core" }
 pascal-project = { path = "../pascal-project" }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "limits", "cache"] }
+
+[features]
+test-support = []
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 blake3 = "1.8.7"
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "limits", "cache"] }
 pascal-project = { path = "../pascal-project", features = ["test-support"] }
+pascal-cache = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -375,3 +375,14 @@ fn members_carry_paths_spelling_uri_fallback_and_context() {
         assert_ne!(MemberKey::new(&other), base, "{name}");
     }
 }
+
+#[test]
+fn expanded_keys_remember_their_root() {
+    let root = local(
+        UNIT,
+        &ConditionalContext::default(),
+        SourceOrigin::ProjectCompiled,
+    );
+    let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
+    assert_eq!(expanded.root_digest(), root.digest());
+}

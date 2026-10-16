@@ -40,12 +40,10 @@ pub struct ArtifactWrite<'a> {
 /// [`Store::read_artifact`] has streamed and checked all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHeader {
-    #[allow(dead_code)] // read by the artifact reader (Task 5)
     pub(crate) scope: Scope,
     pub(crate) artifact_id: Digest,
     pub(crate) row_count: u64,
     pub(crate) content_bytes: u64,
-    #[allow(dead_code)] // read by the artifact reader (Task 5)
     pub(crate) fact_checksum: Digest,
     pub(crate) supplemental: Vec<u8>,
 }

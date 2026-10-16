@@ -4,12 +4,14 @@
 
 mod artifacts;
 mod container;
+mod index;
 mod keys;
 mod limits;
 mod location;
 mod namespaces;
 mod outcome;
 mod pool;
+mod reader;
 mod sqlite;
 #[cfg(feature = "test-support")]
 mod testing;
@@ -17,9 +19,13 @@ mod testing;
 pub use artifacts::{
     ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
 };
+#[cfg(feature = "test-support")]
+pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
+pub use index::{IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
+pub use reader::{ArtifactReader, RowBatch, StoredRow};
 
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use limits::{
@@ -46,6 +52,7 @@ pub struct Store {
     namespace: Namespace,
     scope: Scope,
     pool: Pool,
+    scratch: std::sync::Arc<reader::ScratchBudget>,
     _lock: NamespaceLock,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
@@ -81,6 +88,7 @@ impl Store {
             namespace: namespace.clone(),
             scope,
             pool,
+            scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),

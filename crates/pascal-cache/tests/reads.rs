@@ -246,6 +246,68 @@ fn readers_hold_no_snapshot_between_batches() {
     assert_eq!(busy, 0);
 }
 
+/// Drain `reader`, returning every ordinal received, in order.
+fn drain(reader: &mut pascal_cache::ArtifactReader<'_>) -> Vec<u64> {
+    let mut ordinals = Vec::new();
+    while let Lookup::Hit(Some(batch)) = reader.next_batch().unwrap() {
+        ordinals.extend(batch.rows().iter().map(|row| row.ordinal));
+    }
+    ordinals
+}
+
+#[test]
+fn a_bypass_mid_batch_leaves_the_witness_where_the_caller_is() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let header = publish(&store, &key("unit A;"), &small(300));
+    store.fail_row_reads_after_for_test(Some(10));
+    let mut reader = store.read_artifact(&header);
+    assert!(matches!(reader.next_batch(), Err(Bypass::Sqlite { .. })));
+    assert!(!reader.is_verified());
+    store.fail_row_reads_after_for_test(None);
+    assert_eq!(drain(&mut reader), (0..300).collect::<Vec<u64>>());
+    assert!(reader.is_verified());
+}
+
+#[test]
+fn a_retry_after_a_bypass_resumes_at_the_undelivered_ordinal() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let header = publish(&store, &key("unit A;"), &small(600));
+    let mut reader = store.read_artifact(&header);
+    let mut received = Vec::new();
+    match reader.next_batch().unwrap() {
+        Lookup::Hit(Some(batch)) => received.extend(batch.rows().iter().map(|row| row.ordinal)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(received.len(), 256);
+    store.fail_row_reads_after_for_test(Some(10));
+    let _ = reader.next_batch();
+    received.extend(drain(&mut reader));
+    assert_eq!(received, (0..600).collect::<Vec<u64>>());
+    assert!(reader.is_verified());
+}
+
+#[test]
+fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let header = publish(&store, &key("unit A;"), &small(256));
+    raw(root.path())
+        .execute(
+            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, row_kind, \
+             index_key, payload, row_checksum) \
+             SELECT namespace_id, reset_epoch, artifact_id, 256, 1, NULL, x'00', zeroblob(32) \
+             FROM artifact_rows WHERE ordinal = 0",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        read_all(&store, &header),
+        Err(Miss::Malformed(Malformed::Count))
+    );
+}
+
 fn publish_named(store: &Store, text: &str, names: &[&[u8]]) -> Digest {
     let key = key(text);
     let rows: Vec<ArtifactRow<'_>> = names

@@ -1,5 +1,5 @@
 use super::Store;
-use super::artifacts::{ArtifactHeader, FactHasher, row_checksum, row_encoding};
+use super::artifacts::{ArtifactHeader, FactHasher, hash_row};
 use super::limits::{MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS};
 use super::namespaces::{ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
@@ -146,6 +146,31 @@ impl ArtifactReader<'_> {
         Ok(Lookup::Miss(miss))
     }
 
+    /// A row at or past the header's count would be indexed yet never
+    /// yielded by a verified read, so it makes the artifact malformed.
+    fn trailing_rows(&self) -> Result<Option<Miss>, Bypass> {
+        let scope = self.header.scope;
+        let mut reader = self.store.reader()?;
+        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+        ensure_live(&transaction, scope)?;
+        let found: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM artifact_rows \
+                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3 AND ordinal >= ?4 \
+                 LIMIT 1",
+                params![
+                    scope.namespace.as_bytes().as_slice(),
+                    epoch(scope),
+                    self.header.artifact_id.as_bytes().as_slice(),
+                    self.header.row_count as i64
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| classify(&error))?;
+        Ok(found.map(|_| Miss::Malformed(Malformed::Count)))
+    }
+
     /// The next batch, or `Hit(None)` once every row was read and verified.
     /// Rows are unverified until then.
     pub fn next_batch(&mut self) -> Result<Lookup<Option<RowBatch>>, Bypass> {
@@ -155,6 +180,9 @@ impl ArtifactReader<'_> {
             State::Reading => {}
         }
         if self.next_ordinal == self.header.row_count {
+            if let Some(miss) = self.trailing_rows()? {
+                return self.fail(miss);
+            }
             if self.content_bytes == self.header.content_bytes
                 && self.hasher.finish() == self.header.fact_checksum
             {
@@ -209,9 +237,21 @@ impl ArtifactReader<'_> {
                 MAX_ROW_BATCH_ROWS as i64
             ])
             .map_err(|error| classify(&error))?;
+        // The witness advances in locals and is committed to `self` only
+        // when the batch is handed out, so a bypass mid-batch leaves it
+        // where the caller is and a retry re-reads the same rows.
+        let mut hasher = self.hasher.clone();
+        let mut next_ordinal = self.next_ordinal;
+        let mut content_bytes = self.content_bytes;
         let mut batch = Vec::new();
         let mut bytes = 0usize;
+        let fault = store.take_row_fault();
         loop {
+            if fault == Some(batch.len()) {
+                return Err(Bypass::Sqlite {
+                    extended_code: rusqlite::ffi::SQLITE_IOERR,
+                });
+            }
             let row = match rows.next() {
                 Ok(Some(row)) => row,
                 Ok(None) => break,
@@ -232,7 +272,7 @@ impl ArtifactReader<'_> {
                 Ok(values) => values,
                 Err(error) => return classify_read(&error).and_then(|miss| self.fail(miss)),
             };
-            if ordinal != self.next_ordinal as i64 {
+            if ordinal != next_ordinal as i64 {
                 return self.fail(Miss::Malformed(Malformed::Ordinal));
             }
             let Ok(row_kind) = u8::try_from(row_kind) else {
@@ -245,22 +285,27 @@ impl ArtifactReader<'_> {
             if bytes + size > MAX_ROW_BATCH_BYTES {
                 break;
             }
-            let encoding =
-                row_encoding(artifact_id, self.next_ordinal, row_kind, index_key, payload);
-            if row_checksum(encoding.as_bytes()).as_bytes().as_slice() != checksum {
+            let computed = hash_row(
+                &mut hasher,
+                artifact_id,
+                next_ordinal,
+                row_kind,
+                index_key,
+                payload,
+            );
+            if computed.as_bytes().as_slice() != checksum {
                 return self.fail(Miss::ChecksumMismatch);
             }
-            self.hasher.row(encoding.as_bytes());
             bytes += size;
-            self.content_bytes += size as u64;
+            content_bytes += size as u64;
             batch.push(StoredRow {
-                ordinal: self.next_ordinal,
+                ordinal: next_ordinal,
                 row_kind,
                 index_key: index_key.map(<[u8]>::to_vec),
                 payload: payload.to_vec(),
             });
-            self.next_ordinal += 1;
-            if self.next_ordinal > self.header.row_count {
+            next_ordinal += 1;
+            if next_ordinal > self.header.row_count {
                 return self.fail(Miss::Malformed(Malformed::Count));
             }
         }
@@ -269,6 +314,9 @@ impl ArtifactReader<'_> {
             return self.fail(Miss::Malformed(Malformed::Count));
         }
         scratch.shrink_to(bytes as u64);
+        self.hasher = hasher;
+        self.next_ordinal = next_ordinal;
+        self.content_bytes = content_bytes;
         Ok(Lookup::Hit(Some(RowBatch {
             rows: batch,
             _scratch: scratch,

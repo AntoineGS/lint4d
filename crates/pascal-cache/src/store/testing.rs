@@ -11,6 +11,7 @@ type Hook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct Hooks {
     before_commit: Mutex<Option<Hook>>,
+    row_fault: Mutex<Option<usize>>,
 }
 
 impl Hooks {
@@ -23,6 +24,18 @@ impl Hooks {
         if let Some(hook) = hook {
             hook();
         }
+    }
+}
+
+impl Store {
+    /// Take the one-shot row fault: the number of rows to read before the
+    /// next `next_batch` call fails with a SQLite I/O error.
+    pub(crate) fn take_row_fault(&self) -> Option<usize> {
+        self.hooks
+            .row_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -51,6 +64,16 @@ impl Store {
             .before_commit
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
+    /// Make the next `next_batch` call fail with a SQLite I/O error after
+    /// reading `rows` rows. One-shot; `None` clears a pending fault.
+    pub fn fail_row_reads_after_for_test(&self, rows: Option<usize>) {
+        *self
+            .hooks
+            .row_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = rows;
     }
 
     /// Let the database grow by at most `extra_pages` pages through this

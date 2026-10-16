@@ -155,6 +155,11 @@ impl Store {
 
     #[cfg(not(feature = "test-support"))]
     pub(crate) fn before_commit(&self) {}
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn take_row_fault(&self) -> Option<usize> {
+        None
+    }
 }
 
 fn unix_seconds() -> u64 {

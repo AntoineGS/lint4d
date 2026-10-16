@@ -39,5 +39,9 @@ pub use store::{
     MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
     MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
     MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_SQLITE_VERSION_NUMBER, Malformed, Miss, Published,
-    SQLITE_LENGTH_LIMIT, StoreLimits, StoreLocation, TooLarge, default_directory,
+    Reclaimed, RetireReport, SQLITE_LENGTH_LIMIT, Scope, Store, StoreLimits, StoreLocation,
+    TooLarge, default_directory,
 };
+
+#[cfg(feature = "test-support")]
+pub use store::HeldConnection;

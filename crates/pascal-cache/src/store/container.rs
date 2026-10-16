@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};

@@ -5982,12 +5982,12 @@ fn lint_configuration_for_input(
     workspace.project_selections = input.project_selections.clone();
     workspace.document_owners = input.document_owners.clone();
     let context_key = workspace.context_for_uri(uri)?;
-    let context = workspace
+    let (context, context_observations) = workspace
         .contexts
         .get(&context_key)
-        .map(|state| state.context.clone())
+        .map(|state| (state.context.clone(), state.context_observations.clone()))
         .ok_or_else(|| format!("project context was not retained for {uri}"))?;
-    if has_invalid_project_selection(&context) {
+    if has_invalid_project_selection(&context_observations) {
         return Err(
             "project selection is invalid; select a current project or Automatic".to_string(),
         );
@@ -6026,7 +6026,7 @@ fn lint_configuration_for_input(
                 content_bytes: content_bytes.clone(),
                 candidate_membership: None,
                 candidate_observations: Vec::new(),
-                read_policy: Some(context.read_policy.clone()),
+                read_policy: Some(context.read_policy().clone()),
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,
                 missing_provider_candidate: false,

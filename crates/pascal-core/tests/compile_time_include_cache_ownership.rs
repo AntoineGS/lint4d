@@ -77,7 +77,8 @@ fn actual_include_decoded_cache_keeps_credits_until_its_last_owner_drops() {
     std::fs::write(dir.path().join("value.inc"), b"// \xe9\n").unwrap();
     let ctx =
         ProjectContext::discover(&root_path, &[dir.path().into()], &ProjectOptions::default())
-            .unwrap();
+            .unwrap()
+            .context;
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],

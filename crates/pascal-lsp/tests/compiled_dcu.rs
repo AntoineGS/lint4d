@@ -5,11 +5,21 @@ use pascal_lsp::{
         CompiledUnitDocument, discover_compiled_units, virtual_unit_identity,
     },
 };
+use pascal_project::ProjectContextParts;
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{ProjectContext, ProjectPathEntry, ReadPolicy};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+
+fn edit_context<R>(
+    context: &mut pascal_project::ProjectContext,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts);
+}
 
 fn fixture() -> Vec<u8> {
     fs::read(
@@ -30,13 +40,12 @@ fn selected_context(search_paths: &[PathBuf]) -> ProjectContext {
         .map(ProjectPathEntry::legacy)
         .collect();
     let read_policy = ReadPolicy::new(&search_paths, &[], &[], &EffectiveOverrides::default());
-    ProjectContext {
+    ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
-        search_paths,
         search_path_entries,
         read_policy,
-        ..ProjectContext::default()
-    }
+        ..ProjectContextParts::default()
+    })
 }
 
 #[test]
@@ -48,15 +57,15 @@ fn d13_win64_compiled_unit_is_read_only_navigation_completion_and_hover_provider
     let selected = selected_context(std::slice::from_ref(&fixture_root));
     assert!(
         selected
-            .read_policy
-            .allows_location(&selected.search_path_entries[0])
+            .read_policy()
+            .allows_location(&selected.search_path_entries()[0])
     );
-    let fixture_path = selected.search_paths[0].join("Lint4dFixture.Classes.dcu");
+    let fixture_path = selected.search_paths()[0].join("Lint4dFixture.Classes.dcu");
     let fixture_entry = selected
-        .read_policy
+        .read_policy()
         .entry_for_path(&fixture_path)
         .expect("fixture is covered by policy");
-    assert!(selected.read_policy.allows_location(&fixture_entry));
+    assert!(selected.read_policy().allows_location(&fixture_entry));
     let loaded = discover_compiled_units(
         &selected,
         &["Lint4dFixture.Classes".to_string()],
@@ -159,7 +168,7 @@ fn selected_context_loads_only_unique_authorized_dcu_without_source_shadowing() 
     .expect("read the selected project's supported DCU");
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].document.version_name(), "D13");
-    assert!(units[0].is_current(&selected.read_policy));
+    assert!(units[0].is_current(selected.read_policy()));
 }
 
 #[test]
@@ -202,7 +211,7 @@ fn compiled_unit_content_observation_detects_same_size_replacement() {
     )
     .unwrap();
     assert_eq!(loaded.len(), 1);
-    assert!(loaded[0].is_current(&selected.read_policy));
+    assert!(loaded[0].is_current(selected.read_policy()));
 
     let mut replacement = fixture();
     let last_byte = replacement.len() - 1;
@@ -212,7 +221,7 @@ fn compiled_unit_content_observation_detects_same_size_replacement() {
         fs::metadata(&path).unwrap().len() as usize
     );
     fs::write(&path, replacement).unwrap();
-    assert!(!loaded[0].is_current(&selected.read_policy));
+    assert!(!loaded[0].is_current(selected.read_policy()));
     let refreshed = discover_compiled_units(
         &selected,
         &["Lint4dFixture.Classes".to_string()],
@@ -282,7 +291,7 @@ fn selected_context_refuses_symlinked_dcu_and_unapproved_search_paths() {
     );
 
     let mut unauthorized = selected;
-    unauthorized.read_policy = ReadPolicy::default();
+    edit_context(&mut unauthorized, |p| p.read_policy = ReadPolicy::default());
     assert!(
         discover_compiled_units(&unauthorized, &[name.to_string()], &AtomicBool::new(false),)
             .unwrap()

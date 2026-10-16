@@ -7,9 +7,9 @@
 
 use crate::compile_time::{AdmittedOwned, AdmittedShared, CompileTimeBudget};
 use pascal_project::{
-    MetadataObservation, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_identity,
-    path_stamp_result, read_package_metadata_with_observations,
+    MetadataObservation, ProjectContext, ProjectObservations, ProjectPathEntry,
+    ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ReadPolicy,
+    content_hash_bytes, path_identity, path_stamp_result, read_package_metadata_with_observations,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1422,7 +1422,7 @@ pub use store::{FilesystemSourceStore, OverlaySource};
 /// Resolver-owned caches and observations are request-local. Callers may
 /// explicitly share bounded package catalogues with an operation-scoped cache.
 pub struct UnitResolver<S> {
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     workspace_roots: Vec<PathBuf>,
     store: S,
     limits: ResolverLimits,
@@ -2607,7 +2607,7 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     pub fn new(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
@@ -2620,7 +2620,7 @@ impl<S: SourceStore> UnitResolver<S> {
     /// and unchanged source-store state in one operation. Discard the cache
     /// when that operation completes.
     pub fn new_with_session_cache(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
@@ -2630,29 +2630,21 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn new_inner(
-        context: ProjectContext,
+        context: impl Into<Arc<ProjectContext>>,
         workspace_roots: Vec<PathBuf>,
         store: S,
         limits: ResolverLimits,
         session_cache: Option<ResolverSessionCache>,
     ) -> Self {
+        let context = context.into();
         let session_cache = session_cache.filter(|cache| cache.bind(&context, limits));
         let mut report = ResolutionReport {
             observations: Vec::new(),
             warnings: Vec::new(),
-            complete: context.discovery_complete,
+            complete: context.discovery_complete(),
             incomplete_reasons: Vec::new(),
         };
-        for observation in &context.metadata_observations {
-            push_observation(
-                &mut report.observations,
-                ResolutionObservation::Metadata(observation.clone()),
-            );
-        }
-        for warning in &context.warnings {
-            push_warning(&mut report, warning.clone(), limits.max_resolution_warnings);
-        }
-        if !context.discovery_complete {
+        if !context.discovery_complete() {
             report
                 .incomplete_reasons
                 .push("project metadata is incomplete".to_string());
@@ -2701,6 +2693,25 @@ impl<S: SourceStore> UnitResolver<S> {
             callback_unit_names: None,
             callback_provider: None,
         }
+    }
+
+    /// Seed the resolution report with what constructing the context
+    /// observed, so report consumers can revalidate those reads.
+    pub fn with_context_observations(mut self, observations: &ProjectObservations) -> Self {
+        for observation in &observations.metadata_observations {
+            push_observation(
+                &mut self.report.observations,
+                ResolutionObservation::Metadata(observation.clone()),
+            );
+        }
+        for warning in &observations.warnings {
+            push_warning(
+                &mut self.report,
+                warning.clone(),
+                self.limits.max_resolution_warnings,
+            );
+        }
+        self
     }
 
     /// Declared name and imports of a loaded source, parsed at most once per
@@ -3356,7 +3367,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut loaded_ids = HashSet::from([root.source.id.clone()]);
         self.project_unit_ids = Some(loaded_ids.clone());
         self.enqueue_project_imports(queue, &root, root_sites, cancel)?;
-        let mut complete = self.context.discovery_complete && self.report.complete;
+        let mut complete = self.context.discovery_complete() && self.report.complete;
         while let Some(item) = queue.items.pop_front() {
             let step = (|| {
                 let importer = &item.unit;
@@ -3679,11 +3690,11 @@ impl<S: SourceStore> UnitResolver<S> {
         if self.owning_unit_reason {
             let count = self
                 .context
-                .unit_namespaces
+                .unit_namespaces()
                 .len()
-                .checked_add(self.context.search_path_entries.len())
-                .and_then(|n| n.checked_add(self.context.browsing_path_entries.len()))
-                .and_then(|n| n.checked_add(self.context.explicit_unit_entries.len()))
+                .checked_add(self.context.search_path_entries().len())
+                .and_then(|n| n.checked_add(self.context.browsing_path_entries().len()))
+                .and_then(|n| n.checked_add(self.context.explicit_unit_entries().len()))
                 .ok_or_else(|| {
                     ResolverError::InvalidRequest("unit lookup sizing work overflow".into())
                 })?;
@@ -3691,7 +3702,7 @@ impl<S: SourceStore> UnitResolver<S> {
             budget
                 .charge(count, 0, 0)
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-            for entries in self.context.explicit_unit_entries.values() {
+            for entries in self.context.explicit_unit_entries().values() {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
                 }
@@ -3702,7 +3713,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         let names = self
             .context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .try_fold(0usize, |sum, n| {
                 if cancel.is_cancelled() {
@@ -3716,9 +3727,9 @@ impl<S: SourceStore> UnitResolver<S> {
             })?;
         let paths = self
             .context
-            .search_path_entries
+            .search_path_entries()
             .iter()
-            .chain(&self.context.browsing_path_entries)
+            .chain(self.context.browsing_path_entries())
             .try_fold(0usize, |sum, e| {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
@@ -3731,7 +3742,7 @@ impl<S: SourceStore> UnitResolver<S> {
             })?;
         let explicit = self
             .context
-            .explicit_unit_entries
+            .explicit_unit_entries()
             .values()
             .flatten()
             .try_fold(0usize, |sum, e| {
@@ -3752,8 +3763,8 @@ impl<S: SourceStore> UnitResolver<S> {
             .saturating_mul(2)
             .saturating_add(explicit.saturating_mul(2))
             .saturating_add(names.saturating_mul(
-                self.context.search_path_entries.len()
-                    + self.context.browsing_path_entries.len()
+                self.context.search_path_entries().len()
+                    + self.context.browsing_path_entries().len()
                     + 2,
             ))
             .saturating_add(request.requested_name.len().saturating_mul(8));
@@ -3791,10 +3802,10 @@ impl<S: SourceStore> UnitResolver<S> {
         let missing_issue = if self.owning_unit_reason {
             let mut budget = self.store_budget(cancel).expect("owning unit reason root");
             budget
-                .charge(self.context.path_issues.len(), 0, 0)
+                .charge(self.context.path_issues().len(), 0, 0)
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
             let mut found = None;
-            for issue in &self.context.path_issues {
+            for issue in self.context.path_issues() {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
                 }
@@ -3866,7 +3877,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         if let Some(entries) = self
             .context
-            .explicit_unit_entries
+            .explicit_unit_entries()
             .get(&lookup.to_ascii_lowercase())
         {
             let group = CandidateGroup {
@@ -3878,36 +3889,14 @@ impl<S: SourceStore> UnitResolver<S> {
             {
                 return Ok(result);
             }
-        } else if let Some(paths) = self
-            .context
-            .explicit_units
-            .get(&lookup.to_ascii_lowercase())
-        {
-            let paths: Vec<_> = paths
-                .iter()
-                .filter_map(|path| {
-                    self.context
-                        .path_entry_for(path)
-                        .or_else(|| self.legacy_entry_for_path(path, request.legacy_route))
-                        .map(|entry| (path.clone(), entry))
-                })
-                .collect();
-            let group = CandidateGroup {
-                paths: paths.into(),
-                legacy_route: request.legacy_route,
-            };
-            if let Some(result) =
-                self.resolve_candidate_group(&group, requested, &lookup, cancel)?
-            {
-                return Ok(result);
-            }
         }
 
+        let namespaces = self.context.unit_namespaces().to_vec();
         if let Some(directory) = request.importer_path.parent()
             && let Some(result) = self.resolve_directory(
                 directory,
                 &lookup,
-                &self.context.unit_namespaces.clone(),
+                &namespaces,
                 request.legacy_route,
                 cancel,
                 None,
@@ -3916,20 +3905,12 @@ impl<S: SourceStore> UnitResolver<S> {
         {
             return Ok(result);
         }
-        let search_entries = if self.context.search_path_entries.is_empty() {
-            self.context
-                .search_paths
-                .iter()
-                .filter_map(|path| self.context.path_entry_for(path))
-                .collect::<Vec<_>>()
-        } else {
-            self.context.search_path_entries.clone()
-        };
+        let search_entries = self.context.search_path_entries().to_vec();
         for entry in search_entries {
             if let Some(result) = self.resolve_directory(
                 &entry.path,
                 &lookup,
-                &self.context.unit_namespaces.clone(),
+                &namespaces,
                 request.legacy_route,
                 cancel,
                 Some(&entry),
@@ -3943,11 +3924,11 @@ impl<S: SourceStore> UnitResolver<S> {
         // follow every project/client and selected-installation library path,
         // and missing explicit bindings were reserved above.
         if !skip_browsing {
-            for entry in self.context.browsing_path_entries.clone() {
+            for entry in self.context.browsing_path_entries().to_vec() {
                 if let Some(result) = self.resolve_directory(
                     &entry.path,
                     &lookup,
-                    &self.context.unit_namespaces.clone(),
+                    &namespaces,
                     request.legacy_route,
                     cancel,
                     Some(&entry),
@@ -3958,7 +3939,7 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
 
-        if self.context.project_file.is_none() {
+        if self.context.project_file().is_none() {
             let catalogue_groups = self.filename_catalogue_candidates(&lookup, cancel)?;
             for group in catalogue_groups {
                 if let Some(result) =
@@ -3969,7 +3950,7 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
 
-        if !self.context.packages.is_empty() {
+        if !self.context.packages().is_empty() {
             self.package_lookup_for_unit(requested, &lookup, request.legacy_route, cancel)
         } else {
             Ok(Resolution::Unavailable {
@@ -4272,9 +4253,9 @@ impl<S: SourceStore> UnitResolver<S> {
 
     fn exact_context_entry_for_path(&self, path: &Path) -> Option<ProjectPathEntry> {
         self.context
-            .main_source_entry
-            .iter()
-            .chain(self.context.explicit_unit_entries.values().flatten())
+            .main_source_entry()
+            .into_iter()
+            .chain(self.context.explicit_unit_entries().values().flatten())
             .find(|entry| path_equivalent(&entry.path, path))
             .cloned()
     }
@@ -5143,8 +5124,8 @@ impl<S: SourceStore> UnitResolver<S> {
             .ok_or_else(overflow)?;
         let mut entry_bound = 0;
         for source in std::iter::once(entry)
-            .chain(self.context.main_source_entry.iter())
-            .chain(self.context.explicit_unit_entries.values().flatten())
+            .chain(self.context.main_source_entry())
+            .chain(self.context.explicit_unit_entries().values().flatten())
         {
             let mut bytes = 0usize;
             source
@@ -5184,7 +5165,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let work = count
             .checked_mul(
                 count
-                    .checked_add(self.context.explicit_unit_entries.len())
+                    .checked_add(self.context.explicit_unit_entries().len())
                     .and_then(|n| n.checked_add(names.len()))
                     .and_then(|n| n.checked_add(2))
                     .ok_or_else(overflow)?,
@@ -5269,7 +5250,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let cache_key = DirectoryCacheKey {
             path: path_identity::path_lookup_key(&key),
             entry: entry.clone(),
-            read_policy: self.context.read_policy.clone(),
+            read_policy: self.context.read_policy().clone(),
             missing_is_incomplete,
         };
         if self.compile_time_store.is_none()
@@ -5280,7 +5261,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let request = DirectoryRequest {
             directory: &key,
             entry,
-            read_policy: &self.context.read_policy,
+            read_policy: self.context.read_policy(),
         };
         let result = self.store.list_directory(request, cancel);
         let listing = match result {
@@ -5387,7 +5368,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .visit_recovery_payload(&mut visit)
             .map_err(ResolverError::InvalidRequest)?;
         self.context
-            .read_policy
+            .read_policy()
             .visit_owned_clone_payload(&mut visit)
             .map_err(ResolverError::InvalidRequest)?;
         let key = OwnedDirectoryKey(
@@ -5395,7 +5376,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 .admit_owned(1, key_bytes, key_bytes, || DirectoryCacheKey {
                     path: path_identity::path_lookup_key(&canonical),
                     entry: entry.clone(),
-                    read_policy: self.context.read_policy.clone(),
+                    read_policy: self.context.read_policy().clone(),
                     missing_is_incomplete,
                 })
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
@@ -5548,7 +5529,7 @@ impl<S: SourceStore> UnitResolver<S> {
         self.check_cancel(cancel)
             .map_err(|_| SourceStoreError::Cancelled)?;
         let (path, entry) = self.source_request_scratch(path, entry, cancel)?;
-        let stamp = if self.context.read_policy.allows_location(&entry) {
+        let stamp = if self.context.read_policy().allows_location(&entry) {
             path_stamp_result(&path).ok().flatten()
         } else {
             None
@@ -5558,7 +5539,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let request = SourceRequest {
             path: &path,
             entry: &entry,
-            read_policy: &self.context.read_policy,
+            read_policy: self.context.read_policy(),
             legacy_route,
             kind,
             max_bytes,
@@ -5702,7 +5683,7 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<(), ResolverError> {
         let stamp = entry
             .as_ref()
-            .filter(|entry| self.context.read_policy.allows_location(entry))
+            .filter(|entry| self.context.read_policy().allows_location(entry))
             .and_then(|_| path_stamp_result(path).ok().flatten());
         self.record_observation_build(report_path_payload(path, entry), cancel, || {
             ResolutionObservation::Candidate {
@@ -5736,19 +5717,19 @@ impl<S: SourceStore> UnitResolver<S> {
             || ResolverError::InvalidRequest("provider construction bound overflow".into());
         let scan_count = self
             .context
-            .defines
+            .defines()
             .len()
-            .checked_add(self.context.conditional_context.defines.len())
-            .and_then(|n| n.checked_add(self.context.conditional_context.options.len()))
-            .and_then(|n| n.checked_add(self.context.conditional_context.constants.len()))
-            .and_then(|n| n.checked_add(self.context.library_conditional_context.defines.len()))
-            .and_then(|n| n.checked_add(self.context.library_conditional_context.options.len()))
-            .and_then(|n| n.checked_add(self.context.library_conditional_context.constants.len()))
+            .checked_add(self.context.conditional_context().defines.len())
+            .and_then(|n| n.checked_add(self.context.conditional_context().options.len()))
+            .and_then(|n| n.checked_add(self.context.conditional_context().constants.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context().defines.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context().options.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context().constants.len()))
             .ok_or_else(overflow)?;
         let sizing_work = scan_count
             .checked_mul(2)
             .and_then(|n| n.checked_add(2))
-            .and_then(|n| n.checked_add(self.context.unit_aliases.len()))
+            .and_then(|n| n.checked_add(self.context.unit_aliases().len()))
             .ok_or_else(overflow)?;
         budget
             .charge(sizing_work, 0, 0)
@@ -5769,7 +5750,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .map_err(root_store_error)?;
         }
         let mut alias = requested;
-        for (key, target) in &self.context.unit_aliases {
+        for (key, target) in self.context.unit_aliases() {
             if cancel.is_cancelled() {
                 return Err(ResolverError::Cancelled);
             }
@@ -5872,12 +5853,12 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         self.check_cancel(cancel)?;
+        let include_paths = self.context.include_paths();
+        let search_paths = self.context.search_paths();
         if self.owning_include_callback {
-            let count = self
-                .context
-                .include_paths
+            let count = include_paths
                 .len()
-                .checked_add(self.context.search_paths.len())
+                .checked_add(search_paths.len())
                 .ok_or_else(|| {
                     ResolverError::InvalidRequest("include path sizing work overflow".into())
                 })?;
@@ -5886,11 +5867,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 .charge(count, 0, 0)
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
         }
-        let paths = self
-            .context
-            .include_paths
+        let paths = include_paths
             .iter()
-            .chain(&self.context.search_paths)
+            .chain(&search_paths)
             .try_fold(0usize, |sum, path| {
                 if cancel.is_cancelled() {
                     return Err(ResolverError::Cancelled);
@@ -5936,7 +5915,7 @@ impl<S: SourceStore> UnitResolver<S> {
             self.record_include_search_directory(&entry, cancel)?;
             let resolved = match self
                 .context
-                .overrides
+                .overrides()
                 .resolve_path(request.requested_name, &entry.path)
             {
                 Ok(resolved) => resolved,
@@ -6584,8 +6563,8 @@ impl<S: SourceStore> UnitResolver<S> {
         };
         Ok((legacy
             && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-            && self.context.read_policy.allows_legacy_route_entry(entry))
-            || self.context.read_policy.allows_entry(entry))
+            && self.context.read_policy().allows_legacy_route_entry(entry))
+            || self.context.read_policy().allows_entry(entry))
     }
 
     fn can_reuse_loaded_source(
@@ -6600,8 +6579,8 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         let legacy = legacy_route.is_some_and(|route| legacy_route_authorizes(&path, route))
             && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-            && self.context.read_policy.allows_legacy_route_entry(entry);
-        legacy || self.context.read_policy.allows_entry(entry)
+            && self.context.read_policy().allows_legacy_route_entry(entry);
+        legacy || self.context.read_policy().allows_entry(entry)
     }
 
     fn authorized_case_lookup_base(
@@ -6630,7 +6609,7 @@ impl<S: SourceStore> UnitResolver<S> {
                         path: candidate.clone(),
                         provenance: entry.provenance,
                     };
-                    if self.context.read_policy.allows_location(&entry) {
+                    if self.context.read_policy().allows_location(&entry) {
                         return Some((candidate, entry));
                     }
                 }
@@ -6892,7 +6871,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .sum::<usize>()
             + self
                 .context
-                .unit_namespaces
+                .unit_namespaces()
                 .iter()
                 .map(|n| n.len() + std::mem::size_of::<String>())
                 .sum::<usize>()
@@ -6903,7 +6882,7 @@ impl<S: SourceStore> UnitResolver<S> {
             initial.saturating_mul(8),
             cancel,
         )?;
-        let tiers = filename_tiers(unit_name, &self.context.unit_namespaces);
+        let tiers = filename_tiers(unit_name, self.context.unit_namespaces());
         let mut paths_by_tier: Vec<Vec<(PathBuf, ProjectPathEntry)>> =
             vec![Vec::new(); tiers.len()];
         // Projectless lookup is deliberately rooted at the caller-supplied
@@ -7089,7 +7068,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 let Some(child_entry) = self.context.path_entry_for(child) else {
                     continue;
                 };
-                if self.context.read_policy.allows_location(&child_entry) {
+                if self.context.read_policy().allows_location(&child_entry) {
                     queue.push_back(child.clone());
                 }
             }
@@ -7097,7 +7076,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 let Some(file_entry) = self.context.path_entry_for(file) else {
                     continue;
                 };
-                if !self.context.read_policy.allows_location(&file_entry) {
+                if !self.context.read_policy().allows_location(&file_entry) {
                     continue;
                 }
                 if file.extension().is_some_and(|extension| {
@@ -7168,7 +7147,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 candidates: Vec::new(),
             });
         }
-        if self.context.packages.len() > self.limits.max_package_lookups {
+        if self.context.packages().len() > self.limits.max_package_lookups {
             self.mark_incomplete(format!(
                 "named package lookup limit ({}) reached",
                 self.limits.max_package_lookups
@@ -7180,7 +7159,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         self.package_lookups += 1;
         let mut package_candidates = Vec::new();
-        for package in self.context.packages.clone() {
+        for package in self.context.packages().to_vec() {
             self.check_cancel(cancel)?;
             let package_key = package_stem(&package);
             let mut dpk_descriptors = Vec::new();
@@ -7245,8 +7224,8 @@ impl<S: SourceStore> UnitResolver<S> {
             let package_read = read_package_metadata_with_observations(
                 &descriptor,
                 &self.context.selected_project_options(),
-                &self.context.overrides,
-                &self.context.read_policy,
+                self.context.overrides(),
+                self.context.read_policy(),
                 &entry,
             );
             let read = match package_read {
@@ -7373,7 +7352,7 @@ impl<S: SourceStore> UnitResolver<S> {
 
     fn package_roots(&self) -> Vec<PathBuf> {
         let mut roots = self.workspace_roots.clone();
-        for configured_root in self.context.overrides.read_roots() {
+        for configured_root in self.context.overrides().read_roots() {
             let root = resolved_package_root(&self.context, &configured_root);
             if !root.exists() && !context_uses_package_root(&self.context, &root) {
                 continue;
@@ -7953,8 +7932,8 @@ fn conditional_context_reserve_polled(
 ) -> Result<usize, ResolverError> {
     let mut total = std::mem::size_of::<pascal_project::ConditionalContext>();
     for candidate in [
-        &context.conditional_context,
-        &context.library_conditional_context,
+        &context.conditional_context(),
+        &context.library_conditional_context(),
     ] {
         let mut cancelled = false;
         candidate
@@ -7983,7 +7962,7 @@ fn conditional_context_reserve_polled(
             )
             .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
     }
-    for define in &context.defines {
+    for define in &context.defines() {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
@@ -8109,7 +8088,7 @@ struct ResolverSessionCacheState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolverSessionCacheScope {
-    context: ProjectContext,
+    context: Arc<ProjectContext>,
     limits: ResolverLimits,
 }
 
@@ -8122,16 +8101,16 @@ struct CachedCatalogue {
 }
 
 impl ResolverSessionCache {
-    fn bind(&self, context: &ProjectContext, limits: ResolverLimits) -> bool {
+    fn bind(&self, context: &Arc<ProjectContext>, limits: ResolverLimits) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &state.scope {
-            Some(bound_scope) => bound_scope.limits == limits && &bound_scope.context == context,
+            Some(bound_scope) => bound_scope.limits == limits && bound_scope.context == *context,
             None => {
                 state.scope = Some(ResolverSessionCacheScope {
-                    context: context.clone(),
+                    context: Arc::clone(context),
                     limits,
                 });
                 true
@@ -8276,6 +8255,44 @@ fn source_text(source: &LoadedSource) -> String {
 }
 
 #[cfg(test)]
+pub(crate) trait ContextSlot: Default {
+    fn into_context(self) -> ProjectContext;
+    fn from_context(context: ProjectContext) -> Self;
+}
+
+#[cfg(test)]
+impl ContextSlot for ProjectContext {
+    fn into_context(self) -> ProjectContext {
+        self
+    }
+
+    fn from_context(context: ProjectContext) -> Self {
+        context
+    }
+}
+
+#[cfg(test)]
+impl ContextSlot for Arc<ProjectContext> {
+    fn into_context(self) -> ProjectContext {
+        Arc::unwrap_or_clone(self)
+    }
+
+    fn from_context(context: ProjectContext) -> Self {
+        Arc::new(context)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn edit_context<C: ContextSlot, R>(
+    context: &mut C,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::mem::take(context).into_context().into_parts();
+    edit(&mut parts);
+    *context = C::from_context(ProjectContext::from_parts(parts));
+}
+
+#[cfg(test)]
 thread_local! {
     static TEST_METADATA_PARSES: std::cell::RefCell<HashMap<PathBuf, usize>> =
         std::cell::RefCell::new(HashMap::new());
@@ -8391,7 +8408,7 @@ fn declared_name_matches_owned(
     budget
         .charge(
             context
-                .unit_namespaces
+                .unit_namespaces()
                 .len()
                 .checked_add(2)
                 .ok_or_else(overflow)?,
@@ -8413,7 +8430,7 @@ fn declared_name_matches_owned(
     if lookup.contains('.') {
         return Ok(false);
     }
-    for namespace in &context.unit_namespaces {
+    for namespace in context.unit_namespaces() {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
@@ -8455,7 +8472,7 @@ fn declared_name_matches(
         || actual.eq_ignore_ascii_case(lookup)
         || (!lookup.contains('.')
             && context
-                .unit_namespaces
+                .unit_namespaces()
                 .iter()
                 .any(|namespace| format!("{namespace}.{lookup}").eq_ignore_ascii_case(actual)))
 }
@@ -8516,7 +8533,7 @@ fn aliased_name(context: &ProjectContext, requested: &str) -> String {
 
 fn aliased_name_ref<'a>(context: &'a ProjectContext, requested: &'a str) -> &'a str {
     context
-        .unit_aliases
+        .unit_aliases()
         .iter()
         .find(|(alias, _)| alias.eq_ignore_ascii_case(requested))
         .map_or(requested, |(_, target)| target.as_str())
@@ -9472,11 +9489,11 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
 
 fn context_uses_package_root(context: &ProjectContext, root: &Path) -> bool {
     context
-        .main_source_entry
-        .iter()
-        .chain(context.search_path_entries.iter())
-        .chain(context.include_path_entries.iter())
-        .chain(context.explicit_unit_entries.values().flatten())
+        .main_source_entry()
+        .into_iter()
+        .chain(context.search_path_entries().iter())
+        .chain(context.include_path_entries().iter())
+        .chain(context.explicit_unit_entries().values().flatten())
         .any(|entry| match &entry.provenance {
             ProjectPathProvenance::Mapped { root: mapped_root } => {
                 path_equivalent(mapped_root, root) || path_starts_with(&entry.path, root)
@@ -9489,11 +9506,11 @@ fn context_uses_package_root(context: &ProjectContext, root: &Path) -> bool {
 fn resolved_package_root(context: &ProjectContext, configured_root: &Path) -> PathBuf {
     let configured_root = canonical_path(configured_root);
     context
-        .main_source_entry
-        .iter()
-        .chain(context.search_path_entries.iter())
-        .chain(context.include_path_entries.iter())
-        .chain(context.explicit_unit_entries.values().flatten())
+        .main_source_entry()
+        .into_iter()
+        .chain(context.search_path_entries().iter())
+        .chain(context.include_path_entries().iter())
+        .chain(context.explicit_unit_entries().values().flatten())
         .find_map(|entry| match &entry.provenance {
             ProjectPathProvenance::Mapped { root }
                 if path_equivalent_ignore_case(root, &configured_root) =>
@@ -9545,12 +9562,11 @@ mod tests {
 
     fn admission_resolver(limits: ResolverLimits) -> UnitResolver<MemoryStore> {
         UnitResolver::new(
-            ProjectContext {
+            ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 discovery_complete: true,
-                search_paths: vec![PathBuf::from("/workspace")],
                 search_path_entries: vec![ProjectPathEntry::legacy(PathBuf::from("/workspace"))],
                 ..Default::default()
-            },
+            }),
             vec![PathBuf::from("/workspace")],
             MemoryStore::default(),
             limits,
@@ -10044,8 +10060,9 @@ mod tests {
             "unit Other; interface implementation end.",
         )
         .unwrap();
-        let context =
-            ProjectContext::discover(&root, &[dir.path().into()], &Default::default()).unwrap();
+        let context = ProjectContext::discover(&root, &[dir.path().into()], &Default::default())
+            .unwrap()
+            .context;
         let resolver = UnitResolver::new(
             context,
             vec![dir.path().into()],
@@ -10832,10 +10849,9 @@ mod tests {
             .into_iter()
             .map(|p| resolver.context.path_entry_for(p).unwrap())
             .collect();
-        resolver
-            .context
-            .explicit_unit_entries
-            .insert("broken".into(), entries);
+        edit_context(&mut resolver.context, |p| {
+            p.explicit_unit_entries.insert("broken".into(), entries)
+        });
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let observer = budget
             .admit_owned(0, 0, 0, || ())
@@ -11037,10 +11053,9 @@ mod tests {
                 .into_iter()
                 .map(|p| resolver.context.path_entry_for(p).unwrap())
                 .collect();
-            resolver
-                .context
-                .explicit_unit_entries
-                .insert("broken".into(), entries);
+            edit_context(&mut resolver.context, |p| {
+                p.explicit_unit_entries.insert("broken".into(), entries)
+            });
             let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
             let observer = budget
                 .admit_owned(0, 0, 0, || ())
@@ -11134,10 +11149,9 @@ mod tests {
             .into_iter()
             .map(|p| resolver.context.path_entry_for(p).unwrap())
             .collect();
-        resolver
-            .context
-            .explicit_unit_entries
-            .insert("broken".into(), entries);
+        edit_context(&mut resolver.context, |p| {
+            p.explicit_unit_entries.insert("broken".into(), entries)
+        });
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let observer = budget
             .admit_owned(0, 0, 0, || ())
@@ -11296,10 +11310,9 @@ mod tests {
             .into_iter()
             .map(|p| resolver.context.path_entry_for(p).unwrap())
             .collect();
-        resolver
-            .context
-            .explicit_unit_entries
-            .insert("other".into(), entries);
+        edit_context(&mut resolver.context, |p| {
+            p.explicit_unit_entries.insert("other".into(), entries)
+        });
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let observer = budget
             .admit_owned(0, 0, 0, || ())
@@ -11497,9 +11510,10 @@ mod tests {
             let later = dir.path().join("later");
             fs::create_dir(&later).unwrap();
             fs::write(later.join("value.inc"), "{later physical include}").unwrap();
-            resolver.context.include_paths = vec![later.clone(), later.clone()];
-            resolver.context.include_path_entries =
-                vec![resolver.context.path_entry_for(&later).unwrap(); 2];
+            let later_entry = resolver.context.path_entry_for(&later).unwrap();
+            edit_context(&mut resolver.context, |p| {
+                p.include_path_entries = vec![later_entry.clone(); 2]
+            });
             if overlay {
                 resolver.store.insert_overlay(
                     dir.path().join("value.inc"),
@@ -13469,7 +13483,7 @@ mod tests {
                 SourceRequest {
                     path: &p,
                     entry: &e,
-                    read_policy: &call.resolver.context.read_policy,
+                    read_policy: call.resolver.context.read_policy(),
                     legacy_route: None,
                     kind: SourceKind::Unit,
                     max_bytes: 4096,
@@ -14503,7 +14517,7 @@ mod tests {
         ));
         assert_eq!(probe.0.get(), 0);
         assert_eq!(empty.snapshot().work, 0);
-        let policy = &resolver.context.read_policy;
+        let policy = &resolver.context.read_policy();
         let mut payload_visits = 0;
         let error = policy.visit_owned_clone_payload_with_preflight(&mut |work, bytes| {
             if bytes.is_none() {
@@ -14715,14 +14729,18 @@ mod tests {
                 "unit Other; interface {$I absent.inc} type T=Int64; implementation end.",
             )
             .unwrap();
-            inner.context.conditional_context = pascal_project::ConditionalContext::default()
-                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-                .with_layout(pascal_project::LayoutContext {
-                    platform: Some(pascal_project::LayoutPlatform::Win32),
-                    defaults: Default::default(),
-                });
-            inner.context.library_conditional_context = inner.context.conditional_context.clone();
-            let context = inner.context.conditional_context.clone();
+            edit_context(&mut inner.context, |p| {
+                p.conditional_context = pascal_project::ConditionalContext::default()
+                    .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                    .with_layout(pascal_project::LayoutContext {
+                        platform: Some(pascal_project::LayoutPlatform::Win32),
+                        defaults: Default::default(),
+                    })
+            });
+            edit_context(&mut inner.context, |p| {
+                p.library_conditional_context = p.conditional_context.clone()
+            });
+            let context = inner.context.conditional_context().clone();
             let root = inner
                 .load_source(&path, None, SourceKind::Unit, &NoCancellation)
                 .unwrap();
@@ -14868,14 +14886,18 @@ mod tests {
             .unwrap();
             let include_path = dir.path().join("export.inc");
             fs::write(&include_path, "type Export=Int64;").unwrap();
-            inner.context.conditional_context = pascal_project::ConditionalContext::default()
-                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-                .with_layout(pascal_project::LayoutContext {
-                    platform: Some(pascal_project::LayoutPlatform::Win32),
-                    defaults: Default::default(),
-                });
-            inner.context.library_conditional_context = inner.context.conditional_context.clone();
-            let context = inner.context.conditional_context.clone();
+            edit_context(&mut inner.context, |p| {
+                p.conditional_context = pascal_project::ConditionalContext::default()
+                    .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                    .with_layout(pascal_project::LayoutContext {
+                        platform: Some(pascal_project::LayoutPlatform::Win32),
+                        defaults: Default::default(),
+                    })
+            });
+            edit_context(&mut inner.context, |p| {
+                p.library_conditional_context = p.conditional_context.clone()
+            });
+            let context = inner.context.conditional_context().clone();
             let root = inner
                 .load_source(&path, None, SourceKind::Unit, &NoCancellation)
                 .unwrap();
@@ -15098,10 +15120,11 @@ mod tests {
                 .is_some(),
             "existing actual legacy builder authorizes relative route"
         );
-        resolver
-            .context
-            .explicit_units
-            .insert("selected".into(), vec![unit.clone()]);
+        let entry = resolver.legacy_entry_for_path(&unit, Some(&route)).unwrap();
+        edit_context(&mut resolver.context, |p| {
+            p.explicit_unit_entries
+                .insert("selected".into(), vec![entry])
+        });
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let outcome = resolver
             .unit_report_capability(
@@ -15144,14 +15167,12 @@ mod tests {
                 .iter()
                 .map(|p| resolver.context.path_entry_for(p).unwrap())
                 .collect();
-            resolver
-                .context
-                .unit_aliases
-                .insert("alias".into(), "Other".into());
-            resolver
-                .context
-                .explicit_unit_entries
-                .insert("other".into(), entries);
+            edit_context(&mut resolver.context, |p| {
+                p.unit_aliases.insert("alias".into(), "Other".into())
+            });
+            edit_context(&mut resolver.context, |p| {
+                p.explicit_unit_entries.insert("other".into(), entries)
+            });
             let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
             let observer = budget
                 .admit_owned(0, 0, 0, || ())
@@ -15516,10 +15537,10 @@ mod tests {
             },
         };
         let authorized = resolver.context.path_entry_for(&later).unwrap();
-        resolver
-            .context
-            .explicit_unit_entries
-            .insert("selected".into(), vec![authorized, unauthorized]);
+        edit_context(&mut resolver.context, |p| {
+            p.explicit_unit_entries
+                .insert("selected".into(), vec![authorized, unauthorized])
+        });
         let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
         let outcome = resolver
             .unit_report_capability(
@@ -15564,10 +15585,10 @@ mod tests {
             first.path = wrong;
             let mut second = first.clone();
             second.path = bad;
-            resolver
-                .context
-                .explicit_unit_entries
-                .insert("broken".into(), vec![first, second]);
+            edit_context(&mut resolver.context, |p| {
+                p.explicit_unit_entries
+                    .insert("broken".into(), vec![first, second])
+            });
             let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
             let observer = budget
                 .admit_owned(0, 0, 0, || ())
@@ -15755,24 +15776,26 @@ mod tests {
                 first.path = wrong;
                 let mut second = first.clone();
                 second.path = bad;
-                resolver
-                    .context
-                    .explicit_unit_entries
-                    .insert("broken".into(), vec![first, second]);
+                edit_context(&mut resolver.context, |p| {
+                    p.explicit_unit_entries
+                        .insert("broken".into(), vec![first, second])
+                });
             } else if scenario == 1 {
-                resolver.context.discovery_complete = false;
-                resolver.context.binding_metadata_complete = false;
+                edit_context(&mut resolver.context, |p| p.discovery_complete = false);
+                edit_context(&mut resolver.context, |p| {
+                    p.binding_metadata_complete = false
+                });
             } else if scenario == 2 {
-                resolver.context.packages = vec!["UnadmittedPackage".into()];
+                edit_context(&mut resolver.context, |p| {
+                    p.packages = vec!["UnadmittedPackage".into()]
+                });
             } else if scenario == 3 {
                 resolver.limits.max_source_bytes = 1;
             } else if scenario == 4 {
                 let missing = dir.path().join("Never.pas");
                 let entry = resolver.context.path_entry_for(&missing).unwrap();
-                resolver
-                    .context
-                    .path_issues
-                    .push(pascal_project::ProjectPathIssue {
+                edit_context(&mut resolver.context, |p| {
+                    p.path_issues.push(pascal_project::ProjectPathIssue {
                         kind: pascal_project::ProjectPathIssueKind::MissingReference,
                         source_file: root.clone(),
                         property: "DCCReference".into(),
@@ -15780,7 +15803,8 @@ mod tests {
                         path: Some(missing),
                         unit_name: Some("Absent".into()),
                         provenance: entry.provenance,
-                    });
+                    })
+                });
             } else {
                 resolver.limits.max_directory_entries = 0;
             }
@@ -16018,11 +16042,12 @@ mod tests {
                 "unit Space.Named; interface type T=Int64; implementation end.",
             )
             .unwrap();
-            resolver
-                .context
-                .unit_aliases
-                .insert("Alias".into(), "Space.Other".into());
-            resolver.context.unit_namespaces = vec!["Space".into()];
+            edit_context(&mut resolver.context, |p| {
+                p.unit_aliases.insert("Alias".into(), "Space.Other".into())
+            });
+            edit_context(&mut resolver.context, |p| {
+                p.unit_namespaces = vec!["Space".into()]
+            });
             let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
             let observer = budget
                 .admit_owned(0, 0, 0, || ())
@@ -16120,7 +16145,7 @@ mod tests {
                     SourceRequest {
                         path: &path,
                         entry: &entry,
-                        read_policy: &resolver.context.read_policy,
+                        read_policy: resolver.context.read_policy(),
                         legacy_route: None,
                         kind: SourceKind::Unit,
                         max_bytes: 4096,
@@ -16232,7 +16257,9 @@ mod tests {
                 "unit Space.Other; interface implementation end.",
             )
             .unwrap();
-            resolver.context.unit_namespaces = vec!["Space".into()];
+            edit_context(&mut resolver.context, |p| {
+                p.unit_namespaces = vec!["Space".into()]
+            });
             let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
             let observer = budget
                 .admit_owned(0, 0, 0, || ())
@@ -17081,11 +17108,12 @@ mod tests {
     fn candidate_scratch_actual_alias_namespace_and_ambiguous_callbacks_keep_behavior() {
         use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
         let (dir, root, mut resolver) = physical_report_resolver();
-        resolver
-            .context
-            .unit_aliases
-            .insert("Alias".into(), "Other".into());
-        resolver.context.unit_namespaces = vec!["Space".into()];
+        edit_context(&mut resolver.context, |p| {
+            p.unit_aliases.insert("Alias".into(), "Other".into())
+        });
+        edit_context(&mut resolver.context, |p| {
+            p.unit_namespaces = vec!["Space".into()]
+        });
         fs::write(
             dir.path().join("Space.Named.pas"),
             "unit Space.Named; interface type T=Byte; implementation end.",
@@ -17841,13 +17869,15 @@ mod tests {
                 2,
                 "authorization entry is part of cache identity"
             );
-            let previous_policy = call.context.read_policy.clone();
-            call.context.read_policy = ReadPolicy::new(
-                &[dir.path().into()],
-                &[],
-                &["**/*.denied".into()],
-                &Default::default(),
-            );
+            let previous_policy = call.context.read_policy().clone();
+            edit_context(&mut call.context, |p| {
+                p.read_policy = ReadPolicy::new(
+                    &[dir.path().into()],
+                    &[],
+                    &["**/*.denied".into()],
+                    &Default::default(),
+                )
+            });
             let policy_listing = call
                 .list_directory(dir.path(), &entry, None, &NoCancellation, false)
                 .unwrap();
@@ -17875,10 +17905,10 @@ mod tests {
                     cache
                         .directories
                         .keys()
-                        .any(|k| k.0.read_policy == call.context.read_policy)
+                        .any(|k| k.0.read_policy == *call.context.read_policy())
                 );
             }
-            call.context.read_policy = previous_policy;
+            edit_context(&mut call.context, |p| p.read_policy = previous_policy);
             let missing = dir.path().join("missing");
             let missing_entry = ProjectPathEntry {
                 path: missing.clone(),
@@ -18420,14 +18450,18 @@ mod tests {
                 fs::write(dir.path().join("inside.inc"), "type T=Int64;").unwrap();
             }
             fs::create_dir(dir.path().join("bad.inc")).unwrap();
-            inner.context.conditional_context = pascal_project::ConditionalContext::default()
-                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
-                .with_layout(pascal_project::LayoutContext {
-                    platform: Some(pascal_project::LayoutPlatform::Win32),
-                    defaults: Default::default(),
-                });
-            inner.context.library_conditional_context = inner.context.conditional_context.clone();
-            let context = inner.context.conditional_context.clone();
+            edit_context(&mut inner.context, |p| {
+                p.conditional_context = pascal_project::ConditionalContext::default()
+                    .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                    .with_layout(pascal_project::LayoutContext {
+                        platform: Some(pascal_project::LayoutPlatform::Win32),
+                        defaults: Default::default(),
+                    })
+            });
+            edit_context(&mut inner.context, |p| {
+                p.library_conditional_context = p.conditional_context.clone()
+            });
+            let context = inner.context.conditional_context().clone();
             let root = inner
                 .load_source(&root_path, None, SourceKind::Unit, &NoCancellation)
                 .unwrap();
@@ -19454,15 +19488,14 @@ mod tests {
                 .sources
                 .insert(root.join(name), text.as_bytes().to_vec());
         }
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,
             }],
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         reset_test_metadata_parses();
         let project = UnitResolver::new(context, vec![root.clone()], store, Default::default())
             .resolve_project(
@@ -19504,15 +19537,14 @@ mod tests {
                 .sources
                 .insert(root.join(name), text.as_bytes().to_vec());
         }
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,
             }],
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         reset_test_metadata_parses();
         let scope = TestScope::new();
         UnitResolver::new(context, vec![root.clone()], store, Default::default())
@@ -19579,15 +19611,14 @@ mod tests {
     fn spellings_of_one_directory_share_a_listing_and_a_catalogue_on_case_insensitive_volumes() {
         path_identity::with_case_insensitive_volumes(|| {
             let root = PathBuf::from("/workspace");
-            let context = ProjectContext {
+            let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
                 discovery_complete: true,
-                search_paths: vec![root.clone()],
                 search_path_entries: vec![ProjectPathEntry {
                     path: root.clone(),
                     provenance: ProjectPathProvenance::LegacyNative,
                 }],
-                ..ProjectContext::default()
-            };
+                ..pascal_project::ProjectContextParts::default()
+            });
             let limits = ResolverLimits {
                 max_package_catalogues: 1,
                 ..Default::default()
@@ -19695,15 +19726,14 @@ mod tests {
                 .directories
                 .insert(directory.clone(), (vec![directory.join(unit)], Vec::new()));
         }
-        let context = ProjectContext {
+        let context = ProjectContext::from_parts(pascal_project::ProjectContextParts {
             discovery_complete: true,
-            search_paths: vec![root.clone()],
             search_path_entries: vec![ProjectPathEntry {
                 path: root.clone(),
                 provenance: ProjectPathProvenance::LegacyNative,
             }],
-            ..ProjectContext::default()
-        };
+            ..pascal_project::ProjectContextParts::default()
+        });
         let mut resolver =
             UnitResolver::new(context, vec![root.clone()], store, Default::default());
 

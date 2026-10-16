@@ -25,7 +25,7 @@ pub fn discover(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     ProjectContext::discover(file, workspace_roots, options)
 }
 
@@ -100,7 +100,7 @@ pub fn discover_with_selections(
     selections: &ProjectSelections,
     overrides: &OverrideSession,
     exclusions: &[String],
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     discover_context_with_selections(
         file,
         workspace_roots,
@@ -113,7 +113,10 @@ pub fn discover_with_selections(
         None,
         &[],
     )
-    .map(|discovery| discovery.context)
+    .map(|discovery| DiscoveredProject {
+        context: discovery.context,
+        observations: discovery.context_observations,
+    })
 }
 
 #[allow(dead_code)]
@@ -305,7 +308,7 @@ fn discover_context(
     file: &Path,
     workspace_roots: &[PathBuf],
     options: &ProjectOptions,
-) -> Result<ProjectContext, String> {
+) -> Result<Arc<ProjectContext>, String> {
     let (overrides, warnings) = production_override_session();
     discover_context_with_selections(
         file,
@@ -750,7 +753,7 @@ fn discover_context_with_selections_inner(
                         }
                         let mut build_tracker =
                             ProjectReadTracker::with_budget(work_budget, deleted_paths);
-                        let mut context = build_project_context(
+                        let mut project = build_project_context(
                             project_file,
                             &file_path,
                             &roots,
@@ -767,7 +770,7 @@ fn discover_context_with_selections_inner(
                         )?;
                         read_tracker.merge_project_context_reads(
                             &CachedProjectContext {
-                                context: context.clone(),
+                                project: project.clone(),
                                 observations: build_tracker.observations,
                                 metadata_paths: build_tracker.metadata_paths,
                                 metadata_observations: build_tracker.metadata_observations,
@@ -778,10 +781,10 @@ fn discover_context_with_selections_inner(
                         if let Some(work_budget) = work_budget {
                             work_budget.check_cancelled()?;
                         }
-                        context.discovery_complete = false;
-                        context.override_error = Some(error);
+                        Arc::make_mut(&mut project.context).discovery_complete = false;
+                        Arc::make_mut(&mut project.context).override_error = Some(error);
                         return Ok(
-                            read_tracker.into_discovery(context, discovery_selection.clone())
+                            read_tracker.into_discovery(project, discovery_selection.clone())
                         );
                     }
                 };
@@ -803,19 +806,19 @@ fn discover_context_with_selections_inner(
                 roots: roots.clone(),
                 deleted_paths: cache_path_list(deleted_paths),
                 option_base,
-                options: ProjectOptionsCacheKey::from(&options),
+                options: ProjectOptionsCacheKey::new(&options, &project_file),
                 overrides: effective_overrides.clone(),
                 exclusions: exclusions.to_vec(),
                 warnings: warnings.clone(),
                 explicit,
             };
             let cached = project_context_cache_get(&cache_key, cancel, work_budget)?;
-            let context = if let Some(cached) = cached {
+            let project = if let Some(cached) = cached {
                 read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
-                cached.context
+                cached.project
             } else {
                 let mut build_tracker = ProjectReadTracker::with_budget(work_budget, deleted_paths);
-                let context = build_project_context(
+                let project = build_project_context(
                     project_file,
                     &file_path,
                     &roots,
@@ -831,25 +834,25 @@ fn discover_context_with_selections_inner(
                     cancel,
                 )?;
                 let cached = CachedProjectContext {
-                    context: context.clone(),
+                    project: project.clone(),
                     observations: build_tracker.observations,
                     metadata_paths: build_tracker.metadata_paths,
                     metadata_observations: build_tracker.metadata_observations,
                 };
                 read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
                 project_context_cache_insert(cache_key, cached);
-                context
+                project
             };
             if let Some(work_budget) = work_budget {
                 work_budget.check_cancelled()?;
             }
-            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
+            Ok(read_tracker.into_discovery(project, discovery_selection.clone()))
         }
         ProjectSelection::Standalone {
             metadata_files,
             metadata_observations,
         } => {
-            let context = build_standalone_context_with_overrides(
+            let project = build_standalone_context_with_overrides(
                 &file_path,
                 &roots,
                 &options,
@@ -863,14 +866,14 @@ fn discover_context_with_selections_inner(
             if let Some(work_budget) = work_budget {
                 work_budget.check_cancelled()?;
             }
-            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
+            Ok(read_tracker.into_discovery(project, discovery_selection.clone()))
         }
         ProjectSelection::Incomplete {
             metadata_files,
             metadata_observations,
             override_error,
         } => {
-            let mut context = build_standalone_context_with_overrides(
+            let mut project = build_standalone_context_with_overrides(
                 &file_path,
                 &roots,
                 &options,
@@ -882,9 +885,9 @@ fn discover_context_with_selections_inner(
                 exclusions,
             )?;
             if override_error.is_some() {
-                context.override_error = override_error;
+                Arc::make_mut(&mut project.context).override_error = override_error;
             }
-            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
+            Ok(read_tracker.into_discovery(project, discovery_selection.clone()))
         }
     }
 }
@@ -939,8 +942,8 @@ pub fn runtime_project_selection(
         .map(|(scope, project)| (scope.clone(), project.clone()))
 }
 
-pub fn has_invalid_project_selection(context: &ProjectContext) -> bool {
-    context.warnings.iter().any(|warning| {
+pub fn has_invalid_project_selection(observations: &ProjectObservations) -> bool {
+    observations.warnings.iter().any(|warning| {
         warning.starts_with("selected project ")
             && warning.contains(" is not a current candidate in ")
     })
@@ -1803,17 +1806,20 @@ fn inspect_project_candidate(
         tracker,
         cancel,
     ) {
-        Ok(context) => {
-            for metadata_file in &context.metadata_files {
+        Ok(DiscoveredProject {
+            context,
+            observations,
+        }) => {
+            for metadata_file in &observations.metadata_files {
                 add_unique_path(&mut metadata_files, metadata_file.clone());
             }
-            metadata_observations.extend(context.metadata_observations.iter().cloned());
+            metadata_observations.extend(observations.metadata_observations.iter().cloned());
             if !context.discovery_complete {
                 return CandidateEvaluation {
                     ownership: CandidateOwnership::Incomplete,
                     metadata_files,
                     metadata_observations,
-                    warnings: context.warnings,
+                    warnings: observations.warnings,
                     override_error: None,
                 };
             }
@@ -1831,7 +1837,7 @@ fn inspect_project_candidate(
             } else {
                 CandidateOwnership::NotOwned
             };
-            let mut warnings = context.warnings;
+            let mut warnings = observations.warnings;
             warnings.extend(membership.warnings);
             CandidateEvaluation {
                 ownership,
@@ -2492,27 +2498,31 @@ mod tests {
             ProjectContext::discover(&member, &[root.to_path_buf()], &ProjectOptions::default())
                 .expect("discover project context");
 
-        assert!(context.project_file.is_none(), "{context:?}");
-        assert!(!context.discovery_complete);
+        assert!(context.context.project_file.is_none(), "{context:?}");
+        assert!(!context.context.discovery_complete);
         for path in [&main, &member] {
             assert!(
-                context.metadata_observations.iter().any(|observation| {
-                    let MetadataObservation::Payload {
-                        path: observed,
-                        path_entry,
-                        stamp,
-                        content_hash,
-                        ..
-                    } = observation
-                    else {
-                        return false;
-                    };
-                    observed == path
-                        && path_entry.path == *path
-                        && stamp == &path_stamp_result(path).expect("payload path stamp")
-                        && *content_hash
-                            == content_hash_bytes(&fs::read(path).expect("payload bytes"))
-                }),
+                context
+                    .observations
+                    .metadata_observations
+                    .iter()
+                    .any(|observation| {
+                        let MetadataObservation::Payload {
+                            path: observed,
+                            path_entry,
+                            stamp,
+                            content_hash,
+                            ..
+                        } = observation
+                        else {
+                            return false;
+                        };
+                        observed == path
+                            && path_entry.path == *path
+                            && stamp == &path_stamp_result(path).expect("payload path stamp")
+                            && *content_hash
+                                == content_hash_bytes(&fs::read(path).expect("payload bytes"))
+                    }),
                 "evaluated payload {path:?} was downgraded to stat-only: {context:?}"
             );
         }

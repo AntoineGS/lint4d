@@ -27,7 +27,7 @@ pub(super) fn build_standalone_context_with_overrides(
     metadata_observations: Vec<MetadataObservation>,
     session: &OverrideSession,
     exclusions: &[String],
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     let (mut effective_overrides, override_error) = match standalone_overrides(file, roots, session)
     {
         Ok(overrides) => (overrides, None),
@@ -52,7 +52,7 @@ pub(super) fn build_standalone_context_with_overrides(
                 crate::installations::compiler_version_for_installation(&installation.id);
         }
     }
-    let mut context = build_standalone_context(
+    let mut project = build_standalone_context(
         file,
         roots,
         &options,
@@ -64,8 +64,8 @@ pub(super) fn build_standalone_context_with_overrides(
         exclusions,
         None,
     )?;
-    context.override_error = override_error;
-    Ok(context)
+    Arc::make_mut(&mut project.context).override_error = override_error;
+    Ok(project)
 }
 
 /// A source inside exactly one configured installation's `BDS` tree (its RTL
@@ -256,7 +256,7 @@ pub(super) fn build_project_context(
     exclusions: &[String],
     tracker: &mut ProjectReadTracker<'_>,
     cancel: Option<&AtomicBool>,
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     check_project_scan_cancel(cancel)?;
     #[cfg(any(test, feature = "test-support"))]
     test_record_project_discovery(true);
@@ -266,11 +266,8 @@ pub(super) fn build_project_context(
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
-    let session_build_choice = options
-        .build_selections
-        .iter()
-        .find(|(path, _)| project_paths_equal(path, &project_file))
-        .map(|(_, choice)| choice);
+    let session_selections = options.session_selections_for(&project_file);
+    let session_build_choice = session_selections.build.as_ref();
     let configured_build_choice = installation_config.configured_build_for(&project_file);
     let config_selected_in_session = session_build_choice
         .and_then(|choice| choice.config.as_ref())
@@ -348,11 +345,7 @@ pub(super) fn build_project_context(
         &installation_config,
         &project_file,
         &selection_evidence,
-        evaluation_options
-            .installation_selections
-            .iter()
-            .find(|(path, _)| project_paths_equal(path, &project_file))
-            .map(|(_, id)| id.as_str()),
+        session_selections.installation.as_deref(),
     ));
     let mut installation_environment = None;
     let mut installation_config_files = Vec::new();
@@ -541,8 +534,7 @@ pub(super) fn build_project_context(
     } else {
         Some(ProjectPathEntry::legacy(project_file.clone()))
     };
-    let main_source = main_source_entry.as_ref().map(|entry| entry.path.clone());
-    if project_is_dproj && main_source.is_none() {
+    if project_is_dproj && main_source_entry.is_none() {
         let main_source_raw = builder.property("mainsource").unwrap_or_default();
         builder.path_issues.push(ProjectPathIssue {
             kind: ProjectPathIssueKind::MissingMainSource,
@@ -614,7 +606,6 @@ pub(super) fn build_project_context(
             search_path_entries.push(entry.clone());
         }
     }
-    let search_paths = paths_from_entries(&search_path_entries);
 
     let mut include_path_entries = Vec::new();
     for (item, provenance) in builder.property_list_with_provenance("dcc_includepath") {
@@ -629,14 +620,11 @@ pub(super) fn build_project_context(
             provenance,
         );
     }
-    let include_paths = paths_from_entries(&include_path_entries);
 
-    let mut explicit_units = HashMap::new();
     let mut explicit_unit_entries = HashMap::new();
     if let Some(main_source) = &main_source_entry
         && let Some(observation) = add_explicit_units_from_source(
             main_source,
-            &mut explicit_units,
             &mut explicit_unit_entries,
             &mut builder.warnings,
             &builder.overrides,
@@ -735,7 +723,7 @@ pub(super) fn build_project_context(
         };
         let name = canonical_unit_name(&stem.to_string_lossy());
         if !name.is_empty() {
-            add_unit_candidate_entry(&mut explicit_units, &mut explicit_unit_entries, name, entry);
+            add_unit_candidate_entry(&mut explicit_unit_entries, name, entry);
         }
     }
 
@@ -743,10 +731,10 @@ pub(super) fn build_project_context(
     if !metadata_files.iter().any(|path| path == &project_file) {
         metadata_files.push(project_file.clone());
     }
-    if let Some(main_source) = &main_source
-        && !metadata_files.iter().any(|path| path == main_source)
+    if let Some(main_source) = &main_source_entry
+        && !metadata_files.iter().any(|path| path == &main_source.path)
     {
-        metadata_files.push(main_source.clone());
+        metadata_files.push(main_source.path.clone());
     }
     for metadata_file in consulted_metadata_files {
         check_project_scan_cancel(cancel)?;
@@ -854,17 +842,6 @@ pub(super) fn build_project_context(
             .collect(),
     );
 
-    let mut defines = project_defines;
-    for (name, value) in &conditional_context.defines {
-        if *value == ConditionalFact::True
-            && !defines
-                .iter()
-                .any(|define| define.eq_ignore_ascii_case(name))
-        {
-            defines.push(name.clone());
-        }
-    }
-
     let mut config_selection = build_selection::selection_for_value(
         config.as_deref(),
         &build_candidates.configs,
@@ -960,47 +937,46 @@ pub(super) fn build_project_context(
         rtl_constants,
     };
 
-    Ok(ProjectContext {
-        discovery_complete,
-        binding_metadata_complete: !builder.incomplete
-            && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
-        path_issues: builder.path_issues.clone(),
-        project_file: Some(project_file.clone()),
-        installation_evidence: installation_evidence.clone(),
-        installation_selection,
-        main_source,
-        search_paths,
-        project_source_roots,
-        search_path_entries,
-        browsing_path_entries: ide_paths.browsing,
-        debug_dcu_path_entries: ide_paths.debug_dcu,
-        main_source_entry,
-        explicit_unit_entries,
-        include_paths,
-        include_path_entries,
-        explicit_units,
-        unit_namespaces: property_list(&builder, "dcc_namespace")
-            .into_iter()
-            .chain(ide_paths.namespaces)
-            .collect(),
-        unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
-        defines,
-        conditional_context,
-        conditional_closure,
-        library_conditional_context,
-        config,
-        platform,
-        config_selection,
-        platform_selection,
-        overrides,
-        read_policy,
-        packages: package_list(&builder),
-        metadata_files,
-        installation_config_files,
-        system_pas_searches: builder.system_pas_searches,
-        metadata_observations,
-        warnings: builder.warnings,
-        override_error: None,
+    Ok(DiscoveredProject {
+        context: Arc::new(ProjectContext {
+            discovery_complete,
+            binding_metadata_complete: !builder.incomplete
+                && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
+            path_issues: builder.path_issues.clone(),
+            project_file: Some(project_file.clone()),
+            installation_evidence: installation_evidence.clone(),
+            installation_selection,
+            project_source_roots,
+            search_path_entries,
+            browsing_path_entries: ide_paths.browsing,
+            debug_dcu_path_entries: ide_paths.debug_dcu,
+            main_source_entry,
+            explicit_unit_entries,
+            include_path_entries,
+            unit_namespaces: property_list(&builder, "dcc_namespace")
+                .into_iter()
+                .chain(ide_paths.namespaces)
+                .collect(),
+            unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages: package_list(&builder),
+            installation_config_files,
+            override_error: None,
+        }),
+        observations: ProjectObservations {
+            metadata_files,
+            metadata_observations,
+            warnings: builder.warnings,
+            system_pas_searches: builder.system_pas_searches,
+        },
     })
 }
 
@@ -1016,7 +992,7 @@ fn build_standalone_context(
     metadata_observations: Vec<MetadataObservation>,
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
-) -> Result<ProjectContext, String> {
+) -> Result<DiscoveredProject, String> {
     check_project_scan_cancel(cancel)?;
     let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut search_path_entries = Vec::new();
@@ -1045,7 +1021,6 @@ fn build_standalone_context(
             ProjectPathProvenance::Configured,
         );
     }
-    let search_paths = paths_from_entries(&search_path_entries);
     let project_source_roots = paths_from_entries(&search_path_entries);
     let config = selected_standalone_property(&overrides, options.build_config.as_ref(), "config");
     let platform = selected_standalone_property(&overrides, options.platform.as_ref(), "platform");
@@ -1077,12 +1052,6 @@ fn build_standalone_context(
     conditional_closure::merge_rtl_constants(&mut conditional_context, rtl_constants.as_deref());
     conditional_context.absent_define = ConditionalFact::Unknown;
     let library_conditional_context = conditional_context.clone();
-    let defines = conditional_context
-        .defines
-        .iter()
-        .filter(|(_, value)| **value == ConditionalFact::True)
-        .map(|(name, _)| name.clone())
-        .collect();
     let config_selection = BuildSelection::default();
     let platform_selection = BuildSelection::default();
     let open_reasons = conditional_closure::open_reasons(
@@ -1103,43 +1072,42 @@ fn build_standalone_context(
     let metadata_observations =
         complete_metadata_observations(&metadata_files, metadata_observations);
 
-    Ok(ProjectContext {
-        discovery_complete,
-        binding_metadata_complete: discovery_complete,
-        path_issues: Vec::new(),
-        project_file: None,
-        installation_evidence: InstallationEvidence::default(),
-        installation_selection: None,
-        main_source: None,
-        search_paths,
-        project_source_roots,
-        search_path_entries,
-        browsing_path_entries: Vec::new(),
-        debug_dcu_path_entries: Vec::new(),
-        main_source_entry: None,
-        explicit_unit_entries: HashMap::new(),
-        include_paths: Vec::new(),
-        include_path_entries: Vec::new(),
-        explicit_units: HashMap::new(),
-        unit_namespaces: Vec::new(),
-        unit_aliases: HashMap::new(),
-        defines,
-        conditional_context,
-        conditional_closure,
-        library_conditional_context,
-        config,
-        platform,
-        config_selection,
-        platform_selection,
-        overrides,
-        read_policy,
-        packages: Vec::new(),
-        metadata_files,
-        installation_config_files: Vec::new(),
-        system_pas_searches: Vec::new(),
-        metadata_observations,
-        warnings,
-        override_error: None,
+    Ok(DiscoveredProject {
+        context: Arc::new(ProjectContext {
+            discovery_complete,
+            binding_metadata_complete: discovery_complete,
+            path_issues: Vec::new(),
+            project_file: None,
+            installation_evidence: InstallationEvidence::default(),
+            installation_selection: None,
+            project_source_roots,
+            search_path_entries,
+            browsing_path_entries: Vec::new(),
+            debug_dcu_path_entries: Vec::new(),
+            main_source_entry: None,
+            explicit_unit_entries: HashMap::new(),
+            include_path_entries: Vec::new(),
+            unit_namespaces: Vec::new(),
+            unit_aliases: HashMap::new(),
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages: Vec::new(),
+            installation_config_files: Vec::new(),
+            override_error: None,
+        }),
+        observations: ProjectObservations {
+            metadata_files,
+            metadata_observations,
+            warnings,
+            system_pas_searches: Vec::new(),
+        },
     })
 }
 
@@ -1979,7 +1947,7 @@ pub(super) fn add_unique_project_path_entry(
     }
 }
 
-fn paths_from_entries(entries: &[ProjectPathEntry]) -> Vec<PathBuf> {
+pub(super) fn paths_from_entries(entries: &[ProjectPathEntry]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for entry in entries {
         add_unique_path(&mut paths, entry.path.clone());
@@ -2063,18 +2031,15 @@ pub(super) fn add_unit_candidate(
 }
 
 fn add_unit_candidate_entry(
-    units: &mut HashMap<String, Vec<PathBuf>>,
     entries: &mut HashMap<String, Vec<ProjectPathEntry>>,
     name: String,
     entry: ProjectPathEntry,
 ) {
-    add_unit_candidate(units, name.clone(), entry.path.clone());
     add_unique_project_path_entry(entries.entry(name).or_default(), entry);
 }
 
 fn add_explicit_units_from_source(
     source_entry: &ProjectPathEntry,
-    units: &mut HashMap<String, Vec<PathBuf>>,
     entries: &mut HashMap<String, Vec<ProjectPathEntry>>,
     warnings: &mut Vec<String>,
     overrides: &EffectiveOverrides,
@@ -2120,7 +2085,7 @@ fn add_explicit_units_from_source(
             continue;
         };
         let entry = inherit_path_provenance(entry, &source_entry.provenance);
-        add_unit_candidate_entry(units, entries, canonical_unit_name(&unit_name), entry);
+        add_unit_candidate_entry(entries, canonical_unit_name(&unit_name), entry);
     }
     Some(observation)
 }
@@ -2227,7 +2192,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .search_path_entries
             .iter()
@@ -2280,7 +2246,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .explicit_unit_entries
             .values()
@@ -2321,7 +2288,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let entry = context
             .search_path_entries
             .iter()
@@ -2366,7 +2334,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
         let configured = context
             .search_path_entries
             .iter()
@@ -2442,7 +2411,8 @@ mod tests {
             &ProjectOptions::default(),
             &OverrideSession::new(None),
         )
-        .expect("discover project");
+        .expect("discover project")
+        .context;
 
         let search_entry = |path: &Path| {
             context
@@ -2563,7 +2533,8 @@ mod tests {
                 &ProjectOptions::default(),
                 &OverrideSession::new(None),
             )
-            .expect("discover project");
+            .expect("discover project")
+            .context;
 
             for name in configured_names {
                 let path = outside.join(name);

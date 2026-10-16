@@ -27641,14 +27641,15 @@ fn missing_compiled_only_package_is_reported_only_when_an_import_cannot_resolve(
     );
 
     let session = OverrideSession::new(None);
-    let context = ProjectContext::discover_with_overrides(
+    let observations = ProjectContext::discover_with_overrides(
         &main,
         std::slice::from_ref(&root),
         &pascal_lsp::ProjectOptions::default(),
         &session,
     )
-    .expect("discover project context");
-    assert!(context.warnings.is_empty());
+    .expect("discover project context")
+    .observations;
+    assert!(observations.warnings.is_empty());
 
     let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
     assert!(

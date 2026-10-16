@@ -1,5 +1,5 @@
 use lsp_types::{Position, Url};
-use pascal_lsp::project::{ProjectContext, ProjectOptions};
+use pascal_lsp::project::{DiscoveredProject, ProjectContext, ProjectOptions};
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_project::delphi_overrides::OverrideSession;
 #[cfg(target_os = "linux")]
@@ -135,15 +135,18 @@ to = '{}'
             sdk.path().display(),
         ),
     );
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
         &OverrideSession::new(None),
     )
     .unwrap();
-    assert!(context.search_paths.contains(&sdk.path().join("source")));
-    assert!(!context.warnings.iter().any(|warning| {
+    assert!(context.search_paths().contains(&sdk.path().join("source")));
+    assert!(!observations.warnings.iter().any(|warning| {
         warning.contains("Windows path") || warning.contains("unresolved property")
     }));
 }
@@ -169,17 +172,21 @@ fn unknown_bds_target_import_is_ignored_without_tainting_context() {
     let context = discover(&main, root, &options());
 
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "context was tainted: {context:?}"
     );
-    assert_eq!(context.defines, ["AFTER", "KNOWN"]);
-    assert_eq!(context.search_paths, vec![root.to_path_buf(), units]);
-    assert!(context.warnings.iter().any(|warning| {
+    assert_eq!(context.context.defines(), ["AFTER", "KNOWN"]);
+    assert_eq!(
+        context.context.search_paths(),
+        vec![root.to_path_buf(), units]
+    );
+    assert!(context.observations.warnings.iter().any(|warning| {
         warning.contains("ignored unsupported MSBuild import")
             && warning.contains("CodeGear.Delphi.Targets")
     }));
     assert!(
         !context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unresolved property")
@@ -208,17 +215,21 @@ fn known_unmapped_bds_target_import_is_ignored_without_tainting_context() {
     let context = discover(&main, root, &options());
 
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "context was tainted: {context:?}"
     );
-    assert_eq!(context.defines, ["AFTER", "KNOWN"]);
-    assert_eq!(context.search_paths, vec![root.to_path_buf(), units]);
-    assert!(context.warnings.iter().any(|warning| {
+    assert_eq!(context.context.defines(), ["AFTER", "KNOWN"]);
+    assert_eq!(
+        context.context.search_paths(),
+        vec![root.to_path_buf(), units]
+    );
+    assert!(context.observations.warnings.iter().any(|warning| {
         warning.contains("ignored unsupported MSBuild import")
             && warning.contains("CodeGear.Delphi.Targets")
     }));
     assert!(
         !context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unresolved property")
@@ -248,21 +259,25 @@ fn macro_before_literal_non_optset_suffix_is_ignored_without_tainting_context() 
     let context = discover(&main, root, &options());
 
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "context was tainted: {context:?}"
     );
-    assert_eq!(context.defines, ["AFTER", "KNOWN"]);
-    assert_eq!(context.search_paths, vec![root.to_path_buf(), units]);
+    assert_eq!(context.context.defines(), ["AFTER", "KNOWN"]);
+    assert_eq!(
+        context.context.search_paths(),
+        vec![root.to_path_buf(), units]
+    );
     for import in [
         "$(BDS)\\Bin\\CodeGear.$(Personality).Targets",
         "$(TargetName).targets",
     ] {
-        assert!(context.warnings.iter().any(|warning| {
+        assert!(context.observations.warnings.iter().any(|warning| {
             warning.contains("ignored unsupported MSBuild import") && warning.contains(import)
         }));
     }
     assert!(
         !context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unresolved property")
@@ -295,7 +310,10 @@ fn native_xml_bds_paths_normalize_delphi_separators_for_exists_and_references() 
     );
 
     let session = OverrideSession::new(None);
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.to_path_buf(), sdk.to_path_buf()],
         &options(),
@@ -303,14 +321,14 @@ fn native_xml_bds_paths_normalize_delphi_separators_for_exists_and_references() 
     )
     .expect("discover project with authorized SDK root");
 
-    assert!(context.search_paths.contains(&sdk.join("source")));
-    assert_eq!(context.defines, ["NATIVE_EXISTS"]);
+    assert!(context.search_paths().contains(&sdk.join("source")));
+    assert_eq!(context.defines(), ["NATIVE_EXISTS"]);
     assert_eq!(
-        context.explicit_units.get("provider"),
+        context.explicit_units().get("provider"),
         Some(&vec![provider])
     );
     assert!(
-        !context
+        !observations
             .warnings
             .iter()
             .any(|warning| warning.contains("path does not exist")
@@ -344,7 +362,10 @@ fn native_override_bds_paths_normalize_delphi_separators_for_exists_and_referenc
     );
 
     let session = OverrideSession::new(None);
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.to_path_buf(), sdk.to_path_buf()],
         &options(),
@@ -352,14 +373,14 @@ fn native_override_bds_paths_normalize_delphi_separators_for_exists_and_referenc
     )
     .expect("discover project with authorized SDK root");
 
-    assert!(context.search_paths.contains(&sdk.join("source")));
-    assert_eq!(context.defines, ["NATIVE_OVERRIDE_EXISTS"]);
+    assert!(context.search_paths().contains(&sdk.join("source")));
+    assert_eq!(context.defines(), ["NATIVE_OVERRIDE_EXISTS"]);
     assert_eq!(
-        context.explicit_units.get("provider"),
+        context.explicit_units().get("provider"),
         Some(&vec![provider])
     );
     assert!(
-        !context
+        !observations
             .warnings
             .iter()
             .any(|warning| warning.contains("path does not exist")
@@ -367,7 +388,7 @@ fn native_override_bds_paths_normalize_delphi_separators_for_exists_and_referenc
     );
 }
 
-fn discover(file: &Path, root: &Path, options: &ProjectOptions) -> ProjectContext {
+fn discover(file: &Path, root: &Path, options: &ProjectOptions) -> DiscoveredProject {
     let session = OverrideSession::new(None);
     ProjectContext::discover_with_overrides(file, &[root.to_path_buf()], options, &session)
         .expect("discover project")
@@ -399,11 +420,12 @@ fn delphi_overrides_are_immutable_project_properties() {
         &session,
     )
     .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Debug"), "{context:?}");
-    assert_eq!(context.platform.as_deref(), Some("Win32"), "{context:?}");
+    assert_eq!(context.context.config(), Some("Debug"), "{context:?}");
+    assert_eq!(context.context.platform(), Some("Win32"), "{context:?}");
     assert!(
         context
-            .unit_namespaces
+            .context
+            .unit_namespaces()
             .iter()
             .any(|name| name == "Expected")
     );
@@ -439,20 +461,21 @@ fn delphi_overrides_survive_optset_assignment_and_unknown_import_taint() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert!(
         context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .any(|name| name == "Expected")
     );
     assert!(
         !context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .any(|name| name == "OptsetWrong")
     );
-    assert_eq!(context.defines, ["MAIN_SOURCE_KNOWN"]);
+    assert_eq!(context.defines(), ["MAIN_SOURCE_KNOWN"]);
 }
 
 #[test]
@@ -481,9 +504,10 @@ fn explicit_client_config_and_platform_override_file_properties() {
         },
         &session,
     )
-    .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Client"));
-    assert_eq!(context.platform.as_deref(), Some("Client"));
+    .unwrap()
+    .context;
+    assert_eq!(context.config(), Some("Client"));
+    assert_eq!(context.platform(), Some("Client"));
 }
 
 #[test]
@@ -506,21 +530,24 @@ fn immutable_globals_skip_unresolved_xml_rhs_expansion() {
             ..ProjectOptions::default()
         },
     );
-    assert!(client_context.discovery_complete, "{client_context:?}");
+    assert!(
+        client_context.context.discovery_complete(),
+        "{client_context:?}"
+    );
     assert_eq!(
         (
-            client_context.config.as_deref(),
-            client_context.platform.as_deref()
+            client_context.context.config(),
+            client_context.context.platform()
         ),
         (Some("Debug"), Some("Win32"))
     );
     assert!(
         !client_context
-            .warnings
+            .observations.warnings
             .iter()
             .any(|warning| warning.contains("MissingConfig") || warning.contains("MissingPlatform")),
         "immutable client globals expanded their XML RHS: {:?}",
-        client_context.warnings
+        client_context.observations.warnings
     );
 
     let file_root = tempfile::tempdir().unwrap();
@@ -537,21 +564,24 @@ fn immutable_globals_skip_unresolved_xml_rhs_expansion() {
         "[properties]\nConfig = 'Release'\nPlatform = 'Win64'\n",
     );
     let file_context = discover(&file_main, file_root.path(), &ProjectOptions::default());
-    assert!(file_context.discovery_complete, "{file_context:?}");
+    assert!(
+        file_context.context.discovery_complete(),
+        "{file_context:?}"
+    );
     assert_eq!(
         (
-            file_context.config.as_deref(),
-            file_context.platform.as_deref()
+            file_context.context.config(),
+            file_context.context.platform()
         ),
         (Some("Release"), Some("Win64"))
     );
     assert!(
         !file_context
-            .warnings
+            .observations.warnings
             .iter()
             .any(|warning| warning.contains("MissingConfig") || warning.contains("MissingPlatform")),
         "immutable file globals expanded their XML RHS: {:?}",
-        file_context.warnings
+        file_context.observations.warnings
     );
 }
 
@@ -594,17 +624,18 @@ fn selected_installation_keeps_project_local_properties_and_profile_roots() {
         },
         &OverrideSession::new(None),
     )
-    .expect("discover project using the selected installation");
+    .expect("discover project using the selected installation")
+    .context;
 
     assert!(matches!(
-        context.installation_selection,
-        Some(pascal_project::InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+        context.installation_selection(),
+        Some(pascal_project::InstallationSelection::Selected { id, .. }) if id == "37.0"
     ));
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(context.config(), Some("Debug"));
+    assert_eq!(context.platform(), Some("Win32"));
     assert_eq!(
         context
-            .overrides
+            .overrides()
             .properties
             .get("config")
             .map(String::as_str),
@@ -612,7 +643,7 @@ fn selected_installation_keeps_project_local_properties_and_profile_roots() {
     );
     assert_eq!(
         context
-            .overrides
+            .overrides()
             .properties
             .get("projectonly")
             .map(String::as_str),
@@ -620,24 +651,24 @@ fn selected_installation_keeps_project_local_properties_and_profile_roots() {
     );
     assert_eq!(
         context
-            .overrides
+            .overrides()
             .properties
             .get("sharedvsprofile")
             .map(String::as_str),
         Some("profile")
     );
     assert_eq!(
-        context.overrides.properties.get("bds"),
+        context.overrides().properties.get("bds"),
         Some(&sdk.display().to_string())
     );
     assert_eq!(
-        context.overrides.properties.get("profileroot"),
+        context.overrides().properties.get("profileroot"),
         Some(&sdk.display().to_string())
     );
-    assert!(context.search_paths.contains(&sdk.join("source")));
+    assert!(context.search_paths().contains(&sdk.join("source")));
     assert!(
         context
-            .read_policy
+            .read_policy()
             .allows_location(&pascal_project::ProjectPathEntry {
                 path: sdk.join("source"),
                 provenance: pascal_project::ProjectPathProvenance::Configured,
@@ -646,7 +677,7 @@ fn selected_installation_keeps_project_local_properties_and_profile_roots() {
     let unrelated_root = tempfile::tempdir().unwrap();
     assert!(
         !context
-            .read_policy
+            .read_policy()
             .allows_location(&pascal_project::ProjectPathEntry {
                 path: unrelated_root.path().to_path_buf(),
                 provenance: pascal_project::ProjectPathProvenance::Configured,
@@ -676,12 +707,13 @@ fn configured_empty_bds_is_not_replaced_by_project_xml() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert_eq!(
-        context.overrides.properties.get("bds"),
+        context.overrides().properties.get("bds"),
         Some(&String::new())
     );
-    assert!(context.unit_namespaces.is_empty());
+    assert!(context.unit_namespaces().is_empty());
 }
 
 #[test]
@@ -706,9 +738,10 @@ fn unrelated_unknown_metadata_remains_conservative_with_an_override() {
         &options(),
         &session,
     )
-    .unwrap();
-    assert!(context.unit_namespaces.is_empty());
-    assert!(!context.discovery_complete);
+    .unwrap()
+    .context;
+    assert!(context.unit_namespaces().is_empty());
+    assert!(!context.discovery_complete());
 }
 
 #[test]
@@ -738,10 +771,11 @@ fn automatic_candidate_uses_its_project_directory_override_scope() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
     assert!(
         context
-            .unit_namespaces
+            .unit_namespaces()
             .iter()
             .any(|name| name == "Candidate")
     );
@@ -775,16 +809,18 @@ fn incomplete_configured_candidate_does_not_establish_a_unique_owner() {
 
     let context = discover(&shared, root.path(), &options());
 
-    assert!(context.project_file.is_none(), "{context:?}");
-    assert!(!context.discovery_complete, "{context:?}");
+    assert!(context.context.project_file().is_none(), "{context:?}");
+    assert!(!context.context.discovery_complete(), "{context:?}");
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.path().join("A.dproj"))
     );
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.path().join("B.dproj"))
@@ -827,9 +863,12 @@ fn case_distinct_external_project_does_not_inherit_workspace_overrides() {
     )
     .unwrap();
 
-    assert!(context.discovery_complete, "{context:?}");
-    assert!(context.overrides.properties.is_empty(), "{context:?}");
-    assert_eq!(context.unit_namespaces, ["ProjectOnly"]);
+    assert!(context.context.discovery_complete(), "{context:?}");
+    assert!(
+        context.context.overrides().properties.is_empty(),
+        "{context:?}"
+    );
+    assert_eq!(context.context.unit_namespaces(), ["ProjectOnly"]);
 }
 
 #[test]
@@ -857,15 +896,16 @@ fn malformed_override_keeps_selected_project_context_incomplete() {
     )
     .expect("selected project context should remain inspectable");
 
-    assert_eq!(context.project_file, Some(project));
-    assert!(!context.discovery_complete, "{context:?}");
+    assert_eq!(context.context.project_file(), Some(project).as_deref());
+    assert!(!context.context.discovery_complete(), "{context:?}");
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains(&user_config.display().to_string())),
         "selected context lost malformed override provenance: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -890,11 +930,12 @@ fn nested_workspace_override_does_not_inherit_ancestor_properties() {
     session.capture_workspace(&nested).unwrap();
     let context =
         ProjectContext::discover_with_overrides(&source, &[ancestor, nested], &options(), &session)
-            .unwrap();
+            .unwrap()
+            .context;
 
     assert_eq!(
         context
-            .overrides
+            .overrides()
             .properties
             .get("shared")
             .map(String::as_str),
@@ -902,13 +943,13 @@ fn nested_workspace_override_does_not_inherit_ancestor_properties() {
     );
     assert_eq!(
         context
-            .overrides
+            .overrides()
             .properties
             .get("nestedonly")
             .map(String::as_str),
         Some("selected")
     );
-    assert!(!context.overrides.properties.contains_key("ancestoronly"));
+    assert!(!context.overrides().properties.contains_key("ancestoronly"));
 }
 
 #[test]
@@ -932,14 +973,15 @@ fn malformed_nested_workspace_override_is_retained_with_its_provenance() {
         ProjectContext::discover_with_overrides(&source, &[ancestor, nested], &options(), &session)
             .unwrap();
 
-    assert!(!context.discovery_complete, "{context:?}");
+    assert!(!context.context.discovery_complete(), "{context:?}");
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains(&nested_config.display().to_string())),
         "nested workspace error was not retained: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -969,15 +1011,16 @@ fn malformed_project_override_is_retained_with_its_provenance() {
     )
     .unwrap();
 
-    assert_eq!(context.project_file, Some(project));
-    assert!(!context.discovery_complete, "{context:?}");
+    assert_eq!(context.context.project_file(), Some(project).as_deref());
+    assert!(!context.context.discovery_complete(), "{context:?}");
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains(&project_config.display().to_string())),
         "project error was not retained: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -1027,30 +1070,36 @@ fn evaluates_legacy_property_groups_in_source_order_and_maps_explicit_units() {
 </Project>"#,
     );
 
-    let context = discover(&main_unit, root, &options());
+    let context = discover(&main_unit, root, &options()).context;
 
-    assert_eq!(context.project_file, Some(project_dir.join("Tool.dproj")));
-    assert_eq!(context.main_source, Some(main.clone()));
-    assert_eq!(context.config.as_deref(), Some("Release"));
-    assert_eq!(context.defines, ["RELEASE", "NOSF"]);
-    assert_eq!(context.unit_namespaces, ["System"]);
     assert_eq!(
-        context.unit_aliases.get("WinTypes"),
+        context.project_file(),
+        Some(project_dir.join("Tool.dproj")).as_deref()
+    );
+    assert_eq!(
+        context.main_source().map(Path::to_path_buf),
+        Some(main.clone())
+    );
+    assert_eq!(context.config(), Some("Release"));
+    assert_eq!(context.defines(), ["NOSF", "RELEASE"]);
+    assert_eq!(context.unit_namespaces(), ["System"]);
+    assert_eq!(
+        context.unit_aliases().get("WinTypes"),
         Some(&"Windows".to_string())
     );
     assert_eq!(
-        context.explicit_units.get("mainunit"),
+        context.explicit_units().get("mainunit"),
         Some(&vec![main_unit.clone()])
     );
     assert_eq!(
-        context.explicit_units.get("sharedalias"),
+        context.explicit_units().get("sharedalias"),
         Some(&vec![shared.clone()])
     );
     assert_eq!(
-        context.explicit_units.get("config"),
+        context.explicit_units().get("config"),
         Some(&vec![config.clone()])
     );
-    assert!(context.search_paths.contains(&root.join("Common")));
+    assert!(context.search_paths().contains(&root.join("Common")));
 }
 
 #[test]
@@ -1085,7 +1134,10 @@ fn honors_explicit_debug_config_and_reads_local_optset_imports() {
 </Project>"#,
     );
 
-    let context = discover(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover(
         &main,
         root,
         &ProjectOptions {
@@ -1095,14 +1147,14 @@ fn honors_explicit_debug_config_and_reads_local_optset_imports() {
         },
     );
 
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
-    assert_eq!(context.defines, ["DEBUG", "CPU386", "WIN32"]);
-    assert!(context.search_paths.contains(&debug_units));
+    assert_eq!(context.config(), Some("Debug"));
+    assert_eq!(context.platform(), Some("Win32"));
+    assert_eq!(context.defines(), ["CPU386", "DEBUG", "WIN32"]);
+    assert!(context.search_paths().contains(&debug_units));
     assert!(
-        context.warnings.is_empty(),
+        observations.warnings.is_empty(),
         "unexpected warnings: {:?}",
-        context.warnings
+        observations.warnings
     );
 }
 
@@ -1122,9 +1174,10 @@ fn preserves_project_ambiguity_and_allows_explicit_project_override() {
     );
 
     let ambiguous = discover(&file, root, &options());
-    assert!(ambiguous.project_file.is_none());
+    assert!(ambiguous.context.project_file().is_none());
     assert!(
         ambiguous
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("multiple project files"))
@@ -1137,8 +1190,12 @@ fn preserves_project_ambiguity_and_allows_explicit_project_override() {
             project_file: Some(PathBuf::from(r"src\Two.dproj")),
             ..ProjectOptions::default()
         },
+    )
+    .context;
+    assert_eq!(
+        selected.project_file(),
+        Some(root.join("src/Two.dproj")).as_deref()
     );
-    assert_eq!(selected.project_file, Some(root.join("src/Two.dproj")));
 }
 
 #[test]
@@ -1157,10 +1214,10 @@ fn nested_unique_dproj_beats_ancestor_and_same_nearest_projects_stay_ambiguous()
         "<Project><PropertyGroup><DCCReference Include=\"Unit.pas\" /></PropertyGroup></Project>",
     );
 
-    let unique_nearest = discover(&source, root, &options());
+    let unique_nearest = discover(&source, root, &options()).context;
     assert_eq!(
-        unique_nearest.project_file,
-        Some(nested.join("Nested.dproj"))
+        unique_nearest.project_file(),
+        Some(nested.join("Nested.dproj")).as_deref()
     );
 
     write(
@@ -1168,9 +1225,10 @@ fn nested_unique_dproj_beats_ancestor_and_same_nearest_projects_stay_ambiguous()
         "<Project><PropertyGroup><MainSource>Other.dpr</MainSource></PropertyGroup></Project>",
     );
     let ambiguous = discover(&source, root, &options());
-    assert_eq!(ambiguous.project_file, None, "{ambiguous:?}");
+    assert_eq!(ambiguous.context.project_file(), None, "{ambiguous:?}");
     assert!(
         ambiguous
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("multiple project files"))
@@ -1197,18 +1255,21 @@ fn normalizes_case_insensitive_paths_and_rejects_unknown_windows_paths() {
 </Project>"#,
     );
 
-    let context = discover(&project_dir.join("MAIN.DPR"), root, &options());
-    assert_eq!(context.main_source, Some(main));
-    assert!(context.search_paths.contains(&root.join("Common")));
-    assert_eq!(context.explicit_units.get("shared"), Some(&vec![shared]));
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover(&project_dir.join("MAIN.DPR"), root, &options());
+    assert_eq!(context.main_source().map(Path::to_path_buf), Some(main));
+    assert!(context.search_paths().contains(&root.join("Common")));
+    assert_eq!(context.explicit_units().get("shared"), Some(&vec![shared]));
     // On Windows the drive path is native and simply absent.
     if cfg!(not(windows)) {
-        assert!(context.warnings.iter().any(|warning| {
+        assert!(observations.warnings.iter().any(|warning| {
             warning == "Windows path in DCC_UnitSearchPath is unavailable on Linux and was omitted: C:\\Windows\\Never"
         }));
     }
     assert!(
-        context
+        observations
             .warnings
             .iter()
             .any(|warning| warning.contains("MissingPath"))
@@ -1240,9 +1301,9 @@ end."#,
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
     );
 
-    let context = discover(&main, root, &options());
-    assert_eq!(context.explicit_units.get("actual"), Some(&vec![real]));
-    assert!(!context.explicit_units.contains_key("fake"));
+    let context = discover(&main, root, &options()).context;
+    assert_eq!(context.explicit_units().get("actual"), Some(&vec![real]));
+    assert!(!context.explicit_units().contains_key("fake"));
 }
 
 #[test]
@@ -1261,12 +1322,13 @@ fn standalone_context_uses_only_bounded_explicit_source_paths() {
             source_paths: vec!["Sources".to_string()],
             ..ProjectOptions::default()
         },
-    );
+    )
+    .context;
 
-    assert!(context.project_file.is_none());
-    assert!(context.main_source.is_none());
-    assert!(context.search_paths.contains(&root.join("src")));
-    assert!(context.search_paths.contains(&source));
+    assert!(context.project_file().is_none());
+    assert!(context.main_source().is_none());
+    assert!(context.search_paths().contains(&root.join("src")));
+    assert!(context.search_paths().contains(&source));
 }
 
 #[test]
@@ -1299,13 +1361,14 @@ fn imported_optset_cycles_are_bounded_and_reported() {
 
     let context = discover(&main, root, &options());
     assert!(
-        !context.discovery_complete,
+        !context.context.discovery_complete(),
         "a cyclic import must not expose a partial context as complete"
     );
-    assert!(!context.defines.contains(&"ONE".to_string()));
-    assert!(!context.defines.contains(&"TWO".to_string()));
+    assert!(!context.context.defines().contains(&"ONE".to_string()));
+    assert!(!context.context.defines().contains(&"TWO".to_string()));
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("cycle"))
@@ -1335,10 +1398,10 @@ fn uses_option_style_optsets_and_falls_back_to_project_stem_main_source() {
 </Project>"#,
     );
 
-    let context = discover(&root.join("Unit.pas"), root, &options());
-    assert_eq!(context.main_source, Some(main));
-    assert_eq!(context.defines, ["OPTSET"]);
-    assert!(context.search_paths.contains(&units));
+    let context = discover(&root.join("Unit.pas"), root, &options()).context;
+    assert_eq!(context.main_source().map(Path::to_path_buf), Some(main));
+    assert_eq!(context.defines(), ["OPTSET"]);
+    assert!(context.search_paths().contains(&units));
 }
 
 #[test]
@@ -1358,17 +1421,21 @@ fn known_missing_optset_import_is_retained_when_exists_guard_is_false() {
 
     let missing = discover(&main, root, &options());
     assert!(
-        missing.metadata_files.iter().any(|path| path == &import),
+        missing
+            .observations
+            .metadata_files
+            .iter()
+            .any(|path| path == &import),
         "known missing import was not retained: {missing:?}"
     );
-    assert!(missing.defines.is_empty());
+    assert!(missing.context.defines().is_empty());
 
     write(
         &import,
         "<Project><PropertyGroup><DCC_Define>CREATED</DCC_Define></PropertyGroup></Project>",
     );
-    let restored = discover(&main, root, &options());
-    assert_eq!(restored.defines, ["CREATED"]);
+    let restored = discover(&main, root, &options()).context;
+    assert_eq!(restored.defines(), ["CREATED"]);
 }
 
 #[test]
@@ -1385,16 +1452,19 @@ fn unresolved_optset_import_path_is_not_retained_or_guessed() {
 </Project>"#,
     );
 
-    let context = discover(&main, root, &options());
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover(&main, root, &options());
     assert!(
-        !context
+        !observations
             .metadata_files
             .iter()
             .any(|path| path.to_string_lossy().contains("$(Unavailable)"))
     );
-    assert!(context.defines.is_empty());
+    assert!(context.defines().is_empty());
     assert!(
-        context
+        observations
             .warnings
             .iter()
             .any(|warning| warning.contains("Unavailable"))
@@ -1424,15 +1494,16 @@ fn inactive_xml_ancestors_do_not_apply_references_or_target_properties() {
 
     let context = discover(&root.join("App.dpr"), root, &options());
     assert!(
-        context.explicit_units.is_empty(),
+        context.context.explicit_units().is_empty(),
         "inactive XML applied: {context:?}"
     );
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "Target property applied: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("Target")),
@@ -1456,10 +1527,10 @@ fn unresolved_condition_paths_are_unknown_and_never_guessed() {
 
     let context = discover(&root.join("App.dpr"), root, &options());
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "unknown path guessed: {context:?}"
     );
-    assert!(!context.warnings.is_empty());
+    assert!(!context.observations.warnings.is_empty());
 }
 
 #[test]
@@ -1477,7 +1548,7 @@ fn tainted_condition_comparisons_remain_unknown() {
 
     let context = discover(&root.join("App.dpr"), root, &options());
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "tainted comparison guessed: {context:?}"
     );
 }
@@ -1514,7 +1585,7 @@ fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     )
     .expect("discover project context");
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "escaped workspace: {context:?}"
     );
 }
@@ -1554,11 +1625,12 @@ fn case_distinct_workspace_roots_keep_relative_project_ambiguity() {
     .expect("discover project context");
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "case-distinct roots collapsed: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| { warning.contains("multiple explicit project files matched") })
@@ -1578,8 +1650,11 @@ fn nearest_unambiguous_dpr_can_own_a_different_member_unit_name() {
         "unit U; interface implementation end.",
     );
 
-    let context = discover(&root.join("src/U.pas"), root, &options());
-    assert_eq!(context.project_file, Some(root.join("App.dpr")));
+    let context = discover(&root.join("src/U.pas"), root, &options()).context;
+    assert_eq!(
+        context.project_file(),
+        Some(root.join("App.dpr")).as_deref()
+    );
 }
 
 #[test]
@@ -1599,11 +1674,17 @@ fn ancestor_dproj_beats_nested_dpr_for_unit_context() {
         "unit U; interface implementation end.",
     );
 
-    let context = discover(&root.join("src/U.pas"), root, &options());
+    let context = discover(&root.join("src/U.pas"), root, &options()).context;
 
-    assert_eq!(context.project_file, Some(root.join("App.dproj")));
-    assert_eq!(context.main_source, Some(root.join("src/App.dpr")));
-    assert_eq!(context.defines, ["PROJECT_CONTEXT"]);
+    assert_eq!(
+        context.project_file(),
+        Some(root.join("App.dproj")).as_deref()
+    );
+    assert_eq!(
+        context.main_source().map(Path::to_path_buf),
+        Some(root.join("src/App.dpr"))
+    );
+    assert_eq!(context.defines(), ["PROJECT_CONTEXT"]);
 }
 
 #[test]
@@ -1628,9 +1709,9 @@ fn imported_relative_references_use_the_main_project_directory() {
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"settings/common.optset\"/></Project>",
     );
 
-    let context = discover(&root.join("App.dpr"), root, &options());
+    let context = discover(&root.join("App.dpr"), root, &options()).context;
     assert_eq!(
-        context.explicit_units.get("u"),
+        context.explicit_units().get("u"),
         Some(&vec![root.join("src/U.pas")])
     );
 }
@@ -1656,9 +1737,10 @@ fn explicit_config_and_platform_are_immutable_global_properties() {
         },
         &session,
     )
-    .expect("discover project context");
+    .expect("discover project context")
+    .context;
     assert_eq!(
-        (context.config.as_deref(), context.platform.as_deref()),
+        (context.config(), context.platform()),
         (Some("Debug"), Some("Win64"))
     );
 }
@@ -1677,10 +1759,13 @@ fn property_expansion_has_per_value_and_aggregate_budgets() {
     xml.push_str("</PropertyGroup></Project>");
     write(root.join("App.dproj").as_path(), &xml);
 
-    let context = discover(&root.join("App.dpr"), root, &options());
-    let expanded_bytes: usize = context.defines.iter().map(String::len).sum();
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover(&root.join("App.dpr"), root, &options());
+    let expanded_bytes: usize = context.defines().iter().map(String::len).sum();
     assert!(
-        expanded_bytes <= 4 * 1024 * 1024 || !context.warnings.is_empty(),
+        expanded_bytes <= 4 * 1024 * 1024 || !observations.warnings.is_empty(),
         "{expanded_bytes} bytes of XML silently expanded to {expanded_bytes} bytes"
     );
 }
@@ -1697,7 +1782,10 @@ fn seeded_property_budget_warnings_identify_client_provenance() {
     );
     write(&override_file, "[properties]\nConfig = 'file default'\n");
 
-    let context = discover(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = discover(
         &root.join("App.dpr"),
         root,
         &ProjectOptions {
@@ -1706,23 +1794,23 @@ fn seeded_property_budget_warnings_identify_client_provenance() {
         },
     );
 
-    assert!(!context.discovery_complete);
+    assert!(!context.discovery_complete());
     assert!(
-        context.warnings.iter().any(|warning| {
+        observations.warnings.iter().any(|warning| {
             warning.contains("configured Delphi override properties exceed")
                 && warning.contains("client initialization options")
         }),
         "aggregate seeded-property warning lost provenance: {:?}",
-        context.warnings
+        observations.warnings
     );
     assert!(
-        context.warnings.iter().any(|warning| {
+        observations.warnings.iter().any(|warning| {
             warning.contains("configured Delphi property config")
                 && warning.contains("client initialization options")
                 && !warning.contains(&override_file.display().to_string())
         }),
         "client property was attributed to the override file: {:?}",
-        context.warnings
+        observations.warnings
     );
 }
 
@@ -1773,15 +1861,16 @@ fn legacy_project_keeps_release_metadata_and_reference_paths() {
         &ProjectOptions::default(),
         &session,
     )
-    .expect("discover legacy project");
+    .expect("discover legacy project")
+    .context;
     assert_eq!(
-        context.main_source,
+        context.main_source().map(Path::to_path_buf),
         Some(root.join("Projects/Tools/WebQueryExporter/WebQuery.dpr"))
     );
-    assert_eq!(context.defines, ["RELEASE", "NOSF", "CPU386", "WIN32"]);
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(context.defines(), ["CPU386", "NOSF", "RELEASE", "WIN32"]);
+    assert_eq!(context.platform(), Some("Win32"));
     assert_eq!(
-        context.explicit_units.get("hartlib"),
+        context.explicit_units().get("hartlib"),
         Some(&vec![
             root.join("Projects/Chaindrive/Librairies/hartlib.pas")
         ])
@@ -1803,9 +1892,9 @@ fn evaluates_dcc_use_package_names_in_declared_order_without_duplicates() {
 </Project>"#,
     );
 
-    let context = discover(&root.join("App.dpr"), root, &options());
+    let context = discover(&root.join("App.dpr"), root, &options()).context;
 
-    assert_eq!(context.packages, ["firstpkg", "multidevd10", "secondpkg"]);
+    assert_eq!(context.packages(), ["firstpkg", "multidevd10", "secondpkg"]);
 }
 
 #[test]
@@ -1842,18 +1931,19 @@ fn ordinary_undefined_configuration_properties_are_empty() {
         },
     );
 
-    assert_eq!(context.defines, ["DEBUG", "CPU386", "WIN32"]);
+    assert_eq!(context.context.defines(), ["CPU386", "DEBUG", "WIN32"]);
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "unexpected incomplete context: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .all(|warning| !warning.contains("Cfg_2") && !warning.contains("Cfg_1_Win32")),
         "ordinary missing configuration properties stayed unknown: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -1880,20 +1970,21 @@ fn properties_from_unknown_prior_conditions_remain_unknown() {
     let context = discover(&root.join("App.dpr"), root, &options());
 
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "unknown property was guessed: {context:?}"
     );
     assert!(
-        !context.discovery_complete,
+        !context.context.discovery_complete(),
         "unknown property was treated as complete"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("unknown project condition")),
         "unknown condition was not reported: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -1920,16 +2011,18 @@ fn automatic_selection_does_not_guess_from_unique_source_membership() {
 
     let context = discover(&source, root, &options());
 
-    assert_eq!(context.project_file, None, "{context:?}");
-    assert!(!context.discovery_complete);
+    assert_eq!(context.context.project_file(), None, "{context:?}");
+    assert!(!context.context.discovery_complete());
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("A.dproj"))
     );
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("B.dproj"))
@@ -1956,26 +2049,29 @@ fn automatic_selection_refuses_shared_source_owners_even_through_aliases() {
     let context = discover(&source, root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "shared ownership was guessed: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("multiple project files")),
         "shared ownership was not reported: {:?}",
-        context.warnings
+        context.observations.warnings
     );
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("A.dproj"))
     );
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("B.dproj"))
@@ -2004,12 +2100,13 @@ fn incomplete_candidate_metadata_is_not_exclusion_proof() {
     let context = discover(&source, root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "incomplete candidate was excluded: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
     assert!(
         context
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("Unknown.dproj"))
@@ -2032,17 +2129,18 @@ fn missing_compiled_references_do_not_invalidate_source_context() {
     let context = discover(&root.join("App.dpr"), root, &options());
 
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "missing DCP poisoned context: {context:?}"
     );
-    assert!(context.explicit_units.is_empty());
+    assert!(context.context.explicit_units().is_empty());
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .all(|warning| !warning.contains("missing.dcp")),
         "compiled-only reference was treated as source: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -2066,17 +2164,18 @@ fn missing_source_references_remain_incomplete() {
     let context = discover(&root.join("App.dpr"), root, &options());
 
     assert!(
-        !context.discovery_complete,
+        !context.context.discovery_complete(),
         "missing source references were ignored: {context:?}"
     );
     for extension in ["missing.pas", "missing.dpk", "missing.inc"] {
         assert!(
             context
+                .observations
                 .warnings
                 .iter()
                 .any(|warning| warning.contains(extension)),
             "missing source reference {extension} was not reported: {:?}",
-            context.warnings
+            context.observations.warnings
         );
     }
 }
@@ -2099,15 +2198,15 @@ fn evaluates_inherited_include_paths_without_adding_them_to_unit_search_paths() 
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project=\"common.optset\"/><PropertyGroup><DCC_IncludePath>project-includes;$(DCC_IncludePath)</DCC_IncludePath></PropertyGroup></Project>",
     );
 
-    let context = discover(&root.join("App.dpr"), root, &options());
+    let context = discover(&root.join("App.dpr"), root, &options()).context;
 
     assert_eq!(
-        context.include_paths,
+        context.include_paths(),
         vec![project_include.clone(), optset_include.clone()]
     );
-    assert!(!context.search_paths.contains(&project_include));
-    assert!(!context.search_paths.contains(&optset_include));
-    assert!(context.search_paths.contains(&root.join("units")));
+    assert!(!context.search_paths().contains(&project_include));
+    assert!(!context.search_paths().contains(&optset_include));
+    assert!(context.search_paths().contains(&root.join("units")));
 }
 
 #[test]
@@ -2135,10 +2234,10 @@ fn bare_uses_is_not_exclusion_proof_for_automatic_selection() {
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "bare uses were excluded: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
 }
 
 #[test]
@@ -2170,10 +2269,10 @@ fn transitive_bare_uses_are_not_exclusion_proof_for_automatic_selection() {
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "transitive bare uses were excluded: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
 }
 
 #[test]
@@ -2202,10 +2301,10 @@ fn include_provided_membership_is_not_exclusion_proof_for_automatic_selection() 
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "include-provided membership was excluded: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
 }
 
 #[cfg(unix)]
@@ -2232,10 +2331,10 @@ fn symlink_source_is_not_exclusion_proof_for_automatic_selection() {
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none(),
+        context.context.project_file().is_none(),
         "symlink ownership was excluded: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
 }
 
 #[test]
@@ -2265,7 +2364,7 @@ fn unmodeled_environment_properties_are_unknown_in_both_comparison_directions() 
         );
 
         assert!(
-            !context.discovery_complete,
+            !context.context.discovery_complete(),
             "unmodeled OS input was treated as known for {condition}: {context:?}"
         );
     }
@@ -2314,30 +2413,32 @@ fn metadata_limit_prevents_automatic_exclusion() {
         },
     );
     assert!(
-        !explicit.discovery_complete,
+        !explicit.context.discovery_complete(),
         "metadata cutoff was reported as complete: {explicit:?}"
     );
     assert!(
         explicit
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("metadata file limit")),
         "metadata cutoff warning was lost: {:?}",
-        explicit.warnings
+        explicit.observations.warnings
     );
 
     let automatic = discover(&root.join("src/Shared.pas"), root, &options());
     assert!(
-        automatic.project_file.is_none() && !automatic.discovery_complete,
+        automatic.context.project_file().is_none() && !automatic.context.discovery_complete(),
         "metadata cutoff allowed automatic selection: {automatic:?}"
     );
     assert!(
         automatic
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("metadata file limit")),
         "automatic cutoff warning was lost: {:?}",
-        automatic.warnings
+        automatic.observations.warnings
     );
 }
 
@@ -2370,10 +2471,11 @@ fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert!(before.project_file.is_none(), "{before:?}");
-    assert!(!before.discovery_complete);
+    assert!(before.context.project_file().is_none(), "{before:?}");
+    assert!(!before.context.discovery_complete());
     assert!(
         before
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("a.dproj")),
@@ -2386,7 +2488,7 @@ fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
     );
     let after = discover(&root.join("src/Shared.pas"), root, &options());
     assert!(
-        after.project_file.is_none() && !after.discovery_complete,
+        after.context.project_file().is_none() && !after.context.discovery_complete(),
         "mutated case-distinct candidate was not re-evaluated: {after:?}"
     );
 }
@@ -2411,10 +2513,11 @@ fn exists_dependencies_are_retained_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert!(before.project_file.is_none(), "{before:?}");
-    assert!(!before.discovery_complete);
+    assert!(before.context.project_file().is_none(), "{before:?}");
+    assert!(!before.context.discovery_complete());
     assert!(
         before
+            .observations
             .metadata_files
             .iter()
             .any(|path| path == &root.join("enabled.flag")),
@@ -2424,7 +2527,7 @@ fn exists_dependencies_are_retained_in_the_ownership_readset() {
     write(root.join("enabled.flag").as_path(), "enabled");
     let after = discover(&root.join("src/Shared.pas"), root, &options());
     assert!(
-        after.project_file.is_none() && !after.discovery_complete,
+        after.context.project_file().is_none() && !after.context.discovery_complete(),
         "Exists dependency change did not invalidate ownership: {after:?}"
     );
 }
@@ -2457,12 +2560,13 @@ fn unknown_import_taints_later_property_conditions_until_reassignment() {
             platform: Some("Win32".to_string()),
             ..ProjectOptions::default()
         },
-    );
+    )
+    .context;
 
-    assert_eq!(context.defines, ["KNOWN", "CPU386", "WIN32"]);
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
-    assert!(!context.discovery_complete);
+    assert_eq!(context.defines(), ["CPU386", "KNOWN", "WIN32"]);
+    assert_eq!(context.config(), Some("Debug"));
+    assert_eq!(context.platform(), Some("Win32"));
+    assert!(!context.discovery_complete());
 }
 
 #[test]
@@ -2498,16 +2602,17 @@ fn automatic_selection_has_an_aggregate_candidate_probe_bound() {
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none() && !context.discovery_complete,
+        context.context.project_file().is_none() && !context.context.discovery_complete(),
         "candidate probe budget was not enforced: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("candidate") && warning.contains("limit")),
         "candidate probe limit was not reported: {:?}",
-        context.warnings
+        context.observations.warnings
     );
 }
 
@@ -2540,7 +2645,7 @@ fn conditional_alternative_paths_are_not_exclusion_proof_for_automatic_selection
     let context = discover(&root.join("src/Shared.pas"), root, &options());
 
     assert!(
-        context.project_file.is_none() && !context.discovery_complete,
+        context.context.project_file().is_none() && !context.context.discovery_complete(),
         "conditional alternative was treated as exhaustive ownership evidence: {context:?}"
     );
 }
@@ -2601,8 +2706,8 @@ fn project_defines_select_the_active_navigation_branch_without_inventing_version
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>",
     );
 
-    let context = discover(&main, root, &options());
-    assert_eq!(context.defines, ["FEATURE"]);
+    let context = discover(&main, root, &options()).context;
+    assert_eq!(context.defines(), ["FEATURE"]);
 
     let source_uri = Url::from_file_path(&main).expect("source URI");
     let mut workspace = Workspace::new(
@@ -2743,7 +2848,7 @@ fn symlink_dependent_automatic_ownership_is_refused() {
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
     assert!(
-        before.project_file.is_none() && !before.discovery_complete,
+        before.context.project_file().is_none() && !before.context.discovery_complete(),
         "symlink-dependent candidate was used for automatic ownership: {before:?}"
     );
 
@@ -2752,7 +2857,7 @@ fn symlink_dependent_automatic_ownership_is_refused() {
         .expect("retarget source alias");
     let after = discover(&root.join("src/Shared.pas"), root, &options());
     assert!(
-        after.project_file.is_none() && !after.discovery_complete,
+        after.context.project_file().is_none() && !after.context.discovery_complete(),
         "retargeted symlink was used for automatic ownership: {after:?}"
     );
 }
@@ -2773,12 +2878,15 @@ fn unknown_option_set_does_not_erase_the_known_main_source() {
 
     let context = discover(&root.join("App.dpr"), root, &options());
 
-    assert_eq!(context.main_source, Some(root.join("App.dpr")));
+    assert_eq!(
+        context.context.main_source().map(Path::to_path_buf),
+        Some(root.join("App.dpr"))
+    );
     assert!(
-        context.defines == ["KNOWN"],
+        context.context.defines() == ["KNOWN"],
         "preserved entrypoint or derived taint leaked into an uncertain condition, or reassignment did not restore certainty: {context:?}"
     );
-    assert!(!context.discovery_complete);
+    assert!(!context.context.discovery_complete());
 }
 
 #[cfg(unix)]
@@ -2805,11 +2913,11 @@ fn mapped_exists_condition_revalidates_native_destination() {
     )
     .unwrap();
     assert!(
-        before.defines.is_empty(),
+        before.context.defines().is_empty(),
         "missing mapped flag was true: {before:?}"
     );
-    assert!(before.metadata_files.contains(&flag));
-    assert!(!before.metadata_files.iter().any(|path| {
+    assert!(before.observations.metadata_files.contains(&flag));
+    assert!(!before.observations.metadata_files.iter().any(|path| {
         path.file_name()
             .is_some_and(|name| name == ".delphi-tools.local.toml")
     }));
@@ -2821,8 +2929,9 @@ fn mapped_exists_condition_revalidates_native_destination() {
         &options(),
         &session,
     )
-    .unwrap();
-    assert_eq!(after.defines, ["MAPPED_EXISTS"]);
+    .unwrap()
+    .context;
+    assert_eq!(after.defines(), ["MAPPED_EXISTS"]);
 }
 
 #[cfg(unix)]
@@ -2844,7 +2953,10 @@ fn mapped_optset_import_is_loaded_and_watched_at_its_destination() {
 </Project>"#,
     );
     let session = mapped_session(root.path(), "", r"C:\SDK", sdk.path());
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
@@ -2852,9 +2964,9 @@ fn mapped_optset_import_is_loaded_and_watched_at_its_destination() {
     )
     .unwrap();
 
-    assert_eq!(context.defines, ["MAPPED_OPTSET"]);
-    assert!(context.metadata_files.contains(&optset));
-    assert!(!context.metadata_files.iter().any(|path| {
+    assert_eq!(context.defines(), ["MAPPED_OPTSET"]);
+    assert!(observations.metadata_files.contains(&optset));
+    assert!(!observations.metadata_files.iter().any(|path| {
         path.file_name()
             .is_some_and(|name| name == ".delphi-tools.local.toml")
     }));
@@ -2887,16 +2999,17 @@ fn mapped_optset_import_rechecks_the_final_extension_before_reading() {
     .unwrap();
 
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "mapped target was evaluated: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("ignored unsupported MSBuild import"))
     );
-    assert!(!context.metadata_files.contains(&destination));
+    assert!(!context.observations.metadata_files.contains(&destination));
 }
 
 #[cfg(unix)]
@@ -2913,7 +3026,10 @@ fn missing_mapped_import_reports_mapping_provenance_without_watching_config() {
 </Project>"#,
     );
     let session = mapped_session(root.path(), "", r"C:\SDK", sdk.path());
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
@@ -2923,10 +3039,10 @@ fn missing_mapped_import_reports_mapping_provenance_without_watching_config() {
     let missing = sdk.path().join("missing.optset");
     let config = root.path().join(".delphi-tools.local.toml");
 
-    assert!(!context.discovery_complete);
-    assert!(context.metadata_files.contains(&missing));
-    assert!(!context.metadata_files.contains(&config));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(!context.discovery_complete());
+    assert!(observations.metadata_files.contains(&missing));
+    assert!(!observations.metadata_files.contains(&config));
+    assert!(observations.warnings.iter().any(|warning| {
         warning.contains("missing.optset")
             && warning.contains(&config.display().to_string())
             && warning.contains(&sdk.path().display().to_string())
@@ -2947,7 +3063,10 @@ fn missing_mapped_search_path_is_retained_at_its_native_destination() {
 </PropertyGroup></Project>"#,
     );
     let session = mapped_session(root.path(), "", r"C:\SDK", sdk.path());
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
@@ -2957,8 +3076,8 @@ fn missing_mapped_search_path_is_retained_at_its_native_destination() {
     let future = sdk.path().join("future");
     let config = root.path().join(".delphi-tools.local.toml");
 
-    assert!(context.search_paths.contains(&future));
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(context.search_paths().contains(&future));
+    assert!(observations.warnings.iter().any(|warning| {
         warning.contains("future")
             && warning.contains(&config.display().to_string())
             && warning.contains(&sdk.path().display().to_string())
@@ -2994,9 +3113,10 @@ fn macro_defined_optset_import_is_expanded_before_path_validation() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
 
-    assert_eq!(context.defines, ["MACRO_OPTSET"]);
+    assert_eq!(context.defines(), ["MACRO_OPTSET"]);
 }
 
 #[cfg(unix)]
@@ -3032,16 +3152,17 @@ fn mapped_target_imports_are_ignored_without_reading_the_destination() {
     .unwrap();
 
     assert!(
-        context.defines.is_empty(),
+        context.context.defines().is_empty(),
         "Target was evaluated: {context:?}"
     );
     assert!(
         context
+            .observations
             .warnings
             .iter()
             .any(|warning| warning.contains("ignored unsupported MSBuild import"))
     );
-    assert!(!context.metadata_files.contains(&target));
+    assert!(!context.observations.metadata_files.contains(&target));
 }
 
 #[cfg(unix)]
@@ -3069,10 +3190,14 @@ fn mapped_include_paths_remain_separate_from_unit_search_paths() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
 
-    assert_eq!(context.search_paths, vec![root.path().to_path_buf(), units]);
-    assert_eq!(context.include_paths, vec![include]);
+    assert_eq!(
+        context.search_paths(),
+        vec![root.path().to_path_buf(), units]
+    );
+    assert_eq!(context.include_paths(), vec![include]);
 }
 
 // Needs case-distinct paths, which Windows volumes cannot hold.
@@ -3097,7 +3222,10 @@ fn mapped_native_lookup_prefers_exact_case_and_rejects_ambiguous_fallback() {
 </Project>"#,
     );
     let session = mapped_session(root.path(), "", r"C:\SDK", sdk.path());
-    let context = ProjectContext::discover_with_overrides(
+    let DiscoveredProject {
+        context,
+        observations,
+    } = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
@@ -3105,15 +3233,15 @@ fn mapped_native_lookup_prefers_exact_case_and_rejects_ambiguous_fallback() {
     )
     .unwrap();
 
-    assert_eq!(context.explicit_units.get("provider"), Some(&vec![exact]));
+    assert_eq!(context.explicit_units().get("provider"), Some(&vec![exact]));
     let config = root.path().join(".delphi-tools.local.toml");
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning.contains("ambiguous case-insensitive")
             && warning.contains(r"C:\SDK\PROVIDER.pas")
             && warning.contains(&config.display().to_string())
             && warning.contains(&sdk.path().display().to_string())
     }));
-    assert!(!context.explicit_units["provider"].contains(&ambiguous));
+    assert!(!context.explicit_units()["provider"].contains(&ambiguous));
 }
 
 #[cfg(unix)]
@@ -3131,16 +3259,17 @@ fn mapped_path_resolution_errors_report_original_input_and_mapping_provenance() 
 </Project>"#,
     );
     let session = mapped_session(root.path(), "", r"C:\SDK", sdk.path());
-    let context = ProjectContext::discover_with_overrides(
+    let observations = ProjectContext::discover_with_overrides(
         &main,
         &[root.path().to_path_buf()],
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .observations;
     let config = root.path().join(".delphi-tools.local.toml");
 
-    assert!(context.warnings.iter().any(|warning| {
+    assert!(observations.warnings.iter().any(|warning| {
         warning.contains("mapped Windows path contains")
             && warning.contains(raw)
             && warning.contains(&config.display().to_string())
@@ -3175,11 +3304,12 @@ fn mapped_main_source_and_dpr_membership_are_resolved() {
         },
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
 
-    assert_eq!(context.main_source, Some(main));
+    assert_eq!(context.main_source().map(Path::to_path_buf), Some(main));
     assert_eq!(
-        context.explicit_units.get("provider"),
+        context.explicit_units().get("provider"),
         Some(&vec![provider])
     );
 }
@@ -3203,11 +3333,12 @@ fn mapped_dpk_contains_membership_is_resolved() {
         &options(),
         &session,
     )
-    .unwrap();
+    .unwrap()
+    .context;
 
-    assert_eq!(context.main_source, Some(package));
+    assert_eq!(context.main_source().map(Path::to_path_buf), Some(package));
     assert_eq!(
-        context.explicit_units.get("provider"),
+        context.explicit_units().get("provider"),
         Some(&vec![provider])
     );
 }
@@ -3242,8 +3373,9 @@ fn mapped_main_source_symlink_is_not_read_during_context_discovery() {
             &options(),
             &session,
         )
-        .unwrap();
-        assert!(context.main_source.is_some());
+        .unwrap()
+        .context;
+        assert!(context.main_source().is_some());
     });
 
     assert!(!opened, "forbidden mapped MainSource was opened");
@@ -3276,10 +3408,11 @@ fn mapped_optset_symlink_is_not_read_during_context_discovery() {
             &options(),
             &session,
         )
-        .unwrap();
+        .unwrap()
+        .context;
         assert!(
             !context
-                .defines
+                .defines()
                 .iter()
                 .any(|define| define == "MUST_NOT_LOAD")
         );
@@ -3324,9 +3457,10 @@ fn mapped_optset_relative_import_cannot_escape_its_mapping() {
         )
         .expect("discover project");
         assert!(
-            !context.discovery_complete
+            !context.context.discovery_complete()
                 && !context
-                    .defines
+                    .context
+                    .defines()
                     .iter()
                     .any(|define| define == "MUST_NOT_LOAD"),
             "escaped nested optset received mapped authority: {context:?}"
@@ -3369,11 +3503,11 @@ fn native_configured_optset_under_effective_mapping_is_consumed() {
     .expect("discover project");
 
     assert!(
-        context.discovery_complete,
+        context.context.discovery_complete(),
         "native mapped optset made the context incomplete: {context:?}"
     );
-    assert_eq!(context.defines, ["NATIVE_MAPPED_OPTSET"]);
-    assert!(context.metadata_files.contains(&optset));
+    assert_eq!(context.context.defines(), ["NATIVE_MAPPED_OPTSET"]);
+    assert!(context.observations.metadata_files.contains(&optset));
 }
 
 #[cfg(target_os = "linux")]
@@ -3411,9 +3545,10 @@ fn empty_configured_substitution_does_not_authorize_external_optset() {
         )
         .expect("discover project");
         assert!(
-            !context.discovery_complete
+            !context.context.discovery_complete()
                 && !context
-                    .defines
+                    .context
+                    .defines()
                     .iter()
                     .any(|define| define == "MUST_NOT_LOAD"),
             "empty configured substitution received legacy authority: {context:?}"
@@ -3462,7 +3597,7 @@ fn multi_candidate_denied_mapped_main_source_is_not_probed() {
         )
         .expect("discover project candidates");
         assert!(
-            context.project_file.is_none() && !context.discovery_complete,
+            context.context.project_file().is_none() && !context.context.discovery_complete(),
             "denied MainSource allowed automatic ownership selection: {context:?}"
         );
     });
@@ -3510,7 +3645,7 @@ fn mapped_recursive_membership_escape_is_not_read_during_ownership_probe() {
         )
         .expect("discover project candidates");
         assert!(
-            context.project_file.is_none() && !context.discovery_complete,
+            context.context.project_file().is_none() && !context.context.discovery_complete(),
             "denied recursive membership established an owner: {context:?}"
         );
     });

@@ -2,7 +2,17 @@
 mod support;
 use pascal_core::conditional::Truth;
 use pascal_project::LayoutPlatform;
+use pascal_project::ProjectContextParts;
 use support::{Fixture, activity, context};
+
+fn edit_context<R>(
+    context: &mut std::sync::Arc<pascal_project::ProjectContext>,
+    edit: impl FnOnce(&mut pascal_project::ProjectContextParts) -> R,
+) {
+    let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(context)).into_parts();
+    edit(&mut parts);
+    *context = pascal_project::ProjectContext::from_parts(parts).into();
+}
 
 #[test]
 fn fix_i1_split_brace_opening_never_reads_forbidden() {
@@ -146,9 +156,12 @@ fn generic_resolver_uses_source_order_and_retains_observations() {
     std::fs::write(&path, text).unwrap();
     std::fs::write(dir.path().join("revision.inc"), "7").unwrap();
     std::fs::write(dir.path().join("chosen.inc"), "type A=array[1..N] of Byte;").unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -498,9 +511,12 @@ fn generic_active_import_uses_included_constant_first_pass() {
         "unit Chosen; interface implementation end.",
     )
     .unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -623,8 +639,11 @@ fn generic_child_limits_retain_failed_lookup_observations_and_warnings() {
     ] {
         let mut ctx =
             ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
-                .unwrap();
-        ctx.conditional_context = context(LayoutPlatform::Win32);
+                .unwrap()
+                .context;
+        edit_context(&mut ctx, |p| {
+            p.conditional_context = context(LayoutPlatform::Win32)
+        });
         let mut resolver = UnitResolver::new(
             ctx,
             vec![dir.path().into()],
@@ -665,9 +684,12 @@ fn latin1_child_retains_raw_revision_and_physical_text_coordinates() {
         [b'7', b' ', b'{', 0xe9, b'}'],
     )
     .unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -889,8 +911,11 @@ fn fix_i2_same_id_and_text_different_physical_root_reselects_imports() {
         &[dir.path().into()],
         &ProjectOptions::default(),
     )
-    .unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    .unwrap()
+    .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -961,9 +986,12 @@ fn fix_i2_changed_root_revision_revalidates_dependency_payload() {
         )
         .unwrap();
     }
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -1032,9 +1060,12 @@ fn fix_i3_small_aggregate_budget_refuses_before_child_payload() {
     let text = "unit T; interface {$I value.inc} implementation end.";
     std::fs::write(&path, text).unwrap();
     std::fs::write(dir.path().join("value.inc"), "type R=Byte;").unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -1084,13 +1115,12 @@ fn fix_i2_same_id_text_and_path_do_not_replay_a_revoked_legacy_route() {
     std::fs::write(&path, text).unwrap();
     std::fs::write(root.join("actual.inc"), "{body}").unwrap();
     std::os::unix::fs::symlink(root.join("actual.inc"), root.join("Link.inc")).unwrap();
-    let ctx = ProjectContext {
+    let ctx = ProjectContext::from_parts(ProjectContextParts {
         discovery_complete: true,
-        search_paths: vec![root.into()],
         search_path_entries: vec![ProjectPathEntry::legacy(root.into())],
         conditional_context: context(LayoutPlatform::Win32),
         ..Default::default()
-    };
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![],
@@ -1144,9 +1174,12 @@ fn fix_i3_versions_replace_temporary_projection_and_share_work() {
     let base = "unit T; interface {$I value.inc} implementation end.";
     std::fs::write(&path, base).unwrap();
     std::fs::write(dir.path().join("value.inc"), "{body}").unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],
@@ -1196,9 +1229,12 @@ fn fix_i3_repeated_project_outputs_are_admitted_not_free_replays() {
     let text = "unit T; interface {$I value.inc} implementation end.";
     std::fs::write(&path, text).unwrap();
     std::fs::write(dir.path().join("value.inc"), "type R=Byte;").unwrap();
-    let mut ctx =
-        ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default()).unwrap();
-    ctx.conditional_context = context(LayoutPlatform::Win32);
+    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+        .unwrap()
+        .context;
+    edit_context(&mut ctx, |p| {
+        p.conditional_context = context(LayoutPlatform::Win32)
+    });
     let mut resolver = UnitResolver::new(
         ctx,
         vec![dir.path().into()],

@@ -48,6 +48,13 @@ impl ProjectPathEntry {
         }
     }
 
+    pub fn configured(path: PathBuf) -> Self {
+        Self {
+            path,
+            provenance: ProjectPathProvenance::Configured,
+        }
+    }
+
     pub(super) fn resolved(path: PathBuf, resolved: &ResolvedPath, configured: bool) -> Self {
         let provenance = resolved.mapping.as_ref().map_or_else(
             || {

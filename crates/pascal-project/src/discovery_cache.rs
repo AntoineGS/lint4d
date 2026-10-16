@@ -1,4 +1,5 @@
 use super::authorization::extension_is;
+use super::context::SessionSelections;
 use super::selection::push_bounded_candidate;
 use super::*;
 
@@ -89,29 +90,18 @@ pub struct ProjectDiscoveryCacheStats {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProjectOptionsCacheKey {
     pub(super) project_file: Option<PathBuf>,
-    pub(super) installation_selections: Vec<(PathBuf, String)>,
+    pub(super) selections: SessionSelections,
     pub(super) build_config: Option<String>,
     pub(super) platform: Option<String>,
     pub(super) source_paths: Vec<String>,
     pub(super) conditional_context: ConditionalContext,
 }
 
-impl From<&ProjectOptions> for ProjectOptionsCacheKey {
-    fn from(options: &ProjectOptions) -> Self {
-        let mut installation_selections = options
-            .installation_selections
-            .iter()
-            .map(|(path, selection)| (path.clone(), selection.clone()))
-            .collect::<Vec<_>>();
-        installation_selections.sort_by(|left, right| {
-            left.0
-                .to_string_lossy()
-                .cmp(&right.0.to_string_lossy())
-                .then_with(|| left.1.cmp(&right.1))
-        });
+impl ProjectOptionsCacheKey {
+    pub(super) fn new(options: &ProjectOptions, project_file: &Path) -> Self {
         Self {
             project_file: options.project_file.clone(),
-            installation_selections,
+            selections: options.session_selections_for(project_file),
             build_config: options.build_config.clone(),
             platform: options.platform.clone(),
             source_paths: options.source_paths.clone(),
@@ -135,7 +125,7 @@ pub(super) struct ProjectContextBuildCacheKey {
 
 #[derive(Debug, Clone)]
 pub(super) struct CachedProjectContext {
-    pub(super) context: ProjectContext,
+    pub(super) project: DiscoveredProject,
     pub(super) observations: Vec<ProjectReadObservation>,
     pub(super) metadata_paths: Vec<PathBuf>,
     pub(super) metadata_observations: Vec<MetadataObservation>,
@@ -278,7 +268,7 @@ fn project_context_cache_is_current(
             return Ok(false);
         }
     }
-    for observation in &cached.context.metadata_observations {
+    for observation in &cached.project.observations.metadata_observations {
         check_project_scan_cancel(cancel)?;
         if let Some(work_budget) = work_budget {
             work_budget.check_cancelled()?;
@@ -892,7 +882,7 @@ mod tests {
 
         for expected in expected_paths {
             assert!(
-                context.search_paths.contains(&expected),
+                context.context.search_paths().contains(&expected),
                 "case-insensitive discovery should retain on-disk spelling for {}",
                 expected.display()
             );
@@ -932,8 +922,9 @@ mod tests {
             &options,
             &overrides,
         )
-        .expect("first discovery");
-        assert!(first.search_paths.contains(&requested));
+        .expect("first discovery")
+        .context;
+        assert!(first.search_paths().contains(&requested));
         fs::create_dir_all(&expected).expect("create directory between discovery calls");
 
         let second = ProjectContext::discover_with_overrides(
@@ -942,10 +933,11 @@ mod tests {
             &options,
             &overrides,
         )
-        .expect("second discovery");
+        .expect("second discovery")
+        .context;
 
         assert!(
-            second.search_paths.contains(&expected),
+            second.search_paths().contains(&expected),
             "a later discovery must observe newly-created entries and their on-disk spelling"
         );
     }

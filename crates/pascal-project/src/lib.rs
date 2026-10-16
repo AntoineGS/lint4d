@@ -99,11 +99,15 @@ pub use discovery_cache::{
     test_reset_project_directory_listing_counts, test_reset_project_discovery_counts,
 };
 mod discovery_cache;
+#[cfg(any(test, feature = "test-support"))]
+pub use context::ProjectContextParts;
 pub use context::{
     ProjectCandidateMembership, ProjectCandidates, ProjectContext, ProjectOptions,
     ProjectSelections,
 };
 mod context;
+pub use observations::{DiscoveredProject, ProjectObservations};
+mod observations;
 pub use selection::{
     discover, discover_with_selections,
     discover_with_selections_and_observations_with_cancel_and_overrides,

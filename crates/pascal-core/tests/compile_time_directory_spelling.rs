@@ -11,12 +11,14 @@ fn short_directory_names_retire_unused_filename_reservation() {
         std::fs::write(temp.path().join(format!("n{n}")), "").unwrap();
     }
     let context =
-        ProjectContext::discover(&root, &[temp.path().into()], &ProjectOptions::default()).unwrap();
+        ProjectContext::discover(&root, &[temp.path().into()], &ProjectOptions::default())
+            .unwrap()
+            .context;
     let entry = context.path_entry_for(temp.path()).unwrap();
     let request = DirectoryRequest {
         directory: temp.path(),
         entry: &entry,
-        read_policy: &context.read_policy,
+        read_policy: context.read_policy(),
     };
     let mut store = FilesystemSourceStore::new();
     let mut budget = CompileTimeBudget::new(
@@ -45,12 +47,14 @@ fn admitted_spelling_listing_keeps_symlink_names_without_following_targets() {
     let link = temp.path().join("Missing.inc");
     std::os::unix::fs::symlink("does-not-exist.inc", &link).unwrap();
     let context =
-        ProjectContext::discover(&root, &[temp.path().into()], &ProjectOptions::default()).unwrap();
+        ProjectContext::discover(&root, &[temp.path().into()], &ProjectOptions::default())
+            .unwrap()
+            .context;
     let entry = context.path_entry_for(temp.path()).unwrap();
     let request = DirectoryRequest {
         directory: temp.path(),
         entry: &entry,
-        read_policy: &context.read_policy,
+        read_policy: context.read_policy(),
     };
     let mut store = FilesystemSourceStore::new();
     let ordinary = store.list_directory(request, &NoCancellation).unwrap();

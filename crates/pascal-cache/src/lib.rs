@@ -8,6 +8,7 @@ mod artifact_key;
 mod context_key;
 mod digest;
 mod encoding;
+mod facts;
 mod member_key;
 mod path;
 mod project;
@@ -20,6 +21,10 @@ pub use artifact_key::{
 pub use context_key::ContextKey;
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
+pub use facts::{
+    DECLARATION_ROW, EncodedFacts, EncodedRow, FactDecodeError, FactDecoder, IMPORT_ROW,
+    INCLUDE_ROW, POSTING_ROW, SEGMENT_ROW, encode_facts, encoded_content_bytes,
+};
 pub use member_key::{ArtifactRef, MemberInputs, MemberKey};
 pub use source::{SourceContent, SourceIdentity};
 

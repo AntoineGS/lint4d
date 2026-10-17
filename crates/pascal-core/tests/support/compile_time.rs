@@ -98,6 +98,23 @@ impl Fixture {
     pub fn include(&mut self, name: &str, text: &str) {
         self.includes.insert(name.into(), loaded(name, text));
     }
+    /// An include read from disk under a configured search entry, the
+    /// revision a saved file has.
+    pub fn disk_include(&mut self, name: &str, text: &str) {
+        let mut source = loaded(name, text);
+        source.revision = SourceRevision::Disk {
+            stamp: pascal_project::ProjectReadStamp {
+                bytes: text.len() as u64,
+                modified: None,
+                is_dir: false,
+                is_symlink: false,
+            },
+            content_hash: pascal_project::content_hash_bytes(text.as_bytes()),
+            read_policy: Default::default(),
+            path_entry: pascal_project::ProjectPathEntry::configured("/fixture".into()),
+        };
+        self.includes.insert(name.into(), source);
+    }
     pub fn unit(&mut self, name: &str, text: &str, context: ConditionalContext) {
         self.units.insert(
             name.into(),

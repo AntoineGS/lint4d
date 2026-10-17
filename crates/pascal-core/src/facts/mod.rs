@@ -7,8 +7,13 @@
 //! lexical candidates, never proven references.
 
 mod lexical;
+mod slots;
 
 pub use lexical::{IdentifierRuns, identifier_runs, is_identifier_byte};
+pub use slots::{
+    IncludeSlot, IncludeSlotOutcome, NotPersistable, SlotError, UnresolvedInclude, decoded_text,
+    include_slots, session_persistability,
+};
 
 use crate::ImportSection;
 use std::fmt;

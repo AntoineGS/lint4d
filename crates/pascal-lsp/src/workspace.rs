@@ -9906,14 +9906,19 @@ impl Workspace {
             }
             return matches.map(|_| None);
         }
-        self.select_document_context_with_pruning(
+        if let Err(error) = self.select_document_context_with_pruning(
             uri,
             &owner.key,
             owner.origin,
             cancel,
             budget,
             !defer_context_pruning,
-        )?;
+        ) {
+            if !installed {
+                self.contexts.remove(&owner.key);
+            }
+            return Err(error);
+        }
         Ok(Some(owner.key.clone()))
     }
 
@@ -18508,15 +18513,59 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_automatic_owner_reuse_installs_nothing() {
+    fn automatic_owner_reuse_interrupted_at_any_point_installs_nothing() {
         let (_temp, main, uri, key) = automatic_owner_fixture();
-        let mut worker = worker_view(&main);
-        let cancel = AtomicBool::new(true);
+        for cancelling in [false, true] {
+            let expected = if cancelling {
+                super::CANCELLATION_MESSAGE
+            } else {
+                super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
+            };
+            let mut errors = 0;
+            let mut first_ok = None;
+            for step in 0..10_000 {
+                let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+                if cancelling {
+                    budget.cancel_after_path_visits(step);
+                } else {
+                    budget.set_path_visit_limit(step);
+                }
+                let mut worker = worker_view(&main);
 
-        let result = worker.context_for_uri_with_cancel(&uri, Some(&cancel));
+                pascal_project::test_reset_project_discovery_counts();
+                let result =
+                    worker.context_for_uri_with_cancel_and_budget(&uri, None, Some(&budget));
 
-        assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
-        assert!(!worker.contexts.contains_key(&key));
+                assert_eq!(
+                    pascal_project::test_project_discovery_counts(),
+                    (0, 0),
+                    "step {step} cancelling={cancelling}"
+                );
+                match result {
+                    Ok(reused) => {
+                        assert_eq!(reused, key, "step {step} cancelling={cancelling}");
+                        first_ok = Some(step);
+                        break;
+                    }
+                    Err(error) => {
+                        assert_eq!(error, expected, "step {step}");
+                        assert!(
+                            !worker.contexts.contains_key(&key),
+                            "an interrupted reuse left the owner context installed at step {step} cancelling={cancelling}"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+            let first_ok = first_ok.expect("the sweep must reach a successful call");
+            eprintln!(
+                "sweep cancelling={cancelling}: {errors} errors, first Ok at step {first_ok}"
+            );
+            assert!(
+                errors > 3,
+                "the sweep must interrupt inside the call: {errors}"
+            );
+        }
     }
 
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.

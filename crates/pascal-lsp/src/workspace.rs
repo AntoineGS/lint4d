@@ -18373,6 +18373,152 @@ mod tests {
         assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
     }
 
+    #[test]
+    fn analysis_workspace_rediscovers_an_automatic_owner_after_a_same_size_descriptor_edit() {
+        let (temp, main, uri, _key) = automatic_owner_fixture();
+        let project = temp.path().join("App.dproj");
+        let modified = fs::metadata(&project).unwrap().modified().unwrap();
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>EDITED</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&project)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let mut worker = worker_view(&main);
+
+        pascal_project::test_reset_project_discovery_counts();
+        let key = worker.context_for_uri(&uri).expect("context");
+
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+        let defines = worker.contexts.get(&key).unwrap().context.defines();
+        assert!(
+            defines.iter().any(|define| define == "EDITED"),
+            "{defines:?}"
+        );
+    }
+
+    #[test]
+    fn analysis_workspace_rediscovers_an_automatic_owner_when_a_candidate_appears() {
+        let (temp, main, uri, _key) = automatic_owner_fixture();
+        fs::write(
+            temp.path().join("Other.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let mut worker = worker_view(&main);
+
+        pascal_project::test_reset_project_discovery_counts();
+        let reused = worker.context_for_uri(&uri);
+
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+        let mut fresh =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        // Two candidates may make discovery refuse; either way both must agree.
+        assert_eq!(
+            reused,
+            fresh.context_for_uri(&uri),
+            "the result must equal a fresh discovery"
+        );
+    }
+
+    #[test]
+    fn analysis_workspace_rediscovers_an_automatic_owner_once_a_project_is_selected() {
+        let (temp, main, uri, key) = automatic_owner_fixture();
+        let mut input = main.analysis_input();
+        input
+            .project_selections
+            .insert(temp.path().to_path_buf(), temp.path().join("App.dproj"));
+        let mut worker = Workspace::from_analysis_input(&input);
+
+        pascal_project::test_reset_project_discovery_counts();
+        let selected = worker.context_for_uri(&uri).expect("context");
+
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+        assert_ne!(selected, key);
+        assert!(selected.selection_scope.is_some(), "{selected:?}");
+    }
+
+    #[test]
+    fn analysis_workspace_rediscovers_when_the_owner_did_not_record_the_documents_directories() {
+        let (temp, main, uri, _key) = automatic_owner_fixture();
+        let nested = temp.path().join("Nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Unit.pas"),
+            "unit Unit;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let nested_uri = Url::from_file_path(nested.join("Unit.pas")).unwrap();
+        let mut input = main.analysis_input();
+        let owner = input.document_owners.get(&uri).cloned().expect("owner");
+        assert!(
+            !owner
+                .state
+                .project_candidate_memberships
+                .keys()
+                .any(|directory| super::package_paths_equal(directory, &nested)),
+            "the owner state must not already know Nested"
+        );
+        input.document_owners.insert(nested_uri.clone(), owner);
+        let mut worker = Workspace::from_analysis_input(&input);
+
+        pascal_project::test_reset_project_discovery_counts();
+        worker.context_for_uri(&nested_uri).expect("context");
+
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    #[test]
+    fn analysis_workspace_rediscovers_an_automatic_owner_that_needs_revalidation() {
+        let (_temp, main, uri, _key) = automatic_owner_fixture();
+        let mut input = main.analysis_input();
+        input
+            .document_owners
+            .get_mut(&uri)
+            .expect("owner")
+            .needs_revalidation = true;
+        let mut worker = Workspace::from_analysis_input(&input);
+
+        pascal_project::test_reset_project_discovery_counts();
+        worker.context_for_uri(&uri).expect("context");
+
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    #[test]
+    fn analysis_workspace_reuses_one_installed_context_for_two_documents_of_a_project() {
+        let (temp, mut main, uri, key) = automatic_owner_fixture();
+        let second_source = "unit Second;\ninterface\nimplementation\nend.\n";
+        fs::write(temp.path().join("Second.pas"), second_source).unwrap();
+        let second = Url::from_file_path(temp.path().join("Second.pas")).unwrap();
+        main.open_document(second.clone(), second_source.to_string(), 1)
+            .expect("open Second.pas");
+        let mut worker = worker_view(&main);
+
+        pascal_project::test_reset_project_discovery_counts();
+        assert_eq!(worker.context_for_uri(&uri).expect("first"), key);
+        assert_eq!(worker.context_for_uri(&second).expect("second"), key);
+
+        assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    #[test]
+    fn cancelled_automatic_owner_reuse_installs_nothing() {
+        let (_temp, main, uri, key) = automatic_owner_fixture();
+        let mut worker = worker_view(&main);
+        let cancel = AtomicBool::new(true);
+
+        let result = worker.context_for_uri_with_cancel(&uri, Some(&cancel));
+
+        assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
+        assert!(!worker.contexts.contains_key(&key));
+    }
+
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
     fn interface_entry(
         workspace: &Workspace,

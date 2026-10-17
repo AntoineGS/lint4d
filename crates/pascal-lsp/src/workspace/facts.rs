@@ -116,6 +116,9 @@ mod tests {
     pub(super) const CONDITIONAL: &[u8] = b"unit Cond;\ninterface\n{$IFDEF MAYBE}\nconst Maybe = 1;\n{$ENDIF}\n{$IF False}\nconst Never = 2;\n{$ENDIF}\nconst Always = 3;\nimplementation\nend.\n";
     pub(super) const LATIN: &[u8] = b"unit Latin;\ninterface\n{ caf\xe9 cr\xe8me }\nconst Greeting = 'd\xe9j\xe0';\nconst After = 1;\nimplementation\nend.\n";
 
+    pub(super) const BROKEN: &[u8] =
+        b"unit Broken;\ninterface\nprocedure Bad(;\nconst After = 1;\nimplementation\nend.\n";
+
     pub(super) fn includes() -> Indexed {
         index(
             &[
@@ -309,5 +312,226 @@ mod tests {
             vec![PostingActivity::Inactive]
         );
         assert!(facts.coverage.contains(&CoverageReason::ConditionalUnknown));
+    }
+
+    #[cfg(unix)]
+    mod persisted {
+        use super::*;
+        use pascal_cache::{
+            ArtifactKeyRef, Bypass, ContextKey, Digest, ExpandedArtifactKey, LocalArtifactKey,
+            Lookup, Namespace, Published, SourceContent, Store, StoreLimits, encode_facts,
+        };
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        fn private_dir() -> tempfile::TempDir {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), PermissionsExt::from_mode(0o700)).unwrap();
+            directory
+        }
+
+        fn store(directory: &Path) -> Store {
+            Store::open(
+                directory,
+                &Namespace::new(Digest::from_bytes([9; 32])),
+                StoreLimits::default(),
+            )
+            .unwrap()
+        }
+
+        struct Keys {
+            local: LocalArtifactKey,
+            expanded: Option<ExpandedArtifactKey>,
+        }
+
+        impl Keys {
+            fn artifact(&self) -> ArtifactKeyRef<'_> {
+                match &self.expanded {
+                    Some(expanded) => ArtifactKeyRef::expanded(expanded, &self.local).unwrap(),
+                    None => ArtifactKeyRef::local(&self.local),
+                }
+            }
+        }
+
+        /// The keys of `name`'s facts. Built from the context the parse
+        /// used, not `LocalArtifactKey::for_source`.
+        fn keys(indexed: &Indexed, name: &str, source: &SourceFacts) -> Keys {
+            let bytes = std::fs::read(indexed.root.join(name)).unwrap();
+            let context = &source.extracted.conditional_context;
+            let local =
+                LocalArtifactKey::new(&SourceContent::from_bytes(&bytes), context, source.origin);
+            let parsed = indexed
+                .workspace
+                .index
+                .parsed_document(&indexed.uri(name))
+                .unwrap();
+            let expanded = parsed
+                .compile_time_session()
+                .map(|session| include_slots(session).unwrap())
+                .filter(|slots| !slots.is_empty())
+                .map(|slots| ExpandedArtifactKey::from_slots(&local, context, &slots).unwrap());
+            Keys { local, expanded }
+        }
+
+        fn load(store: &Store, keys: &Keys) -> Lookup<ArtifactFacts> {
+            store
+                .load_facts(keys.artifact(), &mut FactBudget::new(1 << 26))
+                .unwrap()
+        }
+
+        #[test]
+        fn facts_round_trip_through_the_store_for_every_fixture() {
+            let directory = private_dir();
+            let store = store(directory.path());
+            type Files<'a> = &'a [(&'a str, &'a [u8])];
+            let fixtures: [(Files, &str, bool); 4] = [
+                (&[("Cond.pas", CONDITIONAL)], "Cond.pas", false),
+                (&[("Broken.pas", BROKEN)], "Broken.pas", false),
+                (&[("Latin.pas", LATIN)], "Latin.pas", false),
+                (
+                    &[
+                        ("Main.pas", MAIN.as_bytes()),
+                        ("Types.inc", TYPES.as_bytes()),
+                        ("Nested.inc", NESTED.as_bytes()),
+                    ],
+                    "Main.pas",
+                    true,
+                ),
+            ];
+            for (files, main, expanded) in fixtures {
+                let indexed = index(files, &[main]);
+                let source = indexed.facts(main);
+                assert_eq!(source.extracted.persistable, Ok(()), "{main}");
+                let keys = keys(&indexed, main, &source);
+                assert_eq!(keys.expanded.is_some(), expanded, "{main}");
+                assert_eq!(
+                    store.publish_facts(keys.artifact(), &source.extracted.facts),
+                    Ok(Published::Inserted),
+                    "{main}"
+                );
+                // Equality covers certainty, coverage and mappings: nothing
+                // is upgraded to proof on the way through the store.
+                assert_eq!(
+                    load(&store, &keys),
+                    Lookup::Hit(source.extracted.facts.clone()),
+                    "{main}"
+                );
+            }
+        }
+
+        #[test]
+        fn identical_local_inputs_from_two_projects_share_one_artifact_without_their_paths() {
+            const SHARED: &[u8] = b"unit Shared;\ninterface\n{$IFDEF FEATURE}\nconst Feature = 1;\n{$ENDIF}\nconst Plain = 2;\nimplementation\nend.\n";
+            const LOOSE: &[u8] = b"const Loose = 1;\n";
+            const IMPORTER: &[u8] = b"unit Main;\ninterface\nuses Shared;\nimplementation\nend.\n";
+            let dproj = "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>";
+            let a = index(
+                &[
+                    ("App.dproj", dproj.as_bytes()),
+                    ("Main.pas", IMPORTER),
+                    ("Shared.pas", SHARED),
+                    ("Snippet.pas", LOOSE),
+                ],
+                &["Shared.pas", "Snippet.pas"],
+            );
+            let b = index(
+                &[
+                    ("Other.dproj", dproj.as_bytes()),
+                    ("Main.pas", IMPORTER),
+                    ("Shared.pas", SHARED),
+                    ("Fragment.pas", LOOSE),
+                ],
+                &["Shared.pas", "Fragment.pas"],
+            );
+            let context = |indexed: &Indexed, name: &str| {
+                let key = &indexed.workspace.document_contexts[&indexed.uri(name)];
+                ContextKey::new(&indexed.workspace.contexts[key].context)
+            };
+            assert_ne!(
+                context(&a, "Shared.pas"),
+                context(&b, "Shared.pas"),
+                "two distinct project contexts"
+            );
+            let directory = private_dir();
+            let (store_a, store_b) = (store(directory.path()), store(directory.path()));
+            for (name_a, name_b) in [
+                ("Shared.pas", "Shared.pas"),
+                ("Snippet.pas", "Fragment.pas"),
+            ] {
+                let (facts_a, facts_b) = (a.facts(name_a), b.facts(name_b));
+                let (keys_a, keys_b) = (keys(&a, name_a, &facts_a), keys(&b, name_b, &facts_b));
+                assert_eq!(keys_a.local, keys_b.local, "{name_a}");
+                assert!(keys_a.expanded.is_none() && keys_b.expanded.is_none());
+                assert_eq!(facts_a.extracted.facts, facts_b.extracted.facts, "{name_a}");
+                assert_eq!(
+                    store_a.publish_facts(keys_a.artifact(), &facts_a.extracted.facts),
+                    Ok(Published::Inserted)
+                );
+                assert_eq!(
+                    store_b.publish_facts(keys_b.artifact(), &facts_b.extracted.facts),
+                    Ok(Published::AlreadyPresent)
+                );
+                assert_eq!(
+                    load(&store_b, &keys_b),
+                    Lookup::Hit(facts_a.extracted.facts.clone())
+                );
+                let encoded = encode_facts(&facts_a.extracted.facts).unwrap();
+                let mut bytes = encoded.supplemental.clone();
+                for row in &encoded.rows {
+                    bytes.extend(row.index_key.iter().flatten());
+                    bytes.extend(&row.payload);
+                }
+                for needle in [
+                    a.root.as_os_str().as_bytes(),
+                    b.root.as_os_str().as_bytes(),
+                    b"snippet",
+                    b"Snippet",
+                    b"fragment",
+                    b"Fragment",
+                    b".dproj",
+                ] {
+                    assert!(
+                        !bytes.windows(needle.len()).any(|window| window == needle),
+                        "{name_a}'s artifact holds {:?}",
+                        String::from_utf8_lossy(needle)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn facts_outlive_their_syntax_trees_and_are_admitted_before_retention() {
+            fn owned<T: Send + Sync + 'static>() {}
+            owned::<ArtifactFacts>();
+            let indexed = includes();
+            let mut small = FactBudget::new(512);
+            assert!(matches!(
+                indexed.workspace.source_facts(
+                    &indexed.uri("Main.pas"),
+                    &mut small,
+                    &AtomicBool::new(false)
+                ),
+                Err(FactError::Budget { limit: 512 })
+            ));
+            assert!(small.used() <= 512);
+            let source = indexed.facts("Main.pas");
+            let keys = keys(&indexed, "Main.pas", &source);
+            // Every parse and syntax tree of the workspace goes here.
+            drop(indexed);
+            let directory = private_dir();
+            let store = store(directory.path());
+            assert_eq!(
+                store.publish_facts(keys.artifact(), &source.extracted.facts),
+                Ok(Published::Inserted)
+            );
+            let mut tight = FactBudget::new(64);
+            assert_eq!(
+                store.load_facts(keys.artifact(), &mut tight),
+                Err(Bypass::FactBudget)
+            );
+            assert_eq!(tight.used(), 0);
+            assert_eq!(load(&store, &keys), Lookup::Hit(source.extracted.facts));
+        }
     }
 }

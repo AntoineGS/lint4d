@@ -26,6 +26,7 @@ fn slots_follow_expansion_order_with_repetition_nesting_and_unresolved_barriers(
     );
     f.disk_include("a.inc", "{$I b.inc} const A = 1;");
     f.disk_include("b.inc", "const B = 2;");
+    f.disk_root();
     let analysis = f.analyze().unwrap();
     let slots = include_slots(&analysis).unwrap();
     assert_eq!(
@@ -69,14 +70,17 @@ fn only_unresolved(
     text: &str,
     name: &str,
     failure: Resolution<pascal_core::LoadedSource>,
-) -> UnresolvedInclude {
+) -> (UnresolvedInclude, Result<(), NotPersistable>) {
     let mut f = Fixture::new(text, context(LayoutPlatform::Win32));
     f.fail_include(name, failure);
+    f.disk_root();
     let analysis = f.analyze().unwrap();
     let slots = include_slots(&analysis).unwrap();
     assert_eq!(slots.len(), 1);
     match &slots[0].outcome {
-        IncludeSlotOutcome::Unresolved(reason) => reason.clone(),
+        IncludeSlotOutcome::Unresolved(reason) => {
+            (reason.clone(), session_persistability(&analysis, &slots))
+        }
         IncludeSlotOutcome::Expanded { .. } => panic!("{:?} must be unresolved", slots[0]),
     }
 }
@@ -98,9 +102,12 @@ fn ambiguous_and_incomplete_includes_keep_typed_candidates_without_resolver_text
                 ],
             },
         ),
-        UnresolvedInclude::Ambiguous {
-            candidates: vec!["/fixture/x/two.inc".into(), "/fixture/y/two.inc".into()],
-        }
+        (
+            UnresolvedInclude::Ambiguous {
+                candidates: vec!["/fixture/x/two.inc".into(), "/fixture/y/two.inc".into()],
+            },
+            Ok(())
+        )
     );
     assert_eq!(
         only_unresolved(
@@ -111,9 +118,13 @@ fn ambiguous_and_incomplete_includes_keep_typed_candidates_without_resolver_text
                 candidates: vec![candidate("/fixture/x/part.inc")],
             },
         ),
-        UnresolvedInclude::Incomplete {
-            candidates: vec!["/fixture/x/part.inc".into()],
-        }
+        (
+            UnresolvedInclude::Incomplete {
+                candidates: vec!["/fixture/x/part.inc".into()],
+            },
+            // An IO failure is retried, never stored (spec §5).
+            Err(NotPersistable::Transient)
+        )
     );
 }
 
@@ -124,11 +135,27 @@ fn overlay_includes_are_not_persistable() {
         context(LayoutPlatform::Win32),
     );
     f.include("a.inc", "const A = 1;");
+    f.disk_root();
     let analysis = f.analyze().unwrap();
     let slots = include_slots(&analysis).unwrap();
     assert_eq!(
         session_persistability(&analysis, &slots),
         Err(NotPersistable::OverlayInclude { slot: 1 })
+    );
+}
+
+#[test]
+fn an_overlay_root_is_not_persistable() {
+    let mut f = Fixture::new(
+        "unit T; interface {$I a.inc} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.disk_include("a.inc", "const A = 1;");
+    let analysis = f.analyze().unwrap();
+    let slots = include_slots(&analysis).unwrap();
+    assert_eq!(
+        session_persistability(&analysis, &slots),
+        Err(NotPersistable::OverlayRoot)
     );
 }
 
@@ -143,6 +170,7 @@ fn provider_lookups_are_not_persistable() {
         "unit Other; interface const Early=SizeOf(Integer)=4; implementation end.",
         context(LayoutPlatform::Win32),
     );
+    f.disk_root();
     let analysis = f.analyze().unwrap();
     assert!(analysis.provider_queries > 0);
     assert_eq!(
@@ -154,6 +182,7 @@ fn provider_lookups_are_not_persistable() {
         "unit T; interface {$IFDEF X}{$ENDIF} implementation end.",
         context(LayoutPlatform::Win32),
     );
+    f.disk_root();
     let analysis = f.analyze().unwrap();
     assert_eq!(analysis.provider_queries, 0);
     assert_eq!(session_persistability(&analysis, &[]), Ok(()));

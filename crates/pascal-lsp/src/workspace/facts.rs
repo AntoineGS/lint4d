@@ -5,7 +5,7 @@
 use super::Workspace;
 use crate::navigation::{ExtractedFacts, extract_facts};
 use lsp_types::Url;
-use pascal_core::facts::{FactBudget, FactError};
+use pascal_core::facts::{FactBudget, FactError, NotPersistable};
 use pascal_project::SourceOrigin;
 use std::sync::atomic::AtomicBool;
 
@@ -15,6 +15,11 @@ pub(crate) struct SourceFacts {
     /// The source's origin in its project context: the local key's last
     /// input.
     pub(crate) origin: SourceOrigin,
+    /// The content hash the workspace recorded for the parsed root, which
+    /// lets a producer verify the bytes it keys are the bytes parsed. For a
+    /// saved source it is `pascal_project::content_hash_bytes` of the raw
+    /// file bytes; an open document's is its buffer's overlay hash.
+    pub(crate) root_content_hash: Option<u64>,
 }
 
 impl Workspace {
@@ -36,9 +41,21 @@ impl Workspace {
             .ok_or(FactError::NotIndexed)?;
         let path = uri.to_file_path().map_err(|()| FactError::NotIndexed)?;
         let expansion = self.expansions.get(uri).map(|record| &record.expanded);
+        let mut extracted = extract_facts(&parsed, expansion, budget, cancel)?;
+        // A root without a session carries no revision, so the editor state
+        // decides; a transient failure still comes first.
+        if extracted.persistable != Err(NotPersistable::Transient)
+            && (self.is_open(uri)
+                || self
+                    .overlay_inputs()
+                    .contains_key(&super::canonical_file_uri(uri)))
+        {
+            extracted.persistable = Err(NotPersistable::OverlayRoot);
+        }
         Ok(SourceFacts {
-            extracted: extract_facts(&parsed, expansion, budget, cancel)?,
+            extracted,
             origin: state.context.source_origin(&path),
+            root_content_hash: self.indexed_content_hashes.get(uri).copied(),
         })
     }
 }
@@ -58,16 +75,33 @@ mod tests {
 
     /// Index `open` in a worker over a fresh directory holding `files`.
     pub(super) fn index(files: &[(&str, &[u8])], open: &[&str]) -> Indexed {
+        index_with_buffers(files, &[], open)
+    }
+
+    /// `index`, with `buffers` open in the editor over their saved files.
+    pub(super) fn index_with_buffers(
+        files: &[(&str, &[u8])],
+        buffers: &[(&str, &str)],
+        open: &[&str],
+    ) -> Indexed {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         for (name, bytes) in files {
             std::fs::write(root.join(name), bytes).unwrap();
         }
-        let main = Workspace::with_override_session(
+        let mut main = Workspace::with_override_session(
             vec![root.clone()],
             Default::default(),
             OverrideSession::new(None),
         );
+        for (name, text) in buffers {
+            main.open_document(
+                Url::from_file_path(root.join(name)).unwrap(),
+                (*text).to_owned(),
+                1,
+            )
+            .unwrap();
+        }
         let mut workspace = Workspace::from_analysis_input(&main.analysis_input());
         for name in open {
             let uri = Url::from_file_path(root.join(name)).unwrap();
@@ -212,6 +246,12 @@ mod tests {
             .index
             .parsed_document(&indexed.uri("Main.pas"))
             .unwrap();
+        let root = &parsed.compile_time_session().unwrap().occurrences[0].source;
+        assert!(
+            matches!(root.revision, pascal_core::SourceRevision::Disk { .. }),
+            "a saved root is read from disk: {:?}",
+            root.revision
+        );
         assert_eq!(
             crate::navigation::extract_facts(
                 &parsed,
@@ -314,6 +354,60 @@ mod tests {
         assert!(facts.coverage.contains(&CoverageReason::ConditionalUnknown));
     }
 
+    #[test]
+    fn a_root_open_in_the_editor_is_not_persistable() {
+        const SAVED: &[u8] = b"unit Plain;\ninterface\nconst A = 1;\nimplementation\nend.\n";
+        const EDITED: &str = "unit Plain;\ninterface\nconst B = 2;\nimplementation\nend.\n";
+        const MAIN_EDITED: &str =
+            "unit Main;\ninterface\n{$I Types.inc}\nconst Edited = 1;\nimplementation\nend.\n";
+        let indexed = index_with_buffers(
+            &[
+                ("Plain.pas", SAVED),
+                ("Main.pas", MAIN.as_bytes()),
+                ("Types.inc", TYPES.as_bytes()),
+                ("Nested.inc", NESTED.as_bytes()),
+            ],
+            &[("Plain.pas", EDITED), ("Main.pas", MAIN_EDITED)],
+            &["Plain.pas", "Main.pas"],
+        );
+        // Without directives the parse has no session; with includes it has
+        // one whose root is the buffer.
+        for (name, session) in [("Plain.pas", false), ("Main.pas", true)] {
+            let parsed = indexed
+                .workspace
+                .index
+                .parsed_document(&indexed.uri(name))
+                .unwrap();
+            assert_eq!(parsed.compile_time_session().is_some(), session, "{name}");
+            if session {
+                let own = crate::navigation::extract_facts(
+                    &parsed,
+                    Some(&indexed.workspace.expansions[&indexed.uri(name)].expanded),
+                    &mut FactBudget::new(1 << 26),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(
+                    own.persistable,
+                    Err(NotPersistable::OverlayRoot),
+                    "the session's own root revision is the buffer's"
+                );
+            }
+            let source = indexed.facts(name);
+            assert_eq!(
+                source.extracted.persistable,
+                Err(NotPersistable::OverlayRoot),
+                "{name}"
+            );
+            let saved = std::fs::read(indexed.root.join(name)).unwrap();
+            assert_ne!(
+                source.root_content_hash,
+                Some(pascal_project::content_hash_bytes(&saved)),
+                "{name}: the saved bytes are not what was parsed"
+            );
+        }
+    }
+
     #[cfg(unix)]
     mod persisted {
         use super::*;
@@ -358,6 +452,11 @@ mod tests {
         /// used, not `LocalArtifactKey::for_source`.
         fn keys(indexed: &Indexed, name: &str, source: &SourceFacts) -> Keys {
             let bytes = std::fs::read(indexed.root.join(name)).unwrap();
+            assert_eq!(
+                source.root_content_hash,
+                Some(pascal_project::content_hash_bytes(&bytes)),
+                "{name}: the keyed bytes are the parsed bytes"
+            );
             let context = &source.extracted.conditional_context;
             let local =
                 LocalArtifactKey::new(&SourceContent::from_bytes(&bytes), context, source.origin);

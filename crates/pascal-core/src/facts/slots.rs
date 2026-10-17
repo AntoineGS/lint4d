@@ -57,6 +57,8 @@ pub enum NotPersistable {
     /// Compile-time evaluation consulted unit providers, which no artifact
     /// key holds yet (`l4d-zf1b.5`).
     ProviderDependent,
+    /// The root came from an unsaved editor buffer (spec §4.4).
+    OverlayRoot,
     /// An include came from an unsaved editor buffer (spec §4.4).
     OverlayInclude { slot: u32 },
 }
@@ -171,8 +173,20 @@ pub fn session_persistability(
             reason,
             IncompleteReason::Cancelled | IncompleteReason::Limit { .. }
         )
+    }) || slots.iter().any(|slot| {
+        matches!(
+            slot.outcome,
+            IncludeSlotOutcome::Unresolved(UnresolvedInclude::Incomplete { .. })
+        )
     }) {
         return Err(NotPersistable::Transient);
+    }
+    if output
+        .occurrences
+        .first()
+        .is_some_and(|root| matches!(root.source.revision, SourceRevision::Overlay { .. }))
+    {
+        return Err(NotPersistable::OverlayRoot);
     }
     if output.provider_queries > 0 {
         return Err(NotPersistable::ProviderDependent);

@@ -357,6 +357,31 @@ fn malformed_rows_are_refused() {
         &encoded.supplemental,
         "parent out of range",
     );
+    let mut cycle = facts.clone();
+    cycle.declarations[1].parent = Some(2);
+    cycle.declarations[2].parent = Some(1);
+    let encoded = encode_facts(&cycle).unwrap();
+    refused(stored(&encoded), &encoded.supplemental, "parent cycle");
+    let mut unflagged = facts.clone();
+    unflagged
+        .coverage
+        .retain(|reason| *reason != CoverageReason::UnresolvedInclude);
+    let encoded = encode_facts(&unflagged).unwrap();
+    refused(
+        stored(&encoded),
+        &encoded.supplemental,
+        "unresolved include without coverage",
+    );
+    let mut unflagged = facts.clone();
+    unflagged
+        .coverage
+        .retain(|reason| *reason != CoverageReason::UnmappedLocation);
+    let encoded = encode_facts(&unflagged).unwrap();
+    refused(
+        stored(&encoded),
+        &encoded.supplemental,
+        "expanded location without coverage",
+    );
     let mut uncovered = facts.clone();
     uncovered.segments.pop();
     let encoded = encode_facts(&uncovered).unwrap();

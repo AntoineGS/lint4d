@@ -452,10 +452,32 @@ fn validate(facts: &ArtifactFacts) -> Decoded<()> {
         FactLocation::Source { slot: index, range } => within(range, slot(index)?),
         FactLocation::Expanded { range } => within(range, facts.expanded_length),
     };
+    let covered = |reason: CoverageReason| facts.coverage.contains(&reason);
+    if !covered(CoverageReason::UnresolvedInclude)
+        && facts
+            .includes
+            .iter()
+            .any(|include| include.expansion == IncludeExpansion::Unresolved)
+    {
+        return malformed("unresolved include is not in the coverage");
+    }
+    let expanded = |location: &FactLocation| matches!(location, FactLocation::Expanded { .. });
+    if !covered(CoverageReason::UnmappedLocation)
+        && (facts
+            .declarations
+            .iter()
+            .any(|declaration| expanded(&declaration.location))
+            || facts
+                .imports
+                .iter()
+                .any(|import| expanded(&import.location)))
+    {
+        return malformed("expanded location is not in the coverage");
+    }
     for declaration in &facts.declarations {
         located(&declaration.location)?;
         if let Some(parent) = declaration.parent
-            && (parent == declaration.id || parent as usize >= facts.declarations.len())
+            && parent >= declaration.id
         {
             return malformed("invalid declaration parent");
         }

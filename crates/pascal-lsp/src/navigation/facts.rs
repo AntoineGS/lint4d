@@ -50,6 +50,19 @@ pub(crate) fn extract_facts(
         Some(session) => include_slots(session).map_err(|_| FactError::Inconsistent)?,
         None => Vec::new(),
     };
+    // Occurrence ids repeat across sessions, so the source map must be the
+    // one this parse was built from.
+    if !slots.is_empty()
+        && let Some(expansion) = expansion
+        && (!expansion
+            .session
+            .as_deref()
+            .zip(parsed.compile_time_session())
+            .is_some_and(|(own, parsed)| std::ptr::eq(own, parsed))
+            || expansion.text() != parsed.source.as_ref())
+    {
+        return Err(FactError::Inconsistent);
+    }
     let map = SlotMap::new(session, &slots, expansion)?;
     let texts = slot_texts(parsed, session, &slots)?;
     let mut facts = ArtifactFacts {

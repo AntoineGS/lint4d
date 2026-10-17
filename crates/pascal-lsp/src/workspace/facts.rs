@@ -265,6 +265,32 @@ mod tests {
     }
 
     #[test]
+    fn a_source_map_from_another_session_is_inconsistent() {
+        let (a, b) = (includes(), includes());
+        let parsed = a
+            .workspace
+            .index
+            .parsed_document(&a.uri("Main.pas"))
+            .unwrap();
+        let foreign = &b.workspace.expansions[&b.uri("Main.pas")].expanded;
+        assert_eq!(
+            foreign.text(),
+            parsed.source_text().as_ref(),
+            "same text, other session"
+        );
+        assert_eq!(
+            crate::navigation::extract_facts(
+                &parsed,
+                Some(foreign),
+                &mut FactBudget::new(1 << 26),
+                &AtomicBool::new(false)
+            )
+            .unwrap_err(),
+            FactError::Inconsistent
+        );
+    }
+
+    #[test]
     fn non_utf8_sources_are_located_in_decoded_coordinates() {
         let indexed = index(&[("Latin.pas", LATIN)], &["Latin.pas"]);
         let facts = indexed.facts("Latin.pas").extracted.facts;

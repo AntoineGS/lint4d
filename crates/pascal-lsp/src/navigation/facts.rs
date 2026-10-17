@@ -373,11 +373,12 @@ fn imports(
             .get(span.clone())
             .ok_or(FactError::Inconsistent)?;
         budget.charge(size_of::<ImportFact>() + import.name.len() + display.len())?;
+        // The postings' predicate: any overlap with an unknown region.
         let unknown = parsed
             .conditionals
             .unknown_spans
             .iter()
-            .any(|unknown| unknown.start <= span.start && span.end <= unknown.end);
+            .any(|unknown| unknown.start < span.end && span.start < unknown.end);
         facts.imports.push(ImportFact {
             id: length(facts.imports.len())?,
             name: import.name.clone(),
@@ -776,6 +777,34 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].name < pair[1].name)
         );
+    }
+
+    #[test]
+    fn an_import_overlapping_an_unknown_region_is_unknown() {
+        let source = "unit U;\ninterface\nuses Vendor.{$IFDEF MAYBE}Sub{$ENDIF}, Plain;\nimplementation\nend.\n";
+        let parsed = parse(source, &ConditionalContext::default());
+        let facts = extract(&parsed);
+        let imports: Vec<_> = facts
+            .imports
+            .iter()
+            .map(|import| (import.name.as_str(), import.certainty.activity))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                ("vendor.sub", Activity::Unknown),
+                ("plain", Activity::Active)
+            ]
+        );
+        let unknown = &parsed.conditionals.unknown_spans;
+        let span = parsed.imports[0].span;
+        assert!(
+            !unknown
+                .iter()
+                .any(|u| u.start <= span.start && span.end <= u.end),
+            "the fixture must overlap without containment: {span:?} {unknown:?}"
+        );
+        assert_eq!(activities(&facts, "sub"), vec![PostingActivity::Unknown]);
     }
 
     #[test]

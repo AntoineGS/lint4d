@@ -7,7 +7,7 @@
 
 use super::{
     Origin as SymbolOrigin, ParsedDocument, ROOT_SCOPE, Region as SymbolRegion, Span, Symbol,
-    SymbolKind, Visibility as SymbolVisibility,
+    SymbolKind, Visibility as SymbolVisibility, canonical_path,
 };
 use crate::include_expansion::{ExpandedSource, SegmentSource};
 use pascal_core::compile_time::CompileTimeOutput;
@@ -225,6 +225,10 @@ fn declared(symbol: &Symbol) -> Option<DeclarationKind> {
     {
         return None;
     }
+    // A path-inferred fallback unit name is not a declaration fact (spec §4.1).
+    if symbol.kind == SymbolKind::Unit && symbol.key != written_unit_name(&symbol.name) {
+        return None;
+    }
     Some(match symbol.kind {
         SymbolKind::Unit => DeclarationKind::Unit,
         SymbolKind::Type => DeclarationKind::Type,
@@ -236,6 +240,15 @@ fn declared(symbol: &Symbol) -> Option<DeclarationKind> {
         SymbolKind::EnumValue => DeclarationKind::EnumValue,
         SymbolKind::Parameter | SymbolKind::Label => return None,
     })
+}
+
+/// The unit key the analyser builds from a header's written dotted name.
+fn written_unit_name(display: &str) -> String {
+    let parts: Vec<String> = display
+        .split('.')
+        .map(|part| part.trim().to_owned())
+        .collect();
+    canonical_path(&parts)
 }
 
 fn visibility(visibility: SymbolVisibility) -> Visibility {
@@ -647,6 +660,42 @@ mod tests {
         assert_eq!(facts.slot_lengths, vec![CONDITIONAL.len() as u32]);
         assert_eq!(facts.expanded_length, CONDITIONAL.len() as u32);
         assert!(facts.includes.is_empty() && facts.segments.is_empty());
+    }
+
+    #[test]
+    fn a_path_derived_unit_name_is_not_a_declaration() {
+        let parsed = parse(
+            "unit ;\ninterface\nimplementation\nend.\n",
+            &ConditionalContext::default(),
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|symbol| symbol.kind == SymbolKind::Unit && symbol.key == "unit"),
+            "the fixture must take the file-name fallback"
+        );
+        let facts = extract(&parsed);
+        assert!(
+            facts
+                .declarations
+                .iter()
+                .all(|d| d.kind != DeclarationKind::Unit && d.name != "unit"),
+            "{:?}",
+            facts.declarations
+        );
+        let dotted = extract(&parse(
+            "unit Vendor . Sub;\ninterface\nimplementation\nend.\n",
+            &ConditionalContext::default(),
+        ));
+        assert!(
+            dotted
+                .declarations
+                .iter()
+                .any(|d| d.kind == DeclarationKind::Unit && d.name == "vendor.sub"),
+            "a written dotted name stays a declaration: {:?}",
+            dotted.declarations
+        );
     }
 
     #[test]

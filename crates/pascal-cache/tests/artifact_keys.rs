@@ -3,7 +3,9 @@ use pascal_cache::{
     KeyKind, LocalArtifactKey, ManifestHeader, MemberInputs, MemberKey, SOURCE_DIGEST_CONTEXT,
     SourceContent, SourceIdentity,
 };
-use pascal_core::SourceEncoding;
+use pascal_core::compile_time::OccurrenceId;
+use pascal_core::facts::{IncludeSlot, IncludeSlotOutcome, UnresolvedInclude};
+use pascal_core::{LoadedSource, SourceEncoding, SourceId, SourceRevision};
 use pascal_project::{
     ConditionalContext, ConditionalFact, ProjectContext, ProjectContextParts, ProjectPathEntry,
     SourceOrigin,
@@ -177,15 +179,15 @@ fn expansion_identity_keeps_order_repetition_and_nesting() {
     other_inherited.inherited = defines(ConditionalFact::False);
     let unresolved = IncludeOccurrence {
         outcome: IncludeOutcome::Unresolved {
-            searched: vec![ProjectPathEntry::configured("/w".into())],
-            reason: "not found".into(),
+            reason: UnresolvedInclude::Unavailable,
         },
         ..b.clone()
     };
     let unresolved_elsewhere = IncludeOccurrence {
         outcome: IncludeOutcome::Unresolved {
-            searched: vec![ProjectPathEntry::configured("/v".into())],
-            reason: "not found".into(),
+            reason: UnresolvedInclude::Ambiguous {
+                candidates: vec!["/w/b.inc".into(), "/v/b.inc".into()],
+            },
         },
         ..b.clone()
     };
@@ -385,4 +387,167 @@ fn expanded_keys_remember_their_root() {
     );
     let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
     assert_eq!(expanded.root_digest(), root.digest());
+}
+
+fn source(path: &str, text: &str, revision: Option<SourceRevision>) -> LoadedSource {
+    LoadedSource {
+        id: SourceId::new(path),
+        path: path.into(),
+        bytes: text.as_bytes().into(),
+        decoded_text: Some(text.into()),
+        revision: revision.unwrap_or_else(|| SourceRevision::Disk {
+            stamp: pascal_project::ProjectReadStamp {
+                bytes: text.len() as u64,
+                modified: None,
+                is_dir: false,
+                is_symlink: false,
+            },
+            content_hash: pascal_project::content_hash_bytes(text.as_bytes()),
+            read_policy: Default::default(),
+            path_entry: ProjectPathEntry::configured("/w".into()),
+        }),
+        compile_time_backing: None,
+    }
+}
+
+#[test]
+fn session_slots_key_like_the_equivalent_occurrences() {
+    let inherited = defines(ConditionalFact::True);
+    let root = local(UNIT, &inherited, SourceOrigin::ProjectCompiled);
+    let a = source("/w/a.inc", "{$I b.inc} const A = 1;", None);
+    let b = source("/w/b.inc", "const B = 1;", None);
+    let slots = [
+        IncludeSlot {
+            parent: 0,
+            directive: 10..20,
+            written: "{$I a.inc}",
+            outcome: IncludeSlotOutcome::Expanded {
+                occurrence: OccurrenceId(1),
+                source: &a,
+            },
+        },
+        IncludeSlot {
+            parent: 1,
+            directive: 0..10,
+            written: "{$I b.inc}",
+            outcome: IncludeSlotOutcome::Expanded {
+                occurrence: OccurrenceId(2),
+                source: &b,
+            },
+        },
+        IncludeSlot {
+            parent: 0,
+            directive: 30..46,
+            written: "{$I missing.inc}",
+            outcome: IncludeSlotOutcome::Unresolved(UnresolvedInclude::Unavailable),
+        },
+    ];
+    let resolved = |path: &str, text: &str| IncludeOutcome::Resolved {
+        source: SourceIdentity {
+            canonical: path.into(),
+            logical: path.into(),
+            spelling: None,
+            uri: None,
+        },
+        entry: Some(ProjectPathEntry::configured("/w".into())),
+        content: SourceContent::from_bytes(text.as_bytes()),
+    };
+    let occurrences = [
+        IncludeOccurrence {
+            parent: None,
+            directive_range: 10..20,
+            directive: "{$I a.inc}".into(),
+            inherited: inherited.clone(),
+            outcome: resolved("/w/a.inc", "{$I b.inc} const A = 1;"),
+        },
+        IncludeOccurrence {
+            parent: Some(0),
+            directive_range: 0..10,
+            directive: "{$I b.inc}".into(),
+            inherited: inherited.clone(),
+            outcome: resolved("/w/b.inc", "const B = 1;"),
+        },
+        IncludeOccurrence {
+            parent: None,
+            directive_range: 30..46,
+            directive: "{$I missing.inc}".into(),
+            inherited: inherited.clone(),
+            outcome: IncludeOutcome::Unresolved {
+                reason: UnresolvedInclude::Unavailable,
+            },
+        },
+    ];
+    let from_slots = ExpandedArtifactKey::from_slots(&root, &inherited, &slots).unwrap();
+    assert_eq!(
+        from_slots,
+        ExpandedArtifactKey::new(&root, &occurrences).unwrap()
+    );
+    assert_eq!(from_slots.root_digest(), root.digest());
+}
+
+#[test]
+fn an_overlay_include_has_no_persistent_expansion_key() {
+    let root = local(
+        UNIT,
+        &ConditionalContext::default(),
+        SourceOrigin::ProjectCompiled,
+    );
+    let edited = source(
+        "/w/a.inc",
+        "const A = 1;",
+        Some(SourceRevision::Overlay {
+            version: 3,
+            content_hash: 0,
+        }),
+    );
+    let slots = [IncludeSlot {
+        parent: 0,
+        directive: 0..10,
+        written: "{$I a.inc}",
+        outcome: IncludeSlotOutcome::Expanded {
+            occurrence: OccurrenceId(1),
+            source: &edited,
+        },
+    }];
+    assert_eq!(
+        ExpandedArtifactKey::from_slots(&root, &ConditionalContext::default(), &slots),
+        Err(KeyError::OverlayInclude { occurrence: 0 })
+    );
+}
+
+#[test]
+fn unresolved_reasons_are_typed_parts_of_the_identity() {
+    let root = local(UNIT, &ConditionalContext::default(), SourceOrigin::Library);
+    let key = |reason: UnresolvedInclude| {
+        ExpandedArtifactKey::new(
+            &root,
+            &[IncludeOccurrence {
+                parent: None,
+                directive_range: 0..10,
+                directive: "{$I x.inc}".into(),
+                inherited: ConditionalContext::default(),
+                outcome: IncludeOutcome::Unresolved { reason },
+            }],
+        )
+        .unwrap()
+    };
+    let keys = [
+        key(UnresolvedInclude::Unavailable),
+        key(UnresolvedInclude::NotExpanded),
+        key(UnresolvedInclude::Ambiguous {
+            candidates: vec!["/a/x.inc".into(), "/b/x.inc".into()],
+        }),
+        key(UnresolvedInclude::Ambiguous {
+            candidates: vec!["/a/x.inc".into(), "/c/x.inc".into()],
+        }),
+        key(UnresolvedInclude::Incomplete {
+            candidates: vec!["/a/x.inc".into(), "/b/x.inc".into()],
+        }),
+    ];
+    for (index, left) in keys.iter().enumerate() {
+        for right in &keys[index + 1..] {
+            assert_ne!(left, right);
+        }
+    }
+    assert_eq!(keys[0], key(UnresolvedInclude::Unavailable));
 }

@@ -2,6 +2,8 @@ use crate::manifest::manifest_encoder;
 use crate::{
     CanonicalEncode, CanonicalKey, Digest, Encoder, KeyKind, SourceContent, SourceIdentity,
 };
+use pascal_core::SourceRevision;
+use pascal_core::facts::{IncludeSlot, IncludeSlotOutcome, UnresolvedInclude};
 use pascal_project::{ConditionalContext, ProjectContext, ProjectPathEntry, SourceOrigin};
 use std::fmt;
 use std::ops::Range;
@@ -54,12 +56,11 @@ pub enum IncludeOutcome {
         entry: Option<ProjectPathEntry>,
         content: SourceContent,
     },
-    /// The search entries consulted are part of the identity: a different
-    /// search could find the file.
-    Unresolved {
-        searched: Vec<ProjectPathEntry>,
-        reason: String,
-    },
+    /// The typed reason, never resolver text, so identical inputs key
+    /// identically everywhere. The search configuration is in the context
+    /// key: a search that finds the file yields `Resolved`, and one that
+    /// also fails cannot change the expansion.
+    Unresolved { reason: UnresolvedInclude },
 }
 
 /// One include directive in expansion order. A parent always precedes its
@@ -80,6 +81,7 @@ pub struct IncludeOccurrence {
 pub enum KeyError {
     ParentNotEarlier { occurrence: usize, parent: usize },
     InvertedRange { occurrence: usize },
+    OverlayInclude { occurrence: usize },
 }
 
 impl fmt::Display for KeyError {
@@ -95,6 +97,10 @@ impl fmt::Display for KeyError {
                     "include occurrence {occurrence} has an inverted directive range"
                 )
             }
+            Self::OverlayInclude { occurrence } => write!(
+                formatter,
+                "include occurrence {occurrence} came from an unsaved editor buffer"
+            ),
         }
     }
 }
@@ -117,13 +123,30 @@ impl CanonicalEncode for IncludeOutcome {
                 encoder.field(3);
                 encoder.encode(content);
             }
-            Self::Unresolved { searched, reason } => {
+            Self::Unresolved { reason } => {
                 encoder.variant(2);
                 encoder.field(1);
-                encoder.seq(searched, |encoder, entry| encoder.encode(entry));
-                encoder.field(2);
-                encoder.str(reason);
+                encoder.encode(reason);
             }
+        }
+    }
+}
+
+impl CanonicalEncode for UnresolvedInclude {
+    fn encode(&self, encoder: &mut Encoder) {
+        match self {
+            Self::Unavailable => encoder.variant(1),
+            Self::Ambiguous { candidates } => {
+                encoder.variant(2);
+                encoder.field(1);
+                encoder.seq(candidates, |encoder, path| encoder.encode(path.as_path()));
+            }
+            Self::Incomplete { candidates } => {
+                encoder.variant(3);
+                encoder.field(1);
+                encoder.seq(candidates, |encoder, path| encoder.encode(path.as_path()));
+            }
+            Self::NotExpanded => encoder.variant(4),
         }
     }
 }
@@ -190,6 +213,52 @@ impl ExpandedArtifactKey {
             key: CanonicalKey::finish(KeyKind::ExpandedArtifact, encoder),
             root: root.digest(),
         })
+    }
+
+    /// Key the expansion a compile-time session performed. Every occurrence
+    /// inherits `context`, the root's effective environment: the state at a
+    /// directive is a function of the root, that environment and the earlier
+    /// occurrences, all of which the key holds. The session observed one path
+    /// per included source; it is both its canonical and logical identity.
+    pub fn from_slots(
+        root: &LocalArtifactKey,
+        context: &ConditionalContext,
+        slots: &[IncludeSlot<'_>],
+    ) -> Result<Self, KeyError> {
+        let occurrences = slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let outcome = match &slot.outcome {
+                    IncludeSlotOutcome::Expanded { source, .. } => {
+                        let SourceRevision::Disk { path_entry, .. } = &source.revision else {
+                            return Err(KeyError::OverlayInclude { occurrence: index });
+                        };
+                        IncludeOutcome::Resolved {
+                            source: SourceIdentity {
+                                canonical: source.path.clone(),
+                                logical: source.path.clone(),
+                                spelling: None,
+                                uri: None,
+                            },
+                            entry: Some(path_entry.clone()),
+                            content: SourceContent::from_bytes(&source.bytes),
+                        }
+                    }
+                    IncludeSlotOutcome::Unresolved(reason) => IncludeOutcome::Unresolved {
+                        reason: reason.clone(),
+                    },
+                };
+                Ok(IncludeOccurrence {
+                    parent: slot.parent.checked_sub(1).map(|parent| parent as usize),
+                    directive_range: slot.directive.start as u64..slot.directive.end as u64,
+                    directive: slot.written.to_owned(),
+                    inherited: context.clone(),
+                    outcome,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(root, &occurrences)
     }
 
     pub fn key(&self) -> &CanonicalKey {

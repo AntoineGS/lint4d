@@ -18202,6 +18202,53 @@ mod tests {
         Workspace::from_analysis_input(&main.analysis_input())
     }
 
+    /// A workspace whose `Main.pas` is opened inside an automatically selected
+    /// `App.dproj` project; returns the main workspace, the document URI and
+    /// its context key.
+    fn automatic_owner_fixture() -> (tempfile::TempDir, Workspace, Url, ContextKey) {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>BEFORE</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        workspace
+            .open_document(uri.clone(), source.to_string(), 1)
+            .expect("open Main.pas");
+        let owner = workspace.document_owners.get(&uri).expect("recorded owner");
+        assert_eq!(owner.origin, OwnerOrigin::Automatic);
+        let key = owner.key.clone();
+        (temp, workspace, uri, key)
+    }
+
+    #[test]
+    fn analysis_workspace_reuses_an_automatic_owner_whose_open_source_lost_its_file() {
+        let (temp, mut main, _uri, key) = automatic_owner_fixture();
+        let extra_source = "unit Extra;\ninterface\nimplementation\nend.\n";
+        let extra_path = temp.path().join("Extra.pas");
+        fs::write(&extra_path, extra_source).unwrap();
+        let extra = Url::from_file_path(&extra_path).unwrap();
+        main.open_document(extra.clone(), extra_source.to_string(), 1)
+            .expect("open Extra.pas");
+        assert_eq!(
+            main.document_owners.get(&extra).map(|owner| &owner.key),
+            Some(&key)
+        );
+        fs::remove_file(&extra_path).unwrap();
+        let mut worker = worker_view(&main);
+
+        pascal_project::test_reset_project_discovery_counts();
+        let reused = worker.context_for_uri(&extra).expect("context");
+
+        assert_eq!(reused, key);
+        assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
     fn interface_entry(
         workspace: &Workspace,

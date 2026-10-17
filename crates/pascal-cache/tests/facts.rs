@@ -403,3 +403,213 @@ fn decoding_is_charged_before_facts_are_retained() {
     assert_eq!(pushed, Err(FactDecodeError::Budget));
     assert!(budget.used() <= 200);
 }
+
+#[cfg(unix)]
+mod common;
+
+#[cfg(unix)]
+mod store {
+    use super::*;
+    use crate::common::private_tempdir;
+    use pascal_cache::{
+        ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, Integrity, LocalArtifactKey,
+        Lookup, MAX_ROW_BATCH_BYTES, Malformed, Miss, Namespace, Published, SourceContent, Store,
+        StoreLimits,
+    };
+    use pascal_project::{ConditionalContext, SourceOrigin};
+    use std::path::Path;
+
+    fn open(directory: &Path, limits: StoreLimits) -> Store {
+        Store::open(
+            directory,
+            &Namespace::new(Digest::from_bytes([4; 32])),
+            limits,
+        )
+        .unwrap()
+    }
+
+    fn key(text: &str) -> LocalArtifactKey {
+        LocalArtifactKey::new(
+            &SourceContent::from_bytes(text.as_bytes()),
+            &ConditionalContext::default(),
+            SourceOrigin::ProjectCompiled,
+        )
+    }
+
+    fn load(store: &Store, key: &LocalArtifactKey) -> Lookup<ArtifactFacts> {
+        store
+            .load_facts(ArtifactKeyRef::local(key), &mut FactBudget::new(1 << 26))
+            .unwrap()
+    }
+
+    #[test]
+    fn published_facts_load_back_verified_and_equal() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        let facts = sample();
+        assert_eq!(
+            store.publish_facts(ArtifactKeyRef::local(&key), &facts),
+            Ok(Published::Inserted)
+        );
+        let Lookup::Hit(loaded) = load(&store, &key) else {
+            panic!("expected the published facts")
+        };
+        assert_eq!(loaded, facts);
+        // Nothing uncertain was upgraded on the way.
+        assert!(!loaded.declarations[2].certainty.is_proven());
+        assert!(loaded.declarations[4].certainty.recovered);
+        assert!(matches!(
+            loaded.declarations[7].location,
+            FactLocation::Expanded { .. }
+        ));
+        assert_eq!(loaded.includes[1].expansion, IncludeExpansion::Unresolved);
+        assert_eq!(loaded.coverage, facts.coverage);
+    }
+
+    #[test]
+    fn identical_facts_publish_once_and_different_facts_conflict() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        let facts = sample();
+        store
+            .publish_facts(ArtifactKeyRef::local(&key), &facts)
+            .unwrap();
+        assert_eq!(
+            store.publish_facts(ArtifactKeyRef::local(&key), &facts),
+            Ok(Published::AlreadyPresent)
+        );
+        let mut other = facts.clone();
+        other.declarations[0].display = "Other".into();
+        assert_eq!(
+            store.publish_facts(ArtifactKeyRef::local(&key), &other),
+            Err(Bypass::Integrity(Integrity::ConflictingArtifact))
+        );
+    }
+
+    #[test]
+    fn posting_rows_are_candidates_by_binary_name() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        store
+            .publish_facts(ArtifactKeyRef::local(&key), &sample())
+            .unwrap();
+        let page = store.find_by_index(POSTING_ROW, b"tfoo", None, 10).unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].artifact_id, key.digest());
+        assert!(
+            store
+                .find_by_index(POSTING_ROW, b"TFOO", None, 10)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert!(
+            store
+                .find_by_index(DECLARATION_ROW, b"tfoo", None, 10)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_published_facts_are_a_miss_not_empty_facts() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        let encoded = encode_facts(&sample()).unwrap();
+        let mut rows: Vec<ArtifactRow<'_>> = encoded.rows();
+        rows[11].index_key = Some(b"BAR".as_slice());
+        store
+            .publish_artifact(&ArtifactWrite {
+                key: ArtifactKeyRef::local(&key),
+                supplemental: &encoded.supplemental,
+                rows: &rows,
+            })
+            .unwrap();
+        let mut budget = FactBudget::new(1 << 26);
+        assert_eq!(
+            store.load_facts(ArtifactKeyRef::local(&key), &mut budget),
+            Ok(Lookup::Miss(Miss::Malformed(Malformed::Facts)))
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn decoded_facts_are_charged_before_they_are_retained() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        store
+            .publish_facts(ArtifactKeyRef::local(&key), &sample())
+            .unwrap();
+        let mut budget = FactBudget::new(64);
+        assert_eq!(
+            store.load_facts(ArtifactKeyRef::local(&key), &mut budget),
+            Err(Bypass::FactBudget)
+        );
+        assert_eq!(budget.used(), 0);
+        assert_eq!(store.scratch_in_use(), 0);
+    }
+
+    #[test]
+    fn encoding_is_charged_to_scratch_before_it_is_built() {
+        let root = private_tempdir();
+        let store = open(
+            root.path(),
+            StoreLimits {
+                scratch_bytes: MAX_ROW_BATCH_BYTES as u64,
+                ..StoreLimits::default()
+            },
+        );
+        let key = key("unit Big;");
+        let occurrences: Vec<_> = (0..90_000u32)
+            .map(|index| occurrence(0, index * 2, index * 2 + 1, PostingActivity::Active))
+            .collect();
+        let facts = ArtifactFacts {
+            slot_lengths: vec![180_000],
+            expanded_length: 180_000,
+            postings: vec![PostingFact {
+                name: "x".into(),
+                occurrences,
+            }],
+            ..ArtifactFacts::default()
+        };
+        assert_eq!(
+            store.publish_facts(ArtifactKeyRef::local(&key), &facts),
+            Err(Bypass::ScratchExhausted)
+        );
+        assert_eq!(
+            store.open_artifact(ArtifactKeyRef::local(&key)),
+            Ok(Lookup::Miss(Miss::Absent))
+        );
+    }
+
+    #[test]
+    fn an_oversized_name_is_not_persisted() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit Long;");
+        let name = "a".repeat(pascal_cache::MAX_INDEX_KEY_BYTES + 1);
+        let facts = ArtifactFacts {
+            slot_lengths: vec![name.len() as u32],
+            expanded_length: name.len() as u32,
+            postings: vec![PostingFact {
+                occurrences: vec![occurrence(0, 0, name.len() as u32, PostingActivity::Active)],
+                name,
+            }],
+            ..ArtifactFacts::default()
+        };
+        assert!(matches!(
+            store.publish_facts(ArtifactKeyRef::local(&key), &facts),
+            Err(Bypass::TooLarge(TooLarge::IndexKey { .. }))
+        ));
+        assert_eq!(
+            store.open_artifact(ArtifactKeyRef::local(&key)),
+            Ok(Lookup::Miss(Miss::Absent))
+        );
+    }
+}

@@ -4,6 +4,7 @@
 
 mod artifacts;
 mod container;
+mod facts;
 mod index;
 mod keys;
 mod limits;

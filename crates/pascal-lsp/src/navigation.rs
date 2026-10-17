@@ -26,6 +26,7 @@ mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
 mod documentation;
+mod facts;
 mod folding;
 mod inlay;
 mod overload;
@@ -42,6 +43,7 @@ pub(crate) use assistance::completion_prefix_at_position;
 pub(crate) use assistance::{
     CompletionMetadata, CompletionOptions, CompletionResult, MissingUnitCandidate,
 };
+pub(crate) use facts::{ExtractedFacts, extract_facts};
 
 /// A source-backed class method declaration for which the complete indexed
 /// unit proves that no implementation currently exists.
@@ -15843,6 +15845,14 @@ impl ParsedDocument {
     /// The parsed text, before conditional projection.
     pub(crate) fn source_text(&self) -> &Arc<str> {
         &self.source
+    }
+
+    /// The compile-time session the parse used, when the source needed one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compile_time_session(
+        &self,
+    ) -> Option<&pascal_core::compile_time::CompileTimeAnalysis> {
+        self.compile_time_session.as_deref()
     }
 
     pub(crate) fn visit_recovery_payload(

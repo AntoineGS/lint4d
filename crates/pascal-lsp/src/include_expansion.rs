@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use pascal_core::compile_time::OccurrenceId;
 use pascal_core::conditional::{self, DirectiveKind};
 use pascal_project::ConditionalContext;
 
@@ -80,7 +81,23 @@ struct Segment {
 
 #[derive(Debug, Clone)]
 enum SegmentMapping {
-    Physical { uri: Url, source_start: usize },
+    Physical {
+        uri: Url,
+        source_start: usize,
+        occurrence: Option<OccurrenceId>,
+    },
+    Synthetic,
+}
+
+/// Where one segment of analysed text came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentSource {
+    /// `occurrence` is the compile-time session's occurrence; `None` outside
+    /// a session.
+    Physical {
+        occurrence: Option<OccurrenceId>,
+        source_start: usize,
+    },
     Synthetic,
 }
 
@@ -121,7 +138,7 @@ impl ExpandedSource {
     }
 
     fn push_physical(&mut self, uri: Url, source: &str) -> Range<usize> {
-        self.push_physical_range(uri, source, 0)
+        self.push_physical_range(uri, source, 0, None)
     }
 
     pub(crate) fn push_physical_range(
@@ -129,12 +146,17 @@ impl ExpandedSource {
         uri: Url,
         source: &str,
         source_start: usize,
+        occurrence: Option<OccurrenceId>,
     ) -> Range<usize> {
         let range = self.push_text(source);
         if !range.is_empty() {
             self.map.segments.push(Segment {
                 virtual_range: range.clone(),
-                mapping: SegmentMapping::Physical { uri, source_start },
+                mapping: SegmentMapping::Physical {
+                    uri,
+                    source_start,
+                    occurrence,
+                },
             });
         }
         range
@@ -186,7 +208,9 @@ impl ExpandedSource {
                 continue;
             }
             let span = match &segment.mapping {
-                SegmentMapping::Physical { uri, source_start } => PhysicalSpan {
+                SegmentMapping::Physical {
+                    uri, source_start, ..
+                } => PhysicalSpan {
                     uri: uri.clone(),
                     range: source_start + (start - segment.virtual_range.start)
                         ..source_start + (end - segment.virtual_range.start),
@@ -229,6 +253,7 @@ impl ExpandedSource {
                 let SegmentMapping::Physical {
                     uri: segment_uri,
                     source_start,
+                    ..
                 } = &segment.mapping
                 else {
                     return None;
@@ -267,6 +292,24 @@ impl ExpandedSource {
 
     pub(crate) fn segment_count(&self) -> usize {
         self.map.segments.len()
+    }
+
+    /// The source map in analysed order.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (Range<usize>, SegmentSource)> + '_ {
+        self.map.segments.iter().map(|segment| {
+            let source = match &segment.mapping {
+                SegmentMapping::Physical {
+                    source_start,
+                    occurrence,
+                    ..
+                } => SegmentSource::Physical {
+                    occurrence: *occurrence,
+                    source_start: *source_start,
+                },
+                SegmentMapping::Synthetic => SegmentSource::Synthetic,
+            };
+            (segment.virtual_range.clone(), source)
+        })
     }
 
     fn append(&mut self, child: &ExpandedSource) {
@@ -604,7 +647,7 @@ mod tests {
     fn reverse_mapping_ignores_ranges_before_a_physical_segment() {
         let root = uri("/workspace/Main.pas");
         let mut expanded = ExpandedSource::new();
-        expanded.push_physical_range(root.clone(), "tail", 4);
+        expanded.push_physical_range(root.clone(), "tail", 4, None);
 
         assert!(expanded.reverse_range(&root, 0..3).is_empty());
     }

@@ -307,6 +307,9 @@ pub struct CompileTimeOutput {
     pub observations: Vec<ResolutionObservation>,
     pub warnings: Vec<String>,
     pub directive_fragments: Vec<DirectiveFragments>,
+    /// Unit-provider lookups compile-time evaluation made. A result that
+    /// made any depends on those providers.
+    pub provider_queries: usize,
     /// Admitted session storage and cumulative work (not allocator telemetry).
     pub budget: Arc<AdmittedShared<()>>,
     // Root backing remains independently transferable even after publication.
@@ -354,6 +357,7 @@ struct SessionOutput {
     observations: AdmittedOwned<Vec<ResolutionObservation>>,
     warnings: AdmittedOwned<Vec<String>>,
     directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
+    provider_queries: usize,
 }
 
 impl SessionOutput {
@@ -554,6 +558,7 @@ fn publish_analysis(
         .and_then(|v| v.into_arc(budget))
         .map_err(|r| resolver_error(r, budget))?;
     let root_limits = budget.limits();
+    let provider_queries = analysis.provider_queries;
     let mut output = budget
         .admit_owned(1, 0, 0, || CompileTimeOutput {
             root: conditional::empty_output(),
@@ -565,6 +570,7 @@ fn publish_analysis(
             observations: Vec::new(),
             warnings: Vec::new(),
             directive_fragments: Vec::new(),
+            provider_queries,
             budget: view,
             root_credit: None,
             root_limits,
@@ -1120,6 +1126,7 @@ fn analyze_source_with_providers_inner(
             .map_err(|r| resolver_error(r, session.budget))?;
     }
     Ok(SessionOutput {
+        provider_queries: session.providers.queries,
         root: analysis,
         occurrences: {
             session

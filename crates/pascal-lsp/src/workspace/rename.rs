@@ -33,6 +33,7 @@ use pascal_core::conditional::{
     is_harmless_directive_keyword,
 };
 use pascal_core::decode_bytes;
+use pascal_core::facts::{identifier_runs, is_identifier_byte};
 use pascal_core::resolver::{
     IncludeResolveRequest, LegacyRoute, LoadedSource, Resolution, ResolverLimits,
 };
@@ -3069,30 +3070,13 @@ fn binding_info_for_source(
 }
 
 fn contains_any_identifier(source: &str, names: &[String]) -> bool {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < bytes.len() && is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
-        let Some(identifier) = source.get(start..index) else {
-            continue;
-        };
-        if names
-            .iter()
-            .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
-        {
-            return true;
-        }
-    }
-    false
+    identifier_runs(source.as_bytes()).any(|run| {
+        source.get(run).is_some_and(|identifier| {
+            names
+                .iter()
+                .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
+        })
+    })
 }
 
 fn inherited_conditional_branch_contains_identifier(
@@ -3116,120 +3100,56 @@ fn inherited_conditional_branch_contains_identifier(
     if conditional_ranges.is_empty() {
         return false;
     }
-
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < bytes.len() && is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
+    identifier_runs(source.as_bytes()).any(|run| {
         if analysis
             .directives
             .iter()
-            .any(|directive| start >= directive.start && index <= directive.end)
+            .any(|directive| run.start >= directive.start && run.end <= directive.end)
         {
-            continue;
+            return false;
         }
-        let Some(identifier) = source.get(start..index) else {
-            continue;
-        };
-        if names
-            .iter()
-            .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
-            && conditional_ranges
+        source.get(run.clone()).is_some_and(|identifier| {
+            names
                 .iter()
-                .any(|range| start >= range.start && index <= range.end)
-        {
-            return true;
-        }
-    }
-    false
+                .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&')))
+        }) && conditional_ranges
+            .iter()
+            .any(|range| run.start >= range.start && run.end <= range.end)
+    })
 }
 
 fn contains_any_identifier_bytes(source: &[u8], names: &[String]) -> bool {
-    let mut index = 0;
-    while index < source.len() {
-        while index < source.len() && !is_identifier_byte(source[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < source.len() && is_identifier_byte(source[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
-        let identifier = &source[start..index];
-        if names
+    identifier_runs(source).any(|run| {
+        let identifier = &source[run];
+        names
             .iter()
             .any(|name| identifier.eq_ignore_ascii_case(name.trim_start_matches('&').as_bytes()))
-        {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 pub(crate) fn contains_any_identifier_prefix(source: &str, names: &[String]) -> bool {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && !is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < bytes.len() && is_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
-        let Some(identifier) = source.get(start..index) else {
-            continue;
-        };
-        if names.iter().any(|name| {
-            let name = name.trim_start_matches('&');
-            !name.is_empty()
-                && identifier.len() >= name.len()
-                && identifier[..name.len()].eq_ignore_ascii_case(name)
-        }) {
-            return true;
-        }
-    }
-    false
+    identifier_runs(source.as_bytes()).any(|run| {
+        source.get(run).is_some_and(|identifier| {
+            names.iter().any(|name| {
+                let name = name.trim_start_matches('&');
+                !name.is_empty()
+                    && identifier.len() >= name.len()
+                    && identifier[..name.len()].eq_ignore_ascii_case(name)
+            })
+        })
+    })
 }
 
 fn contains_any_identifier_prefix_bytes(source: &[u8], names: &[String]) -> bool {
-    let mut index = 0;
-    while index < source.len() {
-        while index < source.len() && !is_identifier_byte(source[index]) {
-            index += 1;
-        }
-        let start = index;
-        while index < source.len() && is_identifier_byte(source[index]) {
-            index += 1;
-        }
-        if start == index {
-            continue;
-        }
-        let identifier = &source[start..index];
-        if names.iter().any(|name| {
+    identifier_runs(source).any(|run| {
+        let identifier = &source[run];
+        names.iter().any(|name| {
             let name = name.trim_start_matches('&').as_bytes();
             !name.is_empty()
                 && identifier.len() >= name.len()
                 && identifier[..name.len()].eq_ignore_ascii_case(name)
-        }) {
-            return true;
-        }
-    }
-    false
+        })
+    })
 }
 
 pub(crate) fn source_unit_name(
@@ -3364,10 +3284,6 @@ fn source_requires_include_owner_closure(uri: &Url, source: &str) -> bool {
         path.extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("inc"))
     }) || may_contain_include_directive(source.as_bytes())
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 pub(crate) fn prepare_from_input(

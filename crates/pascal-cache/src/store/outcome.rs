@@ -26,6 +26,8 @@ pub enum Bypass {
     Corrupt,
     OutOfMemory,
     ScratchExhausted,
+    /// Decoded facts did not fit the caller's retained-byte admission.
+    FactBudget,
     TooLarge(TooLarge),
     InvalidRowKind {
         ordinal: usize,
@@ -98,6 +100,8 @@ pub enum Malformed {
     Row,
     Ordinal,
     Count,
+    /// Rows whose checksums hold but whose facts break a DTO invariant.
+    Facts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

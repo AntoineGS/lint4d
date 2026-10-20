@@ -1054,6 +1054,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "notify",
+ "pascal-cache",
  "pascal-core",
  "pascal-project",
  "serde",

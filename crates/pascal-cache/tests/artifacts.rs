@@ -9,6 +9,7 @@ use pascal_cache::{
     MAX_WAIT, Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
     StoreLimits, TooLarge,
 };
+use pascal_core::facts::UnresolvedInclude;
 use pascal_project::{ConditionalContext, ConditionalFact, SourceOrigin};
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -442,8 +443,7 @@ fn an_oversized_manifest_is_refused_before_taking_the_write_lock() {
         directive: "x".repeat(MAX_MANIFEST_BYTES + 1),
         inherited: ConditionalContext::default(),
         outcome: IncludeOutcome::Unresolved {
-            searched: Vec::new(),
-            reason: String::new(),
+            reason: UnresolvedInclude::Unavailable,
         },
     };
     let expanded = ExpandedArtifactKey::new(&root, &[occurrence]).unwrap();

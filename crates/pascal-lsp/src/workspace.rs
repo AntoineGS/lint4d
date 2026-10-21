@@ -9769,16 +9769,24 @@ impl Workspace {
             }
             if owner.origin == OwnerOrigin::Automatic
                 && !rediscover_open_context
-                && let Some(key) = self.reuse_automatic_owner(
+                && self.context_has_open_legacy_overlay(&owner.state)
+                && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
+            {
+                // An automatic project owner remains authoritative while an
+                // explicitly opened legacy source has lost its backing file.
+                // Once project candidates change, freshness fails and normal
+                // automatic discovery is allowed to reconsider the owner.
+                self.contexts
+                    .insert(owner.key.clone(), ContextState::clone(&owner.state));
+                self.select_document_context_with_pruning(
                     uri,
-                    &path,
-                    &owner,
+                    &owner.key,
+                    owner.origin,
                     cancel,
                     budget,
-                    defer_context_pruning,
-                )?
-            {
-                return Ok(key);
+                    !defer_context_pruning,
+                )?;
+                return Ok(owner.key);
             }
         }
         let discovered =
@@ -9841,111 +9849,6 @@ impl Workspace {
             !defer_context_pruning,
         )?;
         Ok(key)
-    }
-
-    /// Reuses an automatic owner's context when the checks that keep the main
-    /// workspace's own cached contexts pass. The owner stays automatic: any
-    /// change to its project candidates or inputs fails freshness and the
-    /// caller rediscovers.
-    fn reuse_automatic_owner(
-        &mut self,
-        uri: &Url,
-        path: &Path,
-        owner: &KnownDocumentOwner,
-        cancel: Option<&AtomicBool>,
-        budget: Option<&ReconciliationBudget>,
-        defer_context_pruning: bool,
-    ) -> Result<Option<ContextKey>, String> {
-        if self.context_has_open_legacy_overlay(&owner.state) {
-            // An automatic project owner remains authoritative while an
-            // explicitly opened legacy source has lost its backing file.
-            // Once project candidates change, freshness fails and normal
-            // automatic discovery is allowed to reconsider the owner.
-            if !self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)? {
-                return Ok(None);
-            }
-            self.contexts
-                .insert(owner.key.clone(), ContextState::clone(&owner.state));
-            self.select_document_context_with_pruning(
-                uri,
-                &owner.key,
-                owner.origin,
-                cancel,
-                budget,
-                !defer_context_pruning,
-            )?;
-            return Ok(Some(owner.key.clone()));
-        }
-        if owner.needs_revalidation {
-            return Ok(None);
-        }
-        // A context another document already installed in this workspace is
-        // checked as installed rather than replaced by the owner's copy.
-        let installed = self.contexts.contains_key(&owner.key);
-        let state = match self.contexts.get(&owner.key) {
-            Some(state) => state,
-            None => owner.state.as_ref(),
-        };
-        if !reuse_check(self.state_records_discovery_directories(state, path, cancel, budget))?
-            || !reuse_check(self.context_state_is_fresh_with_open_documents(state, cancel, budget))?
-        {
-            return Ok(None);
-        }
-        if !installed {
-            self.contexts
-                .insert(owner.key.clone(), ContextState::clone(&owner.state));
-        }
-        let matches = reuse_check(
-            self.context_matches_current_selection_with_cancel_and_budget(
-                path, &owner.key, cancel, budget,
-            ),
-        );
-        if !matches!(matches, Ok(true)) {
-            if !installed {
-                self.contexts.remove(&owner.key);
-            }
-            return matches.map(|_| None);
-        }
-        if let Err(error) = self.select_document_context_with_pruning(
-            uri,
-            &owner.key,
-            owner.origin,
-            cancel,
-            budget,
-            !defer_context_pruning,
-        ) {
-            if !installed {
-                self.contexts.remove(&owner.key);
-            }
-            return Err(error);
-        }
-        Ok(Some(owner.key.clone()))
-    }
-
-    /// Whether `state` already records the project-candidate membership of
-    /// every directory discovery searches for `path`, so its freshness check
-    /// compares them instead of accepting their current contents.
-    fn state_records_discovery_directories(
-        &self,
-        state: &ContextState,
-        path: &Path,
-        cancel: Option<&AtomicBool>,
-        budget: Option<&ReconciliationBudget>,
-    ) -> Result<bool, String> {
-        for directory in self.discovery_directories_with_control(path, cancel, budget)? {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            if !state
-                .project_candidate_memberships
-                .keys()
-                .any(|known| package_paths_equal(known, &directory))
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15091,21 +14994,6 @@ fn context_state_is_fresh_with_cancel(
     context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget)
 }
 
-/// Cancellation and budget exhaustion end a reuse check; any other error means
-/// the context cannot be shown fresh, so the caller rediscovers.
-fn reuse_check(result: Result<bool, String>) -> Result<bool, String> {
-    match result {
-        Err(error)
-            if error == CANCELLATION_MESSAGE
-                || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED =>
-        {
-            Err(error)
-        }
-        Err(_) => Ok(false),
-        ok => ok,
-    }
-}
-
 fn context_state_is_fresh_with_cancel_ignoring_paths(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
@@ -18339,23 +18227,6 @@ mod tests {
     }
 
     #[test]
-    fn analysis_workspace_reuses_a_fresh_automatic_owner_without_rediscovery() {
-        let (_temp, main, uri, key) = automatic_owner_fixture();
-        let mut worker = worker_view(&main);
-
-        pascal_project::test_reset_project_discovery_counts();
-        let reused = worker.context_for_uri(&uri).expect("context");
-
-        assert_eq!(reused, key);
-        assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
-        assert_eq!(
-            worker.document_owners.get(&uri).map(|owner| owner.origin),
-            Some(OwnerOrigin::Automatic),
-            "reuse must not turn the owner into a selection"
-        );
-    }
-
-    #[test]
     fn analysis_workspace_reuses_an_automatic_owner_whose_open_source_lost_its_file() {
         let (temp, mut main, _uri, key) = automatic_owner_fixture();
         let extra_source = "unit Extra;\ninterface\nimplementation\nend.\n";
@@ -18376,196 +18247,6 @@ mod tests {
 
         assert_eq!(reused, key);
         assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
-    }
-
-    #[test]
-    fn analysis_workspace_rediscovers_an_automatic_owner_after_a_same_size_descriptor_edit() {
-        let (temp, main, uri, _key) = automatic_owner_fixture();
-        let project = temp.path().join("App.dproj");
-        let modified = fs::metadata(&project).unwrap().modified().unwrap();
-        fs::write(
-            &project,
-            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>EDITED</DCC_Define></PropertyGroup></Project>",
-        )
-        .unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&project)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
-        let mut worker = worker_view(&main);
-
-        pascal_project::test_reset_project_discovery_counts();
-        let key = worker.context_for_uri(&uri).expect("context");
-
-        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
-        let defines = worker.contexts.get(&key).unwrap().context.defines();
-        assert!(
-            defines.iter().any(|define| define == "EDITED"),
-            "{defines:?}"
-        );
-    }
-
-    #[test]
-    fn analysis_workspace_rediscovers_an_automatic_owner_when_a_candidate_appears() {
-        let (temp, main, uri, _key) = automatic_owner_fixture();
-        fs::write(
-            temp.path().join("Other.dproj"),
-            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
-        )
-        .unwrap();
-        let mut worker = worker_view(&main);
-
-        pascal_project::test_reset_project_discovery_counts();
-        let reused = worker.context_for_uri(&uri);
-
-        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
-        let mut fresh =
-            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
-        // Two candidates may make discovery refuse; either way both must agree.
-        assert_eq!(
-            reused,
-            fresh.context_for_uri(&uri),
-            "the result must equal a fresh discovery"
-        );
-    }
-
-    #[test]
-    fn analysis_workspace_rediscovers_an_automatic_owner_once_a_project_is_selected() {
-        let (temp, main, uri, key) = automatic_owner_fixture();
-        let mut input = main.analysis_input();
-        input
-            .project_selections
-            .insert(temp.path().to_path_buf(), temp.path().join("App.dproj"));
-        let mut worker = Workspace::from_analysis_input(&input);
-
-        pascal_project::test_reset_project_discovery_counts();
-        let selected = worker.context_for_uri(&uri).expect("context");
-
-        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
-        assert_ne!(selected, key);
-        assert!(selected.selection_scope.is_some(), "{selected:?}");
-    }
-
-    #[test]
-    fn analysis_workspace_rediscovers_when_the_owner_did_not_record_the_documents_directories() {
-        let (temp, main, uri, _key) = automatic_owner_fixture();
-        let nested = temp.path().join("Nested");
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(
-            nested.join("Unit.pas"),
-            "unit Unit;\ninterface\nimplementation\nend.\n",
-        )
-        .unwrap();
-        let nested_uri = Url::from_file_path(nested.join("Unit.pas")).unwrap();
-        let mut input = main.analysis_input();
-        let owner = input.document_owners.get(&uri).cloned().expect("owner");
-        assert!(
-            !owner
-                .state
-                .project_candidate_memberships
-                .keys()
-                .any(|directory| super::package_paths_equal(directory, &nested)),
-            "the owner state must not already know Nested"
-        );
-        input.document_owners.insert(nested_uri.clone(), owner);
-        let mut worker = Workspace::from_analysis_input(&input);
-
-        pascal_project::test_reset_project_discovery_counts();
-        worker.context_for_uri(&nested_uri).expect("context");
-
-        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
-    }
-
-    #[test]
-    fn analysis_workspace_rediscovers_an_automatic_owner_that_needs_revalidation() {
-        let (_temp, main, uri, _key) = automatic_owner_fixture();
-        let mut input = main.analysis_input();
-        input
-            .document_owners
-            .get_mut(&uri)
-            .expect("owner")
-            .needs_revalidation = true;
-        let mut worker = Workspace::from_analysis_input(&input);
-
-        pascal_project::test_reset_project_discovery_counts();
-        worker.context_for_uri(&uri).expect("context");
-
-        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
-    }
-
-    #[test]
-    fn analysis_workspace_reuses_one_installed_context_for_two_documents_of_a_project() {
-        let (temp, mut main, uri, key) = automatic_owner_fixture();
-        let second_source = "unit Second;\ninterface\nimplementation\nend.\n";
-        fs::write(temp.path().join("Second.pas"), second_source).unwrap();
-        let second = Url::from_file_path(temp.path().join("Second.pas")).unwrap();
-        main.open_document(second.clone(), second_source.to_string(), 1)
-            .expect("open Second.pas");
-        let mut worker = worker_view(&main);
-
-        pascal_project::test_reset_project_discovery_counts();
-        assert_eq!(worker.context_for_uri(&uri).expect("first"), key);
-        assert_eq!(worker.context_for_uri(&second).expect("second"), key);
-
-        assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
-    }
-
-    #[test]
-    fn automatic_owner_reuse_interrupted_at_any_point_installs_nothing() {
-        let (_temp, main, uri, key) = automatic_owner_fixture();
-        for cancelling in [false, true] {
-            let expected = if cancelling {
-                super::CANCELLATION_MESSAGE
-            } else {
-                super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
-            };
-            let mut errors = 0;
-            let mut first_ok = None;
-            for step in 0..10_000 {
-                let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
-                if cancelling {
-                    budget.cancel_after_path_visits(step);
-                } else {
-                    budget.set_path_visit_limit(step);
-                }
-                let mut worker = worker_view(&main);
-
-                pascal_project::test_reset_project_discovery_counts();
-                let result =
-                    worker.context_for_uri_with_cancel_and_budget(&uri, None, Some(&budget));
-
-                assert_eq!(
-                    pascal_project::test_project_discovery_counts(),
-                    (0, 0),
-                    "step {step} cancelling={cancelling}"
-                );
-                match result {
-                    Ok(reused) => {
-                        assert_eq!(reused, key, "step {step} cancelling={cancelling}");
-                        first_ok = Some(step);
-                        break;
-                    }
-                    Err(error) => {
-                        assert_eq!(error, expected, "step {step}");
-                        assert!(
-                            !worker.contexts.contains_key(&key),
-                            "an interrupted reuse left the owner context installed at step {step} cancelling={cancelling}"
-                        );
-                        errors += 1;
-                    }
-                }
-            }
-            let first_ok = first_ok.expect("the sweep must reach a successful call");
-            eprintln!(
-                "sweep cancelling={cancelling}: {errors} errors, first Ok at step {first_ok}"
-            );
-            assert!(
-                errors > 3,
-                "the sweep must interrupt inside the call: {errors}"
-            );
-        }
     }
 
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.

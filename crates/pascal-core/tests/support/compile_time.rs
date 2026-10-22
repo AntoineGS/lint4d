@@ -98,6 +98,17 @@ impl Fixture {
     pub fn include(&mut self, name: &str, text: &str) {
         self.includes.insert(name.into(), loaded(name, text));
     }
+    /// An include read from disk under a configured search entry, the
+    /// revision a saved file has.
+    pub fn disk_include(&mut self, name: &str, text: &str) {
+        let mut source = loaded(name, text);
+        source.revision = disk_revision(&source.bytes);
+        self.includes.insert(name.into(), source);
+    }
+    /// A root read from disk rather than an editor buffer.
+    pub fn disk_root(&mut self) {
+        self.root.revision = disk_revision(&self.root.bytes);
+    }
     pub fn unit(&mut self, name: &str, text: &str, context: ConditionalContext) {
         self.units.insert(
             name.into(),
@@ -378,6 +389,20 @@ pub fn activity(analysis: &CompileTimeAnalysis, body: &str) -> Truth {
         .collect::<Vec<_>>();
     assert_eq!(matches.len(), 1, "directive {body}");
     matches[0].activity
+}
+
+fn disk_revision(bytes: &[u8]) -> SourceRevision {
+    SourceRevision::Disk {
+        stamp: pascal_project::ProjectReadStamp {
+            bytes: bytes.len() as u64,
+            modified: None,
+            is_dir: false,
+            is_symlink: false,
+        },
+        content_hash: pascal_project::content_hash_bytes(bytes),
+        read_policy: Default::default(),
+        path_entry: pascal_project::ProjectPathEntry::configured("/fixture".into()),
+    }
 }
 
 pub fn loaded(path: &str, text: &str) -> LoadedSource {

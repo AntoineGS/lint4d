@@ -118,6 +118,7 @@ pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
 pub(crate) mod extract;
+mod facts;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;

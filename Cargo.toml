@@ -5,6 +5,7 @@ members = [
     "crates/fmt4d",
     "crates/pascal-lsp",
     "crates/pascal-project",
+    "crates/pascal-cache",
     "crates/tree-sitter-pascal",
     "crates/cfg-core",
     "crates/cfg-pascal",

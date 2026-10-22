@@ -77,7 +77,9 @@ const MAX_OWNERSHIP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNERSHIP_WARNING_BYTES: usize = 256 * 1024;
 const UNRESOLVED_MARKER: char = '\u{1}';
 
-pub use authorization::{ProjectPathEntry, ProjectPathProvenance, ReadPolicy};
+pub use authorization::{
+    ProjectPathEntry, ProjectPathProvenance, ReadPolicy, ReadPolicyView, ReadRootView,
+};
 mod authorization;
 pub use reads::{
     MetadataObservation, ProjectDiscovery, ProjectReadObservation, ProjectReadStamp,

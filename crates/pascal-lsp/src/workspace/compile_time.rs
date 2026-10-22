@@ -740,7 +740,7 @@ pub(super) fn expand_with_limits(
             return Err("mapped expansion limit reached".into());
         }
         let mut expanded = ExpandedSource::default();
-        expanded.push_physical_range(uri.clone(), source, 0);
+        expanded.push_physical_range(uri.clone(), source, 0, None);
         expanded.conditionals = Some(ConditionalAnalysis {
             projected_source: source.into(),
             inactive_spans: vec![],
@@ -1091,7 +1091,7 @@ impl Mapping<'_> {
             if range.start < cursor || range.end > source.len() {
                 return Err("non-physical include directive requires a mapped continuation".into());
             }
-            self.append_region(&uri, source, &occurrence.analysis, cursor..range.start)?;
+            self.append_region(&uri, id, source, &occurrence.analysis, cursor..range.start)?;
             let marker = mask(&source[range.clone()]);
             self.synthetic(&marker)?;
             let inactive = occurrence.analysis.directives.iter().any(|d| {
@@ -1140,12 +1140,13 @@ impl Mapping<'_> {
             }
             cursor = range.end;
         }
-        self.append_region(&uri, source, &occurrence.analysis, cursor..source.len())
+        self.append_region(&uri, id, source, &occurrence.analysis, cursor..source.len())
     }
 
     fn append_region(
         &mut self,
         uri: &Url,
+        occurrence: OccurrenceId,
         source: &str,
         decisions: &ConditionalAnalysis,
         range: Range<usize>,
@@ -1159,9 +1160,12 @@ impl Mapping<'_> {
                 .saturating_add(decisions.directives.len()),
         )?;
         let start = self.result.expanded.text().len();
-        self.result
-            .expanded
-            .push_physical_range(uri.clone(), &source[range.clone()], range.start);
+        self.result.expanded.push_physical_range(
+            uri.clone(),
+            &source[range.clone()],
+            range.start,
+            Some(occurrence),
+        );
         self.projection
             .projected_source
             .push_str(&decisions.projected_source[range.clone()]);

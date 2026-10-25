@@ -84,6 +84,17 @@ pub(in crate::workspace) mod tests {
         buffers: &[(&str, &str)],
         open: &[&str],
     ) -> Indexed {
+        index_with_edits(files, buffers, &[], open)
+    }
+
+    /// `index_with_buffers`, with `deleted` files removed in the editor but
+    /// still on disk.
+    pub(in crate::workspace) fn index_with_edits(
+        files: &[(&str, &[u8])],
+        buffers: &[(&str, &str)],
+        deleted: &[&str],
+        open: &[&str],
+    ) -> Indexed {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         for (name, bytes) in files {
@@ -103,6 +114,9 @@ pub(in crate::workspace) mod tests {
                 1,
             )
             .unwrap();
+        }
+        for name in deleted {
+            main.remember_deleted(&Url::from_file_path(root.join(name)).unwrap());
         }
         let mut workspace = Workspace::from_analysis_input(&main.analysis_input());
         for name in open {

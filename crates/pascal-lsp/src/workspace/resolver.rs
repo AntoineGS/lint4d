@@ -452,7 +452,22 @@ impl SourceStore for LspSourceStore {
         budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<pascal_core::compile_time::AdmittedOwned<DirectoryListing>, SourceStoreError> {
-        let listing = self.disk.list_directory_admitted(request, budget, cancel)?;
+        let listing = match self.disk.list_directory_admitted(request, budget, cancel) {
+            Ok(listing) => listing,
+            Err(SourceStoreError::NotFound { path }) => {
+                if let Some(capture) = &self.capture {
+                    let empty = DirectoryListing {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                        stamp: None,
+                        complete: true,
+                    };
+                    capture.listed(request.directory, &empty, false);
+                }
+                return Err(SourceStoreError::NotFound { path });
+            }
+            Err(error) => return Err(error),
+        };
         let overlays = || {
             self.overlays.keys().filter(|path| {
                 path.parent()
@@ -544,6 +559,14 @@ impl SourceStore for LspSourceStore {
             // coordinate backing, without simultaneous worst-case decoders.
             #[cfg(test)]
             record_test_source_load(request.path);
+            if let Some(capture) = &self.capture
+                && self
+                    .deleted_overrides
+                    .get(request.path)
+                    .is_some_and(|stamp| super::disk_stamp(request.path) == *stamp)
+            {
+                capture.editor_deleted();
+            }
             let raw = self.disk.load_raw_admitted(request, budget, cancel)?;
             if let Some(capture) = &self.capture {
                 capture.loaded(&raw);
@@ -670,6 +693,18 @@ impl SourceStore for LspSourceStore {
                     complete: true,
                 })
             }
+            Err(SourceStoreError::NotFound { path }) => {
+                if let Some(capture) = &self.capture {
+                    let empty = DirectoryListing {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                        stamp: None,
+                        complete: true,
+                    };
+                    capture.listed(request.directory, &empty, false);
+                }
+                Err(SourceStoreError::NotFound { path })
+            }
             Err(error) => Err(error),
         }
     }
@@ -755,6 +790,9 @@ impl SourceStore for LspSourceStore {
             .get(&path)
             .is_some_and(|stamp| super::disk_stamp(&path) == *stamp)
         {
+            if let Some(capture) = &self.capture {
+                capture.editor_deleted();
+            }
             return Err(SourceStoreError::NotFound { path });
         }
 

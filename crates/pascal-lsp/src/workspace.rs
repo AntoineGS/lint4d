@@ -118,6 +118,7 @@ mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
+mod evidence;
 pub(crate) mod extract;
 mod facts;
 pub mod project_catalogue;

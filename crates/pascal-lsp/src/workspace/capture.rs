@@ -35,6 +35,9 @@ pub(crate) struct CapturedReads {
     pub(crate) payloads: Vec<CapturedPayload>,
     /// Reads past `MAX_CAPTURED_READS` were not recorded.
     pub(crate) overflowed: bool,
+    /// The store answered `NotFound` for a file the disk still has, because
+    /// the editor deleted it.
+    pub(crate) editor_deleted: bool,
 }
 
 pub(crate) enum ListingCapture<'a> {
@@ -110,6 +113,14 @@ impl ReadCapture {
             content: SourceContent::from_bytes(&source.bytes),
         };
         self.push(|reads| reads.payloads.push(payload));
+    }
+
+    /// The store hid a file the disk still has: an editor deletion.
+    pub(crate) fn editor_deleted(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .editor_deleted = true;
     }
 
     fn push(&self, record: impl FnOnce(&mut CapturedReads)) {

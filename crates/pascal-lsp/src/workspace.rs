@@ -113,6 +113,7 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
+pub(crate) mod capture;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;

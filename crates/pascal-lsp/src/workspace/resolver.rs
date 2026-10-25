@@ -95,6 +95,7 @@ pub(crate) struct LspSourceStore {
     context: Arc<ProjectContext>,
     project_cache: crate::project_cache::ProjectCache,
     disk: FilesystemSourceStore,
+    capture: Option<Arc<super::capture::ReadCapture>>,
 }
 
 pub(crate) fn decode_source_bytes(bytes: &[u8]) -> String {
@@ -314,7 +315,25 @@ impl LspSourceStore {
             context,
             project_cache: input.project_cache.clone(),
             disk: FilesystemSourceStore::new(),
+            capture: None,
         }
+    }
+
+    /// Record every disk listing and payload this store (and its clones)
+    /// serves into `capture`.
+    pub(crate) fn with_capture(mut self, capture: Arc<super::capture::ReadCapture>) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+
+    fn captured_load(
+        &self,
+        loaded: Result<LoadedSource, SourceStoreError>,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        if let (Some(capture), Ok(source)) = (&self.capture, &loaded) {
+            capture.loaded(source);
+        }
+        loaded
     }
 
     pub(crate) fn uri_for_path(&self, path: &Path) -> Option<Url> {
@@ -441,6 +460,11 @@ impl SourceStore for LspSourceStore {
                     && self.context.path_entry_for(path).is_some()
             })
         };
+        if let Some(capture) = &self.capture {
+            let overlay =
+                overlays().any(|path| !listing.files.iter().any(|f| path_equivalent(f, path)));
+            capture.listed(request.directory, &listing, overlay);
+        }
         let count = listing.files.len() + overlays().count();
         let bytes = listing
             .files
@@ -521,6 +545,9 @@ impl SourceStore for LspSourceStore {
             #[cfg(test)]
             record_test_source_load(request.path);
             let raw = self.disk.load_raw_admitted(request, budget, cancel)?;
+            if let Some(capture) = &self.capture {
+                capture.loaded(&raw);
+            }
             return admit_decoded_source(raw, budget, cancel);
         }
         let size = if let Some(overlay) = self.overlays.get(request.path) {
@@ -533,7 +560,8 @@ impl SourceStore for LspSourceStore {
                         .read_policy
                         .allows_legacy_payload_entry(request.entry))
             {
-                return self.disk.load_admitted(request, budget, cancel);
+                let loaded = self.disk.load_admitted(request, budget, cancel);
+                return self.captured_load(loaded);
             }
             let metadata = std::fs::metadata(request.path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -606,6 +634,13 @@ impl SourceStore for LspSourceStore {
         let overlay_children = self.overlay_children(request.directory);
         match self.disk.list_directory(request, cancel) {
             Ok(mut listing) => {
+                if let Some(capture) = &self.capture {
+                    let overlay = overlay_children
+                        .0
+                        .iter()
+                        .any(|path| !listing.files.iter().any(|f| path_equivalent(f, path)));
+                    capture.listed(request.directory, &listing, overlay);
+                }
                 for path in overlay_children.0 {
                     if !listing
                         .files
@@ -619,6 +654,15 @@ impl SourceStore for LspSourceStore {
                 Ok(listing)
             }
             Err(SourceStoreError::NotFound { path }) if !overlay_children.0.is_empty() => {
+                if let Some(capture) = &self.capture {
+                    let empty = DirectoryListing {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                        stamp: None,
+                        complete: true,
+                    };
+                    capture.listed(request.directory, &empty, true);
+                }
                 Ok(DirectoryListing {
                     files: overlay_children.0,
                     directories: overlay_children.1,
@@ -723,7 +767,7 @@ impl SourceStore for LspSourceStore {
                     reason: "disk source is outside the requester-scoped project roots".to_string(),
                 });
             }
-            return self
+            let loaded = self
                 .disk
                 .load(
                     SourceRequest {
@@ -737,13 +781,15 @@ impl SourceStore for LspSourceStore {
                     cancel,
                 )
                 .map(with_decoded_text);
+            return self.captured_load(loaded);
         };
         let entry = ProjectPathEntry {
             path,
             provenance: request.entry.provenance.clone(),
         };
         let _context_entry_matches = path_equivalent(&context_entry.path, &entry.path);
-        self.disk
+        let loaded = self
+            .disk
             .load(
                 SourceRequest {
                     path: &entry.path,
@@ -755,7 +801,8 @@ impl SourceStore for LspSourceStore {
                 },
                 cancel,
             )
-            .map(with_decoded_text)
+            .map(with_decoded_text);
+        self.captured_load(loaded)
     }
 }
 
@@ -1337,7 +1384,7 @@ fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(&absolute_path(path.to_path_buf())).replace('\\', "/")
 }
 
-fn path_equivalent(left: &Path, right: &Path) -> bool {
+pub(super) fn path_equivalent(left: &Path, right: &Path) -> bool {
     path_key(left) == path_key(right)
 }
 

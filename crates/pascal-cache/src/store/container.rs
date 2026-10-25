@@ -143,18 +143,58 @@ fn classify_container(
     }
 }
 
+/// Where a test may let another opener act.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookPoint {
+    Inspected,
+    BeforeWal,
+    WalBusy,
+}
+
+#[cfg(test)]
+type Hook = Box<dyn FnMut(HookPoint)>;
+
+#[cfg(test)]
+thread_local! {
+    static HOOK: std::cell::RefCell<Option<Hook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_hook(hook: Hook) {
+    HOOK.set(Some(hook));
+}
+
+/// The hook is taken while it runs, so an opener it starts does not reenter it.
+#[cfg(test)]
+fn run_hook(point: HookPoint) {
+    if let Some(mut hook) = HOOK.take() {
+        hook(point);
+        HOOK.with_borrow_mut(|slot| {
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
 /// Read-only inspection: nothing is written to a file that is not ours.
+/// The header and schema are read in one statement, so one snapshot: read
+/// separately, a creation committed between them looks foreign.
 fn inspect(connection: &Connection) -> Result<Container, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let application_id: i64 = connection
-        .pragma_query_value(None, "application_id", |row| row.get(0))
+    let (application_id, user_version, tables): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT application_id FROM pragma_application_id), \
+             (SELECT user_version FROM pragma_user_version), \
+             (SELECT count(*) FROM sqlite_schema)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .map_err(fail)?;
-    let user_version: i64 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(fail)?;
-    let tables: i64 = connection
-        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
-        .map_err(fail)?;
+    #[cfg(test)]
+    run_hook(HookPoint::Inspected);
     let container = classify_container(application_id, user_version, tables)?;
     if container == Container::Current {
         let version: Option<i64> = connection
@@ -188,10 +228,9 @@ pub(crate) fn prepare_container(
             .pragma_update(None, "auto_vacuum", "INCREMENTAL")
             .map_err(fail)?;
     }
-    limit_wait(connection, deadline)?;
-    let mode: String = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-        .map_err(fail)?;
+    #[cfg(test)]
+    run_hook(HookPoint::BeforeWal);
+    let mode = switch_to_wal(connection, deadline)?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(Bypass::WalUnavailable);
     }
@@ -199,6 +238,30 @@ pub(crate) fn prepare_container(
         create(connection, deadline)?;
     }
     Ok(())
+}
+
+/// The switch reads the header, then upgrades to a write lock while holding
+/// that read, and SQLite does not wait on that upgrade (a holder of a read
+/// lock waiting for a writer may be what blocks it). So a busy switch waits
+/// for the writer through an immediate transaction, which does wait, then
+/// tries again.
+fn switch_to_wal(connection: &mut Connection, deadline: Deadline) -> Result<String, Bypass> {
+    loop {
+        limit_wait(connection, deadline)?;
+        match connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
+            Ok(mode) => return Ok(mode),
+            Err(error) => {
+                let bypass = classify(&error);
+                if bypass != Bypass::Busy {
+                    return Err(bypass);
+                }
+            }
+        }
+        #[cfg(test)]
+        run_hook(HookPoint::WalBusy);
+        let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
+        transaction.commit().map_err(|error| classify(&error))?;
+    }
 }
 
 fn create(connection: &mut Connection, deadline: Deadline) -> Result<(), Bypass> {
@@ -430,6 +493,48 @@ mod tests {
             .query_row("SELECT count(*) FROM store_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_container_created_during_inspection_is_not_foreign() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        let mut connection = connect(&path);
+        let creator = path.clone();
+        let mut created = false;
+        set_hook(Box::new(move |point| {
+            if point == HookPoint::Inspected && !created {
+                created = true;
+                prepare_container(&mut connect(&creator), deadline()).unwrap();
+            }
+        }));
+        assert_eq!(prepare_container(&mut connection, deadline()), Ok(()));
+        let rows: i64 = connection
+            .query_row("SELECT count(*) FROM store_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_wal_switch_waits_for_a_concurrent_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        let mut connection = connect(&path);
+        let writer = connect(&path);
+        // The writer takes the lock just before the switch and releases it
+        // once the switch has hit it.
+        set_hook(Box::new(move |point| match point {
+            HookPoint::BeforeWal => writer.execute_batch("BEGIN IMMEDIATE").unwrap(),
+            HookPoint::WalBusy if !writer.is_autocommit() => {
+                writer.execute_batch("COMMIT").unwrap()
+            }
+            _ => {}
+        }));
+        assert_eq!(prepare_container(&mut connection, deadline()), Ok(()));
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
     }
 
     #[test]

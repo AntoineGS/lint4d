@@ -47,7 +47,7 @@ impl ScratchBudget {
 }
 
 impl ScratchLease {
-    fn shrink_to(&mut self, bytes: u64) {
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
         let mut used = self
             .budget
             .used

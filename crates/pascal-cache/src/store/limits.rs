@@ -18,6 +18,10 @@ pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_SUPPLEMENTAL_BYTES: usize = 1024 * 1024;
 pub const MAX_INDEX_KEY_BYTES: usize = 4096;
 pub const MAX_INDEX_PAGE: usize = 256;
+/// Observations in one evidence set (spec §10: multi-row manifests).
+pub const MAX_EVIDENCE_OBSERVATIONS: usize = 65_536;
+/// Evidence sets one lookup considers for a subject.
+pub const MAX_EVIDENCE_CANDIDATES: usize = 16;
 /// `SQLITE_LIMIT_LENGTH`: SQLite refuses to materialize a longer value, so
 /// a planted oversized blob fails before it is copied.
 pub const SQLITE_LENGTH_LIMIT: i32 = 2 * 1024 * 1024;

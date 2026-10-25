@@ -1,8 +1,8 @@
 use super::Store;
 use super::keys::ArtifactKeyRef;
 use super::outcome::{Bypass, Lookup, Malformed, Miss, Published};
-use crate::ArtifactWrite;
 use crate::facts::{FactDecodeError, FactDecoder, encode_facts, encoded_content_bytes};
+use crate::{ArtifactHeader, ArtifactWrite, Digest};
 use pascal_core::facts::{ArtifactFacts, FactBudget};
 
 impl Store {
@@ -36,12 +36,31 @@ impl Store {
         key: ArtifactKeyRef<'_>,
         budget: &mut FactBudget,
     ) -> Result<Lookup<ArtifactFacts>, Bypass> {
-        let header = match self.open_artifact(key)? {
-            Lookup::Hit(header) => header,
-            Lookup::Miss(miss) => return Ok(Lookup::Miss(miss)),
-        };
+        match self.open_artifact(key)? {
+            Lookup::Hit(header) => self.load_facts_from(&header, budget),
+            Lookup::Miss(miss) => Ok(Lookup::Miss(miss)),
+        }
+    }
+
+    /// `load_facts` for the artifact validated evidence concluded.
+    pub fn load_facts_by_id(
+        &self,
+        id: Digest,
+        budget: &mut FactBudget,
+    ) -> Result<Lookup<ArtifactFacts>, Bypass> {
+        match self.open_artifact_by_id(id)? {
+            Lookup::Hit(header) => self.load_facts_from(&header, budget),
+            Lookup::Miss(miss) => Ok(Lookup::Miss(miss)),
+        }
+    }
+
+    fn load_facts_from(
+        &self,
+        header: &ArtifactHeader,
+        budget: &mut FactBudget,
+    ) -> Result<Lookup<ArtifactFacts>, Bypass> {
         let mut trial = *budget;
-        let mut reader = self.read_artifact(&header);
+        let mut reader = self.read_artifact(header);
         let mut decoder = FactDecoder::new(&mut trial);
         loop {
             match reader.next_batch()? {

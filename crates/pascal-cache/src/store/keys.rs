@@ -3,7 +3,10 @@ use super::limits::MAX_MANIFEST_BYTES;
 use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Miss, Published, TooLarge};
 use super::sqlite::{begin, classify, classify_read};
-use crate::{CanonicalKey, Digest, ExpandedArtifactKey, KeyRecord, LocalArtifactKey, Namespace};
+use crate::{
+    CanonicalKey, Digest, ExpandedArtifactKey, KeyKind, KeyRecord, LocalArtifactKey,
+    MANIFEST_DIGEST_CONTEXT, ManifestHeader, Mismatch, Namespace,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// An artifact key and, for an expanded artifact, the local key of its
@@ -137,6 +140,49 @@ pub(crate) fn admit_manifest(
         Ok(()) => Lookup::Hit(()),
         Err(mismatch) => Lookup::Miss(Miss::KeyMismatch(mismatch)),
     })
+}
+
+/// Admit the manifest stored under `digest` when only the digest is known:
+/// it must be of `kind` and hash to `digest`, which is what comparing it
+/// with a known key's manifest would establish.
+pub(crate) fn admit_manifest_by_digest(
+    connection: &Connection,
+    scope: Scope,
+    digest: Digest,
+    kind: KeyKind,
+) -> Result<Lookup<()>, Bypass> {
+    let stored = connection
+        .query_row(
+            "SELECT manifest FROM key_manifests \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND digest = ?3",
+            params![
+                scope.namespace.as_bytes().as_slice(),
+                epoch(scope),
+                digest.as_bytes().as_slice()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional();
+    let manifest = match stored {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+        Err(error) => return classify_read(&error).map(Lookup::Miss),
+    };
+    let mismatch = |mismatch| Ok(Lookup::Miss(Miss::KeyMismatch(mismatch)));
+    match ManifestHeader::parse(&manifest) {
+        Err(error) => return mismatch(Mismatch::Malformed(error)),
+        Ok(header) if header.kind != kind => {
+            return mismatch(Mismatch::KindDiffers {
+                expected: kind,
+                found: header.kind,
+            });
+        }
+        Ok(_) => {}
+    }
+    if Digest::derive(MANIFEST_DIGEST_CONTEXT, &manifest) != digest {
+        return mismatch(Mismatch::DigestDiffers);
+    }
+    Ok(Lookup::Hit(()))
 }
 
 impl Store {

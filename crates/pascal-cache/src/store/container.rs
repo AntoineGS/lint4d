@@ -5,13 +5,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 1;
+pub const CONTAINER_VERSION: i64 = 2;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 1. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 2. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
 const SCHEMA: &str = "
@@ -84,6 +84,44 @@ CREATE TABLE artifact_rows (
 CREATE INDEX artifact_rows_by_index_key
     ON artifact_rows (namespace_id, reset_epoch, row_kind, index_key, artifact_id, ordinal)
     WHERE index_key IS NOT NULL;
+
+CREATE TABLE evidence_sets (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    evidence_id BLOB NOT NULL CHECK (length(evidence_id) = 32),
+    context_key BLOB NOT NULL CHECK (length(context_key) = 32),
+    root_key BLOB NOT NULL CHECK (length(root_key) = 32),
+    artifact_id BLOB NOT NULL CHECK (length(artifact_id) = 32),
+    lifecycle INTEGER NOT NULL CHECK (lifecycle IN (1, 2)),
+    observation_count INTEGER NOT NULL CHECK (observation_count BETWEEN 0 AND 65536),
+    content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
+    PRIMARY KEY (namespace_id, reset_epoch, evidence_id),
+    FOREIGN KEY (namespace_id, reset_epoch, context_key)
+        REFERENCES key_manifests (namespace_id, reset_epoch, digest),
+    FOREIGN KEY (namespace_id, reset_epoch, root_key)
+        REFERENCES key_manifests (namespace_id, reset_epoch, digest),
+    FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
+        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id)
+) STRICT;
+
+CREATE INDEX evidence_by_subject
+    ON evidence_sets (namespace_id, reset_epoch, context_key, root_key, evidence_id);
+
+CREATE TABLE observations (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    evidence_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 3),
+    path_key BLOB NOT NULL CHECK (length(path_key) <= 4096),
+    payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
+    PRIMARY KEY (namespace_id, reset_epoch, evidence_id, ordinal),
+    FOREIGN KEY (namespace_id, reset_epoch, evidence_id)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id)
+) STRICT;
+
+CREATE INDEX observations_by_path
+    ON observations (namespace_id, reset_epoch, path_key, evidence_id);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,8 +279,10 @@ mod tests {
             [
                 "artifact_rows",
                 "artifacts",
+                "evidence_sets",
                 "key_manifests",
                 "namespaces",
+                "observations",
                 "retired_scopes",
                 "store_state"
             ]
@@ -286,12 +326,33 @@ mod tests {
         {
             let mut connection = connect(&path);
             prepare_container(&mut connection, deadline()).unwrap();
-            connection.pragma_update(None, "user_version", 2).unwrap();
+            connection
+                .pragma_update(None, "user_version", CONTAINER_VERSION + 1)
+                .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
             prepare_container(&mut connect(&path), deadline()),
-            Err(Bypass::UnsupportedContainer { version: 2 })
+            Err(Bypass::UnsupportedContainer {
+                version: CONTAINER_VERSION + 1
+            })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_version_1_container_is_bypassed_not_migrated() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        {
+            let mut connection = connect(&path);
+            prepare_container(&mut connection, deadline()).unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            prepare_container(&mut connect(&path), deadline()),
+            Err(Bypass::UnsupportedContainer { version: 1 })
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
@@ -421,8 +482,8 @@ mod tests {
     #[test]
     fn schema_bounds_match_the_store_limits() {
         use crate::store::limits::{
-            MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES,
-            MAX_ROW_BATCH_BYTES, MAX_SUPPLEMENTAL_BYTES,
+            MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_OBSERVATIONS,
+            MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_ROW_BATCH_BYTES, MAX_SUPPLEMENTAL_BYTES,
         };
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
@@ -432,7 +493,13 @@ mod tests {
                 "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
                  INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
                  INSERT INTO artifacts VALUES
-                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');",
+                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');
+                 INSERT INTO key_manifests VALUES
+                     (zeroblob(32), 0, CAST(zeroblob(31) || x'01' AS BLOB), 4, zeroblob(9));
+                 INSERT INTO evidence_sets VALUES
+                     (zeroblob(32), 0, zeroblob(32), CAST(zeroblob(31) || x'01' AS BLOB),
+                      zeroblob(32),
+                      zeroblob(32), 1, 0, 0);",
             )
             .unwrap();
         // Each statement takes the bound as ?1: accepted at the limit,
@@ -465,11 +532,30 @@ mod tests {
                  (zeroblob(32), 0, zeroblob(32), 0, 1, NULL, zeroblob(?1), zeroblob(32))",
                 MAX_ROW_BATCH_BYTES,
             ),
+            (
+                "UPDATE evidence_sets SET observation_count = ?1",
+                MAX_EVIDENCE_OBSERVATIONS,
+            ),
+            (
+                "UPDATE evidence_sets SET content_bytes = ?1",
+                MAX_ARTIFACT_CONTENT_BYTES,
+            ),
+            (
+                "INSERT INTO observations VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, zeroblob(?1), x'')",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "INSERT INTO observations VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, x'', zeroblob(?1))",
+                MAX_ROW_BATCH_BYTES,
+            ),
         ];
         for (sql, limit) in cases {
             let at = connection.execute(sql, [limit as i64]);
             assert!(at.is_ok(), "{sql} at {limit}: {at:?}");
             connection.execute("DELETE FROM artifact_rows", []).unwrap();
+            connection.execute("DELETE FROM observations", []).unwrap();
             let past = connection.execute(sql, [limit as i64 + 1]).unwrap_err();
             assert!(
                 past.to_string().contains("CHECK"),

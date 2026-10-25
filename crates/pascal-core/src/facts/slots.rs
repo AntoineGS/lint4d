@@ -54,9 +54,6 @@ pub enum SlotError {
 pub enum NotPersistable {
     /// Cancelled or limited: retry, never store as a stable result.
     Transient,
-    /// Compile-time evaluation consulted unit providers, which no artifact
-    /// key holds yet (`l4d-zf1b.5`).
-    ProviderDependent,
     /// The root came from an unsaved editor buffer (spec §4.4).
     OverlayRoot,
     /// An include came from an unsaved editor buffer (spec §4.4).
@@ -164,6 +161,9 @@ fn unresolved(target: &Resolution<LoadedSource>) -> UnresolvedInclude {
 }
 
 /// Whether facts derived from this session may be published.
+///
+/// Provider queries (`CompileTimeOutput::provider_queries`) do not refuse
+/// persistence; they make the key dependent (`pascal_cache::SessionDependence`).
 pub fn session_persistability(
     output: &CompileTimeOutput,
     slots: &[IncludeSlot<'_>],
@@ -187,9 +187,6 @@ pub fn session_persistability(
         .is_some_and(|root| matches!(root.source.revision, SourceRevision::Overlay { .. }))
     {
         return Err(NotPersistable::OverlayRoot);
-    }
-    if output.provider_queries > 0 {
-        return Err(NotPersistable::ProviderDependent);
     }
     for (index, slot) in slots.iter().enumerate() {
         if let IncludeSlotOutcome::Expanded { source, .. } = &slot.outcome

@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_dependent_compile_time_facts_are_not_persistable() {
+    fn provider_dependent_compile_time_facts_say_so() {
         let indexed = index(
             &[
                 (
@@ -333,14 +333,12 @@ mod tests {
             &["Main.pas"],
         );
         let source = indexed.facts("Main.pas");
-        assert_eq!(
-            source.extracted.persistable,
-            Err(NotPersistable::ProviderDependent)
-        );
+        assert_eq!(source.extracted.persistable, Ok(()));
         assert!(
-            !source.extracted.facts.declarations.is_empty(),
-            "the facts stay usable in memory"
+            source.extracted.provider_dependent,
+            "only a key holding its context and evidence may store these facts"
         );
+        assert!(!source.extracted.facts.declarations.is_empty());
     }
 
     #[test]
@@ -348,6 +346,7 @@ mod tests {
         let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
         let source = indexed.facts("Cond.pas");
         assert_eq!(source.extracted.persistable, Ok(()));
+        assert!(!source.extracted.provider_dependent);
         assert_eq!(
             source.origin,
             SourceOrigin::Library,

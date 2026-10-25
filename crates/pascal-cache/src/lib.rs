@@ -18,6 +18,7 @@ mod store;
 
 pub use artifact_key::{
     ExpandedArtifactKey, IncludeOccurrence, IncludeOutcome, KeyError, LocalArtifactKey,
+    SessionDependence,
 };
 pub use context_key::ContextKey;
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};

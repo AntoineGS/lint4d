@@ -177,17 +177,47 @@ impl CanonicalEncode for IncludeOccurrence {
     }
 }
 
+/// What makes an expansion's facts depend on more than its root and
+/// includes: compile-time evaluation that consulted unit providers. Those
+/// facts hold only under the context that resolved the providers and for
+/// the exact observations the session made, so both join the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionDependence {
+    /// The `ContextKey` digest.
+    pub context: Digest,
+    /// `observations_digest` of the session's evidence.
+    pub observations: Digest,
+}
+
 /// A root's local key plus its ordered include occurrences and topology.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpandedArtifactKey {
     key: CanonicalKey,
     root: Digest,
+    dependence: Option<SessionDependence>,
 }
 
 impl ExpandedArtifactKey {
     pub fn new(
         root: &LocalArtifactKey,
         occurrences: &[IncludeOccurrence],
+    ) -> Result<Self, KeyError> {
+        Self::build(root, occurrences, None)
+    }
+
+    /// Key an expansion whose facts also depend on `dependence`.
+    pub fn dependent(
+        root: &LocalArtifactKey,
+        occurrences: &[IncludeOccurrence],
+        dependence: SessionDependence,
+    ) -> Result<Self, KeyError> {
+        Self::build(root, occurrences, Some(dependence))
+    }
+
+    fn build(
+        root: &LocalArtifactKey,
+        occurrences: &[IncludeOccurrence],
+        dependence: Option<SessionDependence>,
     ) -> Result<Self, KeyError> {
         for (index, occurrence) in occurrences.iter().enumerate() {
             if let Some(parent) = occurrence.parent
@@ -209,9 +239,17 @@ impl ExpandedArtifactKey {
         encoder.seq(occurrences, |encoder, occurrence| {
             encoder.encode(occurrence)
         });
+        // Present only for a dependent key, so every other key keeps its
+        // phase-4 encoding.
+        if let Some(dependence) = &dependence {
+            encoder.field(3);
+            encoder.digest(&dependence.context);
+            encoder.digest(&dependence.observations);
+        }
         Ok(Self {
             key: CanonicalKey::finish(KeyKind::ExpandedArtifact, encoder),
             root: root.digest(),
+            dependence,
         })
     }
 
@@ -225,40 +263,22 @@ impl ExpandedArtifactKey {
         context: &ConditionalContext,
         slots: &[IncludeSlot<'_>],
     ) -> Result<Self, KeyError> {
-        let occurrences = slots
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| {
-                let outcome = match &slot.outcome {
-                    IncludeSlotOutcome::Expanded { source, .. } => {
-                        let SourceRevision::Disk { path_entry, .. } = &source.revision else {
-                            return Err(KeyError::OverlayInclude { occurrence: index });
-                        };
-                        IncludeOutcome::Resolved {
-                            source: SourceIdentity {
-                                canonical: source.path.clone(),
-                                logical: source.path.clone(),
-                                spelling: None,
-                                uri: None,
-                            },
-                            entry: Some(path_entry.clone()),
-                            content: SourceContent::from_bytes(&source.bytes),
-                        }
-                    }
-                    IncludeSlotOutcome::Unresolved(reason) => IncludeOutcome::Unresolved {
-                        reason: reason.clone(),
-                    },
-                };
-                Ok(IncludeOccurrence {
-                    parent: slot.parent.checked_sub(1).map(|parent| parent as usize),
-                    directive_range: slot.directive.start as u64..slot.directive.end as u64,
-                    directive: slot.written.to_owned(),
-                    inherited: context.clone(),
-                    outcome,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::new(root, &occurrences)
+        Self::new(root, &slot_occurrences(context, slots)?)
+    }
+
+    /// Key the expansion a compile-time session performed. Every occurrence
+    /// inherits `context`, the root's effective environment: the state at a
+    /// directive is a function of the root, that environment and the earlier
+    /// occurrences, all of which the key holds. The session observed one path
+    /// per included source; it is both its canonical and logical identity.
+    /// This is the key for a session that consulted providers.
+    pub fn dependent_from_slots(
+        root: &LocalArtifactKey,
+        context: &ConditionalContext,
+        slots: &[IncludeSlot<'_>],
+        dependence: SessionDependence,
+    ) -> Result<Self, KeyError> {
+        Self::dependent(root, &slot_occurrences(context, slots)?, dependence)
     }
 
     pub fn key(&self) -> &CanonicalKey {
@@ -273,4 +293,48 @@ impl ExpandedArtifactKey {
     pub fn root_digest(&self) -> Digest {
         self.root
     }
+
+    /// What this key holds beyond its root and includes, if anything.
+    pub fn dependence(&self) -> Option<SessionDependence> {
+        self.dependence
+    }
+}
+
+fn slot_occurrences(
+    context: &ConditionalContext,
+    slots: &[IncludeSlot<'_>],
+) -> Result<Vec<IncludeOccurrence>, KeyError> {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let outcome = match &slot.outcome {
+                IncludeSlotOutcome::Expanded { source, .. } => {
+                    let SourceRevision::Disk { path_entry, .. } = &source.revision else {
+                        return Err(KeyError::OverlayInclude { occurrence: index });
+                    };
+                    IncludeOutcome::Resolved {
+                        source: SourceIdentity {
+                            canonical: source.path.clone(),
+                            logical: source.path.clone(),
+                            spelling: None,
+                            uri: None,
+                        },
+                        entry: Some(path_entry.clone()),
+                        content: SourceContent::from_bytes(&source.bytes),
+                    }
+                }
+                IncludeSlotOutcome::Unresolved(reason) => IncludeOutcome::Unresolved {
+                    reason: reason.clone(),
+                },
+            };
+            Ok(IncludeOccurrence {
+                parent: slot.parent.checked_sub(1).map(|parent| parent as usize),
+                directive_range: slot.directive.start as u64..slot.directive.end as u64,
+                directive: slot.written.to_owned(),
+                inherited: context.clone(),
+                outcome,
+            })
+        })
+        .collect()
 }

@@ -1,6 +1,5 @@
 //! What one analysis read from disk, with durable digests, as the source
 //! store saw it (spec §7). `workspace::evidence` builds evidence from it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use pascal_cache::{Digest, SourceContent, listing_digest};
 use pascal_core::resolver::{DirectoryListing, LoadedSource, SourceRevision};

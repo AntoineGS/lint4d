@@ -5,7 +5,6 @@
 //! payload is read the strict way the resolver reads one without a legacy
 //! route: an `Observation` does not record whether a route was used, and
 //! the strict form can only turn a hit into a miss.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::project_cache::{ProjectCache, Proven};
 use crate::workspace::rename::OverlayInput;

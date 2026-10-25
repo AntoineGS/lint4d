@@ -1,5 +1,4 @@
 //! Durable evidence of what a compile-time session consulted (spec §7).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::Workspace;
 use super::capture::{CapturedReads, ListingCapture};

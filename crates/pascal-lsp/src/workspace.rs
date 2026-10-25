@@ -121,6 +121,7 @@ pub(crate) mod compile_time;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+mod persist;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;

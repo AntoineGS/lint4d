@@ -5296,6 +5296,7 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
+        workspace.begin_request();
         if matches!(
             &request,
             AnalysisRequest::ProjectContext { .. }

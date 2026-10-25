@@ -2257,6 +2257,10 @@ pub(crate) struct ContextState {
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
     system_pas_search_stamps: Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    /// Set when discovery built this state, cleared when the request ends
+    /// (`analysis_input`, `apply_navigation_state`). Binding gates trust an
+    /// unsettled-but-equal stamp only while it is set.
+    built_this_request: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -2272,6 +2276,7 @@ impl Clone for ContextState {
             project_candidate_memberships: self.project_candidate_memberships.clone(),
             project_read_observations: self.project_read_observations.clone(),
             system_pas_search_stamps: Mutex::new(lock(&self.system_pas_search_stamps).clone()),
+            built_this_request: AtomicBool::new(self.built_this_request.load(Ordering::Relaxed)),
         }
     }
 }
@@ -3026,7 +3031,7 @@ impl Workspace {
     /// content worker. This path performs no filesystem access; URI and binding
     /// authorization are still required before a snapshot is created.
     pub(crate) fn compiled_virtual_document_snapshot(
-        &self,
+        &mut self,
         uri: &Url,
     ) -> Option<CompiledContentSnapshot> {
         let (fingerprint, _, _) = virtual_unit_identity(uri)?;
@@ -3049,20 +3054,43 @@ impl Workspace {
                         })
                     })
         })?;
-        let key = self.document_contexts.get(&binding.importer)?;
+        let importer = binding.importer.clone();
+        let importer_source_hash = binding.importer_source_hash;
+        let context_fingerprint = binding.context_fingerprint;
+        let key = self.document_contexts.get(&importer)?.clone();
+        let state = self.contexts.get(&key)?;
+        if !context_state_is_fresh_for_binding_with_cancel(state, None, None).ok()? {
+            // Inputs that still compare equal but were unsettled when last
+            // read are re-obtained from current inputs, not reported absent.
+            // A state whose inputs moved stays refused.
+            if !context_state_is_fresh_with_cancel_ignoring_paths(
+                state,
+                None,
+                &[],
+                &[],
+                None,
+                false,
+            )
+            .ok()?
+            {
+                return None;
+            }
+            self.context_for_uri(&importer).ok()?;
+        }
+        let key = self.document_contexts.get(&importer)?;
         let context = self.contexts.get(key)?.clone();
         let unit = self.compiled_units.get(uri)?.clone();
         (unit.document.uri() == uri).then(|| CompiledContentSnapshot {
             uri: uri.clone(),
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
-            importer: binding.importer.clone(),
-            importer_source_hash: binding.importer_source_hash,
-            context_fingerprint: binding.context_fingerprint,
+            importer: importer.clone(),
+            importer_source_hash,
+            context_fingerprint,
             context,
             open_source: self
                 .open_documents
-                .get(&binding.importer)
+                .get(&importer)
                 .and_then(|document| document.text.clone()),
             unit,
         })
@@ -3082,7 +3110,11 @@ impl Workspace {
             || crate::navigation::compiled_dcu::project_context_fingerprint(
                 &snapshot.context.context,
             ) != fingerprint
-            || !context_state_is_current_with_cancel(&snapshot.context, Some(cancel), None)?
+            || !context_state_is_fresh_for_binding_with_cancel(
+                &snapshot.context,
+                Some(cancel),
+                None,
+            )?
         {
             return Ok(None);
         }
@@ -3145,7 +3177,7 @@ impl Workspace {
                     .filter(|state| {
                         crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                             == fingerprint
-                            && context_state_is_current_with_cancel(state, None, None)
+                            && context_state_is_fresh_for_binding_with_cancel(state, None, None)
                                 .is_ok_and(|fresh| fresh)
                     })
                     .map(|_| importer.clone())
@@ -3186,7 +3218,8 @@ impl Workspace {
             if !state.context.discovery_complete()
                 || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                     != fingerprint
-                || !context_state_is_current_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                || !context_state_is_fresh_for_binding_with_cancel(state, None, None)
+                    .is_ok_and(|fresh| fresh)
                 || !seen.insert(fingerprint)
             {
                 continue;
@@ -3506,6 +3539,14 @@ impl Workspace {
         }
     }
 
+    /// A request starts: the context states built so far belong to earlier
+    /// requests, so binding gates no longer trust their unsettled stamps.
+    pub(crate) fn begin_request(&self) {
+        for state in self.contexts.values() {
+            state.built_this_request.store(false, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
         for (key, incoming) in state.contexts {
             let preserve_existing = !incoming.context.discovery_complete()
@@ -3558,7 +3599,8 @@ impl Workspace {
                 return false;
             }
             let fresh = *fresh.get_or_insert_with(|| {
-                context_state_is_current_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                context_state_is_fresh_for_binding_with_cancel(state, None, None)
+                    .is_ok_and(|fresh| fresh)
             });
             fresh
                 && importer_hashes
@@ -3579,6 +3621,9 @@ impl Workspace {
             compiled_provider_bindings.clear();
         }
         self.compiled_provider_bindings = compiled_provider_bindings;
+        for state in self.contexts.values() {
+            state.built_this_request.store(false, Ordering::Relaxed);
+        }
         let retained_compiled_bytes = self
             .compiled_units
             .values()
@@ -10759,6 +10804,7 @@ impl Workspace {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
+            *state.built_this_request.get_mut() = true;
         } else {
             self.contexts.insert(
                 key,
@@ -10769,6 +10815,7 @@ impl Workspace {
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
                     system_pas_search_stamps: Mutex::new(HashMap::new()),
+                    built_this_request: AtomicBool::new(true),
                 },
             );
         }
@@ -15021,16 +15068,17 @@ fn context_state_is_fresh_with_cancel(
     context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, true)
 }
 
-/// Like `context_state_is_fresh_with_cancel`, but an unsettled stamp that
-/// still equals the current one counts as current. For callers that gate
-/// bindings on a state this process built, not for reusing a state across
-/// requests: a state rebuilt within the settle window must not read as absent.
-fn context_state_is_current_with_cancel(
+/// Freshness for gates that decide whether bindings of a state survive.
+/// A state built in this request compares its own stamps with plain equality,
+/// so a rebuild inside the settle window does not read as absent. A state
+/// from an earlier request needs the same settled proof as any reuse.
+fn context_state_is_fresh_for_binding_with_cancel(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, false)
+    let built_here = state.built_this_request.load(Ordering::Relaxed);
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, !built_here)
 }
 
 fn context_state_is_fresh_with_cancel_ignoring_paths(
@@ -15069,7 +15117,10 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         let unchanged = match (stamp, &actual) {
             (Some(recorded), Some(current)) => {
                 if require_settled {
+                    // Equal content-checked inputs are verified by the
+                    // payload loop below, which proves what `settled` would.
                     recorded.proves_unchanged(current)
+                        || (recorded == current && path_is_content_checked(state, path))
                 } else {
                     recorded == current
                 }
@@ -15090,36 +15141,12 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
 
     for observation in &state.context_observations.metadata_observations {
         check_workspace_cancel(cancel)?;
-        let MetadataObservation::Payload { path, .. } = observation else {
+        let Some((_, read_limit)) = content_checked_payload(state, observation) else {
             continue;
         };
-        let is_system_pas = path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"));
-        if !(is_system_pas
-            || extension_is(path, "json")
-            || extension_is(path, "dproj")
-            || extension_is(path, "dpr")
-            || extension_is(path, "dpk")
-            || extension_is(path, "optset")
-            || extension_is(path, "props"))
-            || (!is_system_pas
-                && !state.project_read_observations.iter().any(|read| {
-                    package_paths_equal(&read.path, path) && read.content_bytes.is_some()
-                }))
-        {
-            continue;
-        }
         if let Some(budget) = budget {
             budget.charge_path_visits(1)?;
         }
-        let read_limit = if extension_is(path, "json") {
-            64 * 1024
-        } else if extension_is(path, "dpr") {
-            8 * 1024 * 1024
-        } else {
-            4 * 1024 * 1024
-        };
         if !metadata_payload_is_current_in_pass(observation, read_limit, budget)? {
             return Ok(false);
         }
@@ -15150,6 +15177,52 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
     Ok(true)
+}
+
+/// The path and read limit of a metadata payload that a freshness pass
+/// re-verifies by content.
+fn content_checked_payload<'a>(
+    state: &ContextState,
+    observation: &'a MetadataObservation,
+) -> Option<(&'a Path, u64)> {
+    let MetadataObservation::Payload { path, .. } = observation else {
+        return None;
+    };
+    let is_system_pas = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"));
+    if !(is_system_pas
+        || extension_is(path, "json")
+        || extension_is(path, "dproj")
+        || extension_is(path, "dpr")
+        || extension_is(path, "dpk")
+        || extension_is(path, "optset")
+        || extension_is(path, "props"))
+        || (!is_system_pas
+            && !state
+                .project_read_observations
+                .iter()
+                .any(|read| package_paths_equal(&read.path, path) && read.content_bytes.is_some()))
+    {
+        return None;
+    }
+    let read_limit = if extension_is(path, "json") {
+        64 * 1024
+    } else if extension_is(path, "dpr") {
+        8 * 1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    };
+    Some((path, read_limit))
+}
+
+fn path_is_content_checked(state: &ContextState, watched: &Path) -> bool {
+    state
+        .context_observations
+        .metadata_observations
+        .iter()
+        .filter_map(|observation| content_checked_payload(state, observation))
+        .any(|(path, _)| package_paths_equal(path, watched))
 }
 
 fn system_pas_search_is_current(
@@ -16219,6 +16292,7 @@ mod tests {
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: Mutex::new(HashMap::new()),
+            ..Default::default()
         };
         assert!(state(Vec::new()) != state(vec!["warning".to_string()]));
         assert!(state(vec!["warning".to_string()]) == state(vec!["warning".to_string()]));
@@ -18300,6 +18374,104 @@ mod tests {
 
         assert_eq!(reused, key);
         assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    /// A project whose `App.dproj` was just written, with a unit opened inside it.
+    fn unsettled_project_fixture() -> (tempfile::TempDir, Workspace, Url, ContextKey) {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>BEFORE</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("App.dpr"), "program App; begin end.").unwrap();
+        // Only the project file stays unsettled; the main source is not
+        // content-checked, so it would need a settled stamp.
+        pascal_project::backdate_for_test(&root.join("App.dpr"));
+        let source = "unit Extra;\ninterface\nimplementation\nend.\n";
+        fs::write(root.join("Extra.pas"), source).unwrap();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Extra.pas")).unwrap();
+        workspace
+            .open_document(uri.clone(), source.to_string(), 1)
+            .expect("open Extra.pas");
+        let key = workspace.document_contexts[&uri].clone();
+        (temp, workspace, uri, key)
+    }
+
+    #[test]
+    fn an_unsettled_context_whose_payloads_still_match_is_fresh() {
+        let (_temp, mut workspace, uri, key) = unsettled_project_fixture();
+        pascal_project::test_reset_project_discovery_counts();
+        assert_eq!(workspace.context_for_uri(&uri).expect("context"), key);
+        assert_eq!(
+            pascal_project::test_project_discovery_counts(),
+            (0, 0),
+            "a content-checked input need not be settled to prove the context"
+        );
+    }
+
+    #[test]
+    fn an_unsettled_context_rejects_a_same_size_rewrite_with_the_mtime_restored() {
+        let (temp, mut workspace, uri, key) = unsettled_project_fixture();
+        let project = temp.path().join("App.dproj");
+        let modified = fs::metadata(&project).unwrap().modified().unwrap();
+        let before = fs::read_to_string(&project).unwrap();
+        fs::write(&project, before.replace("BEFORE", "AFTER_")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&project)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            !workspace
+                .context_is_fresh_with_cancel(&key, None, None)
+                .expect("freshness")
+        );
+        pascal_project::test_reset_project_discovery_counts();
+        workspace.context_for_uri(&uri).expect("context");
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_binding_gate_trusts_an_unsettled_state_only_in_the_request_that_built_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri(&uri).expect("context");
+        let gate = |workspace: &Workspace| {
+            super::context_state_is_fresh_for_binding_with_cancel(
+                &workspace.contexts[&key],
+                None,
+                None,
+            )
+            .expect("gate")
+        };
+        assert!(gate(&workspace), "built in this request");
+
+        workspace.begin_request();
+        assert!(
+            !gate(&workspace),
+            "an unsettled state from an earlier request is not trusted"
+        );
+        pascal_project::test_reset_project_discovery_counts();
+        assert_eq!(workspace.context_for_uri(&uri).expect("context"), key);
+        assert_ne!(
+            pascal_project::test_project_discovery_counts(),
+            (0, 0),
+            "the lookup rediscovers instead of reporting the context absent"
+        );
+        assert!(gate(&workspace), "the rebuilt state is this request's own");
     }
 
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
@@ -22733,6 +22905,7 @@ BDS = '/fake/37'
             )]),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            ..Default::default()
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -22785,6 +22958,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             },
         );
         let changed =
@@ -23033,6 +23207,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             },
         );
         let incoming = (0..EXISTING)
@@ -23140,6 +23315,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             }),
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
@@ -25813,6 +25989,7 @@ BDS = '/fake/37'
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            ..Default::default()
         };
 
         assert!(

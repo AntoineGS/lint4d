@@ -543,6 +543,10 @@ pub enum ResolutionObservation {
         entry: ProjectPathEntry,
         stamp: Option<ProjectReadStamp>,
         complete: bool,
+        /// The directory was listed. An include search marks each directory
+        /// it consults with a stat-only observation (`false`) and lists it
+        /// only when the exact name misses there.
+        listed: bool,
     },
     Candidate {
         path: PathBuf,
@@ -5304,6 +5308,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: listing.stamp.clone(),
                 complete,
+                listed: true,
             }
         })?;
         if !complete {
@@ -5440,6 +5445,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: listing.stamp.clone(),
                 complete,
+                listed: true,
             },
         )?;
         if !complete {
@@ -6138,6 +6144,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: path_stamp_result(&entry.path).ok().flatten(),
                 complete: true,
+                listed: false,
             },
         )
     }
@@ -8944,6 +8951,19 @@ fn push_observation(
                 if *present {
                     *existing = observation;
                 }
+                return;
+            }
+        }
+        ResolutionObservation::Directory { path, entry, stamp, complete, listed } => {
+            // A listing and a search marker of the same directory state stay one
+            // observation; it is a listing when either was.
+            if let Some(ResolutionObservation::Directory { listed: existing, .. }) =
+                observations.iter_mut().find(|existing| {
+                    matches!(existing, ResolutionObservation::Directory { path: p, entry: e, stamp: s, complete: c, .. }
+                        if p == path && e == entry && s == stamp && c == complete)
+                })
+            {
+                *existing |= *listed;
                 return;
             }
         }

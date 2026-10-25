@@ -2,10 +2,12 @@
 
 use super::Workspace;
 use super::capture::{CapturedReads, ListingCapture};
+use super::resolver::path_equivalent;
 use lsp_types::Url;
 use pascal_cache::Observation;
 use pascal_core::resolver::{ResolutionObservation, SourceRevision};
 use pascal_project::ProjectObservations;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Why a session's inputs cannot be proven to another process. The facts
@@ -47,6 +49,7 @@ pub(crate) fn session_evidence(
     if reads.editor_state {
         return Err(EvidenceGap::Overlay);
     }
+    let searched = SearchedDirectories::of(observations, reads);
     let mut evidence = Vec::with_capacity(observations.len());
     for observation in observations {
         if cancel.load(Ordering::Relaxed) {
@@ -56,6 +59,14 @@ pub(crate) fn session_evidence(
             ResolutionObservation::Directory {
                 complete: false, ..
             } => return Err(EvidenceGap::Incomplete),
+            ResolutionObservation::Directory {
+                path,
+                listed: false,
+                ..
+            } if searched.proves(path) => continue,
+            ResolutionObservation::Directory { listed: false, .. } => {
+                return Err(EvidenceGap::Uncaptured);
+            }
             ResolutionObservation::Directory { path, entry, .. } => match reads.listing_of(path) {
                 ListingCapture::One(listing) if listing.overlay => {
                     return Err(EvidenceGap::Overlay);
@@ -113,6 +124,50 @@ pub(crate) fn session_evidence(
         });
     }
     Ok(evidence)
+}
+
+/// What proves an include search's stat-only marker of a directory it
+/// consulted (`Directory { listed: false }`). After an exact hit the resolver
+/// consults nothing else in that directory, so the hit's payload evidence,
+/// reread and authorized at validation, proves what the session learned
+/// there. Every directory where the exact name missed was listed by the
+/// case-insensitive fallback; that listing is its own observation and is
+/// proven by its capture.
+struct SearchedDirectories<'a> {
+    hit_parents: Vec<&'a Path>,
+    listed: Vec<&'a Path>,
+}
+
+impl<'a> SearchedDirectories<'a> {
+    fn of(observations: &'a [ResolutionObservation], reads: &CapturedReads) -> Self {
+        let mut searched = Self {
+            hit_parents: Vec::new(),
+            listed: Vec::new(),
+        };
+        for observation in observations {
+            match observation {
+                ResolutionObservation::Directory {
+                    path, listed: true, ..
+                } => searched.listed.push(path),
+                ResolutionObservation::Payload {
+                    path,
+                    revision: SourceRevision::Disk { content_hash, .. },
+                    ..
+                } if reads.payload_of(path, *content_hash).is_some() => {
+                    searched.hit_parents.extend(path.parent());
+                }
+                _ => {}
+            }
+        }
+        searched
+    }
+
+    fn proves(&self, directory: &Path) -> bool {
+        self.hit_parents
+            .iter()
+            .chain(&self.listed)
+            .any(|path| path_equivalent(path, directory))
+    }
 }
 
 impl Workspace {
@@ -249,6 +304,7 @@ mod tests {
             entry: entry.clone(),
             stamp: None,
             complete,
+            listed: true,
         };
         let captured = |listing: [u8; 32], overlay| CapturedListing {
             directory: directory.clone(),
@@ -345,6 +401,111 @@ mod tests {
         assert_eq!(
             session_evidence(&[], &deleted, &context, &AtomicBool::new(false)),
             Err(EvidenceGap::Overlay)
+        );
+    }
+
+    #[test]
+    fn a_search_marker_is_proven_by_the_hit_or_the_listing_in_its_directory() {
+        let directory = PathBuf::from("/w/include");
+        let entry = ProjectPathEntry::configured(directory.clone());
+        let directory_observation = |listed| ResolutionObservation::Directory {
+            path: directory.clone(),
+            entry: entry.clone(),
+            stamp: None,
+            complete: true,
+            listed,
+        };
+        let payload = |path: &str| ResolutionObservation::Payload {
+            source_id: pascal_core::SourceId::new(format!("source:{path}")),
+            path: PathBuf::from(path),
+            revision: pascal_core::SourceRevision::Disk {
+                stamp: pascal_project::ProjectReadStamp {
+                    bytes: 1,
+                    modified: None,
+                    is_dir: false,
+                    is_symlink: false,
+                    change: None,
+                    settled: false,
+                },
+                content_hash: 7,
+                read_policy: Default::default(),
+                path_entry: entry.clone(),
+            },
+        };
+        let captured_payload = |path: &str| CapturedPayload {
+            path: PathBuf::from(path),
+            content_hash: 7,
+            content: SourceContent::from_bytes(b"x"),
+        };
+        let context = ProjectObservations::default();
+        let evidence = |observations: &[ResolutionObservation], reads: &CapturedReads| {
+            session_evidence(observations, reads, &context, &AtomicBool::new(false))
+        };
+        let hit = CapturedReads {
+            payloads: vec![captured_payload("/w/include/Shared.inc")],
+            ..CapturedReads::default()
+        };
+        assert_eq!(
+            evidence(
+                &[
+                    directory_observation(false),
+                    payload("/w/include/Shared.inc")
+                ],
+                &hit
+            ),
+            Ok(vec![Observation::Payload {
+                path: PathBuf::from("/w/include/Shared.inc"),
+                entry: entry.clone(),
+                content: SourceContent::from_bytes(b"x"),
+            }]),
+            "the exact hit proves its directory's marker"
+        );
+        assert_eq!(
+            evidence(&[directory_observation(false)], &CapturedReads::default()),
+            Err(EvidenceGap::Uncaptured)
+        );
+        // A hit elsewhere, or a payload the capture did not see, proves nothing here.
+        let elsewhere = CapturedReads {
+            payloads: vec![captured_payload("/w/Shared.inc")],
+            ..CapturedReads::default()
+        };
+        assert_eq!(
+            evidence(
+                &[directory_observation(false), payload("/w/Shared.inc")],
+                &elsewhere
+            ),
+            Err(EvidenceGap::Uncaptured)
+        );
+        assert_eq!(
+            evidence(
+                &[
+                    directory_observation(false),
+                    payload("/w/include/Shared.inc")
+                ],
+                &CapturedReads::default()
+            ),
+            Err(EvidenceGap::Uncaptured)
+        );
+        // A miss is listed by the fallback; that listing is the evidence.
+        let listing = CapturedReads {
+            listings: vec![CapturedListing {
+                directory: directory.clone(),
+                listing: Digest::from_bytes([1; 32]),
+                complete: true,
+                overlay: false,
+            }],
+            ..CapturedReads::default()
+        };
+        assert_eq!(
+            evidence(
+                &[directory_observation(false), directory_observation(true)],
+                &listing
+            ),
+            Ok(vec![Observation::Listing {
+                path: directory.clone(),
+                entry: entry.clone(),
+                listing: Digest::from_bytes([1; 32]),
+            }])
         );
     }
 

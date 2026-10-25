@@ -227,6 +227,66 @@ mod tests {
     }
 
     #[test]
+    fn an_include_found_on_the_first_hit_captures_its_payload_and_every_listing() {
+        let indexed = index(
+            &[
+                ("App.dproj", DPROJ),
+                (
+                    "Main.pas",
+                    b"unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n",
+                ),
+                ("include/Shared.inc", SHARED),
+            ],
+            &["Main.pas"],
+        );
+        let expanded = &indexed.workspace.expansions[&indexed.uri("Main.pas")].expanded;
+        let reads = expanded.reads.as_ref().unwrap();
+        let observations = &expanded.session.as_ref().unwrap().observations;
+        let captured_hit_under = |directory: &Path| {
+            observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    ResolutionObservation::Payload {
+                        path,
+                        revision: pascal_core::SourceRevision::Disk { content_hash, .. },
+                        ..
+                    } if path.parent() == Some(directory)
+                        && reads.payload_of(path, *content_hash).is_some()
+                )
+            })
+        };
+        let mut marked = 0;
+        for observation in observations {
+            match observation {
+                ResolutionObservation::Directory {
+                    path,
+                    complete: true,
+                    listed: true,
+                    ..
+                } => {
+                    let ListingCapture::One(captured) = reads.listing_of(path) else {
+                        panic!("{observation:?} was listed but not captured: {reads:?}")
+                    };
+                    assert_eq!(captured.listing, disk_listing(path), "{path:?}");
+                }
+                ResolutionObservation::Directory {
+                    path,
+                    listed: false,
+                    ..
+                } if path.ends_with("include") => {
+                    assert!(captured_hit_under(path), "{observation:?}: {reads:?}");
+                    marked += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            marked, 1,
+            "the include directory was searched: {observations:?}"
+        );
+    }
+
+    #[test]
     fn a_buffer_the_disk_lacks_marks_its_directory_listing() {
         let indexed = index_with_buffers(
             &[

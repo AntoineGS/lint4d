@@ -533,8 +533,7 @@ mod acceptance {
     use std::path::Path;
 
     const DPROJ: &str = "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>include</DCC_IncludePath><DCC_Define>FEATURE</DCC_Define></PropertyGroup></Project>";
-    const SHARED_MAIN: &[u8] =
-        b"unit Main;\ninterface\n{$I Shared.inc}\n{$I Missing.inc}\nimplementation\nend.\n";
+    const SHARED_MAIN: &[u8] = b"unit Main;\ninterface\n{$I Shared.inc}\nimplementation\nend.\n";
     const SHARED: &[u8] = b"const Shared = 1;\n";
 
     fn includes() -> Vec<(&'static str, Vec<u8>)> {

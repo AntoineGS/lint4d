@@ -1095,6 +1095,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
                 stamp,
                 complete: _,
                 entry: _,
+                listed: _,
             } => (path, stamp.clone(), false, true, None),
             ResolutionObservation::Candidate {
                 path,

@@ -32,6 +32,14 @@ impl SourceContent {
     pub fn encoding(&self) -> SourceEncoding {
         self.encoding
     }
+
+    pub(crate) fn from_parts(digest: Digest, length: u64, encoding: SourceEncoding) -> Self {
+        Self {
+            digest,
+            length,
+            encoding,
+        }
+    }
 }
 
 impl CanonicalEncode for SourceEncoding {

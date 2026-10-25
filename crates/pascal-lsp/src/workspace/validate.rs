@@ -1,5 +1,10 @@
 //! Checks durable evidence against the current filesystem, under the
 //! current read policy and editor state (spec §7 steps 2-3).
+//!
+//! Authorization mirrors the resolver (Decision 9), except that every
+//! payload is read the strict way the resolver reads one without a legacy
+//! route: an `Observation` does not record whether a route was used, and
+//! the strict form can only turn a hit into a miss.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::project_cache::{ProjectCache, Proven};
@@ -137,12 +142,7 @@ impl<'a> Validator<'a> {
             return stale(Stale::Overlay);
         }
         let policy = self.inputs.read_policy;
-        let authorized = if legacy(entry) {
-            policy.allows_legacy_payload_entry(entry)
-        } else {
-            policy.allows_entry(entry)
-        };
-        if !authorized {
+        if !policy.allows_location(entry) || !policy.allows_entry(entry) {
             return stale(Stale::Unauthorized);
         }
         let Ok(Some(before)) = path_stamp_result(path) else {
@@ -166,13 +166,8 @@ impl<'a> Validator<'a> {
         {
             return self.limited();
         }
-        let bytes = if legacy(entry) {
-            policy.read_legacy_payload_bytes(entry, limit as u64)
-        } else {
-            policy.read_payload_bytes(entry, limit as u64)
-        };
         // Unreadable, a symlink, too large: not the input the evidence saw.
-        let Ok(bytes) = bytes else {
+        let Ok(bytes) = policy.read_payload_bytes(entry, limit as u64) else {
             return stale(Stale::Content);
         };
         if self.budget.charge_file_bytes(bytes.len()).is_err() {
@@ -215,6 +210,8 @@ impl<'a> Validator<'a> {
     ) -> Check {
         let stale = |stale: fn(PathBuf) -> Stale| Check::Stale(stale(path.to_path_buf()));
         let policy = self.inputs.read_policy;
+        // The resolver lists a `LegacyNative` directory under the route form
+        // whether or not a legacy route led there.
         let authorized = if legacy(entry) {
             policy.allows_legacy_route_entry(entry)
         } else {
@@ -491,6 +488,56 @@ mod tests {
                 [Check::Stale(Stale::Content(_) | Stale::Unauthorized(_))]
             ));
         }
+    }
+
+    fn legacy_payload(path: PathBuf) -> Observation {
+        Observation::Payload {
+            entry: ProjectPathEntry::legacy(path.clone()),
+            content: SourceContent::from_bytes(&std::fs::read(&path).unwrap()),
+            path,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_legacy_payload_holds() {
+        let fixture = fixture();
+        let payload = legacy_payload(fixture.root.join("include/A.inc"));
+        assert_eq!(fixture.check(&[payload]).0, vec![Check::Holds]);
+    }
+
+    /// Without a legacy route the resolver reads a `LegacyNative` entry
+    /// strictly; the evidence does not record a route, so neither may follow
+    /// a symlink to the same bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_payload_behind_a_symlink_is_stale() {
+        let fixture = fixture();
+        let path = fixture.root.join("include/A.inc");
+        let payload = legacy_payload(path.clone());
+        let copy = fixture.root.join("A.copy");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&copy, &path).unwrap();
+        assert_eq!(
+            fixture.check(&[payload]).0,
+            vec![Check::Stale(Stale::Unauthorized(path))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_payload_under_a_symlinked_directory_is_stale() {
+        let fixture = fixture();
+        let path = fixture.root.join("include/A.inc");
+        let payload = legacy_payload(path.clone());
+        let include = fixture.root.join("include");
+        let moved = fixture.root.join("real-include");
+        std::fs::rename(&include, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &include).unwrap();
+        assert_eq!(
+            fixture.check(&[payload]).0,
+            vec![Check::Stale(Stale::Unauthorized(path))]
+        );
     }
 
     #[cfg(unix)]

@@ -160,7 +160,7 @@ fn an_overlay_root_is_not_persistable() {
 }
 
 #[test]
-fn provider_lookups_are_not_persistable() {
+fn provider_lookups_are_counted_and_do_not_refuse_persistence() {
     let mut f = Fixture::new(
         "unit Main; interface uses Other; {$IF Other.Early}{$DEFINE EARLY}{$ENDIF} implementation end.",
         context(LayoutPlatform::Win32),
@@ -173,10 +173,8 @@ fn provider_lookups_are_not_persistable() {
     f.disk_root();
     let analysis = f.analyze().unwrap();
     assert!(analysis.provider_queries > 0);
-    assert_eq!(
-        session_persistability(&analysis, &[]),
-        Err(NotPersistable::ProviderDependent)
-    );
+    // The key, not this rule, makes the providers part of what is stored.
+    assert_eq!(session_persistability(&analysis, &[]), Ok(()));
 
     let mut f = Fixture::new(
         "unit T; interface {$IFDEF X}{$ENDIF} implementation end.",

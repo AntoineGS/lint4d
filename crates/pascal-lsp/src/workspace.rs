@@ -113,12 +113,15 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
+pub(crate) mod capture;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
+mod evidence;
 pub(crate) mod extract;
 mod facts;
+mod persist;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;
@@ -126,6 +129,7 @@ pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
 pub(crate) mod signature;
+mod validate;
 
 pub(super) fn conditional_context_for_path(
     context: &ProjectContext,
@@ -1334,7 +1338,7 @@ pub enum FileChange {
     Deleted,
 }
 
-const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
+pub(crate) const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
 const MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_RECONCILIATION_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES: usize = 16 * 1024 * 1024;
@@ -2057,13 +2061,42 @@ struct DiskSource {
     content_hash: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
+
+#[derive(Debug, Clone, Eq)]
 pub(crate) struct DiskStamp {
     bytes: u64,
     modified: Option<SystemTime>,
+    change: Option<pascal_project::ChangeIdentity>,
+    /// See `ProjectReadStamp::settled`; not part of equality.
+    settled: bool,
 }
 
-pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
+impl PartialEq for DiskStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.modified == other.modified && self.change == other.change
+    }
+}
+
+impl DiskStamp {
+    pub(crate) fn from_project(stamp: &PathStamp) -> Self {
+        Self {
+            bytes: stamp.bytes,
+            modified: stamp.modified,
+            change: stamp.change,
+            settled: stamp.settled,
+        }
+    }
+
+    fn from_metadata(link: &fs::Metadata, target: &fs::Metadata) -> Self {
+        Self::from_project(&pascal_project::stamp_from_metadata(link, target))
+    }
+
+    /// `ProjectReadStamp::proves_unchanged` for a closed source file.
+    pub(crate) fn proves_unchanged(&self, current: &Self) -> bool {
+        self.settled && self == current
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct DirectoryCatalogue {
@@ -2228,6 +2261,10 @@ pub(crate) struct ContextState {
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
     system_pas_search_stamps: Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    /// The request generation (`Workspace::request_generation`) that built
+    /// this state, `None` for a state nothing built. Binding gates trust an
+    /// unsettled-but-equal stamp only while this equals the current generation.
+    built_generation: Option<u64>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -2243,6 +2280,7 @@ impl Clone for ContextState {
             project_candidate_memberships: self.project_candidate_memberships.clone(),
             project_read_observations: self.project_read_observations.clone(),
             system_pas_search_stamps: Mutex::new(lock(&self.system_pas_search_stamps).clone()),
+            built_generation: self.built_generation,
         }
     }
 }
@@ -2370,6 +2408,7 @@ pub(crate) struct CompiledContentSnapshot {
     uri: Url,
     source_generation: u64,
     configuration_generation: u64,
+    request_generation: u64,
     importer: Url,
     importer_source_hash: u64,
     context_fingerprint: u64,
@@ -2905,6 +2944,9 @@ pub struct Workspace {
     diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
+    /// Advanced once per message the server dispatches, before its handler
+    /// runs. Jobs record the generation they were spawned under.
+    request_generation: u64,
     source_change_generations: HashMap<Url, u64>,
     source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
     configuration_change_generations: HashMap<Url, u64>,
@@ -2994,10 +3036,13 @@ struct SharedLintResult {
 
 impl Workspace {
     /// Capture only the bounded, already-authorized immutable data needed by a
-    /// content worker. This path performs no filesystem access; URI and binding
-    /// authorization are still required before a snapshot is created.
+    /// content worker. URI and binding authorization are still required before
+    /// a snapshot is created. The importer's context is checked for freshness,
+    /// which stats its watched files and re-verifies content-checked inputs;
+    /// when the context is unproven but its inputs still compare equal, it is
+    /// re-obtained through `context_for_uri`, which may run discovery.
     pub(crate) fn compiled_virtual_document_snapshot(
-        &self,
+        &mut self,
         uri: &Url,
     ) -> Option<CompiledContentSnapshot> {
         let (fingerprint, _, _) = virtual_unit_identity(uri)?;
@@ -3020,20 +3065,51 @@ impl Workspace {
                         })
                     })
         })?;
-        let key = self.document_contexts.get(&binding.importer)?;
+        let importer = binding.importer.clone();
+        let importer_source_hash = binding.importer_source_hash;
+        let context_fingerprint = binding.context_fingerprint;
+        let key = self.document_contexts.get(&importer)?.clone();
+        let state = self.contexts.get(&key)?;
+        if !context_state_is_fresh_for_binding_with_cancel(
+            state,
+            self.request_generation,
+            None,
+            None,
+        )
+        .ok()?
+        {
+            // Inputs that still compare equal but were unsettled when last
+            // read are re-obtained from current inputs, not reported absent.
+            // A state whose inputs moved stays refused.
+            if !context_state_is_fresh_with_cancel_ignoring_paths(
+                state,
+                None,
+                &[],
+                &[],
+                None,
+                false,
+            )
+            .ok()?
+            {
+                return None;
+            }
+            self.context_for_uri(&importer).ok()?;
+        }
+        let key = self.document_contexts.get(&importer)?;
         let context = self.contexts.get(key)?.clone();
         let unit = self.compiled_units.get(uri)?.clone();
         (unit.document.uri() == uri).then(|| CompiledContentSnapshot {
             uri: uri.clone(),
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
-            importer: binding.importer.clone(),
-            importer_source_hash: binding.importer_source_hash,
-            context_fingerprint: binding.context_fingerprint,
+            request_generation: self.request_generation,
+            importer: importer.clone(),
+            importer_source_hash,
+            context_fingerprint,
             context,
             open_source: self
                 .open_documents
-                .get(&binding.importer)
+                .get(&importer)
                 .and_then(|document| document.text.clone()),
             unit,
         })
@@ -3053,7 +3129,12 @@ impl Workspace {
             || crate::navigation::compiled_dcu::project_context_fingerprint(
                 &snapshot.context.context,
             ) != fingerprint
-            || !context_state_is_fresh_with_cancel(&snapshot.context, Some(cancel), None)?
+            || !context_state_is_fresh_for_binding_with_cancel(
+                &snapshot.context,
+                snapshot.request_generation,
+                Some(cancel),
+                None,
+            )?
         {
             return Ok(None);
         }
@@ -3116,8 +3197,13 @@ impl Workspace {
                     .filter(|state| {
                         crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                             == fingerprint
-                            && context_state_is_fresh_with_cancel(state, None, None)
-                                .is_ok_and(|fresh| fresh)
+                            && context_state_is_fresh_for_binding_with_cancel(
+                                state,
+                                self.request_generation,
+                                None,
+                                None,
+                            )
+                            .is_ok_and(|fresh| fresh)
                     })
                     .map(|_| importer.clone())
             })
@@ -3157,7 +3243,13 @@ impl Workspace {
             if !state.context.discovery_complete()
                 || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                     != fingerprint
-                || !context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                || !context_state_is_fresh_for_binding_with_cancel(
+                    state,
+                    self.request_generation,
+                    None,
+                    None,
+                )
+                .is_ok_and(|fresh| fresh)
                 || !seen.insert(fingerprint)
             {
                 continue;
@@ -3442,6 +3534,7 @@ impl Workspace {
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
+            request_generation: input.request_generation,
             ..Self::default()
         }
     }
@@ -3475,6 +3568,13 @@ impl Workspace {
             owner_last_used: self.owner_last_used.clone(),
             use_clock: self.use_clock,
         }
+    }
+
+    /// A message is dispatched: the context states built so far belong to
+    /// earlier messages, so binding gates no longer trust their unsettled
+    /// stamps. Called once, where the server dispatches each message.
+    pub(crate) fn advance_request_generation(&mut self) {
+        self.request_generation = self.request_generation.wrapping_add(1);
     }
 
     pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
@@ -3529,7 +3629,13 @@ impl Workspace {
                 return false;
             }
             let fresh = *fresh.get_or_insert_with(|| {
-                context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                context_state_is_fresh_for_binding_with_cancel(
+                    state,
+                    self.request_generation,
+                    None,
+                    None,
+                )
+                .is_ok_and(|fresh| fresh)
             });
             fresh
                 && importer_hashes
@@ -7422,13 +7528,8 @@ impl Workspace {
                     if let pascal_core::SourceRevision::Disk { stamp, .. } =
                         &dependency.source.revision
                     {
-                        self.disk_stamps.insert(
-                            dependency_uri.clone(),
-                            DiskStamp {
-                                bytes: stamp.bytes,
-                                modified: stamp.modified,
-                            },
-                        );
+                        self.disk_stamps
+                            .insert(dependency_uri.clone(), DiskStamp::from_project(stamp));
                     }
                     pinned.insert(dependency_uri.clone());
                     resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
@@ -7965,7 +8066,12 @@ impl Workspace {
             self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Ok(false);
         }
-        if self.index.contains(uri) && self.disk_stamps.get(uri) == Some(&current_stamp) {
+        if self.index.contains(uri)
+            && self
+                .disk_stamps
+                .get(uri)
+                .is_some_and(|recorded| recorded.proves_unchanged(&current_stamp))
+        {
             check_workspace_cancel(cancel)?;
             self.touch(uri);
             self.set_document_context_with_control(uri, context_key, cancel, budget)?;
@@ -8253,12 +8359,12 @@ impl Workspace {
         // The parse holds the expanded text when includes were expanded, so
         // the disk origin then keeps its own copy of the file text.
         let disk_origin = match (&claim, disk_stamp, disk_size) {
-            (Some(_), Some(stamp), Some(raw_bytes)) => stamp.modified.map(|modified| {
+            (Some(_), Some(stamp), Some(raw_bytes)) => {
                 let text = expansion
                     .as_ref()
                     .map(|_| std::sync::Arc::<str>::from(source.as_str()));
-                (stamp.bytes, modified, raw_bytes, text)
-            }),
+                Some((stamp.clone(), raw_bytes, text))
+            }
             _ => None,
         };
         if let Some(expansion) = expansion.filter(|e| {
@@ -8288,14 +8394,14 @@ impl Workspace {
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
-            let disk = disk_origin.map(|(len, modified, raw_bytes, text)| {
-                crate::project_cache::DiskOrigin {
-                    len,
-                    modified,
-                    raw_bytes,
-                    text: text.unwrap_or_else(|| parsed.source_text().clone()),
-                }
-            });
+            let disk =
+                disk_origin.map(
+                    |(stamp, raw_bytes, text)| crate::project_cache::DiskOrigin {
+                        stamp,
+                        raw_bytes,
+                        text: text.unwrap_or_else(|| parsed.source_text().clone()),
+                    },
+                );
             let value = crate::project_cache::UnitValue {
                 parsed,
                 expansion: cached_expansion.map(std::sync::Arc::new),
@@ -8327,9 +8433,6 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Option<DiskSource>, String> {
-        let Some(modified) = stamp.modified else {
-            return Ok(None);
-        };
         if stamp.bytes > self.options.limits.max_file_bytes as u64 {
             return Ok(None);
         }
@@ -8341,13 +8444,10 @@ impl Workspace {
         if fs::symlink_metadata(path).map_or(true, |metadata| metadata.file_type().is_symlink()) {
             return Ok(None);
         }
-        let Some((unit, content_hash)) = self.project_cache.peek_unit_from_disk(
-            uri,
-            context,
-            stamp.bytes,
-            modified,
-            &self.overlay_inputs(),
-        ) else {
+        let Some((unit, content_hash)) =
+            self.project_cache
+                .peek_unit_from_disk(uri, context, stamp, &self.overlay_inputs())
+        else {
             return Ok(None);
         };
         let Some(origin) = unit.disk.as_ref() else {
@@ -10725,6 +10825,7 @@ impl Workspace {
         if let Some(budget) = budget {
             budget.check_cancelled()?;
         }
+        let request_generation = self.request_generation;
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
             state.context_observations = context_observations;
@@ -10736,6 +10837,7 @@ impl Workspace {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
+            state.built_generation = Some(request_generation);
         } else {
             self.contexts.insert(
                 key,
@@ -10746,6 +10848,7 @@ impl Workspace {
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
                     system_pas_search_stamps: Mutex::new(HashMap::new()),
+                    built_generation: Some(request_generation),
                 },
             );
         }
@@ -10904,6 +11007,7 @@ impl Workspace {
             &open_overlay_paths,
             &deleted_paths,
             budget,
+            true,
         )
     }
 
@@ -14793,6 +14897,8 @@ fn path_stamp_from_project_read(stamp: &ProjectReadStamp) -> PathStamp {
         modified: stamp.modified,
         is_dir: stamp.is_dir,
         is_symlink: stamp.is_symlink,
+        change: stamp.change,
+        settled: stamp.settled,
     }
 }
 
@@ -14992,7 +15098,22 @@ fn context_state_is_fresh_with_cancel(
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget)
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, true)
+}
+
+/// Freshness for gates that decide whether bindings of a state survive.
+/// A state built under `request_generation` compares its own stamps with plain
+/// equality, so a rebuild inside the settle window does not read as absent.
+/// A state built under another generation needs the same settled proof as
+/// any reuse.
+fn context_state_is_fresh_for_binding_with_cancel(
+    state: &ContextState,
+    request_generation: u64,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<bool, String> {
+    let built_here = state.built_generation == Some(request_generation);
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, !built_here)
 }
 
 fn context_state_is_fresh_with_cancel_ignoring_paths(
@@ -15001,6 +15122,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     ignored_paths: &[PathBuf],
     deleted_paths: &[PathBuf],
     budget: Option<&ReconciliationBudget>,
+    require_settled: bool,
 ) -> Result<bool, String> {
     for (path, stamp) in &state.watched_paths {
         check_workspace_cancel(cancel)?;
@@ -15027,7 +15149,21 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         } else {
             path_stamp(path)
         };
-        if actual != *stamp {
+        let unchanged = match (stamp, &actual) {
+            (Some(recorded), Some(current)) => {
+                if require_settled {
+                    // Equal content-checked inputs are verified by the
+                    // payload loop below, which proves what `settled` would.
+                    recorded.proves_unchanged(current)
+                        || (recorded == current && path_is_content_checked(state, path))
+                } else {
+                    recorded == current
+                }
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
             return Ok(false);
         }
     }
@@ -15040,36 +15176,12 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
 
     for observation in &state.context_observations.metadata_observations {
         check_workspace_cancel(cancel)?;
-        let MetadataObservation::Payload { path, .. } = observation else {
+        let Some((_, read_limit)) = content_checked_payload(state, observation) else {
             continue;
         };
-        let is_system_pas = path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"));
-        if !(is_system_pas
-            || extension_is(path, "json")
-            || extension_is(path, "dproj")
-            || extension_is(path, "dpr")
-            || extension_is(path, "dpk")
-            || extension_is(path, "optset")
-            || extension_is(path, "props"))
-            || (!is_system_pas
-                && !state.project_read_observations.iter().any(|read| {
-                    package_paths_equal(&read.path, path) && read.content_bytes.is_some()
-                }))
-        {
-            continue;
-        }
         if let Some(budget) = budget {
             budget.charge_path_visits(1)?;
         }
-        let read_limit = if extension_is(path, "json") {
-            64 * 1024
-        } else if extension_is(path, "dpr") {
-            8 * 1024 * 1024
-        } else {
-            4 * 1024 * 1024
-        };
         if !metadata_payload_is_current_in_pass(observation, read_limit, budget)? {
             return Ok(false);
         }
@@ -15100,6 +15212,52 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
     Ok(true)
+}
+
+/// The path and read limit of a metadata payload that a freshness pass
+/// re-verifies by content.
+fn content_checked_payload<'a>(
+    state: &ContextState,
+    observation: &'a MetadataObservation,
+) -> Option<(&'a Path, u64)> {
+    let MetadataObservation::Payload { path, .. } = observation else {
+        return None;
+    };
+    let is_system_pas = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"));
+    if !(is_system_pas
+        || extension_is(path, "json")
+        || extension_is(path, "dproj")
+        || extension_is(path, "dpr")
+        || extension_is(path, "dpk")
+        || extension_is(path, "optset")
+        || extension_is(path, "props"))
+        || (!is_system_pas
+            && !state
+                .project_read_observations
+                .iter()
+                .any(|read| package_paths_equal(&read.path, path) && read.content_bytes.is_some()))
+    {
+        return None;
+    }
+    let read_limit = if extension_is(path, "json") {
+        64 * 1024
+    } else if extension_is(path, "dpr") {
+        8 * 1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    };
+    Some((path, read_limit))
+}
+
+fn path_is_content_checked(state: &ContextState, watched: &Path) -> bool {
+    state
+        .context_observations
+        .metadata_observations
+        .iter()
+        .filter_map(|observation| content_checked_payload(state, observation))
+        .any(|(path, _)| package_paths_equal(path, watched))
 }
 
 fn system_pas_search_is_current(
@@ -15440,7 +15598,7 @@ fn read_disk_source_with_budget(
         }
         fs::metadata(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
     } else {
-        link_metadata
+        link_metadata.clone()
     };
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
@@ -15476,10 +15634,7 @@ fn read_disk_source_with_budget(
     Ok(DiskSource {
         text,
         bytes: bytes.len(),
-        stamp: DiskStamp {
-            bytes: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
+        stamp: DiskStamp::from_metadata(&link_metadata, &metadata),
         content_hash: content_hash_bytes(&bytes),
     })
 }
@@ -15530,11 +15685,15 @@ fn disk_bytes_equal(uri: &Url, bytes: &[u8]) -> bool {
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {
-    let metadata = fs::metadata(path).ok()?;
-    metadata.is_file().then_some(DiskStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
+    let link = fs::symlink_metadata(path).ok()?;
+    let metadata = if link.file_type().is_symlink() {
+        fs::metadata(path).ok()?
+    } else {
+        link.clone()
+    };
+    metadata
+        .is_file()
+        .then(|| DiskStamp::from_metadata(&link, &metadata))
 }
 
 fn absolute_path(path: PathBuf) -> PathBuf {
@@ -16168,6 +16327,7 @@ mod tests {
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: Mutex::new(HashMap::new()),
+            ..Default::default()
         };
         assert!(state(Vec::new()) != state(vec!["warning".to_string()]));
         assert!(state(vec!["warning".to_string()]) == state(vec!["warning".to_string()]));
@@ -18216,6 +18376,7 @@ mod tests {
         .unwrap();
         let source = "unit Main;\ninterface\nimplementation\nend.\n";
         fs::write(root.join("Main.pas"), source).unwrap();
+        pascal_project::backdate_tree_for_test(&root);
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
         let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
         workspace
@@ -18248,6 +18409,129 @@ mod tests {
 
         assert_eq!(reused, key);
         assert_eq!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    /// A project whose `App.dproj` was just written, with a unit opened inside it.
+    fn unsettled_project_fixture() -> (tempfile::TempDir, Workspace, Url, ContextKey) {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_Define>BEFORE</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("App.dpr"), "program App; begin end.").unwrap();
+        // Only the project file stays unsettled; the main source is not
+        // content-checked, so it would need a settled stamp.
+        pascal_project::backdate_for_test(&root.join("App.dpr"));
+        let source = "unit Extra;\ninterface\nimplementation\nend.\n";
+        fs::write(root.join("Extra.pas"), source).unwrap();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Extra.pas")).unwrap();
+        workspace
+            .open_document(uri.clone(), source.to_string(), 1)
+            .expect("open Extra.pas");
+        let key = workspace.document_contexts[&uri].clone();
+        (temp, workspace, uri, key)
+    }
+
+    #[test]
+    fn an_unsettled_context_whose_payloads_still_match_is_fresh() {
+        let (_temp, mut workspace, uri, key) = unsettled_project_fixture();
+        pascal_project::test_reset_project_discovery_counts();
+        assert_eq!(workspace.context_for_uri(&uri).expect("context"), key);
+        assert_eq!(
+            pascal_project::test_project_discovery_counts(),
+            (0, 0),
+            "a content-checked input need not be settled to prove the context"
+        );
+    }
+
+    #[test]
+    fn an_unsettled_context_rejects_a_same_size_rewrite_with_the_mtime_restored() {
+        let (temp, mut workspace, uri, key) = unsettled_project_fixture();
+        let project = temp.path().join("App.dproj");
+        let modified = fs::metadata(&project).unwrap().modified().unwrap();
+        let before = fs::read_to_string(&project).unwrap();
+        fs::write(&project, before.replace("BEFORE", "AFTER_")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&project)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            !workspace
+                .context_is_fresh_with_cancel(&key, None, None)
+                .expect("freshness")
+        );
+        pascal_project::test_reset_project_discovery_counts();
+        workspace.context_for_uri(&uri).expect("context");
+        assert_ne!(pascal_project::test_project_discovery_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_binding_gate_trusts_an_unsettled_state_only_under_the_generation_that_built_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let source = "unit Main;\ninterface\nimplementation\nend.\n";
+        fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let gate = |workspace: &Workspace, key: &ContextKey| {
+            super::context_state_is_fresh_for_binding_with_cancel(
+                &workspace.contexts[key],
+                workspace.request_generation,
+                None,
+                None,
+            )
+            .expect("gate")
+        };
+        // A message that builds the context on the main side, as didOpen does.
+        workspace.advance_request_generation();
+        let key = workspace.context_for_uri(&uri).expect("context");
+        assert!(gate(&workspace, &key), "built while handling this message");
+
+        // A job spawned under that message builds its own state under the
+        // same generation.
+        let mut worker = worker_view(&workspace);
+        let worker_key = worker.context_for_uri(&uri).expect("worker context");
+        assert!(gate(&worker, &worker_key));
+        let job_state = worker.contexts.remove(&worker_key).unwrap();
+
+        // The next dispatched message: neither the main-side state nor the
+        // job's state, applied now, is trusted on plain equality.
+        workspace.advance_request_generation();
+        assert!(
+            !gate(&workspace, &key),
+            "an unsettled state from an earlier message is not trusted"
+        );
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(
+                &job_state,
+                workspace.request_generation,
+                None,
+                None,
+            )
+            .expect("gate"),
+            "a job-built state applied under a later message is not trusted"
+        );
+        pascal_project::test_reset_project_discovery_counts();
+        assert_eq!(workspace.context_for_uri(&uri).expect("context"), key);
+        assert_ne!(
+            pascal_project::test_project_discovery_counts(),
+            (0, 0),
+            "the lookup rediscovers instead of reporting the context absent"
+        );
+        assert!(
+            gate(&workspace, &key),
+            "the rebuilt state is this message's own"
+        );
     }
 
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
@@ -19500,6 +19784,7 @@ mod tests {
                 .unwrap();
             }
         }
+        pascal_project::backdate_tree_for_test(root);
 
         let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
@@ -20839,6 +21124,7 @@ mod tests {
     fn the_warm_closed_source_check_charges_its_stat_and_honours_cancellation() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
+        pascal_project::backdate_tree_for_test(temp.path());
         let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
         worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
         let mut worker = worker_view(&main);
@@ -20867,9 +21153,55 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_unit_rewritten_within_one_tick_is_reread() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let path = root.join("Unit1.pas");
+        fs::write(
+            &path,
+            "unit Unit1;\ninterface\nconst A = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let key = workspace.context_for_uri(&uri).expect("context");
+        assert!(
+            workspace
+                .load_source(&uri, &key, &HashSet::new())
+                .expect("first load")
+        );
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(
+            &path,
+            "unit Unit1;\ninterface\nconst B = 1;\nimplementation\nend.\n",
+        )
+        .expect("same-size rewrite");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            workspace
+                .load_source(&uri, &key, &HashSet::new())
+                .expect("second load")
+        );
+        assert!(
+            workspace
+                .index
+                .source_text(&uri)
+                .unwrap()
+                .contains("const B"),
+            "an unsettled stamp may not skip the reread"
+        );
+    }
+
+    #[test]
     fn second_definition_on_a_closed_unit_reads_no_files() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, provider_uri) = provider_fixture(temp.path());
+        pascal_project::backdate_tree_for_test(temp.path());
         let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
         let definition = || {
             super::queries::navigation_from_input(
@@ -21726,6 +22058,7 @@ BDS = '/fake/37'
         )
         .unwrap();
         fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        pascal_project::backdate_tree_for_test(root);
         let shared_uri = Url::from_file_path(&shared).unwrap();
         let sibling_uri = Url::from_file_path(&sibling).unwrap();
         let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
@@ -22632,6 +22965,7 @@ BDS = '/fake/37'
             )]),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            ..Default::default()
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -22684,6 +23018,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             },
         );
         let changed =
@@ -22716,6 +23051,8 @@ BDS = '/fake/37'
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: 0,
             content_bytes: None,
@@ -22754,6 +23091,8 @@ BDS = '/fake/37'
                     modified: None,
                     is_dir: false,
                     is_symlink: false,
+                    change: None,
+                    settled: true,
                 },
                 content_hash: 0,
                 content_bytes: None,
@@ -22853,6 +23192,8 @@ BDS = '/fake/37'
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: 1,
             content_bytes: None,
@@ -22926,6 +23267,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             },
         );
         let incoming = (0..EXISTING)
@@ -23033,6 +23375,7 @@ BDS = '/fake/37'
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
                 system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+                ..Default::default()
             }),
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
@@ -24048,6 +24391,7 @@ BDS = '/fake/37'
             document_versions: HashMap::new(),
             deleted_overrides: HashMap::new(),
             source_generation: 0,
+            request_generation: 0,
             configuration_generation: 0,
         };
         let entry = ProjectPathEntry {
@@ -25706,6 +26050,7 @@ BDS = '/fake/37'
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
             system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            ..Default::default()
         };
 
         assert!(
@@ -25734,6 +26079,7 @@ BDS = '/fake/37'
             "unit System; interface const RTLVersion111 = True; implementation end.",
         )
         .expect("System.pas");
+        pascal_project::backdate_tree_for_test(root);
         let options = ProjectOptions {
             conditional_context: ConditionalContext::default()
                 .with_compiler_version(CompilerVersion::new(35, 0)),

@@ -11387,6 +11387,9 @@ fn event_loop(
             }
         };
 
+        // The one place every dispatched message passes: states built while
+        // handling earlier messages stop being "built in this request".
+        workspace.advance_request_generation();
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
@@ -18207,6 +18210,8 @@ mod tests {
                 modified: Some(std::time::SystemTime::UNIX_EPOCH),
                 is_dir: false,
                 is_symlink: true,
+                change: None,
+                settled: true,
             }),
             content_hash: Some(0xA11C_E001),
             parsed_text_hash: Some(0xA11C_E002),
@@ -18361,6 +18366,8 @@ mod tests {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         });
         assert_compaction_hashes(&path_only, None, None);
         let (completion, diagnostic, _) = compact_with_both_wrappers(&path_only);

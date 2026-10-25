@@ -30,6 +30,7 @@ required-features = ["test-support"]
 [dependencies]
 pascal-core = { path = "../pascal-core" }
 pascal-project = { path = "../pascal-project" }
+pascal-cache = { path = "../pascal-cache" }
 lint4d = { path = "../lint4d" }
 fmt4d = { path = "../fmt4d" }
 tree-sitter = "0.24"
@@ -46,7 +47,6 @@ notify = "8"
 libc = "0.2"
 
 [dev-dependencies]
-pascal-cache = { path = "../pascal-cache" }
 pascal-project = { path = "../pascal-project", features = ["test-support"] }
 tempfile = "3"
 

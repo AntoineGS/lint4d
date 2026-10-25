@@ -2971,6 +2971,53 @@ fn case_adjusted_mapped_include_retains_mapping_restriction() {
 }
 
 #[test]
+fn an_exact_include_hit_only_marks_its_directory_and_misses_are_listed() {
+    let directory = tempdir().expect("include root");
+    let root = directory.path().canonicalize().unwrap();
+    fs::create_dir(root.join("include")).expect("include directory");
+    fs::write(root.join("include/Shared.inc"), "const Shared = 1;").expect("include");
+    let mut context = configured_disk_context(&root);
+    edit_context(&mut context, |p| {
+        p.include_path_entries = vec![ProjectPathEntry::configured(root.join("include"))]
+    });
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![],
+        FilesystemSourceStore::new(),
+        Default::default(),
+    );
+
+    let outcome = resolver.resolve_include(
+        pascal_core::IncludeResolveRequest {
+            including_path: &root.join("Main.pas"),
+            byte_range: 0..10,
+            requested_name: "Shared.inc",
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+
+    assert!(matches!(outcome.result, Resolution::Found(_)));
+    let directories = |path: &Path| {
+        outcome
+            .observations
+            .iter()
+            .filter_map(|observation| match observation {
+                ResolutionObservation::Directory {
+                    path: observed,
+                    listed,
+                    ..
+                } if observed == path => Some(*listed),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // The miss's listing and its marker are one observation.
+    assert_eq!(directories(&root), [true], "{outcome:?}");
+    assert_eq!(directories(&root.join("include")), [false], "{outcome:?}");
+}
+
+#[test]
 fn authorized_parent_relative_and_absolute_include_case_adjustment_is_preserved() {
     let directory = tempdir().expect("include root");
     let root = directory.path();

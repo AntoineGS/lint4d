@@ -1833,6 +1833,7 @@ fn cached_discovery_returns_the_construction_observations() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
     write_webquery_fixture(root);
+    pascal_project::backdate_tree_for_test(root);
     let overrides = OverrideSession::new(Some(root.join("config.toml")));
     let scope = ProjectDiscoveryCacheScope::new();
 
@@ -1856,6 +1857,7 @@ fn cached_discoveries_share_one_context() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
     write_webquery_fixture(root);
+    pascal_project::backdate_tree_for_test(root);
     let overrides = OverrideSession::new(Some(root.join("config.toml")));
     let _scope = ProjectDiscoveryCacheScope::new();
 
@@ -2039,6 +2041,7 @@ fn another_projects_selection_change_reuses_this_projects_cached_context() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
     write_webquery_fixture(root);
+    pascal_project::backdate_tree_for_test(root);
     let overrides = OverrideSession::new(Some(root.join("config.toml")));
     let other = root.join("Other").join("Other.dproj");
     let other_build = ProjectOptions {
@@ -2136,4 +2139,20 @@ fn defines_follow_effective_facts_when_the_caller_sets_a_project_define_false() 
     let mut sorted = defines.clone();
     sorted.sort();
     assert_eq!(defines, sorted);
+}
+
+#[test]
+fn a_cached_discovery_of_a_project_written_just_now_is_not_reused() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+    let _scope = ProjectDiscoveryCacheScope::new();
+
+    let first = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+    let second = discover_webquery_project_at(root, &ProjectOptions::default(), &overrides);
+
+    // A same-size rewrite in the same tick would leave equal stamps, so an
+    // unsettled observation cannot vouch for the cached context (l4d-122).
+    assert!(!Arc::ptr_eq(&first.context, &second.context));
 }

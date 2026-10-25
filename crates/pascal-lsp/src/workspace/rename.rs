@@ -248,6 +248,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) document_versions: HashMap<Url, i32>,
     pub(crate) deleted_overrides: HashMap<Url, Option<DiskStamp>>,
     pub(crate) source_generation: u64,
+    pub(crate) request_generation: u64,
     pub(crate) configuration_generation: u64,
 }
 
@@ -1483,6 +1484,7 @@ impl Workspace {
             document_versions,
             deleted_overrides: self.deleted_overrides.clone(),
             source_generation: self.source_generation,
+            request_generation: self.request_generation,
             configuration_generation: self.configuration_generation,
         }
     }
@@ -11588,6 +11590,8 @@ mod tests {
             modified: None,
             is_dir: true,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
 
         let mut candidate_first = BaselineAccumulator::default();
@@ -11729,6 +11733,8 @@ mod tests {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
         let record = path_record_at(
             path.clone(),

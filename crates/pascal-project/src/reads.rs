@@ -2,6 +2,7 @@ use super::authorization::extension_is;
 use super::discovery_cache::{CachedProjectContext, check_project_scan_cancel};
 use super::selection::is_deleted_path;
 use super::*;
+use std::time::Duration;
 
 impl ReadPolicy {
     pub(super) fn read_payload_with_observation(
@@ -145,6 +146,7 @@ impl ReadPolicy {
 /// payload read.  Payload observations carry the exact policy and path entry
 /// that authorized the original read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub enum MetadataObservation {
     Stat {
         path: PathBuf,
@@ -233,12 +235,100 @@ impl ProjectReadObservation {
         Ok(())
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// How long after its last modification a file's stamp starts to prove
+/// anything. Two writes within one timestamp tick can leave equal stamps
+/// (l4d-122); 2 s covers FAT's granularity and the Windows timer tick.
+pub const STAMP_SETTLE_WINDOW: Duration = Duration::from_secs(2);
+
+/// The platform's own record of a file's identity and last change. A
+/// same-size rewrite that restores the modification time still moves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChangeIdentity {
+    device: u64,
+    inode: u64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+#[derive(Debug, Clone, Eq)]
 pub struct ProjectReadStamp {
     pub bytes: u64,
     pub modified: Option<SystemTime>,
     pub is_dir: bool,
     pub is_symlink: bool,
+    /// `None` where the platform exposes no change identity (Windows).
+    pub change: Option<ChangeIdentity>,
+    /// Whether the file had not been modified for `STAMP_SETTLE_WINDOW`
+    /// when the stamp was taken. Not part of equality: two stamps of one
+    /// file state are equal however much their observers may trust them.
+    pub settled: bool,
+}
+
+impl PartialEq for ProjectReadStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+            && self.modified == other.modified
+            && self.is_dir == other.is_dir
+            && self.is_symlink == other.is_symlink
+            && self.change == other.change
+    }
+}
+
+impl std::hash::Hash for ProjectReadStamp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+        self.modified.hash(state);
+        self.is_dir.hash(state);
+        self.is_symlink.hash(state);
+        self.change.hash(state);
+    }
+}
+
+impl ProjectReadStamp {
+    /// Whether `current`, taken now, proves the path unchanged since this
+    /// stamp was taken. Equal stamps prove it only if this one was settled.
+    /// Long-lived caches use this; a request comparing two of its own
+    /// stamps compares them with `==`.
+    pub fn proves_unchanged(&self, current: &Self) -> bool {
+        self.settled && self == current
+    }
+
+    pub fn has_change_identity(&self) -> bool {
+        self.change.is_some()
+    }
+}
+
+#[cfg(unix)]
+fn change_identity(metadata: &fs::Metadata) -> Option<ChangeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(ChangeIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        changed_seconds: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+fn change_identity(_metadata: &fs::Metadata) -> Option<ChangeIdentity> {
+    None
+}
+
+/// The stamp of a path whose own metadata is `link` and whose target's is
+/// `target` (the same metadata for anything but a symlink).
+pub fn stamp_from_metadata(link: &fs::Metadata, target: &fs::Metadata) -> ProjectReadStamp {
+    let modified = target.modified().ok();
+    let settled = modified
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= STAMP_SETTLE_WINDOW);
+    ProjectReadStamp {
+        bytes: target.len(),
+        modified,
+        is_dir: target.is_dir(),
+        is_symlink: link.file_type().is_symlink(),
+        change: change_identity(target),
+        settled,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -538,6 +628,41 @@ fn run_after_project_read(_path: &Path) {}
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_before_project_read(_path: &Path) {}
+
+/// Move `path`'s modification time a minute back, so a fixture written just
+/// now is settled (`ProjectReadStamp::settled`). Works on directories.
+#[cfg(any(test, feature = "test-support"))]
+pub fn backdate_for_test(path: &Path) {
+    let when = SystemTime::now() - Duration::from_secs(60);
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS opens directories as well as files.
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0x0200_0000)
+            .open(path)
+    };
+    #[cfg(not(windows))]
+    let file = fs::File::open(path);
+    file.and_then(|file| {
+        file.set_times(fs::FileTimes::new().set_modified(when).set_accessed(when))
+    })
+    .unwrap_or_else(|error| panic!("backdate {}: {error}", path.display()));
+}
+
+/// `backdate_for_test` over `root` and everything under it, children first.
+#[cfg(any(test, feature = "test-support"))]
+pub fn backdate_tree_for_test(root: &Path) {
+    if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+        for entry in fs::read_dir(root).expect("fixture directory") {
+            backdate_tree_for_test(&entry.expect("fixture entry").path());
+        }
+    }
+    if !fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        backdate_for_test(root);
+    }
+}
 #[derive(Debug)]
 #[allow(dead_code)]
 struct BoundedRead {
@@ -775,18 +900,12 @@ fn decode_source_payload(bytes: &[u8]) -> String {
 pub(super) fn project_read_stamp(path: &Path) -> Result<ProjectReadStamp, String> {
     let link_metadata =
         fs::symlink_metadata(path).map_err(|error| format!("could not stat file: {error}"))?;
-    let is_symlink = link_metadata.file_type().is_symlink();
-    let metadata = if is_symlink {
+    let metadata = if link_metadata.file_type().is_symlink() {
         fs::metadata(path).map_err(|error| format!("could not stat file: {error}"))?
     } else {
-        link_metadata
+        link_metadata.clone()
     };
-    Ok(ProjectReadStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-        is_dir: metadata.is_dir(),
-        is_symlink,
-    })
+    Ok(stamp_from_metadata(&link_metadata, &metadata))
 }
 
 fn project_content_hash(bytes: &[u8]) -> u64 {
@@ -849,22 +968,16 @@ pub fn path_stamp_result(path: &Path) -> io::Result<Option<ProjectReadStamp>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let is_symlink = link_metadata.file_type().is_symlink();
-    let metadata = if is_symlink {
+    let metadata = if link_metadata.file_type().is_symlink() {
         match fs::metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => link_metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => link_metadata.clone(),
             Err(error) => return Err(error),
         }
     } else {
-        link_metadata
+        link_metadata.clone()
     };
-    Ok(Some(ProjectReadStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-        is_dir: metadata.is_dir(),
-        is_symlink,
-    }))
+    Ok(Some(stamp_from_metadata(&link_metadata, &metadata)))
 }
 
 pub(super) fn is_pascal_source_path(path: &Path) -> bool {
@@ -966,12 +1079,16 @@ mod tests {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
         let second_stamp = ProjectReadStamp {
             bytes: 6,
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
         let mut tracker = ProjectReadTracker::default();
         tracker.record(&path, first_stamp.clone(), b"first");
@@ -1107,5 +1224,117 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0], first);
+    }
+
+    #[test]
+    fn a_stamp_taken_right_after_a_write_proves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.pas");
+        fs::write(&path, b"unit A;").unwrap();
+        let first = path_stamp_result(&path).unwrap().unwrap();
+        assert!(!first.settled, "written just now");
+        assert!(
+            !first.proves_unchanged(&first.clone()),
+            "an unsettled stamp proves nothing, not even against itself"
+        );
+        let modified = first.modified.unwrap();
+        fs::write(&path, b"unit B;").unwrap();
+        // A second write within one timestamp tick keeps the modification time.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let second = path_stamp_result(&path).unwrap().unwrap();
+        assert_eq!(
+            (second.bytes, second.modified),
+            (first.bytes, first.modified)
+        );
+        assert!(!first.proves_unchanged(&second));
+    }
+
+    #[test]
+    fn a_settled_stamp_proves_an_unchanged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.pas");
+        fs::write(&path, b"unit A;").unwrap();
+        backdate_for_test(&path);
+        let first = path_stamp_result(&path).unwrap().unwrap();
+        let second = path_stamp_result(&path).unwrap().unwrap();
+        assert!(first.settled);
+        assert!(first.proves_unchanged(&second));
+        assert_eq!(
+            project_read_stamp(&path).unwrap(),
+            first,
+            "both stamp functions agree"
+        );
+        let unsettled = ProjectReadStamp {
+            settled: false,
+            ..first.clone()
+        };
+        assert_eq!(
+            unsettled, first,
+            "equality is the file state, not the observer's trust"
+        );
+        assert!(!unsettled.proves_unchanged(&first));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_the_modification_time_does_not_hide_a_settled_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.pas");
+        fs::write(&path, b"unit A;").unwrap();
+        backdate_for_test(&path);
+        let before = path_stamp_result(&path).unwrap().unwrap();
+        assert!(before.settled && before.has_change_identity());
+        let modified = before.modified.unwrap();
+        // Rewrite and restore the modification time until the kernel's
+        // change-time clock has visibly advanced: no sleep, bounded tries.
+        let mut after = before.clone();
+        for round in 0..10_000 {
+            let text: &[u8] = if round % 2 == 0 {
+                b"unit B;"
+            } else {
+                b"unit C;"
+            };
+            fs::write(&path, text).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            after = path_stamp_result(&path).unwrap().unwrap();
+            if after != before {
+                break;
+            }
+        }
+        assert_eq!(
+            (after.bytes, after.modified),
+            (before.bytes, before.modified)
+        );
+        assert!(after.settled, "the restored modification time is old");
+        assert!(!before.proves_unchanged(&after), "the change time moved");
+    }
+
+    #[test]
+    fn backdating_a_tree_settles_files_and_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("include");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("A.inc"), b"{}").unwrap();
+        backdate_tree_for_test(temp.path());
+        for path in [
+            temp.path().to_path_buf(),
+            nested.clone(),
+            nested.join("A.inc"),
+        ] {
+            assert!(
+                path_stamp_result(&path).unwrap().unwrap().settled,
+                "{path:?}"
+            );
+        }
     }
 }

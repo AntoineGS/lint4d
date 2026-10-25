@@ -264,7 +264,12 @@ fn project_context_cache_is_current(
             work_budget.charge_path_bytes(observation.path.as_os_str().len())?;
         }
         let current = path_stamp_result(&observation.path).unwrap_or(None);
-        if current.as_ref() != Some(&observation.stamp) {
+        // A cached context is a long-lived proof: an unsettled read cannot
+        // vouch that a same-size rewrite in the same tick did not happen.
+        if !current
+            .as_ref()
+            .is_some_and(|current| observation.stamp.proves_unchanged(current))
+        {
             return Ok(false);
         }
     }

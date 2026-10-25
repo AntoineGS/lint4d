@@ -14,8 +14,14 @@ pub(crate) const RETIRED: i64 = 2;
 const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
-/// Child tables first, so foreign keys hold at every step.
-const RECLAIM_TABLES: [&str; 3] = ["artifact_rows", "artifacts", "key_manifests"];
+/// Scoped tables, each before every table it references.
+const RECLAIM_TABLES: [&str; 5] = [
+    "observations",
+    "evidence_sets",
+    "artifact_rows",
+    "artifacts",
+    "key_manifests",
+];
 
 /// The scope every row of this store is published and read in (spec §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -358,5 +364,52 @@ mod tests {
         // The stale handle's lock is on the removed file and blocks nothing.
         drop(lock);
         assert!(NamespaceLock::try_exclusive(path).unwrap().is_some());
+    }
+
+    #[test]
+    fn reclaim_covers_every_scoped_table_children_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = crate::store::sqlite::open_connection(
+            &root.path().join("a.sqlite3"),
+            1 << 20,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        crate::store::container::prepare_container(
+            &mut connection,
+            Deadline::after(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let scoped: std::collections::BTreeSet<String> = connection
+            .prepare(
+                "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
+                 WHERE m.type = 'table' AND c.name = 'reset_epoch' \
+                 AND m.name NOT IN ('namespaces', 'retired_scopes', 'store_state')",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scoped,
+            RECLAIM_TABLES.iter().map(|t| t.to_string()).collect()
+        );
+        // A table is deleted from before every table it references.
+        for (index, table) in RECLAIM_TABLES.iter().enumerate() {
+            let parents: Vec<String> = connection
+                .prepare(&format!(
+                    "SELECT \"table\" FROM pragma_foreign_key_list('{table}')"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for parent in parents.iter().filter(|parent| *parent != "namespaces") {
+                let position = RECLAIM_TABLES.iter().position(|t| t == parent).unwrap();
+                assert!(position > index, "{table} references {parent}");
+            }
+        }
     }
 }

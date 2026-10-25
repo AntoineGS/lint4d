@@ -1,5 +1,7 @@
 use super::Store;
-use super::keys::{ArtifactKeyRef, admit_manifest, check_manifest_size, put_manifest};
+use super::keys::{
+    ArtifactKeyRef, admit_manifest, admit_manifest_by_digest, check_manifest_size, put_manifest,
+};
 use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
     MAX_SUPPLEMENTAL_BYTES,
@@ -7,7 +9,7 @@ use super::limits::{
 use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::sqlite::{begin, classify, classify_read};
-use crate::{Digest, Encoder};
+use crate::{Digest, Encoder, KeyKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// Domain of the whole-artifact fact checksum.
@@ -219,101 +221,170 @@ fn read_header(
         .optional()
 }
 
+/// An admitted, hashed artifact write, ready for [`insert_prepared`].
+pub(crate) struct PreparedArtifact {
+    artifact_id: Digest,
+    expected: StoredHeader,
+    checksums: Vec<Digest>,
+}
+
+/// Admit and hash `write`: everything a publication does before its
+/// transaction starts.
+pub(crate) fn prepare_artifact(write: &ArtifactWrite<'_>) -> Result<PreparedArtifact, Bypass> {
+    let content_bytes = admit_write(write)?;
+    let artifact_id = write.key.digest();
+    let mut hasher = FactHasher::new(artifact_id, write.rows.len() as u64, write.supplemental);
+    let mut checksums = Vec::with_capacity(write.rows.len());
+    for (ordinal, row) in write.rows.iter().enumerate() {
+        checksums.push(hash_row(
+            &mut hasher,
+            artifact_id,
+            ordinal as u64,
+            row.row_kind,
+            row.index_key,
+            row.payload,
+        ));
+    }
+    let expected = StoredHeader {
+        kind: i64::from(write.key.key().kind().tag()),
+        root_key: write
+            .key
+            .root()
+            .map(|root| root.digest().as_bytes().to_vec()),
+        lifecycle: LIVE,
+        row_count: write.rows.len() as i64,
+        content_bytes: content_bytes as i64,
+        fact_checksum: hasher.finish().as_bytes().to_vec(),
+        supplemental: write.supplemental.to_vec(),
+    };
+    Ok(PreparedArtifact {
+        artifact_id,
+        expected,
+        checksums,
+    })
+}
+
+/// Insert the key manifests, header and rows of a prepared write inside the
+/// caller's write transaction, unless the identical artifact is stored.
+pub(crate) fn insert_prepared(
+    transaction: &Connection,
+    scope: Scope,
+    write: &ArtifactWrite<'_>,
+    prepared: &PreparedArtifact,
+) -> Result<Published, Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    let PreparedArtifact {
+        artifact_id,
+        expected,
+        checksums,
+    } = prepared;
+    put_manifest(transaction, scope, write.key.key())?;
+    if let Some(root) = write.key.root() {
+        put_manifest(transaction, scope, root)?;
+    }
+    if let Some(stored) = read_header(transaction, scope, *artifact_id).map_err(fail)? {
+        return if stored.lifecycle != LIVE {
+            Err(Bypass::Retiring)
+        } else if stored == *expected {
+            Ok(Published::AlreadyPresent)
+        } else {
+            Err(Bypass::Integrity(Integrity::ConflictingArtifact))
+        };
+    }
+    let namespace = scope.namespace.as_bytes().as_slice();
+    let reset_epoch = epoch(scope);
+    transaction
+        .execute(
+            "INSERT INTO artifacts (namespace_id, reset_epoch, artifact_id, kind, root_key, \
+             lifecycle, row_count, content_bytes, fact_checksum, supplemental) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                namespace,
+                reset_epoch,
+                artifact_id.as_bytes().as_slice(),
+                expected.kind,
+                expected.root_key,
+                expected.lifecycle,
+                expected.row_count,
+                expected.content_bytes,
+                expected.fact_checksum,
+                expected.supplemental
+            ],
+        )
+        .map_err(fail)?;
+    let mut insert = transaction
+        .prepare_cached(
+            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, \
+             row_kind, index_key, payload, row_checksum) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .map_err(fail)?;
+    for (ordinal, (row, checksum)) in write.rows.iter().zip(checksums).enumerate() {
+        insert
+            .execute(params![
+                namespace,
+                reset_epoch,
+                artifact_id.as_bytes().as_slice(),
+                ordinal as i64,
+                i64::from(row.row_kind),
+                row.index_key,
+                row.payload,
+                checksum.as_bytes().as_slice()
+            ])
+            .map_err(fail)?;
+    }
+    Ok(Published::Inserted)
+}
+
+/// Check a live stored header against the key it was looked up by.
+fn admit_header(
+    scope: Scope,
+    artifact_id: Digest,
+    stored: StoredHeader,
+    kind: KeyKind,
+    expected_root: Option<Vec<u8>>,
+) -> Lookup<ArtifactHeader> {
+    let malformed = Lookup::Miss(Miss::Malformed(Malformed::Header));
+    let (Ok(row_count), Ok(content_bytes), Ok(fact_checksum)) = (
+        u64::try_from(stored.row_count),
+        u64::try_from(stored.content_bytes),
+        <[u8; 32]>::try_from(stored.fact_checksum.as_slice()),
+    ) else {
+        return malformed;
+    };
+    if stored.kind != i64::from(kind.tag())
+        || stored.root_key != expected_root
+        || row_count > MAX_ARTIFACT_ROWS as u64
+        || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
+        || stored.supplemental.len() > MAX_SUPPLEMENTAL_BYTES
+    {
+        return malformed;
+    }
+    Lookup::Hit(ArtifactHeader {
+        scope,
+        artifact_id,
+        row_count,
+        content_bytes,
+        fact_checksum: Digest::from_bytes(fact_checksum),
+        supplemental: stored.supplemental,
+    })
+}
+
 impl Store {
     /// Publish an immutable artifact: key manifests, header and rows in one
     /// transaction. Hashing happens before the transaction starts.
     pub fn publish_artifact(&self, write: &ArtifactWrite<'_>) -> Result<Published, Bypass> {
-        let content_bytes = admit_write(write)?;
-        let artifact_id = write.key.digest();
-        let mut hasher = FactHasher::new(artifact_id, write.rows.len() as u64, write.supplemental);
-        let mut checksums = Vec::with_capacity(write.rows.len());
-        for (ordinal, row) in write.rows.iter().enumerate() {
-            checksums.push(hash_row(
-                &mut hasher,
-                artifact_id,
-                ordinal as u64,
-                row.row_kind,
-                row.index_key,
-                row.payload,
-            ));
-        }
-        let expected = StoredHeader {
-            kind: i64::from(write.key.key().kind().tag()),
-            root_key: write
-                .key
-                .root()
-                .map(|root| root.digest().as_bytes().to_vec()),
-            lifecycle: LIVE,
-            row_count: write.rows.len() as i64,
-            content_bytes: content_bytes as i64,
-            fact_checksum: hasher.finish().as_bytes().to_vec(),
-            supplemental: write.supplemental.to_vec(),
-        };
-
-        let fail = |error: rusqlite::Error| classify(&error);
+        let prepared = prepare_artifact(write)?;
         let mut writer = self.writer()?;
         let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
         ensure_live(&transaction, self.scope)?;
-        put_manifest(&transaction, self.scope, write.key.key())?;
-        if let Some(root) = write.key.root() {
-            put_manifest(&transaction, self.scope, root)?;
-        }
-        if let Some(stored) = read_header(&transaction, self.scope, artifact_id).map_err(fail)? {
-            return if stored.lifecycle != LIVE {
-                Err(Bypass::Retiring)
-            } else if stored == expected {
-                Ok(Published::AlreadyPresent)
-            } else {
-                Err(Bypass::Integrity(Integrity::ConflictingArtifact))
-            };
-        }
-        let namespace = self.scope.namespace.as_bytes().as_slice();
-        let reset_epoch = epoch(self.scope);
-        transaction
-            .execute(
-                "INSERT INTO artifacts (namespace_id, reset_epoch, artifact_id, kind, root_key, \
-                 lifecycle, row_count, content_bytes, fact_checksum, supplemental) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    namespace,
-                    reset_epoch,
-                    artifact_id.as_bytes().as_slice(),
-                    expected.kind,
-                    expected.root_key,
-                    expected.lifecycle,
-                    expected.row_count,
-                    expected.content_bytes,
-                    expected.fact_checksum,
-                    expected.supplemental
-                ],
-            )
-            .map_err(fail)?;
-        {
-            let mut insert = transaction
-                .prepare_cached(
-                    "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, \
-                     row_kind, index_key, payload, row_checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .map_err(fail)?;
-            for (ordinal, (row, checksum)) in write.rows.iter().zip(&checksums).enumerate() {
-                insert
-                    .execute(params![
-                        namespace,
-                        reset_epoch,
-                        artifact_id.as_bytes().as_slice(),
-                        ordinal as i64,
-                        i64::from(row.row_kind),
-                        row.index_key,
-                        row.payload,
-                        checksum.as_bytes().as_slice()
-                    ])
-                    .map_err(fail)?;
-            }
+        let published = insert_prepared(&transaction, self.scope, write, &prepared)?;
+        if published == Published::AlreadyPresent {
+            return Ok(published);
         }
         self.before_commit();
-        transaction.commit().map_err(fail)?;
-        Ok(Published::Inserted)
+        transaction.commit().map_err(|error| classify(&error))?;
+        Ok(published)
     }
 
     /// Admit the artifact's key manifests (and its root's) and its header.
@@ -336,31 +407,54 @@ impl Store {
         if stored.lifecycle != LIVE {
             return Ok(Lookup::Miss(Miss::Retired));
         }
-        let malformed = Lookup::Miss(Miss::Malformed(Malformed::Header));
         let expected_root = key.root().map(|root| root.digest().as_bytes().to_vec());
-        let (Ok(row_count), Ok(content_bytes), Ok(fact_checksum)) = (
-            u64::try_from(stored.row_count),
-            u64::try_from(stored.content_bytes),
-            <[u8; 32]>::try_from(stored.fact_checksum.as_slice()),
-        ) else {
-            return Ok(malformed);
+        Ok(admit_header(
+            self.scope,
+            key.digest(),
+            stored,
+            key.key().kind(),
+            expected_root,
+        ))
+    }
+
+    /// Admit the artifact stored under `id` when only its digest is known,
+    /// as the conclusion of validated evidence is. Its manifest, and its
+    /// root's, must hash to the stored digests (`admit_manifest_by_digest`).
+    pub fn open_artifact_by_id(&self, id: Digest) -> Result<Lookup<ArtifactHeader>, Bypass> {
+        let mut reader = self.reader()?;
+        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+        ensure_live(&transaction, self.scope)?;
+        let stored = match read_header(&transaction, self.scope, id) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+            Err(error) => return classify_read(&error).map(Lookup::Miss),
         };
-        if stored.kind != i64::from(key.key().kind().tag())
-            || stored.root_key != expected_root
-            || row_count > MAX_ARTIFACT_ROWS as u64
-            || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
-            || stored.supplemental.len() > MAX_SUPPLEMENTAL_BYTES
-        {
-            return Ok(malformed);
+        if stored.lifecycle != LIVE {
+            return Ok(Lookup::Miss(Miss::Retired));
         }
-        Ok(Lookup::Hit(ArtifactHeader {
-            scope: self.scope,
-            artifact_id: key.digest(),
-            row_count,
-            content_bytes,
-            fact_checksum: Digest::from_bytes(fact_checksum),
-            supplemental: stored.supplemental,
-        }))
+        let kind = match stored.kind {
+            2 => KeyKind::LocalArtifact,
+            3 => KeyKind::ExpandedArtifact,
+            _ => return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header))),
+        };
+        if let Lookup::Miss(miss) = admit_manifest_by_digest(&transaction, self.scope, id, kind)? {
+            return Ok(Lookup::Miss(miss));
+        }
+        if let Some(root) = &stored.root_key {
+            let Ok(root) = <[u8; 32]>::try_from(root.as_slice()) else {
+                return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header)));
+            };
+            if let Lookup::Miss(miss) = admit_manifest_by_digest(
+                &transaction,
+                self.scope,
+                Digest::from_bytes(root),
+                KeyKind::LocalArtifact,
+            )? {
+                return Ok(Lookup::Miss(miss));
+            }
+        }
+        let expected_root = stored.root_key.clone();
+        Ok(admit_header(self.scope, id, stored, kind, expected_root))
     }
 }
 

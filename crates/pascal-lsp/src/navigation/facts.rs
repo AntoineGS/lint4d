@@ -30,6 +30,10 @@ pub(crate) struct ExtractedFacts {
     /// Whether the facts may be published; unpublishable facts remain usable
     /// in memory.
     pub(crate) persistable: Result<(), NotPersistable>,
+    /// The session queried unit providers, so only a key holding its
+    /// context and evidence (`pascal_cache::SessionDependence`) may store
+    /// these facts.
+    pub(crate) provider_dependent: bool,
     /// The environment the parse used, which a local artifact key names.
     pub(crate) conditional_context: ConditionalContext,
 }
@@ -82,6 +86,7 @@ pub(crate) fn extract_facts(
     Ok(ExtractedFacts {
         facts,
         persistable: session.map_or(Ok(()), |session| session_persistability(session, &slots)),
+        provider_dependent: session.is_some_and(|session| session.provider_queries > 0),
         conditional_context: parsed.conditional_context.clone(),
     })
 }

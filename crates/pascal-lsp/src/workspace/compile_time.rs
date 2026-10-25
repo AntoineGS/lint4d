@@ -803,8 +803,10 @@ pub(super) fn expand_with_limits(
         .max_include_directives
         .min(limits.max_directives);
     resolver_limits.max_include_depth = resolver_limits.max_include_depth.min(limits.max_depth);
-    let store =
-        LspSourceStore::from_input(context.clone(), &input).with_directory_limit(directory_limit);
+    let capture = Arc::new(super::capture::ReadCapture::default());
+    let store = LspSourceStore::from_input(context.clone(), &input)
+        .with_directory_limit(directory_limit)
+        .with_capture(Arc::clone(&capture));
     let store = Resources {
         store,
         control: &control,
@@ -856,6 +858,7 @@ pub(super) fn expand_with_limits(
                 Some(crate::project_cache::overlay_content_hash(&overlay.text));
         }
     }
+    result.expanded.reads = Some(Arc::new(capture.snapshot()));
     Ok(result)
 }
 

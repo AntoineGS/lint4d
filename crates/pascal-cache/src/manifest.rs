@@ -12,6 +12,8 @@ pub enum KeyKind {
     ExpandedArtifact,
     Context,
     Member,
+    /// An evidence manifest; streamed, never stored whole (see `evidence`).
+    Evidence,
 }
 
 impl KeyKind {
@@ -22,6 +24,7 @@ impl KeyKind {
             Self::ExpandedArtifact => 3,
             Self::Context => 4,
             Self::Member => 5,
+            Self::Evidence => 6,
         }
     }
 
@@ -32,6 +35,7 @@ impl KeyKind {
             3 => Some(Self::ExpandedArtifact),
             4 => Some(Self::Context),
             5 => Some(Self::Member),
+            6 => Some(Self::Evidence),
             _ => None,
         }
     }
@@ -214,6 +218,7 @@ mod tests {
             KeyKind::ExpandedArtifact,
             KeyKind::Context,
             KeyKind::Member,
+            KeyKind::Evidence,
         ] {
             assert_eq!(KeyKind::from_tag(kind.tag()), Some(kind));
         }

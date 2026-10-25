@@ -35,6 +35,8 @@ pub enum Bypass {
     Integrity(Integrity),
     /// The artifact is being reclaimed; publish again later.
     Retiring,
+    /// Evidence proves an expansion; a local key is its own proof (spec §6.1).
+    EvidenceForLocalArtifact,
     Io(io::ErrorKind),
     Sqlite {
         extended_code: i32,
@@ -71,6 +73,7 @@ pub enum TooLarge {
     Row { ordinal: usize, bytes: usize },
     IndexKey { ordinal: usize, bytes: usize },
     Content { bytes: usize },
+    Observations { count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +82,8 @@ pub enum Integrity {
     ConflictingManifest,
     /// An immutable artifact with the same key has different content.
     ConflictingArtifact,
+    /// A stored evidence set with the same ID has different counts or subject.
+    ConflictingEvidence,
 }
 
 /// Why a lookup found nothing usable. A miss is never proof of absence.
@@ -102,6 +107,8 @@ pub enum Malformed {
     Count,
     /// Rows whose checksums hold but whose facts break a DTO invariant.
     Facts,
+    /// Observation rows that do not decode or disagree with their index columns.
+    Evidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

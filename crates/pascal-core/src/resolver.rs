@@ -266,6 +266,7 @@ impl SourceId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SourceRevision {
     Disk {
         stamp: ProjectReadStamp,
@@ -542,6 +543,10 @@ pub enum ResolutionObservation {
         entry: ProjectPathEntry,
         stamp: Option<ProjectReadStamp>,
         complete: bool,
+        /// The directory was listed. An include search marks each directory
+        /// it consults with a stat-only observation (`false`) and lists it
+        /// only when the exact name misses there.
+        listed: bool,
     },
     Candidate {
         path: PathBuf,
@@ -646,6 +651,34 @@ fn observation_action(
                 if new.path == old.path =>
             {
                 return ReportAction::Discard;
+            }
+            // A listing and a search marker of the same directory state stay one
+            // observation; it is a listing when either was.
+            (
+                ResolutionObservation::Directory {
+                    path,
+                    entry,
+                    stamp,
+                    complete,
+                    listed,
+                },
+                ResolutionObservation::Directory {
+                    path: old_path,
+                    entry: old_entry,
+                    stamp: old_stamp,
+                    complete: old_complete,
+                    listed: old_listed,
+                },
+            ) if path == old_path
+                && entry == old_entry
+                && stamp == old_stamp
+                && complete == old_complete =>
+            {
+                return if *listed && !*old_listed {
+                    ReportAction::Replace(index)
+                } else {
+                    ReportAction::Discard
+                };
             }
             _ if incoming == existing => return ReportAction::Discard,
             _ => {}
@@ -5303,6 +5336,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: listing.stamp.clone(),
                 complete,
+                listed: true,
             }
         })?;
         if !complete {
@@ -5439,6 +5473,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: listing.stamp.clone(),
                 complete,
+                listed: true,
             },
         )?;
         if !complete {
@@ -6137,6 +6172,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 entry: entry.clone(),
                 stamp: path_stamp_result(&entry.path).ok().flatten(),
                 complete: true,
+                listed: false,
             },
         )
     }
@@ -8921,36 +8957,13 @@ fn push_warning(report: &mut ResolutionReport, warning: String, maximum: usize) 
 
 fn push_observation(
     observations: &mut Vec<ResolutionObservation>,
-    observation: ResolutionObservation,
+    mut observation: ResolutionObservation,
 ) {
-    match &observation {
-        ResolutionObservation::Metadata(metadata) => {
-            let path = metadata.path();
-            if let Some(existing) = observations.iter_mut().find(|existing| matches!(existing, ResolutionObservation::Metadata(current) if current.path() == path)) {
-                if matches!(existing, ResolutionObservation::Metadata(MetadataObservation::Stat { .. }))
-                    && matches!(metadata, MetadataObservation::Payload { .. })
-                { *existing = observation; }
-                return;
-            }
-        }
-        ResolutionObservation::ProjectRead(read) => {
-            if observations.iter().any(|existing| matches!(existing, ResolutionObservation::ProjectRead(current) if current.path == read.path)) { return; }
-        }
-        ResolutionObservation::Candidate { path, present, .. } => {
-            if let Some(existing) = observations.iter_mut().find(|existing| {
-                matches!(existing, ResolutionObservation::Candidate { path: current, .. } if current == path)
-            }) {
-                if *present {
-                    *existing = observation;
-                }
-                return;
-            }
-        }
-        _ => {
-            if observations.iter().any(|existing| existing == &observation) { return; }
-        }
+    match observation_action(observations, &mut observation) {
+        ReportAction::Discard => {}
+        ReportAction::Replace(index) => observations[index] = observation,
+        ReportAction::Append => observations.push(observation),
     }
-    observations.push(observation);
 }
 
 fn source_request_path(

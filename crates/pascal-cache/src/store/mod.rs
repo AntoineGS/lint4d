@@ -4,6 +4,7 @@
 
 mod artifacts;
 mod container;
+mod evidence;
 mod facts;
 mod index;
 mod keys;
@@ -20,6 +21,9 @@ mod testing;
 pub use artifacts::{
     ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
 };
+pub use evidence::{
+    EvidenceHeader, EvidenceReader, EvidenceWrite, ObservationBatch, PublishedEvidence,
+};
 #[cfg(feature = "test-support")]
 pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
 pub use index::{IndexHit, IndexPage};
@@ -30,10 +34,11 @@ pub use reader::{ArtifactReader, RowBatch, StoredRow};
 
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use limits::{
-    LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES,
-    MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
-    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT, StoreLimits,
+    LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
+    MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
+    MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS,
+    MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    SQLITE_LENGTH_LIMIT, StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;

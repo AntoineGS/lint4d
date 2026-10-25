@@ -3573,6 +3573,14 @@ mod tests {
         tv_nsec: i64,
     }
 
+    // The change identity catches a restored-mtime rewrite at the stamp level
+    // on Unix, before the content check runs; both reject with a retry error.
+    #[cfg(target_os = "linux")]
+    fn is_changed_config_rejection(error: &str) -> bool {
+        error.contains("configuration content changed")
+            || error.contains("metadata or membership changed")
+    }
+
     #[cfg(target_os = "linux")]
     fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
         let pathname = CString::new(path.to_string_lossy().as_bytes()).expect("valid path");
@@ -3623,7 +3631,7 @@ mod tests {
             &cancel,
         )
         .expect_err("same-stamp metadata content changes must stale assistance");
-        assert!(error.contains("configuration content changed"), "{error}");
+        assert!(is_changed_config_rejection(&error), "{error}");
     }
 
     #[cfg(target_os = "linux")]
@@ -3675,13 +3683,13 @@ mod tests {
         let completion_error = revalidate_input(&input, &completion.records, &cancel)
             .expect_err("empty completion must retain consumed project metadata");
         assert!(
-            completion_error.contains("configuration content changed"),
+            is_changed_config_rejection(&completion_error),
             "{completion_error}"
         );
         let signature_error = revalidate_input(&input, &signature.records, &cancel)
             .expect_err("null signature must retain consumed project metadata");
         assert!(
-            signature_error.contains("configuration content changed"),
+            is_changed_config_rejection(&signature_error),
             "{signature_error}"
         );
     }
@@ -3787,7 +3795,7 @@ mod tests {
         restore_mtime(&package_project, &before);
         let error = revalidate_input(&input, &mutated.records, &cancel)
             .expect_err("package project mutation at the read boundary must stale assistance");
-        assert!(error.contains("configuration content changed"), "{error}");
+        assert!(is_changed_config_rejection(&error), "{error}");
 
         let upper = temp.path().join("UpperPackage.dpk");
         let lower = temp.path().join("lowerpackage.dpk");

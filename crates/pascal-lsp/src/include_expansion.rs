@@ -64,6 +64,8 @@ pub(crate) struct ExpandedSource {
     text: String,
     map: SourceMap,
     pub(crate) session: Option<std::sync::Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
+    /// What the session read from disk, with durable digests.
+    pub(crate) reads: Option<std::sync::Arc<crate::workspace::capture::CapturedReads>>,
     pub(crate) conditionals: Option<conditional::ConditionalAnalysis>,
     pub(crate) observations: Vec<IncludeObservation>,
 }
@@ -109,6 +111,9 @@ impl ExpandedSource {
         visit(self.text.len())?;
         if let Some(session) = &self.session {
             visit(session.budget.budget_snapshot().retained_bytes)?;
+        }
+        if let Some(reads) = &self.reads {
+            visit(reads.retained_bytes())?;
         }
         if let Some(analysis) = &self.conditionals {
             visit(analysis.projected_source.len())?;
@@ -774,6 +779,8 @@ mod tests {
                             modified: None,
                             is_dir: false,
                             is_symlink: false,
+                            change: None,
+                            settled: true,
                         },
                         content_hash: hash,
                         read_policy: Default::default(),

@@ -5204,6 +5204,7 @@ mod tests {
             },
             stamp: None,
             complete: true,
+            listed: true,
         };
         append_observations(
             &mut analysis.value_mut().observations,

@@ -82,14 +82,15 @@ pub use authorization::{
 };
 mod authorization;
 pub use reads::{
-    MetadataObservation, ProjectDiscovery, ProjectReadObservation, ProjectReadStamp,
-    ProjectWorkBudget, SystemPasSearchObservation, content_hash_bytes, metadata_payload_is_current,
-    path_stamp_result,
+    ChangeIdentity, MetadataObservation, ProjectDiscovery, ProjectReadObservation,
+    ProjectReadStamp, ProjectWorkBudget, STAMP_SETTLE_WINDOW, SystemPasSearchObservation,
+    content_hash_bytes, metadata_payload_is_current, path_stamp_result, stamp_from_metadata,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use reads::{
     TestAfterProjectReadAtGuard, TestAfterProjectReadGuard, TestBeforeProjectReadAtGuard,
-    test_after_project_read, test_after_project_read_at, test_before_project_read_at,
+    backdate_for_test, backdate_tree_for_test, test_after_project_read, test_after_project_read_at,
+    test_before_project_read_at,
 };
 mod reads;
 pub use discovery_cache::{ProjectDiscoveryCacheScope, ProjectDiscoveryCacheStats};

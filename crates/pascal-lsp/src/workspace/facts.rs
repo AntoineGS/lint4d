@@ -61,33 +61,46 @@ impl Workspace {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::workspace) mod tests {
     use super::*;
     use pascal_core::facts::*;
     use pascal_project::delphi_overrides::OverrideSession;
     use std::path::PathBuf;
 
-    pub(super) struct Indexed {
+    pub(in crate::workspace) struct Indexed {
         _temp: tempfile::TempDir,
-        pub(super) root: PathBuf,
-        pub(super) workspace: Workspace,
+        pub(in crate::workspace) root: PathBuf,
+        pub(in crate::workspace) workspace: Workspace,
     }
 
     /// Index `open` in a worker over a fresh directory holding `files`.
-    pub(super) fn index(files: &[(&str, &[u8])], open: &[&str]) -> Indexed {
+    pub(in crate::workspace) fn index(files: &[(&str, &[u8])], open: &[&str]) -> Indexed {
         index_with_buffers(files, &[], open)
     }
 
     /// `index`, with `buffers` open in the editor over their saved files.
-    pub(super) fn index_with_buffers(
+    pub(in crate::workspace) fn index_with_buffers(
         files: &[(&str, &[u8])],
         buffers: &[(&str, &str)],
+        open: &[&str],
+    ) -> Indexed {
+        index_with_edits(files, buffers, &[], open)
+    }
+
+    /// `index_with_buffers`, with `deleted` files removed in the editor but
+    /// still on disk.
+    pub(in crate::workspace) fn index_with_edits(
+        files: &[(&str, &[u8])],
+        buffers: &[(&str, &str)],
+        deleted: &[&str],
         open: &[&str],
     ) -> Indexed {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         for (name, bytes) in files {
-            std::fs::write(root.join(name), bytes).unwrap();
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
         }
         let mut main = Workspace::with_override_session(
             vec![root.clone()],
@@ -101,6 +114,9 @@ mod tests {
                 1,
             )
             .unwrap();
+        }
+        for name in deleted {
+            main.remember_deleted(&Url::from_file_path(root.join(name)).unwrap());
         }
         let mut workspace = Workspace::from_analysis_input(&main.analysis_input());
         for name in open {
@@ -121,11 +137,11 @@ mod tests {
     }
 
     impl Indexed {
-        pub(super) fn uri(&self, name: &str) -> Url {
+        pub(in crate::workspace) fn uri(&self, name: &str) -> Url {
             Url::from_file_path(self.root.join(name)).unwrap()
         }
 
-        pub(super) fn facts(&self, name: &str) -> SourceFacts {
+        pub(in crate::workspace) fn facts(&self, name: &str) -> SourceFacts {
             self.workspace
                 .source_facts(
                     &self.uri(name),
@@ -144,13 +160,13 @@ mod tests {
             .unwrap_or_else(|| panic!("no posting {name}"))
     }
 
-    pub(super) const MAIN: &str = "unit Main;\ninterface\n{$I Types.inc}\n{$I Types.inc}\n{$I Missing.inc}\nimplementation\nend.\n";
-    pub(super) const TYPES: &str = "{$I Nested.inc}\nconst FromTypes = 1;\n";
-    pub(super) const NESTED: &str = "const FromNested = 2;\n";
-    pub(super) const CONDITIONAL: &[u8] = b"unit Cond;\ninterface\n{$IFDEF MAYBE}\nconst Maybe = 1;\n{$ENDIF}\n{$IF False}\nconst Never = 2;\n{$ENDIF}\nconst Always = 3;\nimplementation\nend.\n";
-    pub(super) const LATIN: &[u8] = b"unit Latin;\ninterface\n{ caf\xe9 cr\xe8me }\nconst Greeting = 'd\xe9j\xe0';\nconst After = 1;\nimplementation\nend.\n";
+    pub(in crate::workspace) const MAIN: &str = "unit Main;\ninterface\n{$I Types.inc}\n{$I Types.inc}\n{$I Missing.inc}\nimplementation\nend.\n";
+    pub(in crate::workspace) const TYPES: &str = "{$I Nested.inc}\nconst FromTypes = 1;\n";
+    pub(in crate::workspace) const NESTED: &str = "const FromNested = 2;\n";
+    pub(in crate::workspace) const CONDITIONAL: &[u8] = b"unit Cond;\ninterface\n{$IFDEF MAYBE}\nconst Maybe = 1;\n{$ENDIF}\n{$IF False}\nconst Never = 2;\n{$ENDIF}\nconst Always = 3;\nimplementation\nend.\n";
+    pub(in crate::workspace) const LATIN: &[u8] = b"unit Latin;\ninterface\n{ caf\xe9 cr\xe8me }\nconst Greeting = 'd\xe9j\xe0';\nconst After = 1;\nimplementation\nend.\n";
 
-    pub(super) const BROKEN: &[u8] =
+    pub(in crate::workspace) const BROKEN: &[u8] =
         b"unit Broken;\ninterface\nprocedure Bad(;\nconst After = 1;\nimplementation\nend.\n";
 
     pub(super) fn includes() -> Indexed {
@@ -318,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_dependent_compile_time_facts_are_not_persistable() {
+    fn provider_dependent_compile_time_facts_say_so() {
         let indexed = index(
             &[
                 (
@@ -333,14 +349,12 @@ mod tests {
             &["Main.pas"],
         );
         let source = indexed.facts("Main.pas");
-        assert_eq!(
-            source.extracted.persistable,
-            Err(NotPersistable::ProviderDependent)
-        );
+        assert_eq!(source.extracted.persistable, Ok(()));
         assert!(
-            !source.extracted.facts.declarations.is_empty(),
-            "the facts stay usable in memory"
+            source.extracted.provider_dependent,
+            "only a key holding its context and evidence may store these facts"
         );
+        assert!(!source.extracted.facts.declarations.is_empty());
     }
 
     #[test]
@@ -348,6 +362,7 @@ mod tests {
         let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
         let source = indexed.facts("Cond.pas");
         assert_eq!(source.extracted.persistable, Ok(()));
+        assert!(!source.extracted.provider_dependent);
         assert_eq!(
             source.origin,
             SourceOrigin::Library,

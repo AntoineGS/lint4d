@@ -1,7 +1,7 @@
 use pascal_cache::{
-    ArtifactRef, ContextKey, ExpandedArtifactKey, IncludeOccurrence, IncludeOutcome, KeyError,
-    KeyKind, LocalArtifactKey, ManifestHeader, MemberInputs, MemberKey, SOURCE_DIGEST_CONTEXT,
-    SourceContent, SourceIdentity,
+    ArtifactRef, ContextKey, Digest, ExpandedArtifactKey, IncludeOccurrence, IncludeOutcome,
+    KeyError, KeyKind, LocalArtifactKey, ManifestHeader, MemberInputs, MemberKey,
+    SOURCE_DIGEST_CONTEXT, SessionDependence, SourceContent, SourceIdentity,
 };
 use pascal_core::compile_time::OccurrenceId;
 use pascal_core::facts::{IncludeSlot, IncludeSlotOutcome, UnresolvedInclude};
@@ -401,6 +401,8 @@ fn source(path: &str, text: &str, revision: Option<SourceRevision>) -> LoadedSou
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: pascal_project::content_hash_bytes(text.as_bytes()),
             read_policy: Default::default(),
@@ -550,4 +552,53 @@ fn unresolved_reasons_are_typed_parts_of_the_identity() {
         }
     }
     assert_eq!(keys[0], key(UnresolvedInclude::Unavailable));
+}
+
+#[test]
+fn provider_dependent_expansions_key_their_context_and_observations() {
+    let root = local(UNIT, &ConditionalContext::default(), SourceOrigin::Library);
+    let plain = ExpandedArtifactKey::new(&root, &[]).unwrap();
+    let dependence = SessionDependence {
+        context: Digest::from_bytes([1; 32]),
+        observations: Digest::from_bytes([2; 32]),
+    };
+    let dependent = ExpandedArtifactKey::dependent(&root, &[], dependence).unwrap();
+    assert_ne!(plain.digest(), dependent.digest());
+    assert_eq!(plain.dependence(), None);
+    assert_eq!(dependent.dependence(), Some(dependence));
+    assert_eq!(dependent.root_digest(), root.digest());
+    assert!(
+        dependent
+            .key()
+            .manifest()
+            .starts_with(plain.key().manifest()),
+        "a dependent key appends field 3; every other key keeps its encoding"
+    );
+    for other in [
+        SessionDependence {
+            context: Digest::from_bytes([3; 32]),
+            ..dependence
+        },
+        SessionDependence {
+            observations: Digest::from_bytes([3; 32]),
+            ..dependence
+        },
+    ] {
+        assert_ne!(
+            ExpandedArtifactKey::dependent(&root, &[], other)
+                .unwrap()
+                .digest(),
+            dependent.digest()
+        );
+    }
+    assert_eq!(
+        ExpandedArtifactKey::dependent_from_slots(
+            &root,
+            &ConditionalContext::default(),
+            &[],
+            dependence
+        )
+        .unwrap(),
+        dependent
+    );
 }

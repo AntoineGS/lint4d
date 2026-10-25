@@ -7,8 +7,9 @@
 //! the strict form can only turn a hit into a miss.
 
 use crate::project_cache::{ProjectCache, Proven};
+use crate::workspace::DiskStamp;
 use crate::workspace::rename::OverlayInput;
-use crate::workspace::resolver::path_equivalent;
+use crate::workspace::resolver::{deletion_applies, path_equivalent};
 use lsp_types::Url;
 use pascal_cache::{Observation, SourceContent, listing_digest};
 use pascal_core::resolver::{
@@ -25,6 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) struct CurrentInputs<'a> {
     pub(crate) read_policy: &'a ReadPolicy,
     pub(crate) overlays: &'a HashMap<Url, OverlayInput>,
+    /// The editor's deletions (`resolver::deletion_overrides_by_path`).
+    pub(crate) deleted: &'a HashMap<PathBuf, Option<DiskStamp>>,
     pub(crate) cache: &'a ProjectCache,
     pub(crate) max_file_bytes: usize,
     pub(crate) directory_entries: usize,
@@ -135,9 +138,17 @@ impl<'a> Validator<'a> {
         })
     }
 
+    /// The editor deleted `path`, which this session's store hides.
+    fn deleted(&self, path: &Path) -> bool {
+        deletion_applies(
+            self.inputs.deleted,
+            &crate::workspace::absolute_path(path.to_path_buf()),
+        )
+    }
+
     fn payload(&mut self, path: &Path, entry: &ProjectPathEntry, content: &SourceContent) -> Check {
         let stale = |stale: fn(PathBuf) -> Stale| Check::Stale(stale(path.to_path_buf()));
-        if self.open(path) {
+        if self.open(path) || self.deleted(path) {
             return stale(Stale::Overlay);
         }
         let policy = self.inputs.read_policy;
@@ -189,7 +200,13 @@ impl<'a> Validator<'a> {
     /// Mirrors the resolver: a candidate is visible only where the read
     /// policy allows its location.
     fn presence(&mut self, path: &Path, entry: Option<&ProjectPathEntry>, present: bool) -> Check {
-        if !present && self.open(path) {
+        // A buffer can create the candidate, a deletion remove it.
+        let edited = if present {
+            self.deleted(path)
+        } else {
+            self.open(path)
+        };
+        if edited {
             return Check::Stale(Stale::Overlay(path.to_path_buf()));
         }
         let visible = entry.is_none_or(|entry| self.inputs.read_policy.allows_location(entry));
@@ -237,14 +254,16 @@ impl<'a> Validator<'a> {
             Err(SourceStoreError::Cancelled) => return self.limited(),
             _ => return stale(Stale::Listing),
         };
-        // A buffer for a file the disk lacks joins the session's listing.
+        // A buffer for a file the disk lacks joins the session's listing,
+        // and a file deleted in the editor is missing from it.
         if self.inputs.overlays.keys().any(|uri| {
             uri.to_file_path().is_ok_and(|open| {
                 open.parent()
                     .is_some_and(|parent| path_equivalent(parent, path))
                     && !files.iter().any(|file| path_equivalent(file, &open))
             })
-        }) {
+        }) || files.iter().any(|file| self.deleted(file))
+        {
             return stale(Stale::Overlay);
         }
         let witnessed = before
@@ -294,6 +313,7 @@ mod tests {
         policy: ReadPolicy,
         cache: ProjectCache,
         overlays: HashMap<Url, OverlayInput>,
+        deleted: HashMap<PathBuf, Option<DiskStamp>>,
     }
 
     fn fixture() -> Fixture {
@@ -315,6 +335,7 @@ mod tests {
             policy,
             cache: ProjectCache::default(),
             overlays: HashMap::new(),
+            deleted: HashMap::new(),
         }
     }
 
@@ -371,6 +392,7 @@ mod tests {
                 CurrentInputs {
                     read_policy: policy,
                     overlays: &self.overlays,
+                    deleted: &self.deleted,
                     cache,
                     max_file_bytes: 1 << 20,
                     directory_entries: 1024,
@@ -596,6 +618,56 @@ mod tests {
         );
     }
 
+    impl Fixture {
+        /// Delete `name` in the editor; the disk keeps it.
+        fn delete_in_editor(&mut self, name: &str) {
+            let path = self.root.join(name);
+            let stamp = crate::workspace::disk_stamp(&path);
+            assert!(stamp.is_some());
+            self.deleted.insert(path, stamp);
+        }
+    }
+
+    #[test]
+    fn an_editor_deletion_makes_disk_evidence_stale() {
+        let mut fixture = fixture();
+        let include = fixture.root.join("include");
+        let present = Observation::Presence {
+            entry: Some(ProjectPathEntry::configured(include.join("A.inc"))),
+            path: include.join("A.inc"),
+            present: true,
+        };
+        let (payload, listing) = (fixture.payload(), fixture.listing());
+        assert_eq!(
+            fixture
+                .check(&[payload.clone(), present.clone(), listing.clone()])
+                .0,
+            vec![Check::Holds; 3]
+        );
+        fixture.delete_in_editor("include/A.inc");
+        assert_eq!(
+            fixture.check(&[payload, present, listing]).0,
+            vec![
+                Check::Stale(Stale::Overlay(include.join("A.inc"))),
+                Check::Stale(Stale::Overlay(include.join("A.inc"))),
+                Check::Stale(Stale::Overlay(include)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_editor_deletion_the_disk_has_moved_past_does_not_apply() {
+        let mut fixture = fixture();
+        let payload = fixture.payload();
+        fixture.delete_in_editor("include/A.inc");
+        let path = fixture.root.join("include/A.inc");
+        // The file was rewritten since: the deletion no longer hides it.
+        std::fs::write(&path, b"{$DEFINE A}").unwrap();
+        pascal_project::backdate_tree_for_test(&fixture.root);
+        assert_ne!(crate::workspace::disk_stamp(&path), fixture.deleted[&path]);
+        assert_eq!(fixture.check(&[payload]).0, vec![Check::Holds]);
+    }
+
     #[test]
     fn cancellation_and_budget_never_hold() {
         let fixture = fixture();
@@ -605,6 +677,7 @@ mod tests {
             CurrentInputs {
                 read_policy: &fixture.policy,
                 overlays: &fixture.overlays,
+                deleted: &fixture.deleted,
                 cache: &fixture.cache,
                 max_file_bytes: 1 << 20,
                 directory_entries: 1024,
@@ -624,6 +697,7 @@ mod tests {
             CurrentInputs {
                 read_policy: &fixture.policy,
                 overlays: &fixture.overlays,
+                deleted: &fixture.deleted,
                 cache: &fixture.cache,
                 max_file_bytes: 1 << 20,
                 directory_entries: 1024,

@@ -280,6 +280,31 @@ fn admit_decoded_source(
     })
 }
 
+/// The editor's deletions keyed by path, as [`LspSourceStore`] matches them.
+pub(crate) fn deletion_overrides_by_path(
+    overrides: &HashMap<Url, Option<DiskStamp>>,
+) -> HashMap<PathBuf, Option<DiskStamp>> {
+    overrides
+        .iter()
+        .filter_map(|(uri, stamp)| {
+            uri.to_file_path()
+                .ok()
+                .map(|path| (absolute_path(path), stamp.clone()))
+        })
+        .collect()
+}
+
+/// An editor deletion of `path` applies while the disk still holds the file
+/// it deleted.
+pub(crate) fn deletion_applies(
+    overrides: &HashMap<PathBuf, Option<DiskStamp>>,
+    path: &Path,
+) -> bool {
+    overrides
+        .get(path)
+        .is_some_and(|stamp| super::disk_stamp(path) == *stamp)
+}
+
 impl LspSourceStore {
     pub(crate) fn from_input(context: Arc<ProjectContext>, input: &WorkspaceInput) -> Self {
         let mut overlays = HashMap::new();
@@ -293,15 +318,7 @@ impl LspSourceStore {
             overlays.insert(path.clone(), overlay.clone());
             paths_to_uris.insert(path, uri);
         }
-        let deleted_overrides = input
-            .deleted_overrides
-            .iter()
-            .filter_map(|(uri, stamp)| {
-                uri.to_file_path()
-                    .ok()
-                    .map(|path| (absolute_path(path), stamp.clone()))
-            })
-            .collect();
+        let deleted_overrides = deletion_overrides_by_path(&input.deleted_overrides);
         let rejected_paths = input
             .rejected_documents
             .iter()
@@ -565,10 +582,7 @@ impl SourceStore for LspSourceStore {
             #[cfg(test)]
             record_test_source_load(request.path);
             if let Some(capture) = &self.capture
-                && self
-                    .deleted_overrides
-                    .get(request.path)
-                    .is_some_and(|stamp| super::disk_stamp(request.path) == *stamp)
+                && deletion_applies(&self.deleted_overrides, request.path)
             {
                 capture.editor_state();
             }
@@ -795,11 +809,7 @@ impl SourceStore for LspSourceStore {
             });
         }
 
-        if self
-            .deleted_overrides
-            .get(&path)
-            .is_some_and(|stamp| super::disk_stamp(&path) == *stamp)
-        {
+        if deletion_applies(&self.deleted_overrides, &path) {
             if let Some(capture) = &self.capture {
                 capture.editor_state();
             }

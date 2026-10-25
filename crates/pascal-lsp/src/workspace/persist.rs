@@ -61,7 +61,8 @@ pub(crate) enum ReuseVia {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReuseMiss {
-    /// The root is open in the editor; its view is session-private.
+    /// The root is open or deleted in the editor; its view is
+    /// session-private.
     Open,
     Stale(Stale),
     Unproven(Unproven),
@@ -213,7 +214,12 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
         let overlays = self.overlay_inputs();
-        if self.is_open(uri) || overlays.contains_key(&super::canonical_file_uri(uri)) {
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
+        let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
+        if self.is_open(uri)
+            || overlays.contains_key(&super::canonical_file_uri(uri))
+            || super::resolver::deletion_applies(&deleted, &super::absolute_path(path.clone()))
+        {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
         let key = self
@@ -227,7 +233,6 @@ impl Workspace {
                 .context,
         );
         let bytes = self.saved_root_bytes(uri, &context)?;
-        let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
         let local = LocalArtifactKey::new(
             &SourceContent::from_bytes(&bytes),
             &super::conditional_context_for_uri(&context, uri),
@@ -254,6 +259,7 @@ impl Workspace {
             CurrentInputs {
                 read_policy: context.read_policy(),
                 overlays: &overlays,
+                deleted: &deleted,
                 cache: &self.project_cache,
                 max_file_bytes: self.options.limits.max_file_bytes,
                 directory_entries: ResolverLimits::default().max_directory_entries,
@@ -351,6 +357,16 @@ pub(in crate::workspace) mod tests {
         indexed: &Indexed,
         buffers: &[(&str, &str)],
     ) -> Workspace {
+        restart_with_edits(indexed, buffers, &[])
+    }
+
+    /// `restart_with_buffers`, with `deleted` removed in the editor but
+    /// still on disk.
+    pub(in crate::workspace) fn restart_with_edits(
+        indexed: &Indexed,
+        buffers: &[(&str, &str)],
+        deleted: &[&str],
+    ) -> Workspace {
         let mut main = Workspace::with_override_session(
             vec![indexed.root.clone()],
             Default::default(),
@@ -363,6 +379,9 @@ pub(in crate::workspace) mod tests {
                 1,
             )
             .unwrap();
+        }
+        for name in deleted {
+            main.remember_deleted(&Url::from_file_path(indexed.root.join(name)).unwrap());
         }
         Workspace::from_analysis_input(&main.analysis_input())
     }
@@ -883,6 +902,35 @@ mod acceptance {
                 "{searched}: identical bytes behind a symlinked search directory: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn editor_deletions_are_editor_state_on_reuse() {
+        let (indexed, directory) = persisted(&include_path());
+        assert!(is_hit(&after_restart(&indexed, &directory)));
+        let store = open_store(directory.path());
+        let uri = indexed.uri("Main.pas");
+        let mut restarted = restart_with_edits(&indexed, &[], &["include/Shared.inc"]);
+        assert_eq!(
+            reuse(&mut restarted, &uri, &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Stale(Stale::Overlay(
+                indexed.root.join("include/Shared.inc")
+            )))
+        );
+        let mut restarted = restart_with_edits(&indexed, &[], &["Main.pas"]);
+        assert_eq!(
+            reuse(&mut restarted, &uri, &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Open)
+        );
+        // A local key is its own proof, so only the editor state refuses it.
+        let (indexed, directory) = persisted(&[("Main.pas", CONDITIONAL.to_vec())]);
+        assert!(is_hit(&after_restart(&indexed, &directory)));
+        let store = open_store(directory.path());
+        let mut restarted = restart_with_edits(&indexed, &[], &["Main.pas"]);
+        assert_eq!(
+            reuse(&mut restarted, &indexed.uri("Main.pas"), &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Open)
+        );
     }
 
     #[test]

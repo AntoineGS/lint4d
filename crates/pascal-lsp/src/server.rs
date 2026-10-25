@@ -18207,6 +18207,8 @@ mod tests {
                 modified: Some(std::time::SystemTime::UNIX_EPOCH),
                 is_dir: false,
                 is_symlink: true,
+                change: None,
+                settled: true,
             }),
             content_hash: Some(0xA11C_E001),
             parsed_text_hash: Some(0xA11C_E002),
@@ -18361,6 +18363,8 @@ mod tests {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         });
         assert_compaction_hashes(&path_only, None, None);
         let (completion, diagnostic, _) = compact_with_both_wrappers(&path_only);

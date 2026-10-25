@@ -266,6 +266,7 @@ impl SourceId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SourceRevision {
     Disk {
         stamp: ProjectReadStamp,

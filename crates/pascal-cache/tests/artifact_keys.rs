@@ -401,6 +401,8 @@ fn source(path: &str, text: &str, revision: Option<SourceRevision>) -> LoadedSou
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: pascal_project::content_hash_bytes(text.as_bytes()),
             read_policy: Default::default(),

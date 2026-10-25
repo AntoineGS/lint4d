@@ -14793,6 +14793,8 @@ fn path_stamp_from_project_read(stamp: &ProjectReadStamp) -> PathStamp {
         modified: stamp.modified,
         is_dir: stamp.is_dir,
         is_symlink: stamp.is_symlink,
+        change: stamp.change,
+        settled: stamp.settled,
     }
 }
 
@@ -22716,6 +22718,8 @@ BDS = '/fake/37'
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: 0,
             content_bytes: None,
@@ -22754,6 +22758,8 @@ BDS = '/fake/37'
                     modified: None,
                     is_dir: false,
                     is_symlink: false,
+                    change: None,
+                    settled: true,
                 },
                 content_hash: 0,
                 content_bytes: None,
@@ -22853,6 +22859,8 @@ BDS = '/fake/37'
                 modified: None,
                 is_dir: false,
                 is_symlink: false,
+                change: None,
+                settled: true,
             },
             content_hash: 1,
             content_bytes: None,

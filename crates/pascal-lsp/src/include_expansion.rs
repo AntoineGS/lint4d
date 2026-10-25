@@ -774,6 +774,8 @@ mod tests {
                             modified: None,
                             is_dir: false,
                             is_symlink: false,
+                            change: None,
+                            settled: true,
                         },
                         content_hash: hash,
                         read_policy: Default::default(),

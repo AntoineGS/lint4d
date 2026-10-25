@@ -11588,6 +11588,8 @@ mod tests {
             modified: None,
             is_dir: true,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
 
         let mut candidate_first = BaselineAccumulator::default();
@@ -11729,6 +11731,8 @@ mod tests {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         };
         let record = path_record_at(
             path.clone(),

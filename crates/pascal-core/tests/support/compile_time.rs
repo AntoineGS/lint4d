@@ -398,6 +398,8 @@ fn disk_revision(bytes: &[u8]) -> SourceRevision {
             modified: None,
             is_dir: false,
             is_symlink: false,
+            change: None,
+            settled: true,
         },
         content_hash: pascal_project::content_hash_bytes(bytes),
         read_policy: Default::default(),

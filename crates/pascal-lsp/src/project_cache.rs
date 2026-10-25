@@ -284,7 +284,13 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
                 return overlay_content_hash(&overlay.text) == *content_hash;
             }
             match current_stamp(path) {
-                Ok(Some(now)) if Some(&now) == stamp.as_ref() => true,
+                Ok(Some(now))
+                    if stamp
+                        .as_ref()
+                        .is_some_and(|stamp| stamp.proves_unchanged(&now)) =>
+                {
+                    true
+                }
                 Ok(Some(_)) => {
                     #[cfg(test)]
                     crate::workspace::resolver::record_test_disk_read(path);
@@ -453,15 +459,47 @@ mod probe_tests {
             content_hash: pascal_project::content_hash_bytes(b"unit A;"),
         }];
         std::fs::write(&file, "unit B;").unwrap();
-        // Windows can stamp both writes with the same timer tick; the probe
-        // only rereads content once the stamp moved (TASK-122).
+        assert!(!probes_hold(&probes, &HashMap::new()));
+    }
+
+    #[test]
+    fn a_same_tick_rewrite_breaks_a_content_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.pas");
+        std::fs::write(&file, "unit A;").unwrap();
+        let before = stamp(&file).unwrap();
+        let probes = vec![Probe::Content {
+            path: file.clone(),
+            stamp: Some(before.clone()),
+            content_hash: pascal_project::content_hash_bytes(b"unit A;"),
+        }];
+        std::fs::write(&file, "unit B;").unwrap();
         std::fs::File::options()
             .write(true)
             .open(&file)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .set_modified(before.modified.unwrap())
             .unwrap();
         assert!(!probes_hold(&probes, &HashMap::new()));
+    }
+
+    #[test]
+    fn a_settled_unchanged_content_probe_holds_without_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.pas");
+        std::fs::write(&file, "unit A;").unwrap();
+        pascal_project::backdate_for_test(&file);
+        let probes = vec![Probe::Content {
+            path: file.clone(),
+            stamp: stamp(&file),
+            content_hash: pascal_project::content_hash_bytes(b"unit A;"),
+        }];
+        crate::workspace::resolver::take_test_disk_reads();
+        assert!(probes_hold(&probes, &HashMap::new()));
+        assert!(
+            crate::workspace::resolver::take_test_disk_reads().is_empty(),
+            "a settled stamp is the fast path"
+        );
     }
 
     #[test]
@@ -751,13 +789,6 @@ mod cache_tests {
         );
 
         std::fs::write(&include, "{$DEFINE B}").unwrap();
-        // Windows can stamp both writes with the same timer tick (TASK-122).
-        std::fs::File::options()
-            .write(true)
-            .open(&include)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
-            .unwrap();
         assert!(
             cache
                 .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
@@ -1534,8 +1565,14 @@ mod cache_tests {
         assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
 
         let origin = |text| DiskOrigin {
-            len: 1,
-            modified: std::time::SystemTime::UNIX_EPOCH,
+            stamp: crate::workspace::DiskStamp::from_project(&pascal_project::ProjectReadStamp {
+                bytes: 1,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                is_dir: false,
+                is_symlink: false,
+                change: None,
+                settled: true,
+            }),
             raw_bytes: 1,
             text,
         };
@@ -2002,13 +2039,12 @@ pub(crate) struct UnitValue {
     pub(crate) disk: Option<DiskOrigin>,
 }
 
-/// A closed source file as it was read. A later load whose `stat` still
-/// shows this length and modification time takes `text` instead of reading
-/// and decoding the file again.
+/// A closed source file as it was read. A later load whose stamp this one
+/// proves unchanged (`DiskStamp::proves_unchanged`) takes `text` instead of
+/// reading and decoding the file again.
 #[derive(Debug)]
 pub(crate) struct DiskOrigin {
-    pub(crate) len: u64,
-    pub(crate) modified: std::time::SystemTime,
+    pub(crate) stamp: crate::workspace::DiskStamp,
     /// Raw file size, before decoding.
     pub(crate) raw_bytes: usize,
     /// Decoded file text. Without include expansion this is the parse's own
@@ -2639,21 +2675,20 @@ impl ProjectCache {
         })
     }
 
-    /// A verified unit entry read from a closed file whose length and
-    /// modification time are still `len` and `modified`, with the raw content
-    /// hash that keys it. Lets a load skip reading the file; never claims.
+    /// A verified unit entry read from a closed file whose stamp the recorded
+    /// one proves unchanged, with the raw content hash that keys it. Lets a
+    /// load skip reading the file; never claims.
     pub(crate) fn peek_unit_from_disk(
         &self,
         uri: &Url,
         context: &ProjectContext,
-        len: u64,
-        modified: std::time::SystemTime,
+        stamp: &crate::workspace::DiskStamp,
         overlays: &HashMap<Url, OverlayInput>,
     ) -> Option<(Arc<UnitValue>, u64)> {
         let same_file = |unit: &UnitValue| {
             unit.disk
                 .as_ref()
-                .is_some_and(|disk| disk.len == len && disk.modified == modified)
+                .is_some_and(|disk| disk.stamp.proves_unchanged(stamp))
         };
         let key = Key {
             layer: Layer::Unit,

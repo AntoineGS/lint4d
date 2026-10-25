@@ -2057,13 +2057,42 @@ struct DiskSource {
     content_hash: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
+
+#[derive(Debug, Clone, Eq)]
 pub(crate) struct DiskStamp {
     bytes: u64,
     modified: Option<SystemTime>,
+    change: Option<pascal_project::ChangeIdentity>,
+    /// See `ProjectReadStamp::settled`; not part of equality.
+    settled: bool,
 }
 
-pub(crate) type PathStamp = pascal_project::ProjectReadStamp;
+impl PartialEq for DiskStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.modified == other.modified && self.change == other.change
+    }
+}
+
+impl DiskStamp {
+    pub(crate) fn from_project(stamp: &PathStamp) -> Self {
+        Self {
+            bytes: stamp.bytes,
+            modified: stamp.modified,
+            change: stamp.change,
+            settled: stamp.settled,
+        }
+    }
+
+    fn from_metadata(link: &fs::Metadata, target: &fs::Metadata) -> Self {
+        Self::from_project(&pascal_project::stamp_from_metadata(link, target))
+    }
+
+    /// `ProjectReadStamp::proves_unchanged` for a closed source file.
+    pub(crate) fn proves_unchanged(&self, current: &Self) -> bool {
+        self.settled && self == current
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct DirectoryCatalogue {
@@ -7422,13 +7451,8 @@ impl Workspace {
                     if let pascal_core::SourceRevision::Disk { stamp, .. } =
                         &dependency.source.revision
                     {
-                        self.disk_stamps.insert(
-                            dependency_uri.clone(),
-                            DiskStamp {
-                                bytes: stamp.bytes,
-                                modified: stamp.modified,
-                            },
-                        );
+                        self.disk_stamps
+                            .insert(dependency_uri.clone(), DiskStamp::from_project(stamp));
                     }
                     pinned.insert(dependency_uri.clone());
                     resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
@@ -7965,7 +7989,12 @@ impl Workspace {
             self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Ok(false);
         }
-        if self.index.contains(uri) && self.disk_stamps.get(uri) == Some(&current_stamp) {
+        if self.index.contains(uri)
+            && self
+                .disk_stamps
+                .get(uri)
+                .is_some_and(|recorded| recorded.proves_unchanged(&current_stamp))
+        {
             check_workspace_cancel(cancel)?;
             self.touch(uri);
             self.set_document_context_with_control(uri, context_key, cancel, budget)?;
@@ -8253,12 +8282,12 @@ impl Workspace {
         // The parse holds the expanded text when includes were expanded, so
         // the disk origin then keeps its own copy of the file text.
         let disk_origin = match (&claim, disk_stamp, disk_size) {
-            (Some(_), Some(stamp), Some(raw_bytes)) => stamp.modified.map(|modified| {
+            (Some(_), Some(stamp), Some(raw_bytes)) => {
                 let text = expansion
                     .as_ref()
                     .map(|_| std::sync::Arc::<str>::from(source.as_str()));
-                (stamp.bytes, modified, raw_bytes, text)
-            }),
+                Some((stamp.clone(), raw_bytes, text))
+            }
             _ => None,
         };
         if let Some(expansion) = expansion.filter(|e| {
@@ -8288,14 +8317,14 @@ impl Workspace {
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
-            let disk = disk_origin.map(|(len, modified, raw_bytes, text)| {
-                crate::project_cache::DiskOrigin {
-                    len,
-                    modified,
-                    raw_bytes,
-                    text: text.unwrap_or_else(|| parsed.source_text().clone()),
-                }
-            });
+            let disk =
+                disk_origin.map(
+                    |(stamp, raw_bytes, text)| crate::project_cache::DiskOrigin {
+                        stamp,
+                        raw_bytes,
+                        text: text.unwrap_or_else(|| parsed.source_text().clone()),
+                    },
+                );
             let value = crate::project_cache::UnitValue {
                 parsed,
                 expansion: cached_expansion.map(std::sync::Arc::new),
@@ -8327,9 +8356,6 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Option<DiskSource>, String> {
-        let Some(modified) = stamp.modified else {
-            return Ok(None);
-        };
         if stamp.bytes > self.options.limits.max_file_bytes as u64 {
             return Ok(None);
         }
@@ -8341,13 +8367,10 @@ impl Workspace {
         if fs::symlink_metadata(path).map_or(true, |metadata| metadata.file_type().is_symlink()) {
             return Ok(None);
         }
-        let Some((unit, content_hash)) = self.project_cache.peek_unit_from_disk(
-            uri,
-            context,
-            stamp.bytes,
-            modified,
-            &self.overlay_inputs(),
-        ) else {
+        let Some((unit, content_hash)) =
+            self.project_cache
+                .peek_unit_from_disk(uri, context, stamp, &self.overlay_inputs())
+        else {
             return Ok(None);
         };
         let Some(origin) = unit.disk.as_ref() else {
@@ -15029,7 +15052,12 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         } else {
             path_stamp(path)
         };
-        if actual != *stamp {
+        let unchanged = match (stamp, &actual) {
+            (Some(recorded), Some(current)) => recorded.proves_unchanged(current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
             return Ok(false);
         }
     }
@@ -15442,7 +15470,7 @@ fn read_disk_source_with_budget(
         }
         fs::metadata(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
     } else {
-        link_metadata
+        link_metadata.clone()
     };
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
@@ -15478,10 +15506,7 @@ fn read_disk_source_with_budget(
     Ok(DiskSource {
         text,
         bytes: bytes.len(),
-        stamp: DiskStamp {
-            bytes: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
+        stamp: DiskStamp::from_metadata(&link_metadata, &metadata),
         content_hash: content_hash_bytes(&bytes),
     })
 }
@@ -15532,11 +15557,15 @@ fn disk_bytes_equal(uri: &Url, bytes: &[u8]) -> bool {
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {
-    let metadata = fs::metadata(path).ok()?;
-    metadata.is_file().then_some(DiskStamp {
-        bytes: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
+    let link = fs::symlink_metadata(path).ok()?;
+    let metadata = if link.file_type().is_symlink() {
+        fs::metadata(path).ok()?
+    } else {
+        link.clone()
+    };
+    metadata
+        .is_file()
+        .then(|| DiskStamp::from_metadata(&link, &metadata))
 }
 
 fn absolute_path(path: PathBuf) -> PathBuf {
@@ -18218,6 +18247,7 @@ mod tests {
         .unwrap();
         let source = "unit Main;\ninterface\nimplementation\nend.\n";
         fs::write(root.join("Main.pas"), source).unwrap();
+        pascal_project::backdate_tree_for_test(&root);
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
         let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
         workspace
@@ -19502,6 +19532,7 @@ mod tests {
                 .unwrap();
             }
         }
+        pascal_project::backdate_tree_for_test(root);
 
         let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
         let input = workspace.analysis_input();
@@ -20841,6 +20872,7 @@ mod tests {
     fn the_warm_closed_source_check_charges_its_stat_and_honours_cancellation() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
+        pascal_project::backdate_tree_for_test(temp.path());
         let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
         worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
         let mut worker = worker_view(&main);
@@ -20869,9 +20901,55 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_unit_rewritten_within_one_tick_is_reread() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let path = root.join("Unit1.pas");
+        fs::write(
+            &path,
+            "unit Unit1;\ninterface\nconst A = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let key = workspace.context_for_uri(&uri).expect("context");
+        assert!(
+            workspace
+                .load_source(&uri, &key, &HashSet::new())
+                .expect("first load")
+        );
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(
+            &path,
+            "unit Unit1;\ninterface\nconst B = 1;\nimplementation\nend.\n",
+        )
+        .expect("same-size rewrite");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            workspace
+                .load_source(&uri, &key, &HashSet::new())
+                .expect("second load")
+        );
+        assert!(
+            workspace
+                .index
+                .source_text(&uri)
+                .unwrap()
+                .contains("const B"),
+            "an unsettled stamp may not skip the reread"
+        );
+    }
+
+    #[test]
     fn second_definition_on_a_closed_unit_reads_no_files() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, provider_uri) = provider_fixture(temp.path());
+        pascal_project::backdate_tree_for_test(temp.path());
         let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
         let definition = || {
             super::queries::navigation_from_input(
@@ -21728,6 +21806,7 @@ BDS = '/fake/37'
         )
         .unwrap();
         fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        pascal_project::backdate_tree_for_test(root);
         let shared_uri = Url::from_file_path(&shared).unwrap();
         let sibling_uri = Url::from_file_path(&sibling).unwrap();
         let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
@@ -25742,6 +25821,7 @@ BDS = '/fake/37'
             "unit System; interface const RTLVersion111 = True; implementation end.",
         )
         .expect("System.pas");
+        pascal_project::backdate_tree_for_test(root);
         let options = ProjectOptions {
             conditional_context: ConditionalContext::default()
                 .with_compiler_version(CompilerVersion::new(35, 0)),

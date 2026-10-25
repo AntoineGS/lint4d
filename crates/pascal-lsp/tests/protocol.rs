@@ -90,6 +90,7 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
         &root.join("App.dproj"),
         "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
     );
+    pascal_project::backdate_tree_for_test(root);
     let mut server = TestServer::launch();
     server.initialize(root, Value::Null);
     server.send_notification(
@@ -403,6 +404,7 @@ fn compiled_provider_rebind_after_same_importer_edit_keeps_fresh_binding() {
         &root.join("App.dproj"),
         "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
     );
+    pascal_project::backdate_tree_for_test(root);
     let mut server = TestServer::launch();
     server.initialize(root, Value::Null);
     let definition_id = RequestId::from("initial-compiled-provider-binding".to_string());
@@ -15192,6 +15194,8 @@ fn legacy_sibling_route_survives_closed_assistance_and_disk_refresh() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../external/External.pas\" /></ItemGroup></Project>",
     );
 
+    pascal_project::backdate_tree_for_test(temp.path());
+
     let mut server = TestServer::launch();
     server.initialize(&project_root, Value::Null);
 
@@ -15374,6 +15378,8 @@ fn legacy_explicit_dependency_overlay_survives_deleted_backing_file_until_close(
         &project,
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>",
     );
+
+    pascal_project::backdate_tree_for_test(temp.path());
 
     let mut server = TestServer::launch();
     server.initialize(&workspace_root, Value::Null);
@@ -32907,6 +32913,8 @@ fn symbol_rename_uses_same_provider_as_navigation_across_project_collision() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
     );
 
+    pascal_project::backdate_tree_for_test(temp.path());
+
     let mut server = TestServer::launch();
     let init = RequestId::from("unit-collision-init".to_string());
     server.send_request(
@@ -33284,6 +33292,8 @@ fn unit_rename_updates_only_selected_relative_uses_in_paths() {
             &project_b.join("App.dproj"),
             "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
         );
+
+        pascal_project::backdate_tree_for_test(temp.path());
 
         let mut server = TestServer::launch();
         let init = RequestId::from(format!("relative-in-path-{operation}-init"));

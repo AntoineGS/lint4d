@@ -898,10 +898,7 @@ pub(crate) fn source_record_for_loaded(
             uri,
             text,
             version: None,
-            stamp: Some(DiskStamp {
-                bytes: stamp.bytes,
-                modified: stamp.modified,
-            }),
+            stamp: Some(DiskStamp::from_project(stamp)),
             open: false,
             path: Some(source.path.clone()),
             path_stamp: Some(stamp.clone()),
@@ -941,10 +938,7 @@ fn payload_record(
             uri,
             text: String::new(),
             version: None,
-            stamp: Some(DiskStamp {
-                bytes: stamp.bytes,
-                modified: stamp.modified,
-            }),
+            stamp: Some(DiskStamp::from_project(stamp)),
             open: false,
             path: Some(path.to_path_buf()),
             path_stamp: Some(stamp.clone()),

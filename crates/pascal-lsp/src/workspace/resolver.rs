@@ -565,7 +565,7 @@ impl SourceStore for LspSourceStore {
                     .get(request.path)
                     .is_some_and(|stamp| super::disk_stamp(request.path) == *stamp)
             {
-                capture.editor_deleted();
+                capture.editor_state();
             }
             let raw = self.disk.load_raw_admitted(request, budget, cancel)?;
             if let Some(capture) = &self.capture {
@@ -739,6 +739,11 @@ impl SourceStore for LspSourceStore {
         #[cfg(test)]
         record_test_source_load(request.path);
         let path = absolute_path(request.path.to_path_buf());
+        if let Some(capture) = &self.capture
+            && (self.overlays.contains_key(&path) || self.rejected_paths.contains(&path))
+        {
+            capture.editor_state();
+        }
         if self.rejected_paths.contains(&path) {
             return Err(SourceStoreError::Unauthorized {
                 path,
@@ -791,7 +796,7 @@ impl SourceStore for LspSourceStore {
             .is_some_and(|stamp| super::disk_stamp(&path) == *stamp)
         {
             if let Some(capture) = &self.capture {
-                capture.editor_deleted();
+                capture.editor_state();
             }
             return Err(SourceStoreError::NotFound { path });
         }

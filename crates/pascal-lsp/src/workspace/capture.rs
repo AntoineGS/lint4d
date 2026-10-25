@@ -35,9 +35,9 @@ pub(crate) struct CapturedReads {
     pub(crate) payloads: Vec<CapturedPayload>,
     /// Reads past `MAX_CAPTURED_READS` were not recorded.
     pub(crate) overflowed: bool,
-    /// The store answered `NotFound` for a file the disk still has, because
-    /// the editor deleted it.
-    pub(crate) editor_deleted: bool,
+    /// An editor buffer or deletion shaped an answer the store gave, even
+    /// when no overlay payload was read (a refused buffer, a hidden file).
+    pub(crate) editor_state: bool,
 }
 
 pub(crate) enum ListingCapture<'a> {
@@ -115,12 +115,12 @@ impl ReadCapture {
         self.push(|reads| reads.payloads.push(payload));
     }
 
-    /// The store hid a file the disk still has: an editor deletion.
-    pub(crate) fn editor_deleted(&self) {
+    /// The store answered from, or refused because of, editor state.
+    pub(crate) fn editor_state(&self) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .editor_deleted = true;
+            .editor_state = true;
     }
 
     fn push(&self, record: impl FnOnce(&mut CapturedReads)) {
@@ -293,5 +293,55 @@ mod tests {
             reads.listings.len() + reads.payloads.len(),
             MAX_CAPTURED_READS
         );
+    }
+
+    #[test]
+    fn a_refused_buffer_still_marks_the_capture() {
+        use pascal_core::resolver::{SourceKind, SourceStore};
+        use pascal_project::{ProjectContext, ProjectOptions, delphi_overrides::OverrideSession};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Shared.inc");
+        std::fs::write(&path, "const Shared = 1;\n").unwrap();
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![dir.path().into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        workspace
+            .open_document(
+                lsp_types::Url::from_file_path(&path).unwrap(),
+                "const Edited = 1;\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        let context =
+            ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+                .unwrap()
+                .context;
+        let entry = context.path_entry_for(&path).unwrap();
+        let policy = context.read_policy().clone();
+        let capture = Arc::new(ReadCapture::default());
+        let mut store = super::super::resolver::LspSourceStore::from_input(
+            context,
+            &workspace.analysis_input(),
+        )
+        .with_capture(Arc::clone(&capture));
+        // Smaller than the buffer: the store refuses it, reading no payload.
+        let refused = store.load(
+            pascal_core::resolver::SourceRequest {
+                path: &path,
+                entry: &entry,
+                read_policy: &policy,
+                legacy_route: None,
+                kind: SourceKind::Include,
+                max_bytes: 1,
+            },
+            &pascal_core::resolver::NoCancellation,
+        );
+        assert!(refused.is_err());
+        let reads = capture.snapshot();
+        assert!(reads.payloads.is_empty());
+        assert!(reads.editor_state);
     }
 }

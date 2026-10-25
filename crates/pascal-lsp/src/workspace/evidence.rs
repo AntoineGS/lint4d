@@ -45,7 +45,7 @@ pub(crate) fn session_evidence(
     if cancel.load(Ordering::Relaxed) {
         return Err(EvidenceGap::Cancelled);
     }
-    if reads.editor_deleted {
+    if reads.editor_state {
         return Err(EvidenceGap::Overlay);
     }
     let mut evidence = Vec::with_capacity(observations.len());
@@ -135,9 +135,8 @@ impl Workspace {
             .as_ref()
             .ok_or(EvidenceGap::NoCapture)?;
         let state = self
-            .document_contexts
-            .get(uri)
-            .and_then(|key| self.contexts.get(key))
+            .contexts
+            .get(&record.context_key)
             .ok_or(EvidenceGap::NoSession)?;
         session_evidence(
             &session.observations,
@@ -341,7 +340,7 @@ mod tests {
             Err(EvidenceGap::Cancelled)
         );
         let deleted = CapturedReads {
-            editor_deleted: true,
+            editor_state: true,
             ..CapturedReads::default()
         };
         assert_eq!(
@@ -411,6 +410,34 @@ mod tests {
                     if path.ends_with("nowhere") && *listing == listing_digest(&[], &[])
             )),
             "{evidence:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_uses_the_context_that_produced_the_session() {
+        let mut indexed = index(&files(), &["Main.pas"]);
+        let uri = indexed.uri("Main.pas");
+        assert!(
+            indexed
+                .workspace
+                .source_evidence(&uri, &AtomicBool::new(false))
+                .is_ok()
+        );
+        // The document's mapping moves on; the expansion keeps its own key.
+        indexed.workspace.document_contexts.remove(&uri);
+        assert!(
+            indexed
+                .workspace
+                .source_evidence(&uri, &AtomicBool::new(false))
+                .is_ok()
+        );
+        let produced = indexed.workspace.expansions[&uri].context_key.clone();
+        indexed.workspace.contexts.remove(&produced);
+        assert_eq!(
+            indexed
+                .workspace
+                .source_evidence(&uri, &AtomicBool::new(false)),
+            Err(EvidenceGap::NoSession)
         );
     }
 }

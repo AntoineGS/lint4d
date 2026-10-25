@@ -128,6 +128,7 @@ pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
 pub(crate) mod signature;
+mod validate;
 
 pub(super) fn conditional_context_for_path(
     context: &ProjectContext,
@@ -1336,7 +1337,7 @@ pub enum FileChange {
     Deleted,
 }
 
-const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
+pub(crate) const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
 const MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_RECONCILIATION_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES: usize = 16 * 1024 * 1024;

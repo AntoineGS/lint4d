@@ -47,7 +47,6 @@ pub(crate) enum Probe {
 
 /// What this process proved about one path while its stamp held (spec §7):
 /// the digest of the bytes read, or of the complete directory listing.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Proven {
     Content(pascal_cache::SourceContent),
@@ -3798,7 +3797,6 @@ impl ProjectCache {
     /// Only a settled stamp with a change identity can witness anything
     /// (spec §7: "reliable native change identity and the l4d-122
     /// freshness contract"); other stamps are ignored.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_witness(&self, path: &Path, stamp: ProjectReadStamp, proven: Proven) {
         if !stamp.settled || !stamp.has_change_identity() {
             return;
@@ -3816,7 +3814,6 @@ impl ProjectCache {
 
     /// What this process proved about `path`, if `current` (taken now)
     /// shows it unchanged since.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn witness(&self, path: &Path, current: &ProjectReadStamp) -> Option<Proven> {
         let witnesses = self
             .inner

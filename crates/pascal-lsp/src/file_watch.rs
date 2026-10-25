@@ -443,4 +443,21 @@ mod tests {
         assert_eq!(events.drain(&cache, 2), vec![uris[2].clone()]);
         assert_eq!(cache.stats().imports, 0);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn overflow_drops_every_witness() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.inc");
+        std::fs::write(&file, b"{A}").unwrap();
+        pascal_project::backdate_for_test(&file);
+        let stamp = pascal_project::path_stamp_result(&file).unwrap().unwrap();
+        let cache = ProjectCache::default();
+        let proven =
+            crate::project_cache::Proven::Content(pascal_cache::SourceContent::from_bytes(b"{A}"));
+        cache.record_witness(&file, stamp.clone(), proven.clone());
+        assert_eq!(cache.witness(&file, &stamp), Some(proven));
+        apply_watch_event(&cache, WatchEvent::Overflow);
+        assert_eq!(cache.witness(&file, &stamp), None);
+    }
 }

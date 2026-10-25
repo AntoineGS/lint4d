@@ -45,6 +45,24 @@ pub(crate) enum Probe {
     },
 }
 
+/// What this process proved about one path while its stamp held (spec §7):
+/// the digest of the bytes read, or of the complete directory listing.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Proven {
+    Content(pascal_cache::SourceContent),
+    Listing(pascal_cache::Digest),
+}
+
+#[derive(Debug, Clone)]
+struct Witness {
+    stamp: ProjectReadStamp,
+    proven: Proven,
+}
+
+/// Witnesses past this are not recorded; validation reads instead.
+pub(crate) const MAX_WITNESSES: usize = 131_072;
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn overlay_content_hash(text: &str) -> u64 {
     pascal_project::content_hash_bytes(text.as_bytes())
@@ -2287,12 +2305,15 @@ struct WatcherState {
 /// Lock order: `watcher` before `state`. Code holding `state` never takes
 /// `watcher`, never calls the watcher and never touches the filesystem; it
 /// queues watch-count changes in `State::watch_changes`, and `sync_watches`
-/// applies them after `state` is released.
+/// applies them after `state` is released. `witnesses` is never held together
+/// with either lock.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
     watcher: Mutex<WatcherState>,
+    /// Never held together with `state` or `watcher`.
+    witnesses: Mutex<HashMap<PathBuf, Witness>>,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -3737,6 +3758,7 @@ impl ProjectCache {
             }
         }
         self.release(state);
+        self.drop_witnesses(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
         }
@@ -3764,6 +3786,60 @@ impl ProjectCache {
         state.closure_misses.clear();
         self.release(state);
         self.inner.changed.notify_all();
+        // Overflow lost which paths changed: no witness survives it.
+        self.inner
+            .witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Remember that `path`, while it has `stamp`, holds what `proven` says.
+    /// Only a settled stamp with a change identity can witness anything
+    /// (spec §7: "reliable native change identity and the l4d-122
+    /// freshness contract"); other stamps are ignored.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn record_witness(&self, path: &Path, stamp: ProjectReadStamp, proven: Proven) {
+        if !stamp.settled || !stamp.has_change_identity() {
+            return;
+        }
+        let mut witnesses = self
+            .inner
+            .witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if witnesses.len() >= MAX_WITNESSES && !witnesses.contains_key(path) {
+            return;
+        }
+        witnesses.insert(path.to_path_buf(), Witness { stamp, proven });
+    }
+
+    /// What this process proved about `path`, if `current` (taken now)
+    /// shows it unchanged since.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn witness(&self, path: &Path, current: &ProjectReadStamp) -> Option<Proven> {
+        let witnesses = self
+            .inner
+            .witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let witness = witnesses.get(path)?;
+        witness
+            .stamp
+            .proves_unchanged(current)
+            .then(|| witness.proven.clone())
+    }
+
+    fn drop_witnesses(&self, path: &Path, include_parent: bool) {
+        let mut witnesses = self
+            .inner
+            .witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        witnesses.remove(path);
+        if let Some(parent) = path.parent().filter(|_| include_parent) {
+            witnesses.remove(parent);
+        }
     }
 
     pub(crate) fn retain_fingerprints(&self, keep: &HashSet<u64>) {
@@ -3826,5 +3902,99 @@ impl ProjectCache {
             .unwrap_or_else(PoisonError::into_inner);
         state.watcher = Some(watcher);
         state.registered.clear();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod witness_tests {
+    use super::*;
+    use pascal_cache::{Digest, SourceContent};
+
+    fn settled(path: &Path, bytes: &[u8]) -> ProjectReadStamp {
+        std::fs::write(path, bytes).unwrap();
+        pascal_project::backdate_for_test(path);
+        pascal_project::path_stamp_result(path).unwrap().unwrap()
+    }
+
+    fn content(bytes: &[u8]) -> Proven {
+        Proven::Content(SourceContent::from_bytes(bytes))
+    }
+
+    #[test]
+    fn a_witness_holds_while_its_stamp_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.inc");
+        let stamp = settled(&file, b"{A}");
+        let cache = ProjectCache::default();
+        cache.record_witness(&file, stamp.clone(), content(b"{A}"));
+        assert_eq!(cache.witness(&file, &stamp), Some(content(b"{A}")));
+        std::fs::write(&file, b"{B}").unwrap();
+        let now = pascal_project::path_stamp_result(&file).unwrap().unwrap();
+        assert_eq!(cache.witness(&file, &now), None);
+    }
+
+    #[test]
+    fn an_unsettled_stamp_is_never_witnessed() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.inc");
+        std::fs::write(&file, b"{A}").unwrap();
+        let stamp = pascal_project::path_stamp_result(&file).unwrap().unwrap();
+        let cache = ProjectCache::default();
+        cache.record_witness(&file, stamp.clone(), content(b"{A}"));
+        assert_eq!(cache.witness(&file, &stamp), None);
+    }
+
+    #[test]
+    fn watcher_events_drop_the_witnesses_they_concern() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.inc");
+        let file_stamp = settled(&file, b"{A}");
+        pascal_project::backdate_for_test(temp.path());
+        let directory_stamp = pascal_project::path_stamp_result(temp.path())
+            .unwrap()
+            .unwrap();
+        let listing = Proven::Listing(Digest::from_bytes([1; 32]));
+        let cache = ProjectCache::default();
+        let record = || {
+            cache.record_witness(&file, file_stamp.clone(), content(b"{A}"));
+            cache.record_witness(temp.path(), directory_stamp.clone(), listing.clone());
+        };
+        record();
+        cache.invalidate_file_contents(&file);
+        assert_eq!(cache.witness(&file, &file_stamp), None);
+        assert_eq!(
+            cache.witness(temp.path(), &directory_stamp),
+            Some(listing.clone()),
+            "a content change keeps the parent's listing"
+        );
+        record();
+        cache.invalidate_path(&file);
+        assert_eq!(cache.witness(&file, &file_stamp), None);
+        assert_eq!(cache.witness(temp.path(), &directory_stamp), None);
+        record();
+        cache.invalidate_after_overflow();
+        assert_eq!(cache.witness(&file, &file_stamp), None);
+        assert_eq!(cache.witness(temp.path(), &directory_stamp), None);
+    }
+
+    #[test]
+    fn witnesses_are_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.inc");
+        let stamp = settled(&file, b"{A}");
+        let cache = ProjectCache::default();
+        for index in 0..MAX_WITNESSES {
+            cache.record_witness(
+                &temp.path().join(format!("{index}.inc")),
+                stamp.clone(),
+                content(b"{A}"),
+            );
+        }
+        cache.record_witness(&file, stamp.clone(), content(b"{A}"));
+        assert_eq!(
+            cache.witness(&file, &stamp),
+            None,
+            "past the bound nothing is recorded"
+        );
     }
 }

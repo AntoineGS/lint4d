@@ -3082,7 +3082,7 @@ impl Workspace {
             || crate::navigation::compiled_dcu::project_context_fingerprint(
                 &snapshot.context.context,
             ) != fingerprint
-            || !context_state_is_fresh_with_cancel(&snapshot.context, Some(cancel), None)?
+            || !context_state_is_current_with_cancel(&snapshot.context, Some(cancel), None)?
         {
             return Ok(None);
         }
@@ -3145,7 +3145,7 @@ impl Workspace {
                     .filter(|state| {
                         crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                             == fingerprint
-                            && context_state_is_fresh_with_cancel(state, None, None)
+                            && context_state_is_current_with_cancel(state, None, None)
                                 .is_ok_and(|fresh| fresh)
                     })
                     .map(|_| importer.clone())
@@ -3186,7 +3186,7 @@ impl Workspace {
             if !state.context.discovery_complete()
                 || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                     != fingerprint
-                || !context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                || !context_state_is_current_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
                 || !seen.insert(fingerprint)
             {
                 continue;
@@ -3558,7 +3558,7 @@ impl Workspace {
                 return false;
             }
             let fresh = *fresh.get_or_insert_with(|| {
-                context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                context_state_is_current_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
             });
             fresh
                 && importer_hashes
@@ -10927,6 +10927,7 @@ impl Workspace {
             &open_overlay_paths,
             &deleted_paths,
             budget,
+            true,
         )
     }
 
@@ -15017,7 +15018,19 @@ fn context_state_is_fresh_with_cancel(
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget)
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, true)
+}
+
+/// Like `context_state_is_fresh_with_cancel`, but an unsettled stamp that
+/// still equals the current one counts as current. For callers that gate
+/// bindings on a state this process built, not for reusing a state across
+/// requests: a state rebuilt within the settle window must not read as absent.
+fn context_state_is_current_with_cancel(
+    state: &ContextState,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<bool, String> {
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, false)
 }
 
 fn context_state_is_fresh_with_cancel_ignoring_paths(
@@ -15026,6 +15039,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     ignored_paths: &[PathBuf],
     deleted_paths: &[PathBuf],
     budget: Option<&ReconciliationBudget>,
+    require_settled: bool,
 ) -> Result<bool, String> {
     for (path, stamp) in &state.watched_paths {
         check_workspace_cancel(cancel)?;
@@ -15053,7 +15067,13 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
             path_stamp(path)
         };
         let unchanged = match (stamp, &actual) {
-            (Some(recorded), Some(current)) => recorded.proves_unchanged(current),
+            (Some(recorded), Some(current)) => {
+                if require_settled {
+                    recorded.proves_unchanged(current)
+                } else {
+                    recorded == current
+                }
+            }
             (None, None) => true,
             _ => false,
         };

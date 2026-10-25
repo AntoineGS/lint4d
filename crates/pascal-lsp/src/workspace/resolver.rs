@@ -544,6 +544,11 @@ impl SourceStore for LspSourceStore {
         if cancel.is_cancelled() {
             return Err(SourceStoreError::Cancelled);
         }
+        if let Some(capture) = &self.capture
+            && self.overlays.contains_key(request.path)
+        {
+            capture.editor_state();
+        }
         let legacy = matches!(
             request.entry.provenance,
             ProjectPathProvenance::LegacyNative

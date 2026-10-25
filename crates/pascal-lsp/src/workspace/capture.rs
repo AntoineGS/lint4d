@@ -145,6 +145,7 @@ mod tests {
     use super::*;
     use crate::workspace::facts::tests::{index, index_with_buffers};
     use pascal_core::resolver::ResolutionObservation;
+    use std::sync::Arc;
 
     const DPROJ: &[u8] = b"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>include</DCC_IncludePath></PropertyGroup></Project>";
     const MAIN: &[u8] =
@@ -295,11 +296,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_refused_buffer_still_marks_the_capture() {
-        use pascal_core::resolver::{SourceKind, SourceStore};
+    /// A store over a saved `Shared.inc` with a different buffer open.
+    fn buffered_store() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<pascal_project::ProjectContext>,
+        Arc<ReadCapture>,
+        super::super::resolver::LspSourceStore,
+    ) {
         use pascal_project::{ProjectContext, ProjectOptions, delphi_overrides::OverrideSession};
-        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Shared.inc");
         std::fs::write(&path, "const Shared = 1;\n").unwrap();
@@ -319,15 +324,22 @@ mod tests {
             ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
                 .unwrap()
                 .context;
-        let entry = context.path_entry_for(&path).unwrap();
-        let policy = context.read_policy().clone();
         let capture = Arc::new(ReadCapture::default());
-        let mut store = super::super::resolver::LspSourceStore::from_input(
-            context,
+        let store = super::super::resolver::LspSourceStore::from_input(
+            context.clone(),
             &workspace.analysis_input(),
         )
         .with_capture(Arc::clone(&capture));
-        // Smaller than the buffer: the store refuses it, reading no payload.
+        (dir, path, context, capture, store)
+    }
+
+    // Smaller than the buffer: the store refuses it, reading no payload.
+    #[test]
+    fn a_refused_buffer_still_marks_the_capture() {
+        use pascal_core::resolver::{SourceKind, SourceStore};
+        let (_dir, path, context, capture, mut store) = buffered_store();
+        let entry = context.path_entry_for(&path).unwrap();
+        let policy = context.read_policy().clone();
         let refused = store.load(
             pascal_core::resolver::SourceRequest {
                 path: &path,
@@ -338,6 +350,32 @@ mod tests {
                 max_bytes: 1,
             },
             &pascal_core::resolver::NoCancellation,
+        );
+        assert!(refused.is_err());
+        let reads = capture.snapshot();
+        assert!(reads.payloads.is_empty());
+        assert!(reads.editor_state);
+    }
+
+    #[test]
+    fn an_admitted_refused_buffer_still_marks_the_capture() {
+        use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits};
+        use pascal_core::resolver::{NoCancellation, SourceKind, SourceStore};
+        let (_dir, path, context, capture, mut store) = buffered_store();
+        let entry = context.path_entry_for(&path).unwrap();
+        let policy = context.read_policy().clone();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let refused = store.load_admitted(
+            pascal_core::resolver::SourceRequest {
+                path: &path,
+                entry: &entry,
+                read_policy: &policy,
+                legacy_route: None,
+                kind: SourceKind::Include,
+                max_bytes: 1,
+            },
+            &mut budget,
+            &NoCancellation,
         );
         assert!(refused.is_err());
         let reads = capture.snapshot();

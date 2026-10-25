@@ -148,6 +148,11 @@ impl<'a> Validator<'a> {
 
     fn payload(&mut self, path: &Path, entry: &ProjectPathEntry, content: &SourceContent) -> Check {
         let stale = |stale: fn(PathBuf) -> Stale| Check::Stale(stale(path.to_path_buf()));
+        // The stamp and witness are taken at `path`, the bytes read through
+        // `entry`: they must name one file.
+        if !path_equivalent(&entry.path, path) {
+            return stale(Stale::Content);
+        }
         if self.open(path) || self.deleted(path) {
             return stale(Stale::Overlay);
         }
@@ -509,6 +514,23 @@ mod tests {
                 [Check::Stale(Stale::Content(_) | Stale::Unauthorized(_))]
             ));
         }
+    }
+
+    #[test]
+    fn a_payload_whose_entry_names_another_path_is_stale() {
+        let fixture = fixture();
+        let path = fixture.root.join("include/A.inc");
+        let other = fixture.root.join("include/Notes.txt");
+        // The content is the entry's file: reading through the entry would hold.
+        let payload = Observation::Payload {
+            entry: ProjectPathEntry::configured(other.clone()),
+            content: SourceContent::from_bytes(&std::fs::read(&other).unwrap()),
+            path: path.clone(),
+        };
+        assert_eq!(
+            fixture.check(&[payload]).0,
+            vec![Check::Stale(Stale::Content(path))]
+        );
     }
 
     fn legacy_payload(path: PathBuf) -> Observation {

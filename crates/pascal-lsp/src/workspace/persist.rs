@@ -45,7 +45,8 @@ pub(crate) enum Reuse {
     Hit {
         facts: ArtifactFacts,
         via: ReuseVia,
-        /// Payloads and listings validation read rather than witnessed.
+        /// Payloads and listings validation read rather than witnessed,
+        /// including those read for candidates it rejected first.
         reads: usize,
     },
     Miss(ReuseMiss),

@@ -5296,7 +5296,6 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
-        workspace.begin_request();
         if matches!(
             &request,
             AnalysisRequest::ProjectContext { .. }
@@ -11388,6 +11387,9 @@ fn event_loop(
             }
         };
 
+        // The one place every dispatched message passes: states built while
+        // handling earlier messages stop being "built in this request".
+        workspace.advance_request_generation();
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);

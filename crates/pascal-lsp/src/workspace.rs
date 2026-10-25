@@ -2257,10 +2257,10 @@ pub(crate) struct ContextState {
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
     system_pas_search_stamps: Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
-    /// Set when discovery built this state, cleared when the request ends
-    /// (`analysis_input`, `apply_navigation_state`). Binding gates trust an
-    /// unsettled-but-equal stamp only while it is set.
-    built_this_request: AtomicBool,
+    /// The request generation (`Workspace::request_generation`) that built
+    /// this state, `None` for a state nothing built. Binding gates trust an
+    /// unsettled-but-equal stamp only while this equals the current generation.
+    built_generation: Option<u64>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -2276,7 +2276,7 @@ impl Clone for ContextState {
             project_candidate_memberships: self.project_candidate_memberships.clone(),
             project_read_observations: self.project_read_observations.clone(),
             system_pas_search_stamps: Mutex::new(lock(&self.system_pas_search_stamps).clone()),
-            built_this_request: AtomicBool::new(self.built_this_request.load(Ordering::Relaxed)),
+            built_generation: self.built_generation,
         }
     }
 }
@@ -2404,6 +2404,7 @@ pub(crate) struct CompiledContentSnapshot {
     uri: Url,
     source_generation: u64,
     configuration_generation: u64,
+    request_generation: u64,
     importer: Url,
     importer_source_hash: u64,
     context_fingerprint: u64,
@@ -2939,6 +2940,9 @@ pub struct Workspace {
     diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
     source_generation: u64,
     configuration_generation: u64,
+    /// Advanced once per message the server dispatches, before its handler
+    /// runs. Jobs record the generation they were spawned under.
+    request_generation: u64,
     source_change_generations: HashMap<Url, u64>,
     source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
     configuration_change_generations: HashMap<Url, u64>,
@@ -3028,8 +3032,11 @@ struct SharedLintResult {
 
 impl Workspace {
     /// Capture only the bounded, already-authorized immutable data needed by a
-    /// content worker. This path performs no filesystem access; URI and binding
-    /// authorization are still required before a snapshot is created.
+    /// content worker. URI and binding authorization are still required before
+    /// a snapshot is created. The importer's context is checked for freshness,
+    /// which stats its watched files and re-verifies content-checked inputs;
+    /// when the context is unproven but its inputs still compare equal, it is
+    /// re-obtained through `context_for_uri`, which may run discovery.
     pub(crate) fn compiled_virtual_document_snapshot(
         &mut self,
         uri: &Url,
@@ -3059,7 +3066,14 @@ impl Workspace {
         let context_fingerprint = binding.context_fingerprint;
         let key = self.document_contexts.get(&importer)?.clone();
         let state = self.contexts.get(&key)?;
-        if !context_state_is_fresh_for_binding_with_cancel(state, None, None).ok()? {
+        if !context_state_is_fresh_for_binding_with_cancel(
+            state,
+            self.request_generation,
+            None,
+            None,
+        )
+        .ok()?
+        {
             // Inputs that still compare equal but were unsettled when last
             // read are re-obtained from current inputs, not reported absent.
             // A state whose inputs moved stays refused.
@@ -3084,6 +3098,7 @@ impl Workspace {
             uri: uri.clone(),
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
+            request_generation: self.request_generation,
             importer: importer.clone(),
             importer_source_hash,
             context_fingerprint,
@@ -3112,6 +3127,7 @@ impl Workspace {
             ) != fingerprint
             || !context_state_is_fresh_for_binding_with_cancel(
                 &snapshot.context,
+                snapshot.request_generation,
                 Some(cancel),
                 None,
             )?
@@ -3177,8 +3193,13 @@ impl Workspace {
                     .filter(|state| {
                         crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                             == fingerprint
-                            && context_state_is_fresh_for_binding_with_cancel(state, None, None)
-                                .is_ok_and(|fresh| fresh)
+                            && context_state_is_fresh_for_binding_with_cancel(
+                                state,
+                                self.request_generation,
+                                None,
+                                None,
+                            )
+                            .is_ok_and(|fresh| fresh)
                     })
                     .map(|_| importer.clone())
             })
@@ -3218,8 +3239,13 @@ impl Workspace {
             if !state.context.discovery_complete()
                 || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
                     != fingerprint
-                || !context_state_is_fresh_for_binding_with_cancel(state, None, None)
-                    .is_ok_and(|fresh| fresh)
+                || !context_state_is_fresh_for_binding_with_cancel(
+                    state,
+                    self.request_generation,
+                    None,
+                    None,
+                )
+                .is_ok_and(|fresh| fresh)
                 || !seen.insert(fingerprint)
             {
                 continue;
@@ -3504,6 +3530,7 @@ impl Workspace {
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
+            request_generation: input.request_generation,
             ..Self::default()
         }
     }
@@ -3539,12 +3566,11 @@ impl Workspace {
         }
     }
 
-    /// A request starts: the context states built so far belong to earlier
-    /// requests, so binding gates no longer trust their unsettled stamps.
-    pub(crate) fn begin_request(&self) {
-        for state in self.contexts.values() {
-            state.built_this_request.store(false, Ordering::Relaxed);
-        }
+    /// A message is dispatched: the context states built so far belong to
+    /// earlier messages, so binding gates no longer trust their unsettled
+    /// stamps. Called once, where the server dispatches each message.
+    pub(crate) fn advance_request_generation(&mut self) {
+        self.request_generation = self.request_generation.wrapping_add(1);
     }
 
     pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
@@ -3599,8 +3625,13 @@ impl Workspace {
                 return false;
             }
             let fresh = *fresh.get_or_insert_with(|| {
-                context_state_is_fresh_for_binding_with_cancel(state, None, None)
-                    .is_ok_and(|fresh| fresh)
+                context_state_is_fresh_for_binding_with_cancel(
+                    state,
+                    self.request_generation,
+                    None,
+                    None,
+                )
+                .is_ok_and(|fresh| fresh)
             });
             fresh
                 && importer_hashes
@@ -3621,9 +3652,6 @@ impl Workspace {
             compiled_provider_bindings.clear();
         }
         self.compiled_provider_bindings = compiled_provider_bindings;
-        for state in self.contexts.values() {
-            state.built_this_request.store(false, Ordering::Relaxed);
-        }
         let retained_compiled_bytes = self
             .compiled_units
             .values()
@@ -10793,6 +10821,7 @@ impl Workspace {
         if let Some(budget) = budget {
             budget.check_cancelled()?;
         }
+        let request_generation = self.request_generation;
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
             state.context_observations = context_observations;
@@ -10804,7 +10833,7 @@ impl Workspace {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
-            *state.built_this_request.get_mut() = true;
+            state.built_generation = Some(request_generation);
         } else {
             self.contexts.insert(
                 key,
@@ -10815,7 +10844,7 @@ impl Workspace {
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
                     system_pas_search_stamps: Mutex::new(HashMap::new()),
-                    built_this_request: AtomicBool::new(true),
+                    built_generation: Some(request_generation),
                 },
             );
         }
@@ -15069,15 +15098,17 @@ fn context_state_is_fresh_with_cancel(
 }
 
 /// Freshness for gates that decide whether bindings of a state survive.
-/// A state built in this request compares its own stamps with plain equality,
-/// so a rebuild inside the settle window does not read as absent. A state
-/// from an earlier request needs the same settled proof as any reuse.
+/// A state built under `request_generation` compares its own stamps with plain
+/// equality, so a rebuild inside the settle window does not read as absent.
+/// A state built under another generation needs the same settled proof as
+/// any reuse.
 fn context_state_is_fresh_for_binding_with_cancel(
     state: &ContextState,
+    request_generation: u64,
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    let built_here = state.built_this_request.load(Ordering::Relaxed);
+    let built_here = state.built_generation == Some(request_generation);
     context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget, !built_here)
 }
 
@@ -18436,7 +18467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_binding_gate_trusts_an_unsettled_state_only_in_the_request_that_built_it() {
+    fn a_binding_gate_trusts_an_unsettled_state_only_under_the_generation_that_built_it() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path().to_path_buf();
         fs::write(
@@ -18448,21 +18479,43 @@ mod tests {
         fs::write(root.join("Main.pas"), source).unwrap();
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
         let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
-        let key = workspace.context_for_uri(&uri).expect("context");
-        let gate = |workspace: &Workspace| {
+        let gate = |workspace: &Workspace, key: &ContextKey| {
             super::context_state_is_fresh_for_binding_with_cancel(
-                &workspace.contexts[&key],
+                &workspace.contexts[key],
+                workspace.request_generation,
                 None,
                 None,
             )
             .expect("gate")
         };
-        assert!(gate(&workspace), "built in this request");
+        // A message that builds the context on the main side, as didOpen does.
+        workspace.advance_request_generation();
+        let key = workspace.context_for_uri(&uri).expect("context");
+        assert!(gate(&workspace, &key), "built while handling this message");
 
-        workspace.begin_request();
+        // A job spawned under that message builds its own state under the
+        // same generation.
+        let mut worker = worker_view(&workspace);
+        let worker_key = worker.context_for_uri(&uri).expect("worker context");
+        assert!(gate(&worker, &worker_key));
+        let job_state = worker.contexts.remove(&worker_key).unwrap();
+
+        // The next dispatched message: neither the main-side state nor the
+        // job's state, applied now, is trusted on plain equality.
+        workspace.advance_request_generation();
         assert!(
-            !gate(&workspace),
-            "an unsettled state from an earlier request is not trusted"
+            !gate(&workspace, &key),
+            "an unsettled state from an earlier message is not trusted"
+        );
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(
+                &job_state,
+                workspace.request_generation,
+                None,
+                None,
+            )
+            .expect("gate"),
+            "a job-built state applied under a later message is not trusted"
         );
         pascal_project::test_reset_project_discovery_counts();
         assert_eq!(workspace.context_for_uri(&uri).expect("context"), key);
@@ -18471,7 +18524,10 @@ mod tests {
             (0, 0),
             "the lookup rediscovers instead of reporting the context absent"
         );
-        assert!(gate(&workspace), "the rebuilt state is this request's own");
+        assert!(
+            gate(&workspace, &key),
+            "the rebuilt state is this message's own"
+        );
     }
 
     /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
@@ -24331,6 +24387,7 @@ BDS = '/fake/37'
             document_versions: HashMap::new(),
             deleted_overrides: HashMap::new(),
             source_generation: 0,
+            request_generation: 0,
             configuration_generation: 0,
         };
         let entry = ProjectPathEntry {

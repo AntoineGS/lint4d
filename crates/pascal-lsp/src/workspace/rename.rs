@@ -248,6 +248,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) document_versions: HashMap<Url, i32>,
     pub(crate) deleted_overrides: HashMap<Url, Option<DiskStamp>>,
     pub(crate) source_generation: u64,
+    pub(crate) request_generation: u64,
     pub(crate) configuration_generation: u64,
 }
 
@@ -1483,6 +1484,7 @@ impl Workspace {
             document_versions,
             deleted_overrides: self.deleted_overrides.clone(),
             source_generation: self.source_generation,
+            request_generation: self.request_generation,
             configuration_generation: self.configuration_generation,
         }
     }

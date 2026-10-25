@@ -767,6 +767,54 @@ mod acceptance {
     }
 
     #[test]
+    fn ac4_a_search_directory_replaced_by_a_symlink_to_a_copy_is_stale() {
+        let nested = vec![
+            (
+                "App.dproj",
+                DPROJ
+                    .replace(">include<", ">lib/include<")
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            ("Main.pas", SHARED_MAIN.to_vec()),
+            ("lib/include/Shared.inc", SHARED.to_vec()),
+        ];
+        // `include` is in the listed owner directory; `lib`, the parent of
+        // `lib/include`, is never listed. The copy is outside the project's
+        // readable roots, or beside the link inside them.
+        let elsewhere = tempfile::tempdir().unwrap();
+        for (files, searched, inside) in [
+            (include_path(), "include", false),
+            (nested.clone(), "lib/include", false),
+            (nested, "lib/include", true),
+        ] {
+            let (indexed, directory) = persisted(&files);
+            assert!(is_hit(&after_restart(&indexed, &directory)), "{searched}");
+            let include = indexed.root.join(searched);
+            let copy = if inside {
+                indexed.root.join("lib/copy")
+            } else {
+                tempfile::tempdir_in(elsewhere.path()).unwrap().keep()
+            };
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::copy(include.join("Shared.inc"), copy.join("Shared.inc")).unwrap();
+            std::fs::remove_dir_all(&include).unwrap();
+            std::os::unix::fs::symlink(&copy, &include).unwrap();
+            let result = after_restart(&indexed, &directory);
+            // Where no listing covers the link, the hit's own evidence refuses it.
+            let by_the_hit = matches!(
+                result,
+                Reuse::Miss(ReuseMiss::Stale(Stale::Presence(_) | Stale::Content(_)))
+            );
+            assert!(
+                matches!(result, Reuse::Miss(ReuseMiss::Stale(_)))
+                    && (searched == "include" || by_the_hit),
+                "{searched}: identical bytes behind a symlinked search directory: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ac4_cancelled_validation_is_never_a_hit() {
         struct CancelOnFirstVisit<'a>(&'a AtomicBool);
         impl ProjectWorkBudget for CancelOnFirstVisit<'_> {

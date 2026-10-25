@@ -284,6 +284,19 @@ mod tests {
             marked, 1,
             "the include directory was searched: {observations:?}"
         );
+        // The owned compile-time path keeps the miss's marker and listing as one.
+        let owner: Vec<bool> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                ResolutionObservation::Directory { path, listed, .. }
+                    if super::super::resolver::path_equivalent(path, &indexed.root) =>
+                {
+                    Some(*listed)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owner, [true], "{observations:?}");
     }
 
     #[test]

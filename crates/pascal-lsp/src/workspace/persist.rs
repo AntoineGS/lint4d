@@ -99,6 +99,15 @@ impl Workspace {
         budget: &mut FactBudget,
         cancel: &AtomicBool,
     ) -> Result<Persisted, PersistError> {
+        // The document's context labels the facts and the evidence, which
+        // describe the context that produced the session.
+        if self
+            .expansions
+            .get(uri)
+            .is_some_and(|record| self.document_contexts.get(uri) != Some(&record.context_key))
+        {
+            return Err(PersistError::Fact(FactError::Inconsistent));
+        }
         let source = self
             .source_facts(uri, budget, cancel)
             .map_err(PersistError::Fact)?;
@@ -494,6 +503,68 @@ pub(in crate::workspace) mod tests {
         assert!(matches!(
             reuse(&mut restarted, &indexed.uri("Main.pas"), &store).unwrap(),
             Reuse::Miss(_)
+        ));
+    }
+
+    #[test]
+    fn a_session_is_not_published_under_another_context() {
+        let mut indexed = index(
+            &[
+                ("Main.pas", MAIN.as_bytes()),
+                ("Types.inc", TYPES.as_bytes()),
+                ("Nested.inc", NESTED.as_bytes()),
+            ],
+            &["Main.pas"],
+        );
+        let uri = indexed.uri("Main.pas");
+        let workspace = &mut indexed.workspace;
+        let produced = workspace.expansions[&uri].context_key.clone();
+        // Another configuration over the same files: the root stays readable.
+        let mut parts = (*workspace.contexts[&produced].context)
+            .clone()
+            .into_parts();
+        parts.config = Some("Other".to_owned());
+        let other_context = ProjectContext::from_parts(parts);
+        let other = crate::workspace::ContextKey {
+            config: Some("Other".to_owned()),
+            ..produced.clone()
+        };
+        workspace.contexts.insert(
+            other.clone(),
+            crate::workspace::ContextState {
+                context: Arc::new(other_context.clone()),
+                ..Default::default()
+            },
+        );
+        workspace.document_contexts.insert(uri.clone(), other);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        assert_eq!(
+            workspace.persist_source(
+                &uri,
+                &store,
+                &mut FactBudget::new(1 << 26),
+                &AtomicBool::new(false)
+            ),
+            Err(PersistError::Fact(FactError::Inconsistent))
+        );
+        let source = indexed.facts("Main.pas");
+        let bytes = std::fs::read(indexed.root.join("Main.pas")).unwrap();
+        let local = LocalArtifactKey::new(
+            &SourceContent::from_bytes(&bytes),
+            &source.extracted.conditional_context,
+            source.origin,
+        );
+        assert_eq!(
+            store
+                .find_evidence(&CacheContextKey::new(&other_context), &local)
+                .unwrap(),
+            Lookup::Miss(Miss::Absent)
+        );
+        let mut restarted = restart(&indexed);
+        assert!(matches!(
+            reuse(&mut restarted, &uri, &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Store(Miss::Absent))
         ));
     }
 

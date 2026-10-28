@@ -6,7 +6,7 @@ use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
     MAX_SUPPLEMENTAL_BYTES,
 };
-use super::namespaces::{Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::sqlite::{begin, classify, classify_read};
 use crate::{Digest, Encoder, KeyKind};
@@ -17,8 +17,6 @@ pub const FACT_CHECKSUM_CONTEXT: &str =
     "lint4d persistent analysis cache 2026-10 artifact facts v1";
 /// Domain of each row checksum.
 pub const ROW_CHECKSUM_CONTEXT: &str = "lint4d persistent analysis cache 2026-10 artifact row v1";
-
-const LIVE: i64 = 1;
 
 /// One fact row as a producer supplies it. The producer (`l4d-zf1b.4`)
 /// owns `row_kind` (1-255) and the payload encoding; `index_key` is the

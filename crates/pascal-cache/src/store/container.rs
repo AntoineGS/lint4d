@@ -5,15 +5,16 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 2;
+pub const CONTAINER_VERSION: i64 = 3;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 2. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 3. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
+/// Spec §6.1 (amended 2026-10-27) adds evidence purposes and the publication sequence.
 const SCHEMA: &str = "
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -22,7 +23,8 @@ CREATE TABLE store_state (
     reset_epoch INTEGER NOT NULL CHECK (reset_epoch >= 0),
     max_disk_bytes INTEGER NOT NULL CHECK (max_disk_bytes > 0),
     wal_threshold_bytes INTEGER NOT NULL
-        CHECK (wal_threshold_bytes > 0 AND wal_threshold_bytes < max_disk_bytes)
+        CHECK (wal_threshold_bytes > 0 AND wal_threshold_bytes < max_disk_bytes),
+    publication_seq INTEGER NOT NULL CHECK (publication_seq >= 0)
 ) STRICT;
 
 CREATE TABLE namespaces (
@@ -43,7 +45,7 @@ CREATE TABLE key_manifests (
     namespace_id BLOB NOT NULL REFERENCES namespaces (namespace_id),
     reset_epoch INTEGER NOT NULL CHECK (reset_epoch >= 0),
     digest BLOB NOT NULL CHECK (length(digest) = 32),
-    kind INTEGER NOT NULL CHECK (kind BETWEEN 2 AND 5),
+    kind INTEGER NOT NULL CHECK (kind IN (2, 3, 4, 5, 7, 8)),
     manifest BLOB NOT NULL CHECK (length(manifest) BETWEEN 9 AND 1048576),
     PRIMARY KEY (namespace_id, reset_epoch, digest)
 ) STRICT;
@@ -89,23 +91,31 @@ CREATE TABLE evidence_sets (
     namespace_id BLOB NOT NULL,
     reset_epoch INTEGER NOT NULL,
     evidence_id BLOB NOT NULL CHECK (length(evidence_id) = 32),
+    purpose INTEGER NOT NULL CHECK (purpose BETWEEN 1 AND 3),
     context_key BLOB NOT NULL CHECK (length(context_key) = 32),
-    root_key BLOB NOT NULL CHECK (length(root_key) = 32),
-    artifact_id BLOB NOT NULL CHECK (length(artifact_id) = 32),
+    subject_key BLOB NOT NULL CHECK (length(subject_key) = 32),
+    artifact_id BLOB CHECK (artifact_id IS NULL OR length(artifact_id) = 32),
     lifecycle INTEGER NOT NULL CHECK (lifecycle IN (1, 2)),
     observation_count INTEGER NOT NULL CHECK (observation_count BETWEEN 0 AND 65536),
     content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
+    publication_seq INTEGER NOT NULL CHECK (publication_seq >= 1),
     PRIMARY KEY (namespace_id, reset_epoch, evidence_id),
     FOREIGN KEY (namespace_id, reset_epoch, context_key)
         REFERENCES key_manifests (namespace_id, reset_epoch, digest),
-    FOREIGN KEY (namespace_id, reset_epoch, root_key)
+    FOREIGN KEY (namespace_id, reset_epoch, subject_key)
         REFERENCES key_manifests (namespace_id, reset_epoch, digest),
     FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
-        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id)
+        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id),
+    CHECK ((purpose = 1) = (artifact_id IS NOT NULL))
 ) STRICT;
 
 CREATE INDEX evidence_by_subject
-    ON evidence_sets (namespace_id, reset_epoch, context_key, root_key, evidence_id);
+    ON evidence_sets (namespace_id, reset_epoch, purpose, context_key, subject_key,
+        publication_seq);
+
+CREATE INDEX evidence_by_artifact
+    ON evidence_sets (namespace_id, reset_epoch, artifact_id)
+    WHERE artifact_id IS NOT NULL;
 
 CREATE TABLE observations (
     namespace_id BLOB NOT NULL,
@@ -122,6 +132,105 @@ CREATE TABLE observations (
 
 CREATE INDEX observations_by_path
     ON observations (namespace_id, reset_epoch, path_key, evidence_id);
+
+CREATE TABLE member_records (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    record_id BLOB NOT NULL CHECK (length(record_id) = 32),
+    lifecycle INTEGER NOT NULL CHECK (lifecycle IN (1, 2)),
+    header BLOB NOT NULL CHECK (length(header) <= 1048576),
+    source_key BLOB NOT NULL CHECK (length(source_key) <= 4096),
+    artifact_id BLOB CHECK (artifact_id IS NULL OR length(artifact_id) = 32),
+    member_evidence BLOB CHECK (member_evidence IS NULL OR length(member_evidence) = 32),
+    binding_count INTEGER NOT NULL CHECK (binding_count BETWEEN 0 AND 65536),
+    content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
+    PRIMARY KEY (namespace_id, reset_epoch, record_id),
+    FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
+        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id),
+    FOREIGN KEY (namespace_id, reset_epoch, member_evidence)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK (member_evidence IS NULL OR artifact_id IS NOT NULL)
+) STRICT;
+
+CREATE INDEX member_records_by_artifact
+    ON member_records (namespace_id, reset_epoch, artifact_id)
+    WHERE artifact_id IS NOT NULL;
+
+CREATE INDEX member_records_by_evidence
+    ON member_records (namespace_id, reset_epoch, member_evidence)
+    WHERE member_evidence IS NOT NULL;
+
+CREATE TABLE member_bindings (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    record_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 1 AND 4),
+    target_key BLOB CHECK (target_key IS NULL OR length(target_key) <= 4096),
+    evidence_id BLOB CHECK (evidence_id IS NULL OR length(evidence_id) = 32),
+    payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
+    PRIMARY KEY (namespace_id, reset_epoch, record_id, ordinal),
+    FOREIGN KEY (namespace_id, reset_epoch, record_id)
+        REFERENCES member_records (namespace_id, reset_epoch, record_id),
+    FOREIGN KEY (namespace_id, reset_epoch, evidence_id)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK ((outcome = 1) = (target_key IS NOT NULL))
+) STRICT;
+
+CREATE INDEX member_bindings_by_target
+    ON member_bindings (namespace_id, reset_epoch, target_key, record_id, ordinal)
+    WHERE target_key IS NOT NULL;
+
+CREATE INDEX member_bindings_by_evidence
+    ON member_bindings (namespace_id, reset_epoch, evidence_id, record_id)
+    WHERE evidence_id IS NOT NULL;
+
+CREATE TABLE snapshots (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    snapshot_id BLOB NOT NULL CHECK (length(snapshot_id) = 16),
+    context_key BLOB NOT NULL CHECK (length(context_key) = 32),
+    state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
+    builder_token BLOB NOT NULL CHECK (length(builder_token) = 16),
+    build_revision INTEGER NOT NULL CHECK (build_revision >= 0),
+    member_count INTEGER NOT NULL CHECK (member_count BETWEEN 0 AND 100000),
+    discovery_evidence BLOB
+        CHECK (discovery_evidence IS NULL OR length(discovery_evidence) = 32),
+    coverage BLOB CHECK (coverage IS NULL OR length(coverage) <= 64),
+    sealed_digest BLOB CHECK (sealed_digest IS NULL OR length(sealed_digest) = 32),
+    publication_seq INTEGER CHECK (publication_seq IS NULL OR publication_seq >= 1),
+    PRIMARY KEY (namespace_id, reset_epoch, snapshot_id),
+    FOREIGN KEY (namespace_id, reset_epoch, context_key)
+        REFERENCES key_manifests (namespace_id, reset_epoch, digest),
+    FOREIGN KEY (namespace_id, reset_epoch, discovery_evidence)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK (state <> 1
+        OR (coverage IS NULL AND sealed_digest IS NULL AND publication_seq IS NULL)),
+    CHECK (state <> 2
+        OR (coverage IS NOT NULL AND sealed_digest IS NOT NULL AND publication_seq IS NOT NULL))
+) STRICT;
+
+CREATE INDEX snapshots_by_context
+    ON snapshots (namespace_id, reset_epoch, context_key, state, publication_seq);
+
+CREATE TABLE snapshot_members (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    snapshot_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    record_id BLOB NOT NULL CHECK (length(record_id) = 32),
+    source_key BLOB NOT NULL CHECK (length(source_key) <= 4096),
+    PRIMARY KEY (namespace_id, reset_epoch, snapshot_id, ordinal),
+    UNIQUE (namespace_id, reset_epoch, snapshot_id, source_key),
+    FOREIGN KEY (namespace_id, reset_epoch, snapshot_id)
+        REFERENCES snapshots (namespace_id, reset_epoch, snapshot_id),
+    FOREIGN KEY (namespace_id, reset_epoch, record_id)
+        REFERENCES member_records (namespace_id, reset_epoch, record_id)
+) STRICT;
+
+CREATE INDEX snapshot_members_by_record
+    ON snapshot_members (namespace_id, reset_epoch, record_id, snapshot_id);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +384,8 @@ fn create(connection: &mut Connection, deadline: Deadline) -> Result<(), Bypass>
     transaction
         .execute(
             "INSERT INTO store_state (singleton, container_version, policy_revision, \
-             reset_epoch, max_disk_bytes, wal_threshold_bytes) VALUES (1, ?1, 0, 0, ?2, ?3)",
+             reset_epoch, max_disk_bytes, wal_threshold_bytes, publication_seq) \
+             VALUES (1, ?1, 0, 0, ?2, ?3, 0)",
             params![
                 CONTAINER_VERSION,
                 DEFAULT_MAX_DISK_BYTES,
@@ -344,16 +454,20 @@ mod tests {
                 "artifacts",
                 "evidence_sets",
                 "key_manifests",
+                "member_bindings",
+                "member_records",
                 "namespaces",
                 "observations",
                 "retired_scopes",
+                "snapshot_members",
+                "snapshots",
                 "store_state"
             ]
         );
-        let state: (i64, i64, i64, i64, i64) = connection
+        let state: (i64, i64, i64, i64, i64, i64) = connection
             .query_row(
                 "SELECT container_version, policy_revision, reset_epoch, max_disk_bytes, \
-                 wal_threshold_bytes FROM store_state",
+                 wal_threshold_bytes, publication_seq FROM store_state",
                 [],
                 |row| {
                     Ok((
@@ -362,11 +476,12 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(state, (CONTAINER_VERSION, 0, 0, 8 << 30, 256 << 20));
+        assert_eq!(state, (CONTAINER_VERSION, 0, 0, 8 << 30, 256 << 20, 0));
     }
 
     #[test]
@@ -404,20 +519,24 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_container_is_bypassed_not_migrated() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("a.sqlite3");
-        {
-            let mut connection = connect(&path);
-            prepare_container(&mut connection, deadline()).unwrap();
-            connection.pragma_update(None, "user_version", 1).unwrap();
+    fn older_containers_are_bypassed_not_migrated() {
+        for version in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("a.sqlite3");
+            {
+                let mut connection = connect(&path);
+                prepare_container(&mut connection, deadline()).unwrap();
+                connection
+                    .pragma_update(None, "user_version", version)
+                    .unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                prepare_container(&mut connect(&path), deadline()),
+                Err(Bypass::UnsupportedContainer { version })
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
         }
-        let before = std::fs::read(&path).unwrap();
-        assert_eq!(
-            prepare_container(&mut connect(&path), deadline()),
-            Err(Bypass::UnsupportedContainer { version: 1 })
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -588,7 +707,8 @@ mod tests {
     fn schema_bounds_match_the_store_limits() {
         use crate::store::limits::{
             MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_OBSERVATIONS,
-            MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_ROW_BATCH_BYTES, MAX_SUPPLEMENTAL_BYTES,
+            MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_ROW_BATCH_BYTES,
+            MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES,
         };
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
@@ -602,9 +722,13 @@ mod tests {
                  INSERT INTO key_manifests VALUES
                      (zeroblob(32), 0, CAST(zeroblob(31) || x'01' AS BLOB), 4, zeroblob(9));
                  INSERT INTO evidence_sets VALUES
-                     (zeroblob(32), 0, zeroblob(32), CAST(zeroblob(31) || x'01' AS BLOB),
-                      zeroblob(32),
-                      zeroblob(32), 1, 0, 0);",
+                     (zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
+                      zeroblob(32), zeroblob(32), 1, 0, 0, 1);
+                 INSERT INTO member_records VALUES
+                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0);
+                 INSERT INTO snapshots VALUES
+                     (zeroblob(32), 0, zeroblob(16), CAST(zeroblob(31) || x'01' AS BLOB), 1,
+                      zeroblob(16), 0, 0, NULL, NULL, NULL, NULL);",
             )
             .unwrap();
         // Each statement takes the bound as ?1: accepted at the limit,
@@ -655,17 +779,131 @@ mod tests {
                  (zeroblob(32), 0, zeroblob(32), 0, 1, x'', zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
+            (
+                "UPDATE member_records SET header = zeroblob(?1)",
+                MAX_MANIFEST_BYTES,
+            ),
+            (
+                "UPDATE member_records SET source_key = zeroblob(?1)",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "UPDATE member_records SET binding_count = ?1",
+                MAX_MEMBER_BINDINGS,
+            ),
+            (
+                "UPDATE member_records SET content_bytes = ?1",
+                MAX_ARTIFACT_CONTENT_BYTES,
+            ),
+            (
+                "INSERT INTO member_bindings VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, 1, zeroblob(?1), NULL, x'')",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "INSERT INTO member_bindings VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, 3, NULL, NULL, zeroblob(?1))",
+                MAX_ROW_BATCH_BYTES,
+            ),
+            (
+                "UPDATE snapshots SET member_count = ?1",
+                MAX_SNAPSHOT_MEMBERS,
+            ),
+            (
+                "INSERT INTO snapshot_members VALUES \
+                 (zeroblob(32), 0, zeroblob(16), 0, zeroblob(32), zeroblob(?1))",
+                MAX_INDEX_KEY_BYTES,
+            ),
         ];
         for (sql, limit) in cases {
             let at = connection.execute(sql, [limit as i64]);
             assert!(at.is_ok(), "{sql} at {limit}: {at:?}");
             connection.execute("DELETE FROM artifact_rows", []).unwrap();
             connection.execute("DELETE FROM observations", []).unwrap();
+            connection
+                .execute("DELETE FROM member_bindings", [])
+                .unwrap();
+            connection
+                .execute("DELETE FROM snapshot_members", [])
+                .unwrap();
             let past = connection.execute(sql, [limit as i64 + 1]).unwrap_err();
             assert!(
                 past.to_string().contains("CHECK"),
                 "{sql} past {limit}: {past}"
             );
         }
+    }
+
+    #[test]
+    fn only_artifact_evidence_names_an_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = connect(&root.path().join("a.sqlite3"));
+        prepare_container(&mut connection, deadline()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
+                 INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
+                 INSERT INTO artifacts VALUES
+                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');",
+            )
+            .unwrap();
+        for (purpose, artifact) in [(1, "NULL"), (2, "zeroblob(32)"), (3, "zeroblob(32)")] {
+            let error = connection
+                .execute(
+                    &format!(
+                        "INSERT INTO evidence_sets VALUES (zeroblob(32), 0, zeroblob(32), {purpose}, \
+                         zeroblob(32), zeroblob(32), {artifact}, 1, 0, 0, 1)"
+                    ),
+                    [],
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("CHECK"), "{purpose}: {error}");
+        }
+        for (purpose, artifact) in [(1, "zeroblob(32)"), (2, "NULL"), (3, "NULL")] {
+            let id = format!("x'{}{purpose:02x}'", "00".repeat(31));
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO evidence_sets VALUES (zeroblob(32), 0, {id}, {purpose}, \
+                         zeroblob(32), zeroblob(32), {artifact}, 1, 0, 0, 1)"
+                    ),
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("{purpose}: {error}"));
+        }
+    }
+
+    #[test]
+    fn only_a_sealed_snapshot_carries_its_digest_and_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = connect(&root.path().join("a.sqlite3"));
+        prepare_container(&mut connection, deadline()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
+                 INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 4, zeroblob(9));",
+            )
+            .unwrap();
+        let insert = |state: i64, sealed: &str| {
+            connection.execute(
+                &format!(
+                    "INSERT INTO snapshots VALUES (zeroblob(32), 0, zeroblob(16), zeroblob(32), \
+                     {state}, zeroblob(16), 0, 0, NULL, {sealed})"
+                ),
+                [],
+            )
+        };
+        for (state, sealed) in [
+            (1, "x'0000', zeroblob(32), 1"),
+            (2, "NULL, NULL, NULL"),
+            (2, "x'0000', NULL, 1"),
+        ] {
+            let error = insert(state, sealed).unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK"),
+                "{state} {sealed}: {error}"
+            );
+        }
+        assert!(insert(2, "x'0000', zeroblob(32), 1").is_ok());
     }
 }

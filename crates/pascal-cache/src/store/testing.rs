@@ -4,6 +4,7 @@ use super::Store;
 use super::outcome::Bypass;
 use super::pool::Lease;
 use super::sqlite::classify;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -12,6 +13,7 @@ type Hook = Arc<dyn Fn() + Send + Sync>;
 pub(crate) struct Hooks {
     before_commit: Mutex<Option<Hook>>,
     row_fault: Mutex<Option<usize>>,
+    faults: Mutex<HashMap<FaultPoint, Hook>>,
 }
 
 impl Hooks {
@@ -86,5 +88,92 @@ impl Store {
         writer
             .pragma_update(None, "max_page_count", pages + extra_pages)
             .map_err(|error| classify(&error))
+    }
+}
+
+/// Named points of the publication protocol where a test may act or a test
+/// process may abort (spec §12.1 amendment). They exist only in a
+/// `test-support` build; `fault_point!` compiles to nothing otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FaultPoint {
+    /// Inside an evidence publication, before commit.
+    EvidenceBeforeCommit,
+    /// Inside a member record publication, before commit.
+    RecordBeforeCommit,
+    /// Inside `begin_snapshot`, before commit.
+    BeginBeforeCommit,
+    /// Inside an `add_members` batch, before commit.
+    MembersBeforeCommit,
+    /// After the seal digest streamed, before the seal transaction; no
+    /// transaction or connection is held.
+    SealDigestStreamed,
+    /// Inside the seal transaction, before commit.
+    SealBeforeCommit,
+    /// After the seal committed; no transaction or connection is held.
+    SealCommitted,
+    /// Inside a snapshot retirement, before commit.
+    RetireBeforeCommit,
+}
+
+impl FaultPoint {
+    pub const ALL: [Self; 8] = [
+        Self::EvidenceBeforeCommit,
+        Self::RecordBeforeCommit,
+        Self::BeginBeforeCommit,
+        Self::MembersBeforeCommit,
+        Self::SealDigestStreamed,
+        Self::SealBeforeCommit,
+        Self::SealCommitted,
+        Self::RetireBeforeCommit,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::EvidenceBeforeCommit => "EvidenceBeforeCommit",
+            Self::RecordBeforeCommit => "RecordBeforeCommit",
+            Self::BeginBeforeCommit => "BeginBeforeCommit",
+            Self::MembersBeforeCommit => "MembersBeforeCommit",
+            Self::SealDigestStreamed => "SealDigestStreamed",
+            Self::SealBeforeCommit => "SealBeforeCommit",
+            Self::SealCommitted => "SealCommitted",
+            Self::RetireBeforeCommit => "RetireBeforeCommit",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|point| point.name() == name)
+    }
+}
+
+impl Store {
+    pub(crate) fn fault(&self, point: FaultPoint) {
+        let hook = self
+            .hooks
+            .faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&point)
+            .cloned();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` each time this store reaches `point`. A hook inside a
+    /// write transaction must not write through this store's own pool.
+    pub fn set_fault_for_test(&self, point: FaultPoint, hook: impl Fn() + Send + Sync + 'static) {
+        self.hooks
+            .faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(point, Arc::new(hook));
+    }
+
+    pub fn clear_fault_for_test(&self, point: FaultPoint) {
+        self.hooks
+            .faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&point);
     }
 }

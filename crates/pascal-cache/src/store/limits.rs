@@ -22,6 +22,12 @@ pub const MAX_INDEX_PAGE: usize = 256;
 pub const MAX_EVIDENCE_OBSERVATIONS: usize = 65_536;
 /// Evidence sets one lookup considers for a subject.
 pub const MAX_EVIDENCE_CANDIDATES: usize = 16;
+/// Bindings in one member record (spec §10: multi-row manifests).
+pub const MAX_MEMBER_BINDINGS: usize = 65_536;
+/// Members of one snapshot: the `maxWorkspaceUnits` ceiling (spec §8).
+pub const MAX_SNAPSHOT_MEMBERS: usize = 100_000;
+/// Sealed snapshots one lookup returns for a context, as hints (spec §6.3).
+pub const MAX_SNAPSHOT_CANDIDATES: usize = 8;
 /// `SQLITE_LIMIT_LENGTH`: SQLite refuses to materialize a longer value, so
 /// a planted oversized blob fails before it is copied.
 pub const SQLITE_LENGTH_LIMIT: i32 = 2 * 1024 * 1024;

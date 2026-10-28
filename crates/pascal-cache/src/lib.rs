@@ -6,13 +6,16 @@
 
 mod artifact_key;
 mod context_key;
+mod decode;
 mod digest;
 mod encoding;
 mod evidence;
 mod facts;
+mod lookup_key;
 mod member_key;
 mod path;
 mod project;
+mod record;
 mod source;
 mod store;
 
@@ -24,15 +27,24 @@ pub use context_key::ContextKey;
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
 pub use evidence::{
-    EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT, Observation,
-    ObservationError, decode_observation, evidence_id, listing_digest, observations_digest,
-    path_key,
+    EvidencePurpose, EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT,
+    Observation, ObservationError, decode_observation, evidence_id, listing_digest,
+    observations_digest, path_key,
 };
 pub use facts::{
     DECLARATION_ROW, EncodedFacts, EncodedRow, FactDecodeError, FactDecoder, IMPORT_ROW,
     INCLUDE_ROW, POSTING_ROW, SEGMENT_ROW, encode_facts, encoded_content_bytes,
 };
+pub use lookup_key::{
+    DiscoveryInputs, DiscoveryScope, LookupInputs, LookupKey, LookupKind, ScannedDirectory,
+};
 pub use member_key::{ArtifactRef, MemberInputs, MemberKey};
+pub use record::{
+    Binding, BindingKind, BindingOutcome, CoverageStatus, IncompleteReason,
+    MAX_AMBIGUOUS_CANDIDATES, MemberCoverage, MemberError, MemberHeader, MemberRecord,
+    RecordDecodeError, SnapshotCoverage, decode_binding, decode_member_header,
+    decode_snapshot_coverage,
+};
 pub use source::{SourceContent, SourceIdentity};
 
 #[cfg(test)]
@@ -47,18 +59,26 @@ pub use manifest::{
 pub use namespace::{BUILD_FINGERPRINT, Namespace};
 pub use store::{
     APPLICATION_ID, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow, ArtifactWrite,
-    Bypass, CONTAINER_VERSION, DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceWrite,
-    FACT_CHECKSUM_CONTEXT, IndexHit, IndexPage, Integrity, LimitsError, LocationIssue, Lookup,
-    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
-    MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
-    MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS,
-    MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
-    MIN_SQLITE_VERSION_NUMBER, Malformed, Miss, ObservationBatch, Published, PublishedEvidence,
-    ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT,
-    Scope, Store, StoreLimits, StoreLocation, StoredRow, TooLarge, default_directory,
+    BindingBatch, Bypass, CONTAINER_VERSION, DATABASE_FILE, EvidenceHeader, EvidenceReader,
+    EvidenceTarget, EvidenceWrite, FACT_CHECKSUM_CONTEXT, ImporterHit, ImporterPage, IndexHit,
+    IndexPage, Integrity, LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES,
+    MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
+    MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES,
+    MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES,
+    MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
+    MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_SQLITE_VERSION_NUMBER, Malformed, MemberBatch,
+    MemberRecordHeader, MemberRecordReader, Miss, ObservationBatch, Published, PublishedEvidence,
+    PublishedRecord, PublishedSet, ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch,
+    RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal, SnapshotBuilder, SnapshotHeader, SnapshotId,
+    SnapshotMember, SnapshotReader, SnapshotSeal, Store, StoreLimits, StoreLocation, StoredRow,
+    TooLarge, default_directory,
 };
 
+#[cfg(feature = "test-support")]
+pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
 pub use store::HeldConnection;
 #[cfg(feature = "test-support")]
 pub use store::INDEX_QUERY_FOR_TEST;
+#[cfg(feature = "test-support")]
+pub use store::{IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY_FOR_TEST};

@@ -14,6 +14,14 @@ pub enum KeyKind {
     Member,
     /// An evidence manifest; streamed, never stored whole (see `evidence`).
     Evidence,
+    /// The subject of binding evidence: one resolver lookup.
+    Lookup,
+    /// The subject of discovery evidence: the scanned directories.
+    Discovery,
+    /// A member record manifest; streamed, never stored whole (see `record`).
+    MemberRecord,
+    /// A sealed snapshot manifest; streamed, never stored whole.
+    Snapshot,
 }
 
 impl KeyKind {
@@ -25,6 +33,10 @@ impl KeyKind {
             Self::Context => 4,
             Self::Member => 5,
             Self::Evidence => 6,
+            Self::Lookup => 7,
+            Self::Discovery => 8,
+            Self::MemberRecord => 9,
+            Self::Snapshot => 10,
         }
     }
 
@@ -36,6 +48,10 @@ impl KeyKind {
             4 => Some(Self::Context),
             5 => Some(Self::Member),
             6 => Some(Self::Evidence),
+            7 => Some(Self::Lookup),
+            8 => Some(Self::Discovery),
+            9 => Some(Self::MemberRecord),
+            10 => Some(Self::Snapshot),
             _ => None,
         }
     }
@@ -209,8 +225,8 @@ mod tests {
             Err(ManifestError::UnsupportedEncoding(2))
         );
         assert_eq!(
-            ManifestHeader::parse(&[b'L', b'4', b'D', b'C', 1, 0, 0, 0, 9]),
-            Err(ManifestError::UnknownKind(9))
+            ManifestHeader::parse(&[b'L', b'4', b'D', b'C', 1, 0, 0, 0, 200]),
+            Err(ManifestError::UnknownKind(200))
         );
         for kind in [
             KeyKind::Namespace,
@@ -219,6 +235,10 @@ mod tests {
             KeyKind::Context,
             KeyKind::Member,
             KeyKind::Evidence,
+            KeyKind::Lookup,
+            KeyKind::Discovery,
+            KeyKind::MemberRecord,
+            KeyKind::Snapshot,
         ] {
             assert_eq!(KeyKind::from_tag(kind.tag()), Some(kind));
         }

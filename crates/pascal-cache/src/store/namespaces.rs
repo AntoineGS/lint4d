@@ -8,6 +8,8 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The `lifecycle` of every namespace, artifact, evidence set and member
+/// record: retiring one ends its read eligibility at once.
 pub(crate) const LIVE: i64 = 1;
 pub(crate) const RETIRED: i64 = 2;
 /// Namespaces examined per retirement pass; the rest wait for the next start.
@@ -15,7 +17,11 @@ const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 5] = [
+const RECLAIM_TABLES: [&str; 9] = [
+    "snapshot_members",
+    "snapshots",
+    "member_bindings",
+    "member_records",
     "observations",
     "evidence_sets",
     "artifact_rows",

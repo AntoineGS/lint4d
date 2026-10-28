@@ -10,3 +10,7 @@ pub fn private_tempdir() -> tempfile::TempDir {
     .unwrap();
     root
 }
+
+/// Member record and snapshot fixtures; not every test file uses them all.
+#[allow(dead_code)]
+pub mod records;

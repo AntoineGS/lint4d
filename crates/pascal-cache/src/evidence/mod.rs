@@ -151,29 +151,74 @@ pub fn observations_digest(observations: &[Observation]) -> Digest {
     Digest::derive(OBSERVATIONS_DIGEST_CONTEXT, encoder.as_bytes())
 }
 
-/// Whose inputs an evidence set proves: one root under one complete context.
+/// What an evidence set proves (spec §6.1 amendment 2026-10-27).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EvidenceSubject {
-    pub context: Digest,
-    pub root: Digest,
+pub enum EvidencePurpose {
+    /// An expanded artifact's inputs for one root.
+    Artifact,
+    /// One resolver lookup's outcome, found or not.
+    Binding,
+    /// One discovery scan's membership.
+    Discovery,
 }
 
-/// The evidence ID: the digest of the evidence manifest (subject,
-/// conclusion, then each observation's encoding), streamed so the manifest
-/// itself never exists in one buffer.
+impl EvidencePurpose {
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Artifact => 1,
+            Self::Binding => 2,
+            Self::Discovery => 3,
+        }
+    }
+
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Artifact),
+            2 => Some(Self::Binding),
+            3 => Some(Self::Discovery),
+            _ => None,
+        }
+    }
+
+    /// The kind of the subject's manifest.
+    pub const fn subject_kind(self) -> KeyKind {
+        match self {
+            Self::Artifact => KeyKind::LocalArtifact,
+            Self::Binding => KeyKind::Lookup,
+            Self::Discovery => KeyKind::Discovery,
+        }
+    }
+}
+
+/// Whose inputs an evidence set proves: a root local key, a lookup key or a
+/// discovery scope, under one complete context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvidenceSubject {
+    pub purpose: EvidencePurpose,
+    pub context: Digest,
+    pub subject: Digest,
+}
+
+/// The evidence ID: the digest of the evidence manifest (purpose, subject,
+/// the concluded artifact if any, then each observation's encoding),
+/// streamed so the manifest itself never exists in one buffer.
 #[derive(Clone)]
 pub(crate) struct EvidenceHasher(blake3::Hasher);
 
 impl EvidenceHasher {
-    pub(crate) fn new(subject: &EvidenceSubject, conclusion: Digest, count: usize) -> Self {
+    pub(crate) fn new(subject: &EvidenceSubject, conclusion: Option<Digest>, count: usize) -> Self {
         let mut encoder = manifest_encoder(KeyKind::Evidence);
         encoder.field(1);
-        encoder.digest(&subject.context);
+        encoder.variant(subject.purpose.tag());
         encoder.field(2);
-        encoder.digest(&subject.root);
+        encoder.digest(&subject.context);
         encoder.field(3);
-        encoder.digest(&conclusion);
+        encoder.digest(&subject.subject);
         encoder.field(4);
+        encoder.option(conclusion.as_ref(), |encoder, conclusion| {
+            encoder.digest(conclusion)
+        });
+        encoder.field(5);
         encoder.length(count);
         let mut hasher = blake3::Hasher::new_derive_key(MANIFEST_DIGEST_CONTEXT);
         hasher.update(encoder.as_bytes());
@@ -192,7 +237,7 @@ impl EvidenceHasher {
 
 pub fn evidence_id(
     subject: &EvidenceSubject,
-    conclusion: Digest,
+    conclusion: Option<Digest>,
     observations: &[Observation],
 ) -> Digest {
     let mut hasher = EvidenceHasher::new(subject, conclusion, observations.len());
@@ -209,8 +254,9 @@ mod tests {
     #[test]
     fn the_streamed_id_is_the_digest_of_the_whole_manifest() {
         let subject = EvidenceSubject {
+            purpose: EvidencePurpose::Binding,
             context: Digest::from_bytes([1; 32]),
-            root: Digest::from_bytes([2; 32]),
+            subject: Digest::from_bytes([2; 32]),
         };
         let observations = [Observation::Presence {
             path: PathBuf::from("x"),
@@ -219,18 +265,28 @@ mod tests {
         }];
         let mut manifest = manifest_encoder(KeyKind::Evidence);
         manifest.field(1);
-        manifest.digest(&subject.context);
+        manifest.variant(2);
         manifest.field(2);
-        manifest.digest(&subject.root);
+        manifest.digest(&subject.context);
         manifest.field(3);
-        manifest.digest(&Digest::from_bytes([3; 32]));
+        manifest.digest(&subject.subject);
         manifest.field(4);
+        manifest.u8(0);
+        manifest.field(5);
         manifest.seq(&observations, |encoder, observation| {
             encoder.encode(observation)
         });
         assert_eq!(
-            evidence_id(&subject, Digest::from_bytes([3; 32]), &observations),
+            evidence_id(&subject, None, &observations),
             Digest::derive(MANIFEST_DIGEST_CONTEXT, manifest.as_bytes())
         );
+        for purpose in [
+            EvidencePurpose::Artifact,
+            EvidencePurpose::Binding,
+            EvidencePurpose::Discovery,
+        ] {
+            assert_eq!(EvidencePurpose::from_tag(purpose.tag()), Some(purpose));
+        }
+        assert_eq!(EvidencePurpose::from_tag(0), None);
     }
 }

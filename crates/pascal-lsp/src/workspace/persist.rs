@@ -4,12 +4,14 @@
 
 use super::Workspace;
 use super::evidence::EvidenceGap;
-use super::validate::{Check, CurrentInputs, Stale, Unproven, Validator};
+use super::validate::{
+    CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
+};
 use lsp_types::Url;
 use pascal_cache::{
     ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, EvidenceWrite, ExpandedArtifactKey,
-    KeyError, LocalArtifactKey, Lookup, Miss, Published, PublishedEvidence, SessionDependence,
-    SourceContent, Store, observations_digest,
+    KeyError, LocalArtifactKey, Lookup, Malformed, Miss, Published, PublishedEvidence,
+    SessionDependence, SourceContent, Store, observations_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget, FactError, NotPersistable, include_slots};
 use pascal_core::resolver::ResolverLimits;
@@ -269,38 +271,28 @@ impl Workspace {
             cancel,
         );
         let mut last = ReuseMiss::Store(Miss::Absent);
-        'candidates: for header in &headers {
-            let mut reader = store.read_evidence(header);
-            loop {
-                match reader.next_batch().map_err(PersistError::Store)? {
-                    Lookup::Hit(Some(batch)) => {
-                        for observation in batch.observations() {
-                            match validator.check(observation) {
-                                Check::Holds => {}
-                                Check::Stale(stale) => {
-                                    last = ReuseMiss::Stale(stale);
-                                    continue 'candidates;
-                                }
-                                Check::Unproven(unproven) => {
-                                    return Ok(Reuse::Miss(ReuseMiss::Unproven(unproven)));
-                                }
-                            }
-                        }
-                    }
-                    // Every observation held and the evidence verified.
-                    Lookup::Hit(None) => break,
-                    Lookup::Miss(miss) => {
-                        last = ReuseMiss::Store(miss);
-                        continue 'candidates;
-                    }
+        for header in &headers {
+            let Some(artifact) = header.artifact_id() else {
+                last = ReuseMiss::Store(Miss::Malformed(Malformed::Evidence));
+                continue;
+            };
+            match validate_evidence(store, header, &mut validator).map_err(PersistError::Store)? {
+                EvidenceCheck::Holds => {}
+                EvidenceCheck::Stale(stale) => {
+                    last = ReuseMiss::Stale(stale);
+                    continue;
                 }
-            }
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Cancelled)));
+                EvidenceCheck::Unproven(unproven) => {
+                    return Ok(Reuse::Miss(ReuseMiss::Unproven(unproven)));
+                }
+                EvidenceCheck::Store(miss) => {
+                    last = ReuseMiss::Store(miss);
+                    continue;
+                }
             }
             return Ok(
                 match store
-                    .load_facts_by_id(header.artifact_id(), budget)
+                    .load_facts_by_id(artifact, budget)
                     .map_err(PersistError::Store)?
                 {
                     Lookup::Hit(facts) => Reuse::Hit {

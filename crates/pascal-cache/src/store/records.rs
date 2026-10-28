@@ -358,6 +358,9 @@ impl Store {
         }
         let published = match read_record_row(&transaction, self.scope, encoded.id).map_err(fail)? {
             Some(stored) if stored.lifecycle != LIVE => return Err(Bypass::Retiring),
+            // Only the record row is compared: the ID is the digest of the
+            // header and every binding, so the same ID means the same
+            // bindings, and stored rows that disagree fail every read.
             Some(stored) if stored == expected => Published::AlreadyPresent,
             Some(_) => return Err(Bypass::Integrity(Integrity::ConflictingRecord)),
             None => {

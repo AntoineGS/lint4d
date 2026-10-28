@@ -306,3 +306,105 @@ fn a_record_retired_before_its_final_check_is_a_miss() {
     ));
     assert!(!reader.is_verified());
 }
+
+#[test]
+fn binding_columns_that_disagree_with_their_payload_are_never_a_verified_read() {
+    let cases: [(&str, &str, Miss); 5] = [
+        (
+            "kind",
+            "UPDATE member_bindings SET kind = 2 WHERE ordinal = 0",
+            Miss::Malformed(Malformed::Member),
+        ),
+        (
+            "outcome",
+            "UPDATE member_bindings SET outcome = 2 WHERE ordinal = 1",
+            Miss::Malformed(Malformed::Member),
+        ),
+        (
+            "evidence removed",
+            "UPDATE member_bindings SET evidence_id = NULL WHERE ordinal = 1",
+            Miss::Malformed(Malformed::Member),
+        ),
+        (
+            "evidence replaced",
+            "UPDATE member_bindings SET evidence_id = zeroblob(32) WHERE ordinal = 1",
+            Miss::Malformed(Malformed::Member),
+        ),
+        (
+            "content bytes",
+            "UPDATE member_records SET content_bytes = content_bytes + 1",
+            Miss::ChecksumMismatch,
+        ),
+    ];
+    for (label, tamper, miss) in cases {
+        let directory = private_tempdir();
+        let store = open(directory.path());
+        let evidence = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+        let mut record = member("/w/Main.pas", &["/w/Shapes.pas"], evidence);
+        record.bindings.push(Binding {
+            kind: BindingKind::Import,
+            occurrence: 1,
+            outcome: BindingOutcome::Unavailable,
+            evidence: Some(evidence),
+        });
+        let id = store.publish_member_record(&record).unwrap().record_id;
+        assert_eq!(read_record(&store, id), Ok(record), "{label}: untouched");
+        raw(directory.path()).execute(tamper, []).unwrap();
+        assert_eq!(read_record(&store, id), Err(miss), "{label}");
+    }
+}
+
+#[test]
+fn record_columns_that_disagree_with_the_header_are_not_admitted() {
+    for (label, tamper) in [
+        ("source key", "UPDATE member_records SET source_key = x'00'"),
+        (
+            "artifact",
+            "UPDATE member_records SET artifact_id = zeroblob(32)",
+        ),
+        (
+            "member evidence",
+            "UPDATE member_records SET member_evidence = zeroblob(32)",
+        ),
+    ] {
+        let directory = private_tempdir();
+        let store = open(directory.path());
+        let mut record = member("/w/Main.pas", &[], Digest::from_bytes([0; 32]));
+        record.header.artifact = Some(artifact(&store, "unit Main;"));
+        let id = store.publish_member_record(&record).unwrap().record_id;
+        assert!(
+            matches!(store.open_member_record(id).unwrap(), Lookup::Hit(_)),
+            "{label}: untouched"
+        );
+        raw(directory.path()).execute(tamper, []).unwrap();
+        assert_eq!(
+            store.open_member_record(id).unwrap(),
+            Lookup::Miss(Miss::Malformed(Malformed::Member)),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn a_retired_artifact_or_record_refuses_publication() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let mut record = member("/w/Main.pas", &[], Digest::from_bytes([0; 32]));
+    record.header.artifact = Some(artifact(&store, "unit Main;"));
+    raw(directory.path())
+        .execute("UPDATE artifacts SET lifecycle = 2", [])
+        .unwrap();
+    assert_eq!(store.publish_member_record(&record), Err(Bypass::Retiring));
+    let plain = member("/w/Plain.pas", &[], Digest::from_bytes([0; 32]));
+    let id = store.publish_member_record(&plain).unwrap().record_id;
+    assert!(store.retire_member_record(id).unwrap());
+    assert_eq!(
+        store.publish_member_record(&plain),
+        Err(Bypass::Retiring),
+        "a retired record is never revived by republishing"
+    );
+    assert_eq!(
+        store.open_member_record(id).unwrap(),
+        Lookup::Miss(Miss::Retired)
+    );
+}

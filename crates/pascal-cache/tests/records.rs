@@ -145,9 +145,61 @@ fn record_ids_cover_every_field() {
     change(|r| {
         r.bindings.pop();
     });
+    change(|r| r.header.source.canonical = "/w/Other.pas".into());
+    change(|r| r.header.source.uri = None);
+    change(|r| {
+        r.header.artifact = None;
+        r.header.member_evidence = None;
+    });
+    change(|r| r.header.member_evidence = Some(Digest::from_bytes([8; 32])));
+    change(|r| r.header.fallback_unit_name = Some("Other".into()));
+    change(|r| {
+        r.header.coverage.extraction = CoverageStatus::Incomplete(IncompleteReason::Unsupported)
+    });
+    change(|r| {
+        let mut moved = r.bindings.remove(1);
+        moved.kind = BindingKind::Include;
+        r.bindings.insert(2, moved);
+    });
+    change(|r| {
+        r.bindings[0].outcome = BindingOutcome::Precise {
+            target: identity("/w/Other.pas"),
+        }
+    });
+    change(|r| {
+        r.bindings[2].outcome = BindingOutcome::Ambiguous {
+            candidates: vec![identity("/a/X.inc"), identity("/c/X.inc")],
+            overflow: false,
+        }
+    });
+    change(|r| r.bindings[3].evidence = Some(Digest::from_bytes([5; 32])));
+    change(|r| {
+        r.bindings[1].outcome = BindingOutcome::Precise {
+            target: identity("/w/Shapes.pas"),
+        }
+    });
+    change(|r| {
+        r.bindings[3].outcome = BindingOutcome::Unavailable;
+        r.bindings[3].evidence = Some(Digest::from_bytes([3; 32]));
+    });
     for changed in changes {
         assert_ne!(changed.id().unwrap(), base, "{changed:?}");
     }
+}
+
+#[test]
+fn the_overflow_flag_changes_the_record_id() {
+    let with_overflow = |overflow| {
+        let mut record = record();
+        record.bindings[2].outcome = BindingOutcome::Ambiguous {
+            candidates: (0..MAX_AMBIGUOUS_CANDIDATES)
+                .map(|index| identity(&format!("/{index}/X.inc")))
+                .collect(),
+            overflow,
+        };
+        record.id().unwrap()
+    };
+    assert_ne!(with_overflow(true), with_overflow(false));
 }
 
 #[test]

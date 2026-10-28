@@ -18,6 +18,8 @@ pub enum KeyKind {
     Lookup,
     /// The subject of discovery evidence: the scanned directories.
     Discovery,
+    /// A member record manifest; streamed, never stored whole (see `record`).
+    MemberRecord,
 }
 
 impl KeyKind {
@@ -31,6 +33,7 @@ impl KeyKind {
             Self::Evidence => 6,
             Self::Lookup => 7,
             Self::Discovery => 8,
+            Self::MemberRecord => 9,
         }
     }
 
@@ -44,6 +47,7 @@ impl KeyKind {
             6 => Some(Self::Evidence),
             7 => Some(Self::Lookup),
             8 => Some(Self::Discovery),
+            9 => Some(Self::MemberRecord),
             _ => None,
         }
     }
@@ -229,6 +233,7 @@ mod tests {
             KeyKind::Evidence,
             KeyKind::Lookup,
             KeyKind::Discovery,
+            KeyKind::MemberRecord,
         ] {
             assert_eq!(KeyKind::from_tag(kind.tag()), Some(kind));
         }

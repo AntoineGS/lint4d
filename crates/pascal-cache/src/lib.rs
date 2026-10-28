@@ -6,6 +6,7 @@
 
 mod artifact_key;
 mod context_key;
+mod decode;
 mod digest;
 mod encoding;
 mod evidence;
@@ -14,6 +15,7 @@ mod lookup_key;
 mod member_key;
 mod path;
 mod project;
+mod record;
 mod source;
 mod store;
 
@@ -37,6 +39,12 @@ pub use lookup_key::{
     DiscoveryInputs, DiscoveryScope, LookupInputs, LookupKey, LookupKind, ScannedDirectory,
 };
 pub use member_key::{ArtifactRef, MemberInputs, MemberKey};
+pub use record::{
+    Binding, BindingKind, BindingOutcome, CoverageStatus, IncompleteReason,
+    MAX_AMBIGUOUS_CANDIDATES, MemberCoverage, MemberError, MemberHeader, MemberRecord,
+    RecordDecodeError, SnapshotCoverage, decode_binding, decode_member_header,
+    decode_snapshot_coverage,
+};
 pub use source::{SourceContent, SourceIdentity};
 
 #[cfg(test)]

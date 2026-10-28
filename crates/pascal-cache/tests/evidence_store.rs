@@ -380,22 +380,30 @@ fn evidence_retired_or_deleted_between_batches_is_a_miss() {
 }
 
 #[test]
-fn a_row_past_the_declared_count_is_a_count_miss_even_when_malformed() {
-    let directory = private_tempdir();
-    let store = store(directory.path());
-    let keys = keys("unit A;");
-    publish(&store, &keys, &observations()).unwrap();
-    raw(directory.path())
-        .execute(
-            "INSERT INTO observations SELECT namespace_id, reset_epoch, evidence_id, 3, \
-             3, X'00', X'00' FROM observations WHERE ordinal = 0",
-            [],
-        )
-        .unwrap();
-    assert_eq!(
-        read_all(&store, &keys),
-        Err(Miss::Malformed(Malformed::Count))
-    );
+fn a_row_past_the_declared_count_is_a_count_miss_even_when_malformed_or_oversized() {
+    for (label, path_key, payload) in [
+        ("malformed", "X'00'", "X'00'"),
+        ("oversized", "X'00'", "zeroblob(1048576)"),
+    ] {
+        let directory = private_tempdir();
+        let store = store(directory.path());
+        let keys = keys("unit A;");
+        publish(&store, &keys, &observations()).unwrap();
+        raw(directory.path())
+            .execute(
+                &format!(
+                    "INSERT INTO observations SELECT namespace_id, reset_epoch, evidence_id, 3, \
+                     3, {path_key}, {payload} FROM observations WHERE ordinal = 0"
+                ),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            read_all(&store, &keys),
+            Err(Miss::Malformed(Malformed::Count)),
+            "{label}"
+        );
+    }
 }
 
 /// l4d-e8bl: a subject accumulates sets, and an ID-ordered cap of 16 can

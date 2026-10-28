@@ -182,6 +182,20 @@ fn record_ids_cover_every_field() {
         r.bindings[3].outcome = BindingOutcome::Unavailable;
         r.bindings[3].evidence = Some(Digest::from_bytes([3; 32]));
     });
+    change(|r| {
+        r.bindings[0].outcome = BindingOutcome::Ambiguous {
+            candidates: vec![identity("/w/Shapes.pas"), identity("/v/Shapes.pas")],
+            overflow: false,
+        }
+    });
+    change(|r| r.bindings[2].outcome = BindingOutcome::Unavailable);
+    change(|r| r.bindings[2].outcome = BindingOutcome::Incomplete(IncompleteReason::Unsupported));
+    change(|r| {
+        r.bindings[1].outcome = BindingOutcome::Ambiguous {
+            candidates: vec![identity("/a/X.inc"), identity("/b/X.inc")],
+            overflow: false,
+        }
+    });
     for changed in changes {
         assert_ne!(changed.id().unwrap(), base, "{changed:?}");
     }
@@ -345,4 +359,102 @@ fn malformed_encodings_are_refused() {
         decode_member_header(&no_artifact.header.encoded()).is_err(),
         "member evidence requires an artifact"
     );
+}
+
+fn ambiguous(count: usize, overflow: bool) -> Binding {
+    Binding {
+        kind: BindingKind::Include,
+        occurrence: 0,
+        outcome: BindingOutcome::Ambiguous {
+            candidates: (0..count)
+                .map(|index| identity(&format!("/{index}/X.inc")))
+                .collect(),
+            overflow,
+        },
+        evidence: Some(Digest::from_bytes([3; 32])),
+    }
+}
+
+/// `bytes` with the byte at `at` (which must be `was`) replaced by `now`.
+fn with_byte(mut bytes: Vec<u8>, at: usize, was: u8, now: u8) -> Vec<u8> {
+    assert_eq!(bytes[at], was, "the byte being forged");
+    bytes[at] = now;
+    bytes
+}
+
+#[cfg(unix)]
+#[test]
+fn decoders_refuse_every_malformed_part() {
+    let full = ambiguous(MAX_AMBIGUOUS_CANDIDATES, true);
+    assert_eq!(
+        decode_binding(&full.encoded()),
+        Ok(full),
+        "a full candidate list with overflow round-trips"
+    );
+    for (label, binding) in [
+        ("no candidate", ambiguous(0, false)),
+        ("one candidate", ambiguous(1, false)),
+        (
+            "17 candidates",
+            ambiguous(MAX_AMBIGUOUS_CANDIDATES + 1, false),
+        ),
+        ("overflow below 16", ambiguous(3, true)),
+    ] {
+        assert!(decode_binding(&binding.encoded()).is_err(), "{label}");
+    }
+    // [1,0,kind] [2,0,occurrence×8] [3,0,outcome,reason] [4,0,evidence?]
+    let incomplete = Binding {
+        kind: BindingKind::Import,
+        occurrence: 0,
+        outcome: BindingOutcome::Incomplete(IncompleteReason::Unsupported),
+        evidence: Some(Digest::from_bytes([3; 32])),
+    };
+    let encoded = incomplete.encoded();
+    assert_eq!(
+        decode_binding(&encoded),
+        Ok(incomplete),
+        "an incomplete binding may carry evidence"
+    );
+    assert!(
+        decode_binding(&with_byte(encoded.clone(), 16, 1, 9)).is_err(),
+        "unknown reason"
+    );
+    assert!(
+        decode_binding(&with_byte(encoded, 0, 1, 2)).is_err(),
+        "wrong field tag"
+    );
+    let coverage = SnapshotCoverage {
+        discovery: CoverageStatus::Incomplete(IncompleteReason::Unsupported),
+        membership: CoverageStatus::Complete,
+    }
+    .encoded();
+    assert!(
+        decode_snapshot_coverage(&with_byte(coverage, 3, 1, 0)).is_err(),
+        "unknown coverage reason"
+    );
+    // The pinned header of `member_header_encoding_is_pinned`.
+    let header = MemberHeader {
+        source: identity("/a"),
+        artifact: None,
+        member_evidence: None,
+        origin: SourceOrigin::Library,
+        fallback_unit_name: None,
+        coverage: MemberCoverage {
+            extraction: CoverageStatus::Complete,
+            resolution: CoverageStatus::Complete,
+        },
+    };
+    let encoded = header.encoded();
+    assert_eq!(decode_member_header(&encoded), Ok(header));
+    assert!(
+        decode_member_header(&with_byte(encoded.clone(), 42, 2, 9)).is_err(),
+        "unknown origin"
+    );
+    assert!(
+        decode_member_header(&with_byte(encoded.clone(), 0, 1, 2)).is_err(),
+        "wrong field tag"
+    );
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(decode_member_header(&trailing).is_err(), "trailing byte");
 }

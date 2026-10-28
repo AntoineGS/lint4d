@@ -859,6 +859,18 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("CHECK"), "{purpose}: {error}");
         }
+        for (purpose, artifact) in [(1, "zeroblob(32)"), (2, "NULL"), (3, "NULL")] {
+            let id = format!("x'{}{purpose:02x}'", "00".repeat(31));
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO evidence_sets VALUES (zeroblob(32), 0, {id}, {purpose}, \
+                         zeroblob(32), zeroblob(32), {artifact}, 1, 0, 0, 1)"
+                    ),
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("{purpose}: {error}"));
+        }
     }
 
     #[test]

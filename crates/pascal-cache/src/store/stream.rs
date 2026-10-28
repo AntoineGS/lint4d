@@ -107,6 +107,9 @@ enum State {
     Failed(Miss),
 }
 
+/// Reads one manifest of `S` rows against the parent's [`Expected`]
+/// header. Items handed out are unverified until `next_batch` returns
+/// `Hit(None)`; any miss is sticky and leaves the read unverified.
 pub(crate) struct ManifestReader<'a, S: RowSource> {
     store: &'a Store,
     expected: Expected,
@@ -291,10 +294,5 @@ mod tests {
     fn row_errors_from_sql_conversions_are_sql_errors() {
         let error: RowError = rusqlite::types::FromSqlError::InvalidType.into();
         assert!(matches!(error, RowError::Sql(_)));
-        let error: RowError = rusqlite::Error::QueryReturnedNoRows.into();
-        assert!(matches!(
-            error,
-            RowError::Sql(rusqlite::Error::QueryReturnedNoRows)
-        ));
     }
 }

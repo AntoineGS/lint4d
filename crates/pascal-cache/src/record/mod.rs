@@ -142,7 +142,8 @@ pub struct Binding {
     /// The occurrence ID in the member's artifact.
     pub occurrence: u64,
     pub outcome: BindingOutcome,
-    /// Required unless the outcome is `Incomplete`.
+    /// Required unless the outcome is `Incomplete`, which may still carry
+    /// the evidence of the lookup that ended incomplete.
     pub evidence: Option<Digest>,
 }
 
@@ -295,6 +296,8 @@ impl Binding {
         encoded(self)
     }
 
+    /// The stored order: by kind tag value (`Import` = 1 before
+    /// `Include` = 2), then occurrence. Part of the record ID.
     pub(crate) fn order_key(&self) -> (u8, u64) {
         (self.kind.tag(), self.occurrence)
     }

@@ -37,6 +37,11 @@ fn lookup_keys_distinguish_every_field() {
     ] {
         assert_ne!(other.digest(), base.digest(), "{other:?}");
     }
+    assert_ne!(
+        lookup(LookupKind::Unit, "sysutils", None, Some("/w")),
+        lookup(LookupKind::Unit, "sysutils", None, Some("/x")),
+        "the importer directory's value, not only its presence"
+    );
 }
 
 #[test]
@@ -87,6 +92,19 @@ fn discovery_scopes_keep_directory_order_and_treat_exclusions_as_a_set() {
         scope(&[a, b], &["*.BAK", "tmp"]),
         "patterns are exact"
     );
+    // Each list is counted, so an entry never moves between them.
+    let lists = [
+        scope(&[], &[]),
+        scope(&[a], &[]),
+        scope(&[], &["/a"]),
+        scope(&[a, b], &[]),
+        scope(&[], &["*.bak", "tmp"]),
+    ];
+    for (index, left) in lists.iter().enumerate() {
+        for right in &lists[index + 1..] {
+            assert_ne!(left, right);
+        }
+    }
 }
 
 #[cfg(unix)]

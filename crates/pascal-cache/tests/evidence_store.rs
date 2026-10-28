@@ -327,3 +327,67 @@ fn an_artifact_opened_by_id_is_checked_against_its_stored_manifest() {
         Lookup::Miss(Miss::KeyMismatch(Mismatch::DigestDiffers))
     );
 }
+
+#[test]
+fn evidence_retired_or_deleted_between_batches_is_a_miss() {
+    for (label, change, miss) in [
+        (
+            "retired",
+            "UPDATE evidence_sets SET lifecycle = 2",
+            Miss::Retired,
+        ),
+        (
+            "deleted",
+            "DELETE FROM observations; DELETE FROM evidence_sets",
+            Miss::Vanished,
+        ),
+    ] {
+        let directory = private_tempdir();
+        let store = store(directory.path());
+        let keys = keys("unit A;");
+        // More than one batch of observations.
+        let many: Vec<Observation> = (0..300)
+            .map(|index| Observation::Presence {
+                path: PathBuf::from(format!("/w/{index}.inc")),
+                entry: None,
+                present: false,
+            })
+            .collect();
+        publish(&store, &keys, &many).unwrap();
+        let Lookup::Hit(headers) = store.find_evidence(&keys.context, &keys.root).unwrap() else {
+            panic!("published")
+        };
+        let mut reader = store.read_evidence(&headers[0]);
+        let Lookup::Hit(Some(first)) = reader.next_batch().unwrap() else {
+            panic!("{label}: first batch")
+        };
+        assert_eq!(first.observations().len(), 256);
+        raw(directory.path()).execute_batch(change).unwrap();
+        assert_eq!(reader.next_batch().unwrap(), Lookup::Miss(miss), "{label}");
+        assert!(!reader.is_verified());
+        assert_eq!(
+            reader.next_batch().unwrap(),
+            Lookup::Miss(miss),
+            "{label}: sticky"
+        );
+    }
+}
+
+#[test]
+fn a_row_past_the_declared_count_is_a_count_miss_even_when_malformed() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    publish(&store, &keys, &observations()).unwrap();
+    raw(directory.path())
+        .execute(
+            "INSERT INTO observations SELECT namespace_id, reset_epoch, evidence_id, 3, \
+             3, X'00', X'00' FROM observations WHERE ordinal = 0",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        read_all(&store, &keys),
+        Err(Miss::Malformed(Malformed::Count))
+    );
+}

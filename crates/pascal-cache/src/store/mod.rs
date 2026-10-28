@@ -15,6 +15,7 @@ mod outcome;
 mod pool;
 mod reader;
 mod sqlite;
+mod stream;
 #[cfg(feature = "test-support")]
 mod testing;
 

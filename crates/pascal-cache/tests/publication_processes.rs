@@ -383,8 +383,9 @@ fn ac4_duplicate_publishers_in_two_processes_converge_and_keep_history() {
     let root = private_tempdir();
     let directory = root.path();
     drop(open(directory));
-    let first = run(child("build", directory, "New"));
+    let paused = Paused::spawn(child("build", directory, "New"), "begun");
     let second = run(child("build", directory, "New"));
+    let first = paused.resume();
     assert_ne!(
         first, second,
         "each seal takes its own publication sequence"
@@ -395,6 +396,7 @@ fn ac4_duplicate_publishers_in_two_processes_converge_and_keep_history() {
     for header in &sealed {
         let members = read_members(&store, header).unwrap();
         assert_eq!(members[0].record_id, expected_record("New"));
+        assert_eq!(targets_of(&store, header), [PathBuf::from(target("New"))]);
     }
     let connection = raw(directory);
     let count = |table: &str| -> i64 {

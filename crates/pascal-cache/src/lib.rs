@@ -10,6 +10,7 @@ mod digest;
 mod encoding;
 mod evidence;
 mod facts;
+mod lookup_key;
 mod member_key;
 mod path;
 mod project;
@@ -31,6 +32,9 @@ pub use evidence::{
 pub use facts::{
     DECLARATION_ROW, EncodedFacts, EncodedRow, FactDecodeError, FactDecoder, IMPORT_ROW,
     INCLUDE_ROW, POSTING_ROW, SEGMENT_ROW, encode_facts, encoded_content_bytes,
+};
+pub use lookup_key::{
+    DiscoveryInputs, DiscoveryScope, LookupInputs, LookupKey, LookupKind, ScannedDirectory,
 };
 pub use member_key::{ArtifactRef, MemberInputs, MemberKey};
 pub use source::{SourceContent, SourceIdentity};

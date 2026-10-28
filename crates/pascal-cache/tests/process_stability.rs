@@ -1,7 +1,8 @@
 use pascal_cache::{
-    ArtifactRef, ContextKey, Digest, ExpandedArtifactKey, IncludeOccurrence, IncludeOutcome,
-    LocalArtifactKey, MANIFEST_DIGEST_CONTEXT, MemberInputs, MemberKey, Namespace,
-    SOURCE_DIGEST_CONTEXT, SourceContent, SourceIdentity,
+    ArtifactRef, ContextKey, Digest, DiscoveryInputs, DiscoveryScope, ExpandedArtifactKey,
+    IncludeOccurrence, IncludeOutcome, LocalArtifactKey, LookupInputs, LookupKey, LookupKind,
+    MANIFEST_DIGEST_CONTEXT, MemberInputs, MemberKey, Namespace, SOURCE_DIGEST_CONTEXT,
+    ScannedDirectory, SourceContent, SourceIdentity,
 };
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
@@ -135,6 +136,25 @@ fn vectors(fixture: &Path) -> Vec<(String, String)> {
         fallback_unit_name: Some("Vector"),
         artifact: Some(ArtifactRef::Expanded(&expanded)),
     });
+    let lookup = LookupKey::new(&LookupInputs {
+        kind: LookupKind::Unit,
+        normalized_name: "vector",
+        path_expression: Some("Vector.pas"),
+        importer_directory: Some(Path::new("/w")),
+    });
+    let discovery = DiscoveryScope::new(&DiscoveryInputs {
+        directories: &[
+            ScannedDirectory {
+                path: Path::new("/w"),
+                recursive: true,
+            },
+            ScannedDirectory {
+                path: Path::new("/lib"),
+                recursive: false,
+            },
+        ],
+        exclusions: &["__history", "*.bak"],
+    });
     [
         (
             "namespace",
@@ -146,6 +166,8 @@ fn vectors(fixture: &Path) -> Vec<(String, String)> {
         ("local", local.digest()),
         ("expanded", expanded.digest()),
         ("member", member.digest()),
+        ("lookup", lookup.digest()),
+        ("discovery", discovery.digest()),
     ]
     .into_iter()
     .map(|(name, digest)| (name.to_string(), digest.to_hex()))
@@ -195,7 +217,7 @@ fn vectors_are_identical_in_a_separate_process() {
             (name.to_string(), hex.to_string())
         })
         .collect::<Vec<_>>();
-    assert_eq!(child.len(), 7);
+    assert_eq!(child.len(), 9);
     assert_eq!(child, vectors(fixture.path()));
 }
 

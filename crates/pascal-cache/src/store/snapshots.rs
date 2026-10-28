@@ -18,7 +18,7 @@ use super::reader::ScratchLease;
 use super::records::{LIVE, require_evidence};
 use super::sequence::{Candidates, newest_first, next_publication_seq};
 use super::sqlite::{begin, classify};
-use super::stream::{Expected, ManifestReader, RowError, RowSource};
+use super::stream::{Expected, ManifestReader, RowError, RowSource, ineligible};
 use crate::manifest::manifest_encoder;
 use crate::{
     ContextKey, Digest, EvidencePurpose, KeyKind, MANIFEST_DIGEST_CONTEXT, MemberError,
@@ -706,6 +706,21 @@ impl Store {
             )),
         ))
     }
+}
+
+/// Why `snapshot` can no longer be read in `transaction` (no longer sealed,
+/// or gone); `None` while it is sealed. The queries run the reader's check.
+pub(crate) fn snapshot_ineligible(
+    transaction: &Connection,
+    scope: Scope,
+    snapshot: SnapshotId,
+) -> Result<Option<Miss>, Bypass> {
+    ineligible::<MemberSource>(
+        transaction,
+        scope.namespace.as_bytes(),
+        scope,
+        snapshot.as_bytes(),
+    )
 }
 
 /// The rows of one snapshot: members whose record is still live, folded

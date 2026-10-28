@@ -79,7 +79,7 @@ pub(crate) struct Batch<T> {
 
 /// Why the parent can no longer be read, by `S::PARENT_SQL` in the
 /// caller's transaction; `None` while it is readable.
-fn ineligible<S: RowSource>(
+pub(crate) fn ineligible<S: RowSource>(
     transaction: &Connection,
     namespace: &[u8],
     scope: Scope,

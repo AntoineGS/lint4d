@@ -265,11 +265,12 @@ fn ac1_an_old_publisher_sealing_after_a_new_one_never_replaces_or_mixes_bindings
                 "{pause}: no mixed bindings"
             );
             assert!(
-                store
-                    .find_importers(header, Path::new(&target(theirs)), None, 10)
-                    .unwrap()
-                    .hits
-                    .is_empty(),
+                matches!(
+                    store
+                        .find_importers(header, Path::new(&target(theirs)), None, 10)
+                        .unwrap(),
+                    Lookup::Hit(page) if page.hits.is_empty()
+                ),
                 "{pause}: one snapshot's importers never include the other's"
             );
         }

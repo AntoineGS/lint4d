@@ -22,9 +22,12 @@ fn all_importers(
     let mut hits = Vec::new();
     let mut after = None;
     loop {
-        let page = store
+        let Lookup::Hit(page) = store
             .find_importers(header, Path::new(target), after, limit)
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("a sealed snapshot answers")
+        };
         assert!(page.hits.len() <= limit);
         hits.extend_from_slice(&page.hits);
         match page.next {
@@ -135,10 +138,7 @@ fn binding_targets_resolve_by_canonical_path_not_spelling() {
         .unwrap()
         .record_id;
     let header = sealed(&store, &[target, importer_id, other_case]);
-    let hits = store
-        .find_importers(&header, &spelled.canonical, None, 10)
-        .unwrap()
-        .hits;
+    let hits = all_importers(&store, &header, "/w/B0.pas", 10);
     assert_eq!(
         hits.iter().map(|hit| hit.record_id).collect::<Vec<_>>(),
         [importer_id]
@@ -160,7 +160,7 @@ fn binding_targets_resolve_by_canonical_path_not_spelling() {
 }
 
 #[test]
-fn queries_on_a_retired_snapshot_find_nothing() {
+fn queries_on_a_retired_or_vanished_snapshot_are_a_miss() {
     let directory = private_tempdir();
     let store = open(directory.path());
     let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
@@ -170,19 +170,155 @@ fn queries_on_a_retired_snapshot_find_nothing() {
         .unwrap()
         .record_id;
     let header = sealed(&store, &[target, importer]);
+    let gone = sealed(&store, &[target, importer]);
     assert!(store.retire_snapshot(header.id()).unwrap());
     assert_eq!(
         store
             .find_member(&header, Path::new("/w/Target0.pas"))
             .unwrap(),
-        Lookup::Miss(Miss::Absent)
+        Lookup::Miss(Miss::Retired)
     );
-    assert!(
+    assert_eq!(
         store
             .find_importers(&header, Path::new("/w/Target0.pas"), None, 10)
-            .unwrap()
-            .hits
-            .is_empty()
+            .unwrap(),
+        Lookup::Miss(Miss::Retired),
+        "never an empty last page"
+    );
+    let connection = raw(directory.path());
+    connection
+        .execute(
+            "DELETE FROM snapshot_members WHERE snapshot_id = ?1",
+            [gone.id().as_bytes().as_slice()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM snapshots WHERE snapshot_id = ?1",
+            [gone.id().as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .find_member(&gone, Path::new("/w/Target0.pas"))
+            .unwrap(),
+        Lookup::Miss(Miss::Vanished)
+    );
+    assert_eq!(
+        store
+            .find_importers(&gone, Path::new("/w/Target0.pas"), None, 10)
+            .unwrap(),
+        Lookup::Miss(Miss::Vanished)
+    );
+}
+
+#[test]
+fn a_snapshot_retired_between_importer_pages_is_a_miss_not_a_last_page() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
+    let target = records(&store, "Target", 1)[0];
+    let importers: Vec<_> = (0..4)
+        .map(|index| {
+            store
+                .publish_member_record(&member(
+                    &format!("/w/I{index}.pas"),
+                    &["/w/Target0.pas"],
+                    evidence,
+                ))
+                .unwrap()
+                .record_id
+        })
+        .collect();
+    let mut members = vec![target];
+    members.extend(&importers);
+    let header = sealed(&store, &members);
+    let Lookup::Hit(first) = store
+        .find_importers(&header, Path::new("/w/Target0.pas"), None, 2)
+        .unwrap()
+    else {
+        panic!("the snapshot is sealed")
+    };
+    assert_eq!(first.hits.len(), 2);
+    assert!(first.next.is_some());
+    assert!(store.retire_snapshot(header.id()).unwrap());
+    assert_eq!(
+        store
+            .find_importers(&header, Path::new("/w/Target0.pas"), first.next, 2)
+            .unwrap(),
+        Lookup::Miss(Miss::Retired)
+    );
+}
+
+#[test]
+fn several_bindings_of_one_record_split_across_pages_without_gaps_or_repeats() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
+    let target = records(&store, "Target", 1)[0];
+    let targets = ["/w/Target0.pas"; 5];
+    let importers: Vec<_> = ["/w/A.pas", "/w/B.pas"]
+        .iter()
+        .map(|path| {
+            store
+                .publish_member_record(&member(path, &targets, evidence))
+                .unwrap()
+                .record_id
+        })
+        .collect();
+    let header = sealed(&store, &[target, importers[0], importers[1]]);
+    let mut expected: Vec<_> = importers
+        .iter()
+        .flat_map(|record| (0..5).map(move |ordinal| (*record, ordinal)))
+        .collect();
+    expected.sort();
+    for limit in [1, 2, 3, 4, 7] {
+        let hits = all_importers(&store, &header, "/w/Target0.pas", limit);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.record_id, hit.binding_ordinal))
+                .collect::<Vec<_>>(),
+            expected,
+            "limit {limit}"
+        );
+    }
+}
+
+#[test]
+fn a_forged_cursor_past_every_ordinal_never_wraps() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
+    let target = records(&store, "Target", 1)[0];
+    let importers: Vec<_> = ["/w/A.pas", "/w/B.pas"]
+        .iter()
+        .map(|path| {
+            store
+                .publish_member_record(&member(path, &["/w/Target0.pas"], evidence))
+                .unwrap()
+                .record_id
+        })
+        .collect();
+    let header = sealed(&store, &[target, importers[0], importers[1]]);
+    let first = importers.iter().min().copied().unwrap();
+    let forged = ImporterHit {
+        record_id: first,
+        binding_ordinal: u64::MAX,
+        member_ordinal: 0,
+    };
+    let Lookup::Hit(page) = store
+        .find_importers(&header, Path::new("/w/Target0.pas"), Some(forged), 10)
+        .unwrap()
+    else {
+        panic!("the snapshot is sealed")
+    };
+    assert_eq!(
+        page.hits
+            .iter()
+            .map(|hit| hit.record_id)
+            .collect::<Vec<_>>(),
+        [importers.iter().max().copied().unwrap()],
+        "nothing of the cursor's record repeats"
     );
 }
 
@@ -259,9 +395,14 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
     sealed(&store, &ids);
     let importers = plan(directory.path(), pascal_cache::IMPORTERS_QUERY_FOR_TEST, 8);
     assert!(
-        importers.contains("member_bindings_by_target"),
-        "{importers}"
+        importers
+            .lines()
+            .next()
+            .is_some_and(|step| step.starts_with("SEARCH b ")
+                && step.contains("INDEX member_bindings_by_target ")),
+        "member_bindings drives through its target index: {importers}"
     );
+    assert!(!importers.contains("SCAN"), "{importers}");
     assert!(!importers.contains("TEMP B-TREE"), "{importers}");
     let member = plan(directory.path(), pascal_cache::MEMBER_QUERY_FOR_TEST, 5);
     assert!(!member.contains("SCAN"), "{member}");

@@ -11,7 +11,9 @@ use crate::workspace::DiskStamp;
 use crate::workspace::rename::OverlayInput;
 use crate::workspace::resolver::{deletion_applies, path_equivalent};
 use lsp_types::Url;
-use pascal_cache::{Observation, SourceContent, listing_digest};
+use pascal_cache::{
+    Bypass, EvidenceHeader, Lookup, Miss, Observation, SourceContent, Store, listing_digest,
+};
 use pascal_core::resolver::{
     DirectoryRequest, FilesystemSourceStore, SourceStore, SourceStoreError,
 };
@@ -302,6 +304,53 @@ impl<'a> Validator<'a> {
             stale(Stale::Listing)
         }
     }
+}
+
+/// What validating one stored evidence set concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EvidenceCheck {
+    /// Every observation held and the set read back verified.
+    Holds,
+    Stale(Stale),
+    /// Not decided; never a hit.
+    Unproven(Unproven),
+    /// The set could not be read back verified; another candidate may be.
+    Store(Miss),
+}
+
+/// Validate one evidence set of any purpose (artifact, binding or
+/// discovery; spec §6.1 amendment 2026-10-27) against current inputs. It
+/// holds only once every observation held and the reader verified the set:
+/// a committed record is history, and only this check makes it current
+/// for this session (spec §7, §9).
+pub(crate) fn validate_evidence(
+    store: &Store,
+    header: &EvidenceHeader,
+    validator: &mut Validator<'_>,
+) -> Result<EvidenceCheck, Bypass> {
+    let mut reader = store.read_evidence(header);
+    loop {
+        match reader.next_batch()? {
+            Lookup::Hit(Some(batch)) => {
+                for observation in batch.observations() {
+                    match validator.check(observation) {
+                        Check::Holds => {}
+                        Check::Stale(stale) => return Ok(EvidenceCheck::Stale(stale)),
+                        Check::Unproven(unproven) => {
+                            return Ok(EvidenceCheck::Unproven(unproven));
+                        }
+                    }
+                }
+            }
+            // Every observation held and the evidence verified.
+            Lookup::Hit(None) => break,
+            Lookup::Miss(miss) => return Ok(EvidenceCheck::Store(miss)),
+        }
+    }
+    if validator.cancel.load(Ordering::Relaxed) {
+        return Ok(EvidenceCheck::Unproven(Unproven::Cancelled));
+    }
+    Ok(EvidenceCheck::Holds)
 }
 
 #[cfg(test)]
@@ -730,6 +779,180 @@ mod tests {
         assert_eq!(
             validator.check(&fixture.payload()),
             Check::Unproven(Unproven::Budget)
+        );
+    }
+
+    /// AC3 (l4d-zf1b.6): a committed snapshot is history. The store keeps
+    /// returning it, verified, after its provider was renamed, while its
+    /// binding and discovery evidence no longer hold for this session.
+    #[cfg(unix)]
+    #[test]
+    fn ac3_a_sealed_snapshot_s_binding_evidence_goes_stale_after_a_provider_rename() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        use pascal_cache::{
+            Binding, BindingKind, BindingOutcome, ContextKey as CacheContextKey, CoverageStatus,
+            DiscoveryInputs, DiscoveryScope, EvidenceTarget, EvidenceWrite, Lookup, LookupInputs,
+            LookupKey, LookupKind, MemberCoverage, MemberHeader, MemberRecord, ScannedDirectory,
+            SnapshotCoverage, SnapshotSeal, SourceIdentity,
+        };
+        use pascal_project::{ProjectContext, SourceOrigin};
+
+        let fixture = fixture();
+        let include = fixture.root.join("include");
+        let shapes = include.join("Shapes.pas");
+        std::fs::write(&shapes, b"unit Shapes; interface implementation end.").unwrap();
+        pascal_project::backdate_tree_for_test(&fixture.root);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let context = CacheContextKey::new(&ProjectContext::default());
+        let identity = |path: &Path| SourceIdentity {
+            canonical: path.to_path_buf(),
+            logical: path.to_path_buf(),
+            spelling: None,
+            uri: None,
+        };
+        // The lookup of unit `shapes` found Shapes.pas and read it.
+        let lookup = LookupKey::new(&LookupInputs {
+            kind: LookupKind::Unit,
+            normalized_name: "shapes",
+            path_expression: None,
+            importer_directory: None,
+        });
+        let binding_observations = [
+            Observation::Presence {
+                path: shapes.clone(),
+                entry: Some(ProjectPathEntry::configured(shapes.clone())),
+                present: true,
+            },
+            Observation::Payload {
+                path: shapes.clone(),
+                entry: ProjectPathEntry::configured(shapes.clone()),
+                content: SourceContent::from_bytes(&std::fs::read(&shapes).unwrap()),
+            },
+        ];
+        let binding = store
+            .publish_evidence(
+                EvidenceTarget::Binding(&lookup),
+                &EvidenceWrite {
+                    context: &context,
+                    observations: &binding_observations,
+                },
+            )
+            .unwrap()
+            .evidence_id;
+        // The membership scan listed the include directory.
+        let scope = DiscoveryScope::new(&DiscoveryInputs {
+            directories: &[ScannedDirectory {
+                path: &include,
+                recursive: false,
+            }],
+            exclusions: &[],
+        });
+        let listing = fixture.listing();
+        let discovery = store
+            .publish_evidence(
+                EvidenceTarget::Discovery(&scope),
+                &EvidenceWrite {
+                    context: &context,
+                    observations: std::slice::from_ref(&listing),
+                },
+            )
+            .unwrap()
+            .evidence_id;
+        let complete = CoverageStatus::Complete;
+        let record = MemberRecord {
+            header: MemberHeader {
+                source: identity(&fixture.root.join("Main.pas")),
+                artifact: None,
+                member_evidence: None,
+                origin: SourceOrigin::ProjectCompiled,
+                fallback_unit_name: None,
+                coverage: MemberCoverage {
+                    extraction: complete,
+                    resolution: complete,
+                },
+            },
+            bindings: vec![Binding {
+                kind: BindingKind::Import,
+                occurrence: 0,
+                outcome: BindingOutcome::Precise {
+                    target: identity(&shapes),
+                },
+                evidence: Some(binding),
+            }],
+        };
+        let record_id = store.publish_member_record(&record).unwrap().record_id;
+        let mut builder = store.begin_snapshot(&context).unwrap();
+        store.add_members(&mut builder, &[record_id]).unwrap();
+        let sealed = store
+            .seal_snapshot(
+                builder,
+                &SnapshotSeal {
+                    discovery: Some(discovery),
+                    coverage: SnapshotCoverage {
+                        discovery: complete,
+                        membership: complete,
+                    },
+                },
+            )
+            .unwrap();
+        let check = || {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let budget = ReconciliationBudget::new(Arc::clone(&cancel));
+            let mut validator = Validator::new(
+                CurrentInputs {
+                    read_policy: &fixture.policy,
+                    overlays: &fixture.overlays,
+                    deleted: &fixture.deleted,
+                    cache: &fixture.cache,
+                    max_file_bytes: 1 << 20,
+                    directory_entries: 1024,
+                },
+                &budget,
+                &cancel,
+            );
+            let mut validate = |id| {
+                let Lookup::Hit(header) = store.open_evidence(id).unwrap() else {
+                    panic!("the snapshot's evidence is stored")
+                };
+                validate_evidence(&store, &header, &mut validator).unwrap()
+            };
+            (validate(binding), validate(discovery))
+        };
+        assert_eq!(check(), (EvidenceCheck::Holds, EvidenceCheck::Holds));
+
+        std::fs::rename(&shapes, include.join("Shapes2.pas")).unwrap();
+
+        // The store still returns the snapshot and its record, verified.
+        let Lookup::Hit(headers) = store.find_snapshots(&context).unwrap() else {
+            panic!("the sealed snapshot is history")
+        };
+        assert_eq!(headers, vec![sealed.clone()]);
+        let mut members = store.read_snapshot(&sealed);
+        let Lookup::Hit(Some(batch)) = members.next_batch().unwrap() else {
+            panic!("one member")
+        };
+        assert_eq!(batch.members()[0].record_id, record_id);
+        assert!(matches!(members.next_batch().unwrap(), Lookup::Hit(None)));
+        assert!(members.is_verified());
+        let Lookup::Hit(record_header) = store.open_member_record(record_id).unwrap() else {
+            panic!("the record is stored")
+        };
+        let mut bindings = store.read_member_record(&record_header);
+        let Lookup::Hit(Some(batch)) = bindings.next_batch().unwrap() else {
+            panic!("one binding")
+        };
+        assert_eq!(batch.bindings()[0].evidence, Some(binding));
+        assert!(matches!(bindings.next_batch().unwrap(), Lookup::Hit(None)));
+        assert!(bindings.is_verified());
+
+        // This session's inputs no longer prove it.
+        assert_eq!(
+            check(),
+            (
+                EvidenceCheck::Stale(Stale::Presence(shapes.clone())),
+                EvidenceCheck::Stale(Stale::Listing(include.clone())),
+            )
         );
     }
 }

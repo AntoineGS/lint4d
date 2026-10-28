@@ -15,6 +15,7 @@ use pascal_cache::{
     Digest, EvidencePurpose, EvidenceSubject, EvidenceTarget, FaultPoint, Lookup, Observation,
     SnapshotHeader, Store, evidence_id,
 };
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -205,8 +206,19 @@ impl Paused {
     fn resume(mut self) -> String {
         writeln!(self.stdin, "go").unwrap();
         let result = expect_line(&mut self.stdout, "result ");
-        assert!(self.child.wait().unwrap().success());
+        let status = self.child.wait().unwrap();
+        assert!(status.success(), "the resumed child failed: {status:?}");
         result
+    }
+}
+
+impl Drop for Paused {
+    /// A test that fails while a child waits must not leave it running.
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -346,8 +358,15 @@ fn ac2_death_at_each_publication_boundary_leaves_a_complete_record_or_a_clean_mi
         (FaultPoint::SealCommitted, expected(true, true, 1, 1, 1)),
     ];
     assert_eq!(
-        cases.len() + 1,
-        FaultPoint::ALL.len(),
+        cases
+            .iter()
+            .map(|(point, _)| point.name())
+            .chain([FaultPoint::RetireBeforeCommit.name()])
+            .collect::<BTreeSet<_>>(),
+        FaultPoint::ALL
+            .iter()
+            .map(|point| point.name())
+            .collect::<BTreeSet<_>>(),
         "every point but RetireBeforeCommit is on the build path"
     );
     for (point, seen) in cases {

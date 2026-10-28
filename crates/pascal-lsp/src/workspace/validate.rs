@@ -782,6 +782,106 @@ mod tests {
         );
     }
 
+    /// Publish a binding evidence set of `observations` and open it.
+    #[cfg(unix)]
+    fn stored_evidence(
+        store: &Store,
+        observations: &[Observation],
+    ) -> pascal_cache::EvidenceHeader {
+        use pascal_cache::{
+            ContextKey as CacheContextKey, EvidenceTarget, EvidenceWrite, LookupInputs, LookupKey,
+            LookupKind,
+        };
+        use pascal_project::ProjectContext;
+        let lookup = LookupKey::new(&LookupInputs {
+            kind: LookupKind::Unit,
+            normalized_name: "shapes",
+            path_expression: None,
+            importer_directory: None,
+        });
+        let id = store
+            .publish_evidence(
+                EvidenceTarget::Binding(&lookup),
+                &EvidenceWrite {
+                    context: &CacheContextKey::new(&ProjectContext::default()),
+                    observations,
+                },
+            )
+            .unwrap()
+            .evidence_id;
+        let Lookup::Hit(header) = store.open_evidence(id).unwrap() else {
+            panic!("published")
+        };
+        header
+    }
+
+    /// Validate `header` read through `store`, cancelled or not.
+    #[cfg(unix)]
+    fn validate_with(
+        fixture: &Fixture,
+        store: &Store,
+        header: &pascal_cache::EvidenceHeader,
+        cancelled: bool,
+    ) -> EvidenceCheck {
+        let cancel = Arc::new(AtomicBool::new(cancelled));
+        let budget = ReconciliationBudget::new(Arc::clone(&cancel));
+        let mut validator = Validator::new(
+            CurrentInputs {
+                read_policy: &fixture.policy,
+                overlays: &fixture.overlays,
+                deleted: &fixture.deleted,
+                cache: &fixture.cache,
+                max_file_bytes: 1 << 20,
+                directory_entries: 1024,
+            },
+            &budget,
+            &cancel,
+        );
+        validate_evidence(store, header, &mut validator).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_verified_set_is_unproven_when_cancelled_after_its_last_batch() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        let fixture = fixture();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        // No observation to check: only the final check sees the cancel.
+        let header = stored_evidence(&store, &[]);
+        assert_eq!(
+            validate_with(&fixture, &store, &header, false),
+            EvidenceCheck::Holds
+        );
+        assert_eq!(
+            validate_with(&fixture, &store, &header, true),
+            EvidenceCheck::Unproven(Unproven::Cancelled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_set_that_cannot_be_read_back_is_a_store_miss() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        let fixture = fixture();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let header = stored_evidence(&store, &[fixture.payload()]);
+        assert_eq!(
+            validate_with(&fixture, &store, &header, false),
+            EvidenceCheck::Holds
+        );
+        // The same scope in a store where the set no longer exists, as
+        // after a collection between lookup and read.
+        let elsewhere = private_dir();
+        let collected = open_store(elsewhere.path());
+        assert_eq!(collected.scope(), store.scope());
+        assert_eq!(
+            validate_with(&fixture, &collected, &header, false),
+            EvidenceCheck::Store(Miss::Vanished)
+        );
+    }
+
     /// AC3 (l4d-zf1b.6): a committed snapshot is history. The store keeps
     /// returning it, verified, after its provider was renamed, while its
     /// binding and discovery evidence no longer hold for this session.

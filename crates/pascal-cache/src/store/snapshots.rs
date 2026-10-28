@@ -11,11 +11,11 @@ use super::keys::{admit_manifest, check_manifest_size, put_manifest};
 use super::limits::{
     MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS,
 };
-use super::namespaces::{Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, RETIRED as RECORD_RETIRED, Scope, ensure_live, epoch};
 use super::nonce::nonce;
 use super::outcome::{Bypass, Lookup, Malformed, Miss, SealRefusal, TooLarge};
 use super::reader::ScratchLease;
-use super::records::{LIVE, require_evidence};
+use super::records::require_evidence;
 use super::sequence::{Candidates, newest_first, next_publication_seq};
 use super::sqlite::{begin, classify};
 use super::stream::{Expected, ManifestReader, RowError, RowSource, ineligible};
@@ -26,6 +26,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+/// A snapshot's `state`.
 const BUILDING: i64 = 1;
 const SEALED: i64 = 2;
 const RETIRED: i64 = 3;
@@ -409,6 +410,12 @@ impl Store {
     /// no live snapshot or build lists, then artifacts and evidence no live
     /// record references). Retiring a referenced artifact or evidence set
     /// while its records are live breaks that contract.
+    ///
+    /// Discovery evidence must be discovery evidence of the snapshot's own
+    /// context, or the seal is refused as `DiscoveryEvidence`.
+    ///
+    /// The builder is consumed: clone it before sealing to retry after a
+    /// transient bypass, or to `retire_build` it after a refusal.
     pub fn seal_snapshot(
         &self,
         builder: SnapshotBuilder,
@@ -426,6 +433,8 @@ impl Store {
         let mut hasher: Option<SnapshotHasher> = None;
         let mut stored_count = 0u64;
         let mut count = 0u64;
+        // Each batch is bounded by rows, not bytes: its rows are hashed as
+        // they are read and never retained.
         loop {
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
@@ -521,6 +530,17 @@ impl Store {
                 }
                 bypass => bypass,
             })?;
+            let context: Vec<u8> = transaction
+                .query_row(
+                    "SELECT context_key FROM evidence_sets \
+                     WHERE namespace_id = ?1 AND reset_epoch = ?2 AND evidence_id = ?3",
+                    params![namespace, reset_epoch, discovery.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(fail)?;
+            if context != builder.context.as_bytes() {
+                return Err(Bypass::SealRefused(SealRefusal::DiscoveryEvidence));
+            }
         }
         let sequence = next_publication_seq(&transaction)?;
         let changed = transaction
@@ -551,6 +571,7 @@ impl Store {
         fault_point!(self, SealBeforeCommit);
         self.before_commit();
         transaction.commit().map_err(fail)?;
+        drop(writer);
         fault_point!(self, SealCommitted);
         Ok(SnapshotHeader {
             scope: self.scope,
@@ -629,13 +650,14 @@ impl Store {
         ensure_live(&transaction, self.scope)?;
         let changed = transaction
             .execute(
-                "UPDATE member_records SET lifecycle = 2 WHERE namespace_id = ?1 \
+                "UPDATE member_records SET lifecycle = ?5 WHERE namespace_id = ?1 \
                  AND reset_epoch = ?2 AND record_id = ?3 AND lifecycle = ?4",
                 params![
                     self.scope.namespace.as_bytes().as_slice(),
                     epoch(self.scope),
                     id.as_bytes().as_slice(),
-                    LIVE
+                    LIVE,
+                    RECORD_RETIRED
                 ],
             )
             .map_err(fail)?;

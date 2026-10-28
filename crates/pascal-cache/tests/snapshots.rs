@@ -570,3 +570,133 @@ fn a_malformed_sealed_header_is_a_miss() {
         Lookup::Miss(Miss::Malformed(Malformed::Snapshot))
     );
 }
+
+fn other_context() -> ContextKey {
+    ContextKey::new(&ProjectContext::from_parts(ProjectContextParts {
+        include_path_entries: vec![ProjectPathEntry::configured("/inc".into())],
+        ..ProjectContextParts::default()
+    }))
+}
+
+#[test]
+fn a_seal_refuses_discovery_evidence_of_another_context() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let ids = records(&store, "U", 1);
+    let scope = DiscoveryScope::new(&DiscoveryInputs {
+        directories: &[],
+        exclusions: &[],
+    });
+    let discovery = |context: &ContextKey| {
+        store
+            .publish_evidence(
+                EvidenceTarget::Discovery(&scope),
+                &EvidenceWrite {
+                    context,
+                    observations: &[],
+                },
+            )
+            .unwrap()
+            .evidence_id
+    };
+    let (foreign, own) = (discovery(&other_context()), discovery(&context()));
+    let mut builder = store.begin_snapshot(&context()).unwrap();
+    store.add_members(&mut builder, &ids).unwrap();
+    assert_eq!(
+        store.seal_snapshot(
+            builder.clone(),
+            &SnapshotSeal {
+                discovery: Some(foreign),
+                ..SEAL
+            }
+        ),
+        Err(Bypass::SealRefused(SealRefusal::DiscoveryEvidence))
+    );
+    assert!(found(&store).is_empty(), "a refused seal wrote nothing");
+    let header = store
+        .seal_snapshot(
+            builder,
+            &SnapshotSeal {
+                discovery: Some(own),
+                ..SEAL
+            },
+        )
+        .unwrap();
+    assert_eq!(header.discovery_evidence(), Some(own));
+}
+
+#[test]
+fn a_token_sharing_batch_between_the_digest_stream_and_the_seal_fences_it() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let other_process = Arc::new(open(directory.path()));
+    let ids = records(&store, "U", 2);
+    let mut builder = store.begin_snapshot(&context()).unwrap();
+    store.add_members(&mut builder, &ids[..1]).unwrap();
+    let copy = Arc::new(std::sync::Mutex::new(builder.clone()));
+    let (writer, added) = (Arc::clone(&other_process), Arc::clone(&copy));
+    let late = ids[1];
+    store.set_fault_for_test(FaultPoint::SealDigestStreamed, move || {
+        let mut copy = added.lock().unwrap();
+        writer.add_members(&mut copy, &[late]).unwrap();
+    });
+    assert_eq!(
+        store.seal_snapshot(builder, &SEAL),
+        Err(Bypass::BuilderFenced),
+        "the digest streamed one member; the seal must not cover two"
+    );
+    store.clear_fault_for_test(FaultPoint::SealDigestStreamed);
+    assert!(found(&store).is_empty());
+    let copy = copy.lock().unwrap().clone();
+    assert_eq!(copy.revision(), 2);
+    let header = store.seal_snapshot(copy, &SEAL).unwrap();
+    assert_eq!(
+        read_members(&store, &header)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.record_id)
+            .collect::<Vec<_>>(),
+        ids,
+        "the build goes on under the copy that wrote"
+    );
+}
+
+#[test]
+fn an_ordinal_gap_met_while_streaming_refuses_the_seal() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let ids = records(&store, "U", 2);
+    let mut builder = store.begin_snapshot(&context()).unwrap();
+    store.add_members(&mut builder, &ids).unwrap();
+    raw(directory.path())
+        .execute("DELETE FROM snapshot_members WHERE ordinal = 0", [])
+        .unwrap();
+    assert_eq!(
+        store.seal_snapshot(builder, &SEAL),
+        Err(Bypass::SealRefused(SealRefusal::CountMismatch))
+    );
+    assert!(found(&store).is_empty());
+}
+
+#[test]
+fn the_seal_holds_no_connection_once_committed() {
+    let directory = private_tempdir();
+    let store = Arc::new(open(directory.path()));
+    let ids = records(&store, "U", 1);
+    let builder = {
+        let mut builder = store.begin_snapshot(&context()).unwrap();
+        store.add_members(&mut builder, &ids).unwrap();
+        builder
+    };
+    let id = builder.id();
+    // The hook writes through the sealing store itself: it needs the
+    // writer the seal has released.
+    let same = Arc::downgrade(&store);
+    store.set_fault_for_test(FaultPoint::SealCommitted, move || {
+        let store = same.upgrade().unwrap();
+        assert_eq!(store.retire_snapshot(id), Ok(true));
+    });
+    let header = store.seal_snapshot(builder, &SEAL).unwrap();
+    store.clear_fault_for_test(FaultPoint::SealCommitted);
+    assert_eq!(read_members(&store, &header), Err(Miss::Retired));
+}

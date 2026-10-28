@@ -8,7 +8,7 @@ use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS,
     MAX_ROW_BATCH_BYTES,
 };
-use super::namespaces::{Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::reader::ScratchLease;
 use super::sqlite::{begin, classify, classify_read};
@@ -21,8 +21,6 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::BTreeSet;
-
-pub(crate) const LIVE: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedRecord {

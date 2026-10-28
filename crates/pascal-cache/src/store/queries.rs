@@ -7,9 +7,8 @@
 
 use super::Store;
 use super::limits::MAX_INDEX_PAGE;
-use super::namespaces::{ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
-use super::records::LIVE;
 use super::snapshots::{SnapshotHeader, SnapshotMember, snapshot_ineligible};
 use super::sqlite::{begin, classify_read};
 use crate::Digest;

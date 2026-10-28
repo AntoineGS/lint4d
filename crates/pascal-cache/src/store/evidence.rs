@@ -13,7 +13,7 @@ use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS,
     MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
 };
-use super::namespaces::{Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::reader::ScratchLease;
 use super::sequence::{Candidates, newest_first, next_publication_seq};
@@ -27,8 +27,6 @@ use crate::{
 };
 use pascal_core::facts::ArtifactFacts;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-
-const LIVE: i64 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EvidenceWrite<'a> {

@@ -84,7 +84,7 @@ pub enum SealRefusal {
     CountMismatch,
     /// A member's record was retired or removed since it was added.
     RetiredRecord,
-    /// The seal's discovery evidence is evidence of another purpose.
+    /// The seal's discovery evidence is of another purpose or context.
     DiscoveryEvidence,
 }
 

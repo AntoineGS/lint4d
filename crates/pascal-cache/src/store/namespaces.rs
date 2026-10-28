@@ -8,6 +8,8 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The `lifecycle` of every namespace, artifact, evidence set and member
+/// record: retiring one ends its read eligibility at once.
 pub(crate) const LIVE: i64 = 1;
 pub(crate) const RETIRED: i64 = 2;
 /// Namespaces examined per retirement pass; the rest wait for the next start.

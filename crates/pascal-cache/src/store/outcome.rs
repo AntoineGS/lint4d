@@ -1,4 +1,4 @@
-use crate::Mismatch;
+use crate::{MemberError, Mismatch};
 use std::io;
 
 /// Why an operation did not use the persistent store. The caller continues
@@ -37,6 +37,12 @@ pub enum Bypass {
     Retiring,
     /// Evidence proves an expansion; a local key is its own proof (spec §6.1).
     EvidenceForLocalArtifact,
+    /// The member record breaks an invariant, or references evidence of
+    /// another purpose; nothing was written.
+    InvalidRecord(MemberError),
+    /// A referenced artifact, evidence set or record is not stored in this
+    /// scope; publish it first.
+    MissingReference,
     Io(io::ErrorKind),
     Sqlite {
         extended_code: i32,
@@ -74,6 +80,8 @@ pub enum TooLarge {
     IndexKey { ordinal: usize, bytes: usize },
     Content { bytes: usize },
     Observations { count: usize },
+    Bindings { count: usize },
+    SourceKey { bytes: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,8 @@ pub enum Integrity {
     ConflictingArtifact,
     /// A stored evidence set with the same ID has different counts or subject.
     ConflictingEvidence,
+    /// A stored member record with the same ID has other content.
+    ConflictingRecord,
 }
 
 /// Why a lookup found nothing usable. A miss is never proof of absence.
@@ -109,6 +119,8 @@ pub enum Malformed {
     Facts,
     /// Observation rows that do not decode or disagree with their index columns.
     Evidence,
+    /// Member record rows or header that do not decode or disagree with their columns.
+    Member,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

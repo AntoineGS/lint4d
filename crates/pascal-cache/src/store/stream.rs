@@ -2,7 +2,8 @@
 //! bindings, a snapshot's members) in bounded batches, each in its own short
 //! read transaction, while a witness recomputes its digest (spec §6.2, §9,
 //! §10). Only a read that reached the end, found no row past the count and
-//! matched the stored digest is verified.
+//! matched the stored digest while its parent was still readable is
+//! verified.
 
 use super::Store;
 use super::limits::{MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS};
@@ -11,7 +12,7 @@ use super::outcome::{Bypass, Lookup, Malformed, Miss};
 use super::reader::ScratchLease;
 use super::sqlite::{begin, classify, classify_read};
 use crate::Digest;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// Why a row could not be taken: what it says makes the manifest unusable,
 /// or SQLite could not read it.
@@ -76,6 +77,29 @@ pub(crate) struct Batch<T> {
     pub(crate) scratch: ScratchLease,
 }
 
+/// Why the parent can no longer be read, by `S::PARENT_SQL` in the
+/// caller's transaction; `None` while it is readable.
+fn ineligible<S: RowSource>(
+    transaction: &Connection,
+    namespace: &[u8],
+    scope: Scope,
+    parent: &[u8],
+) -> Result<Option<Miss>, Bypass> {
+    let eligibility: Option<i64> = transaction
+        .query_row(
+            S::PARENT_SQL,
+            params![namespace, epoch(scope), parent],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| classify(&error))?;
+    Ok(match eligibility {
+        None => Some(Miss::Vanished),
+        Some(1) => None,
+        Some(_) => Some(Miss::Retired),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Reading,
@@ -135,6 +159,11 @@ impl<'a, S: RowSource> ManifestReader<'a, S> {
             let mut reader = store.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             ensure_live(&transaction, scope)?;
+            // A parent retired or deleted after its last batch, or one
+            // without rows, is no more verified than one lost mid-read.
+            if let Some(miss) = ineligible::<S>(&transaction, &namespace, scope, &parent)? {
+                return self.fail(miss);
+            }
             let trailing: Option<i64> = transaction
                 .query_row(
                     S::TRAILING_SQL,
@@ -166,18 +195,8 @@ impl<'a, S: RowSource> ManifestReader<'a, S> {
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, scope)?;
         // GC between batches is a miss, never a silent gap (spec §9).
-        let eligibility: Option<i64> = transaction
-            .query_row(
-                S::PARENT_SQL,
-                params![namespace, epoch(scope), parent],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| classify(&error))?;
-        match eligibility {
-            None => return self.fail(Miss::Vanished),
-            Some(1) => {}
-            Some(_) => return self.fail(Miss::Retired),
+        if let Some(miss) = ineligible::<S>(&transaction, &namespace, scope, &parent)? {
+            return self.fail(miss);
         }
         let mut statement = transaction
             .prepare_cached(S::ROWS_SQL)
@@ -248,6 +267,19 @@ impl<'a, S: RowSource> ManifestReader<'a, S> {
         self.next_ordinal = next_ordinal;
         self.read_bytes = read_bytes;
         Ok(Lookup::Hit(Some(Batch { items, scratch })))
+    }
+
+    /// [`Self::next_batch`], with a batch handed out as the caller's
+    /// public batch type.
+    pub(crate) fn next_batch_as<B>(
+        &mut self,
+        wrap: impl FnOnce(Vec<S::Item>, ScratchLease) -> B,
+    ) -> Result<Lookup<Option<B>>, Bypass> {
+        Ok(match self.next_batch()? {
+            Lookup::Hit(Some(Batch { items, scratch })) => Lookup::Hit(Some(wrap(items, scratch))),
+            Lookup::Hit(None) => Lookup::Hit(None),
+            Lookup::Miss(miss) => Lookup::Miss(miss),
+        })
     }
 }
 

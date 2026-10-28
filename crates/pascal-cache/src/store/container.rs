@@ -132,6 +132,59 @@ CREATE TABLE observations (
 
 CREATE INDEX observations_by_path
     ON observations (namespace_id, reset_epoch, path_key, evidence_id);
+
+CREATE TABLE member_records (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    record_id BLOB NOT NULL CHECK (length(record_id) = 32),
+    lifecycle INTEGER NOT NULL CHECK (lifecycle IN (1, 2)),
+    header BLOB NOT NULL CHECK (length(header) <= 1048576),
+    source_key BLOB NOT NULL CHECK (length(source_key) <= 4096),
+    artifact_id BLOB CHECK (artifact_id IS NULL OR length(artifact_id) = 32),
+    member_evidence BLOB CHECK (member_evidence IS NULL OR length(member_evidence) = 32),
+    binding_count INTEGER NOT NULL CHECK (binding_count BETWEEN 0 AND 65536),
+    content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
+    PRIMARY KEY (namespace_id, reset_epoch, record_id),
+    FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
+        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id),
+    FOREIGN KEY (namespace_id, reset_epoch, member_evidence)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK (member_evidence IS NULL OR artifact_id IS NOT NULL)
+) STRICT;
+
+CREATE INDEX member_records_by_artifact
+    ON member_records (namespace_id, reset_epoch, artifact_id)
+    WHERE artifact_id IS NOT NULL;
+
+CREATE INDEX member_records_by_evidence
+    ON member_records (namespace_id, reset_epoch, member_evidence)
+    WHERE member_evidence IS NOT NULL;
+
+CREATE TABLE member_bindings (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    record_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 1 AND 4),
+    target_key BLOB CHECK (target_key IS NULL OR length(target_key) <= 4096),
+    evidence_id BLOB CHECK (evidence_id IS NULL OR length(evidence_id) = 32),
+    payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
+    PRIMARY KEY (namespace_id, reset_epoch, record_id, ordinal),
+    FOREIGN KEY (namespace_id, reset_epoch, record_id)
+        REFERENCES member_records (namespace_id, reset_epoch, record_id),
+    FOREIGN KEY (namespace_id, reset_epoch, evidence_id)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK ((outcome = 1) = (target_key IS NOT NULL))
+) STRICT;
+
+CREATE INDEX member_bindings_by_target
+    ON member_bindings (namespace_id, reset_epoch, target_key, record_id, ordinal)
+    WHERE target_key IS NOT NULL;
+
+CREATE INDEX member_bindings_by_evidence
+    ON member_bindings (namespace_id, reset_epoch, evidence_id, record_id)
+    WHERE evidence_id IS NOT NULL;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +408,8 @@ mod tests {
                 "artifacts",
                 "evidence_sets",
                 "key_manifests",
+                "member_bindings",
+                "member_records",
                 "namespaces",
                 "observations",
                 "retired_scopes",
@@ -604,7 +659,8 @@ mod tests {
     fn schema_bounds_match_the_store_limits() {
         use crate::store::limits::{
             MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_OBSERVATIONS,
-            MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_ROW_BATCH_BYTES, MAX_SUPPLEMENTAL_BYTES,
+            MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_ROW_BATCH_BYTES,
+            MAX_SUPPLEMENTAL_BYTES,
         };
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
@@ -619,7 +675,9 @@ mod tests {
                      (zeroblob(32), 0, CAST(zeroblob(31) || x'01' AS BLOB), 4, zeroblob(9));
                  INSERT INTO evidence_sets VALUES
                      (zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
-                      zeroblob(32), zeroblob(32), 1, 0, 0, 1);",
+                      zeroblob(32), zeroblob(32), 1, 0, 0, 1);
+                 INSERT INTO member_records VALUES
+                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0);",
             )
             .unwrap();
         // Each statement takes the bound as ?1: accepted at the limit,
@@ -670,12 +728,41 @@ mod tests {
                  (zeroblob(32), 0, zeroblob(32), 0, 1, x'', zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
+            (
+                "UPDATE member_records SET header = zeroblob(?1)",
+                MAX_MANIFEST_BYTES,
+            ),
+            (
+                "UPDATE member_records SET source_key = zeroblob(?1)",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "UPDATE member_records SET binding_count = ?1",
+                MAX_MEMBER_BINDINGS,
+            ),
+            (
+                "UPDATE member_records SET content_bytes = ?1",
+                MAX_ARTIFACT_CONTENT_BYTES,
+            ),
+            (
+                "INSERT INTO member_bindings VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, 1, zeroblob(?1), NULL, x'')",
+                MAX_INDEX_KEY_BYTES,
+            ),
+            (
+                "INSERT INTO member_bindings VALUES \
+                 (zeroblob(32), 0, zeroblob(32), 0, 1, 3, NULL, NULL, zeroblob(?1))",
+                MAX_ROW_BATCH_BYTES,
+            ),
         ];
         for (sql, limit) in cases {
             let at = connection.execute(sql, [limit as i64]);
             assert!(at.is_ok(), "{sql} at {limit}: {at:?}");
             connection.execute("DELETE FROM artifact_rows", []).unwrap();
             connection.execute("DELETE FROM observations", []).unwrap();
+            connection
+                .execute("DELETE FROM member_bindings", [])
+                .unwrap();
             let past = connection.execute(sql, [limit as i64 + 1]).unwrap_err();
             assert!(
                 past.to_string().contains("CHECK"),

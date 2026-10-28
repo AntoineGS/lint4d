@@ -18,7 +18,7 @@ use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooL
 use super::reader::ScratchLease;
 use super::sequence::{newest_first, next_publication_seq};
 use super::sqlite::{begin, classify, classify_read};
-use super::stream::{Batch, Expected, ManifestReader, RowError, RowSource};
+use super::stream::{Expected, ManifestReader, RowError, RowSource};
 use crate::evidence::{EvidenceHasher, decode_observation, path_key};
 use crate::facts::{encode_facts, encoded_content_bytes};
 use crate::{
@@ -655,14 +655,11 @@ impl EvidenceReader<'_> {
     /// verified. A validator may reject the evidence on an unverified
     /// batch, but accepts it only after `Hit(None)`.
     pub fn next_batch(&mut self) -> Result<Lookup<Option<ObservationBatch>>, Bypass> {
-        Ok(match self.0.next_batch()? {
-            Lookup::Hit(Some(Batch { items, scratch })) => Lookup::Hit(Some(ObservationBatch {
-                observations: items,
+        self.0
+            .next_batch_as(|observations, scratch| ObservationBatch {
+                observations,
                 _scratch: scratch,
-            })),
-            Lookup::Hit(None) => Lookup::Hit(None),
-            Lookup::Miss(miss) => Lookup::Miss(miss),
-        })
+            })
     }
 }
 

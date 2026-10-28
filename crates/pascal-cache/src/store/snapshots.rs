@@ -75,8 +75,8 @@ pub struct SnapshotSeal {
 /// [`Store::read_snapshot`] has streamed them all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotHeader {
-    scope: Scope,
-    id: SnapshotId,
+    pub(crate) scope: Scope,
+    pub(crate) id: SnapshotId,
     context: Digest,
     member_count: u64,
     discovery: Option<Digest>,

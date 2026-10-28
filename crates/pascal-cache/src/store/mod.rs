@@ -23,6 +23,7 @@ mod namespaces;
 mod nonce;
 mod outcome;
 mod pool;
+mod queries;
 mod reader;
 mod records;
 mod sequence;
@@ -46,6 +47,11 @@ pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use outcome::SealRefusal;
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
+#[cfg(feature = "test-support")]
+pub use queries::{
+    IMPORTERS_QUERY as IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY as MEMBER_QUERY_FOR_TEST,
+};
+pub use queries::{ImporterHit, ImporterPage};
 pub use reader::{ArtifactReader, RowBatch, StoredRow};
 pub use records::{BindingBatch, MemberRecordHeader, MemberRecordReader, PublishedRecord};
 pub use snapshots::{

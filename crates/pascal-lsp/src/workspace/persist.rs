@@ -8,8 +8,8 @@ use super::validate::{Check, CurrentInputs, Stale, Unproven, Validator};
 use lsp_types::Url;
 use pascal_cache::{
     ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, EvidenceWrite, ExpandedArtifactKey,
-    KeyError, LocalArtifactKey, Lookup, Miss, Published, PublishedEvidence, SessionDependence,
-    SourceContent, Store, observations_digest,
+    KeyError, LocalArtifactKey, Lookup, Malformed, Miss, Published, PublishedEvidence,
+    SessionDependence, SourceContent, Store, observations_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget, FactError, NotPersistable, include_slots};
 use pascal_core::resolver::ResolverLimits;
@@ -270,6 +270,10 @@ impl Workspace {
         );
         let mut last = ReuseMiss::Store(Miss::Absent);
         'candidates: for header in &headers {
+            let Some(artifact) = header.artifact_id() else {
+                last = ReuseMiss::Store(Miss::Malformed(Malformed::Evidence));
+                continue;
+            };
             let mut reader = store.read_evidence(header);
             loop {
                 match reader.next_batch().map_err(PersistError::Store)? {
@@ -300,7 +304,7 @@ impl Workspace {
             }
             return Ok(
                 match store
-                    .load_facts_by_id(header.artifact_id(), budget)
+                    .load_facts_by_id(artifact, budget)
                     .map_err(PersistError::Store)?
                 {
                     Lookup::Hit(facts) => Reuse::Hit {

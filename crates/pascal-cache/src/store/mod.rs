@@ -14,6 +14,7 @@ mod namespaces;
 mod outcome;
 mod pool;
 mod reader;
+mod sequence;
 mod sqlite;
 mod stream;
 #[cfg(feature = "test-support")]
@@ -23,7 +24,8 @@ pub use artifacts::{
     ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
 };
 pub use evidence::{
-    EvidenceHeader, EvidenceReader, EvidenceWrite, ObservationBatch, PublishedEvidence,
+    EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite, ObservationBatch,
+    PublishedEvidence, PublishedSet,
 };
 #[cfg(feature = "test-support")]
 pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;

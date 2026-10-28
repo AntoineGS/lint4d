@@ -25,9 +25,9 @@ pub use context_key::ContextKey;
 pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
 pub use evidence::{
-    EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT, Observation,
-    ObservationError, decode_observation, evidence_id, listing_digest, observations_digest,
-    path_key,
+    EvidencePurpose, EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT,
+    Observation, ObservationError, decode_observation, evidence_id, listing_digest,
+    observations_digest, path_key,
 };
 pub use facts::{
     DECLARATION_ROW, EncodedFacts, EncodedRow, FactDecodeError, FactDecoder, IMPORT_ROW,
@@ -51,15 +51,16 @@ pub use manifest::{
 pub use namespace::{BUILD_FINGERPRINT, Namespace};
 pub use store::{
     APPLICATION_ID, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow, ArtifactWrite,
-    Bypass, CONTAINER_VERSION, DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceWrite,
-    FACT_CHECKSUM_CONTEXT, IndexHit, IndexPage, Integrity, LimitsError, LocationIssue, Lookup,
-    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
+    Bypass, CONTAINER_VERSION, DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceTarget,
+    EvidenceWrite, FACT_CHECKSUM_CONTEXT, IndexHit, IndexPage, Integrity, LimitsError,
+    LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
     MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
     MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS,
     MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
     MIN_SQLITE_VERSION_NUMBER, Malformed, Miss, ObservationBatch, Published, PublishedEvidence,
-    ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT,
-    Scope, Store, StoreLimits, StoreLocation, StoredRow, TooLarge, default_directory,
+    PublishedSet, ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch, RowBatch,
+    SQLITE_LENGTH_LIMIT, Scope, Store, StoreLimits, StoreLocation, StoredRow, TooLarge,
+    default_directory,
 };
 
 #[cfg(feature = "test-support")]

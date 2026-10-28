@@ -1,6 +1,6 @@
 use pascal_cache::{
-    Digest, EvidenceSubject, Observation, ObservationError, SourceContent, decode_observation,
-    evidence_id, listing_digest, observations_digest,
+    Digest, EvidencePurpose, EvidenceSubject, Observation, ObservationError, SourceContent,
+    decode_observation, evidence_id, listing_digest, observations_digest,
 };
 use pascal_project::{ProjectPathEntry, ProjectPathProvenance};
 use std::path::PathBuf;
@@ -116,12 +116,13 @@ fn listing_digests_name_entries_and_their_kinds_only() {
 }
 
 #[test]
-fn evidence_ids_cover_subject_conclusion_and_every_observation() {
+fn evidence_ids_cover_purpose_subject_conclusion_and_every_observation() {
     let subject = EvidenceSubject {
+        purpose: EvidencePurpose::Artifact,
         context: Digest::from_bytes([1; 32]),
-        root: Digest::from_bytes([2; 32]),
+        subject: Digest::from_bytes([2; 32]),
     };
-    let conclusion = Digest::from_bytes([3; 32]);
+    let conclusion = Some(Digest::from_bytes([3; 32]));
     let observations = sample();
     let id = evidence_id(&subject, conclusion, &observations);
     assert_eq!(
@@ -135,6 +136,14 @@ fn evidence_ids_cover_subject_conclusion_and_every_observation() {
     for changed in [
         evidence_id(
             &EvidenceSubject {
+                purpose: EvidencePurpose::Binding,
+                ..subject
+            },
+            conclusion,
+            &observations,
+        ),
+        evidence_id(
+            &EvidenceSubject {
                 context: other,
                 ..subject
             },
@@ -143,13 +152,14 @@ fn evidence_ids_cover_subject_conclusion_and_every_observation() {
         ),
         evidence_id(
             &EvidenceSubject {
-                root: other,
+                subject: other,
                 ..subject
             },
             conclusion,
             &observations,
         ),
-        evidence_id(&subject, other, &observations),
+        evidence_id(&subject, Some(other), &observations),
+        evidence_id(&subject, None, &observations),
         evidence_id(&subject, conclusion, &observations[1..]),
         evidence_id(&subject, conclusion, &reordered),
     ] {

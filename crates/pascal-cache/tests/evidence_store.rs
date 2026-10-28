@@ -4,10 +4,12 @@ mod common;
 
 use common::private_tempdir;
 use pascal_cache::{
-    ArtifactKeyRef, Bypass, ContextKey, DATABASE_FILE, Digest, EvidenceWrite, ExpandedArtifactKey,
-    LocalArtifactKey, Lookup, MAX_EVIDENCE_OBSERVATIONS, Malformed, Mismatch, Miss, Namespace,
-    Observation, Published, PublishedEvidence, SourceContent, Store, StoreLimits, TooLarge,
-    listing_digest,
+    ArtifactKeyRef, Bypass, ContextKey, DATABASE_FILE, Digest, DiscoveryInputs, DiscoveryScope,
+    EvidenceHeader, EvidencePurpose, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey,
+    LocalArtifactKey, Lookup, LookupInputs, LookupKey, LookupKind, MAX_EVIDENCE_CANDIDATES,
+    MAX_EVIDENCE_OBSERVATIONS, Malformed, Mismatch, Miss, Namespace, Observation, Published,
+    PublishedEvidence, ScannedDirectory, SourceContent, Store, StoreLimits, TooLarge,
+    decode_observation, evidence_id, listing_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget};
 use pascal_project::{
@@ -145,11 +147,15 @@ fn facts_and_their_evidence_publish_together_and_read_back_verified() {
     let Lookup::Hit(headers) = store.find_evidence(&keys.context, &keys.root).unwrap() else {
         unreachable!()
     };
-    assert_eq!(headers[0].artifact_id(), keys.expanded.digest());
+    assert_eq!(headers[0].artifact_id(), Some(keys.expanded.digest()));
+    assert_eq!(headers[0].purpose(), EvidencePurpose::Artifact);
     assert_eq!(headers[0].observation_count(), 3);
     assert_eq!(
         store
-            .load_facts_by_id(headers[0].artifact_id(), &mut FactBudget::new(1 << 20))
+            .load_facts_by_id(
+                headers[0].artifact_id().unwrap(),
+                &mut FactBudget::new(1 << 20)
+            )
             .unwrap(),
         Lookup::Hit(facts())
     );
@@ -389,5 +395,263 @@ fn a_row_past_the_declared_count_is_a_count_miss_even_when_malformed() {
     assert_eq!(
         read_all(&store, &keys),
         Err(Miss::Malformed(Malformed::Count))
+    );
+}
+
+/// l4d-e8bl: a subject accumulates sets, and an ID-ordered cap of 16 can
+/// hide the valid one forever. Lookups take the most recent first.
+#[test]
+fn a_republished_set_is_never_hidden_by_the_candidate_cap() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    let sets: Vec<Vec<Observation>> = (0..=MAX_EVIDENCE_CANDIDATES)
+        .map(|index| {
+            vec![Observation::Presence {
+                path: PathBuf::from(format!("/w/{index}.inc")),
+                entry: None,
+                present: false,
+            }]
+        })
+        .collect();
+    for set in &sets {
+        publish(&store, &keys, set).unwrap();
+    }
+    // The set whose ID sorts last: an ID-ordered cap always leaves it out.
+    let payload: Vec<u8> = raw(directory.path())
+        .query_row(
+            "SELECT payload FROM observations \
+             WHERE evidence_id = (SELECT max(evidence_id) FROM evidence_sets)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let hidden = vec![decode_observation(&payload).unwrap()];
+    // Republishing an identical set makes it the most recent publication.
+    assert_eq!(
+        publish(&store, &keys, &hidden).unwrap().evidence,
+        Published::AlreadyPresent
+    );
+    let first = |store: &Store| {
+        let Lookup::Hit(headers) = store.find_evidence(&keys.context, &keys.root).unwrap() else {
+            panic!("published")
+        };
+        assert_eq!(headers.len(), MAX_EVIDENCE_CANDIDATES);
+        let mut reader = store.read_evidence(&headers[0]);
+        let Lookup::Hit(Some(batch)) = reader.next_batch().unwrap() else {
+            panic!("readable")
+        };
+        batch.observations().to_vec()
+    };
+    assert_eq!(first(&store), hidden);
+    // A new set is newer still.
+    let newest = vec![Observation::Presence {
+        path: PathBuf::from("/w/new.inc"),
+        entry: None,
+        present: false,
+    }];
+    publish(&store, &keys, &newest).unwrap();
+    assert_eq!(first(&store), newest);
+}
+
+fn lookup(name: &str) -> LookupKey {
+    LookupKey::new(&LookupInputs {
+        kind: LookupKind::Unit,
+        normalized_name: name,
+        path_expression: None,
+        importer_directory: None,
+    })
+}
+
+/// Every observation of one set, or the miss that ended the read.
+fn read_set(store: &Store, header: &EvidenceHeader) -> Result<Vec<Observation>, Miss> {
+    let mut reader = store.read_evidence(header);
+    let mut read = Vec::new();
+    loop {
+        match reader.next_batch().unwrap() {
+            Lookup::Hit(Some(batch)) => read.extend_from_slice(batch.observations()),
+            Lookup::Hit(None) => {
+                assert!(reader.is_verified());
+                return Ok(read);
+            }
+            Lookup::Miss(miss) => return Err(miss),
+        }
+    }
+}
+
+#[test]
+fn binding_and_discovery_evidence_publish_and_read_back_verified() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    let shapes = lookup("shapes");
+    let scope = DiscoveryScope::new(&DiscoveryInputs {
+        directories: &[ScannedDirectory {
+            path: Path::new("/w"),
+            recursive: true,
+        }],
+        exclusions: &[],
+    });
+    let observations = observations();
+    let write = EvidenceWrite {
+        context: &keys.context,
+        observations: &observations,
+    };
+    let binding = store
+        .publish_evidence(EvidenceTarget::Binding(&shapes), &write)
+        .unwrap();
+    let discovery = store
+        .publish_evidence(EvidenceTarget::Discovery(&scope), &write)
+        .unwrap();
+    assert_eq!(binding.published, Published::Inserted);
+    assert_ne!(binding.evidence_id, discovery.evidence_id);
+    assert_eq!(
+        store
+            .publish_evidence(EvidenceTarget::Binding(&shapes), &write)
+            .unwrap()
+            .published,
+        Published::AlreadyPresent
+    );
+    for (target, published, purpose) in [
+        (
+            EvidenceTarget::Binding(&shapes),
+            binding,
+            EvidencePurpose::Binding,
+        ),
+        (
+            EvidenceTarget::Discovery(&scope),
+            discovery,
+            EvidencePurpose::Discovery,
+        ),
+    ] {
+        let Lookup::Hit(headers) = store.find_subject_evidence(&keys.context, target).unwrap()
+        else {
+            panic!("{purpose:?} evidence is found by its subject")
+        };
+        assert_eq!(headers.len(), 1);
+        let header = &headers[0];
+        assert_eq!(
+            (header.evidence_id(), header.purpose(), header.artifact_id()),
+            (published.evidence_id, purpose, None)
+        );
+        assert_eq!(
+            header.evidence_id(),
+            evidence_id(&header.subject(), None, &observations)
+        );
+        assert_eq!(read_set(&store, header), Ok(observations.clone()));
+        assert_eq!(
+            store.open_evidence(published.evidence_id).unwrap(),
+            Lookup::Hit(header.clone())
+        );
+    }
+    assert_eq!(
+        store
+            .find_subject_evidence(&keys.context, EvidenceTarget::Binding(&lookup("other")))
+            .unwrap(),
+        Lookup::Miss(Miss::Absent)
+    );
+    assert_eq!(
+        store.find_evidence(&keys.context, &keys.root).unwrap(),
+        Lookup::Miss(Miss::Absent),
+        "binding evidence is not artifact evidence"
+    );
+}
+
+#[test]
+fn subject_lookups_take_the_newest_publications_first() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    let shapes = lookup("shapes");
+    let set = |name: &str| {
+        vec![Observation::Presence {
+            path: PathBuf::from(format!("/w/{name}.pas")),
+            entry: None,
+            present: true,
+        }]
+    };
+    let publish_set = |observations: &[Observation]| {
+        store
+            .publish_evidence(
+                EvidenceTarget::Binding(&shapes),
+                &EvidenceWrite {
+                    context: &keys.context,
+                    observations,
+                },
+            )
+            .unwrap()
+    };
+    let ids: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|name| publish_set(&set(name)).evidence_id)
+        .collect();
+    let headers = |store: &Store| {
+        let Lookup::Hit(headers) = store
+            .find_subject_evidence(&keys.context, EvidenceTarget::Binding(&shapes))
+            .unwrap()
+        else {
+            panic!("published")
+        };
+        assert!(
+            headers
+                .windows(2)
+                .all(|pair| pair[0].publication_seq() > pair[1].publication_seq())
+        );
+        headers
+            .iter()
+            .map(EvidenceHeader::evidence_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(headers(&store), [ids[2], ids[1], ids[0]]);
+    assert_eq!(publish_set(&set("a")).published, Published::AlreadyPresent);
+    assert_eq!(
+        headers(&store),
+        [ids[0], ids[2], ids[1]],
+        "republishing bumps"
+    );
+}
+
+#[test]
+fn evidence_opened_by_id_is_checked_against_its_manifests() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    let shapes = lookup("shapes");
+    let observations = observations();
+    let published = store
+        .publish_evidence(
+            EvidenceTarget::Binding(&shapes),
+            &EvidenceWrite {
+                context: &keys.context,
+                observations: &observations,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store.open_evidence(published.evidence_id).unwrap(),
+        Lookup::Hit(header) if header.purpose() == EvidencePurpose::Binding
+    ));
+    assert_eq!(
+        store.open_evidence(Digest::from_bytes([7; 32])).unwrap(),
+        Lookup::Miss(Miss::Absent)
+    );
+    let mut manifest = shapes.key().manifest().to_vec();
+    *manifest.last_mut().unwrap() ^= 1;
+    raw(directory.path())
+        .execute(
+            "UPDATE key_manifests SET manifest = ?1 WHERE digest = ?2",
+            rusqlite::params![manifest, shapes.digest().as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.open_evidence(published.evidence_id).unwrap(),
+        Lookup::Miss(Miss::KeyMismatch(Mismatch::DigestDiffers))
+    );
+    raw(directory.path())
+        .execute("UPDATE evidence_sets SET lifecycle = 2", [])
+        .unwrap();
+    assert_eq!(
+        store.open_evidence(published.evidence_id).unwrap(),
+        Lookup::Miss(Miss::Retired)
     );
 }

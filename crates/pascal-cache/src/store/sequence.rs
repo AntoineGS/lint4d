@@ -19,20 +19,32 @@ pub(crate) fn next_publication_seq(connection: &Connection) -> Result<i64, Bypas
         .map_err(|error| classify(&error))
 }
 
-/// At most `limit` rows that `select` (its columns, table and filter) finds,
-/// most recently published first, each made a header by `header`. Every
-/// candidate query goes through here, so none can fall back to an order
-/// that hides the newest publications behind the cap (l4d-e8bl). A row
-/// `header` refuses makes the whole lookup `malformed`.
-pub(crate) fn newest_first<R, H>(
+/// One candidate query: `select` (its columns, table and filter) bound to
+/// `params`, at most `limit` rows, and the miss a refused row makes.
+pub(crate) struct Candidates<P> {
+    pub(crate) select: &'static str,
+    pub(crate) params: P,
+    pub(crate) limit: usize,
+    pub(crate) malformed: Malformed,
+}
+
+/// At most `limit` rows that `select` finds, most recently published first,
+/// each made a header by `header`. Every candidate query goes through here,
+/// so none can fall back to an order that hides the newest publications
+/// behind the cap (l4d-e8bl). A row `header` refuses makes the whole lookup
+/// `malformed`.
+pub(crate) fn newest_first<P: Params, R, H>(
     connection: &Connection,
-    select: &str,
-    params: impl Params,
-    limit: usize,
+    candidates: Candidates<P>,
     row: impl FnMut(&Row<'_>) -> rusqlite::Result<R>,
     mut header: impl FnMut(R) -> Option<H>,
-    malformed: Malformed,
 ) -> Result<Lookup<Vec<H>>, Bypass> {
+    let Candidates {
+        select,
+        params,
+        limit,
+        malformed,
+    } = candidates;
     let rows: rusqlite::Result<Vec<R>> = connection
         .prepare_cached(&format!(
             "{select} ORDER BY publication_seq DESC LIMIT {limit}"

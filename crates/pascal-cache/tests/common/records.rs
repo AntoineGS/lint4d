@@ -4,7 +4,8 @@ use pascal_cache::{
     ArtifactKeyRef, Binding, BindingKind, BindingOutcome, ContextKey, CoverageStatus,
     DATABASE_FILE, Digest, EvidenceTarget, EvidenceWrite, LocalArtifactKey, Lookup, LookupInputs,
     LookupKey, LookupKind, MemberCoverage, MemberHeader, MemberRecord, Miss, Namespace,
-    Observation, SourceContent, SourceIdentity, Store, StoreLimits,
+    Observation, SnapshotHeader, SnapshotMember, SnapshotSeal, SourceContent, SourceIdentity,
+    Store, StoreLimits,
 };
 use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, ProjectContext, SourceOrigin};
@@ -27,6 +28,10 @@ pub fn open(directory: &Path) -> Store {
 pub fn raw(directory: &Path) -> Connection {
     let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
+    // The bundled SQLite enforces foreign keys by default.
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
     connection
 }
 
@@ -135,6 +140,56 @@ pub fn read_record(store: &Store, id: Digest) -> Result<MemberRecord, Miss> {
                     header: header.member().clone(),
                     bindings,
                 });
+            }
+            Lookup::Miss(miss) => {
+                assert!(!reader.is_verified());
+                return Err(miss);
+            }
+        }
+    }
+}
+
+pub const SEAL: SnapshotSeal = SnapshotSeal {
+    discovery: None,
+    coverage: pascal_cache::SnapshotCoverage {
+        discovery: CoverageStatus::Complete,
+        membership: CoverageStatus::Complete,
+    },
+};
+
+/// Publish `count` binding-free members `/w/{prefix}{index}.pas`.
+pub fn records(store: &Store, prefix: &str, count: usize) -> Vec<Digest> {
+    (0..count)
+        .map(|index| {
+            let record = member(
+                &format!("/w/{prefix}{index}.pas"),
+                &[],
+                Digest::from_bytes([0; 32]),
+            );
+            store.publish_member_record(&record).unwrap().record_id
+        })
+        .collect()
+}
+
+/// Seal a snapshot of `records` under `context()`, in batches of 256.
+pub fn sealed(store: &Store, records: &[Digest]) -> SnapshotHeader {
+    let mut builder = store.begin_snapshot(&context()).unwrap();
+    for batch in records.chunks(256) {
+        store.add_members(&mut builder, batch).unwrap();
+    }
+    store.seal_snapshot(builder, &SEAL).unwrap()
+}
+
+/// Every member, read and verified, or the miss that ended the read.
+pub fn read_members(store: &Store, header: &SnapshotHeader) -> Result<Vec<SnapshotMember>, Miss> {
+    let mut reader = store.read_snapshot(header);
+    let mut members = Vec::new();
+    loop {
+        match reader.next_batch().unwrap() {
+            Lookup::Hit(Some(batch)) => members.extend_from_slice(batch.members()),
+            Lookup::Hit(None) => {
+                assert!(reader.is_verified());
+                return Ok(members);
             }
             Lookup::Miss(miss) => {
                 assert!(!reader.is_verified());

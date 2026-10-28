@@ -185,6 +185,52 @@ CREATE INDEX member_bindings_by_target
 CREATE INDEX member_bindings_by_evidence
     ON member_bindings (namespace_id, reset_epoch, evidence_id, record_id)
     WHERE evidence_id IS NOT NULL;
+
+CREATE TABLE snapshots (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    snapshot_id BLOB NOT NULL CHECK (length(snapshot_id) = 16),
+    context_key BLOB NOT NULL CHECK (length(context_key) = 32),
+    state INTEGER NOT NULL CHECK (state IN (1, 2, 3)),
+    builder_token BLOB NOT NULL CHECK (length(builder_token) = 16),
+    build_revision INTEGER NOT NULL CHECK (build_revision >= 0),
+    member_count INTEGER NOT NULL CHECK (member_count BETWEEN 0 AND 100000),
+    discovery_evidence BLOB
+        CHECK (discovery_evidence IS NULL OR length(discovery_evidence) = 32),
+    coverage BLOB CHECK (coverage IS NULL OR length(coverage) <= 64),
+    sealed_digest BLOB CHECK (sealed_digest IS NULL OR length(sealed_digest) = 32),
+    publication_seq INTEGER CHECK (publication_seq IS NULL OR publication_seq >= 1),
+    PRIMARY KEY (namespace_id, reset_epoch, snapshot_id),
+    FOREIGN KEY (namespace_id, reset_epoch, context_key)
+        REFERENCES key_manifests (namespace_id, reset_epoch, digest),
+    FOREIGN KEY (namespace_id, reset_epoch, discovery_evidence)
+        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id),
+    CHECK (state <> 1
+        OR (coverage IS NULL AND sealed_digest IS NULL AND publication_seq IS NULL)),
+    CHECK (state <> 2
+        OR (coverage IS NOT NULL AND sealed_digest IS NOT NULL AND publication_seq IS NOT NULL))
+) STRICT;
+
+CREATE INDEX snapshots_by_context
+    ON snapshots (namespace_id, reset_epoch, context_key, state, publication_seq);
+
+CREATE TABLE snapshot_members (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    snapshot_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    record_id BLOB NOT NULL CHECK (length(record_id) = 32),
+    source_key BLOB NOT NULL CHECK (length(source_key) <= 4096),
+    PRIMARY KEY (namespace_id, reset_epoch, snapshot_id, ordinal),
+    UNIQUE (namespace_id, reset_epoch, snapshot_id, source_key),
+    FOREIGN KEY (namespace_id, reset_epoch, snapshot_id)
+        REFERENCES snapshots (namespace_id, reset_epoch, snapshot_id),
+    FOREIGN KEY (namespace_id, reset_epoch, record_id)
+        REFERENCES member_records (namespace_id, reset_epoch, record_id)
+) STRICT;
+
+CREATE INDEX snapshot_members_by_record
+    ON snapshot_members (namespace_id, reset_epoch, record_id, snapshot_id);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +459,8 @@ mod tests {
                 "namespaces",
                 "observations",
                 "retired_scopes",
+                "snapshot_members",
+                "snapshots",
                 "store_state"
             ]
         );
@@ -660,7 +708,7 @@ mod tests {
         use crate::store::limits::{
             MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_OBSERVATIONS,
             MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_ROW_BATCH_BYTES,
-            MAX_SUPPLEMENTAL_BYTES,
+            MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES,
         };
         let root = tempfile::tempdir().unwrap();
         let mut connection = connect(&root.path().join("a.sqlite3"));
@@ -677,7 +725,10 @@ mod tests {
                      (zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
                       zeroblob(32), zeroblob(32), 1, 0, 0, 1);
                  INSERT INTO member_records VALUES
-                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0);",
+                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0);
+                 INSERT INTO snapshots VALUES
+                     (zeroblob(32), 0, zeroblob(16), CAST(zeroblob(31) || x'01' AS BLOB), 1,
+                      zeroblob(16), 0, 0, NULL, NULL, NULL, NULL);",
             )
             .unwrap();
         // Each statement takes the bound as ?1: accepted at the limit,
@@ -754,6 +805,15 @@ mod tests {
                  (zeroblob(32), 0, zeroblob(32), 0, 1, 3, NULL, NULL, zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
+            (
+                "UPDATE snapshots SET member_count = ?1",
+                MAX_SNAPSHOT_MEMBERS,
+            ),
+            (
+                "INSERT INTO snapshot_members VALUES \
+                 (zeroblob(32), 0, zeroblob(16), 0, zeroblob(32), zeroblob(?1))",
+                MAX_INDEX_KEY_BYTES,
+            ),
         ];
         for (sql, limit) in cases {
             let at = connection.execute(sql, [limit as i64]);
@@ -762,6 +822,9 @@ mod tests {
             connection.execute("DELETE FROM observations", []).unwrap();
             connection
                 .execute("DELETE FROM member_bindings", [])
+                .unwrap();
+            connection
+                .execute("DELETE FROM snapshot_members", [])
                 .unwrap();
             let past = connection.execute(sql, [limit as i64 + 1]).unwrap_err();
             assert!(
@@ -796,5 +859,39 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("CHECK"), "{purpose}: {error}");
         }
+    }
+
+    #[test]
+    fn only_a_sealed_snapshot_carries_its_digest_and_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = connect(&root.path().join("a.sqlite3"));
+        prepare_container(&mut connection, deadline()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
+                 INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 4, zeroblob(9));",
+            )
+            .unwrap();
+        let insert = |state: i64, sealed: &str| {
+            connection.execute(
+                &format!(
+                    "INSERT INTO snapshots VALUES (zeroblob(32), 0, zeroblob(16), zeroblob(32), \
+                     {state}, zeroblob(16), 0, 0, NULL, {sealed})"
+                ),
+                [],
+            )
+        };
+        for (state, sealed) in [
+            (1, "x'0000', zeroblob(32), 1"),
+            (2, "NULL, NULL, NULL"),
+            (2, "x'0000', NULL, 1"),
+        ] {
+            let error = insert(state, sealed).unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK"),
+                "{state} {sealed}: {error}"
+            );
+        }
+        assert!(insert(2, "x'0000', zeroblob(32), 1").is_ok());
     }
 }

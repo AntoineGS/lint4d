@@ -64,14 +64,18 @@ pub use store::{
     LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS,
     MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE,
     MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
-    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_SQLITE_VERSION_NUMBER, Malformed, MemberRecordHeader,
-    MemberRecordReader, Miss, ObservationBatch, Published, PublishedEvidence, PublishedRecord,
-    PublishedSet, ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch, RowBatch,
-    SQLITE_LENGTH_LIMIT, Scope, Store, StoreLimits, StoreLocation, StoredRow, TooLarge,
+    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES,
+    MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    MIN_SQLITE_VERSION_NUMBER, Malformed, MemberBatch, MemberRecordHeader, MemberRecordReader,
+    Miss, ObservationBatch, Published, PublishedEvidence, PublishedRecord, PublishedSet,
+    ROW_CHECKSUM_CONTEXT, Reclaimed, RetireReport, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT,
+    Scope, SealRefusal, SnapshotBuilder, SnapshotHeader, SnapshotId, SnapshotMember,
+    SnapshotReader, SnapshotSeal, Store, StoreLimits, StoreLocation, StoredRow, TooLarge,
     default_directory,
 };
 
+#[cfg(feature = "test-support")]
+pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
 pub use store::HeldConnection;
 #[cfg(feature = "test-support")]

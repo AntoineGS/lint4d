@@ -2,6 +2,15 @@
 //! directory (spec §6, §9-§11). Every operation returns an admitted result,
 //! a typed [`Miss`] or a [`Bypass`]; none is a semantic claim.
 
+/// Let a test act at a named protocol point (feature `test-support`);
+/// expands to nothing otherwise.
+macro_rules! fault_point {
+    ($store:expr, $point:ident) => {
+        #[cfg(feature = "test-support")]
+        $store.fault($crate::store::FaultPoint::$point);
+    };
+}
+
 mod artifacts;
 mod container;
 mod evidence;
@@ -11,11 +20,13 @@ mod keys;
 mod limits;
 mod location;
 mod namespaces;
+mod nonce;
 mod outcome;
 mod pool;
 mod reader;
 mod records;
 mod sequence;
+mod snapshots;
 mod sqlite;
 mod stream;
 #[cfg(feature = "test-support")]
@@ -33,17 +44,25 @@ pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
 pub use index::{IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
+pub use outcome::SealRefusal;
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
 pub use reader::{ArtifactReader, RowBatch, StoredRow};
 pub use records::{BindingBatch, MemberRecordHeader, MemberRecordReader, PublishedRecord};
+pub use snapshots::{
+    MemberBatch, SnapshotBuilder, SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader,
+    SnapshotSeal,
+};
+#[cfg(feature = "test-support")]
+pub use testing::FaultPoint;
 
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use limits::{
     LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
     MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
     MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES,
-    MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT, StoreLimits,
+    MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS,
+    MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT,
+    StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;

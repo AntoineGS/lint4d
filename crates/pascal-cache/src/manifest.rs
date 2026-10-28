@@ -20,6 +20,8 @@ pub enum KeyKind {
     Discovery,
     /// A member record manifest; streamed, never stored whole (see `record`).
     MemberRecord,
+    /// A sealed snapshot manifest; streamed, never stored whole.
+    Snapshot,
 }
 
 impl KeyKind {
@@ -34,6 +36,7 @@ impl KeyKind {
             Self::Lookup => 7,
             Self::Discovery => 8,
             Self::MemberRecord => 9,
+            Self::Snapshot => 10,
         }
     }
 
@@ -48,6 +51,7 @@ impl KeyKind {
             7 => Some(Self::Lookup),
             8 => Some(Self::Discovery),
             9 => Some(Self::MemberRecord),
+            10 => Some(Self::Snapshot),
             _ => None,
         }
     }
@@ -234,6 +238,7 @@ mod tests {
             KeyKind::Lookup,
             KeyKind::Discovery,
             KeyKind::MemberRecord,
+            KeyKind::Snapshot,
         ] {
             assert_eq!(KeyKind::from_tag(kind.tag()), Some(kind));
         }

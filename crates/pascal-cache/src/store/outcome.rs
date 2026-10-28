@@ -43,6 +43,13 @@ pub enum Bypass {
     /// A referenced artifact, evidence set or record is not stored in this
     /// scope; publish it first.
     MissingReference,
+    /// The build's token, revision or state changed: another writer, a
+    /// retirement or a seal won. This writer wrote nothing.
+    BuilderFenced,
+    /// Two members of one snapshot have the same source identity; the
+    /// batch wrote nothing.
+    DuplicateMember,
+    SealRefused(SealRefusal),
     Io(io::ErrorKind),
     Sqlite {
         extended_code: i32,
@@ -70,6 +77,17 @@ pub enum LocationIssue {
     PlatformChecksNotImplemented,
 }
 
+/// Why a seal was refused; the build must be redone, never sealed partly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealRefusal {
+    /// The members read disagree with the stored count.
+    CountMismatch,
+    /// A member's record was retired or removed since it was added.
+    RetiredRecord,
+    /// The seal's discovery evidence is evidence of another purpose.
+    DiscoveryEvidence,
+}
+
 /// A write over an admission limit; the artifact is not persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooLarge {
@@ -82,6 +100,8 @@ pub enum TooLarge {
     Observations { count: usize },
     Bindings { count: usize },
     SourceKey { bytes: usize },
+    Members { added: usize },
+    Batch { bytes: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +141,8 @@ pub enum Malformed {
     Evidence,
     /// Member record rows or header that do not decode or disagree with their columns.
     Member,
+    /// A snapshot header or member rows that are out of range.
+    Snapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

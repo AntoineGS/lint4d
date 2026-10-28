@@ -367,6 +367,7 @@ impl Store {
                 Published::Inserted
             }
         };
+        fault_point!(self, RecordBeforeCommit);
         self.before_commit();
         transaction.commit().map_err(fail)?;
         Ok(PublishedRecord {

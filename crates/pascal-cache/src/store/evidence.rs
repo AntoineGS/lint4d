@@ -16,7 +16,7 @@ use super::limits::{
 use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::reader::ScratchLease;
-use super::sequence::{newest_first, next_publication_seq};
+use super::sequence::{Candidates, newest_first, next_publication_seq};
 use super::sqlite::{begin, classify, classify_read};
 use super::stream::{Expected, ManifestReader, RowError, RowSource};
 use crate::evidence::{EvidenceHasher, decode_observation, path_key};
@@ -391,6 +391,7 @@ impl Store {
         let artifact = insert_prepared(&transaction, self.scope, &write, &artifact_prepared)?;
         put_manifest(&transaction, self.scope, evidence.context.key())?;
         let published = insert_evidence(&transaction, self.scope, &prepared)?;
+        fault_point!(self, EvidenceBeforeCommit);
         self.before_commit();
         transaction.commit().map_err(|error| classify(&error))?;
         Ok(PublishedEvidence {
@@ -424,6 +425,7 @@ impl Store {
         put_manifest(&transaction, self.scope, evidence.context.key())?;
         put_manifest(&transaction, self.scope, target.key())?;
         let published = insert_evidence(&transaction, self.scope, &prepared)?;
+        fault_point!(self, EvidenceBeforeCommit);
         self.before_commit();
         transaction.commit().map_err(|error| classify(&error))?;
         Ok(PublishedSet {
@@ -475,19 +477,22 @@ impl Store {
         };
         newest_first(
             &transaction,
-            "SELECT evidence_id, artifact_id, observation_count, content_bytes, \
-             publication_seq FROM evidence_sets WHERE namespace_id = ?1 \
-             AND reset_epoch = ?2 AND purpose = ?3 AND context_key = ?4 \
-             AND subject_key = ?5 AND lifecycle = ?6",
-            params![
-                self.scope.namespace.as_bytes().as_slice(),
-                epoch(self.scope),
-                i64::from(purpose.tag()),
-                subject.context.as_bytes().as_slice(),
-                subject.subject.as_bytes().as_slice(),
-                LIVE
-            ],
-            MAX_EVIDENCE_CANDIDATES,
+            Candidates {
+                select: "SELECT evidence_id, artifact_id, observation_count, content_bytes, \
+                         publication_seq FROM evidence_sets WHERE namespace_id = ?1 \
+                         AND reset_epoch = ?2 AND purpose = ?3 AND context_key = ?4 \
+                         AND subject_key = ?5 AND lifecycle = ?6",
+                params: params![
+                    self.scope.namespace.as_bytes().as_slice(),
+                    epoch(self.scope),
+                    i64::from(purpose.tag()),
+                    subject.context.as_bytes().as_slice(),
+                    subject.subject.as_bytes().as_slice(),
+                    LIVE
+                ],
+                limit: MAX_EVIDENCE_CANDIDATES,
+                malformed: Malformed::Evidence,
+            },
             |row| {
                 Ok((
                     row.get(0)?,
@@ -498,7 +503,6 @@ impl Store {
                 ))
             },
             |row: CandidateRow| header_from(self.scope, subject, row),
-            Malformed::Evidence,
         )
     }
 

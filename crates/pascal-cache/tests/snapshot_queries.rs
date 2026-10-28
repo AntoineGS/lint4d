@@ -186,6 +186,53 @@ fn queries_on_a_retired_snapshot_find_nothing() {
     );
 }
 
+#[test]
+fn queries_exclude_members_whose_record_was_retired() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
+    let target = records(&store, "Target", 1)[0];
+    let importers: Vec<_> = (0..3)
+        .map(|index| {
+            store
+                .publish_member_record(&member(
+                    &format!("/w/I{index}.pas"),
+                    &["/w/Target0.pas"],
+                    evidence,
+                ))
+                .unwrap()
+                .record_id
+        })
+        .collect();
+    let mut members = vec![target];
+    members.extend(&importers);
+    let header = sealed(&store, &members);
+    assert!(store.retire_member_record(importers[1]).unwrap());
+    let hits = all_importers(&store, &header, "/w/Target0.pas", 10);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.record_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([importers[0], importers[2]]),
+        "a retired importer is gone, the others stay"
+    );
+    assert!(matches!(
+        store.find_member(&header, Path::new("/w/I1.pas")).unwrap(),
+        Lookup::Miss(Miss::Absent)
+    ));
+    let Lookup::Hit(found) = store.find_member(&header, Path::new("/w/I0.pas")).unwrap() else {
+        panic!("a live member is still found")
+    };
+    assert_eq!(found.record_id, importers[0]);
+    assert!(store.retire_member_record(target).unwrap());
+    assert_eq!(
+        store
+            .find_member(&header, Path::new("/w/Target0.pas"))
+            .unwrap(),
+        Lookup::Miss(Miss::Absent)
+    );
+}
+
 fn plan(directory: &Path, query: &str, parameters: usize) -> String {
     let connection = raw(directory);
     let mut statement = connection
@@ -210,13 +257,13 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
     let store = open(directory.path());
     let ids = records(&store, "U", 2);
     sealed(&store, &ids);
-    let importers = plan(directory.path(), pascal_cache::IMPORTERS_QUERY_FOR_TEST, 7);
+    let importers = plan(directory.path(), pascal_cache::IMPORTERS_QUERY_FOR_TEST, 8);
     assert!(
         importers.contains("member_bindings_by_target"),
         "{importers}"
     );
     assert!(!importers.contains("TEMP B-TREE"), "{importers}");
-    let member = plan(directory.path(), pascal_cache::MEMBER_QUERY_FOR_TEST, 4);
+    let member = plan(directory.path(), pascal_cache::MEMBER_QUERY_FOR_TEST, 5);
     assert!(!member.contains("SCAN"), "{member}");
     assert!(!member.contains("TEMP B-TREE"), "{member}");
 }

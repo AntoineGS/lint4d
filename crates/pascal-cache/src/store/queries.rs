@@ -8,6 +8,7 @@ use super::Store;
 use super::limits::MAX_INDEX_PAGE;
 use super::namespaces::{ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
+use super::records::LIVE;
 use super::snapshots::{SnapshotHeader, SnapshotMember};
 use super::sqlite::{begin, classify, classify_read};
 use crate::Digest;
@@ -19,21 +20,27 @@ use std::path::Path;
 /// snapshot's `UNIQUE (snapshot, source_key)` index. `pub` only so
 /// `test-support` can re-export it.
 pub const MEMBER_QUERY: &str = "SELECT m.ordinal, m.record_id, m.source_key \
-     FROM snapshot_members m CROSS JOIN snapshots s \
+     FROM snapshot_members m CROSS JOIN snapshots s CROSS JOIN member_records r \
      WHERE m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.snapshot_id = ?3 \
      AND m.source_key = ?4 \
-     AND s.namespace_id = ?1 AND s.reset_epoch = ?2 AND s.snapshot_id = ?3 AND s.state = 2";
+     AND s.namespace_id = ?1 AND s.reset_epoch = ?2 AND s.snapshot_id = ?3 AND s.state = 2 \
+     AND r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.record_id = m.record_id \
+     AND r.lifecycle = ?5";
 
 /// Precise bindings to a target key whose record is a member of one sealed
-/// snapshot, keyset-paginated over `(record_id, ordinal)`. `CROSS JOIN`
+/// snapshot, keyset-paginated over `(record_id, ordinal)`. Retired records are
+/// excluded, as `read_snapshot` treats them as a miss. `CROSS JOIN`
 /// pins the order: `member_bindings_by_target` drives and serves the sort.
 pub const IMPORTERS_QUERY: &str = "SELECT b.record_id, b.ordinal, m.ordinal \
      FROM member_bindings b CROSS JOIN snapshot_members m CROSS JOIN snapshots s \
+     CROSS JOIN member_records r \
      WHERE b.namespace_id = ?1 AND b.reset_epoch = ?2 AND b.target_key = ?4 \
      AND (b.record_id, b.ordinal) > (?5, ?6) \
      AND m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.record_id = b.record_id \
      AND m.snapshot_id = ?3 \
      AND s.namespace_id = ?1 AND s.reset_epoch = ?2 AND s.snapshot_id = ?3 AND s.state = 2 \
+     AND r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.record_id = b.record_id \
+     AND r.lifecycle = ?8 \
      ORDER BY b.record_id, b.ordinal LIMIT ?7";
 
 /// One binding of a member that targets the queried identity.
@@ -75,7 +82,8 @@ impl Store {
                             self.scope.namespace.as_bytes().as_slice(),
                             epoch(self.scope),
                             snapshot.id.as_bytes().as_slice(),
-                            path_key(source)
+                            path_key(source),
+                            LIVE
                         ],
                         |row| {
                             Ok((
@@ -140,7 +148,8 @@ impl Store {
                     path_key(target),
                     after_record,
                     after_ordinal,
-                    (limit + 1) as i64
+                    (limit + 1) as i64,
+                    LIVE
                 ],
                 |row| {
                     Ok((

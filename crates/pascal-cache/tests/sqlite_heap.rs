@@ -54,10 +54,10 @@ fn an_open_store_stays_within_its_connection_allowance() {
         used > 0,
         "SQLite memory statistics are disabled; the comparison would prove nothing"
     );
+    let overhead_allowance = CONNECTION_OVERHEAD_BYTES * limits.connections() as u64;
     assert!(
-        used <= limits.page_admission_bytes(),
-        "{used} bytes exceed the {} byte allowance",
-        limits.page_admission_bytes()
+        used <= overhead_allowance,
+        "measured {used} bytes exceed the {overhead_allowance} byte connection overhead allowance"
     );
     drop(store);
 }

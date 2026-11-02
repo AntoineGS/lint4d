@@ -13,8 +13,10 @@ pub const MIN_CONNECTION_PAGE_CACHE_BYTES: u64 = 256 * 1024;
 /// Heap one SQLite connection may use beyond its page cache: schema,
 /// lookaside, the prepared-statement cache and parser state (spec §10: "A
 /// connection is not opened when its overhead cannot be admitted").
-/// `tests/sqlite_heap.rs` checks it against SQLite's own heap count;
-/// statement heap beyond it (large sorts, unusual plans) is not accounted.
+/// `tests/sqlite_heap.rs` checks it against SQLite's own heap count, measured
+/// with the statements a fresh store runs (each connection's statement cache
+/// can hold more); statement heap beyond it (large sorts, unusual plans) is
+/// not accounted.
 pub const CONNECTION_OVERHEAD_BYTES: u64 = 1024 * 1024;
 pub const MAX_ROW_BATCH_ROWS: usize = 256;
 pub const MAX_ROW_BATCH_BYTES: usize = 1024 * 1024;
@@ -110,13 +112,15 @@ impl StoreLimits {
     /// What the store's connections are admitted for: the aggregate page
     /// cache plus each connection's overhead allowance.
     pub fn page_admission_bytes(&self) -> u64 {
-        self.page_cache_bytes + CONNECTION_OVERHEAD_BYTES * self.connections() as u64
+        self.page_cache_bytes
+            .saturating_add(CONNECTION_OVERHEAD_BYTES.saturating_mul(self.connections() as u64))
     }
 
     /// Everything an open store is admitted for: its connections and its
     /// scratch.
     pub fn admission_bytes(&self) -> u64 {
-        self.page_admission_bytes() + self.scratch_bytes
+        self.page_admission_bytes()
+            .saturating_add(self.scratch_bytes)
     }
 }
 
@@ -150,6 +154,13 @@ mod tests {
             small.admission_bytes(),
             small.page_admission_bytes() + MAX_ROW_BATCH_BYTES as u64
         );
+        let unvalidated = StoreLimits {
+            readers: usize::MAX - 1,
+            page_cache_bytes: u64::MAX,
+            ..limits
+        };
+        assert_eq!(unvalidated.page_admission_bytes(), u64::MAX);
+        assert_eq!(unvalidated.admission_bytes(), u64::MAX);
     }
 
     #[test]

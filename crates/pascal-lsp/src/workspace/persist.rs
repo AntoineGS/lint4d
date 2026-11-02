@@ -408,8 +408,9 @@ impl Workspace {
             Ok(Lookup::Miss(_)) => {}
             Err(miss) => return Ok(Reuse::Miss(miss)),
         }
+        let context_key = CacheContextKey::new(&context);
         let headers = match store
-            .find_evidence(&CacheContextKey::new(&context), &local)
+            .find_evidence(&context_key, &local)
             .map_err(PersistError::Store)?
         {
             Lookup::Hit(headers) => headers,
@@ -417,6 +418,7 @@ impl Workspace {
         };
         let mut validator = Validator::new(
             CurrentInputs {
+                context: context_key.digest(),
                 read_policy: context.read_policy(),
                 overlays: &overlays,
                 deleted: &deleted,

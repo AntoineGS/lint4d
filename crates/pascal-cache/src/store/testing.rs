@@ -177,3 +177,19 @@ impl Store {
             .remove(&point);
     }
 }
+
+/// Scratch held by a test until dropped.
+#[derive(Debug)]
+pub struct ScratchHold {
+    _lease: super::reader::ScratchLease,
+}
+
+impl Store {
+    /// Hold `bytes` of the store's scratch budget, or `None` when they do
+    /// not fit.
+    pub fn hold_scratch_for_test(&self, bytes: u64) -> Option<ScratchHold> {
+        self.scratch
+            .reserve(bytes)
+            .map(|lease| ScratchHold { _lease: lease })
+    }
+}

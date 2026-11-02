@@ -1,3 +1,4 @@
+use crate::path::path_bound;
 use crate::{CanonicalEncode, Digest, Encoder, SOURCE_DIGEST_CONTEXT};
 use pascal_core::SourceEncoding;
 use std::path::PathBuf;
@@ -97,5 +98,20 @@ impl CanonicalEncode for SourceIdentity {
         });
         encoder.field(4);
         encoder.option(uri.as_deref(), |encoder, uri| encoder.str(uri));
+    }
+}
+
+impl SourceIdentity {
+    /// An upper bound of this identity's canonical encoding, without
+    /// encoding it (spec §10: admission before allocation).
+    pub(crate) fn encoded_bytes_bound(&self) -> usize {
+        // Four field tags and two option tags.
+        const FIXED: usize = 16;
+        let text = |text: &Option<String>| text.as_ref().map_or(0, |text| 8 + text.len());
+        FIXED
+            .saturating_add(path_bound(&self.canonical))
+            .saturating_add(path_bound(&self.logical))
+            .saturating_add(text(&self.spelling))
+            .saturating_add(text(&self.uri))
     }
 }

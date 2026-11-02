@@ -34,7 +34,9 @@ impl Store {
     /// `(artifact_id, ordinal)` order after `after`, at most `limit`
     /// (clamped to 1..=256). A hit is a candidate only: not membership,
     /// authorization or freshness evidence, and its artifact's rows are
-    /// unverified until read (spec §6.1, §7).
+    /// unverified until read (spec §6.1, §7). Its result is charged to the
+    /// scratch while it is built; a page the caller retains is the caller's
+    /// to admit.
     pub fn find_by_index(
         &self,
         row_kind: u8,
@@ -43,6 +45,13 @@ impl Store {
         limit: usize,
     ) -> Result<IndexPage, Bypass> {
         let limit = limit.clamp(1, MAX_INDEX_PAGE);
+        // The page, charged before it is allocated (spec §10).
+        let Some(_scratch) = self
+            .scratch
+            .reserve(((limit + 1) * std::mem::size_of::<IndexHit>()) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let fail = |error: rusqlite::Error| classify(&error);
         let (after_id, after_ordinal) = match after {
             Some(hit) => (hit.artifact_id.as_bytes().to_vec(), hit.ordinal as i64),

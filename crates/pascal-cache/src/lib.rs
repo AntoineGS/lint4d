@@ -77,8 +77,8 @@ pub use store::{
 #[cfg(feature = "test-support")]
 pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
-pub use store::HeldConnection;
-#[cfg(feature = "test-support")]
 pub use store::INDEX_QUERY_FOR_TEST;
+#[cfg(feature = "test-support")]
+pub use store::{HeldConnection, ScratchHold};
 #[cfg(feature = "test-support")]
 pub use store::{IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY_FOR_TEST};

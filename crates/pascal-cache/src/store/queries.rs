@@ -6,7 +6,7 @@
 //! was read is a miss, never an empty answer (spec §9).
 
 use super::Store;
-use super::limits::MAX_INDEX_PAGE;
+use super::limits::{MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE};
 use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
 use super::snapshots::{SnapshotHeader, SnapshotMember, snapshot_ineligible};
@@ -18,9 +18,10 @@ use std::path::Path;
 
 /// The member of one snapshot with a source key, through the snapshot's
 /// `UNIQUE (snapshot, source_key)` index; the caller has checked the
-/// snapshot is sealed in the same transaction. `pub` only so
+/// snapshot is sealed in the same transaction. The key's length comes
+/// first, so an over-long key is refused before it is read. `pub` only so
 /// `test-support` can re-export it.
-pub const MEMBER_QUERY: &str = "SELECT m.ordinal, m.record_id, m.source_key \
+pub const MEMBER_QUERY: &str = "SELECT m.ordinal, m.record_id, length(m.source_key), m.source_key \
      FROM snapshot_members m CROSS JOIN member_records r \
      WHERE m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.snapshot_id = ?3 \
      AND m.source_key = ?4 \
@@ -60,7 +61,9 @@ pub struct ImporterPage {
 
 impl Store {
     /// The member of `snapshot` whose canonical source path is `source`
-    /// (spec §5 amendment: binding targets resolve this way).
+    /// (spec §5 amendment: binding targets resolve this way). Its result is
+    /// charged to the scratch while it is built; a member the caller
+    /// retains is the caller's to admit.
     pub fn find_member(
         &self,
         snapshot: &SnapshotHeader,
@@ -69,6 +72,13 @@ impl Store {
         if snapshot.scope != self.scope {
             return Err(Bypass::Fenced);
         }
+        // The member and its source key, charged before they are read.
+        let Some(_scratch) = self
+            .scratch
+            .reserve((std::mem::size_of::<SnapshotMember>() + MAX_INDEX_KEY_BYTES) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let mut reader = self.reader()?;
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, self.scope)?;
@@ -88,11 +98,12 @@ impl Store {
                             LIVE
                         ],
                         |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, Vec<u8>>(1)?,
-                                row.get::<_, Vec<u8>>(2)?,
-                            ))
+                            let length = row.get::<_, i64>(2)?;
+                            let source_key = usize::try_from(length)
+                                .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
+                                .then(|| row.get::<_, Vec<u8>>(3))
+                                .transpose()?;
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, source_key))
                         },
                     )
                     .optional()
@@ -102,9 +113,10 @@ impl Store {
             Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
             Err(error) => return classify_read(&error).map(Lookup::Miss),
         };
-        let (Ok(ordinal), Ok(record)) = (
+        let (Ok(ordinal), Ok(record), Some(source_key)) = (
             u64::try_from(ordinal),
             <[u8; 32]>::try_from(record.as_slice()),
+            source_key,
         ) else {
             return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
         };
@@ -119,7 +131,9 @@ impl Store {
     /// path `target`, in `(record_id, binding_ordinal)` order after `after`,
     /// at most `limit` (clamped to 1..=256). Each page checks the snapshot
     /// is still sealed: one retired between pages is a miss, so a caller
-    /// never mistakes a truncated set for every importer.
+    /// never mistakes a truncated set for every importer. Its result is
+    /// charged to the scratch while it is built; a page the caller retains
+    /// is the caller's to admit.
     pub fn find_importers(
         &self,
         snapshot: &SnapshotHeader,
@@ -131,6 +145,13 @@ impl Store {
             return Err(Bypass::Fenced);
         }
         let limit = limit.clamp(1, MAX_INDEX_PAGE);
+        // The page, charged before it is allocated (spec §10).
+        let Some(_scratch) = self
+            .scratch
+            .reserve(((limit + 1) * std::mem::size_of::<ImporterHit>()) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         // No binding ordinal exceeds `i64::MAX`, so a larger (forged) one
         // means "after every binding of this record", never a wrap.
         let (after_record, after_ordinal) = match after {

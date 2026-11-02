@@ -7,9 +7,9 @@ use pascal_cache::{
     ArtifactKeyRef, Bypass, ContextKey, DATABASE_FILE, Digest, DiscoveryInputs, DiscoveryScope,
     EvidenceHeader, EvidencePurpose, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey,
     LocalArtifactKey, Lookup, LookupInputs, LookupKey, LookupKind, MAX_EVIDENCE_CANDIDATES,
-    MAX_EVIDENCE_OBSERVATIONS, Malformed, Mismatch, Miss, Namespace, Observation, Published,
-    PublishedEvidence, ScannedDirectory, SourceContent, Store, StoreLimits, TooLarge,
-    decode_observation, evidence_id, listing_digest,
+    MAX_EVIDENCE_OBSERVATIONS, MAX_ROW_BATCH_BYTES, Malformed, Mismatch, Miss, Namespace,
+    Observation, Published, PublishedEvidence, ScannedDirectory, SourceContent, Store, StoreLimits,
+    TooLarge, decode_observation, evidence_id, listing_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget};
 use pascal_project::{
@@ -662,4 +662,90 @@ fn evidence_opened_by_id_is_checked_against_its_manifests() {
         store.open_evidence(published.evidence_id).unwrap(),
         Lookup::Miss(Miss::Retired)
     );
+}
+
+/// Spec §10: evidence is bounded from its inputs and charged before it is
+/// encoded, for artifact evidence and for binding evidence alike.
+#[test]
+fn evidence_whose_bound_exceeds_the_scratch_is_refused_before_encoding() {
+    let long = Observation::Presence {
+        path: PathBuf::from(format!("/{}", "x".repeat(5000))),
+        entry: None,
+        present: false,
+    };
+    let many = vec![long; 128];
+    let keys = keys("unit A;");
+    let small = private_tempdir();
+    let limited = Store::open(
+        small.path(),
+        &Namespace::new(Digest::from_bytes([5; 32])),
+        StoreLimits {
+            scratch_bytes: MAX_ROW_BATCH_BYTES as u64,
+            ..StoreLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        publish(&limited, &keys, &many),
+        Err(Bypass::ScratchExhausted)
+    );
+    assert_eq!(
+        limited
+            .publish_evidence(
+                EvidenceTarget::Binding(&lookup("a")),
+                &EvidenceWrite {
+                    context: &keys.context,
+                    observations: &many,
+                },
+            )
+            .err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    assert_eq!(limited.scratch_in_use(), 0);
+    let roomy = private_tempdir();
+    let default = store(roomy.path());
+    assert!(matches!(
+        publish(&default, &keys, &many),
+        Err(Bypass::TooLarge(TooLarge::IndexKey { ordinal: 0, .. }))
+    ));
+}
+
+/// Spec §10: the candidate headers are charged to the scratch before their
+/// vector is allocated; with no scratch left the lookups bypass.
+#[test]
+fn evidence_lookups_reserve_their_headers_before_allocating_them() {
+    let directory = private_tempdir();
+    let store = store(directory.path());
+    let keys = keys("unit A;");
+    publish(&store, &keys, &observations()).unwrap();
+    let binding = lookup("a");
+    let write = EvidenceWrite {
+        context: &keys.context,
+        observations: &observations(),
+    };
+    store
+        .publish_evidence(EvidenceTarget::Binding(&binding), &write)
+        .unwrap();
+    let free = store.limits().scratch_bytes - store.scratch_in_use();
+    let hold = store.hold_scratch_for_test(free).unwrap();
+    assert_eq!(
+        store.find_evidence(&keys.context, &keys.root).err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    assert_eq!(
+        store
+            .find_subject_evidence(&keys.context, EvidenceTarget::Binding(&binding))
+            .err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    drop(hold);
+    assert!(matches!(
+        store.find_evidence(&keys.context, &keys.root),
+        Ok(Lookup::Hit(_))
+    ));
+    assert!(matches!(
+        store.find_subject_evidence(&keys.context, EvidenceTarget::Binding(&binding)),
+        Ok(Lookup::Hit(_))
+    ));
+    assert_eq!(store.scratch_in_use(), 0, "nothing stays reserved");
 }

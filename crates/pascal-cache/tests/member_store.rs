@@ -4,12 +4,13 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    artifact, binding_evidence, context, identity, member, open, raw, read_record,
+    NAMESPACE, artifact, binding_evidence, context, identity, member, open, raw, read_record,
 };
 use pascal_cache::{
     Binding, BindingKind, BindingOutcome, Bypass, Digest, DiscoveryInputs, DiscoveryScope,
     EvidenceTarget, EvidenceWrite, IncompleteReason, Integrity, Lookup, MAX_MEMBER_BINDINGS,
-    Malformed, MemberError, MemberHeader, MemberRecord, Miss, Published, PublishedRecord, TooLarge,
+    MAX_ROW_BATCH_BYTES, Malformed, MemberError, MemberHeader, MemberRecord, Miss, Namespace,
+    Published, PublishedRecord, Store, StoreLimits, TooLarge,
 };
 use rusqlite::Connection;
 
@@ -407,4 +408,36 @@ fn a_retired_artifact_or_record_refuses_publication() {
         store.open_member_record(id).unwrap(),
         Lookup::Miss(Miss::Retired)
     );
+}
+
+/// Spec §10: the scratch is reserved from input sizes before anything is
+/// encoded. A record whose bound exceeds the scratch is refused at once;
+/// encoding first would have reached the over-long target key and returned
+/// `TooLarge::IndexKey` instead.
+#[test]
+fn a_record_whose_bound_exceeds_the_scratch_is_refused_before_encoding() {
+    let long = format!("/{}", "x".repeat(5000));
+    let targets = vec![long.as_str(); 128];
+    let record = member("/w/Main.pas", &targets, Digest::from_bytes([1; 32]));
+    let small = private_tempdir();
+    let store = Store::open(
+        small.path(),
+        &Namespace::new(Digest::from_bytes([NAMESPACE; 32])),
+        StoreLimits {
+            scratch_bytes: MAX_ROW_BATCH_BYTES as u64,
+            ..StoreLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store.publish_member_record(&record),
+        Err(Bypass::ScratchExhausted)
+    );
+    assert_eq!(store.scratch_in_use(), 0);
+    let roomy = private_tempdir();
+    let store = open(roomy.path());
+    assert!(matches!(
+        store.publish_member_record(&record),
+        Err(Bypass::TooLarge(TooLarge::IndexKey { ordinal: 0, .. }))
+    ));
 }

@@ -4,10 +4,11 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    binding_evidence, member, open, raw, read_members, read_record, records, sealed,
+    binding_evidence, context, member, open, raw, read_members, read_record, records, sealed,
 };
 use pascal_cache::{
-    Binding, BindingKind, BindingOutcome, ImporterHit, Lookup, Miss, SourceIdentity, Store,
+    Binding, BindingKind, BindingOutcome, Bypass, ImporterHit, Lookup, Malformed, Miss,
+    POSTING_ROW, SourceIdentity, Store, path_key,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -407,4 +408,84 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
     let member = plan(directory.path(), pascal_cache::MEMBER_QUERY_FOR_TEST, 5);
     assert!(!member.contains("SCAN"), "{member}");
     assert!(!member.contains("TEMP B-TREE"), "{member}");
+}
+
+/// Spec §10: a query's result vector is charged to the scratch before it is
+/// allocated; with no scratch left every query bypasses.
+#[test]
+fn queries_reserve_their_results_before_allocating_them() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let header = sealed(&store, &records(&store, "M", 2));
+    let member = Path::new("/w/M0.pas");
+    let free = store.limits().scratch_bytes - store.scratch_in_use();
+    let hold = store.hold_scratch_for_test(free).unwrap();
+    assert_eq!(
+        store.find_member(&header, member).err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    assert_eq!(
+        store.find_importers(&header, member, None, 10).err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    assert_eq!(
+        store.find_by_index(POSTING_ROW, b"m", None, 10).err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    drop(hold);
+    assert!(matches!(
+        store.find_member(&header, member),
+        Ok(Lookup::Hit(_))
+    ));
+    assert!(matches!(
+        store.find_importers(&header, member, None, 10),
+        Ok(Lookup::Hit(_))
+    ));
+    assert!(store.find_by_index(POSTING_ROW, b"m", None, 10).is_ok());
+    assert_eq!(store.scratch_in_use(), 0, "nothing stays reserved");
+}
+
+/// Spec §10: the sealed-snapshot candidates are charged to the scratch
+/// before their vector is allocated.
+#[test]
+fn snapshot_lookups_reserve_their_headers_before_allocating_them() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    sealed(&store, &records(&store, "M", 2));
+    let free = store.limits().scratch_bytes - store.scratch_in_use();
+    let hold = store.hold_scratch_for_test(free).unwrap();
+    assert_eq!(
+        store.find_snapshots(&context()).err(),
+        Some(Bypass::ScratchExhausted)
+    );
+    drop(hold);
+    assert!(matches!(
+        store.find_snapshots(&context()),
+        Ok(Lookup::Hit(_))
+    ));
+    assert_eq!(store.scratch_in_use(), 0, "nothing stays reserved");
+}
+
+/// A stored source key longer than any key the store writes is malformed,
+/// refused from its length before the key is read into memory.
+#[test]
+fn an_over_long_stored_source_key_is_a_malformed_snapshot() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let header = sealed(&store, &records(&store, "M", 2));
+    let long = format!("/{}", "x".repeat(5000));
+    let connection = raw(directory.path());
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE snapshot_members SET source_key = ?1 WHERE source_key = ?2",
+            [path_key(Path::new(&long)), path_key(Path::new("/w/M0.pas"))],
+        )
+        .unwrap();
+    assert_eq!(
+        store.find_member(&header, Path::new(&long)).unwrap(),
+        Lookup::Miss(Miss::Malformed(Malformed::Snapshot))
+    );
 }

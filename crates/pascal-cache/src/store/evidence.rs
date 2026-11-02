@@ -19,7 +19,7 @@ use super::reader::ScratchLease;
 use super::sequence::{Candidates, newest_first, next_publication_seq};
 use super::sqlite::{begin, classify, classify_read};
 use super::stream::{Expected, ManifestReader, RowError, RowSource};
-use crate::evidence::{EvidenceHasher, decode_observation, path_key};
+use crate::evidence::{EvidenceHasher, decode_observation, observations_bound, path_key};
 use crate::facts::{encode_facts, encoded_content_bytes};
 use crate::{
     CanonicalKey, ContextKey, Digest, DiscoveryScope, EvidencePurpose, EvidenceSubject, KeyKind,
@@ -121,15 +121,21 @@ struct EncodedObservation {
     payload: Vec<u8>,
 }
 
-/// Encode and admit every observation before any transaction (spec §10).
-fn encode_observations(
-    observations: &[Observation],
-) -> Result<(Vec<EncodedObservation>, u64), Bypass> {
+/// The count limit, checked before anything is reserved or encoded.
+fn check_observation_count(observations: &[Observation]) -> Result<(), Bypass> {
     if observations.len() > MAX_EVIDENCE_OBSERVATIONS {
         return Err(Bypass::TooLarge(TooLarge::Observations {
             count: observations.len(),
         }));
     }
+    Ok(())
+}
+
+/// Encode and admit every observation before any transaction (spec §10).
+fn encode_observations(
+    observations: &[Observation],
+) -> Result<(Vec<EncodedObservation>, u64), Bypass> {
+    check_observation_count(observations)?;
     let mut encoded = Vec::with_capacity(observations.len());
     let mut content = 0usize;
     for (ordinal, observation) in observations.iter().enumerate() {
@@ -354,7 +360,8 @@ fn header_from(
 impl Store {
     /// Publish an expanded artifact's facts and the evidence that proves
     /// them in one transaction (spec §6.2). Hashing and encoding happen
-    /// before it starts and are charged to the scratch allowance.
+    /// before it starts; their scratch is reserved from input sizes before
+    /// either runs.
     pub fn publish_facts_with_evidence(
         &self,
         key: ArtifactKeyRef<'_>,
@@ -366,15 +373,21 @@ impl Store {
         };
         check_manifest_size(evidence.context.key())?;
         let fact_bytes = encoded_content_bytes(facts).map_err(Bypass::TooLarge)?;
+        check_observation_count(evidence.observations)?;
+        // The facts' size is exact; the evidence is bounded from its inputs.
+        // Both are charged before anything is encoded (spec §10).
+        let Some(mut scratch) = self.scratch.reserve(
+            (fact_bytes as u64).saturating_add(observations_bound(evidence.observations) as u64),
+        ) else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let subject = EvidenceSubject {
             purpose: EvidencePurpose::Artifact,
             context: evidence.context.digest(),
             subject: root.digest(),
         };
         let prepared = prepare_evidence(subject, Some(key.digest()), evidence.observations)?;
-        let Some(_scratch) = self.scratch.reserve(fact_bytes as u64 + prepared.bytes) else {
-            return Err(Bypass::ScratchExhausted);
-        };
+        scratch.shrink_to(fact_bytes as u64 + prepared.bytes);
         let encoded = encode_facts(facts).map_err(Bypass::TooLarge)?;
         let rows = encoded.rows();
         let write = ArtifactWrite {
@@ -408,15 +421,20 @@ impl Store {
     ) -> Result<PublishedSet, Bypass> {
         check_manifest_size(evidence.context.key())?;
         check_manifest_size(target.key())?;
+        check_observation_count(evidence.observations)?;
+        let Some(mut scratch) = self
+            .scratch
+            .reserve(observations_bound(evidence.observations) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let subject = EvidenceSubject {
             purpose: target.purpose(),
             context: evidence.context.digest(),
             subject: target.key().digest(),
         };
         let prepared = prepare_evidence(subject, None, evidence.observations)?;
-        let Some(_scratch) = self.scratch.reserve(prepared.bytes) else {
-            return Err(Bypass::ScratchExhausted);
-        };
+        scratch.shrink_to(prepared.bytes);
         let mut writer = self.writer()?;
         let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
         ensure_live(&transaction, self.scope)?;
@@ -434,6 +452,7 @@ impl Store {
 
     /// The live artifact evidence of `root` under `context`, most recent
     /// first, at most `MAX_EVIDENCE_CANDIDATES`. Observations are unverified.
+    /// The candidates are charged to the scratch while they are built.
     pub fn find_evidence(
         &self,
         context: &ContextKey,
@@ -443,7 +462,8 @@ impl Store {
     }
 
     /// The live binding or discovery evidence of `target` under `context`,
-    /// most recent first, at most `MAX_EVIDENCE_CANDIDATES`.
+    /// most recent first, at most `MAX_EVIDENCE_CANDIDATES`, charged to the
+    /// scratch while they are built.
     pub fn find_subject_evidence(
         &self,
         context: &ContextKey,
@@ -458,6 +478,13 @@ impl Store {
         purpose: EvidencePurpose,
         subject_key: &CanonicalKey,
     ) -> Result<Lookup<Vec<EvidenceHeader>>, Bypass> {
+        // The candidates, charged before they are allocated (spec §10).
+        let Some(_scratch) = self
+            .scratch
+            .reserve((MAX_EVIDENCE_CANDIDATES * std::mem::size_of::<EvidenceHeader>()) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let mut reader = self.reader()?;
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, self.scope)?;

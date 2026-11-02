@@ -35,7 +35,7 @@ impl ScratchBudget {
 
     pub(crate) fn reserve(self: &Arc<Self>, bytes: u64) -> Option<ScratchLease> {
         let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        if *used + bytes > self.limit {
+        if used.saturating_add(bytes) > self.limit {
             return None;
         }
         *used += bytes;

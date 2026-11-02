@@ -73,7 +73,7 @@ pub use limits::{
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
 #[cfg(feature = "test-support")]
-pub use testing::HeldConnection;
+pub use testing::{HeldConnection, ScratchHold};
 
 use crate::Namespace;
 use namespaces::NamespaceLock;

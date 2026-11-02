@@ -2030,6 +2030,183 @@ mod cache_tests {
             Lookup::Compute(_)
         ));
     }
+
+    #[test]
+    fn a_reservation_evicts_unpinned_entries_least_recently_used_first() {
+        let cache = ProjectCache::new(30);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        fill(&cache, "C.pas", &ctx, 1, 10);
+        let reservation = cache
+            .reserve(ReservationKind::Facts, 15)
+            .expect("two evictions make room");
+        assert!(!ready(&cache, "A.pas") && !ready(&cache, "B.pas"));
+        assert!(ready(&cache, "C.pas"), "only what was needed is evicted");
+        let stats = cache.stats();
+        assert_eq!((stats.bytes, stats.reserved_facts_bytes), (10, 15));
+        assert_eq!(reservation.kind(), ReservationKind::Facts);
+        assert_eq!(reservation.bytes(), 15);
+    }
+
+    #[test]
+    fn a_reservation_that_pinned_entries_leave_no_room_for_is_refused_without_evicting() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 5);
+        assert!(cache.reserve(ReservationKind::Pages, 11).is_none());
+        assert!(ready(&cache, "A.pas"), "pinned entries are never evicted");
+        assert!(ready(&cache, "B.pas"), "nothing is evicted for a refusal");
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+        let fits = cache
+            .reserve(ReservationKind::Pages, 10)
+            .expect("B makes room");
+        assert!(ready(&cache, "A.pas") && !ready(&cache, "B.pas"));
+        drop(fits);
+    }
+
+    #[test]
+    fn reservations_shrink_release_on_drop_and_are_totalled_per_kind() {
+        let cache = ProjectCache::new(100);
+        let mut facts = cache.reserve(ReservationKind::Facts, 10).unwrap();
+        let scratch = cache.reserve(ReservationKind::Scratch, 3).unwrap();
+        let pages = cache.reserve(ReservationKind::Pages, 2).unwrap();
+        facts.shrink_to(4);
+        facts.shrink_to(50);
+        assert_eq!(facts.bytes(), 4, "a reservation never grows");
+        let stats = cache.stats();
+        assert_eq!(
+            (
+                stats.reserved_facts_bytes,
+                stats.reserved_scratch_bytes,
+                stats.reserved_pages_bytes,
+                stats.reserved_bytes()
+            ),
+            (4, 3, 2, 9)
+        );
+        drop((facts, scratch, pages));
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn reserved_bytes_count_in_eviction_and_room() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        let reservation = cache.reserve(ReservationKind::Scratch, 15).unwrap();
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        assert!(
+            !ready(&cache, "A.pas"),
+            "a store evicts to fit the reservation"
+        );
+        assert!(cache.has_room());
+        let rest = cache.reserve(ReservationKind::Scratch, 5).unwrap();
+        assert!(!cache.has_room(), "reservations alone fill the budget");
+        drop((reservation, rest));
+        assert!(cache.has_room());
+    }
+
+    #[test]
+    fn a_lower_budget_keeps_held_reservations_and_refuses_new_ones() {
+        let cache = ProjectCache::new(100);
+        let held = cache.reserve(ReservationKind::Facts, 60).unwrap();
+        cache.set_max_bytes(50);
+        assert_eq!(
+            cache.stats().reserved_facts_bytes,
+            60,
+            "held bytes stay charged"
+        );
+        assert!(cache.reserve(ReservationKind::Scratch, 1).is_none());
+        drop(held);
+        assert!(cache.reserve(ReservationKind::Scratch, 1).is_some());
+    }
+
+    #[test]
+    fn leased_parses_evicted_for_a_reservation_stay_outstanding_and_refuse_it() {
+        let cache = ProjectCache::new(15);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        assert!(
+            cache.reserve(ReservationKind::Facts, 10).is_none(),
+            "evicting A moves its charge to outstanding, so nothing fits"
+        );
+        assert!(!ready(&cache, "A.pas"));
+        assert_eq!(cache.stats().outstanding_bytes, 10);
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+        drop((lease, unit));
+        assert!(cache.reserve(ReservationKind::Facts, 10).is_some());
+    }
+
+    #[test]
+    fn poison_recovery_keeps_held_reservations_charged_until_they_drop() {
+        let cache = ProjectCache::new(20);
+        let mut held = cache.reserve(ReservationKind::Pages, 12).unwrap();
+        let other = cache.reserve(ReservationKind::Scratch, 3).unwrap();
+        cache.poison_state();
+        let stats = cache.stats();
+        assert_eq!(
+            (stats.reserved_pages_bytes, stats.reserved_scratch_bytes),
+            (12, 3),
+            "recovery keeps what holders still own"
+        );
+        assert!(cache.reserve(ReservationKind::Facts, 6).is_none());
+        held.shrink_to(5);
+        drop(other);
+        assert_eq!(cache.stats().reserved_bytes(), 5);
+        drop(held);
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+        assert!(cache.reserve(ReservationKind::Facts, 20).is_some());
+    }
+
+    /// Spec §12.1 amendment 2026-11-02: reservations racing eviction. Every
+    /// operation runs under the state lock, so each statistics snapshot
+    /// either thread takes must be within the budget, and the pinned entry
+    /// must still be ready. The barrier only lines the threads up; it does
+    /// not force any particular interleaving, so this is a safety net, not
+    /// a proof.
+    #[test]
+    fn reservations_racing_stores_never_exceed_the_budget() {
+        const MAX: usize = 32;
+        let cache = ProjectCache::new(MAX);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open.pas", &["P.pas"], &ctx);
+        fill(&cache, "P.pas", &ctx, 1, 8);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let within = |cache: &ProjectCache| {
+            let stats = cache.stats();
+            assert!(
+                stats.bytes + stats.outstanding_bytes + stats.reserved_bytes() <= MAX,
+                "{stats:?}"
+            );
+            assert!(ready(cache, "P.pas"), "pinned entries are never evicted");
+        };
+        let reserver = {
+            let cache = cache.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    let reservation = cache.reserve(ReservationKind::Facts, 7);
+                    within(&cache);
+                    drop(reservation);
+                    within(&cache);
+                }
+            })
+        };
+        start.wait();
+        for index in 0..500 {
+            fill(&cache, &format!("U{index}.pas"), &ctx, 1, 5);
+            within(&cache);
+        }
+        reserver.join().unwrap();
+        within(&cache);
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+    }
 }
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
@@ -2247,6 +2424,9 @@ struct State {
     /// Charges of leased parses that no entry holds any more. They stay in
     /// the budget until the last lease drops.
     outstanding_bytes: usize,
+    /// Held reservations by `ReservationKind::index`. Poison recovery keeps
+    /// them: their holders release them on drop.
+    reserved: [usize; ReservationKind::COUNT],
     watch_counts: HashMap<PathBuf, usize>,
     /// Directories whose watch count reached or left zero. `sync_watches`
     /// applies them to the watcher once the state lock is released.
@@ -2279,6 +2459,7 @@ impl Default for State {
             cached_parses: HashMap::new(),
             leases: HashMap::new(),
             outstanding_bytes: 0,
+            reserved: [0; ReservationKind::COUNT],
             watch_counts: HashMap::new(),
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
@@ -2442,6 +2623,109 @@ pub(crate) struct CacheStats {
     /// Bytes of removed values that workers still hold.
     pub outstanding_bytes: usize,
     pub pinned_over_budget: bool,
+    /// Held reservations, per kind (spec §10 amendment 2026-11-02).
+    pub reserved_facts_bytes: usize,
+    pub reserved_scratch_bytes: usize,
+    pub reserved_pages_bytes: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CacheStats {
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reserved_facts_bytes
+            .saturating_add(self.reserved_scratch_bytes)
+            .saturating_add(self.reserved_pages_bytes)
+    }
+}
+
+/// What a reservation charges to `maxCacheBytes` for (spec §10 amendment
+/// 2026-11-02): one budget, not a second one.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ReservationKind {
+    /// Decoded persisted facts a caller keeps.
+    Facts,
+    /// The persistent store's transient decode and encode buffers.
+    Scratch,
+    /// The persistent store's SQLite page caches and connection overhead.
+    Pages,
+}
+
+impl ReservationKind {
+    const COUNT: usize = 3;
+
+    fn index(self) -> usize {
+        match self {
+            Self::Facts => 0,
+            Self::Scratch => 1,
+            Self::Pages => 2,
+        }
+    }
+}
+
+/// Bytes charged to the budget before they are allocated, held until
+/// dropped. Eviction never releases a reservation: what it covers stays
+/// charged for as long as its holder keeps it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Reservation {
+    inner: Arc<Inner>,
+    kind: ReservationKind,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Reservation")
+            .field("kind", &self.kind)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Reservation {
+    pub(crate) fn kind(&self) -> ReservationKind {
+        self.kind
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Keep only `bytes` (a reservation never grows).
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        let mut state = lock(&self.inner);
+        let reserved = &mut state.reserved[self.kind.index()];
+        *reserved = reserved.saturating_sub(self.bytes - bytes);
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut state = lock(&self.inner);
+        let reserved = &mut state.reserved[self.kind.index()];
+        *reserved = reserved.saturating_sub(self.bytes);
+    }
+}
+
+fn reserved_bytes(state: &State) -> usize {
+    state
+        .reserved
+        .iter()
+        .fold(0usize, |total, bytes| total.saturating_add(*bytes))
+}
+
+/// Whether `retained` plus everything outstanding and reserved, plus
+/// `request`, fits the budget.
+fn fits(state: &State, retained: usize, request: usize) -> bool {
+    retained
+        .checked_add(state.outstanding_bytes)
+        .and_then(|total| total.checked_add(reserved_bytes(state)))
+        .and_then(|total| total.checked_add(request))
+        .is_some_and(|total| total <= state.max_bytes)
 }
 
 fn recover_poisoned_state<'a>(
@@ -2524,12 +2808,48 @@ impl ProjectCache {
         cache
     }
 
+    /// Evicts to the new budget at once. Held reservations and leased
+    /// outstanding bytes stay charged; new reservations that do not fit
+    /// are refused until they are released.
     #[allow(dead_code)]
     pub(crate) fn set_max_bytes(&self, max_bytes: usize) {
         let mut state = lock(&self.inner);
         state.max_bytes = max_bytes;
         evict_to_budget(&mut state);
         self.release(state);
+    }
+
+    /// Charge `bytes` of `kind` before allocating them (spec §10 amendment
+    /// 2026-11-02): evict unpinned entries, least recently used first, until
+    /// retained, outstanding and reserved bytes plus `bytes` fit
+    /// `maxCacheBytes`, or refuse. Pinned entries are never evicted for a
+    /// reservation, so when pinned, outstanding and reserved bytes alone
+    /// leave no room nothing is evicted. Evicting an entry whose parse a
+    /// request leases moves its charge to outstanding, so a reservation can
+    /// still be refused after evicting.
+    pub(crate) fn reserve(&self, kind: ReservationKind, bytes: usize) -> Option<Reservation> {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        if !fits(&state, state.pinned_bytes, bytes) {
+            self.release(state);
+            return None;
+        }
+        while !fits(&state, state.bytes, bytes) {
+            let Some((_, key)) = state.lru.pop_first() else {
+                self.release(state);
+                return None;
+            };
+            #[cfg(test)]
+            note_examined(&state);
+            remove_ready(&mut state, &key);
+        }
+        state.reserved[kind.index()] += bytes;
+        self.release(state);
+        Some(Reservation {
+            inner: Arc::clone(&self.inner),
+            kind,
+            bytes,
+        })
     }
 
     /// Releases the state lock, then applies the watch changes it queued.
@@ -3550,7 +3870,12 @@ fn prune_dead_leases(state: &mut State) {
 
 fn evict_to_budget(state: &mut State) {
     prune_dead_leases(state);
-    while state.bytes.saturating_add(state.outstanding_bytes) > state.max_bytes {
+    while state
+        .bytes
+        .saturating_add(state.outstanding_bytes)
+        .saturating_add(reserved_bytes(state))
+        > state.max_bytes
+    {
         let Some((_, key)) = state.lru.pop_first() else {
             return;
         };
@@ -3864,7 +4189,11 @@ impl ProjectCache {
     pub(crate) fn has_room(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        state.pinned_bytes.saturating_add(state.outstanding_bytes) < state.max_bytes
+        state
+            .pinned_bytes
+            .saturating_add(state.outstanding_bytes)
+            .saturating_add(reserved_bytes(&state))
+            < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -3887,6 +4216,9 @@ impl ProjectCache {
             bytes: state.bytes,
             outstanding_bytes: state.outstanding_bytes,
             pinned_over_budget: state.pinned_bytes > state.max_bytes,
+            reserved_facts_bytes: state.reserved[ReservationKind::Facts.index()],
+            reserved_scratch_bytes: state.reserved[ReservationKind::Scratch.index()],
+            reserved_pages_bytes: state.reserved[ReservationKind::Pages.index()],
         }
     }
 

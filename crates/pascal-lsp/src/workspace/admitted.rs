@@ -40,8 +40,9 @@ impl std::fmt::Debug for AdmittedStore {
 
 impl AdmittedStore {
     /// Reserve `limits.page_admission_bytes()` as `Pages` and
-    /// `limits.scratch_bytes` as `Scratch`, then open the store. Invalid
-    /// limits reserve nothing; a failed open releases both reservations.
+    /// `limits.scratch_bytes` as `Scratch` together, evicting nothing unless
+    /// both fit, then open the store. Invalid limits reserve nothing; a
+    /// failed open releases both reservations.
     pub(crate) fn open(
         cache: &ProjectCache,
         directory: &Path,
@@ -52,15 +53,17 @@ impl AdmittedStore {
             .validate()
             .map_err(|error| StoreBypass::Store(Bypass::InvalidLimits(error)))?;
         let bytes = |bytes: u64| usize::try_from(bytes).map_err(|_| StoreBypass::Memory);
-        let pages = cache
-            .reserve(
-                ReservationKind::Pages,
-                bytes(limits.page_admission_bytes())?,
-            )
+        let reservations = cache
+            .reserve_all(&[
+                (
+                    ReservationKind::Pages,
+                    bytes(limits.page_admission_bytes())?,
+                ),
+                (ReservationKind::Scratch, bytes(limits.scratch_bytes)?),
+            ])
             .ok_or(StoreBypass::Memory)?;
-        let scratch = cache
-            .reserve(ReservationKind::Scratch, bytes(limits.scratch_bytes)?)
-            .ok_or(StoreBypass::Memory)?;
+        let [pages, scratch] =
+            <[Reservation; 2]>::try_from(reservations).expect("one reservation per request");
         let store = Store::open(directory, namespace, limits).map_err(StoreBypass::Store)?;
         Ok(Self {
             store,
@@ -81,9 +84,15 @@ impl std::ops::Deref for AdmittedStore {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::project_cache::{ImportValue, Lookup};
     use crate::workspace::persist::tests::private_dir;
+    use lsp_types::Url;
     use pascal_cache::{DATABASE_FILE, Digest, LocationIssue, MAX_ROW_BATCH_BYTES};
+    use pascal_project::ProjectContext;
+    use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn namespace() -> Namespace {
         Namespace::new(Digest::from_bytes([11; 32]))
@@ -132,6 +141,53 @@ mod tests {
             ..limits
         };
         assert!(AdmittedStore::open(&cache, directory.path(), &namespace(), small).is_ok());
+    }
+
+    /// Pages alone fit only by evicting the cached entry; Pages and Scratch
+    /// together never fit, so the open refuses before evicting anything.
+    #[test]
+    fn a_store_whose_scratch_does_not_fit_evicts_nothing() {
+        let limits = StoreLimits::default();
+        let cache = ProjectCache::new(limits.page_admission_bytes() as usize + 1);
+        let importer = Url::from_file_path("/ws/Main.pas").unwrap();
+        let no_cancel = AtomicBool::new(false);
+        let Lookup::Compute(claim) = cache.imports(
+            &importer,
+            &ProjectContext::default(),
+            1,
+            &HashMap::new(),
+            &no_cancel,
+        ) else {
+            panic!("an empty cache misses");
+        };
+        let value = ImportValue {
+            resolved: Arc::new(pascal_core::ResolvedImports {
+                bindings: vec![],
+                dependencies: vec![],
+                complete: true,
+            }),
+            report: Arc::new(pascal_core::ResolutionReport {
+                observations: vec![],
+                warnings: vec![],
+                complete: true,
+                incomplete_reasons: vec![],
+            }),
+            probes: vec![],
+            watch_dirs: vec![],
+        };
+        cache.store_imports(claim, value, 100, &no_cancel);
+        assert_eq!(cache.ready_layers(&importer), ["Import"]);
+        let directory = private_dir();
+        assert_eq!(
+            AdmittedStore::open(&cache, directory.path(), &namespace(), limits).err(),
+            Some(StoreBypass::Memory)
+        );
+        assert_eq!(
+            cache.ready_layers(&importer),
+            ["Import"],
+            "nothing was evicted"
+        );
+        assert_eq!(cache.stats().reserved_bytes(), 0);
     }
 
     #[test]

@@ -2108,6 +2108,38 @@ mod cache_tests {
     }
 
     #[test]
+    fn reserving_several_kinds_is_all_or_nothing_and_evicts_only_when_all_fit() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 5);
+        assert!(
+            cache
+                .reserve_all(&[(ReservationKind::Pages, 12), (ReservationKind::Scratch, 9)])
+                .is_none(),
+            "the two do not fit together"
+        );
+        assert!(ready(&cache, "A.pas"), "nothing was evicted");
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+        let held = cache
+            .reserve_all(&[(ReservationKind::Pages, 12), (ReservationKind::Scratch, 8)])
+            .unwrap();
+        assert!(!ready(&cache, "A.pas"), "evicted to fit both");
+        assert_eq!(
+            held.iter()
+                .map(|reservation| (reservation.kind(), reservation.bytes()))
+                .collect::<Vec<_>>(),
+            [(ReservationKind::Pages, 12), (ReservationKind::Scratch, 8)]
+        );
+        let stats = cache.stats();
+        assert_eq!(
+            (stats.reserved_pages_bytes, stats.reserved_scratch_bytes),
+            (12, 8)
+        );
+        drop(held);
+        assert_eq!(cache.stats().reserved_bytes(), 0);
+    }
+
+    #[test]
     fn a_lower_budget_keeps_held_reservations_and_refuses_new_ones() {
         let cache = ProjectCache::new(100);
         let held = cache.reserve(ReservationKind::Facts, 60).unwrap();
@@ -2833,13 +2865,27 @@ impl ProjectCache {
     /// request leases moves its charge to outstanding, so a reservation can
     /// still be refused after evicting.
     pub(crate) fn reserve(&self, kind: ReservationKind, bytes: usize) -> Option<Reservation> {
+        self.reserve_all(&[(kind, bytes)])?.pop()
+    }
+
+    /// `reserve` for several kinds at once, under one lock: their total is
+    /// checked and made room for as one request, so nothing is evicted
+    /// unless all of them fit, and either every reservation is made, in
+    /// `requests` order, or none.
+    pub(crate) fn reserve_all(
+        &self,
+        requests: &[(ReservationKind, usize)],
+    ) -> Option<Vec<Reservation>> {
+        let total = requests
+            .iter()
+            .try_fold(0usize, |total, (_, bytes)| total.checked_add(*bytes))?;
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        if !fits(&state, state.pinned_bytes, bytes) {
+        if !fits(&state, state.pinned_bytes, total) {
             self.release(state);
             return None;
         }
-        while !fits(&state, state.bytes, bytes) {
+        while !fits(&state, state.bytes, total) {
             let Some((_, key)) = state.lru.pop_first() else {
                 self.release(state);
                 return None;
@@ -2848,13 +2894,20 @@ impl ProjectCache {
             note_examined(&state);
             remove_ready(&mut state, &key);
         }
-        state.reserved[kind.index()] += bytes;
+        for &(kind, bytes) in requests {
+            state.reserved[kind.index()] += bytes;
+        }
         self.release(state);
-        Some(Reservation {
-            inner: Arc::clone(&self.inner),
-            kind,
-            bytes,
-        })
+        Some(
+            requests
+                .iter()
+                .map(|&(kind, bytes)| Reservation {
+                    inner: Arc::clone(&self.inner),
+                    kind,
+                    bytes,
+                })
+                .collect(),
+        )
     }
 
     /// Releases the state lock, then applies the watch changes it queued.

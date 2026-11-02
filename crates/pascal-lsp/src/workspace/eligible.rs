@@ -368,8 +368,8 @@ pub(in crate::workspace) mod tests {
     };
     use crate::workspace::persist::tests::{PROVIDER_MAIN, SHAPES, open_store, private_dir};
     use pascal_cache::{
-        BindingKind, BindingOutcome, CoverageStatus, DiscoveryInputs, Lookup, LookupInputs,
-        LookupKind, Published, ScannedDirectory,
+        BindingKind, BindingOutcome, CoverageStatus, DiscoveryInputs, IncompleteReason, Lookup,
+        LookupInputs, LookupKind, Published, ScannedDirectory,
     };
     use pascal_project::ProjectPathEntry;
     use std::path::Path;
@@ -760,11 +760,123 @@ pub(in crate::workspace) mod tests {
             .workspace
             .eligible_member(&other.uri("A.pas"), draft(), &mut budget(), &no_cancel())
             .unwrap();
+        let stranger_path = stranger.value().header.source.canonical.clone();
         let mut extra = members;
         extra.push(stranger);
-        assert!(matches!(
-            check(extra),
-            Some(Ineligible::UnexpectedMember(_) | Ineligible::OtherContext(_))
-        ));
+        assert_eq!(check(extra), Some(Ineligible::OtherContext(stranger_path)));
+    }
+
+    #[test]
+    fn a_member_of_this_context_outside_the_derived_membership_is_unexpected() {
+        let mut indexed = units_a_and_b(&[], &["A.pas", "B.pas"]);
+        let (a, b) = (indexed.uri("A.pas"), indexed.uri("B.pas"));
+        let key = indexed.workspace.document_contexts[&a].clone();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let members = eligible_members(&indexed.workspace, &store, &key);
+        // B is checked under the context, then the workspace stops holding
+        // it: its member is the context's own but no longer a document.
+        indexed.workspace.document_contexts.remove(&b);
+        let result = indexed.workspace.eligible_snapshot(
+            &key,
+            SnapshotDraft {
+                members,
+                discovery: discovery(&indexed.root),
+                coverage: COMPLETE,
+            },
+        );
+        assert_eq!(
+            result.err(),
+            Some(Ineligible::UnexpectedMember(indexed.root.join("B.pas")))
+        );
+    }
+
+    fn incomplete_binding(occurrence: u64, evidence: Option<Digest>) -> Binding {
+        Binding {
+            kind: BindingKind::Import,
+            occurrence,
+            outcome: BindingOutcome::Incomplete(IncompleteReason::Unsupported),
+            evidence,
+        }
+    }
+
+    #[test]
+    fn a_capture_for_a_binding_without_evidence_is_refused_at_its_ordinal() {
+        let indexed = units_a_and_b(&[], &["A.pas"]);
+        let lookup = LookupKey::new(&LookupInputs {
+            kind: LookupKind::Unit,
+            normalized_name: "b",
+            path_expression: None,
+            importer_directory: None,
+        });
+        let captured = listing_capture(&indexed.root, |_| {}, false).unwrap();
+        let draft = MemberDraft {
+            bindings: vec![
+                CheckedBinding {
+                    binding: incomplete_binding(0, None),
+                    proof: None,
+                },
+                CheckedBinding {
+                    binding: incomplete_binding(1, None),
+                    proof: Some((lookup, captured)),
+                },
+            ],
+            ..draft()
+        };
+        assert_eq!(
+            indexed
+                .workspace
+                .eligible_member(&indexed.uri("A.pas"), draft, &mut budget(), &no_cancel())
+                .err(),
+            Some(Ineligible::BindingEvidence { ordinal: 1 })
+        );
+    }
+
+    #[test]
+    fn a_record_the_store_format_rejects_is_ineligible() {
+        let indexed = units_a_and_b(&[], &["A.pas"]);
+        let target = |name: &str| SourceIdentity {
+            canonical: indexed.root.join(name),
+            logical: indexed.root.join(name),
+            spelling: None,
+            uri: None,
+        };
+        let lookup = LookupKey::new(&LookupInputs {
+            kind: LookupKind::Unit,
+            normalized_name: "b",
+            path_expression: None,
+            importer_directory: None,
+        });
+        let captured = listing_capture(&indexed.root, |_| {}, false).unwrap();
+        let uri = indexed.uri("A.pas");
+        let workspace = &indexed.workspace;
+        let context =
+            CacheContextKey::new(&workspace.contexts[&workspace.document_contexts[&uri]].context);
+        let proven = evidence_id(
+            &subject(EvidencePurpose::Binding, &context, lookup.key().digest()),
+            None,
+            captured.observations(),
+        );
+        let draft = MemberDraft {
+            bindings: vec![CheckedBinding {
+                binding: Binding {
+                    kind: BindingKind::Import,
+                    occurrence: 0,
+                    outcome: BindingOutcome::Ambiguous {
+                        candidates: vec![target("B.pas")],
+                        overflow: false,
+                    },
+                    evidence: Some(proven),
+                },
+                proof: Some((lookup, captured)),
+            }],
+            ..draft()
+        };
+        assert_eq!(
+            workspace
+                .eligible_member(&uri, draft, &mut budget(), &no_cancel())
+                .err(),
+            Some(Ineligible::Record(MemberError::Candidates { ordinal: 0 }))
+        );
     }
 }

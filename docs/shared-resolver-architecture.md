@@ -354,9 +354,11 @@ reported with the cache statistics:
   decoding, keeps what decoding used and holds that charge for as long as the
   facts live, also after eviction.
 - **Scratch**: the store's transient encode/decode buffers (16 MiB at most,
-  `persistentCacheScratchBytes` once `l4d-zf1b.11` adds the option). Inside
-  the store, record and evidence encodings and query result pages reserve
-  from it first, from an upper bound computed from their inputs.
+  `persistentCacheScratchBytes` once `l4d-zf1b.11` adds the option).
+  `AdmittedStore` reserves this budget from `maxCacheBytes` up front, not
+  from `ProjectCache` per use. Inside the store, record and evidence
+  encodings and query result pages reserve from that scratch budget first,
+  from an upper bound computed from their inputs.
 - **Pages**: the SQLite page caches (16 MiB aggregate) plus a fixed overhead
   allowance of 1 MiB per connection (2 readers and 1 writer). A store is
   opened only through `AdmittedStore`, which reserves Pages and Scratch first

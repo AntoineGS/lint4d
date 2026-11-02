@@ -120,6 +120,11 @@ mod tests {
             !directory.path().join(DATABASE_FILE).exists(),
             "no connection was opened"
         );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "nothing was created in the cache directory"
+        );
         assert_eq!(cache.stats().reserved_bytes(), 0);
         // Smaller limits fit the same budget.
         let small = StoreLimits {

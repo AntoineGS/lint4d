@@ -675,15 +675,54 @@ pub(in crate::workspace) mod tests {
         ));
     }
 
+    type Fixture = (&'static [(&'static str, &'static [u8])], &'static str);
+
+    /// A source that persists under its local key, and one that only
+    /// persists under evidence (a provider-dependent source).
+    const FIXTURES: [Fixture; 2] = [
+        (&[("Cond.pas", CONDITIONAL)], "Cond.pas"),
+        (
+            &[("Main.pas", PROVIDER_MAIN), ("Shapes.pas", SHAPES)],
+            "Main.pas",
+        ),
+    ];
+
+    /// What decoding `name`'s stored artifact uses, loaded straight from the
+    /// store under its local key, else through its evidence.
+    fn decode_use(indexed: &Indexed, name: &str, store: &Store) -> usize {
+        let source = indexed.facts(name);
+        let bytes = std::fs::read(indexed.root.join(name)).unwrap();
+        let local = LocalArtifactKey::new(
+            &SourceContent::from_bytes(&bytes),
+            &source.extracted.conditional_context,
+            source.origin,
+        );
+        let mut budget = FactBudget::new(DECODE_LIMIT);
+        if let Lookup::Hit(_) = store
+            .load_facts(ArtifactKeyRef::local(&local), &mut budget)
+            .unwrap()
+        {
+            return budget.used();
+        }
+        let context = &indexed.workspace.contexts
+            [&indexed.workspace.document_contexts[&indexed.uri(name)]]
+            .context;
+        let Lookup::Hit(headers) = store
+            .find_evidence(&CacheContextKey::new(context), &local)
+            .unwrap()
+        else {
+            panic!("{name}: neither a local artifact nor evidence")
+        };
+        let artifact = headers[0].artifact_id().unwrap();
+        let Lookup::Hit(_) = store.load_facts_by_id(artifact, &mut budget).unwrap() else {
+            panic!("{name}: the evidence names a stored artifact")
+        };
+        budget.used()
+    }
+
     #[test]
     fn a_hit_is_charged_to_the_cache_until_its_facts_drop() {
-        for (files, name) in [
-            (&[("Cond.pas", CONDITIONAL)][..], "Cond.pas"),
-            (
-                &[("Main.pas", PROVIDER_MAIN), ("Shapes.pas", SHAPES)][..],
-                "Main.pas",
-            ),
-        ] {
+        for (files, name) in FIXTURES {
             let indexed = index(files, &[name]);
             let directory = private_dir();
             let store = open_store(directory.path());
@@ -696,9 +735,11 @@ pub(in crate::workspace) mod tests {
                 panic!("{name}: the persisted facts are reused")
             };
             let charged = facts.charge.bytes();
-            assert!(
-                charged > 0 && charged < DECODE_LIMIT,
-                "{name}: shrunk to what was used: {charged}"
+            assert!(charged > 0, "{name}");
+            assert_eq!(
+                charged,
+                decode_use(&indexed, name, &store),
+                "{name}: shrunk to what decoding used"
             );
             assert_eq!(cache.stats().reserved_facts_bytes, charged, "{name}");
             cache.set_max_bytes(1);
@@ -735,18 +776,39 @@ pub(in crate::workspace) mod tests {
 
     #[test]
     fn facts_over_the_decode_limit_are_a_memory_miss() {
+        for (files, name) in FIXTURES {
+            let indexed = index(files, &[name]);
+            let directory = private_dir();
+            let store = open_store(directory.path());
+            persist(&indexed, name, &store);
+            let mut restarted = restart(&indexed);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let work = ReconciliationBudget::new(Arc::clone(&cancel));
+            assert_eq!(
+                restarted.reuse_persisted_facts(&indexed.uri(name), &store, &work, 16, &cancel),
+                Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory))),
+                "{name}"
+            );
+            assert_eq!(
+                restarted.project_cache.stats().reserved_bytes(),
+                0,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_discovery_failure_is_still_an_error() {
         let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
         let directory = private_dir();
         let store = open_store(directory.path());
-        persist(&indexed, "Cond.pas", &store);
+        std::fs::write(indexed.root.join("Notes.txt"), b"notes").unwrap();
         let mut restarted = restart(&indexed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let work = ReconciliationBudget::new(Arc::clone(&cancel));
-        assert_eq!(
-            restarted.reuse_persisted_facts(&indexed.uri("Cond.pas"), &store, &work, 16, &cancel),
-            Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)))
+        let result = reuse(&mut restarted, &indexed.uri("Notes.txt"), &store);
+        assert!(
+            matches!(&result, Err(PersistError::Context(message)) if message.contains("unsupported Pascal document path")),
+            "{result:?}"
         );
-        assert_eq!(restarted.project_cache.stats().reserved_bytes(), 0);
     }
 }
 

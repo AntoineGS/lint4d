@@ -2191,7 +2191,9 @@ mod cache_tests {
             std::thread::spawn(move || {
                 start.wait();
                 for _ in 0..500 {
-                    let reservation = cache.reserve(ReservationKind::Facts, 7);
+                    let reservation = cache
+                        .reserve(ReservationKind::Facts, 7)
+                        .expect("pinned 8 + 7 fits 32");
                     within(&cache);
                     drop(reservation);
                     within(&cache);
@@ -2622,6 +2624,7 @@ pub(crate) struct CacheStats {
     pub bytes: usize,
     /// Bytes of removed values that workers still hold.
     pub outstanding_bytes: usize,
+    /// Pinned bytes alone exceed the budget; reserved and outstanding bytes are reported separately.
     pub pinned_over_budget: bool,
     /// Held reservations, per kind (spec §10 amendment 2026-11-02).
     pub reserved_facts_bytes: usize,
@@ -2665,7 +2668,9 @@ impl ReservationKind {
 
 /// Bytes charged to the budget before they are allocated, held until
 /// dropped. Eviction never releases a reservation: what it covers stays
-/// charged for as long as its holder keeps it.
+/// charged for as long as its holder keeps it. It must never be stored in
+/// `State` or an `Entry`: dropping it takes the state lock, which is not
+/// reentrant, so dropping it under that lock would deadlock.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Reservation {
     inner: Arc<Inner>,

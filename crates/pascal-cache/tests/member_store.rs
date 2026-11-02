@@ -440,4 +440,9 @@ fn a_record_whose_bound_exceeds_the_scratch_is_refused_before_encoding() {
         store.publish_member_record(&record),
         Err(Bypass::TooLarge(TooLarge::IndexKey { ordinal: 0, .. }))
     ));
+    assert_eq!(
+        store.scratch_in_use(),
+        0,
+        "the refusal releases its scratch"
+    );
 }

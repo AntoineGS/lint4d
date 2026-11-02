@@ -13,15 +13,17 @@ use super::snapshots::{SnapshotHeader, SnapshotMember, snapshot_ineligible};
 use super::sqlite::{begin, classify_read};
 use crate::Digest;
 use crate::evidence::path_key;
+use crate::path::path_bound;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 
 /// The member of one snapshot with a source key, through the snapshot's
 /// `UNIQUE (snapshot, source_key)` index; the caller has checked the
-/// snapshot is sealed in the same transaction. The key's length comes
-/// first, so an over-long key is refused before it is read. `pub` only so
-/// `test-support` can re-export it.
-pub const MEMBER_QUERY: &str = "SELECT m.ordinal, m.record_id, length(m.source_key), m.source_key \
+/// snapshot is sealed in the same transaction. The record ID's and the
+/// key's lengths come first, so an over-long one is refused before it is
+/// read. `pub` only so `test-support` can re-export it.
+pub const MEMBER_QUERY: &str = "SELECT m.ordinal, length(m.record_id), m.record_id, \
+     length(m.source_key), m.source_key \
      FROM snapshot_members m CROSS JOIN member_records r \
      WHERE m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.snapshot_id = ?3 \
      AND m.source_key = ?4 \
@@ -31,9 +33,10 @@ pub const MEMBER_QUERY: &str = "SELECT m.ordinal, m.record_id, length(m.source_k
 /// Precise bindings to a target key whose record is a member of one
 /// snapshot (checked sealed by the caller), keyset-paginated over
 /// `(record_id, ordinal)`. Retired records are excluded, as `read_snapshot`
-/// treats them as a miss. `CROSS JOIN` pins the order:
+/// treats them as a miss. The record ID's length comes first, as in
+/// `MEMBER_QUERY`. `CROSS JOIN` pins the order:
 /// `member_bindings_by_target` drives and serves the sort.
-pub const IMPORTERS_QUERY: &str = "SELECT b.record_id, b.ordinal, m.ordinal \
+pub const IMPORTERS_QUERY: &str = "SELECT length(b.record_id), b.record_id, b.ordinal, m.ordinal \
      FROM member_bindings b CROSS JOIN snapshot_members m CROSS JOIN member_records r \
      WHERE b.namespace_id = ?1 AND b.reset_epoch = ?2 AND b.target_key = ?4 \
      AND (b.record_id, b.ordinal) > (?5, ?6) \
@@ -72,6 +75,9 @@ impl Store {
         if snapshot.scope != self.scope {
             return Err(Bypass::Fenced);
         }
+        if over_long(source) {
+            return Ok(Lookup::Miss(Miss::Absent));
+        }
         // The member and its source key, charged before they are read.
         let Some(_scratch) = self
             .scratch
@@ -98,12 +104,13 @@ impl Store {
                             LIVE
                         ],
                         |row| {
-                            let length = row.get::<_, i64>(2)?;
+                            let record = record_id(row, 1)?;
+                            let length = row.get::<_, i64>(3)?;
                             let source_key = usize::try_from(length)
                                 .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
-                                .then(|| row.get::<_, Vec<u8>>(3))
+                                .then(|| row.get::<_, Vec<u8>>(4))
                                 .transpose()?;
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, source_key))
+                            Ok((row.get::<_, i64>(0)?, record, source_key))
                         },
                     )
                     .optional()
@@ -113,11 +120,9 @@ impl Store {
             Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
             Err(error) => return classify_read(&error).map(Lookup::Miss),
         };
-        let (Ok(ordinal), Ok(record), Some(source_key)) = (
-            u64::try_from(ordinal),
-            <[u8; 32]>::try_from(record.as_slice()),
-            source_key,
-        ) else {
+        let (Ok(ordinal), Some(record), Some(source_key)) =
+            (u64::try_from(ordinal), record, source_key)
+        else {
             return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
         };
         Ok(Lookup::Hit(SnapshotMember {
@@ -143,6 +148,9 @@ impl Store {
     ) -> Result<Lookup<ImporterPage>, Bypass> {
         if snapshot.scope != self.scope {
             return Err(Bypass::Fenced);
+        }
+        if over_long(target) {
+            return Ok(Lookup::Miss(Miss::Absent));
         }
         let limit = limit.clamp(1, MAX_INDEX_PAGE);
         // The page, charged before it is allocated (spec §10).
@@ -185,9 +193,9 @@ impl Store {
             ],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
+                    record_id(row, 0)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         );
@@ -201,8 +209,8 @@ impl Store {
                 Ok(row) => row,
                 Err(error) => return read(error),
             };
-            let (Ok(record), Ok(binding_ordinal), Ok(member_ordinal)) = (
-                <[u8; 32]>::try_from(record.as_slice()),
+            let (Some(record), Ok(binding_ordinal), Ok(member_ordinal)) = (
+                record,
                 u64::try_from(binding_ordinal),
                 u64::try_from(member_ordinal),
             ) else {
@@ -222,4 +230,19 @@ impl Store {
         };
         Ok(Lookup::Hit(ImporterPage { hits, next }))
     }
+}
+
+/// Whether `path`'s key would exceed any key the store writes, from its
+/// bound, so no key is built for a path that cannot be stored.
+fn over_long(path: &Path) -> bool {
+    path_bound(path) > MAX_INDEX_KEY_BYTES
+}
+
+/// The record ID after its length at `length`, the length read first: an
+/// ID of any other length is `None` and never loaded.
+fn record_id(row: &rusqlite::Row<'_>, length: usize) -> rusqlite::Result<Option<[u8; 32]>> {
+    if row.get::<_, i64>(length)? != 32 {
+        return Ok(None);
+    }
+    Ok(<[u8; 32]>::try_from(row.get::<_, Vec<u8>>(length + 1)?.as_slice()).ok())
 }

@@ -360,8 +360,8 @@ impl MemberRecord {
     }
 
     /// An upper bound of what `Store::publish_member_record` encodes and
-    /// charges (the header, every binding payload and every precise target
-    /// key), from input sizes alone, so the scratch is reserved before any
+    /// charges (the header, the source key, every binding payload and every
+    /// precise target key), from input sizes alone, so the scratch is reserved before any
     /// encoding (spec §10).
     pub(crate) fn encoded_bytes_bound(&self) -> usize {
         // Tags, digests, options, coverage and the ambiguous count: under
@@ -369,6 +369,7 @@ impl MemberRecord {
         const FIXED: usize = 128;
         let header = FIXED
             .saturating_add(self.header.source.encoded_bytes_bound())
+            .saturating_add(path_bound(&self.header.source.canonical))
             .saturating_add(
                 self.header
                     .fallback_unit_name
@@ -431,10 +432,11 @@ mod bound_tests {
         }
     }
 
-    /// What `Store::publish_member_record` charges: the encoded header, each
-    /// binding payload and each precise target's path key.
+    /// What `Store::publish_member_record` charges: the encoded header, the
+    /// source key, each binding payload and each precise target's path key.
     fn encoded_bytes(record: &MemberRecord) -> usize {
         record.header.encoded().len()
+            + path_key(&record.header.source.canonical).len()
             + record
                 .bindings
                 .iter()
@@ -514,6 +516,14 @@ mod bound_tests {
                     Some("M"),
                 ),
                 bindings,
+            },
+            MemberRecord {
+                header: header(
+                    identity(&format!("/w/{}.pas", "M".repeat(2048)), None, None),
+                    None,
+                    None,
+                ),
+                bindings: Vec::new(),
             },
         ] {
             let bound = record.encoded_bytes_bound();

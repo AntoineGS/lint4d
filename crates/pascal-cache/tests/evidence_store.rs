@@ -708,6 +708,11 @@ fn evidence_whose_bound_exceeds_the_scratch_is_refused_before_encoding() {
         publish(&default, &keys, &many),
         Err(Bypass::TooLarge(TooLarge::IndexKey { ordinal: 0, .. }))
     ));
+    assert_eq!(
+        default.scratch_in_use(),
+        0,
+        "the refusal releases its scratch"
+    );
 }
 
 /// Spec §10: the candidate headers are charged to the scratch before their

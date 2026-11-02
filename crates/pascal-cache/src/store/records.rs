@@ -322,7 +322,9 @@ impl Store {
             return Err(Bypass::ScratchExhausted);
         };
         let encoded = encode_record(record)?;
-        scratch.shrink_to(encoded.header.len() as u64 + encoded.content_bytes);
+        scratch.shrink_to(
+            (encoded.header.len() + encoded.source_key.len()) as u64 + encoded.content_bytes,
+        );
         let expected = expected_row(record, &encoded);
         let fail = |error: rusqlite::Error| classify(&error);
         let mut writer = self.writer()?;

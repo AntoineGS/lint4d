@@ -343,6 +343,54 @@ per-file `Indexing <file stem>` progress tokens (`<done>/<total> units`).
 pinned entries (open files and their direct imports) are not evicted and may
 exceed it. If they do, warming pauses and one warning is logged.
 
+### Persistent cache memory
+
+The persistent analysis cache (`pascal-cache`) does not add a second memory
+budget: everything it keeps in RAM is reserved from `maxCacheBytes` before it
+is allocated (`ProjectCache::reserve`). Three kinds of reservation are
+reported with the cache statistics:
+
+- **Facts**: decoded persisted facts. Reuse reserves its decode limit before
+  decoding, keeps what decoding used and holds that charge for as long as the
+  facts live, also after eviction.
+- **Scratch**: the store's transient encode/decode buffers (16 MiB at most,
+  `persistentCacheScratchBytes` once `l4d-zf1b.11` adds the option). Inside
+  the store, record and evidence encodings and query result pages reserve
+  from it first, from an upper bound computed from their inputs.
+- **Pages**: the SQLite page caches (16 MiB aggregate) plus a fixed overhead
+  allowance of 1 MiB per connection (2 readers and 1 writer). A store is
+  opened only through `AdmittedStore`, which reserves Pages and Scratch first
+  and bypasses persistence when they do not fit. One admitted store per
+  process is expected.
+
+Reservations count in eviction like retained entries and leased outstanding
+parses. Pinned entries are never evicted for a reservation. Lowering
+`maxCacheBytes` at runtime keeps held reservations charged and refuses new
+ones until they fit.
+
+Not measured or not accounted (as of `l4d-zf1b.7`):
+
+- **Process RSS on the large repository** (`l4d-10`): the 48 bytes per
+  source byte retained-parse factor is calibrated by an ignored RSS test on
+  RAD Studio 7.0 units; the 24k-file repository measurement with
+  `maxCacheBytes` = 512 MiB was never made, and tree-sitter's C allocations
+  are invisible to any in-process count.
+- **Main-index retention** (`l4d-131`): the long-lived workspace index is
+  admitted by source bytes (`maxTotalBytes`), not charged to `maxCacheBytes`.
+- **SQLite statement heap beyond the per-connection allowance**: the
+  allowance was checked once against `sqlite3_memory_used` on a fresh store
+  with every connection opened and used (`pascal-cache`
+  `tests/sqlite_heap.rs`, measured: `sqlite3_memory_used` rose by 598,008
+  bytes, stable over 5 runs, against the 3 MiB allowance of 3 × 1 MiB; this
+  is that test's measurement, not an RSS figure); large sorts or unusual
+  plans can exceed it and are not counted.
+- **WAL shared memory and OS page cache**: the `-shm` mapping and the
+  kernel's file cache are outside the Rust and SQLite heaps and are not
+  charged.
+- **Transient validation reads**: root bytes and evidence payloads read while
+  validating persisted facts are bounded by the file size limit and the
+  request work budget, not reserved from `maxCacheBytes`.
+
 The include auditor uses the shared conditional analyzer and resolver. A known-
 inactive unresolved include can be skipped, but an active or unknown include
 that is unmappable, unavailable, ambiguous, unauthorized, cyclic, malformed,

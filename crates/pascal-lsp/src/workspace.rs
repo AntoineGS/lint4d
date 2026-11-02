@@ -114,6 +114,7 @@ fn warn_exclude_glob(message: String) {
 }
 
 mod admitted;
+mod authorize;
 pub(crate) mod capture;
 mod closure;
 pub(crate) mod code_lenses;

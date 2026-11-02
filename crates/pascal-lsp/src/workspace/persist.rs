@@ -10,13 +10,14 @@ use super::validate::{
 use crate::project_cache::{Reservation, ReservationKind};
 use lsp_types::Url;
 use pascal_cache::{
-    ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, EvidenceWrite, ExpandedArtifactKey,
-    KeyError, LocalArtifactKey, Lookup, Malformed, Miss, Published, PublishedEvidence,
-    SessionDependence, SourceContent, Store, observations_digest,
+    ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, Digest, EvidencePurpose,
+    EvidenceSubject, EvidenceWrite, ExpandedArtifactKey, KeyError, LocalArtifactKey, Lookup,
+    Malformed, Miss, Observation, Published, PublishedEvidence, SessionDependence, SourceContent,
+    Store, evidence_id, observations_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget, FactError, NotPersistable, include_slots};
 use pascal_core::resolver::ResolverLimits;
-use pascal_project::{ProjectContext, ProjectPathProvenance, ProjectWorkBudget};
+use pascal_project::{ProjectContext, ProjectPathProvenance, ProjectWorkBudget, SourceOrigin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +25,72 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) enum Persisted {
     Local(Published),
     Expanded(PublishedEvidence),
+}
+
+/// What `persist_source` publishes, prepared without the store: the facts,
+/// their key and, for an expanded artifact, the evidence that proves it.
+/// `workspace::eligible` derives a member record's header from it.
+pub(crate) struct PreparedArtifact {
+    pub(crate) facts: ArtifactFacts,
+    pub(crate) origin: SourceOrigin,
+    local: LocalArtifactKey,
+    expanded: Option<ExpandedArtifact>,
+}
+
+struct ExpandedArtifact {
+    key: ExpandedArtifactKey,
+    context: CacheContextKey,
+    observations: Vec<Observation>,
+}
+
+impl PreparedArtifact {
+    pub(crate) fn key(&self) -> ArtifactKeyRef<'_> {
+        match &self.expanded {
+            None => ArtifactKeyRef::local(&self.local),
+            Some(expanded) => ArtifactKeyRef::expanded(&expanded.key, &self.local)
+                .expect("an expanded key built from this root names it"),
+        }
+    }
+
+    pub(crate) fn artifact_id(&self) -> Digest {
+        self.key().digest()
+    }
+
+    /// The ID `Store::publish_facts_with_evidence` gives this artifact's
+    /// evidence; `None` for a local artifact, which is its own proof.
+    pub(crate) fn member_evidence_id(&self) -> Option<Digest> {
+        let expanded = self.expanded.as_ref()?;
+        Some(evidence_id(
+            &EvidenceSubject {
+                purpose: EvidencePurpose::Artifact,
+                context: expanded.context.digest(),
+                subject: self.local.digest(),
+            },
+            Some(self.artifact_id()),
+            &expanded.observations,
+        ))
+    }
+
+    /// Publish under the local key, or the expanded key with its evidence
+    /// in one transaction (spec §6.2).
+    pub(crate) fn publish(&self, store: &Store) -> Result<Persisted, PersistError> {
+        let published = match &self.expanded {
+            None => store
+                .publish_facts(self.key(), &self.facts)
+                .map(Persisted::Local),
+            Some(expanded) => store
+                .publish_facts_with_evidence(
+                    self.key(),
+                    &self.facts,
+                    &EvidenceWrite {
+                        context: &expanded.context,
+                        observations: &expanded.observations,
+                    },
+                )
+                .map(Persisted::Expanded),
+        };
+        published.map_err(PersistError::Store)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +221,16 @@ impl Workspace {
         budget: &mut FactBudget,
         cancel: &AtomicBool,
     ) -> Result<Persisted, PersistError> {
+        self.prepare_artifact(uri, budget, cancel)?.publish(store)
+    }
+
+    /// Everything `persist_source` checks and builds before it publishes.
+    pub(crate) fn prepare_artifact(
+        &self,
+        uri: &Url,
+        budget: &mut FactBudget,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedArtifact, PersistError> {
         // The document's context labels the facts and the evidence, which
         // describe the context that produced the session.
         if self
@@ -199,10 +276,12 @@ impl Workspace {
             return Err(PersistError::Cancelled);
         }
         if slots.is_empty() && !source.extracted.provider_dependent {
-            return store
-                .publish_facts(ArtifactKeyRef::local(&local), &source.extracted.facts)
-                .map(Persisted::Local)
-                .map_err(PersistError::Store);
+            return Ok(PreparedArtifact {
+                facts: source.extracted.facts,
+                origin: source.origin,
+                local,
+                expanded: None,
+            });
         }
         // The evidence must be the parse's own session's, as extraction
         // checks for the source map.
@@ -237,22 +316,33 @@ impl Workspace {
             ExpandedArtifactKey::from_slots(&local, conditional, &slots)
         }
         .map_err(PersistError::Key)?;
-        let key = ArtifactKeyRef::expanded(&expanded, &local)
-            .expect("an expanded key built from this root names it");
         if cancel.load(Ordering::Relaxed) {
             return Err(PersistError::Cancelled);
         }
-        store
-            .publish_facts_with_evidence(
-                key,
-                &source.extracted.facts,
-                &EvidenceWrite {
-                    context: &context,
-                    observations: &observations,
-                },
-            )
-            .map(Persisted::Expanded)
-            .map_err(PersistError::Store)
+        Ok(PreparedArtifact {
+            facts: source.extracted.facts,
+            origin: source.origin,
+            local,
+            expanded: Some(ExpandedArtifact {
+                key: expanded,
+                context,
+                observations,
+            }),
+        })
+    }
+
+    /// Whether `uri` is open, overlaid or deleted in this session's editor:
+    /// its view is session-private (spec §4.4).
+    pub(super) fn root_is_session_private(&self, uri: &Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
+        self.is_open(uri)
+            || self
+                .overlay_inputs()
+                .contains_key(&super::canonical_file_uri(uri))
+            || super::resolver::deletion_applies(&deleted, &super::absolute_path(path))
     }
 
     /// `uri`'s persisted facts, only if current inputs prove them (spec §7):
@@ -277,10 +367,7 @@ impl Workspace {
         let overlays = self.overlay_inputs();
         let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
-        if self.is_open(uri)
-            || overlays.contains_key(&super::canonical_file_uri(uri))
-            || super::resolver::deletion_applies(&deleted, &super::absolute_path(path.clone()))
-        {
+        if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
         let key = match self.context_for_uri_with_cancel(uri, Some(cancel)) {

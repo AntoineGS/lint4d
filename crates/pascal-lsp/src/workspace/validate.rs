@@ -60,6 +60,9 @@ pub(crate) enum Stale {
 pub(crate) enum Unproven {
     Cancelled,
     Budget,
+    /// The RAM or decode budget refused the facts (spec §10 amendment
+    /// 2026-11-02). Retryable once memory is released.
+    Memory,
 }
 
 pub(crate) struct Validator<'a> {

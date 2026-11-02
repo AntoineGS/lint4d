@@ -7,6 +7,7 @@ use super::evidence::EvidenceGap;
 use super::validate::{
     CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
 };
+use crate::project_cache::{Reservation, ReservationKind};
 use lsp_types::Url;
 use pascal_cache::{
     ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, EvidenceWrite, ExpandedArtifactKey,
@@ -42,16 +43,66 @@ pub(crate) enum PersistError {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reuse {
     Hit {
-        facts: ArtifactFacts,
+        facts: AdmittedFacts,
         via: ReuseVia,
-        /// Payloads and listings validation read rather than witnessed,
-        /// including those read for candidates it rejected first.
+        /// Payloads and listings this call read rather than witnessed,
+        /// summed over every evidence candidate it validated, including
+        /// candidates rejected before the hit. A cost measure, not a
+        /// property of the facts returned.
         reads: usize,
     },
     Miss(ReuseMiss),
+}
+
+/// Decoded persisted facts and their charge to `maxCacheBytes` (spec §10
+/// amendment 2026-11-02). The charge lives exactly as long as this value,
+/// however long a worker snapshot keeps it; eviction never releases it.
+pub(crate) struct AdmittedFacts {
+    pub(crate) facts: Arc<ArtifactFacts>,
+    pub(crate) charge: Reservation,
+}
+
+impl std::fmt::Debug for AdmittedFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedFacts")
+            .field("facts", &self.facts)
+            .field("charged", &self.charge.bytes())
+            .finish()
+    }
+}
+
+/// The charge is accounting, not content.
+impl PartialEq for AdmittedFacts {
+    fn eq(&self, other: &Self) -> bool {
+        self.facts == other.facts
+    }
+}
+
+impl Eq for AdmittedFacts {}
+
+/// Keep `charge` at what decoding `facts` used.
+fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) -> AdmittedFacts {
+    charge.shrink_to(budget.used());
+    AdmittedFacts {
+        facts: Arc::new(facts),
+        charge,
+    }
+}
+
+/// A decoder refusal for size is a memory miss; any other bypass stays an
+/// error.
+fn decoded(
+    result: Result<Lookup<ArtifactFacts>, Bypass>,
+) -> Result<Result<Lookup<ArtifactFacts>, ReuseMiss>, PersistError> {
+    match result {
+        Ok(lookup) => Ok(Ok(lookup)),
+        Err(Bypass::FactBudget) => Ok(Err(ReuseMiss::Unproven(Unproven::Memory))),
+        Err(bypass) => Err(PersistError::Store(bypass)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,12 +259,19 @@ impl Workspace {
     /// the current context and root bytes select the keys, and evidence
     /// must validate under the current read policy and editor state.
     /// Nothing is indexed or parsed.
+    ///
+    /// `decode_limit` bytes are reserved from `maxCacheBytes` before the
+    /// first decode and held until this returns; a hit keeps only what
+    /// decoding used, for as long as its facts live (spec §10 amendment
+    /// 2026-11-02). A refused reservation, or facts over the limit, is
+    /// `Unproven::Memory`; cancellation, including during context
+    /// discovery, is `Unproven::Cancelled` (l4d-ne50). Both are retryable.
     pub(crate) fn reuse_persisted_facts(
         &mut self,
         uri: &Url,
         store: &Store,
         work: &dyn ProjectWorkBudget,
-        budget: &mut FactBudget,
+        decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
         let overlays = self.overlay_inputs();
@@ -225,9 +283,13 @@ impl Workspace {
         {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
-        let key = self
-            .context_for_uri_with_cancel(uri, Some(cancel))
-            .map_err(PersistError::Context)?;
+        let key = match self.context_for_uri_with_cancel(uri, Some(cancel)) {
+            Ok(key) => key,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Cancelled)));
+            }
+            Err(message) => return Err(PersistError::Context(message)),
+        };
         let context = Arc::clone(
             &self
                 .contexts
@@ -241,15 +303,23 @@ impl Workspace {
             &super::conditional_context_for_uri(&context, uri),
             context.source_origin(&path),
         );
-        if let Lookup::Hit(facts) = store
-            .load_facts(ArtifactKeyRef::local(&local), budget)
-            .map_err(PersistError::Store)?
-        {
-            return Ok(Reuse::Hit {
-                facts,
-                via: ReuseVia::Local,
-                reads: 0,
-            });
+        let Some(charge) = self
+            .project_cache
+            .reserve(ReservationKind::Facts, decode_limit)
+        else {
+            return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)));
+        };
+        let mut budget = FactBudget::new(decode_limit);
+        match decoded(store.load_facts(ArtifactKeyRef::local(&local), &mut budget))? {
+            Ok(Lookup::Hit(facts)) => {
+                return Ok(Reuse::Hit {
+                    facts: admitted(facts, &budget, charge),
+                    via: ReuseVia::Local,
+                    reads: 0,
+                });
+            }
+            Ok(Lookup::Miss(_)) => {}
+            Err(miss) => return Ok(Reuse::Miss(miss)),
         }
         let headers = match store
             .find_evidence(&CacheContextKey::new(&context), &local)
@@ -291,16 +361,14 @@ impl Workspace {
                 }
             }
             return Ok(
-                match store
-                    .load_facts_by_id(artifact, budget)
-                    .map_err(PersistError::Store)?
-                {
-                    Lookup::Hit(facts) => Reuse::Hit {
-                        facts,
+                match decoded(store.load_facts_by_id(artifact, &mut budget))? {
+                    Ok(Lookup::Hit(facts)) => Reuse::Hit {
+                        facts: admitted(facts, &budget, charge),
                         via: ReuseVia::Evidence,
                         reads: validator.reads(),
                     },
-                    Lookup::Miss(miss) => Reuse::Miss(ReuseMiss::Store(miss)),
+                    Ok(Lookup::Miss(miss)) => Reuse::Miss(ReuseMiss::Store(miss)),
+                    Err(miss) => Reuse::Miss(miss),
                 },
             );
         }
@@ -379,6 +447,8 @@ pub(in crate::workspace) mod tests {
         Workspace::from_analysis_input(&main.analysis_input())
     }
 
+    pub(in crate::workspace) const DECODE_LIMIT: usize = 1 << 26;
+
     pub(in crate::workspace) fn reuse(
         workspace: &mut Workspace,
         uri: &Url,
@@ -386,7 +456,7 @@ pub(in crate::workspace) mod tests {
     ) -> Result<Reuse, PersistError> {
         let cancel = Arc::new(AtomicBool::new(false));
         let work = ReconciliationBudget::new(Arc::clone(&cancel));
-        workspace.reuse_persisted_facts(uri, store, &work, &mut FactBudget::new(1 << 26), &cancel)
+        workspace.reuse_persisted_facts(uri, store, &work, DECODE_LIMIT, &cancel)
     }
 
     pub(in crate::workspace) fn persist(indexed: &Indexed, name: &str, store: &Store) -> Persisted {
@@ -440,7 +510,7 @@ pub(in crate::workspace) mod tests {
             match reuse(&mut restarted, &indexed.uri(name), &store).unwrap() {
                 Reuse::Hit { facts, via, .. } => {
                     assert_eq!(via, expected_via, "{name}");
-                    assert_eq!(facts, expected, "{name}");
+                    assert_eq!(*facts.facts, expected, "{name}");
                 }
                 miss => panic!("{name}: {miss:?}"),
             }
@@ -603,6 +673,80 @@ pub(in crate::workspace) mod tests {
             reuse(&mut restarted, &saved.uri("Cond.pas"), &store).unwrap(),
             Reuse::Miss(ReuseMiss::Open)
         ));
+    }
+
+    #[test]
+    fn a_hit_is_charged_to_the_cache_until_its_facts_drop() {
+        for (files, name) in [
+            (&[("Cond.pas", CONDITIONAL)][..], "Cond.pas"),
+            (
+                &[("Main.pas", PROVIDER_MAIN), ("Shapes.pas", SHAPES)][..],
+                "Main.pas",
+            ),
+        ] {
+            let indexed = index(files, &[name]);
+            let directory = private_dir();
+            let store = open_store(directory.path());
+            persist(&indexed, name, &store);
+            let mut restarted = restart(&indexed);
+            let cache = restarted.project_cache.clone();
+            let Reuse::Hit { facts, .. } =
+                reuse(&mut restarted, &indexed.uri(name), &store).unwrap()
+            else {
+                panic!("{name}: the persisted facts are reused")
+            };
+            let charged = facts.charge.bytes();
+            assert!(
+                charged > 0 && charged < DECODE_LIMIT,
+                "{name}: shrunk to what was used: {charged}"
+            );
+            assert_eq!(cache.stats().reserved_facts_bytes, charged, "{name}");
+            cache.set_max_bytes(1);
+            assert_eq!(
+                cache.stats().reserved_facts_bytes,
+                charged,
+                "{name}: eviction never releases facts a caller keeps"
+            );
+            drop(facts);
+            assert_eq!(cache.stats().reserved_bytes(), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_refused_reservation_is_a_retryable_memory_miss() {
+        let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        persist(&indexed, "Cond.pas", &store);
+        let mut restarted = restart(&indexed);
+        restarted.project_cache.set_max_bytes(DECODE_LIMIT - 1);
+        assert_eq!(
+            reuse(&mut restarted, &indexed.uri("Cond.pas"), &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory))
+        );
+        restarted
+            .project_cache
+            .set_max_bytes(crate::project_cache::DEFAULT_MAX_CACHE_BYTES);
+        assert!(matches!(
+            reuse(&mut restarted, &indexed.uri("Cond.pas"), &store).unwrap(),
+            Reuse::Hit { .. }
+        ));
+    }
+
+    #[test]
+    fn facts_over_the_decode_limit_are_a_memory_miss() {
+        let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        persist(&indexed, "Cond.pas", &store);
+        let mut restarted = restart(&indexed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = ReconciliationBudget::new(Arc::clone(&cancel));
+        assert_eq!(
+            restarted.reuse_persisted_facts(&indexed.uri("Cond.pas"), &store, &work, 16, &cancel),
+            Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)))
+        );
+        assert_eq!(restarted.project_cache.stats().reserved_bytes(), 0);
     }
 }
 
@@ -956,7 +1100,29 @@ mod acceptance {
             &indexed.uri("Main.pas"),
             &store,
             &CancelOnFirstVisit(&cancel),
-            &mut FactBudget::new(1 << 26),
+            DECODE_LIMIT,
+            &cancel,
+        );
+        assert_eq!(
+            result,
+            Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Cancelled)))
+        );
+    }
+
+    /// l4d-ne50: cancellation during context discovery is a retryable miss,
+    /// never a hard failure a caller would report.
+    #[test]
+    fn cancellation_during_context_discovery_is_a_cancelled_miss() {
+        let (indexed, directory) = persisted(&providers());
+        let store = open_store(directory.path());
+        let mut restarted = restart(&indexed);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let work = crate::workspace::ReconciliationBudget::new(Arc::clone(&cancel));
+        let result = restarted.reuse_persisted_facts(
+            &indexed.uri("Main.pas"),
+            &store,
+            &work,
+            DECODE_LIMIT,
             &cancel,
         );
         assert_eq!(

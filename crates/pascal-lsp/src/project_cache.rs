@@ -2973,23 +2973,32 @@ impl ProjectCache {
             .expect("an uncached parse is leased when not required to be cached")
     }
 
-    /// Leases a parse the request just stored, only if the cache took it.
-    pub(crate) fn lease_stored_parse(
-        &self,
-        parsed: &Arc<ParsedDocument>,
-        bytes: usize,
-    ) -> Option<CacheLease> {
-        self.lease_parse(parsed, bytes, true)
-    }
-
     fn lease_parse(
         &self,
         parsed: &Arc<ParsedDocument>,
         bytes: usize,
         require_cached: bool,
     ) -> Option<CacheLease> {
-        let payload = Arc::as_ptr(parsed) as *const () as usize;
         let mut state = lock(&self.inner);
+        let lease = self.lease_locked(&mut state, parsed, bytes, require_cached);
+        if lease.as_ref().is_some_and(|(_, charged)| *charged) {
+            evict_to_budget(&mut state);
+        }
+        self.release(state);
+        lease.map(|(lease, _)| lease)
+    }
+
+    /// Takes a lease with the state lock held. The flag says whether the
+    /// lease made new outstanding bytes, which the caller evicts for.
+    fn lease_locked(
+        &self,
+        state: &mut State,
+        parsed: &Arc<ParsedDocument>,
+        bytes: usize,
+        require_cached: bool,
+    ) -> Option<(CacheLease, bool)> {
+        let payload = Arc::as_ptr(parsed) as *const () as usize;
+        let mut charged = false;
         if let Some(lease) = state.leases.get_mut(&payload) {
             lease.holders += 1;
         } else {
@@ -3009,15 +3018,17 @@ impl ProjectCache {
             );
             if cached.is_none() {
                 state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
-                evict_to_budget(&mut state);
+                charged = true;
             }
         }
-        self.release(state);
-        Some(CacheLease {
-            inner: self.inner.clone(),
-            payload,
-            _parsed: Arc::downgrade(parsed),
-        })
+        Some((
+            CacheLease {
+                inner: self.inner.clone(),
+                payload,
+                _parsed: Arc::downgrade(parsed),
+            },
+            charged,
+        ))
     }
 
     /// A verified unit entry read from a closed file whose stamp the recorded
@@ -3246,7 +3257,21 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        self.store(claim, Value::Unit(Arc::new(value)), bytes, cancel);
+        self.store(claim, Value::Unit(Arc::new(value)), bytes, cancel, false);
+    }
+
+    /// `store_unit` for a request that keeps the parse in its own index: the
+    /// stored parse is leased under the same lock, before eviction runs, so
+    /// no eviction can fall between the store and the lease (l4d-10). `None`
+    /// when the store was discarded.
+    pub(crate) fn store_unit_leased(
+        &self,
+        claim: Claim,
+        value: UnitValue,
+        bytes: usize,
+        cancel: &AtomicBool,
+    ) -> Option<CacheLease> {
+        self.store(claim, Value::Unit(Arc::new(value)), bytes, cancel, true)
     }
 
     pub(crate) fn imports(
@@ -3291,7 +3316,7 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        self.store(claim, Value::Import(Arc::new(value)), bytes, cancel);
+        self.store(claim, Value::Import(Arc::new(value)), bytes, cancel, false);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3919,7 +3944,14 @@ fn release_watches(state: &mut State, entry: &Entry) {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ProjectCache {
-    fn store(&self, claim: Claim, value: Value, bytes: usize, cancel: &AtomicBool) {
+    fn store(
+        &self,
+        claim: Claim,
+        value: Value,
+        bytes: usize,
+        cancel: &AtomicBool,
+        lease: bool,
+    ) -> Option<CacheLease> {
         let mut state = lock(&self.inner);
         let current = !claim.detached
             && !cancel.load(Ordering::Relaxed)
@@ -3933,7 +3965,12 @@ impl ProjectCache {
             claim.key.uri.path().rsplit('/').next().unwrap_or_default(),
             claim.started.elapsed().as_secs_f64() * 1000.0
         );
+        let mut leased = None;
         if current {
+            let parsed = match (&value, lease) {
+                (Value::Unit(unit), true) => Some(unit.parsed.clone()),
+                _ => None,
+            };
             state.clock += 1;
             let entry = Entry {
                 value,
@@ -3943,10 +3980,17 @@ impl ProjectCache {
                 last_used: state.clock,
             };
             insert_ready(&mut state, claim.key.clone(), entry);
+            // The entry holds the parse now, so the lease is not outstanding
+            // unless the eviction below removes the entry itself.
+            leased = parsed.and_then(|parsed| {
+                self.lease_locked(&mut state, &parsed, bytes, true)
+                    .map(|(lease, _)| lease)
+            });
             evict_to_budget(&mut state);
         }
         self.release(state);
         drop(claim); // Removes the slot only when it is still Computing.
+        leased
     }
 
     /// Records that a snapshot for `uri` found part of its interface closure

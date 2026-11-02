@@ -124,6 +124,8 @@ mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+#[cfg(all(test, unix))]
+mod isolation;
 mod persist;
 pub mod project_catalogue;
 pub mod projects;

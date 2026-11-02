@@ -308,9 +308,10 @@ fn ac2_rows_published_under_wider_roots_are_refused_to_a_narrower_requester() {
     let deleted = deletion_overrides_by_path(&narrow_view.deleted_overrides);
     let cancel = Arc::new(AtomicBool::new(false));
     let work = ReconciliationBudget::new(Arc::clone(&cancel));
+    let narrow_key = CacheContextKey::new(&narrow_context);
     let mut validator = Validator::new(
         CurrentInputs {
-            context: CacheContextKey::new(&narrow_context).digest(),
+            context: &narrow_key,
             read_policy: narrow_context.read_policy(),
             overlays: &overlays,
             deleted: &deleted,

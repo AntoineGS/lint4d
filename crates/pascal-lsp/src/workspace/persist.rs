@@ -418,7 +418,7 @@ impl Workspace {
         };
         let mut validator = Validator::new(
             CurrentInputs {
-                context: context_key.digest(),
+                context: &context_key,
                 read_policy: context.read_policy(),
                 overlays: &overlays,
                 deleted: &deleted,

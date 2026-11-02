@@ -18802,6 +18802,11 @@ mod tests {
             worker.cache_leases.contains_key(&fixture.derived),
             "the request leases the parse it stored"
         );
+        // A lower bound, not equality: outstanding also holds every other
+        // parse the warm stored and leased (Main, Derived), and each charge
+        // adds the value's own size, its expansion and its probes
+        // (`UnitValue::retained_bytes`), which the test cannot recompute
+        // without rebuilding them.
         assert!(
             cache.stats().outstanding_bytes
                 >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),

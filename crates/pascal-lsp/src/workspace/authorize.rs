@@ -163,8 +163,9 @@ mod tests {
     use crate::workspace::persist::tests::{open_store, private_dir};
     use pascal_cache::{BindingKind, IncompleteReason};
     use pascal_cache::{
-        ContextKey as CacheContextKey, CoverageStatus, ImporterHit, Lookup, MemberCoverage,
-        MemberHeader, SnapshotCoverage, SnapshotSeal,
+        ContextKey as CacheContextKey, CoverageStatus, EvidenceTarget, EvidenceWrite, ImporterHit,
+        Lookup, LookupInputs, LookupKey, LookupKind, MemberCoverage, MemberHeader, Observation,
+        SnapshotCoverage, SnapshotSeal,
     };
     use pascal_project::delphi_overrides::EffectiveOverrides;
     use pascal_project::{ProjectContextParts, ProjectPathEntry, ReadPolicy, SourceOrigin};
@@ -441,6 +442,65 @@ mod tests {
             Some(Refused::Binding {
                 ordinal: 0,
                 reason: Box::new(Refused::Policy(lib)),
+            })
+        );
+    }
+
+    /// Header authorization covers the source only: the stored header of a
+    /// record whose binding target is outside the requester is authorized,
+    /// while the same record read in full is refused for that binding.
+    #[test]
+    fn an_authorized_header_does_not_authorize_its_bindings() {
+        let (_temp, root) = tree();
+        let app = root.join("app");
+        let (main, lib) = (app.join("Main.pas"), root.join("lib/Lib.pas"));
+        let narrow = context(&[&app], &[&app]);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let lookup = LookupKey::new(&LookupInputs {
+            kind: LookupKind::Unit,
+            normalized_name: "lib",
+            path_expression: None,
+            importer_directory: None,
+        });
+        let evidence = store
+            .publish_evidence(
+                EvidenceTarget::Binding(&lookup),
+                &EvidenceWrite {
+                    context: &CacheContextKey::new(&ProjectContext::default()),
+                    observations: &[Observation::Presence {
+                        path: lib.clone(),
+                        entry: None,
+                        present: true,
+                    }],
+                },
+            )
+            .unwrap()
+            .evidence_id;
+        let outside = record_binding(
+            &main,
+            vec![Binding {
+                evidence: Some(evidence),
+                ..binding(
+                    0,
+                    BindingOutcome::Precise {
+                        target: identity(&lib),
+                    },
+                )
+            }],
+        );
+        let record_id = store.publish_member_record(&outside).unwrap().record_id;
+        let Lookup::Hit(header) = store.open_member_record(record_id).unwrap() else {
+            panic!("published")
+        };
+        assert_eq!(header.member(), &outside.header);
+        let authorized = authorize_record(header, &narrow).unwrap();
+        assert_eq!(authorized.entry().path, main);
+        assert_eq!(
+            authorize_record(outside, &narrow).err(),
+            Some(Refused::Binding {
+                ordinal: 0,
+                reason: Box::new(Refused::NoPathEntry(lib)),
             })
         );
     }

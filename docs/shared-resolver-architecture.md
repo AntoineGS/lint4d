@@ -346,9 +346,11 @@ exceed it. If they do, warming pauses and one warning is logged.
 ### Persistent cache memory
 
 The persistent analysis cache (`pascal-cache`) does not add a second memory
-budget: everything it keeps in RAM is reserved from `maxCacheBytes` before it
-is allocated (`ProjectCache::reserve`). Three kinds of reservation are
-reported with the cache statistics:
+budget: what it retains (decoded facts, scratch, page caches) is reserved from
+`maxCacheBytes` before it is allocated (`ProjectCache::reserve`). These are
+building blocks: nothing in production opens a store, reuses facts or
+publishes until `l4d-zf1b.8` adds the first caller. Three kinds of
+reservation are reported with the cache statistics:
 
 - **Facts**: decoded persisted facts. Reuse reserves its decode limit before
   decoding, keeps what decoding used and holds that charge for as long as the
@@ -360,10 +362,10 @@ reported with the cache statistics:
   encodings and query result pages reserve from that scratch budget first,
   from an upper bound computed from their inputs.
 - **Pages**: the SQLite page caches (16 MiB aggregate) plus a fixed overhead
-  allowance of 1 MiB per connection (2 readers and 1 writer). A store is
-  opened only through `AdmittedStore`, which reserves Pages and Scratch first
-  and bypasses persistence when they do not fit. One admitted store per
-  process is expected.
+  allowance of 1 MiB per connection (2 readers and 1 writer). The store is
+  to be opened only through `AdmittedStore`, which reserves Pages and Scratch
+  together first and bypasses persistence, evicting nothing, when they do not
+  both fit. One admitted store per process is documented, not enforced.
 
 Reservations count in eviction like retained entries and leased outstanding
 parses. Pinned entries are never evicted for a reservation. Lowering

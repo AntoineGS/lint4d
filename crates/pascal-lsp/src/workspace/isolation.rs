@@ -191,15 +191,22 @@ fn ac1_unsaved_buffers_of_two_sessions_never_cross_through_the_store() {
     assert_ne!(
         b_record.value().header.artifact,
         a_record.value().header.artifact,
-        "a separate result, not a relabelled one"
+        "a separate artifact ID: each is keyed by the provider bytes it saw"
     );
     publish_record(&b.store, &b_record).unwrap();
 
-    // A now sees the saved disk text through validation: its own earlier
-    // evidence is stale and B's disk evidence holds.
+    // A's own evidence was shown stale above and an expanded artifact has
+    // no local-key hit, so a hit through `Evidence` can only be B's disk
+    // evidence, validated against the saved provider. (Both analyses
+    // extract identical facts, so the facts alone cannot show the source.)
     let mut a_after = a.request(&[]);
-    let Reuse::Hit { facts, .. } = reuse(&mut a_after, &uri(&main), &a.store).unwrap() else {
-        panic!("the saved disk analysis is reusable")
+    let Reuse::Hit {
+        facts,
+        via: ReuseVia::Evidence,
+        ..
+    } = reuse(&mut a_after, &uri(&main), &a.store).unwrap()
+    else {
+        panic!("B's saved disk analysis is reusable through its evidence")
     };
     assert_eq!(*facts.facts, analysed(&b_closed, &main));
 }
@@ -332,10 +339,12 @@ fn ac2_rows_published_under_wider_roots_are_refused_to_a_narrower_requester() {
     ));
 }
 
-/// AC3: decode, lease and retained-facts accounting stays bounded through
-/// eviction and requests that keep what they took.
+/// AC3: totals stay within `maxCacheBytes` while it holds. After a runtime
+/// decrease, what requests keep (facts, leased parses) stays accounted and
+/// new reservations are refused, although the totals then exceed the
+/// budget by design.
 #[test]
-fn ac3_reservations_leases_and_kept_facts_stay_within_max_cache_bytes() {
+fn ac3_held_charges_stay_accounted_and_new_reservations_are_refused_after_a_decrease() {
     const BUDGET: usize = 256 << 20;
     let (_tree, root) = providers();
     let main = root.join("Main.pas");
@@ -424,6 +433,12 @@ fn ac4_a_tiny_budget_refuses_admission_without_touching_editor_state() {
         "the open document's parse is cached"
     );
     let overlays = request.overlay_inputs();
+    assert!(
+        overlays.contains_key(&crate::workspace::canonical_file_uri(&notes_uri)),
+        "the edited document is an overlay"
+    );
+    let pinned = cache.stats();
+    assert!(pinned.bytes > 0 && pinned.units > 0);
 
     cache.set_max_bytes(1);
     let elsewhere = private_dir();
@@ -451,6 +466,12 @@ fn ac4_a_tiny_budget_refuses_admission_without_touching_editor_state() {
     assert!(
         cache.ready_layers(&notes_uri).contains(&"Unit".to_string()),
         "pinned parses are never evicted for admission"
+    );
+    let kept = cache.stats();
+    assert_eq!(
+        (kept.bytes, kept.units, kept.imports),
+        (pinned.bytes, pinned.units, pinned.imports),
+        "the pinned entries are unchanged"
     );
     let after = request.overlay_inputs();
     assert_eq!(after.len(), overlays.len());

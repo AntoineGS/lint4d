@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the current session sees, which evidence is checked against.
 pub(crate) struct CurrentInputs<'a> {
-    /// The requester's cache context digest (`ContextKey::digest`):
-    /// evidence proves its inputs only under the context that recorded it.
+    /// The requester's own cache context digest (`ContextKey::digest`),
+    /// derived by the caller from its context, never taken from the
+    /// evidence: evidence proves its inputs only under the context that
+    /// recorded it.
     pub(crate) context: Digest,
     pub(crate) read_policy: &'a ReadPolicy,
     pub(crate) overlays: &'a HashMap<Url, OverlayInput>,

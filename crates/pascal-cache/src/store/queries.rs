@@ -233,7 +233,9 @@ impl Store {
 }
 
 /// Whether `path`'s key would exceed any key the store writes, from its
-/// bound, so no key is built for a path that cannot be stored.
+/// bound, so no key is built for a path that cannot be stored. On Windows the
+/// bound overestimates non-ASCII paths, so one near the limit is a safe false
+/// miss; the store is bypassed there until `l4d-x2ft`.
 fn over_long(path: &Path) -> bool {
     path_bound(path) > MAX_INDEX_KEY_BYTES
 }

@@ -365,7 +365,8 @@ reservation are reported with the cache statistics:
   allowance of 1 MiB per connection (2 readers and 1 writer). The store is
   to be opened only through `AdmittedStore`, which reserves Pages and Scratch
   together first and bypasses persistence, evicting nothing, when they do not
-  both fit. One admitted store per process is documented, not enforced.
+  both fit. Both rules are documented, not enforced: `Store::open` stays
+  public, and one admitted store per process is expected.
 
 Reservations count in eviction like retained entries and leased outstanding
 parses. Pinned entries are never evicted for a reservation. Lowering

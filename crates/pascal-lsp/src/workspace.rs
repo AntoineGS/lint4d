@@ -117,6 +117,7 @@ fn warn_exclude_glob(message: String) {
 
 pub(crate) mod admitted;
 mod authorize;
+pub(crate) mod baseline;
 pub(crate) mod capture;
 mod catalogues;
 mod closure;

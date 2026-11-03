@@ -24,7 +24,7 @@ pub use artifact_key::{
     SessionDependence,
 };
 pub use context_key::ContextKey;
-pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
+pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, RecordListDigest, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
 pub use evidence::{
     EvidencePurpose, EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT,

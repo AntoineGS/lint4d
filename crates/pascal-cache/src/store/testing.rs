@@ -292,6 +292,37 @@ impl Store {
     }
 }
 
+impl Store {
+    /// The snapshots (builds included) this store's lease holds, by ID.
+    pub fn held_snapshots_for_test(&self) -> Result<Vec<super::SnapshotId>, Bypass> {
+        let reader = self.reader()?;
+        let mut statement = reader
+            .prepare(
+                "SELECT snapshot_id FROM lease_holds WHERE namespace_id = ?1 \
+                 AND reset_epoch = ?2 AND lease_id = ?3 ORDER BY snapshot_id",
+            )
+            .map_err(|error| classify(&error))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    self.scope.namespace.as_bytes().as_slice(),
+                    super::namespaces::epoch(self.scope),
+                    self.lease.id.as_slice()
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| classify(&error))?;
+        let mut held = Vec::new();
+        for row in rows {
+            let id = row.map_err(|error| classify(&error))?;
+            held.push(super::SnapshotId::from_bytes(
+                <[u8; 16]>::try_from(id.as_slice()).map_err(|_| Bypass::Corrupt)?,
+            ));
+        }
+        Ok(held)
+    }
+}
+
 static STORE_OPERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn count_operation() {

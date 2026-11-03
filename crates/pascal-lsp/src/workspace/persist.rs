@@ -180,7 +180,11 @@ impl PartialEq for AdmittedFacts {
 impl Eq for AdmittedFacts {}
 
 /// Keep `charge` at what decoding `facts` used.
-fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) -> AdmittedFacts {
+pub(super) fn admitted(
+    facts: ArtifactFacts,
+    budget: &FactBudget,
+    mut charge: Reservation,
+) -> AdmittedFacts {
     charge.shrink_to(budget.used());
     AdmittedFacts {
         facts: Arc::new(facts),
@@ -190,7 +194,7 @@ fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) 
 
 /// A decoder refusal for size is a memory miss; any other bypass stays an
 /// error.
-fn decoded(
+pub(super) fn decoded(
     result: Result<Lookup<ArtifactFacts>, Bypass>,
 ) -> Result<Result<Lookup<ArtifactFacts>, ReuseMiss>, PersistError> {
     match result {
@@ -206,6 +210,9 @@ pub(crate) enum ReuseVia {
     Local,
     /// Evidence validated against current inputs.
     Evidence,
+    /// The record a held baseline snapshot lists for the member, its
+    /// evidence (or local key) validated against current inputs (D31).
+    Snapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,9 +260,25 @@ impl PersistError {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static REUSE_IN_CONTEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `reuse_in_context` calls on this thread (the evidence-candidate search).
+#[cfg(test)]
+pub(crate) fn reuse_in_context_calls_for_test() -> usize {
+    REUSE_IN_CONTEXT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reuse_in_context_calls_for_test() {
+    REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(0));
+}
+
 impl Workspace {
     /// The saved root bytes of `uri`, read under `context`'s current policy.
-    fn saved_root_bytes(
+    pub(super) fn saved_root_bytes(
         &self,
         uri: &Url,
         context: &ProjectContext,
@@ -466,6 +489,8 @@ impl Workspace {
         decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
+        #[cfg(test)]
+        REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
         if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
@@ -739,6 +764,7 @@ pub(crate) mod tests {
             match expected_via {
                 ReuseVia::Local => assert_eq!(persisted, Persisted::Local(Published::Inserted)),
                 ReuseVia::Evidence => assert_eq!(persisted, Persisted::Expanded(inserted)),
+                ReuseVia::Snapshot => unreachable!("no snapshot is held"),
             }
             let expected = indexed.facts(name).extracted.facts;
             drop(store);

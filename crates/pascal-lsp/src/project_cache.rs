@@ -5307,6 +5307,12 @@ struct StoredIndex {
     /// Store reads spent validating members of this context.
     #[allow(dead_code)] // read by pascal/indexStatus (l4d-zf1b.8)
     validation_reads: u64,
+    /// The snapshot this context's index started from or last sealed (D40).
+    baseline: Option<crate::workspace::baseline::BaselineHint>,
+    /// When this process last sealed, or found nothing new to seal.
+    last_seal: Option<std::time::Instant>,
+    /// Whether this process looked for a sealed snapshot to start from.
+    hint_tried: bool,
 }
 
 impl StoredIndex {
@@ -5321,6 +5327,10 @@ struct IndexStore {
     owners: HashMap<PathBuf, ContextKey>,
     requests: Vec<IndexAnchor>,
     unit_limit: usize,
+    /// Holds of evicted contexts' snapshots, released by the next index
+    /// batch that has a store job (D40): eviction runs under the index lock,
+    /// where no store call may.
+    released: Vec<pascal_cache::SnapshotId>,
 }
 
 impl Default for IndexStore {
@@ -5331,6 +5341,7 @@ impl Default for IndexStore {
             owners: HashMap::new(),
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
+            released: Vec::new(),
         }
     }
 }
@@ -5359,6 +5370,9 @@ impl IndexStore {
             .map(|(key, _)| key.clone())?;
         let stored = self.contexts.remove(&victim)?;
         self.owners.retain(|_, owner| *owner != victim);
+        if let Some(hint) = stored.baseline.as_ref().filter(|hint| hint.held()) {
+            self.released.push(hint.header().id());
+        }
         Some(stored.total_charge())
     }
 }
@@ -5526,6 +5540,9 @@ impl ProjectCache {
                     charged: 0,
                     memory_exhausted: false,
                     validation_reads: 0,
+                    baseline: None,
+                    last_seal: None,
+                    hint_tried: false,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -5731,6 +5748,97 @@ impl ProjectCache {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_stale(path);
         }
+    }
+
+    /// The membership is recomputed by the next batch.
+    pub(crate) fn mark_index_membership_dirty(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.dirty = true;
+        }
+    }
+
+    pub(crate) fn baseline_hint(
+        &self,
+        key: &ContextKey,
+    ) -> Option<crate::workspace::baseline::BaselineHint> {
+        self.index()
+            .contexts
+            .get(key)
+            .and_then(|stored| stored.baseline.clone())
+    }
+
+    /// Install `hint` as `key`'s baseline and return the one it replaces;
+    /// `None` when `key` holds no index any more, so the caller still owns
+    /// the hint's hold.
+    pub(crate) fn set_baseline_hint(
+        &self,
+        key: &ContextKey,
+        hint: crate::workspace::baseline::BaselineHint,
+    ) -> Option<Option<crate::workspace::baseline::BaselineHint>> {
+        self.index()
+            .contexts
+            .get_mut(key)
+            .map(|stored| stored.baseline.replace(hint))
+    }
+
+    /// Drop `key`'s baseline if it is still snapshot `id`; returns it.
+    pub(crate) fn drop_baseline_hint(
+        &self,
+        key: &ContextKey,
+        id: pascal_cache::SnapshotId,
+    ) -> Option<crate::workspace::baseline::BaselineHint> {
+        let mut store = self.index();
+        let stored = store.contexts.get_mut(key)?;
+        if stored
+            .baseline
+            .as_ref()
+            .is_some_and(|hint| hint.header().id() == id)
+        {
+            stored.baseline.take()
+        } else {
+            None
+        }
+    }
+
+    /// Whether `key` was not sealed (or found unchanged) within `interval`
+    /// before `now`.
+    pub(crate) fn baseline_seal_due(
+        &self,
+        key: &ContextKey,
+        now: std::time::Instant,
+        interval: std::time::Duration,
+    ) -> bool {
+        self.index().contexts.get(key).is_some_and(|stored| {
+            stored
+                .last_seal
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        })
+    }
+
+    pub(crate) fn note_baseline_seal(&self, key: &ContextKey, now: std::time::Instant) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.last_seal = Some(now);
+        }
+    }
+
+    /// Whether this process looked for a snapshot to start `key`'s index
+    /// from; `true` when `key` holds no index (nothing to start).
+    pub(crate) fn baseline_adoption_tried(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_none_or(|stored| stored.hint_tried)
+    }
+
+    pub(crate) fn note_baseline_adoption_tried(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.hint_tried = true;
+        }
+    }
+
+    /// The holds evicted contexts left, for a store job to release.
+    pub(crate) fn take_released_holds(&self) -> Vec<pascal_cache::SnapshotId> {
+        std::mem::take(&mut self.index().released)
     }
 
     /// `read` runs under the index lock: it must not call back into the cache.

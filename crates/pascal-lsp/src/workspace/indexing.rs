@@ -16,6 +16,7 @@ use pascal_core::facts::{
 };
 use pascal_project::ProjectContext;
 
+use super::baseline::HintReuse;
 use super::catalogues::CatalogueScope;
 use super::eligible::{ProvenRecord, RecordInputs, Unindexed, prove_existing, publish_proven};
 use super::facts::SourceFacts;
@@ -33,7 +34,7 @@ use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome, Reserva
 use crate::workspace_index::{
     CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
     MAX_UNVERIFIED_CANDIDATES, MAX_UNVERIFIED_SYMBOL_CANDIDATES, MemberFacts, MemberStamp,
-    MemberState, SymbolKey,
+    MemberState, RETRYING_REFUSAL, SymbolKey,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
@@ -349,6 +350,9 @@ pub(crate) struct IndexProgress {
     pub(crate) reuse_deferred: usize,
     /// Members whose artifact and record this batch published.
     pub(crate) persisted: usize,
+    /// Members a held snapshot lists without an artifact, deferred to be
+    /// retried after every other member.
+    pub(crate) retrying: usize,
 }
 
 impl IndexProgress {
@@ -372,6 +376,7 @@ impl IndexProgress {
             reuse_pending: 0,
             reuse_deferred: 0,
             persisted: 0,
+            retrying: 0,
         }
     }
 
@@ -534,6 +539,8 @@ enum ReuseOutcome {
     Memory,
     /// No baseline view, already tried, or no store: nothing was asked.
     NoStore,
+    /// The held snapshot records a previous refusal (no artifact).
+    Retrying,
     /// The request was cancelled while the store was asked.
     Cancelled,
 }
@@ -659,6 +666,10 @@ impl Workspace {
         // view holds a document only while it loads one.
         self.pinned_context = Some(key.clone());
         self.ensure_index_membership(&key, anchor, cancel)?;
+        if self.is_baseline() && self.persistent_cache().is_enabled() {
+            self.release_evicted_holds();
+            self.adopt_baseline_hint_once(&key);
+        }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
         let started = Instant::now();
         // Open members are skipped, so ask for enough to fill the bound.
@@ -718,6 +729,15 @@ impl Workspace {
                     progress.reuse_missed += 1;
                 }
                 ReuseOutcome::Retry => progress.reuse_deferred += 1,
+                // A previous refusal is retried after every other member, by
+                // a later batch (with no hint, members keep path order).
+                ReuseOutcome::Retrying => {
+                    self.project_cache.mark_index_reuse_tried(&key, &path);
+                    self.project_cache
+                        .defer_index_member(&key, &path, RETRYING_REFUSAL);
+                    progress.retrying += 1;
+                    continue;
+                }
                 ReuseOutcome::Memory => {
                     progress.memory = true;
                     break;
@@ -759,14 +779,21 @@ impl Workspace {
             }
         }
         self.ensure_index_membership(&key, anchor, cancel)?;
-        let (all_pending, untried, reuse_pending, generation) = self
+        let (all_pending, untried, reuse_pending, generation, retrying) = self
             .project_cache
             .read_index(&key, |index, _| {
+                let pending = index.pending(usize::MAX);
+                let retrying = pending
+                    .iter()
+                    .filter(|path| index.retrying(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 (
-                    index.pending(usize::MAX),
+                    pending,
                     index.untried(),
                     index.reuse_pending(usize::MAX),
                     index.generation(),
+                    retrying,
                 )
             })
             .unwrap_or_default();
@@ -785,13 +812,19 @@ impl Workspace {
         progress.pending = all_pending.len() - open;
         progress.skipped_open = open;
         progress.generation = generation;
-        progress.complete = progress.pending == 0 && !progress.memory;
+        // Members retrying a previous refusal are coverage gaps, not
+        // pending work (H4/R8-3).
+        let retrying = retrying
+            .iter()
+            .filter(|path| !self.is_open_member(path))
+            .count();
+        progress.complete = progress.pending == retrying && !progress.memory;
         Ok(progress)
     }
 
     /// An open document (rejected ones included) is answered from the
     /// editor's buffer, never from the index.
-    fn is_open_member(&self, path: &Path) -> bool {
+    pub(super) fn is_open_member(&self, path: &Path) -> bool {
         Url::from_file_path(path).is_ok_and(|uri| {
             self.open_documents.contains_key(&uri)
                 || self
@@ -1249,14 +1282,49 @@ impl Workspace {
             return ReuseOutcome::NoStore;
         };
         let work = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
-        let result = self.reuse_in_context(
-            &uri,
-            key,
-            job.store(),
-            &work,
-            pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
-            job.cancel_flag(),
-        );
+        // The held snapshot first: its record skips the candidate search.
+        let mut hinted = None;
+        if let Some(hint) = self.project_cache.baseline_hint(key) {
+            match self.reuse_from_hint(
+                &uri,
+                path,
+                key,
+                &hint,
+                job.store(),
+                &work,
+                pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
+                job.cancel_flag(),
+            ) {
+                Ok(HintReuse::Done(reuse)) => hinted = Some(Ok(reuse)),
+                Ok(HintReuse::Retrying) => return ReuseOutcome::Retrying,
+                Ok(HintReuse::Gone) => {
+                    let id = hint.header().id();
+                    if self
+                        .project_cache
+                        .drop_baseline_hint(key, id)
+                        .is_some_and(|dropped| dropped.held())
+                        && let Err(bypass) = job.store().release_snapshot(id)
+                    {
+                        job.observe(&bypass);
+                    }
+                }
+                Ok(HintReuse::Fallback) => {}
+                Err(bypass) => {
+                    job.observe(&bypass);
+                    return ReuseOutcome::Retry;
+                }
+            }
+        }
+        let result = hinted.unwrap_or_else(|| {
+            self.reuse_in_context(
+                &uri,
+                key,
+                job.store(),
+                &work,
+                pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
+                job.cancel_flag(),
+            )
+        });
         job.record_reuse(&result);
         if cancel.load(Ordering::Relaxed) {
             return ReuseOutcome::Cancelled;

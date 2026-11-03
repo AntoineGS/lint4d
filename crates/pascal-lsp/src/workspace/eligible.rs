@@ -1,10 +1,12 @@
 //! Persistence eligibility as a typed proof (spec §4.4 amendment
 //! 2026-11-02). The store cannot see editor state and does not check it.
-//! An [`Eligible`] value is built only by [`Workspace::eligible_member`]
-//! and [`Workspace::eligible_snapshot`], which derive what they certify from
-//! this session's own analysis, and [`publish_record`] and
-//! [`seal_snapshot`] accept nothing else. The disk-only baseline producer
-//! (`l4d-zf1b.8`) is the first caller.
+//! An [`Eligible`] value is built only by [`Workspace::eligible_member`],
+//! [`Workspace::eligible_indexed_member`] and
+//! [`Workspace::eligible_baseline_snapshot`], which derive what they certify
+//! from this session's own analysis, and [`publish_record`],
+//! [`publish_proven`] and [`seal_baseline`] accept nothing else. The
+//! disk-only baseline producer (`l4d-zf1b.8`) is their caller; the phase-7
+//! `eligible_snapshot` and `seal_snapshot` remain for their tests.
 //!
 //! The proof guards against omission (an unchecked record, an evidence set
 //! no capture produced, an edited member left out of a snapshot), not
@@ -28,6 +30,7 @@ use pascal_cache::{
 use pascal_core::facts::{ArtifactFacts, CoverageReason, DeclarationKind, FactBudget};
 use pascal_core::resolver::ResolutionObservation;
 use pascal_project::{ProjectContext, ProjectObservations, ProjectPathProvenance, SourceOrigin};
+#[cfg(all(test, unix))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +111,15 @@ pub(crate) enum Ineligible {
     DuplicateMember(PathBuf),
     /// A member was checked under another context.
     OtherContext(PathBuf),
+    /// The context's membership lists nothing (D32).
+    EmptyMembership,
+    /// The membership is not current, or a limit, an unreadable directory,
+    /// the index memory share or pending owner discovery cut it short.
+    IncompleteMembership,
+    /// A member has no record this session proved.
+    Unproven(PathBuf),
+    /// The context has no project file (D39).
+    NotAProject,
 }
 
 /// What the workspace does not hold yet for a member record; the producer
@@ -128,6 +140,7 @@ pub(crate) struct CheckedBinding {
     pub(crate) proof: Option<(LookupKey, CapturedEvidence)>,
 }
 
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotDraft {
     pub(crate) members: Vec<Eligible<MemberRecord>>,
@@ -136,6 +149,7 @@ pub(crate) struct SnapshotDraft {
 }
 
 /// A context's complete eligible membership and its discovery evidence.
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone)]
 pub(crate) struct EligibleSnapshot {
     members: Vec<Eligible<MemberRecord>>,
@@ -143,10 +157,38 @@ pub(crate) struct EligibleSnapshot {
     coverage: SnapshotCoverage,
 }
 
+#[cfg(all(test, unix))]
 impl EligibleSnapshot {
     pub(crate) fn members(&self) -> &[Eligible<MemberRecord>] {
         &self.members
     }
+}
+
+/// A context's disk-only baseline (D32): the proven record of every member
+/// of its current, complete membership, in membership order, and its
+/// discovery evidence. The records are already published.
+#[derive(Debug, Clone)]
+pub(crate) struct BaselineSnapshot {
+    records: Vec<Digest>,
+    discovery: Digest,
+}
+
+impl BaselineSnapshot {
+    pub(crate) fn records(&self) -> &[Digest] {
+        &self.records
+    }
+
+    pub(crate) fn discovery(&self) -> Digest {
+        self.discovery
+    }
+}
+
+/// Why `seal_baseline` built no snapshot; its build is retired either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SealFailure {
+    /// `check` refused between two store batches.
+    Interrupted,
+    Bypass(Bypass),
 }
 
 fn subject(
@@ -318,6 +360,7 @@ impl Workspace {
     /// discovery evidence from a checked capture. One session-private
     /// document makes the whole set ineligible, supplied or not, so leaving
     /// an edited member out cannot be expressed.
+    #[cfg(all(test, unix))]
     pub(crate) fn eligible_snapshot(
         &self,
         context: &ContextKey,
@@ -377,6 +420,76 @@ impl Workspace {
             context: cache_context,
             evidence: vec![PendingEvidence::Discovery(scope, captured)],
         })
+    }
+
+    /// D32: `key`'s baseline, if this session may seal it: a project
+    /// context from saved files in a baseline view, its membership current,
+    /// complete and non-empty, one record this session proved per member
+    /// (in membership order), and `discovery` from a baseline capture
+    /// (`Workspace::discovery_evidence`). Editor state never enters the
+    /// membership, so an open document does not block it.
+    pub(crate) fn eligible_baseline_snapshot(
+        &self,
+        key: &ContextKey,
+        discovery: (DiscoveryScope, CapturedEvidence),
+    ) -> Result<Eligible<BaselineSnapshot>, Ineligible> {
+        let records = self.baseline_records(key)?;
+        let cache_context = CacheContextKey::new(&self.contexts[key].context);
+        let (scope, captured) = discovery;
+        let discovery = evidence_id(
+            &subject(
+                EvidencePurpose::Discovery,
+                &cache_context,
+                scope.key().digest(),
+            ),
+            None,
+            captured.observations(),
+        );
+        Ok(Eligible {
+            value: BaselineSnapshot { records, discovery },
+            context: cache_context,
+            evidence: vec![PendingEvidence::Discovery(scope, captured)],
+        })
+    }
+
+    /// The membership checks of `eligible_baseline_snapshot`, which need no
+    /// listing: the proven records in membership order.
+    pub(super) fn baseline_records(&self, key: &ContextKey) -> Result<Vec<Digest>, Ineligible> {
+        let state = self.contexts.get(key).ok_or(Ineligible::NoContext)?;
+        let Some(project) = state.context.project_file() else {
+            return Err(Ineligible::NotAProject);
+        };
+        if !self.is_baseline() || !self.context_inputs_are_disk_only(key) {
+            return Err(Url::from_file_path(project)
+                .map_or(Ineligible::NoContext, Ineligible::SessionPrivate));
+        }
+        let current = self.project_cache.index_membership_current(key);
+        let (paths, records, complete) = self
+            .project_cache
+            .read_index(key, |index, membership| {
+                (
+                    membership.paths.clone(),
+                    index.records(),
+                    membership.complete
+                        && membership.limit.is_none()
+                        && membership.owner_pending == 0,
+                )
+            })
+            .ok_or(Ineligible::IncompleteMembership)?;
+        if paths.is_empty() {
+            return Err(Ineligible::EmptyMembership);
+        }
+        if !current || !complete || records.len() != paths.len() {
+            return Err(Ineligible::IncompleteMembership);
+        }
+        let mut proven = Vec::with_capacity(paths.len());
+        for (path, (member, record)) in paths.iter().zip(records) {
+            if super::rename::path_key(path) != super::rename::path_key(&member) {
+                return Err(Ineligible::IncompleteMembership);
+            }
+            proven.push(record.ok_or_else(|| Ineligible::Unproven(member.clone()))?);
+        }
+        Ok(proven)
     }
 }
 
@@ -569,6 +682,7 @@ pub(crate) fn publish_record(
 /// then one build of at most `MAX_ROW_BATCH_ROWS` members per batch. An
 /// unsealed build left by a bypass is retired by maintenance
 /// (`l4d-zf1b.10`).
+#[cfg(all(test, unix))]
 pub(crate) fn seal_snapshot(
     store: &Store,
     snapshot: &Eligible<EligibleSnapshot>,
@@ -589,6 +703,58 @@ pub(crate) fn seal_snapshot(
             coverage: snapshot.value.coverage,
         },
     )
+}
+
+/// Seal an eligible baseline (spec §6.3 amendment, D31): its discovery
+/// evidence, then one build of at most `MAX_ROW_BATCH_ROWS` members per
+/// batch, without republishing the records. `check` runs before each batch
+/// and before the seal; a refusal or a bypass retires the build.
+pub(crate) fn seal_baseline(
+    store: &Store,
+    snapshot: &Eligible<BaselineSnapshot>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<SnapshotHeader, SealFailure> {
+    publish_pending(store, snapshot).map_err(SealFailure::Bypass)?;
+    let mut builder = store
+        .begin_snapshot(&snapshot.context)
+        .map_err(SealFailure::Bypass)?;
+    let sealed = build_baseline(store, snapshot, &mut builder, check);
+    if sealed.is_err() {
+        // A build no lease holds is abandoned and retired by maintenance;
+        // at the WAL threshold the retirement writes nothing, so the hold
+        // is dropped instead.
+        if store.retire_build(&builder).is_err() {
+            let _ = store.release_snapshot(builder.id());
+        }
+    }
+    sealed
+}
+
+fn build_baseline(
+    store: &Store,
+    snapshot: &Eligible<BaselineSnapshot>,
+    builder: &mut pascal_cache::SnapshotBuilder,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<SnapshotHeader, SealFailure> {
+    for batch in snapshot.value.records.chunks(MAX_ROW_BATCH_ROWS) {
+        check().map_err(|_| SealFailure::Interrupted)?;
+        store
+            .add_members(builder, batch)
+            .map_err(SealFailure::Bypass)?;
+    }
+    check().map_err(|_| SealFailure::Interrupted)?;
+    store
+        .seal_snapshot(
+            builder.clone(),
+            &SnapshotSeal {
+                discovery: Some(snapshot.value.discovery),
+                coverage: SnapshotCoverage {
+                    discovery: CoverageStatus::Complete,
+                    membership: CoverageStatus::Complete,
+                },
+            },
+        )
+        .map_err(SealFailure::Bypass)
 }
 
 fn publish_pending<T>(store: &Store, proof: &Eligible<T>) -> Result<(), Bypass> {

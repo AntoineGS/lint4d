@@ -662,6 +662,15 @@ impl ContextIndex {
             .is_some_and(|id| self.members[id.0 as usize].reuse_tried)
     }
 
+    /// Whether `path` is pending only to retry a previous refusal
+    /// (`RETRYING_REFUSAL`), which does not hold `complete` back.
+    pub(crate) fn retrying(&self, path: &Path) -> bool {
+        self.id_of(path).is_some_and(|id| {
+            let member = &self.members[id.0 as usize];
+            member.retrying && matches!(member.state(), MemberState::Unindexed | MemberState::Stale)
+        })
+    }
+
     pub(crate) fn mark_reuse_tried(&mut self, path: &Path) {
         if let Some(id) = self.id_of(path) {
             self.members[id.0 as usize].reuse_tried = true;

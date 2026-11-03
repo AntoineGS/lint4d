@@ -118,10 +118,12 @@ impl Workspace {
         Ok(membership)
     }
 
-    /// The acceptance today's enumeration applies, with mapped roots.
+    /// The acceptance today's enumeration applies: workspace sources must be
+    /// safe source paths, mapped library sources only readable (mapped roots
+    /// are deliberately not workspace source roots).
     fn index_accepts(&self, key: &ContextKey, path: &Path) -> bool {
-        (self.accepts_path(path) || self.mapped_path_is_readable(path, key))
-            && is_safe_source_path(self, path)
+        (self.accepts_path(path) && is_safe_source_path(self, path))
+            || self.mapped_path_is_readable(path, key)
     }
 
     /// Records the catalogue `membership` was read from, with the generation
@@ -472,6 +474,7 @@ mod tests {
         );
         let found = membership(&mut workspace, &key);
         assert_eq!(found.paths.len(), 5);
+        let all = found.paths.clone();
         workspace.project_cache.set_index_unit_limit_for_test(3);
         let anchor = IndexAnchor::Project(root.join("App.dproj"));
         workspace
@@ -488,6 +491,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!((stored, limited, complete), (3, true, false));
+        let kept = workspace
+            .project_cache
+            .read_index(&key, |index, _| index.member_paths())
+            .unwrap();
+        let mut expected = all;
+        expected.truncate(3);
+        assert_eq!(kept, expected);
     }
 
     #[test]
@@ -547,9 +557,66 @@ mod tests {
         let first = membership(&mut workspace, &key);
         assert_eq!(first.owner_pending, 2);
         assert!(!first.complete);
+        for index in 0..directories {
+            let directory = root.join(format!("d{index:03}"));
+            let remembered = workspace.project_cache.owner_of(&directory).is_some();
+            assert_eq!(remembered, index < directories - 2, "d{index:03}");
+        }
         let second = membership(&mut workspace, &key);
+        for index in 0..directories {
+            let directory = root.join(format!("d{index:03}"));
+            assert!(workspace.project_cache.owner_of(&directory).is_some());
+        }
         assert_eq!(second.owner_pending, 0);
         assert!(second.complete);
-        assert!(second.paths.len() >= first.paths.len());
+        assert!(second.paths.contains(&root.join("d000/U.pas")));
+    }
+
+    #[test]
+    fn a_missing_search_path_is_a_complete_empty_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        unit(&root.join("lib/A.pas"));
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib;gone</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let found = membership(&mut workspace, &key);
+        assert_eq!(relative(&found, root), ["App.dpr", "lib/A.pas"]);
+        assert!(found.complete);
+        let gone = found
+            .scopes
+            .iter()
+            .find(|(scope, _)| scope.root == root.join("gone"))
+            .expect("the missing directory is a recorded scope");
+        assert_eq!(gone.0.depth, Depth::Listing);
+        assert!(gone.1 > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_library_sources_are_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let sdk = temp.path().join("sdk");
+        unit(&sdk.join("Lib.pas"));
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        );
+        let (mut workspace, key) = project_workspace(
+            &root,
+            "<DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let found = membership(&mut workspace, &key);
+        assert!(found.paths.contains(&sdk.join("Lib.pas")), "{found:?}");
+        assert!(found.paths.contains(&root.join("App.dpr")));
     }
 }

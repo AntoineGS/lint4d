@@ -14,6 +14,13 @@ use crate::workspace::rename::WorkspaceInput;
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
     idle: Condvar,
+    /// Queued Interactive and Bulk client requests, which wait for a worker
+    /// and could take a lent slot (queued pull diagnostics are not counted).
+    waiting_clients: std::sync::atomic::AtomicUsize,
+    /// Background jobs paused in `yield_to_interactive_work`. Their workers
+    /// use no CPU meanwhile, so the dispatcher lends their slots to client
+    /// requests.
+    paused: std::sync::atomic::AtomicUsize,
     /// Test seam: after this many passing `try_wait_idle` checks, mark the
     /// gate busy so a pause lands at an exact unit boundary.
     #[cfg(test)]
@@ -44,6 +51,63 @@ impl InteractiveGate {
         !cancel.load(Ordering::Relaxed)
     }
 
+    /// Records how many client requests wait for a worker. Background work
+    /// pauses for them as for interactive work, and lends them its slot.
+    pub(crate) fn set_waiting_clients(&self, waiting: usize) {
+        self.waiting_clients.store(waiting, Ordering::Relaxed);
+        if waiting == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_paused_background_for_tests(&self, paused: usize) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_clients_for_tests(&self) -> usize {
+        self.waiting_clients.load(Ordering::Relaxed)
+    }
+
+    /// The number of background jobs paused for interactive work.
+    pub(crate) fn paused_background(&self) -> usize {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    fn background_may_run(&self, busy: usize) -> bool {
+        busy == 0 && self.waiting_clients.load(Ordering::Relaxed) == 0
+    }
+
+    /// Waits until no interactive request runs or waits and no client request
+    /// waits for a worker, for at most `limit`: true then or after `limit`,
+    /// false if cancelled.
+    fn wait_background_turn(&self, cancel: &AtomicBool, limit: Duration) -> bool {
+        let deadline = Instant::now().checked_add(limit);
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.background_may_run(*busy) {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            let slice = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    remaining.min(Duration::from_millis(25))
+                }
+                None => Duration::from_millis(25),
+            };
+            busy = self
+                .idle
+                .wait_timeout(busy, slice)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !cancel.load(Ordering::Relaxed)
+    }
+
     /// Checks whether warming may proceed without waiting while it owns a cache claim.
     pub(crate) fn try_wait_idle(&self, cancel: &AtomicBool) -> bool {
         #[cfg(test)]
@@ -68,6 +132,52 @@ impl InteractiveGate {
         *self.busy.lock().unwrap_or_else(PoisonError::into_inner) == 0
             && !cancel.load(Ordering::Relaxed)
     }
+}
+
+thread_local! {
+    static BACKGROUND_GATE: std::cell::RefCell<Option<(Arc<InteractiveGate>, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The longest background work pauses at once for interactive work. It
+/// then does one more step and pauses again, so that it slows down to a
+/// fraction of its speed while interactive work runs, but a long or held
+/// interactive request does not stall it.
+pub(crate) const BACKGROUND_PAUSE_LIMIT: Duration = Duration::from_millis(500);
+
+/// Makes the background work on the calling thread pause for interactive
+/// work at `yield_to_interactive_work` points, each time for at most the
+/// given duration (`None`: it never pauses).
+pub(crate) fn set_background_gate_on_this_thread(gate: Option<(Arc<InteractiveGate>, Duration)>) {
+    BACKGROUND_GATE.with(|cell| *cell.borrow_mut() = gate);
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn has_background_gate_on_this_thread() -> bool {
+    BACKGROUND_GATE.with(|cell| cell.borrow().is_some())
+}
+
+/// Waits while interactive requests run or are queued, or other client
+/// requests wait for a worker, up to the thread's pause limit, when the
+/// calling thread does background work and holds no cache claim (a lookup
+/// waiting for one would wait out the pause). False when cancelled.
+pub(crate) fn yield_to_interactive_work(cancel: &AtomicBool) -> bool {
+    let Some((gate, limit)) = BACKGROUND_GATE.with(|cell| cell.borrow().clone()) else {
+        return true;
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    if crate::project_cache::claims_held_on_this_thread() > 0
+        || gate.background_may_run(*gate.busy.lock().unwrap_or_else(PoisonError::into_inner))
+    {
+        return true;
+    }
+    let _span = crate::trace::Span::new(|| "background work paused for interactive work".into());
+    gate.paused.fetch_add(1, Ordering::Relaxed);
+    let resumed = gate.wait_background_turn(cancel, limit);
+    gate.paused.fetch_sub(1, Ordering::Relaxed);
+    resumed
 }
 
 #[derive(Debug, Default)]
@@ -1264,6 +1374,97 @@ mod tests {
     }
 
     #[test]
+    fn background_work_pauses_for_interactive_work_only_without_claims() {
+        let gate = Arc::new(InteractiveGate::default());
+        let cancel = AtomicBool::new(false);
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "work without a background gate never pauses"
+        );
+        gate.set(1);
+        set_background_gate_on_this_thread(Some((gate.clone(), Duration::MAX)));
+
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let context = pascal_project::ProjectContext::from_parts(
+            pascal_project::ProjectContextParts::default(),
+        );
+        let uri = Url::parse("file:///ws/Main.pas").unwrap();
+        let crate::project_cache::Lookup::Compute(claim) =
+            cache.imports(&uri, &context, 1, &HashMap::new(), &cancel)
+        else {
+            panic!("expected a claim")
+        };
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "work holding a claim does not pause: a waiter would wait out the pause"
+        );
+        drop(claim);
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let paused_gate = gate.clone();
+        let paused = std::thread::spawn(move || {
+            set_background_gate_on_this_thread(Some((paused_gate, Duration::MAX)));
+            paused_tx
+                .send(yield_to_interactive_work(&AtomicBool::new(false)))
+                .unwrap();
+        });
+        // The pause is reported to the dispatcher, which lends its slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.paused_background() == 0 {
+            assert!(Instant::now() < deadline, "the work pauses");
+            std::thread::yield_now();
+        }
+        assert!(paused_rx.try_recv().is_err(), "the work is still paused");
+        gate.set(0);
+        assert!(
+            paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the work resumes once interactive work is done")
+        );
+        paused.join().unwrap();
+        assert_eq!(gate.paused_background(), 0);
+
+        // A client request waiting for a worker pauses background work too.
+        gate.set_waiting_clients(1);
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let paused_gate = gate.clone();
+        let paused = std::thread::spawn(move || {
+            set_background_gate_on_this_thread(Some((paused_gate, Duration::MAX)));
+            paused_tx
+                .send(yield_to_interactive_work(&AtomicBool::new(false)))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.paused_background() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the work pauses for a waiting request"
+            );
+            std::thread::yield_now();
+        }
+        gate.set_waiting_clients(0);
+        assert!(
+            paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the work resumes once the request has a worker")
+        );
+        paused.join().unwrap();
+
+        gate.set(1);
+        set_background_gate_on_this_thread(Some((gate.clone(), Duration::ZERO)));
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "a pause ends at its limit while interactive work still runs"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            !yield_to_interactive_work(&cancel),
+            "a cancelled pause fails"
+        );
+        set_background_gate_on_this_thread(None);
+    }
+
+    #[test]
     fn shutdown_cancels_and_joins_worker_waiting_for_interactive_gate() {
         let (_temp, workspace, main) = fixture();
         let gate = Arc::new(InteractiveGate::default());
@@ -1284,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_lookup_can_proceed_after_warm_releases_import_claim() {
+    fn interactive_lookup_does_not_wait_for_a_paused_warm_walk() {
         let (_temp, workspace, main) = fixture();
         let input = workspace.analysis_input();
         let gate = Arc::new(InteractiveGate::default());
@@ -1292,32 +1493,45 @@ mod tests {
         let hook_gate = gate.clone();
         let hook_cancel = warm_cancel.clone();
         let (claim_acquired_tx, claim_acquired_rx) = std::sync::mpsc::channel();
-        let (resume_hook_tx, resume_hook_rx) = crossbeam_channel::bounded(1);
+        let (resume_hook_tx, resume_hook_rx) = crossbeam_channel::bounded::<()>(1);
         let warm_uri = main.clone();
         let mut warming_workspace = Workspace::from_analysis_input(&input);
+        let first_unit = Arc::new(AtomicBool::new(true));
         warming_workspace.set_dependency_hook(Arc::new(move |_, _, _| {
-            hook_gate.set(1);
-            claim_acquired_tx.send(()).unwrap();
-            resume_hook_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("test releases the dependency hook");
+            // Only the first unit boundary holds the walk; the test releases
+            // it (or drops the sender) whatever the interactive request does.
+            if first_unit.swap(false, Ordering::Relaxed) {
+                hook_gate.set(1);
+                claim_acquired_tx.send(()).unwrap();
+                let _ = resume_hook_rx.recv();
+            }
             if hook_gate.try_wait_idle(&hook_cancel) {
                 Ok(())
             } else {
                 Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
             }
         }));
-        let warm_thread =
-            std::thread::spawn(move || warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel));
+        let warm_thread = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::yielding(warm_cancel.clone()),
+            );
+            warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel)
+        });
         claim_acquired_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("warmer reached the dependency hook while holding its imports claim");
+            .expect("warmer reached its dependency walk");
 
         let interactive_input = workspace.analysis_input();
         let interactive_uri = main.clone();
         let (interactive_started_tx, interactive_started_rx) = std::sync::mpsc::channel();
         let (interactive_done_tx, interactive_done_rx) = std::sync::mpsc::channel();
         let interactive_thread = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::ZERO,
+                ),
+            );
             let mut interactive_workspace = Workspace::from_analysis_input(&interactive_input);
             interactive_started_tx.send(()).unwrap();
             let result = interactive_workspace
@@ -1328,18 +1542,18 @@ mod tests {
         interactive_started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("interactive cache consumer started");
-        std::thread::sleep(Duration::from_millis(50));
-        resume_hook_tx.send(()).unwrap();
 
-        let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(2));
+        // The warm stays paused in its dependency walk until the interactive
+        // request is done or has had its chance to finish.
+        let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(10));
         let completed_before_release = completed_while_gate_busy.is_ok();
-        gate.set(0);
+        drop(resume_hook_tx);
         let warm_result = warm_thread.join().unwrap();
         let interactive_result = match completed_while_gate_busy {
             Ok(result) => result,
             Err(_) => interactive_done_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("interactive request finishes after releasing the gate"),
+                .recv_timeout(Duration::from_secs(10))
+                .expect("interactive request finishes after releasing the walk"),
         };
         interactive_thread.join().unwrap();
 

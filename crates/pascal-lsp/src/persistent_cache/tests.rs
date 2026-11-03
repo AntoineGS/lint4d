@@ -264,6 +264,7 @@ fn transitions_leave_project_cache_entries_untouched() {
             bindings: vec![],
             dependencies: vec![],
             complete: true,
+            settled: true,
         }),
         report: Arc::new(pascal_core::ResolutionReport {
             observations: vec![],

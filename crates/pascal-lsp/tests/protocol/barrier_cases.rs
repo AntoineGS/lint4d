@@ -5601,7 +5601,96 @@ fn queued_hover_is_replaced_by_a_newer_hover_for_the_same_document() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
+fn definition_during_a_diagnostics_closure_walk_neither_waits_for_it_nor_repeats_it() {
+    let root = tempfile::tempdir().expect("workspace");
+    let units = ["UOne", "UTwo", "UThree", "UFour"];
+    for name in units {
+        write_file(
+            &root.path().join(format!("{name}.pas")),
+            &format!("unit {name};\ninterface\ntype\n  T{name} = class end;\nimplementation\nend.\n"),
+        );
+    }
+    let main = root.path().join("Main.pas");
+    let source = "unit Main;\ninterface\nuses UOne, UTwo, UThree, UFour;\ntype\n  TUse = TUFour;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let environment = tempfile::tempdir().expect("server environment");
+    let barrier_directory = environment.path().join("background-walk-barrier");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let walk = TestBarrier {
+        entered: barrier_directory.join("entered"),
+        release: barrier_directory.join("release"),
+    };
+    let walk_spec = format!("{}|{}", walk.entered.display(), walk.release.display());
+    let trace = environment.path().join("trace.log");
+    let trace_path = trace.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment.path(),
+        [
+            ("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER", walk_spec.as_str()),
+            ("PASCAL_LSP_TRACE", trace_path.as_str()),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+
+    let diagnostics_id = RequestId::from("diagnostics-walking-the-closure".to_string());
+    server.send_request(
+        diagnostics_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    walk.wait_until_entered();
+
+    // The diagnostics job is held after its first unit; the definition walks
+    // the rest of the closure itself.
+    let definition_id = RequestId::from("definition-during-the-walk".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TUFour", 0),
+    );
+    let definition = server
+        .response_with_timeout(&definition_id, IO_TIMEOUT)
+        .expect("the definition does not wait for the diagnostics walk");
+    let locations = result_locations(definition);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(
+        locations[0]["uri"],
+        uri(&root.path().join("UFour.pas")).to_string()
+    );
+
+    walk.release();
+    let diagnostics = server.response(&diagnostics_id);
+    assert!(diagnostics.error.is_none(), "{diagnostics:?}");
+    server.shutdown();
+
+    let trace = fs::read_to_string(&trace).expect("trace");
+    for name in units.iter().copied().chain(["Main"]) {
+        let computes = trace
+            .lines()
+            .filter(|line| line.contains(&format!("cache compute Unit {name}.pas ")))
+            .count();
+        assert_eq!(computes, 1, "{name} is parsed once:\n{trace}");
+    }
+    let resolutions = trace
+        .lines()
+        .filter(|line| line.contains("cache compute Import Main.pas "))
+        .count();
+    assert_eq!(resolutions, 1, "Main's imports are resolved once:\n{trace}");
+    assert!(
+        !trace.lines().any(|line| line.contains(" detached=")
+            && !line.contains(" detached=0 ")),
+        "nothing is computed uncached beside a claim:\n{trace}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn definition_adopts_a_bulk_references_import_claim() {
     let root = tempfile::tempdir().expect("workspace");
     let provider = root.path().join("Provider.pas");
     let main = root.path().join("Main.pas");
@@ -5628,9 +5717,23 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
         release: barrier_directory.join("release"),
     };
     let claim_spec = format!("{}|{}", claim.entered.display(), claim.release.display());
+    let waited = TestBarrier {
+        entered: barrier_directory.join("interactive-waited"),
+        release: barrier_directory.join("unused"),
+    };
+    let waited_marker = waited.entered.display().to_string();
+    let trace = environment.path().join("trace.log");
+    let trace_path = trace.display().to_string();
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         environment.path(),
-        [("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER", claim_spec.as_str())],
+        [
+            ("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER", claim_spec.as_str()),
+            (
+                "PASCAL_LSP_TEST_INTERACTIVE_CLAIM_WAIT_MARKER",
+                waited_marker.as_str(),
+            ),
+            ("PASCAL_LSP_TRACE", trace_path.as_str()),
+        ],
     );
     server.initialize(root.path(), Value::Null);
 
@@ -5646,20 +5749,22 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
     );
     claim.wait_until_entered();
 
+    // The claim covers Main's import resolution only (the dependency walk
+    // runs after it is stored), so the definition waits for it rather than
+    // resolving the imports a second time.
     let definition_id = RequestId::from("definition-behind-a-bulk-claim".to_string());
-    let started = Instant::now();
     server.send_request(
         definition_id.clone(),
         "textDocument/definition",
         navigation_params(&main, &source, "TProvided", 0),
     );
+    // Outlast any bounded wait (each mark is one 20 ms wait slice) before
+    // the claim is stored: the definition keeps waiting for it.
+    waited.wait_for_entries(2 + 1000 / 20);
+    claim.release();
     let definition = server
         .response_with_timeout(&definition_id, IO_TIMEOUT)
-        .expect("definition must not wait for the bulk job's cache claim");
-    eprintln!(
-        "definition answered in {:?} while references held a cache claim",
-        started.elapsed()
-    );
+        .expect("definition answers once the bulk job stores its claim");
     let locations = result_locations(definition);
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert_eq!(locations[0]["uri"], uri(&provider).to_string());
@@ -5673,10 +5778,24 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
         "only the references job may hold a claim at the barrier"
     );
 
-    claim.release();
     let references = server.response(&references_id);
     assert!(references.error.is_none(), "{references:?}");
     server.shutdown();
+
+    let trace = fs::read_to_string(&trace).expect("trace");
+    let resolutions = trace
+        .lines()
+        .filter(|line| line.contains("cache compute Import Main.pas "))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "the definition adopts the references job's resolution:\n{trace}"
+    );
+    assert!(
+        !trace.lines().any(|line| line.contains(" detached=")
+            && !line.contains(" detached=0 ")),
+        "nothing is computed uncached beside a claim:\n{trace}"
+    );
 }
 
 #[test]

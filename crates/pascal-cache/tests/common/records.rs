@@ -190,7 +190,8 @@ pub const EAGER: MaintenanceLimits = MaintenanceLimits {
 /// Rows that break the reachability invariant (phase 6 Decision 11): a
 /// live record over a retired or missing artifact or evidence set, a
 /// building or sealed snapshot over a retired or missing record or
-/// discovery evidence. Must always be 0.
+/// discovery evidence, live artifact evidence over a retired or missing
+/// artifact. Must always be 0.
 pub fn check_invariant(directory: &Path) -> i64 {
     const LIVE_ARTIFACT: &str = "EXISTS (SELECT 1 FROM artifacts a WHERE a.namespace_id = r.namespace_id \
         AND a.reset_epoch = r.reset_epoch AND a.artifact_id = r.artifact_id AND a.lifecycle = 1)";
@@ -223,6 +224,10 @@ pub fn check_invariant(directory: &Path) -> i64 {
             "SELECT count(*) FROM snapshots s WHERE s.state = 2 AND s.discovery_evidence IS NOT NULL AND NOT {}",
             live_evidence("discovery_evidence", "s")
         ),
+        "SELECT count(*) FROM evidence_sets e WHERE e.lifecycle = 1 AND e.artifact_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.namespace_id = e.namespace_id \
+         AND a.reset_epoch = e.reset_epoch AND a.artifact_id = e.artifact_id AND a.lifecycle = 1)"
+            .to_string(),
     ];
     let connection = raw(directory);
     queries

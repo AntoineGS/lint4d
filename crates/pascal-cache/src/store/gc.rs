@@ -5,13 +5,14 @@
 //! subquery re-checks every condition inside the `IMMEDIATE` transaction,
 //! so a publication either committed before it (and its reference keeps
 //! the row live) or runs after it (and is refused as `Retiring`, spec §6.1
-//! amendment 2026-11-03). Retired rows are deleted later, children first.
+//! amendment 2026-11-03). Retired rows are deleted later, children first,
+//! by [`delete_retired`] inside `Store::reclaim`.
 
 use super::Store;
 use super::budget::{Pressure, pressure_of, read_policy, read_usage};
 use super::health::Access;
 use super::leases::{horizon, live_since};
-use super::namespaces::{ensure_live, epoch};
+use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use rusqlite::{Connection, TransactionBehavior, params};
@@ -120,7 +121,9 @@ macro_rules! held {
     };
 }
 
-// Every statement: `?1` namespace, `?2` epoch, `?4` the batch size.
+// Every statement: `?1` namespace, `?2` epoch, `?4` the batch size. A
+// unary `+` keeps a `lifecycle` term off the lifecycle index, so the probe
+// searches the reference's own index (checked by the plan test below).
 
 const ABANDONED_BUILDS: &str = concat!(
     "UPDATE snapshots SET state = 3 WHERE rowid IN (SELECT s.rowid FROM snapshots s \
@@ -154,7 +157,7 @@ const EVIDENCE: &str = "UPDATE evidence_sets SET lifecycle = 2 WHERE rowid IN (S
     AND e.publication_seq <= ?3 \
     AND NOT EXISTS (SELECT 1 FROM member_records r WHERE r.namespace_id = e.namespace_id \
         AND r.reset_epoch = e.reset_epoch AND r.member_evidence = e.evidence_id \
-        AND r.lifecycle = 1) \
+        AND +r.lifecycle = 1) \
     AND NOT EXISTS (SELECT 1 FROM member_bindings b JOIN member_records r \
         ON r.namespace_id = b.namespace_id AND r.reset_epoch = b.reset_epoch \
         AND r.record_id = b.record_id \
@@ -171,11 +174,144 @@ const ARTIFACTS: &str = "UPDATE artifacts SET lifecycle = 2 WHERE rowid IN (SELE
     AND a.publication_seq <= ?3 \
     AND NOT EXISTS (SELECT 1 FROM member_records r WHERE r.namespace_id = a.namespace_id \
         AND r.reset_epoch = a.reset_epoch AND r.artifact_id = a.artifact_id \
-        AND r.lifecycle = 1) \
+        AND +r.lifecycle = 1) \
     AND NOT EXISTS (SELECT 1 FROM evidence_sets e WHERE e.namespace_id = a.namespace_id \
         AND e.reset_epoch = a.reset_epoch AND e.artifact_id = a.artifact_id \
-        AND e.lifecycle = 1) \
+        AND +e.lifecycle = 1) \
     LIMIT ?4)";
+
+/// The rows of one table that point at retired parent `p` of `parent`
+/// (`state` or `lifecycle` column `status`), reached from the parent's
+/// state index and then by the parent-id prefix of the child's key
+/// (`CROSS JOIN` keeps that order).
+macro_rules! children_of_retired {
+    ($child:literal, $parent:literal, $status:literal, $id:literal) => {
+        concat!(
+            "DELETE FROM ",
+            $child,
+            " WHERE rowid IN (SELECT c.rowid FROM ",
+            $parent,
+            " p CROSS JOIN ",
+            $child,
+            " c ON c.namespace_id = p.namespace_id AND c.reset_epoch = p.reset_epoch AND c.",
+            $id,
+            " = p.",
+            $id,
+            " WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.",
+            $status,
+            " LIMIT ?3)"
+        )
+    };
+}
+
+/// No row of `table` names `p`'s `id` in `column`.
+macro_rules! unnamed_by {
+    ($table:literal, $column:literal, $id:literal) => {
+        concat!(
+            " AND NOT EXISTS (SELECT 1 FROM ",
+            $table,
+            " x WHERE x.namespace_id = p.namespace_id AND x.reset_epoch = p.reset_epoch AND x.",
+            $column,
+            " = p.",
+            $id,
+            ")"
+        )
+    };
+}
+
+/// Deletion inside the live scope, children first (spec §10: retire from
+/// lookup, delete bounded row batches, then remove the header). A parent
+/// goes only once no row of any lifecycle references it, so the foreign
+/// keys hold after every batch. `?1` namespace, `?2` epoch, `?3` the rows
+/// left in the batch.
+pub(crate) const DELETE_STEPS: [&str; 10] = [
+    children_of_retired!("lease_holds", "snapshots", "state = 3", "snapshot_id"),
+    children_of_retired!("snapshot_members", "snapshots", "state = 3", "snapshot_id"),
+    concat!(
+        "DELETE FROM snapshots WHERE rowid IN (SELECT p.rowid FROM snapshots p \
+         WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.state = 3",
+        unnamed_by!("snapshot_members", "snapshot_id", "snapshot_id"),
+        unnamed_by!("lease_holds", "snapshot_id", "snapshot_id"),
+        " LIMIT ?3)"
+    ),
+    children_of_retired!(
+        "member_bindings",
+        "member_records",
+        "lifecycle = 2",
+        "record_id"
+    ),
+    concat!(
+        "DELETE FROM member_records WHERE rowid IN (SELECT p.rowid FROM member_records p \
+         WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
+        unnamed_by!("member_bindings", "record_id", "record_id"),
+        unnamed_by!("snapshot_members", "record_id", "record_id"),
+        " LIMIT ?3)"
+    ),
+    children_of_retired!(
+        "observations",
+        "evidence_sets",
+        "lifecycle = 2",
+        "evidence_id"
+    ),
+    concat!(
+        "DELETE FROM evidence_sets WHERE rowid IN (SELECT p.rowid FROM evidence_sets p \
+         WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
+        unnamed_by!("observations", "evidence_id", "evidence_id"),
+        unnamed_by!("member_records", "member_evidence", "evidence_id"),
+        unnamed_by!("member_bindings", "evidence_id", "evidence_id"),
+        unnamed_by!("snapshots", "discovery_evidence", "evidence_id"),
+        " LIMIT ?3)"
+    ),
+    children_of_retired!("artifact_rows", "artifacts", "lifecycle = 2", "artifact_id"),
+    concat!(
+        "DELETE FROM artifacts WHERE rowid IN (SELECT p.rowid FROM artifacts p \
+         WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
+        unnamed_by!("artifact_rows", "artifact_id", "artifact_id"),
+        unnamed_by!("member_records", "artifact_id", "artifact_id"),
+        unnamed_by!("evidence_sets", "artifact_id", "artifact_id"),
+        " LIMIT ?3)"
+    ),
+    // Orphan manifests (Decision 19). One `NOT EXISTS` per column, so each
+    // probe searches its own index.
+    concat!(
+        "DELETE FROM key_manifests WHERE rowid IN (SELECT p.rowid FROM key_manifests p \
+         WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2",
+        unnamed_by!("artifacts", "artifact_id", "digest"),
+        unnamed_by!("artifacts", "root_key", "digest"),
+        unnamed_by!("evidence_sets", "context_key", "digest"),
+        unnamed_by!("evidence_sets", "subject_key", "digest"),
+        unnamed_by!("snapshots", "context_key", "digest"),
+        " LIMIT ?3)"
+    ),
+];
+
+/// Run [`DELETE_STEPS`] in order in the caller's transaction while
+/// `budget` rows remain. Returns the rows deleted and whether nothing
+/// deletable is left: every step deleted fewer rows than it was allowed.
+/// Retired rows something still references stay until it goes.
+pub(crate) fn delete_retired(
+    connection: &Connection,
+    scope: Scope,
+    budget: usize,
+) -> Result<(usize, bool), Bypass> {
+    let namespace = scope.namespace.as_bytes().as_slice();
+    let reset_epoch = epoch(scope);
+    let mut left = budget;
+    for sql in DELETE_STEPS {
+        if left == 0 {
+            return Ok((budget, false));
+        }
+        let deleted = connection
+            .prepare_cached(sql)
+            .and_then(|mut statement| {
+                statement.execute(params![namespace, reset_epoch, left as i64])
+            })
+            .map_err(|error| classify(&error))?;
+        left -= deleted.min(left);
+    }
+    // A step that used the whole remainder may have left rows behind.
+    Ok((budget - left, left > 0))
+}
 
 fn current_seq(connection: &Connection) -> Result<i64, Bypass> {
     connection
@@ -308,6 +444,142 @@ mod tests {
             writer
                 .prepare(sql)
                 .unwrap_or_else(|error| panic!("{error}: {sql}"));
+        }
+    }
+
+    /// Every `SEARCH`/`SCAN` line of `sql`'s query plan.
+    fn plan(connection: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap_or_else(|error| panic!("{error}: {sql}"));
+        let unbound = std::iter::repeat_n(rusqlite::types::Null, statement.parameter_count());
+        statement
+            .query_map(rusqlite::params_from_iter(unbound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|line| line.starts_with("SEARCH") || line.starts_with("SCAN"))
+            .collect()
+    }
+
+    /// The last term each `SEARCH` of a query alias binds, sorted: a
+    /// child or reference probe must bind its parent's ID, not just the
+    /// scope (foreign key checks, on table names, are left out).
+    fn bound_terms(connection: &Connection, sql: &str) -> Vec<String> {
+        let lines = plan(connection, sql);
+        assert!(
+            lines.iter().all(|line| !line.starts_with("SCAN")),
+            "{sql}\n{lines:#?}"
+        );
+        let mut terms: Vec<String> = lines
+            .iter()
+            .filter(|line| line.split(' ').nth(1).is_some_and(|alias| alias.len() == 1))
+            .map(|line| {
+                let inside = &line[line.rfind('(').unwrap() + 1..line.rfind(')').unwrap()];
+                inside.rsplit(" AND ").next().unwrap().to_string()
+            })
+            .collect();
+        terms.sort();
+        terms
+    }
+
+    #[test]
+    fn every_maintenance_statement_searches_by_parent_or_reference_id() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let store = Store::open(
+            directory.path(),
+            &Namespace::new(Digest::from_bytes([4; 32])),
+            super::super::StoreLimits::default(),
+        )
+        .unwrap();
+        let writer = store.writer().unwrap();
+        let expected: [(&str, &[&str]); 15] = [
+            (DELETE_STEPS[0], &["snapshot_id=?", "state=?"]),
+            (DELETE_STEPS[1], &["snapshot_id=?", "state=?"]),
+            (
+                DELETE_STEPS[2],
+                &["snapshot_id=?", "snapshot_id=?", "state=?"],
+            ),
+            (DELETE_STEPS[3], &["lifecycle=?", "record_id=?"]),
+            (
+                DELETE_STEPS[4],
+                &["lifecycle=?", "record_id=?", "record_id=?"],
+            ),
+            (DELETE_STEPS[5], &["evidence_id=?", "lifecycle=?"]),
+            (
+                DELETE_STEPS[6],
+                &[
+                    "discovery_evidence=?",
+                    "evidence_id=?",
+                    "evidence_id=?",
+                    "lifecycle=?",
+                    "member_evidence=?",
+                ],
+            ),
+            (DELETE_STEPS[7], &["artifact_id=?", "lifecycle=?"]),
+            (
+                DELETE_STEPS[8],
+                &[
+                    "artifact_id=?",
+                    "artifact_id=?",
+                    "artifact_id=?",
+                    "lifecycle=?",
+                ],
+            ),
+            // Orphan manifests are found by visiting the scope's manifests.
+            (
+                DELETE_STEPS[9],
+                &[
+                    "artifact_id=?",
+                    "context_key=?",
+                    "context_key=?",
+                    "reset_epoch=?",
+                    "root_key=?",
+                    "subject_key=?",
+                ],
+            ),
+            (
+                ABANDONED_BUILDS,
+                &["lease_id=?", "snapshot_id=?", "state=?"],
+            ),
+            (
+                UNUSED_SNAPSHOTS,
+                &[
+                    "lease_id=?",
+                    "publication_seq>?",
+                    "snapshot_id=?",
+                    "state=?",
+                ],
+            ),
+            (
+                RECORDS,
+                &["publication_seq<?", "record_id=?", "snapshot_id=?"],
+            ),
+            (
+                EVIDENCE,
+                &[
+                    "discovery_evidence=?",
+                    "evidence_id=?",
+                    "member_evidence=?",
+                    "publication_seq<?",
+                    "record_id=?",
+                ],
+            ),
+            (
+                ARTIFACTS,
+                &["artifact_id=?", "artifact_id=?", "publication_seq<?"],
+            ),
+        ];
+        for (sql, terms) in expected {
+            assert_eq!(bound_terms(&writer, sql), terms, "{sql}");
         }
     }
 

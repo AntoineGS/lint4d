@@ -6,14 +6,17 @@ mod common;
 use common::private_tempdir;
 use common::records::{
     EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
-    local_member, open, raw, read_members, records, sealed,
+    local_member, member, open, raw, read_members, read_record, records, sealed,
 };
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, FaultPoint, Hint,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, DiscoveryInputs,
+    DiscoveryScope, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint,
     HintStats, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup,
-    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, MaintenanceLimits, Miss, PolicyError,
-    PolicyState, Pressure, Published, RetireStep, SourceContent, Store, StorePolicy, Unhealthy,
+    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, MaintenanceLimits, Miss, Observation,
+    PolicyError, PolicyState, Pressure, Published, Reclaimed, RetireStep, ScannedDirectory,
+    SnapshotSeal, SourceContent, Store, StorePolicy, Unhealthy,
 };
+use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
 
@@ -761,4 +764,341 @@ fn a_batch_retires_at_most_batch_rows() {
     assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(2));
     assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(1));
     assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(0));
+}
+
+fn table_rows(directory: &Path) -> i64 {
+    [
+        "snapshot_members",
+        "snapshots",
+        "member_bindings",
+        "member_records",
+        "observations",
+        "evidence_sets",
+        "artifact_rows",
+        "artifacts",
+        "key_manifests",
+        "lease_holds",
+    ]
+    .iter()
+    .map(|table| count(directory, &format!("SELECT count(*) FROM {table}")))
+    .sum()
+}
+
+#[test]
+fn retired_rows_inside_the_live_scope_are_deleted_children_first_in_bounded_batches() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let evidence = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    let record = store
+        .publish_member_record(&local_member(
+            &store,
+            "/w/Main.pas",
+            "unit Main;",
+            "/w/Shapes.pas",
+            evidence,
+        ))
+        .unwrap()
+        .record_id;
+    let snapshot = sealed(&store, &[record]);
+    publish_bulk(&store, "unit Bulk;", 300, 10).unwrap();
+    age_past_grace(&store);
+    assert!(store.retire_snapshot(snapshot.id()).unwrap());
+    while retire_all(&store, &EAGER) > 0 {}
+    let mut passes = 0;
+    loop {
+        let Reclaimed { rows, complete } = store.reclaim(5).unwrap();
+        assert!(rows <= 5);
+        assert_eq!(check_invariant(root.path()), 0, "after every batch");
+        passes += 1;
+        if complete {
+            break;
+        }
+        assert!(passes < 200, "deletion must progress");
+    }
+    assert_eq!(table_rows(root.path()), 0, "everything was unreferenced");
+    assert_eq!(store.check_scope(), Ok(()), "the live scope itself stays");
+    assert_eq!(
+        store.reclaim(5),
+        Ok(Reclaimed {
+            rows: 0,
+            complete: true
+        })
+    );
+}
+
+#[test]
+fn live_rows_are_never_deleted() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let evidence = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    let record = store
+        .publish_member_record(&local_member(
+            &store,
+            "/w/Main.pas",
+            "unit Main;",
+            "/w/Shapes.pas",
+            evidence,
+        ))
+        .unwrap()
+        .record_id;
+    let snapshot = sealed(&store, &[record]);
+    let before = table_rows(root.path());
+    assert_eq!(
+        store.reclaim(1000),
+        Ok(Reclaimed {
+            rows: 0,
+            complete: true
+        })
+    );
+    assert_eq!(table_rows(root.path()), before);
+    assert_eq!(
+        read_members(&store, &snapshot).map(|members| members.len()),
+        Ok(1)
+    );
+    assert!(read_record(&store, record).is_ok());
+}
+
+#[test]
+fn deletion_between_batches_is_a_miss_never_a_verified_read() {
+    let root = private_tempdir();
+    let reader_store = open(root.path());
+    let gc = open(root.path());
+    publish_bulk(&reader_store, "unit Bulk;", 300, 10).unwrap();
+    let Lookup::Hit(header) = reader_store
+        .open_artifact(ArtifactKeyRef::local(&key("unit Bulk;")))
+        .unwrap()
+    else {
+        panic!("published")
+    };
+    let mut reader = reader_store.read_artifact(&header);
+    assert!(
+        matches!(reader.next_batch(), Ok(Lookup::Hit(Some(_)))),
+        "first batch read"
+    );
+    age_past_grace(&gc);
+    gc.advance_clock_for_test(LEASE_EXPIRY);
+    gc.renew_lease().unwrap();
+    assert_eq!(gc.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    while !gc.reclaim(256).unwrap().complete {}
+    assert_eq!(count(root.path(), "SELECT count(*) FROM artifact_rows"), 0);
+    assert!(matches!(
+        reader.next_batch(),
+        Ok(Lookup::Miss(Miss::Retired | Miss::Vanished))
+    ));
+    assert!(!reader.is_verified());
+}
+
+#[test]
+fn a_republish_after_deletion_inserts_afresh() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    publish_bulk(&store, "unit A;", 3, 10).unwrap();
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 3, 10),
+        Err(Bypass::Retiring),
+        "retry later"
+    );
+    while !store.reclaim(256).unwrap().complete {}
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 3, 10),
+        Ok(Published::Inserted)
+    );
+}
+
+#[test]
+fn discovery_evidence_and_artifact_evidence_of_a_sealed_snapshot_survive_deletion() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let library = LocalArtifactKey::new(
+        &SourceContent::from_bytes(b"unit Lib;"),
+        &ConditionalContext::default(),
+        SourceOrigin::Library,
+    );
+    let expanded = ExpandedArtifactKey::new(&library, &[]).unwrap();
+    let artifact_key = ArtifactKeyRef::expanded(&expanded, &library).unwrap();
+    let observations = [Observation::Presence {
+        path: "/w/b.inc".into(),
+        entry: None,
+        present: false,
+    }];
+    let write = EvidenceWrite {
+        context: &context(),
+        observations: &observations,
+    };
+    let facts = ArtifactFacts {
+        slot_lengths: vec![12],
+        expanded_length: 12,
+        ..ArtifactFacts::default()
+    };
+    store
+        .publish_facts_with_evidence(artifact_key, &facts, &write)
+        .unwrap();
+    let artifact_evidence = |store: &Store| {
+        let Lookup::Hit(headers) = store.find_evidence(&context(), &library).unwrap() else {
+            panic!("artifact evidence is live")
+        };
+        headers[0].evidence_id()
+    };
+    let evidence = artifact_evidence(&store);
+    let shapes = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    let mut lib = member("/w/Lib.pas", &["/w/Shapes.pas"], shapes);
+    lib.header.artifact = Some(artifact_key.digest());
+    lib.header.member_evidence = Some(evidence);
+    let record = store.publish_member_record(&lib).unwrap().record_id;
+    let discovery_scope = DiscoveryScope::new(&DiscoveryInputs {
+        directories: &[ScannedDirectory {
+            path: Path::new("/w"),
+            recursive: true,
+        }],
+        exclusions: &[],
+    });
+    let discovery = store
+        .publish_evidence(EvidenceTarget::Discovery(&discovery_scope), &write)
+        .unwrap()
+        .evidence_id;
+    let mut builder = store.begin_snapshot(&context()).unwrap();
+    store.add_members(&mut builder, &[record]).unwrap();
+    let snapshot = store
+        .seal_snapshot(
+            builder,
+            &SnapshotSeal {
+                discovery: Some(discovery),
+                ..SEAL
+            },
+        )
+        .unwrap();
+    age_past_grace(&store);
+    while retire_all(&store, &EAGER) > 0 {}
+    while !store.reclaim(256).unwrap().complete {}
+    assert_eq!(check_invariant(root.path()), 0);
+    let dir = root.path();
+    assert_eq!(
+        lifecycle(dir, "evidence_sets", "evidence_id", discovery.as_bytes()),
+        1
+    );
+    assert_eq!(
+        lifecycle(dir, "evidence_sets", "evidence_id", evidence.as_bytes()),
+        1
+    );
+    assert_eq!(
+        lifecycle(
+            dir,
+            "artifacts",
+            "artifact_id",
+            artifact_key.digest().as_bytes()
+        ),
+        1
+    );
+    assert_eq!(artifact_evidence(&store), evidence);
+    assert!(read_record(&store, record).is_ok());
+    assert_eq!(read_members(&store, &snapshot).map(|m| m.len()), Ok(1));
+    let Lookup::Hit(header) = store.open_artifact(artifact_key).unwrap() else {
+        panic!("the expanded artifact and its root manifest survive")
+    };
+    let mut reader = store.read_artifact(&header);
+    while let Lookup::Hit(Some(_)) = reader.next_batch().unwrap() {}
+    assert!(reader.is_verified());
+}
+
+#[test]
+fn a_gc_retired_build_loses_its_expired_holds_before_its_header() {
+    let root = private_tempdir();
+    let builder_store = open(root.path());
+    let gc = open(root.path());
+    let ids = records(&builder_store, "M", 1);
+    let mut builder = builder_store.begin_snapshot(&context()).unwrap();
+    builder_store.add_members(&mut builder, &ids).unwrap();
+    gc.advance_clock_for_test(LEASE_EXPIRY + LEASE_RENEWAL);
+    gc.renew_lease().unwrap();
+    assert_eq!(gc.retire_step(RetireStep::AbandonedBuilds, &EAGER), Ok(1));
+    assert_eq!(count(root.path(), "SELECT count(*) FROM lease_holds"), 1);
+    let one = gc.reclaim(1).unwrap();
+    assert_eq!((one.rows, one.complete), (1, false));
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM lease_holds"),
+        0,
+        "the hold goes first"
+    );
+    while !gc.reclaim(256).unwrap().complete {}
+    assert_eq!(count(root.path(), "SELECT count(*) FROM snapshots"), 0);
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM snapshot_members"),
+        0
+    );
+    assert_eq!(
+        builder_store.add_members(&mut builder, &ids),
+        Err(Bypass::BuilderFenced)
+    );
+}
+
+#[test]
+fn deletion_runs_in_one_write_transaction_through_its_fault_point() {
+    let root = private_tempdir();
+    let gc = open(root.path());
+    let publisher = std::sync::Arc::new(open(root.path()));
+    artifact(&gc, "unit Stray;");
+    age_past_grace(&gc);
+    gc.advance_clock_for_test(LEASE_EXPIRY);
+    gc.renew_lease().unwrap();
+    assert_eq!(gc.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    let racer = std::sync::Arc::clone(&publisher);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slot = std::sync::Arc::clone(&seen);
+    gc.set_fault_for_test(FaultPoint::GcDeleteBeforeCommit, move || {
+        slot.lock()
+            .unwrap()
+            .push(publish_bulk(&racer, "unit Racer;", 1, 10));
+    });
+    let reclaimed = gc.reclaim(256).unwrap();
+    gc.clear_fault_for_test(FaultPoint::GcDeleteBeforeCommit);
+    assert!(reclaimed.complete && reclaimed.rows > 0);
+    assert_eq!(*seen.lock().unwrap(), [Err(Bypass::Busy)]);
+    assert!(FaultPoint::MAINTENANCE.contains(&FaultPoint::GcDeleteBeforeCommit));
+}
+
+#[test]
+fn reclaim_writes_nothing_at_the_wal_threshold() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    artifact(&store, "unit Stray;");
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    publish_bulk(&store, "unit Bulk;", 9, 1_000_000).unwrap();
+    assert_eq!(store.pressure(), Ok(Pressure::WalPressure));
+    assert_eq!(store.reclaim(256), Err(Bypass::WalPressure));
+    assert_eq!(count(root.path(), "SELECT count(*) FROM artifacts"), 2);
+}
+
+#[test]
+fn a_fenced_handle_still_reclaims_whole_retired_scopes() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    artifact(&store, "unit Stray;");
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    let connection = raw(root.path());
+    connection
+        .execute("UPDATE namespaces SET reset_epoch = reset_epoch + 1", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO retired_scopes SELECT namespace_id, 0 FROM namespaces",
+            [],
+        )
+        .unwrap();
+    assert_eq!(store.check_scope(), Err(Bypass::Fenced));
+    while !store.reclaim(256).unwrap().complete {}
+    assert_eq!(table_rows(root.path()), 0);
+    assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
 }

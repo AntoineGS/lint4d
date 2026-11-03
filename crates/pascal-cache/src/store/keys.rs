@@ -188,7 +188,9 @@ pub(crate) fn admit_manifest_by_digest(
 }
 
 impl Store {
-    /// Retain `key`'s manifest, for example a context key's.
+    /// Retain `key`'s manifest, for example a context key's. A manifest no
+    /// artifact, evidence set or snapshot references is deleted by
+    /// maintenance; publish it again before relying on it.
     pub fn publish_key(&self, key: &CanonicalKey) -> Result<Published, Bypass> {
         self.guarded(Access::Write, || {
             check_manifest_size(key)?;

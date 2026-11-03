@@ -212,13 +212,33 @@ impl Store {
         namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace, deadline)
     }
 
-    /// Delete at most `max_rows` rows of retired scopes. Run off
-    /// interactive paths and repeat until `complete`.
+    /// Delete at most `max_rows` rows in one `IMMEDIATE` transaction: rows
+    /// of retired scopes first, then retired rows nothing references and
+    /// orphan key manifests of this store's scope while it is live. Run off
+    /// interactive paths and repeat until `complete`. At the WAL threshold
+    /// it writes nothing (`WalPressure`: only a checkpoint makes room, spec
+    /// D13).
     pub fn reclaim(&self, max_rows: usize) -> Result<Reclaimed, Bypass> {
         self.guarded(Access::Maintenance, || {
+            let fail = |error: rusqlite::Error| sqlite::classify(&error);
             let deadline = Deadline::after(self.limits.wait);
             let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-            namespaces::reclaim(&mut writer, max_rows, deadline)
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            let policy = budget::read_policy(&transaction)?.policy;
+            if budget::pressure_of(policy, &budget::read_usage(self, &transaction)?)
+                == budget::Pressure::WalPressure
+            {
+                return Err(Bypass::WalPressure);
+            }
+            let reclaimed = namespaces::reclaim(&transaction, max_rows, self.scope)?;
+            fault_point!(self, GcDeleteBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(fail)?;
+            Ok(reclaimed)
         })
     }
 

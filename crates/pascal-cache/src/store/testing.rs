@@ -169,10 +169,12 @@ pub enum FaultPoint {
     LeaseRenewDecided,
     /// Inside a maintenance retirement batch, before commit.
     GcRetireBeforeCommit,
+    /// Inside a `reclaim` deletion batch, before commit.
+    GcDeleteBeforeCommit,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -183,10 +185,11 @@ impl FaultPoint {
         Self::RetireBeforeCommit,
         Self::LeaseRenewDecided,
         Self::GcRetireBeforeCommit,
+        Self::GcDeleteBeforeCommit,
     ];
 
     /// The points inside maintenance batches.
-    pub const MAINTENANCE: [Self; 1] = [Self::GcRetireBeforeCommit];
+    pub const MAINTENANCE: [Self; 2] = [Self::GcRetireBeforeCommit, Self::GcDeleteBeforeCommit];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -200,6 +203,7 @@ impl FaultPoint {
             Self::RetireBeforeCommit => "RetireBeforeCommit",
             Self::LeaseRenewDecided => "LeaseRenewDecided",
             Self::GcRetireBeforeCommit => "GcRetireBeforeCommit",
+            Self::GcDeleteBeforeCommit => "GcDeleteBeforeCommit",
         }
     }
 

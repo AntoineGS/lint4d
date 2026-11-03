@@ -1,3 +1,4 @@
+use super::gc;
 use super::location::StoreLocation;
 use super::outcome::{Bypass, Integrity};
 use super::pool::Deadline;
@@ -48,7 +49,9 @@ pub struct RetireReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Reclaimed {
     pub rows: usize,
-    /// No retired scope remains.
+    /// No retired scope remains, and nothing in the live scope is left to
+    /// delete: no retired row that nothing references, no orphan key
+    /// manifest.
     pub complete: bool,
 }
 
@@ -270,15 +273,17 @@ pub(crate) fn retire_obsolete(
     Ok(report)
 }
 
-/// Delete at most `max_rows` rows of retired scopes in one short write
-/// transaction (spec §10: no unbounded cascades).
+/// Delete at most `max_rows` rows in the caller's write transaction (spec
+/// §10: no unbounded cascades): rows of whole retired scopes first, then,
+/// with what is left, retired rows and orphan key manifests of `live`. The
+/// second part is skipped when `live` is no longer live (a fenced handle
+/// still reclaims retired scopes, its own included).
 pub(crate) fn reclaim(
-    connection: &mut Connection,
+    transaction: &Connection,
     max_rows: usize,
-    deadline: Deadline,
+    live: Scope,
 ) -> Result<Reclaimed, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
     let scopes: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
             .prepare(
@@ -324,6 +329,15 @@ pub(crate) fn reclaim(
             )
             .map_err(fail)?;
     }
+    let drained = match ensure_live(transaction, live) {
+        Ok(()) => {
+            let (deleted, drained) = gc::delete_retired(transaction, live, budget)?;
+            rows += deleted;
+            drained
+        }
+        Err(Bypass::Fenced) => true,
+        Err(error) => return Err(error),
+    };
     transaction
         .execute(
             "DELETE FROM namespaces WHERE state = ?1 \
@@ -336,10 +350,9 @@ pub(crate) fn reclaim(
     let remaining: i64 = transaction
         .query_row("SELECT count(*) FROM retired_scopes", [], |row| row.get(0))
         .map_err(fail)?;
-    transaction.commit().map_err(fail)?;
     Ok(Reclaimed {
         rows,
-        complete: remaining == 0,
+        complete: remaining == 0 && drained,
     })
 }
 

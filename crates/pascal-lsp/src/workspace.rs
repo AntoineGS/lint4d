@@ -2934,6 +2934,14 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    /// `false` in an index build view: loads then drop their cache claim
+    /// instead of publishing the parse (l4d-33 A13). `Default` is `false`,
+    /// so every constructor sets it.
+    pub(crate) retain_units: bool,
+    /// The context an index build is working in: no prune drops it.
+    pinned_context: Option<ContextKey>,
+    /// The read error of the last closed-source load that skipped its file.
+    load_refusal: Option<String>,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3345,6 +3353,7 @@ impl Workspace {
             options,
             overrides,
             roots,
+            retain_units: true,
             ..Self::default()
         };
         workspace
@@ -3513,6 +3522,7 @@ impl Workspace {
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
+            retain_units: true,
             ..Self::default()
         }
     }
@@ -8046,6 +8056,7 @@ impl Workspace {
             }
             Err(error) => {
                 self.warn(format!("skipping {}: {error}", path.display()));
+                self.load_refusal = Some(error);
                 self.remove_indexed_with_control(uri, cancel, budget, true)?;
                 return Ok(false);
             }
@@ -8173,6 +8184,7 @@ impl Workspace {
             }
             None => (None, None),
         };
+        let claim = claim.filter(|_| self.retain_units);
         let expansion = if let Some(expansion) =
             cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
         {
@@ -12921,6 +12933,7 @@ impl Workspace {
             .document_contexts
             .values()
             .chain(self.open_document_contexts.values())
+            .chain(self.pinned_context.iter())
         {
             if unused.is_empty() {
                 break;

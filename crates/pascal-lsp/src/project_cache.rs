@@ -5031,10 +5031,11 @@ impl ProjectCache {
         key: &ContextKey,
         path: &Path,
         stamps: Vec<MemberStamp>,
-    ) {
-        if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.index.refresh(path, stamps);
-        }
+    ) -> bool {
+        self.index()
+            .contexts
+            .get_mut(key)
+            .is_some_and(|stored| stored.index.refresh(path, stamps))
     }
 
     pub(crate) fn refuse_index_member(&self, key: &ContextKey, path: &Path, reason: String) {

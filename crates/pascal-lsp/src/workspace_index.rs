@@ -830,6 +830,20 @@ impl ContextIndex {
             .map(|id| self.members[id.0 as usize].stamps.as_slice())
     }
 
+    pub(crate) fn state_of(&self, path: &Path) -> Option<MemberState> {
+        self.id_of(path)
+            .map(|id| self.members[id.0 as usize].state().clone())
+    }
+
+    /// The slot paths of an indexed (or stale) member; `None` without facts.
+    pub(crate) fn slot_paths_of(&self, path: &Path) -> Option<&[Option<PathBuf>]> {
+        let id = self.id_of(path)?;
+        self.members[id.0 as usize]
+            .facts
+            .as_ref()
+            .map(|facts| &*facts.slot_paths)
+    }
+
     pub(crate) fn coverage(&self) -> IndexCoverage {
         let mut coverage = IndexCoverage {
             members: self.by_path.len(),

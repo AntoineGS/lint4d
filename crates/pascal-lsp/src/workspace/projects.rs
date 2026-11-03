@@ -358,6 +358,7 @@ impl Workspace {
             global_configuration_change_generation: self.global_configuration_change_generation,
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
+            retain_units: true,
             ..Workspace::default()
         };
         let expected_installation =

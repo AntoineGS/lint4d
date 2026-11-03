@@ -90,6 +90,9 @@ pub(super) struct Inner {
     join: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     open_hook: Mutex<Option<OpenHook>>,
+    /// Jobs this handle admitted (a handle-local count of store work).
+    #[cfg(test)]
+    jobs_issued: std::sync::atomic::AtomicUsize,
 }
 
 /// Test seam: the worker sends on the first and blocks on the second after
@@ -238,6 +241,8 @@ impl Inner {
             join: Mutex::new(None),
             #[cfg(test)]
             open_hook: Mutex::new(None),
+            #[cfg(test)]
+            jobs_issued: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -367,6 +372,8 @@ impl Inner {
         }
         let store = shared.store.clone()?;
         shared.active += 1;
+        #[cfg(test)]
+        self.jobs_issued.fetch_add(1, Ordering::Relaxed);
         Some(CacheJob {
             inner: Arc::clone(self),
             store: Some(store),
@@ -482,6 +489,21 @@ impl PersistentCache {
     /// A job while `Enabled`; `None` otherwise (and always when inert).
     pub(crate) fn job(&self) -> Option<CacheJob> {
         self.inner.as_ref()?.job()
+    }
+
+    /// Whether `job` would admit one now; no job is taken.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.lock().state == CacheState::Enabled)
+    }
+
+    /// The jobs this handle has admitted since it started.
+    #[cfg(test)]
+    pub(crate) fn jobs_issued_for_test(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.jobs_issued.load(Ordering::Relaxed))
     }
 
     /// Apply runtime options, waiting at most [`MAX_OPEN_WAIT`] for a

@@ -253,7 +253,8 @@ pub(crate) enum WarmEvent {
     /// One workspace-index batch finished.
     IndexProgress {
         anchor: IndexAnchor,
-        progress: IndexProgress,
+        /// Boxed: it carries the context key.
+        progress: Box<IndexProgress>,
         generation: u64,
     },
     /// A workspace-index batch ended without a result: `paused` when
@@ -975,7 +976,7 @@ fn run_index_job(
             );
             let _ = events.send(WarmEvent::IndexProgress {
                 anchor,
-                progress,
+                progress: Box::new(progress),
                 generation: job.generation,
             });
         }

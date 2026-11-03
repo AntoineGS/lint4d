@@ -308,6 +308,10 @@ pub(crate) struct WorkspaceInput {
     pub(crate) configuration_generation: u64,
     /// The disk-only producer view (`disk_baseline`).
     pub(crate) baseline: bool,
+    /// `path_key` of every path the session holds overlaid or deleted,
+    /// paths only: a baseline view uses it to refuse publishing a context
+    /// built from an unsaved project file, never for analysis.
+    pub(crate) session_private_paths: Arc<HashSet<String>>,
 }
 
 impl WorkspaceInput {
@@ -324,7 +328,16 @@ impl WorkspaceInput {
         )
     )]
     pub(crate) fn disk_baseline(&self) -> WorkspaceInput {
+        let session_private_paths = self
+            .overlays
+            .keys()
+            .chain(self.deleted_overrides.keys())
+            .filter_map(|uri| uri.to_file_path().ok())
+            .map(|path| path_key(&absolute_path(path)))
+            .chain(self.session_private_paths.iter().cloned())
+            .collect();
         WorkspaceInput {
+            session_private_paths: Arc::new(session_private_paths),
             overlays: HashMap::new(),
             cached_documents: HashMap::new(),
             rejected_documents: HashSet::new(),
@@ -1662,6 +1675,7 @@ impl Workspace {
             request_generation: self.request_generation,
             configuration_generation: self.configuration_generation,
             baseline: false,
+            session_private_paths: Arc::clone(&self.session_private_paths),
         }
     }
 

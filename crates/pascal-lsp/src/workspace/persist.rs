@@ -1216,7 +1216,7 @@ pub(crate) mod tests {
 /// `l4d-zf1b.5` acceptance criteria, each against a real store and a
 /// restarted workspace.
 #[cfg(all(test, unix))]
-mod acceptance {
+pub(in crate::workspace) mod acceptance {
     use super::tests::*;
     use super::*;
     use crate::workspace::facts::tests::{CONDITIONAL, Indexed, MAIN, NESTED, TYPES, index};
@@ -1276,7 +1276,7 @@ mod acceptance {
 
     /// A same-size rewrite that keeps the modification time, as one within
     /// one timestamp tick or a restoring tool would.
-    fn rewrite_keeping_the_stamp(path: &Path, bytes: &[u8]) {
+    pub(in crate::workspace) fn rewrite_keeping_the_stamp(path: &Path, bytes: &[u8]) {
         let metadata = std::fs::metadata(path).unwrap();
         assert_eq!(metadata.len(), bytes.len() as u64, "same size");
         std::fs::write(path, bytes).unwrap();

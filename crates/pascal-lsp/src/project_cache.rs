@@ -5654,7 +5654,6 @@ impl ProjectCache {
         }
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn reuse_pending_index_members(
         &self,
         key: &ContextKey,
@@ -5667,14 +5666,12 @@ impl ProjectCache {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn mark_index_reuse_tried(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_reuse_tried(path);
         }
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn mark_index_reused(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_reused(path);
@@ -5684,7 +5681,6 @@ impl ProjectCache {
     /// `context` is the cache digest of the context the caller indexes
     /// under (`CacheContextKey::new(&state.context)`); a proof made under
     /// another context is refused.
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn set_index_record(
         &self,
         key: &ContextKey,
@@ -5699,7 +5695,6 @@ impl ProjectCache {
                 .is_some_and(|stored| stored.index.set_record(proof.path(), proof.record_id()))
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {
         self.index()
             .contexts
@@ -5707,7 +5702,7 @@ impl ProjectCache {
             .is_some_and(|stored| stored.index.record(path).is_some())
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn index_records(
         &self,
         key: &ContextKey,
@@ -5718,14 +5713,13 @@ impl ProjectCache {
             .map(|stored| stored.index.records())
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn add_index_validation_reads(&self, key: &ContextKey, reads: u64) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.validation_reads = stored.validation_reads.saturating_add(reads);
         }
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn index_validation_reads(&self, key: &ContextKey) -> u64 {
         self.index()
             .contexts

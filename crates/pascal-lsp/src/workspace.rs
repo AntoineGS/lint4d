@@ -3088,14 +3088,9 @@ pub struct Workspace {
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
     /// The disk-only producer view: no editor state (`WorkspaceInput::disk_baseline`).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
-        )
-    )]
     baseline: bool,
+    /// `WorkspaceInput::session_private_paths`.
+    session_private_paths: Arc<HashSet<String>>,
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
@@ -3698,19 +3693,34 @@ impl Workspace {
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
             baseline: input.baseline,
+            session_private_paths: Arc::clone(&input.session_private_paths),
             ..Self::default()
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
-        )
-    )]
     pub(crate) fn is_baseline(&self) -> bool {
         self.baseline
+    }
+
+    /// Whether every project metadata file `key`'s context consulted is
+    /// saved: none is open, overlaid or deleted in this workspace or, for a
+    /// baseline view, in the session it was derived from (spec §4.4).
+    pub(crate) fn context_inputs_are_disk_only(&self, key: &ContextKey) -> bool {
+        let Some(state) = self.contexts.get(key) else {
+            return false;
+        };
+        state
+            .context_observations
+            .metadata_files
+            .iter()
+            .map(|path| absolute_path(path.clone()))
+            .all(|path| {
+                !self
+                    .session_private_paths
+                    .contains(&rename::path_key(&path))
+                    && Url::from_file_path(&path)
+                        .is_ok_and(|uri| !self.root_is_session_private(&uri))
+            })
     }
 
     pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
@@ -13519,7 +13529,6 @@ impl Workspace {
         &self.project_cache
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
     pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
         &self.persistent_cache
     }
@@ -25054,6 +25063,7 @@ BDS = '/fake/37'
             request_generation: 0,
             configuration_generation: 0,
             baseline: false,
+            session_private_paths: Default::default(),
         };
         let entry = ProjectPathEntry {
             path: root.clone(),

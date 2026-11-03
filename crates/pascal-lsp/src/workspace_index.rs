@@ -293,7 +293,7 @@ struct Member {
 pub(crate) const RETRYING_REFUSAL: &str = "retrying a previous refusal";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+#[allow(dead_code)] // consumed by pascal/indexStatus (l4d-zf1b.8)
 pub(crate) struct IndexCounts {
     pub(crate) members: usize,
     pub(crate) fresh: usize,
@@ -647,7 +647,6 @@ impl ContextIndex {
 
     /// Pending members the store was not asked about since they were last
     /// invalidated, in path order.
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn reuse_pending(&self, limit: usize) -> Vec<PathBuf> {
         self.pending_members()
             .filter(|member| !member.reuse_tried)
@@ -656,7 +655,13 @@ impl ContextIndex {
             .collect()
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    /// Whether the store was asked for `path`'s facts since it was last
+    /// invalidated; `false` for a path that is no member.
+    pub(crate) fn reuse_tried(&self, path: &Path) -> bool {
+        self.id_of(path)
+            .is_some_and(|id| self.members[id.0 as usize].reuse_tried)
+    }
+
     pub(crate) fn mark_reuse_tried(&mut self, path: &Path) {
         if let Some(id) = self.id_of(path) {
             self.members[id.0 as usize].reuse_tried = true;
@@ -664,7 +669,6 @@ impl ContextIndex {
     }
 
     /// The facts just inserted came from the store.
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn mark_reused(&mut self, path: &Path) {
         if let Some(id) = self.id_of(path) {
             let member = &mut self.members[id.0 as usize];
@@ -675,7 +679,6 @@ impl ContextIndex {
     }
 
     /// Only a Fresh, Refused or Limited member holds a record.
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn set_record(&mut self, path: &Path, record: Digest) -> bool {
         let Some(id) = self.id_of(path) else {
             return false;
@@ -690,14 +693,13 @@ impl ContextIndex {
         }
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
     pub(crate) fn record(&self, path: &Path) -> Option<Digest> {
         self.id_of(path)
             .and_then(|id| self.members[id.0 as usize].record)
     }
 
     /// One entry per member, in path order.
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn records(&self) -> Vec<(PathBuf, Option<Digest>)> {
         self.by_path
             .values()
@@ -708,7 +710,7 @@ impl ContextIndex {
             .collect()
     }
 
-    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn counts(&self) -> IndexCounts {
         let mut counts = IndexCounts {
             members: self.by_path.len(),

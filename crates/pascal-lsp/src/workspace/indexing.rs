@@ -5,15 +5,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use lsp_types::Url;
+use pascal_cache::{ContextKey as CacheContextKey, Hint};
 use pascal_core::facts::{
     FactBudget, FactError, IncludeSlotOutcome, NotPersistable, include_slots,
 };
 use pascal_project::ProjectContext;
 
 use super::catalogues::CatalogueScope;
+use super::eligible::{ProvenRecord, RecordInputs, Unindexed, prove_existing, publish_proven};
+use super::facts::SourceFacts;
+use super::persist::{Reuse, ReuseMiss};
 use super::rename::{
     CANCELLATION_MESSAGE, IndexedSources, WorkspaceInput, is_safe_source_path, path_key,
     project_metadata_context, snapshot_context_for_uri,
@@ -23,7 +29,7 @@ use super::{
     path_stamp, path_stamp_from_project_read, path_starts_with_ci,
 };
 use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
-use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
+use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome, ReservationKind};
 use crate::workspace_index::{
     CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
     MAX_UNVERIFIED_CANDIDATES, MAX_UNVERIFIED_SYMBOL_CANDIDATES, MemberFacts, MemberStamp,
@@ -244,25 +250,70 @@ fn max_unverified_symbol_candidates() -> usize {
     MAX_UNVERIFIED_SYMBOL_CANDIDATES
 }
 
-/// How many pending members one `advance_workspace_index` call takes.
+/// What an index batch may do for a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexMode {
+    /// Reuse only: never loads or parses (the pass before the crawl, D33).
+    Reuse,
+    /// Reuse, then extract what reuse could not prove.
+    Full,
+}
+
+/// How many pending members one `advance_workspace_index` call takes, for
+/// how long, and what it may do with them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IndexBound {
     units: usize,
+    time: Option<Duration>,
+    mode: IndexMode,
 }
 
 impl IndexBound {
+    /// `Full`, without a time bound.
     pub(crate) fn units(units: usize) -> Self {
-        Self { units }
+        Self {
+            units,
+            time: None,
+            mode: IndexMode::Full,
+        }
+    }
+
+    /// The reuse pass: 512 members or 200 ms, never a parse.
+    #[cfg_attr(not(test), allow(dead_code))] // the warmer's reuse pass (l4d-zf1b.8)
+    pub(crate) fn reuse_pass() -> Self {
+        Self {
+            units: 512,
+            time: Some(Duration::from_millis(200)),
+            mode: IndexMode::Reuse,
+        }
+    }
+
+    /// An extraction batch: 64 members or 2 s.
+    #[cfg_attr(not(test), allow(dead_code))] // the warmer's extraction batches (l4d-zf1b.8)
+    pub(crate) fn extraction() -> Self {
+        Self {
+            units: 64,
+            time: Some(Duration::from_secs(2)),
+            mode: IndexMode::Full,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // the warmer's reuse pass (l4d-zf1b.8)
+    pub(crate) fn with_mode(self, mode: IndexMode) -> Self {
+        Self { mode, ..self }
     }
 
     #[cfg(test)]
     pub(crate) fn all() -> Self {
-        Self { units: usize::MAX }
+        Self::units(usize::MAX)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexProgress {
+    /// The context the batch indexed; `None` only before it was resolved.
+    pub(crate) key: Option<ContextKey>,
+    pub(crate) mode: IndexMode,
     pub(crate) indexed: usize,
     pub(crate) refreshed: usize,
     pub(crate) refused: usize,
@@ -288,18 +339,56 @@ pub(crate) struct IndexProgress {
     /// Pending closed members no batch has deferred yet and this batch did
     /// not try (a member skipped without a load stays untried otherwise).
     pub(crate) untried: usize,
+    /// Members whose facts came from the store.
+    pub(crate) reused: usize,
+    /// Members the store had nothing for (now tried for reuse).
+    pub(crate) reuse_missed: usize,
+    /// Pending closed members not tried for reuse since they last changed.
+    pub(crate) reuse_pending: usize,
+    /// Retryable reuse misses this batch (left untried for reuse).
+    pub(crate) reuse_deferred: usize,
+    /// Members whose artifact and record this batch published.
+    pub(crate) persisted: usize,
 }
 
 impl IndexProgress {
+    fn new(key: ContextKey, mode: IndexMode) -> Self {
+        Self {
+            key: Some(key),
+            mode,
+            indexed: 0,
+            refreshed: 0,
+            refused: 0,
+            pending: 0,
+            generation: 0,
+            complete: false,
+            skipped_open: 0,
+            deferred: 0,
+            memory: false,
+            limited: 0,
+            untried: 0,
+            reused: 0,
+            reuse_missed: 0,
+            reuse_pending: 0,
+            reuse_deferred: 0,
+            persisted: 0,
+        }
+    }
+
     /// Another batch can gain something: this one settled a member, or
     /// members no batch has tried yet are still pending. A batch that only
     /// deferred members already deferred is not requeued (no livelock); a
-    /// request or invalidation asks for the anchor again.
+    /// request or invalidation asks for the anchor again. A reuse batch is
+    /// requeued while members are left to try and it tried one for good, so
+    /// a run of retryable misses alone does not loop either.
     pub(crate) fn worth_requeue(&self) -> bool {
         !self.complete
             && !self.memory
-            && (self.indexed + self.refreshed + self.refused + self.limited > 0
-                || (self.deferred > 0 && self.untried > 0))
+            && (self.indexed + self.refreshed + self.refused + self.limited + self.reused > 0
+                || (self.deferred > 0 && self.untried > 0)
+                || (self.mode == IndexMode::Reuse
+                    && self.reuse_pending > 0
+                    && self.reuse_missed > 0))
     }
 }
 
@@ -338,6 +427,37 @@ thread_local! {
 #[cfg(test)]
 fn set_after_load_hook(hook: Option<LoadHook>) {
     AFTER_LOAD.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after each reuse attempt, once its facts are dropped.
+    static AFTER_REUSE: std::cell::RefCell<Option<LoadHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Runs after an extracted member is indexed, before it is persisted.
+    static BEFORE_PERSIST: std::cell::RefCell<Option<LoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_after_reuse_hook(hook: Option<LoadHook>) {
+    AFTER_REUSE.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn set_before_persist_hook(hook: Option<LoadHook>) {
+    BEFORE_PERSIST.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_hook(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<LoadHook>>>,
+    path: &Path,
+) {
+    if let Some(mut hook) = slot.with(|slot| slot.borrow_mut().take()) {
+        hook(path);
+        slot.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
 }
 
 #[cfg(test)]
@@ -387,7 +507,10 @@ fn set_after_target_view_hook(hook: Option<CacheHook>) {
 }
 
 enum MemberOutcome {
-    Published,
+    /// Indexed; `persisted` when its artifact and record were published.
+    Published {
+        persisted: bool,
+    },
     /// The facts were limited: an unverified candidate until it changes.
     Limited,
     /// The load failed for a reason that may pass: still pending.
@@ -396,6 +519,73 @@ enum MemberOutcome {
     /// Not a member any more, or an unsaved buffer: nothing to publish.
     Skipped,
     Memory,
+}
+
+/// What asking the store for one member's facts gave.
+enum ReuseOutcome {
+    /// Indexed from the store.
+    Reused,
+    /// The store cannot prove facts for the current inputs: extract.
+    Missed,
+    /// A miss that may pass (budget, cancellation, a store bypass): the
+    /// member stays untried for reuse.
+    Retry,
+    /// The index share refused the member.
+    Memory,
+    /// No baseline view, already tried, or no store: nothing was asked.
+    NoStore,
+    /// The request was cancelled while the store was asked.
+    Cancelled,
+}
+
+/// Why an extracted member was not persisted. None is an error: the member
+/// stays memory-only, and a later process extracts it again. The reasons are
+/// diagnostics (traces).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum PersistSkip {
+    /// No baseline view, a context built from unsaved project input, or no
+    /// store.
+    Unavailable,
+    Prepare(super::persist::PersistError),
+    /// `maxCacheBytes` had no room for the publication's transient bytes.
+    Memory,
+    Ineligible(super::eligible::Ineligible),
+    Store(pascal_cache::Bypass),
+}
+
+/// The slot paths and stamps of reused facts: slot 0 is the member (its
+/// stamp taken before reuse read it), then one slot per include in slot
+/// order, normalized as `source_slot_paths` does. An include's stamp is
+/// the one reuse took before validating its bytes; without one the member
+/// stays unverified on every request, as for an unresolved include (A7).
+fn reused_slots(
+    path: &Path,
+    own_stamp: &PathStamp,
+    facts: &pascal_core::facts::ArtifactFacts,
+    include_stamps: &[(PathBuf, PathStamp)],
+) -> (Vec<Option<PathBuf>>, Vec<MemberStamp>) {
+    let mut includes = facts.includes.iter().collect::<Vec<_>>();
+    includes.sort_by_key(|include| include.slot);
+    let mut slots = vec![None];
+    slots.extend(
+        includes
+            .iter()
+            .map(|include| include.source.clone().map(absolute_path)),
+    );
+    let observed: HashMap<String, &PathStamp> = include_stamps
+        .iter()
+        .map(|(held, stamp)| (path_key(&absolute_path(held.clone())), stamp))
+        .collect();
+    let mut stamps = vec![MemberStamp {
+        path: path.to_path_buf(),
+        stamp: Some(own_stamp.clone()),
+    }];
+    stamps.extend(slots.iter().skip(1).flatten().map(|slot| MemberStamp {
+        path: slot.clone(),
+        stamp: observed.get(&path_key(slot)).map(|stamp| (*stamp).clone()),
+    }));
+    (slots, stamps)
 }
 
 impl Workspace {
@@ -451,29 +641,23 @@ impl Workspace {
         // view holds a document only while it loads one.
         self.pinned_context = Some(key.clone());
         self.ensure_index_membership(&key, anchor, cancel)?;
-        let mut progress = IndexProgress {
-            indexed: 0,
-            refreshed: 0,
-            refused: 0,
-            pending: 0,
-            generation: 0,
-            complete: false,
-            skipped_open: 0,
-            deferred: 0,
-            memory: false,
-            limited: 0,
-            untried: 0,
-        };
+        let mut progress = IndexProgress::new(key.clone(), bound.mode);
+        let started = Instant::now();
         // Open members are skipped, so ask for enough to fill the bound.
         let wanted = bound.units.saturating_add(self.open_documents.len());
-        let pending = self
-            .project_cache
-            .read_index(&key, |index, _| index.pending(wanted))
-            .unwrap_or_default();
+        let pending = match bound.mode {
+            IndexMode::Reuse => self.project_cache.reuse_pending_index_members(&key, wanted),
+            IndexMode::Full => self
+                .project_cache
+                .read_index(&key, |index, _| index.pending(wanted))
+                .unwrap_or_default(),
+        };
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
         for path in pending {
-            if tried.len() >= bound.units {
+            if tried.len() >= bound.units
+                || bound.time.is_some_and(|limit| started.elapsed() >= limit)
+            {
                 break;
             }
             if self.is_open_member(&path) {
@@ -492,9 +676,44 @@ impl Workspace {
                 self.project_cache.invalidate_path(&path);
                 continue;
             };
-            if self.refresh_unchanged_member(&key, &path, &own_stamp) {
+            // A persisting view proves a member without a record again
+            // through the store (stat and hash, no parse), so the snapshot
+            // can still list it after an invalidation.
+            let reprove = self.may_publish(&key)
+                && self.persistent_cache().is_enabled()
+                && !self.project_cache.index_member_has_record(&key, &path);
+            if !reprove && self.refresh_unchanged_member(&key, &path, &own_stamp) {
                 progress.refreshed += 1;
                 continue;
+            }
+            let reuse = self.reuse_index_member(&key, &path, &own_stamp, cancel);
+            #[cfg(test)]
+            run_hook(&AFTER_REUSE, &path);
+            let asked = !matches!(reuse, ReuseOutcome::NoStore);
+            match reuse {
+                ReuseOutcome::Reused => {
+                    progress.reused += 1;
+                    continue;
+                }
+                ReuseOutcome::Missed => {
+                    self.project_cache.mark_index_reuse_tried(&key, &path);
+                    progress.reuse_missed += 1;
+                }
+                ReuseOutcome::Retry => progress.reuse_deferred += 1,
+                ReuseOutcome::Memory => {
+                    progress.memory = true;
+                    break;
+                }
+                ReuseOutcome::NoStore => {}
+                ReuseOutcome::Cancelled => return Err(CANCELLATION_MESSAGE.to_owned()),
+            }
+            if bound.mode == IndexMode::Reuse {
+                continue;
+            }
+            // The store work above may have taken a while; without it the
+            // member's first check still holds.
+            if asked {
+                before_io()?;
             }
             // One member's failure never stops the batch: it stays pending.
             let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
@@ -503,7 +722,10 @@ impl Workspace {
                 Err(error) => MemberOutcome::Deferred(error),
             };
             match outcome {
-                MemberOutcome::Published => progress.indexed += 1,
+                MemberOutcome::Published { persisted } => {
+                    progress.indexed += 1;
+                    progress.persisted += usize::from(persisted);
+                }
                 MemberOutcome::Refused => progress.refused += 1,
                 MemberOutcome::Limited => progress.limited += 1,
                 MemberOutcome::Skipped => {}
@@ -519,16 +741,21 @@ impl Workspace {
             }
         }
         self.ensure_index_membership(&key, anchor, cancel)?;
-        let (all_pending, untried, generation) = self
+        let (all_pending, untried, reuse_pending, generation) = self
             .project_cache
             .read_index(&key, |index, _| {
                 (
                     index.pending(usize::MAX),
                     index.untried(),
+                    index.reuse_pending(usize::MAX),
                     index.generation(),
                 )
             })
             .unwrap_or_default();
+        progress.reuse_pending = reuse_pending
+            .iter()
+            .filter(|path| !self.is_open_member(path))
+            .count();
         let open = all_pending
             .iter()
             .filter(|path| self.is_open_member(path))
@@ -674,10 +901,7 @@ impl Workspace {
         self.load_refusal = None;
         let loaded = self.load_source_with_cancel(&uri, key, &HashSet::new(), Some(cancel));
         #[cfg(test)]
-        if let Some(mut hook) = AFTER_LOAD.with(|slot| slot.borrow_mut().take()) {
-            hook(path);
-            AFTER_LOAD.with(|slot| *slot.borrow_mut() = Some(hook));
-        }
+        run_hook(&AFTER_LOAD, path);
         let outcome = match loaded {
             Err(error) if is_stable_load_refusal(&error) => {
                 Ok(self.refuse_unless_vanished(key, path, error))
@@ -745,6 +969,7 @@ impl Workspace {
             Err(NotPersistable::Transient) => {
                 check_workspace_cancel(Some(cancel))?;
                 self.project_cache.limit_index_member(key, path);
+                self.prove_unindexed(key, path, Unindexed::NotRecorded);
                 return Ok(MemberOutcome::Limited);
             }
             // An unsaved buffer is not what the disk holds; the index
@@ -787,7 +1012,24 @@ impl Workspace {
                 .project_cache
                 .publish_index_member(key, path, member, stamps, hash)
             {
-                PublishOutcome::Indexed => MemberOutcome::Published,
+                PublishOutcome::Indexed => {
+                    #[cfg(test)]
+                    run_hook(&BEFORE_PERSIST, path);
+                    // The one extraction pass serves the index and the store.
+                    let persisted = match self.persist_extracted(key, uri, facts, cancel) {
+                        Ok(proof) => self.set_member_record(key, &proof),
+                        Err(skip) => {
+                            if !matches!(skip, PersistSkip::Unavailable) {
+                                crate::trace::trace!(
+                                    "  index member {} not persisted: {skip:?}",
+                                    path.display()
+                                );
+                            }
+                            false
+                        }
+                    };
+                    MemberOutcome::Published { persisted }
+                }
                 PublishOutcome::NotAMember => MemberOutcome::Skipped,
                 PublishOutcome::Memory => MemberOutcome::Memory,
             },
@@ -795,8 +1037,223 @@ impl Workspace {
     }
 
     fn refuse_member(&self, key: &ContextKey, path: &Path, reason: String) -> MemberOutcome {
+        let unindexed = if reason.contains("the configured per-file limit") {
+            Unindexed::OverSize
+        } else {
+            Unindexed::NotRecorded
+        };
         self.project_cache.refuse_index_member(key, path, reason);
+        self.prove_unindexed(key, path, unindexed);
         MemberOutcome::Refused
+    }
+
+    /// Only a baseline view whose context came from saved project files
+    /// publishes (spec §4.4, D37).
+    fn may_publish(&self, key: &ContextKey) -> bool {
+        self.is_baseline() && self.context_inputs_are_disk_only(key)
+    }
+
+    /// Record `proof` as `key`'s record of its member.
+    fn set_member_record(&self, key: &ContextKey, proof: &ProvenRecord) -> bool {
+        self.contexts.get(key).is_some_and(|state| {
+            self.project_cache.set_index_record(
+                key,
+                proof,
+                CacheContextKey::new(&state.context).digest(),
+            )
+        })
+    }
+
+    /// Persist an extracted member: its artifact (with the evidence that
+    /// proves it), then its record, in a baseline view whose context came
+    /// from saved files. The transient bytes are reserved first; a refusal
+    /// is no error, the next process extracts the member again (D41).
+    pub(crate) fn persist_extracted(
+        &self,
+        key: &ContextKey,
+        uri: &Url,
+        source: SourceFacts,
+        cancel: &AtomicBool,
+    ) -> Result<ProvenRecord, PersistSkip> {
+        if !self.may_publish(key) || !self.persistent_cache().is_enabled() {
+            return Err(PersistSkip::Unavailable);
+        }
+        let path = uri
+            .to_file_path()
+            .map_err(|()| PersistSkip::Prepare(super::persist::PersistError::NotIndexed))?;
+        let prepared = self
+            .prepare_from_facts(uri, source, cancel)
+            .map_err(PersistSkip::Prepare)?;
+        let eligible = self
+            .eligible_indexed_member(
+                key,
+                &RecordInputs {
+                    path: &path,
+                    facts: Some(&prepared.facts),
+                    artifact: Some(prepared.artifact_id()),
+                    member_evidence: prepared.member_evidence_id(),
+                    origin: prepared.origin,
+                    unindexed: None,
+                },
+            )
+            .map_err(PersistSkip::Ineligible)?;
+        let _transient = self
+            .project_cache
+            .reserve(ReservationKind::Scratch, prepared.transient_bytes())
+            .ok_or(PersistSkip::Memory)?;
+        let job = self
+            .persistent_cache()
+            .job()
+            .ok_or(PersistSkip::Unavailable)?;
+        let published = match prepared.publish(job.store()) {
+            Ok(_) => publish_proven(job.store(), &eligible),
+            Err(super::persist::PersistError::Store(bypass)) => Err(bypass),
+            Err(error) => return Err(PersistSkip::Prepare(error)),
+        };
+        published.map_err(|bypass| {
+            job.observe(&bypass);
+            PersistSkip::Store(bypass)
+        })
+    }
+
+    /// Prove the record `inputs` derive for a member the index holds: found
+    /// live in the store, else published. Without a proof the member only
+    /// delays the context's snapshot.
+    fn prove_member(&self, key: &ContextKey, inputs: &RecordInputs<'_>) -> bool {
+        if !self.may_publish(key) {
+            return false;
+        }
+        let Ok(eligible) = self.eligible_indexed_member(key, inputs) else {
+            return false;
+        };
+        let Some(job) = self.persistent_cache().job() else {
+            return false;
+        };
+        let proof = match prove_existing(job.store(), &eligible) {
+            Ok(Some(proof)) => Ok(proof),
+            Ok(None) => publish_proven(job.store(), &eligible),
+            Err(bypass) => Err(bypass),
+        };
+        let proof = match proof {
+            Ok(proof) => proof,
+            Err(bypass) => {
+                job.observe(&bypass);
+                return false;
+            }
+        };
+        drop(job);
+        self.set_member_record(key, &proof)
+    }
+
+    /// A refused or limited member is listed by an artifact-less record, so
+    /// a complete membership can still be sealed; the indexer retries it.
+    fn prove_unindexed(&self, key: &ContextKey, path: &Path, unindexed: Unindexed) {
+        let Some(state) = self.contexts.get(key) else {
+            return;
+        };
+        self.prove_member(
+            key,
+            &RecordInputs {
+                path,
+                facts: None,
+                artifact: None,
+                member_evidence: None,
+                origin: state.context.source_origin(path),
+                unindexed: Some(unindexed),
+            },
+        );
+    }
+
+    /// Index `path` from the store's facts, if current inputs prove them
+    /// (spec §7), and prove its record. Nothing is loaded or parsed; the
+    /// decoded facts are charged while they live, and dropped here (D41).
+    fn reuse_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        own_stamp: &PathStamp,
+        cancel: &AtomicBool,
+    ) -> ReuseOutcome {
+        if !self.is_baseline()
+            || !self
+                .project_cache
+                .read_index(key, |index, _| !index.reuse_tried(path))
+                .unwrap_or(false)
+        {
+            return ReuseOutcome::NoStore;
+        }
+        let Ok(uri) = Url::from_file_path(path) else {
+            return ReuseOutcome::Missed;
+        };
+        let Some(job) = self.persistent_cache().job() else {
+            return ReuseOutcome::NoStore;
+        };
+        let work = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        let result = self.reuse_in_context(
+            &uri,
+            key,
+            job.store(),
+            &work,
+            pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
+            job.cancel_flag(),
+        );
+        job.record_reuse(&result);
+        if cancel.load(Ordering::Relaxed) {
+            return ReuseOutcome::Cancelled;
+        }
+        let (facts, reads, artifact, evidence, include_stamps, root_hash) = match result {
+            Ok(Reuse::Hit {
+                facts,
+                reads,
+                artifact,
+                evidence,
+                include_stamps,
+                root_hash,
+                ..
+            }) => (facts, reads, artifact, evidence, include_stamps, root_hash),
+            Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => return ReuseOutcome::Retry,
+            Ok(Reuse::Miss(ReuseMiss::Stale(_) | ReuseMiss::Store(_) | ReuseMiss::Open)) => {
+                return ReuseOutcome::Missed;
+            }
+            // `record_reuse` observed the bypass.
+            Err(super::persist::PersistError::Store(_)) => return ReuseOutcome::Retry,
+            Err(_) => return ReuseOutcome::Missed,
+        };
+        job.store().hint_used(match evidence {
+            Some(id) => Hint::Evidence(id),
+            None => Hint::Artifact(artifact),
+        });
+        drop(job);
+        self.project_cache
+            .add_index_validation_reads(key, u64::try_from(reads).unwrap_or(u64::MAX));
+        let (slots, stamps) = reused_slots(path, own_stamp, &facts.facts, &include_stamps);
+        let member = MemberFacts::from_facts(path, &facts.facts, slots);
+        let outcome = match self
+            .project_cache
+            .publish_index_member(key, path, member, stamps, root_hash)
+        {
+            PublishOutcome::Indexed => {
+                self.project_cache.mark_index_reused(key, path);
+                if let Some(state) = self.contexts.get(key) {
+                    self.prove_member(
+                        key,
+                        &RecordInputs {
+                            path,
+                            facts: Some(&facts.facts),
+                            artifact: Some(artifact),
+                            member_evidence: evidence,
+                            origin: state.context.source_origin(path),
+                            unindexed: None,
+                        },
+                    );
+                }
+                ReuseOutcome::Reused
+            }
+            PublishOutcome::Memory => ReuseOutcome::Memory,
+            PublishOutcome::NotAMember => ReuseOutcome::Missed,
+        };
+        drop(facts);
+        outcome
     }
 
     /// The context `anchor` names, resolved and retained.
@@ -2085,7 +2542,7 @@ fn is_descriptor(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::workspace) mod tests {
     use super::*;
     use crate::catalogue::{Catalogue, Depth, test_listings, test_reset_listings};
     use crate::project_cache::{IndexAnchor, IndexMembership};
@@ -2097,7 +2554,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
 
-    fn workspace(root: &Path, options: WorkspaceOptions) -> Workspace {
+    pub(in crate::workspace) fn workspace(root: &Path, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(
             vec![root.to_path_buf()],
             options,
@@ -2105,7 +2562,7 @@ mod tests {
         )
     }
 
-    fn write(path: &Path, text: &str) {
+    pub(in crate::workspace) fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     }
@@ -2151,7 +2608,7 @@ mod tests {
             .collect()
     }
 
-    fn project_workspace(
+    pub(in crate::workspace) fn project_workspace(
         root: &Path,
         properties: &str,
         items: &str,
@@ -2432,7 +2889,7 @@ mod tests {
         assert!(gone.1 > 0);
     }
 
-    fn named_unit(path: &Path, identifier: &str) {
+    pub(in crate::workspace) fn named_unit(path: &Path, identifier: &str) {
         let unit = path.file_stem().unwrap().to_string_lossy().into_owned();
         write(
             path,
@@ -2443,7 +2900,7 @@ mod tests {
     }
 
     /// App.dpr plus `count - 1` units `lib/U<n>.pas`, each declaring `P<n>`.
-    fn indexed_project(
+    pub(in crate::workspace) fn indexed_project(
         root: &Path,
         count: usize,
         options: WorkspaceOptions,
@@ -2463,7 +2920,7 @@ mod tests {
         (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
     }
 
-    fn advance(
+    pub(in crate::workspace) fn advance(
         workspace: &mut Workspace,
         anchor: &IndexAnchor,
         bound: IndexBound,
@@ -2473,21 +2930,29 @@ mod tests {
             .expect("batch")
     }
 
-    fn state(workspace: &Workspace, key: &ContextKey, path: &Path) -> Option<MemberState> {
+    pub(in crate::workspace) fn state(
+        workspace: &Workspace,
+        key: &ContextKey,
+        path: &Path,
+    ) -> Option<MemberState> {
         workspace
             .project_cache
             .read_index(key, |index, _| index.state_of(path))
             .flatten()
     }
 
-    fn members(workspace: &Workspace, key: &ContextKey) -> Vec<PathBuf> {
+    pub(in crate::workspace) fn members(workspace: &Workspace, key: &ContextKey) -> Vec<PathBuf> {
         workspace
             .project_cache
             .read_index(key, |index, _| index.member_paths())
             .unwrap_or_default()
     }
 
-    fn selected(workspace: &Workspace, key: &ContextKey, name: &str) -> Vec<PathBuf> {
+    pub(in crate::workspace) fn selected(
+        workspace: &Workspace,
+        key: &ContextKey,
+        name: &str,
+    ) -> Vec<PathBuf> {
         workspace
             .project_cache
             .read_index(key, |index, _| {
@@ -3062,7 +3527,7 @@ mod tests {
         let mut batches = Vec::new();
         for _ in 0..6 {
             let progress = advance(&mut workspace, &anchor, IndexBound::all());
-            batches.push(progress);
+            batches.push(progress.clone());
             if !progress.worth_requeue() {
                 break;
             }
@@ -4513,5 +4978,690 @@ mod tests {
         assert_eq!(take_membership_computes(), 0, "nothing is computed again");
         assert!(workspace.project_cache.holds_index_for(&p1));
         assert_eq!(workspace.project_cache.indexed_context_count(), 1);
+    }
+
+    /// Index batches that reuse persisted facts and publish what they
+    /// extract (D31). Every test opens a store.
+    #[cfg(unix)]
+    pub(in crate::workspace) mod persisting {
+        use super::*;
+        use crate::persistent_cache::{Ack, CacheOptions, CacheState, PersistentCache};
+        use crate::workspace::persist::acceptance::rewrite_keeping_the_stamp;
+        use crate::workspace::persist::tests::{PROVIDER_MAIN, SHAPES, private_dir};
+        use pascal_cache::{Digest, MaintenanceLimits, Namespace, RetireStep};
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn start(workspace: &Workspace, directory: &Path, enabled: bool) -> PersistentCache {
+            PersistentCache::start_unscheduled_for_test(
+                CacheOptions {
+                    enabled,
+                    directory: Some(directory.to_path_buf()),
+                    ..CacheOptions::default()
+                },
+                workspace.project_cache().clone(),
+                Arc::default(),
+                Namespace::new(Digest::from_bytes([11; 32])),
+            )
+        }
+
+        /// The baseline view of `workspace` under `cache`.
+        pub(in crate::workspace) fn view_with(
+            workspace: &Workspace,
+            cache: &PersistentCache,
+        ) -> Workspace {
+            let mut input = workspace.analysis_input().disk_baseline();
+            input.persistent_cache = cache.clone();
+            Workspace::from_analysis_input(&input)
+        }
+
+        /// A baseline view of `workspace` whose handle has an open store
+        /// under `directory`.
+        pub(in crate::workspace) fn persisting_view(
+            workspace: &Workspace,
+            directory: &Path,
+        ) -> (Workspace, PersistentCache) {
+            let cache = start(workspace, directory, true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            (view_with(workspace, &cache), cache)
+        }
+
+        /// A new process: a fresh workspace and project cache (no
+        /// witnesses) over the same files, and the same store. Nothing is
+        /// rewritten or backdated, so edits made while closed keep their
+        /// bytes and stamps.
+        pub(in crate::workspace) fn restarted_view(
+            root: &Path,
+            directory: &Path,
+        ) -> (Workspace, PersistentCache) {
+            persisting_view(&workspace(root, WorkspaceOptions::default()), directory)
+        }
+
+        pub(in crate::workspace) fn records(
+            workspace: &Workspace,
+            key: &ContextKey,
+        ) -> Vec<(PathBuf, Option<Digest>)> {
+            workspace
+                .project_cache
+                .index_records(key)
+                .unwrap_or_default()
+        }
+
+        fn recorded(workspace: &Workspace, key: &ContextKey) -> Vec<PathBuf> {
+            records(workspace, key)
+                .into_iter()
+                .filter_map(|(path, record)| record.map(|_| path))
+                .collect()
+        }
+
+        fn first_session(root: &Path, directory: &Path, count: usize) -> (ContextKey, IndexAnchor) {
+            let (workspace, key, anchor) =
+                indexed_project(root, count, WorkspaceOptions::default());
+            let (mut first, cache) = persisting_view(&workspace, directory);
+            let progress = advance(&mut first, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.persisted, count, "{progress:?}");
+            assert_eq!(recorded(&first, &key).len(), count);
+            cache.shutdown();
+            (key, anchor)
+        }
+
+        /// Records every member a batch loads.
+        fn record_loads() -> Rc<RefCell<Vec<PathBuf>>> {
+            let loaded = Rc::new(RefCell::new(Vec::new()));
+            let sink = Rc::clone(&loaded);
+            set_after_load_hook(Some(Box::new(move |path| {
+                sink.borrow_mut().push(path.to_path_buf());
+            })));
+            loaded
+        }
+
+        #[test]
+        fn index_bounds_carry_their_budgets_and_mode() {
+            let reuse = IndexBound::reuse_pass();
+            assert_eq!(
+                (reuse.units, reuse.time, reuse.mode),
+                (512, Some(Duration::from_millis(200)), IndexMode::Reuse)
+            );
+            let extraction = IndexBound::extraction();
+            assert_eq!(
+                (extraction.units, extraction.time, extraction.mode),
+                (64, Some(Duration::from_secs(2)), IndexMode::Full)
+            );
+            let units = IndexBound::units(3).with_mode(IndexMode::Reuse);
+            assert_eq!(
+                (units.units, units.time, units.mode),
+                (3, None, IndexMode::Reuse)
+            );
+        }
+
+        #[test]
+        fn a_restart_fills_the_index_from_the_store_without_parsing() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (key, anchor) = first_session(temp.path(), store.path(), 40);
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(
+                crate::navigation::test_document_parse_count(),
+                0,
+                "no member was parsed"
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.reused, 40);
+            assert_eq!((progress.indexed, progress.persisted), (0, 0));
+            assert_eq!(progress.reuse_pending, 0);
+            assert_eq!(progress.key.as_ref(), Some(&key));
+            assert_eq!(members(&second, &key).len(), 40);
+            assert_eq!(
+                selected(&second, &key, "P3"),
+                vec![temp.path().join("lib/U3.pas")],
+                "the index answers"
+            );
+            assert_eq!(recorded(&second, &key).len(), 40, "every reuse is proven");
+            assert_eq!(cache.counters().unwrap().snapshot().hits, 40);
+            cache.shutdown();
+        }
+
+        /// H1: an invalidation drops the record, so an unchanged member is
+        /// proven again through the store instead of only refreshed.
+        #[test]
+        fn an_invalidated_unchanged_member_is_proven_again_without_a_parse() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            assert_eq!(advance(&mut view, &anchor, IndexBound::all()).persisted, 4);
+            let member = temp.path().join("lib/U1.pas");
+            view.project_cache.mark_index_stale(&key, &member);
+            assert!(!view.project_cache.index_member_has_record(&key, &member));
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert_eq!(
+                (progress.refreshed, progress.reused),
+                (0, 1),
+                "{progress:?}"
+            );
+            assert!(view.project_cache.index_member_has_record(&key, &member));
+            assert_eq!(recorded(&view, &key).len(), 4);
+            cache.shutdown();
+        }
+
+        /// A member refused for the per-file limit is listed by an
+        /// artifact-less record, not counted as persisted.
+        #[test]
+        fn a_refused_member_gets_an_artifact_less_record() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let mut options = WorkspaceOptions::default();
+            options.limits.max_file_bytes = 300;
+            let (workspace, key, anchor) = indexed_project(temp.path(), 3, options);
+            let big = temp.path().join("lib/U1.pas");
+            named_unit(&big, &"Long".repeat(60));
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!((progress.refused, progress.indexed), (1, 2), "{progress:?}");
+            assert_eq!(progress.persisted, 2);
+            assert!(matches!(
+                state(&view, &key, &big),
+                Some(MemberState::Refused(_))
+            ));
+            assert!(view.project_cache.index_member_has_record(&key, &big));
+            assert_eq!(recorded(&view, &key).len(), 3);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_cancelled_first_session_resumes_from_published_members() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 40, WorkspaceOptions::default());
+            let (mut first, cache) = persisting_view(&workspace, store.path());
+            // Two checks per member in a Full batch: before its reuse and
+            // before its extraction.
+            let mut calls = 0;
+            let result = first.advance_workspace_index(
+                &anchor,
+                IndexBound::all(),
+                &mut || {
+                    calls += 1;
+                    if calls > 30 {
+                        Err(CANCELLATION_MESSAGE.to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+                &AtomicBool::new(false),
+            );
+            assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+            let published = recorded(&first, &key);
+            assert_eq!(published.len(), 15);
+            cache.shutdown();
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let loaded = record_loads();
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(&mut second, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.reused, progress.indexed), (15, 25));
+            assert_eq!(progress.persisted, 25);
+            let mut unpublished = members(&second, &key);
+            unpublished.retain(|path| !published.contains(path));
+            assert_eq!(
+                *loaded.borrow(),
+                unpublished,
+                "no published member is loaded"
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 25);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn an_edit_while_closed_is_extracted_and_its_neighbours_reused() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (key, anchor) = first_session(temp.path(), store.path(), 40);
+            let edited = temp.path().join("lib/U2.pas");
+            named_unit(&edited, "Renamed2");
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let loaded = record_loads();
+            let progress = advance(&mut second, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.reused, progress.indexed), (39, 1));
+            assert_eq!(*loaded.borrow(), vec![edited.clone()]);
+            assert_eq!(selected(&second, &key, "Renamed2"), vec![edited]);
+            assert!(selected(&second, &key, "P2").is_empty());
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_same_size_same_mtime_rewrite_while_closed_is_not_reused() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (key, anchor) = first_session(temp.path(), store.path(), 10);
+            let edited = temp.path().join("lib/U2.pas");
+            let rewritten = fs::read_to_string(&edited).unwrap().replace("P2", "Q2");
+            rewrite_keeping_the_stamp(&edited, rewritten.as_bytes());
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let loaded = record_loads();
+            let progress = advance(&mut second, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.reused, progress.indexed), (9, 1));
+            assert_eq!(*loaded.borrow(), vec![edited.clone()]);
+            assert_eq!(selected(&second, &key, "Q2"), vec![edited]);
+            assert!(selected(&second, &key, "P2").is_empty());
+            cache.shutdown();
+        }
+
+        #[test]
+        fn units_shared_by_two_project_contexts_are_extracted_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            for name in ["A", "B"] {
+                write(
+                    &root.join(format!("{name}.dproj")),
+                    &format!(
+                        "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>"
+                    ),
+                );
+                write(
+                    &root.join(format!("{name}.dpr")),
+                    &format!("program {name}; begin end.\n"),
+                );
+            }
+            for index in 0..5 {
+                named_unit(
+                    &root.join(format!("lib/U{index}.pas")),
+                    &format!("P{index}"),
+                );
+            }
+            pascal_project::backdate_tree_for_test(root);
+            let (mut first, cache) =
+                persisting_view(&workspace(root, WorkspaceOptions::default()), store.path());
+            let a = IndexAnchor::Project(root.join("A.dproj"));
+            let progress = advance(&mut first, &a, IndexBound::all());
+            assert!(progress.complete && progress.persisted == 6, "{progress:?}");
+            cache.shutdown();
+            let (mut second, cache) = restarted_view(root, store.path());
+            let b = IndexAnchor::Project(root.join("B.dproj"));
+            let loaded = record_loads();
+            let progress = advance(&mut second, &b, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.reused, progress.indexed), (5, 1));
+            assert_eq!(*loaded.borrow(), vec![root.join("B.dpr")]);
+            cache.shutdown();
+        }
+
+        const EDITED_SHAPES: &str = "unit Shapes;\ninterface\ntype TPair = record A, B, C: Integer; end;\nimplementation\nend.\n";
+
+        fn provider_project(root: &Path) -> (Workspace, ContextKey, IndexAnchor) {
+            write(
+                &root.join("lib/Main.pas"),
+                std::str::from_utf8(PROVIDER_MAIN).unwrap(),
+            );
+            write(
+                &root.join("lib/Shapes.pas"),
+                std::str::from_utf8(SHAPES).unwrap(),
+            );
+            let (workspace, key) = project_workspace(
+                root,
+                "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+                "",
+                WorkspaceOptions::default(),
+            );
+            (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
+        }
+
+        #[test]
+        fn an_overlay_provider_never_reaches_a_persisted_member() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let main = root.join("lib/Main.pas");
+            let (mut session, key, anchor) = provider_project(root);
+            session
+                .open_document(
+                    Url::from_file_path(root.join("lib/Shapes.pas")).unwrap(),
+                    EDITED_SHAPES.to_owned(),
+                    1,
+                )
+                .unwrap();
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.persisted, 3, "{progress:?}");
+            assert_eq!(selected(&view, &key, "Wide"), vec![main.clone()]);
+            cache.shutdown();
+
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert!(progress.complete && progress.reused == 3, "{progress:?}");
+            let reused = selected(&restarted, &key, "Wide");
+            cache.shutdown();
+
+            let other = tempfile::tempdir().unwrap();
+            let (mut fresh, fresh_key, fresh_anchor) = provider_project(other.path());
+            assert!(advance(&mut fresh, &fresh_anchor, IndexBound::all()).complete);
+            let disk_only = selected(&fresh, &fresh_key, "Wide");
+            assert_eq!(disk_only, vec![other.path().join("lib/Main.pas")]);
+            assert_eq!(
+                reused,
+                vec![main],
+                "the reused facts are the disk-only ones"
+            );
+        }
+
+        #[test]
+        fn an_overlaid_project_file_context_publishes_nothing() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (mut session, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            // The main source is project metadata (its `uses ... in`
+            // clauses name explicit units); `.dproj` buffers are not held.
+            let main = temp.path().join("App.dpr");
+            session
+                .open_document(
+                    Url::from_file_path(&main).unwrap(),
+                    "program App; { unsaved } begin end.\n".to_owned(),
+                    1,
+                )
+                .unwrap();
+            assert!(!session.context_inputs_are_disk_only(&key));
+            let (mut view, cache) = persisting_view(&session, store.path());
+            assert!(!view.context_inputs_are_disk_only(&key));
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.indexed, progress.persisted), (4, 0));
+            assert!(recorded(&view, &key).is_empty());
+            cache.shutdown();
+            let (mut restarted, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert!(restarted.context_inputs_are_disk_only(&key));
+            assert_eq!(progress.reused, 0, "nothing was in the store");
+            assert_eq!(progress.reuse_pending, 0, "every member was tried");
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_disable_mid_batch_continues_memory_only_without_store_calls() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 10, WorkspaceOptions::default());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let jobs_at_ack = Cell::new(None);
+            let mut calls = 0;
+            let progress = view
+                .advance_workspace_index(
+                    &anchor,
+                    IndexBound::all(),
+                    &mut || {
+                        calls += 1;
+                        // The 5th member's first check.
+                        if calls == 9 {
+                            let ack = cache.reconfigure(CacheOptions {
+                                enabled: false,
+                                directory: Some(store.path().to_path_buf()),
+                                ..CacheOptions::default()
+                            });
+                            assert_eq!(ack, Ack::Done);
+                            assert_eq!(cache.state(), CacheState::Disabled);
+                            jobs_at_ack.set(Some(cache.jobs_issued_for_test()));
+                        }
+                        Ok(())
+                    },
+                    &AtomicBool::new(false),
+                )
+                .expect("batch");
+            let jobs = jobs_at_ack.get().expect("the cache was disabled mid-batch");
+            assert!(jobs > 0, "the first members used the store");
+            assert_eq!(
+                cache.jobs_issued_for_test(),
+                jobs,
+                "no store call after the ack"
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.indexed, progress.persisted), (10, 4));
+            for path in members(&view, &key) {
+                assert_eq!(state(&view, &key, &path), Some(MemberState::Fresh));
+            }
+            assert_eq!(recorded(&view, &key).len(), 4);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn persistence_off_indexes_exactly_as_before() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 10, WorkspaceOptions::default());
+            let cache = start(&workspace, store.path(), false);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Disabled);
+            let mut view = view_with(&workspace, &cache);
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(
+                (
+                    progress.indexed,
+                    progress.refreshed,
+                    progress.refused,
+                    progress.pending
+                ),
+                (10, 0, 0, 0)
+            );
+            assert!(progress.complete && !progress.memory);
+            assert_eq!(
+                (progress.reused, progress.persisted, progress.reuse_deferred),
+                (0, 0, 0)
+            );
+            assert!(recorded(&view, &key).is_empty());
+            assert_eq!(
+                fs::read_dir(store.path()).unwrap().count(),
+                0,
+                "no store file"
+            );
+            assert_eq!(cache.jobs_issued_for_test(), 0);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_refused_publication_reservation_keeps_the_member_memory_only() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 2, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let project_cache = workspace.project_cache().clone();
+            let target = member.clone();
+            let shrunk = Rc::new(Cell::new(false));
+            let flag = Rc::clone(&shrunk);
+            set_before_persist_hook(Some(Box::new(move |path| {
+                if path == target {
+                    let stats = project_cache.stats();
+                    // No room is left for anything new.
+                    project_cache.set_max_bytes(stats.outstanding_bytes + stats.reserved_bytes());
+                    flag.set(true);
+                }
+            })));
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            set_before_persist_hook(None);
+            assert!(shrunk.get());
+            workspace
+                .project_cache()
+                .set_max_bytes(crate::project_cache::DEFAULT_MAX_CACHE_BYTES);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.indexed, progress.persisted), (2, 1));
+            assert_eq!(state(&view, &key, &member), Some(MemberState::Fresh));
+            assert_eq!(recorded(&view, &key), vec![temp.path().join("App.dpr")]);
+            cache.shutdown();
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let loaded = record_loads();
+            let progress = advance(&mut second, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert_eq!((progress.reused, progress.indexed), (1, 1));
+            assert_eq!(*loaded.borrow(), vec![member]);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn reuse_holds_one_members_facts_at_a_time() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (_, anchor) = first_session(temp.path(), store.path(), 12);
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let project_cache = second.project_cache().clone();
+            let samples = Rc::new(RefCell::new(Vec::new()));
+            let sink = Rc::clone(&samples);
+            set_after_reuse_hook(Some(Box::new(move |_| {
+                sink.borrow_mut()
+                    .push(project_cache.stats().reserved_facts_bytes);
+            })));
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            set_after_reuse_hook(None);
+            assert_eq!(progress.reused, 12);
+            assert_eq!(
+                *samples.borrow(),
+                vec![0; 12],
+                "each member's facts were dropped"
+            );
+            let snapshot = cache.counters().unwrap().snapshot();
+            assert_eq!(snapshot.hits, 12);
+            assert!(
+                snapshot.decoded_bytes > 0,
+                "the facts were decoded and charged"
+            );
+            cache.shutdown();
+        }
+
+        /// Maintenance in another process: retire every unreferenced row
+        /// (no snapshot lists the records) and, with `reclaim`, delete them.
+        fn retire_everything(root: &Path, directory: &Path, reclaim: bool) -> usize {
+            let (_, cache) = restarted_view(root, directory);
+            let job = cache.job().expect("job");
+            let limits = MaintenanceLimits {
+                recency_window: 0,
+                ..MaintenanceLimits::DEFAULT
+            };
+            let mut retired = 0;
+            for step in [
+                RetireStep::Records,
+                RetireStep::Evidence,
+                RetireStep::Artifacts,
+            ] {
+                loop {
+                    let rows = job.store().retire_step(step, &limits).unwrap();
+                    if rows == 0 {
+                        break;
+                    }
+                    retired += rows;
+                }
+            }
+            while reclaim && !job.store().reclaim(256).unwrap().complete {}
+            drop(job);
+            cache.shutdown();
+            retired
+        }
+
+        #[test]
+        fn a_retired_artifact_is_extracted_again() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (key, anchor) = first_session(temp.path(), store.path(), 6);
+            assert_eq!(retire_everything(temp.path(), store.path(), false), 12);
+            // Retired but not deleted yet: never reused, and a publication
+            // is refused (`Retiring`), so the member stays memory-only.
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(&mut second, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!((progress.reused, progress.indexed), (0, 6));
+            assert_eq!(progress.persisted, 0);
+            cache.shutdown();
+            assert_eq!(retire_everything(temp.path(), store.path(), true), 0);
+            // Deleted: extracted and published again.
+            let (mut third, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(&mut third, &anchor, IndexBound::all());
+            assert_eq!((progress.reused, progress.indexed), (0, 6));
+            assert_eq!(progress.persisted, 6, "republished");
+            cache.shutdown();
+            let (mut fourth, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(
+                &mut fourth,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert!(progress.complete && progress.reused == 6, "{progress:?}");
+            assert_eq!(recorded(&fourth, &key).len(), 6);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn two_sessions_index_one_store_concurrently() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (first_workspace, key, anchor) =
+                indexed_project(root, 12, WorkspaceOptions::default());
+            let (mut first, cache) = persisting_view(&first_workspace, store.path());
+            let second_workspace = workspace(root, WorkspaceOptions::default());
+            let mut second = view_with(&second_workspace, &cache);
+            let mut done = (false, false);
+            done.0 |= advance(&mut first, &anchor, IndexBound::units(1)).complete;
+            assert!(
+                second.project_cache().read_index(&key, |_, _| ()).is_none(),
+                "two project caches, as two processes have"
+            );
+            for _ in 0..64 {
+                done.0 |= advance(&mut first, &anchor, IndexBound::units(1)).complete;
+                done.1 |= advance(&mut second, &anchor, IndexBound::units(1)).complete;
+                if done == (true, true) {
+                    break;
+                }
+            }
+            assert_eq!(done, (true, true));
+            let (left, right) = (records(&first, &key), records(&second, &key));
+            assert_eq!(left.len(), 12);
+            assert!(left.iter().all(|(_, record)| record.is_some()), "{left:?}");
+            assert_eq!(left, right, "identical records for every member");
+            cache.shutdown();
+            let (mut third, cache) = restarted_view(root, store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut third,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert!(progress.complete && progress.reused == 12, "{progress:?}");
+            cache.shutdown();
+        }
     }
 }

@@ -968,21 +968,8 @@ impl NavigationIndex {
         let mut members = binding
             .members
             .iter()
-            .map(|member| ReferenceTargetMember {
-                uri: member.uri.clone(),
-                unit: self
-                    .documents
-                    .get(&member.uri)
-                    .map(|document| canonical_name(&document.unit_name))
-                    .unwrap_or_default(),
-                top_level: member.scope == ROOT_SCOPE
-                    && member.owner_type.is_none()
-                    && !matches!(
-                        member.kind,
-                        SymbolKind::EnumValue | SymbolKind::Field | SymbolKind::Property
-                    ),
-            })
-            .collect::<Vec<_>>();
+            .map(|member| self.reference_target_member(member))
+            .collect::<Result<Vec<_>, _>>()?;
         members.sort_by(|left, right| {
             left.uri
                 .as_str()
@@ -992,6 +979,27 @@ impl NavigationIndex {
         members.dedup();
         check_cancel(Some(cancel))?;
         Ok(ReferenceTargets { names, members })
+    }
+
+    /// A member whose declaring document is not indexed has no unit to scope
+    /// the query by: phase 1 fails and the caller uses the member rule.
+    fn reference_target_member(&self, member: &SymbolId) -> Result<ReferenceTargetMember, String> {
+        let document = self.documents.get(&member.uri).ok_or_else(|| {
+            format!(
+                "the declaring document of the reference target is not indexed: {}",
+                member.uri
+            )
+        })?;
+        Ok(ReferenceTargetMember {
+            uri: member.uri.clone(),
+            unit: canonical_name(&document.unit_name),
+            top_level: member.scope == ROOT_SCOPE
+                && member.owner_type.is_none()
+                && !matches!(
+                    member.kind,
+                    SymbolKind::EnumValue | SymbolKind::Field | SymbolKind::Property
+                ),
+        })
     }
 
     /// Prove that the rename target can be resolved without any imported
@@ -4341,7 +4349,7 @@ mod tests {
     }
 
     #[test]
-    fn an_overloaded_routine_lists_every_declaring_document() {
+    fn overloads_within_one_unit_list_their_declaring_document() {
         let both = "unit Both;\ninterface\nprocedure Run(Value: Integer); overload;\nprocedure Run(Value: string); overload;\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Run(Value: string);\nbegin\nend;\nend.\n";
         let first = "unit First;\ninterface\nprocedure Go(Value: Integer); overload;\nimplementation\nprocedure Go(Value: Integer);\nbegin\nend;\nend.\n";
         let second = "unit Second;\ninterface\nprocedure Go(Value: string); overload;\nimplementation\nprocedure Go(Value: string);\nbegin\nend;\nend.\n";
@@ -4378,6 +4386,20 @@ mod tests {
                 .reference_targets_with_cancel(&uri, position, &AtomicBool::new(false))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_member_of_an_unknown_document_fails_phase_one() {
+        let index = indexed(&[("Known", "unit Known;\ninterface\nimplementation\nend.\n")]);
+        let member = super::SymbolId {
+            uri: Url::parse("file:///Gone.pas").unwrap(),
+            span: Span { start: 0, end: 1 },
+            scope: super::ROOT_SCOPE,
+            kind: super::SymbolKind::Constant,
+            origin: super::super::Origin::Declaration,
+            owner_type: None,
+        };
+        assert!(index.reference_target_member(&member).is_err());
     }
 
     #[test]

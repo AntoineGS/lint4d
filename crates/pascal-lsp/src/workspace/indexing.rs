@@ -25,8 +25,8 @@ use super::{
 use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
 use crate::workspace_index::{
-    CandidateQuery, Candidates, IndexCoverage, MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp,
-    MemberState,
+    CandidateQuery, Candidates, ContextIndex, IndexCoverage, MAX_UNVERIFIED_CANDIDATES,
+    MemberFacts, MemberStamp, MemberState,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
@@ -224,6 +224,22 @@ fn set_after_load_hook(hook: Option<LoadHook>) {
     AFTER_LOAD.with(|slot| *slot.borrow_mut() = hook);
 }
 
+#[cfg(test)]
+type CacheHook = Box<dyn FnMut(&crate::project_cache::ProjectCache)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after `indexed_sources` read one target's index, before it looks
+    /// up the membership's catalogues.
+    static AFTER_TARGET_VIEW: std::cell::RefCell<Option<CacheHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_after_target_view_hook(hook: Option<CacheHook>) {
+    AFTER_TARGET_VIEW.with(|slot| *slot.borrow_mut() = hook);
+}
+
 enum MemberOutcome {
     Published,
     /// The load failed for a reason that may pass: still pending.
@@ -373,12 +389,45 @@ impl Workspace {
         anchor: &IndexAnchor,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        if !self.project_cache.index_membership_current(key) {
-            let membership = self.index_membership(key, cancel)?;
-            self.project_cache
-                .set_index_membership(key.clone(), anchor.clone(), membership);
+        self.ensure_index_membership_computed(key, anchor, cancel)
+            .map(drop)
+    }
+
+    /// Like `ensure_index_membership`; returns the membership when it had to
+    /// be computed.
+    fn ensure_index_membership_computed(
+        &mut self,
+        key: &ContextKey,
+        anchor: &IndexAnchor,
+        cancel: &AtomicBool,
+    ) -> Result<Option<IndexMembership>, String> {
+        if self.project_cache.index_membership_current(key) {
+            return Ok(None);
         }
-        Ok(())
+        let membership = self.index_membership(key, cancel)?;
+        self.project_cache
+            .set_index_membership(key.clone(), anchor.clone(), membership.clone());
+        Ok(Some(membership))
+    }
+
+    /// The directories of the catalogues `scopes` name, while each is still
+    /// stored under its recorded generation; `None` otherwise.
+    fn membership_listing(&self, scopes: &[(CatalogueKey, u64)]) -> Option<MembershipListing> {
+        let mut listing = MembershipListing::default();
+        for (scope, generation) in scopes {
+            let shared = self
+                .project_cache
+                .catalogue(scope)
+                .filter(|shared| *generation != 0 && shared.generation == *generation)?;
+            let catalogue = &shared.catalogue;
+            listing.incomplete |= !catalogue.is_complete()
+                || catalogue.limit().is_some()
+                || !catalogue.unreadable().is_empty();
+            listing
+                .directories
+                .extend(catalogue.directories().iter().cloned());
+        }
+        Some(listing)
     }
 
     /// A stale member whose own file and every include still prove unchanged
@@ -1074,6 +1123,7 @@ impl Workspace {
                     })
             })
         };
+        let mut unowned = 0usize;
         for (key, anchor) in &targets.contexts {
             check_workspace_cancel(Some(cancel))?;
             if !self.contexts.contains_key(key) {
@@ -1085,65 +1135,77 @@ impl Workspace {
                     ));
                 }
             }
-            self.ensure_index_membership(key, anchor, cancel)?;
+            let mut computed = self.ensure_index_membership_computed(key, anchor, cancel)?;
             if let Some(state) = self.contexts.get(key) {
                 result.contexts.insert(key.clone(), state.clone());
             }
             let display = anchor_display(anchor);
-            let view = self.project_cache.read_index(key, |index, membership| {
-                let candidates = match query {
-                    Some(query) => index.candidates(query),
-                    None => {
-                        let mut all = index.candidates(&CandidateQuery {
-                            names: Vec::new(),
-                            top_level_units: None,
-                            aliases: Vec::new(),
-                        });
-                        all.selected.clear();
-                        all.excluded.clear();
-                        all
-                    }
+            // The directories baseline the membership only while its
+            // catalogues are the ones it was computed from; otherwise the
+            // membership is computed once more.
+            let mut retried = false;
+            let (view, listing) = loop {
+                let view = self.project_cache.read_index(key, |index, membership| {
+                    target_view(index, membership, query)
+                });
+                #[cfg(test)]
+                if let Some(mut hook) = AFTER_TARGET_VIEW.with(|slot| slot.borrow_mut().take()) {
+                    hook(&self.project_cache);
+                    AFTER_TARGET_VIEW.with(|slot| *slot.borrow_mut() = Some(hook));
+                }
+                let scopes = match (&view, &computed) {
+                    (Some(view), _) => view.scopes.clone(),
+                    (None, Some(membership)) => membership.scopes.clone(),
+                    (None, None) => Vec::new(),
                 };
-                let recorded = candidates
-                    .excluded
-                    .iter()
-                    .map(|path| {
-                        let resolved = index
-                            .slot_paths_of(path)
-                            .is_some_and(|slots| slots.iter().skip(1).all(Option::is_some));
-                        let stamps = index.stamps_of(path).map(<[_]>::to_vec).unwrap_or_default();
-                        (resolved, stamps)
-                    })
-                    .collect::<Vec<_>>();
-                TargetView {
-                    candidates,
-                    recorded,
-                    coverage: index.coverage(),
-                    scopes: membership.scopes.clone(),
-                    complete: membership.complete,
-                    limit: membership.limit.clone(),
-                    packages: membership.packages,
+                let listing = self.membership_listing(&scopes);
+                if listing.is_some() || retried {
+                    break (view, listing);
                 }
-            });
-            let Some(view) = view else {
-                // The store kept no index (no room for the membership): read
-                // every member as today's walk would, within the bound.
+                retried = true;
                 let membership = self.index_membership(key, cancel)?;
-                memory = true;
-                let mut skipped = 0usize;
-                let mut searched = 0usize;
-                for path in membership.paths {
-                    if deleted(&path) || !taken.insert(path_key(&path)) {
-                        continue;
-                    }
-                    if unverified_left == 0 {
-                        skipped += 1;
-                        continue;
-                    }
-                    unverified_left -= 1;
-                    searched += 1;
-                    result.sources.push((path, key.clone()));
+                self.project_cache.set_index_membership(
+                    key.clone(),
+                    anchor.clone(),
+                    membership.clone(),
+                );
+                computed = Some(membership);
+            };
+            let listing_incomplete = match listing {
+                Some(listing) => {
+                    result.baseline.extend(listing.directories);
+                    listing.incomplete
                 }
+                None => {
+                    result.gaps.push(format!(
+                        "the directory listings of {display} could not be kept; changes to them may be missed"
+                    ));
+                    false
+                }
+            };
+            let stored = view.filter(|view| {
+                !view
+                    .limit
+                    .as_deref()
+                    .is_some_and(|limit| !limit.starts_with("more than "))
+            });
+            let Some(view) = stored else {
+                // The store holds no members (no room for the membership):
+                // read every member as today's walk would, within the bound.
+                let membership = match computed {
+                    Some(membership) => membership,
+                    None => self.index_membership(key, cancel)?,
+                };
+                memory = true;
+                let (skipped, searched) = take_unverified(
+                    membership.paths,
+                    key,
+                    &open,
+                    &deleted,
+                    &mut taken,
+                    &mut unverified_left,
+                    &mut result.sources,
+                );
                 if skipped > 0 {
                     result.gaps.push(format!(
                         "{skipped} units of {display} are not indexed yet; {searched} were searched directly"
@@ -1162,32 +1224,32 @@ impl Workspace {
                     },
                 recorded,
                 coverage,
-                scopes,
                 complete,
                 limit,
                 packages,
+                owner_pending,
+                ..
             } = view;
 
             for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
                 check_workspace_cancel(Some(cancel))?;
-                let proven = resolved
-                    && recorded.first().is_some_and(|first| first.path == path)
+                let unchanged = recorded.first().is_some_and(|first| first.path == path)
                     && recorded.iter().all(|member| {
                         let now = stamps
                             .entry(path_key(&member.path))
                             .or_insert_with(|| path_stamp(&member.path));
                         matches!((&member.stamp, &*now), (Some(old), Some(now)) if old.proves_unchanged(now))
                     });
-                if proven {
+                if !unchanged {
+                    self.project_cache.mark_index_stale(key, &path);
+                }
+                if resolved && unchanged {
                     result.baseline.extend(
                         recorded
                             .into_iter()
                             .map(|member| (member.path, member.stamp)),
                     );
                 } else {
-                    if resolved {
-                        self.project_cache.mark_index_stale(key, &path);
-                    }
                     unverified.push(path);
                 }
             }
@@ -1198,25 +1260,15 @@ impl Workspace {
                     result.sources.push((path, key.clone()));
                 }
             }
-            let mut skipped = 0usize;
-            let mut searched = 0usize;
-            for path in unverified {
-                let path_key = path_key(&path);
-                if deleted(&path) || taken.contains(&path_key) {
-                    continue;
-                }
-                // Open buffers are always read (A4); they do not use the bound.
-                if !open.contains(&path_key) {
-                    if unverified_left == 0 {
-                        skipped += 1;
-                        continue;
-                    }
-                    unverified_left -= 1;
-                    searched += 1;
-                }
-                taken.insert(path_key);
-                result.sources.push((path, key.clone()));
-            }
+            let (skipped, searched) = take_unverified(
+                unverified,
+                key,
+                &open,
+                &deleted,
+                &mut taken,
+                &mut unverified_left,
+                &mut result.sources,
+            );
             if skipped > 0 {
                 result.gaps.push(format!(
                     "{skipped} units of {display} are not indexed yet; {searched} were searched directly"
@@ -1227,21 +1279,20 @@ impl Workspace {
                 first_refusal = refused_members.into_iter().next().map(|(_, reason)| reason);
             }
 
-            for (scope, _) in &scopes {
-                if let Some(shared) = self.project_cache.catalogue(scope) {
-                    result
-                        .baseline
-                        .extend(shared.catalogue.directories().iter().cloned());
-                }
-            }
             match limit.as_deref() {
-                Some(limit) if limit.starts_with("more than ") => {
+                Some(_) => {
                     result.gaps.push(format!(
                         "{display} has more than {} units; the rest were not searched",
                         coverage.members
                     ));
                 }
-                Some(_) => memory = true,
+                // Directories whose owner is still pending are already the
+                // outside-source gap of the targets.
+                None if !complete && (listing_incomplete || owner_pending == 0) => {
+                    result.gaps.push(format!(
+                        "{display} membership is incomplete; some units were not searched"
+                    ));
+                }
                 None => {}
             }
             memory |= self.project_cache.index_memory_exhausted(key);
@@ -1263,32 +1314,47 @@ impl Workspace {
             if deleted(&path) || taken.contains(&path_key) {
                 continue;
             }
-            let owner = targets
-                .contexts
-                .iter()
-                .map(|(key, _)| key)
-                .find(|key| {
-                    self.project_cache
-                        .read_index(key, |index, _| index.state_of(&path).is_some())
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .or_else(|| {
-                    let known = input
-                        .document_owners
-                        .get(uri)
-                        .or_else(|| input.document_owners.get(&super::canonical_file_uri(uri)))?;
+            let member_of = targets.contexts.iter().map(|(key, _)| key).find(|key| {
+                self.project_cache
+                    .read_index(key, |index, _| index.state_of(&path).is_some())
+                    .unwrap_or(false)
+            });
+            let known = input
+                .document_owners
+                .get(uri)
+                .or_else(|| input.document_owners.get(&super::canonical_file_uri(uri)));
+            let owner = match (member_of, known) {
+                (Some(key), _) => Some(key.clone()),
+                (None, Some(known)) => {
                     result
                         .contexts
                         .entry(known.key.clone())
                         .or_insert_with(|| super::ContextState::clone(&known.state));
                     Some(known.key.clone())
-                });
-            // Without a known owner the snapshot's own overlay step reads it.
-            if let Some(owner) = owner {
-                taken.insert(path_key);
-                result.sources.push((path, owner));
+                }
+                // A declaring document must be bound: the first target that
+                // would read it owns it.
+                (None, None) => targets
+                    .contexts
+                    .iter()
+                    .map(|(key, _)| key)
+                    .find(|key| self.index_accepts(key, &path))
+                    .cloned(),
+            };
+            match owner {
+                Some(owner) => {
+                    taken.insert(path_key);
+                    result.sources.push((path, owner));
+                }
+                // An open buffer is still read by the snapshot's overlay step.
+                None if open.contains(&path_key) => {}
+                None => unowned += 1,
             }
+        }
+        if unowned > 0 {
+            result.gaps.push(format!(
+                "{unowned} requested sources belong to no searched context and were not searched"
+            ));
         }
 
         if refused > 0 {
@@ -1330,6 +1396,88 @@ struct TargetView {
     complete: bool,
     limit: Option<String>,
     packages: bool,
+    owner_pending: usize,
+}
+
+fn target_view(
+    index: &ContextIndex,
+    membership: &IndexMembership,
+    query: Option<&CandidateQuery>,
+) -> TargetView {
+    let candidates = match query {
+        Some(query) => index.candidates(query),
+        None => {
+            let mut all = index.candidates(&CandidateQuery {
+                names: Vec::new(),
+                top_level_units: None,
+                aliases: Vec::new(),
+            });
+            all.selected.clear();
+            all.excluded.clear();
+            all
+        }
+    };
+    let recorded = candidates
+        .excluded
+        .iter()
+        .map(|path| {
+            let resolved = index
+                .slot_paths_of(path)
+                .is_some_and(|slots| slots.iter().skip(1).all(Option::is_some));
+            let stamps = index.stamps_of(path).map(<[_]>::to_vec).unwrap_or_default();
+            (resolved, stamps)
+        })
+        .collect();
+    TargetView {
+        candidates,
+        recorded,
+        coverage: index.coverage(),
+        scopes: membership.scopes.clone(),
+        complete: membership.complete,
+        limit: membership.limit.clone(),
+        packages: membership.packages,
+        owner_pending: membership.owner_pending,
+    }
+}
+
+/// The directories a membership's catalogues listed, with their stamps.
+#[derive(Default)]
+struct MembershipListing {
+    directories: Vec<(PathBuf, Option<PathStamp>)>,
+    /// A catalogue stopped at a limit or could not read a directory.
+    incomplete: bool,
+}
+
+/// Adds `unverified` (path order) to `sources` while the request-wide bound
+/// lasts; open buffers are always read (A4) and do not use it. Returns how
+/// many were skipped and how many used the bound.
+fn take_unverified(
+    unverified: Vec<PathBuf>,
+    key: &ContextKey,
+    open: &HashSet<String>,
+    deleted: &dyn Fn(&Path) -> bool,
+    taken: &mut HashSet<String>,
+    left: &mut usize,
+    sources: &mut Vec<(PathBuf, ContextKey)>,
+) -> (usize, usize) {
+    let (mut skipped, mut searched) = (0, 0);
+    for path in unverified {
+        let path_key = path_key(&path);
+        if deleted(&path) || taken.contains(&path_key) {
+            continue;
+        }
+        if !open.contains(&path_key) {
+            if *left == 0 {
+                skipped += 1;
+                continue;
+            }
+            *left -= 1;
+            searched += 1;
+        }
+        taken.insert(path_key);
+        sources.push((path, key.clone()));
+    }
+    (skipped, searched)
 }
 
 /// How coverage notes name a context: its project file, or the document
@@ -1381,7 +1529,7 @@ fn is_descriptor(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::{Depth, test_listings, test_reset_listings};
+    use crate::catalogue::{Catalogue, Depth, test_listings, test_reset_listings};
     use crate::project_cache::{IndexAnchor, IndexMembership};
     use crate::workspace::WorkspaceOptions;
     use crate::workspace::rename::CANCELLATION_MESSAGE;
@@ -2898,5 +3046,228 @@ mod tests {
         );
         assert_eq!(source_names(&found), ["Plain.pas"]);
         assert_eq!(workspace.project_cache.take_index_requests(), [anchor]);
+    }
+
+    fn lib_scope(root: &Path) -> crate::catalogue::CatalogueKey {
+        CatalogueScope::listing(&root.join("lib")).key().clone()
+    }
+
+    #[test]
+    fn a_catalogue_replaced_after_the_membership_is_recomputed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let scope = lib_scope(root);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = fired.clone();
+        set_after_target_view_hook(Some(Box::new(move |cache| {
+            if count.get() == 0
+                && let Some(shared) = cache.catalogue(&scope)
+            {
+                cache.drop_catalogue(&scope, shared.generation);
+            }
+            count.set(count.get() + 1);
+        })));
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        set_after_target_view_hook(None);
+        assert_eq!(
+            fired.get(),
+            2,
+            "the target was read again after the recompute"
+        );
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+        assert!(
+            found
+                .baseline
+                .iter()
+                .any(|(path, _)| *path == root.join("lib"))
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+    }
+
+    #[test]
+    fn a_catalogue_that_stays_unavailable_is_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let scope = lib_scope(root);
+        set_after_target_view_hook(Some(Box::new(move |cache| {
+            if let Some(shared) = cache.catalogue(&scope) {
+                cache.drop_catalogue(&scope, shared.generation);
+            }
+        })));
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        set_after_target_view_hook(None);
+        assert_eq!(
+            found.gaps,
+            [
+                "the directory listings of App.dproj could not be kept; changes to them may be missed"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_membership_is_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let scope = CatalogueScope::listing(&root.join("lib"));
+        let mut stopped =
+            Catalogue::new(&root.join("lib"), Depth::Listing, &mut || Ok(())).unwrap();
+        stopped
+            .advance(
+                crate::catalogue::Bound::directories(1),
+                &|_| false,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        stopped.test_stop(crate::catalogue::Limit::Entries);
+        workspace
+            .project_cache
+            .publish_catalogue(scope.key().clone(), None, std::sync::Arc::new(stopped))
+            .expect("published");
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(
+            found.gaps,
+            ["App.dproj membership is incomplete; some units were not searched"]
+        );
+    }
+
+    #[test]
+    fn a_changed_member_with_an_unresolved_include_is_marked_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let member = root.join("lib/Inc.pas");
+        write(
+            &member,
+            "unit Inc;\ninterface\n{$I missing.inc}\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        assert_eq!(state(&workspace, &key, &member), Some(MemberState::Fresh));
+        write(
+            &member,
+            "unit Inc;\ninterface\n{$I missing.inc}\nimplementation\n{ edited }\nend.\n",
+        );
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert!(source_names(&found).contains(&"Inc.pas".to_owned()));
+        assert_eq!(state(&workspace, &key, &member), Some(MemberState::Stale));
+    }
+
+    #[test]
+    fn a_required_document_outside_every_membership_is_bound_or_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let elsewhere = temp.path().join("elsewhere/Far.pas");
+        write(&elsewhere, PLAIN);
+        let extra = root.join("ext/Extra.pas");
+        write(&extra, USER.replace("unit User", "unit Extra").as_str());
+        let (mut workspace, key, anchor) = shared_project(&root, WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[
+                Url::from_file_path(&extra).unwrap(),
+                Url::from_file_path(&elsewhere).unwrap(),
+            ],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Extra.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(found.sources.iter().all(|(_, owner)| *owner == key));
+        assert_eq!(
+            found.gaps,
+            ["1 requested sources belong to no searched context and were not searched"]
+        );
+    }
+
+    #[test]
+    fn without_room_for_the_index_every_member_is_read_within_the_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
+        let open = Url::from_file_path(root.join("lib/U3.pas")).unwrap();
+        workspace
+            .open_document(
+                open,
+                "unit U3; interface implementation end.\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        workspace.project_cache = crate::project_cache::ProjectCache::new(64);
+        let _caps = override_caps(|caps| caps.unverified = Some(2));
+        let input = workspace.analysis_input();
+        let query = CandidateQuery {
+            names: vec!["P0".to_owned()],
+            top_level_units: None,
+            aliases: Vec::new(),
+        };
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["App.dpr", "U0.pas", "U3.pas"]);
+        assert!(
+            found.gaps.contains(
+                &"2 units of App.dproj are not indexed yet; 2 were searched directly".to_owned()
+            ),
+            "{:?}",
+            found.gaps
+        );
+        assert!(
+            found
+                .gaps
+                .contains(&"the workspace index memory share is exhausted".to_owned()),
+            "{:?}",
+            found.gaps
+        );
     }
 }

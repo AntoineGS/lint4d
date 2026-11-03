@@ -730,7 +730,8 @@ impl Warmer {
                 // members) or hit the memory limit cannot gain from a retry.
                 if !progress.complete
                     && !progress.memory
-                    && progress.indexed + progress.refreshed + progress.refused > 0
+                    && progress.indexed + progress.refreshed + progress.refused + progress.limited
+                        > 0
                 {
                     self.request_index(anchor.clone());
                 }
@@ -852,10 +853,11 @@ fn run_index_job(
     match result {
         Ok(progress) => {
             crate::trace::trace!(
-                "index batch {anchor:?} indexed={} refreshed={} refused={} deferred={} skipped_open={} pending={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
+                "index batch {anchor:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
                 progress.indexed,
                 progress.refreshed,
                 progress.refused,
+                progress.limited,
                 progress.deferred,
                 progress.skipped_open,
                 progress.pending,

@@ -5049,6 +5049,17 @@ impl ProjectCache {
         }
     }
 
+    pub(crate) fn limit_index_member(&self, key: &ContextKey, path: &Path) {
+        let old = self
+            .index()
+            .contexts
+            .get_mut(key)
+            .and_then(|stored| stored.index.limit(path));
+        if let Some(old) = old {
+            self.release_index(old);
+        }
+    }
+
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_stale(path);

@@ -169,6 +169,9 @@ pub(crate) enum MemberState {
     Fresh,
     Stale,
     Refused(Box<str>),
+    /// Its facts could not be completed (a compile-time limit): read
+    /// directly by every request, and not indexed again until it changes.
+    Limited,
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +666,19 @@ impl ContextIndex {
         true
     }
 
+    /// Returns the old charge, `None` if `path` is not a member. The member
+    /// keeps no facts and stays an unverified candidate until it is stale.
+    pub(crate) fn limit(&mut self, path: &Path) -> Option<usize> {
+        let id = self.id_of(path)?;
+        let old = self.release(id);
+        let member = &mut self.members[id.0 as usize];
+        member.hash = None;
+        member.state = Some(MemberState::Limited);
+        let path = member.path.clone();
+        self.log([path]);
+        Some(old)
+    }
+
     /// Returns the old charge, `None` if `path` is not a member. A refused
     /// member (a stable reason, A6) drops its facts, so it is no include
     /// dependent of anything until it is indexed again.
@@ -680,7 +696,7 @@ impl ContextIndex {
     fn stale_one(&mut self, id: MemberId) -> bool {
         let member = &mut self.members[id.0 as usize];
         match member.state() {
-            MemberState::Fresh | MemberState::Refused(_) => {
+            MemberState::Fresh | MemberState::Refused(_) | MemberState::Limited => {
                 member.state = Some(MemberState::Stale);
                 true
             }
@@ -789,7 +805,7 @@ impl ContextIndex {
         let mut result = Candidates::default();
         for (id, member) in self.live_members_with_ids() {
             match member.state() {
-                MemberState::Unindexed | MemberState::Stale => {
+                MemberState::Unindexed | MemberState::Stale | MemberState::Limited => {
                     result.unverified.push(member.path.clone());
                 }
                 MemberState::Refused(reason) => {
@@ -830,7 +846,7 @@ impl ContextIndex {
         for (key, id) in &self.by_path {
             let member = &self.members[id.0 as usize];
             let facts = match member.state() {
-                MemberState::Unindexed | MemberState::Stale => {
+                MemberState::Unindexed | MemberState::Stale | MemberState::Limited => {
                     scan.unverified.push(member.path.clone());
                     continue;
                 }
@@ -933,6 +949,7 @@ impl ContextIndex {
             match member.state() {
                 MemberState::Fresh => coverage.fresh += 1,
                 MemberState::Unindexed | MemberState::Stale => coverage.pending += 1,
+                MemberState::Limited => {}
                 MemberState::Refused(reason) => {
                     coverage.refused += 1;
                     coverage.first_refusal.get_or_insert_with(|| reason.clone());

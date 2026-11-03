@@ -205,6 +205,9 @@ pub(crate) struct IndexProgress {
     /// The batch stopped because the index share has no room left; asking
     /// again cannot help until memory is released.
     pub(crate) memory: bool,
+    /// Members whose facts were limited: unverified candidates of every
+    /// request until they change.
+    pub(crate) limited: usize,
 }
 
 /// A read failure that repeats for the same bytes or path (A6): a file over
@@ -242,6 +245,18 @@ fn set_after_load_hook(hook: Option<LoadHook>) {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// A member whose indexing fails with an error that is no cancellation.
+    static MEMBER_ERROR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_member_error(path: Option<PathBuf>) {
+    MEMBER_ERROR.with(|slot| *slot.borrow_mut() = path);
+}
+
+#[cfg(test)]
 type CacheHook = Box<dyn FnMut(&crate::project_cache::ProjectCache)>;
 
 #[cfg(test)]
@@ -259,6 +274,8 @@ fn set_after_target_view_hook(hook: Option<CacheHook>) {
 
 enum MemberOutcome {
     Published,
+    /// The facts were limited: an unverified candidate until it changes.
+    Limited,
     /// The load failed for a reason that may pass: still pending.
     Deferred,
     Refused,
@@ -330,6 +347,7 @@ impl Workspace {
             skipped_open: 0,
             deferred: 0,
             memory: false,
+            limited: 0,
         };
         // Open members are skipped, so ask for enough to fill the bound.
         let wanted = bound.units.saturating_add(self.open_documents.len());
@@ -359,9 +377,19 @@ impl Workspace {
                 progress.refreshed += 1;
                 continue;
             }
-            match self.index_member(&key, &path, own_stamp, cancel)? {
+            // One member's failure never stops the batch: it stays pending.
+            let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
+                Ok(outcome) => outcome,
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    crate::trace::trace!("  index member {} deferred: {error}", path.display());
+                    MemberOutcome::Deferred
+                }
+            };
+            match outcome {
                 MemberOutcome::Published => progress.indexed += 1,
                 MemberOutcome::Refused => progress.refused += 1,
+                MemberOutcome::Limited => progress.limited += 1,
                 MemberOutcome::Skipped => {}
                 MemberOutcome::Deferred => progress.deferred += 1,
                 MemberOutcome::Memory => {
@@ -506,6 +534,10 @@ impl Workspace {
         let Ok(uri) = Url::from_file_path(path) else {
             return Ok(self.refuse_member(key, path, "the path has no file URI".to_owned()));
         };
+        #[cfg(test)]
+        if MEMBER_ERROR.with(|slot| slot.borrow().as_deref() == Some(path)) {
+            return Err("an injected member error".to_owned());
+        }
         let held = self.index.contains(&uri);
         self.load_refusal = None;
         let loaded = self.load_source_with_cancel(&uri, key, &HashSet::new(), Some(cancel));
@@ -572,8 +604,12 @@ impl Workspace {
         };
         match facts.extracted.persistable {
             Ok(()) => {}
+            // Limited facts cannot prove a member irrelevant (§8): it stays a
+            // candidate, read directly, until its file changes.
             Err(NotPersistable::Transient) => {
-                return Err("the member's facts were limited; it stays pending".to_owned());
+                check_workspace_cancel(Some(cancel))?;
+                self.project_cache.limit_index_member(key, path);
+                return Ok(MemberOutcome::Limited);
             }
             // An unsaved buffer is not what the disk holds; the index
             // describes saved files only.
@@ -2572,6 +2608,87 @@ mod tests {
         for path in members(&workspace, &key) {
             assert_eq!(state(&workspace, &key, &path), Some(MemberState::Unindexed));
         }
+    }
+
+    /// A unit including an include that includes itself: the session stops
+    /// at the include depth limit, so its facts are limited
+    /// (`NotPersistable::Transient`) every time it is read.
+    fn limited_unit(path: &Path) {
+        write(&path.with_file_name("x.inc"), "{$I x.inc}\n");
+        write(
+            path,
+            "unit U0;\ninterface\n{$I x.inc}\nimplementation\nend.\n",
+        );
+    }
+
+    #[test]
+    fn a_member_with_limited_facts_stays_an_unverified_candidate_and_the_batch_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        limited_unit(&root.join("lib/U0.pas"));
+        for index in 1..3 {
+            named_unit(
+                &root.join(format!("lib/U{index}.pas")),
+                &format!("P{index}"),
+            );
+        }
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        let limited = root.join("lib/U0.pas");
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!((progress.indexed, progress.limited), (3, 1), "{progress:?}");
+        assert_eq!(progress.pending, 0);
+        assert!(progress.complete);
+        assert_eq!(
+            state(&workspace, &key, &limited),
+            Some(MemberState::Limited)
+        );
+        let again = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!((again.indexed, again.limited, again.pending), (0, 0, 0));
+
+        let input = workspace.analysis_input();
+        let query = CandidateQuery {
+            names: vec!["P1".to_owned()],
+            top_level_units: None,
+            aliases: Vec::new(),
+        };
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["U0.pas", "U1.pas"]);
+
+        workspace.project_cache.invalidate_path(&limited);
+        assert_eq!(state(&workspace, &key, &limited), Some(MemberState::Stale));
+    }
+
+    #[test]
+    fn a_member_error_is_deferred_and_the_batch_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 4, WorkspaceOptions::default());
+        let failing = root.join("lib/U0.pas");
+        set_member_error(Some(failing.clone()));
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        set_member_error(None);
+        assert_eq!(
+            (progress.indexed, progress.deferred),
+            (3, 1),
+            "{progress:?}"
+        );
+        assert_eq!(progress.pending, 1);
+        assert_eq!(
+            state(&workspace, &key, &failing),
+            Some(MemberState::Unindexed)
+        );
     }
 
     #[test]

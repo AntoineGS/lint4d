@@ -25,7 +25,6 @@ impl Clock {
         Instant::now() + self.offset()
     }
 
-    #[allow(dead_code)] // first used by the lease renewal
     pub(crate) fn unix_seconds(&self) -> u64 {
         super::unix_seconds() + self.offset().as_secs()
     }

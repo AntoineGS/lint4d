@@ -281,6 +281,24 @@ impl Store {
                     ],
                 )
                 .map_err(fail)?;
+            super::leases::ensure_row(
+                &transaction,
+                self.scope,
+                &self.lease,
+                self.clock.unix_seconds(),
+            )?;
+            transaction
+                .execute(
+                    "INSERT INTO lease_holds (namespace_id, reset_epoch, lease_id, snapshot_id) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        self.scope.namespace.as_bytes().as_slice(),
+                        epoch(self.scope),
+                        self.lease.id.as_slice(),
+                        id.0.as_slice()
+                    ],
+                )
+                .map_err(fail)?;
             fault_point!(self, BeginBeforeCommit);
             self.before_commit();
             transaction.commit().map_err(fail)?;
@@ -598,6 +616,13 @@ impl Store {
             if changed != 1 {
                 return Err(Bypass::BuilderFenced);
             }
+            transaction
+                .execute(
+                    "DELETE FROM lease_holds WHERE namespace_id = ?1 AND reset_epoch = ?2 \
+                     AND snapshot_id = ?3",
+                    params![namespace, reset_epoch, id],
+                )
+                .map_err(fail)?;
             fault_point!(self, SealBeforeCommit);
             self.before_commit();
             transaction.commit().map_err(fail)?;
@@ -667,6 +692,15 @@ impl Store {
             ),
         }
         .map_err(fail)?;
+        if changed == 1 {
+            transaction
+                .execute(
+                    "DELETE FROM lease_holds WHERE namespace_id = ?1 AND reset_epoch = ?2 \
+                     AND snapshot_id = ?3",
+                    params![namespace, reset_epoch, id.0.as_slice()],
+                )
+                .map_err(fail)?;
+        }
         fault_point!(self, RetireBeforeCommit);
         self.before_commit();
         transaction.commit().map_err(fail)?;

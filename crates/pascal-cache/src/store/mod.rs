@@ -20,6 +20,7 @@ mod facts;
 mod health;
 mod index;
 mod keys;
+mod leases;
 mod limits;
 mod location;
 mod namespaces;
@@ -70,6 +71,9 @@ pub use budget::{
 };
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use health::{Access, MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
+pub use leases::{
+    Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,
+};
 pub use limits::{
     CONNECTION_OVERHEAD_BYTES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES,
     MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
@@ -106,6 +110,8 @@ pub struct Store {
     scratch: std::sync::Arc<reader::ScratchBudget>,
     _lock: NamespaceLock,
     clock: clock::Clock,
+    lease: leases::ProcessLease,
+    hints: leases::Hints,
     health: health::Health,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
@@ -130,10 +136,23 @@ impl Store {
         let deadline = Deadline::after(limits.open_wait);
         let lock = NamespaceLock::share(location.namespace_lock(namespace.id()), deadline)?;
         let pool = Pool::new(location.database(), limits);
+        let clock = clock::Clock::default();
+        let lease = leases::ProcessLease::new(nonce::nonce());
         let scope = {
             let mut writer = pool.acquire(Role::Writer, deadline)?;
             container::prepare_container(&mut writer, deadline)?;
-            namespaces::register(&mut writer, namespace, unix_seconds(), deadline)?
+            let scope = namespaces::register(&mut writer, namespace, unix_seconds(), deadline)?;
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            namespaces::ensure_live(&transaction, scope)?;
+            leases::renew(&transaction, scope, &lease, clock.unix_seconds())?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite::classify(&error))?;
+            scope
         };
         let store = Self {
             location,
@@ -143,7 +162,9 @@ impl Store {
             pool,
             scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
-            clock: clock::Clock::default(),
+            clock,
+            lease,
+            hints: leases::Hints::default(),
             health: health::Health::default(),
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),
@@ -252,6 +273,12 @@ impl Store {
     #[cfg(not(feature = "test-support"))]
     pub(crate) fn take_row_fault(&self) -> Option<usize> {
         None
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        leases::release(self);
     }
 }
 

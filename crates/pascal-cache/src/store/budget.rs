@@ -240,7 +240,12 @@ impl Store {
         estimate: WriteEstimate,
     ) -> Result<(), Bypass> {
         let policy = read_policy(transaction)?.policy;
-        decide(policy, &read_usage(self, transaction)?, estimate)
+        decide(policy, &read_usage(self, transaction)?, estimate)?;
+        let now = self.clock.unix_seconds();
+        if super::leases::due(&self.lease, now) {
+            super::leases::renew(transaction, self.scope, &self.lease, now)?;
+        }
+        Ok(())
     }
 
     /// The store-wide policy and its revision.

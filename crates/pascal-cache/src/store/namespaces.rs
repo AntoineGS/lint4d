@@ -328,7 +328,8 @@ pub(crate) fn reclaim(
         .execute(
             "DELETE FROM namespaces WHERE state = ?1 \
              AND NOT EXISTS (SELECT 1 FROM retired_scopes r WHERE r.namespace_id = namespaces.namespace_id) \
-             AND NOT EXISTS (SELECT 1 FROM key_manifests k WHERE k.namespace_id = namespaces.namespace_id)",
+             AND NOT EXISTS (SELECT 1 FROM key_manifests k WHERE k.namespace_id = namespaces.namespace_id) \
+             AND NOT EXISTS (SELECT 1 FROM process_leases l WHERE l.namespace_id = namespaces.namespace_id)",
             [RETIRED],
         )
         .map_err(fail)?;

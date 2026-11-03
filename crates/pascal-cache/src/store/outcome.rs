@@ -31,6 +31,8 @@ pub enum Bypass {
     OverBudget,
     /// The cache directory's filesystem is low on free space.
     LowDiskSpace,
+    /// A lease holds MAX_LEASE_HOLDS sealed snapshots already.
+    TooManyHolds,
     Corrupt,
     OutOfMemory,
     ScratchExhausted,

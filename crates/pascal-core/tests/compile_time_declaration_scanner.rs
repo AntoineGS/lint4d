@@ -413,6 +413,24 @@ fn assembler_statement_inside_a_routine_body() {
     );
 }
 
+/// l4d-4nbs R11: TypInfo.SortPropList's assembler labels `@@repeat` and
+/// `@@endRepeat` are labels, not `repeat`; likewise `&`-escaped identifiers
+/// such as `&begin` are not keywords.
+#[test]
+fn assembler_labels_and_escaped_identifiers_are_not_keywords() {
+    assert_scans_completely(
+        "procedure Sort; assembler; \
+         asm \
+         @@repeat: DEC EAX \
+         JNZ @@repeat \
+         @@case: JMP @@begin \
+         @@begin: \
+         end; \
+         procedure Escaped; var &begin: Integer; begin &begin := 1; end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
 /// Test-only harness (l4d-4nbs R11): analyse the real units listed in
 /// `L4D_SCAN_FILES` (separated by `;`) and report every incomplete reason.
 /// Includes are served from the unit's directory and `L4D_SCAN_INCLUDES`.

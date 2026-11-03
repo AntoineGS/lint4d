@@ -95,6 +95,10 @@ pub struct CompileTimeState {
     word_backing: usize,
     lex: Lex,
     discarding_trivia_comment: bool,
+    /// The current word follows `@` or `&`: an assembler label (`@@repeat`),
+    /// an address (`@Proc`) or an escaped identifier (`&begin`), never a
+    /// keyword.
+    escaped_word: bool,
     section: Section,
     composite_depth: usize,
     rhs: bool,
@@ -238,6 +242,7 @@ impl CompileTimeState {
             word_backing: 0,
             lex: Lex::Normal,
             discarding_trivia_comment: false,
+            escaped_word: false,
             section: Section::None,
             composite_depth: 0,
             rhs: false,
@@ -529,6 +534,7 @@ impl CompileTimeState {
             return Ok(());
         }
         self.flush_word(budget)?;
+        self.escaped_word = matches!(ch, '@' | '&');
         if ch == ';'
             && let Some(header) = &mut self.anonymous_header
             && self.parens <= header.parens
@@ -699,7 +705,11 @@ impl CompileTimeState {
         budget.charge(1, self.word.len(), 0)?;
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
-        let result = self.process_word(&word, budget);
+        let result = if std::mem::take(&mut self.escaped_word) {
+            Ok(())
+        } else {
+            self.process_word(&word, budget)
+        };
         drop(word);
         budget.release(std::mem::replace(&mut self.word_backing, 0));
         result
@@ -1512,6 +1522,7 @@ impl CompileTimeState {
         self.pending.hash(&mut h);
         self.word.hash(&mut h);
         self.lex.hash(&mut h);
+        self.escaped_word.hash(&mut h);
         self.section.hash(&mut h);
         self.composite_depth.hash(&mut h);
         self.parens.hash(&mut h);

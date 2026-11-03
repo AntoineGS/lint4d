@@ -148,7 +148,7 @@ fn report_bytes(report: &pascal_core::ResolutionReport) -> usize {
         .saturating_add(std::mem::size_of_val(report.incomplete_reasons.as_slice()))
 }
 
-fn expansion_bytes(expansion: &ExpansionResult) -> usize {
+pub(crate) fn expansion_bytes(expansion: &ExpansionResult) -> usize {
     let mut total = std::mem::size_of::<ExpansionResult>();
     let _ = expansion.expanded.visit_recovery_payload(&mut |bytes| {
         total = total.saturating_add(bytes);

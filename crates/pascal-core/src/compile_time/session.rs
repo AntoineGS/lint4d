@@ -491,7 +491,108 @@ pub struct CompileTimeOutput {
 
 pub type CompileTimeAnalysis = AdmittedOwned<CompileTimeOutput>;
 
+impl CompileTimeOutput {
+    /// Heap bytes this output keeps besides its declaration state: the
+    /// projections, occurrence sources, include topology and reports. With
+    /// the declarations released this is what a cached expansion retains
+    /// (l4d-4nbs D44); the budget ledger also counts storage other owners
+    /// (a shared provider graph store) keep alive.
+    pub fn projection_bytes(&self) -> usize {
+        fn analysis(analysis: &ConditionalAnalysis) -> usize {
+            analysis.projected_source.len()
+                + size_of_val(analysis.inactive_spans.as_slice())
+                + size_of_val(analysis.unknown_spans.as_slice())
+                + size_of_val(analysis.directives.as_slice())
+                + analysis
+                    .directives
+                    .iter()
+                    .map(|d| d.body.len())
+                    .sum::<usize>()
+        }
+        fn source(source: &LoadedSource) -> usize {
+            crate::resolver::loaded_source_metadata_retained(source)
+                + source.bytes.len()
+                + source.decoded_text.as_ref().map_or(0, |t| t.len())
+        }
+        fn anchors(anchors: &[SourceAnchor]) -> usize {
+            size_of_val(anchors)
+                + anchors
+                    .iter()
+                    .map(|a| a.source.as_str().len())
+                    .sum::<usize>()
+        }
+        let occurrences = self
+            .occurrences
+            .iter()
+            .map(|o| size_of::<OccurrenceAnalysis>() + source(&o.source) + analysis(&o.analysis))
+            .sum::<usize>();
+        let includes = self
+            .includes
+            .iter()
+            .map(|i| {
+                size_of::<IncludeOccurrence>()
+                    + i.directive.source.as_str().len()
+                    + anchors(&i.fragments)
+                    + match &i.target {
+                        Resolution::Found(found) => source(found),
+                        _ => 0,
+                    }
+            })
+            .sum::<usize>();
+        let fragments = self
+            .directive_fragments
+            .iter()
+            .map(|f| {
+                size_of::<DirectiveFragments>()
+                    + f.directive.body.len()
+                    + anchors(&f.fragments)
+                    + anchors(&f.body_fragments)
+            })
+            .sum::<usize>();
+        let header = match &self.header {
+            Fact::Known(h) => h.name.len() + anchors(&h.name_parts),
+            _ => 0,
+        };
+        size_of::<Self>()
+            + analysis(&self.root)
+            + occurrences
+            + includes
+            + fragments
+            + header
+            + size_of_val(self.reasons.as_slice())
+            + observations_payload(&self.observations)
+            + self
+                .warnings
+                .iter()
+                .map(|w| size_of::<String>() + w.len())
+                .sum::<usize>()
+    }
+}
+
 impl AdmittedOwned<CompileTimeOutput> {
+    /// Drop the declaration state the session built (the root's
+    /// declarations, environments and the provider interfaces it compiled
+    /// or copied), keeping the conditional projection, occurrences, includes,
+    /// header, observations and reports. A cached expansion needs only those
+    /// (l4d-4nbs D44); `facts` is left an empty state of the root.
+    pub fn release_declarations(
+        &mut self,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        let Some(root) = self.occurrences.first().map(|o| o.source.clone()) else {
+            return Ok(());
+        };
+        let view = self.budget.clone();
+        let mut budget = view.store_budget(self.root_limits, cancel);
+        let empty =
+            CompileTimeState::admitted_new(&ConditionalContext::default(), &root, &mut budget)?
+                .into_shared(&mut budget)
+                .map_err(|r| resolver_error(r, &budget))?;
+        let released = std::mem::replace(&mut self.value_mut().facts, empty);
+        drop(released);
+        Ok(())
+    }
+
     // Resolver integration remains gated on the callback/cache ownership split.
     #[allow(dead_code)]
     pub(crate) fn into_root_projection(

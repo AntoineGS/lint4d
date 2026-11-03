@@ -157,6 +157,8 @@ struct Control<'a> {
 }
 
 #[cfg(test)]
+thread_local! { pub(super) static TEST_KEEP_DECLARATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
 thread_local! { static TEST_BODY_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
 thread_local! { static TEST_HEADER_REVALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) }; }
@@ -985,7 +987,16 @@ pub(super) fn expand_with_limits(
     // and derives its source-specific context before invoking analyze_source.
     #[cfg(test)]
     TEST_BODY_ANALYSES.with(|count| count.set(count.get() + 1));
-    let analysis = control.finish(resolver.analyze_compile_time(&root, &control))?;
+    let mut analysis = control.finish(resolver.analyze_compile_time(&root, &control))?;
+    // The expansion is cached and read for its projection only (l4d-4nbs
+    // D44): drop the declarations and provider graphs the session holds.
+    #[cfg(test)]
+    let release = !TEST_KEEP_DECLARATIONS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let release = true;
+    if release {
+        control.finish(analysis.release_declarations(&control))?;
+    }
     if let Some(b) = budget {
         b.check_cancelled()?;
     }
@@ -1458,6 +1469,36 @@ mod tests {
         assert_eq!(
             first.expanded.reads, second.expanded.reads,
             "the reuse replays what the compilation read"
+        );
+    }
+
+    /// l4d-4nbs D44: a cached expansion keeps a compact projection of its
+    /// session, not the declaration state and provider graphs it compiled, so
+    /// what it retains is a small multiple of the source it covers.
+    #[test]
+    fn a_cached_expansion_retains_a_small_multiple_of_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        let result = expand_main(&workspace, &uri, &source, &key);
+        let session = result.expanded.session.as_ref().unwrap();
+        let mut declarations = 0usize;
+        session
+            .facts
+            .visit_recovery_payload(&mut |bytes| {
+                declarations += bytes;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            declarations < 8 * 1024,
+            "the session keeps {declarations} bytes of declarations and provider graphs"
+        );
+        let retained = crate::project_cache::expansion_bytes(&result);
+        let provider = std::fs::metadata(temp.path().join("A.pas")).unwrap().len() as usize;
+        assert!(
+            retained < 16 * source.len() + 16 * 1024,
+            "{retained} bytes for a {} byte root (its provider is {provider} bytes)",
+            source.len()
         );
     }
 

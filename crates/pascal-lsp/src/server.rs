@@ -12376,7 +12376,7 @@ fn maintain_warmer(
     }
     for uri in cache.take_closure_crawl_requests() {
         if workspace.is_open(&uri) {
-            warmer.request_closure_crawl(uri, cache.invalidation_epoch());
+            warmer.request_closure_crawl(uri, cache);
         }
     }
     for anchor in cache.take_index_requests() {

@@ -275,6 +275,30 @@ fn every_open_store_holds_a_lease_until_it_closes() {
 }
 
 #[test]
+fn a_zero_wait_store_reclaims_and_releases_its_lease_uncontended() {
+    let root = private_tempdir();
+    let store = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([7; 32])),
+        StoreLimits {
+            wait: std::time::Duration::ZERO,
+            ..StoreLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(count(root.path(), "SELECT count(*) FROM process_leases"), 1);
+    assert_eq!(
+        store.reclaim(16),
+        Ok(Reclaimed {
+            rows: 0,
+            complete: true
+        })
+    );
+    drop(store);
+    assert_eq!(count(root.path(), "SELECT count(*) FROM process_leases"), 0);
+}
+
+#[test]
 fn a_lease_is_renewed_at_most_once_a_minute_inside_writes() {
     let root = private_tempdir();
     let store = open(root.path());

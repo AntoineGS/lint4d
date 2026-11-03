@@ -159,6 +159,17 @@ pub(crate) fn test_set_small_workspace_sources(cap: Option<usize>) {
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    static TARGET_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes `index_targets` fail, for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_set_target_error(fail: bool) {
+    TARGET_ERROR.with(|slot| slot.set(fail));
+}
+
 fn max_unverified_candidates() -> usize {
     #[cfg(test)]
     if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified) {
@@ -941,6 +952,10 @@ impl Workspace {
         purpose: TargetPurpose,
         cancel: &AtomicBool,
     ) -> Result<Targets, String> {
+        #[cfg(test)]
+        if TARGET_ERROR.with(std::cell::Cell::get) {
+            return Err("an injected target error".to_owned());
+        }
         let maximum = max_target_contexts();
         let mut targets = Targets::default();
         let push = |targets: &mut Targets, key: ContextKey, anchor: IndexAnchor| {
@@ -1009,34 +1024,13 @@ impl Workspace {
         }
         targets.from_open_or_configured = targets.contexts.len();
 
-        let scopes = self
-            .roots
-            .iter()
-            .map(|root| CatalogueScope::recursive(&root.path, Some(&root.excludes)))
-            .collect::<Vec<_>>();
-        let mut before_io = || check_workspace_cancel(Some(cancel));
-        let mut complete = true;
-        let mut sources = Vec::<(String, PathBuf)>::new();
-        let mut descriptors = Vec::<(String, PathBuf)>::new();
-        for scope in &scopes {
-            let catalogue = self.shared_catalogue(scope, MAX_CATALOGUE_ENTRIES, &mut before_io)?;
-            complete &= catalogue.is_complete() && catalogue.limit().is_none();
-            sources.extend(catalogue.pascal_files().map(keyed));
-            descriptors.extend(
-                catalogue
-                    .files()
-                    .iter()
-                    .filter(|path| is_descriptor(path))
-                    .map(|path| keyed(path)),
-            );
-        }
-        for list in [&mut sources, &mut descriptors] {
-            list.sort_by(|left, right| left.0.cmp(&right.0));
-            list.dedup_by(|left, right| left.0 == right.0);
-        }
-        targets.small_workspace = complete
-            && sources.len() <= small_workspace_sources()
-            && descriptors.len() <= small_workspace_projects();
+        let files = self.root_files(cancel)?;
+        targets.small_workspace = files.small();
+        let RootFiles {
+            sources,
+            descriptors,
+            ..
+        } = files;
 
         if purpose == TargetPurpose::WorkspaceSymbols {
             let roots = self.workspace_root_paths();
@@ -1137,6 +1131,44 @@ impl Workspace {
             ));
         }
         Ok(targets)
+    }
+
+    /// The Pascal sources and project descriptors the root catalogues list.
+    fn root_files(&mut self, cancel: &AtomicBool) -> Result<RootFiles, String> {
+        let scopes = self
+            .roots
+            .iter()
+            .map(|root| CatalogueScope::recursive(&root.path, Some(&root.excludes)))
+            .collect::<Vec<_>>();
+        let mut before_io = || check_workspace_cancel(Some(cancel));
+        let mut files = RootFiles {
+            complete: true,
+            ..RootFiles::default()
+        };
+        for scope in &scopes {
+            let catalogue = self.shared_catalogue(scope, MAX_CATALOGUE_ENTRIES, &mut before_io)?;
+            files.complete &= catalogue.is_complete() && catalogue.limit().is_none();
+            files.sources.extend(catalogue.pascal_files().map(keyed));
+            files.descriptors.extend(
+                catalogue
+                    .files()
+                    .iter()
+                    .filter(|path| is_descriptor(path))
+                    .map(|path| keyed(path)),
+            );
+        }
+        for list in [&mut files.sources, &mut files.descriptors] {
+            list.sort_by(|left, right| left.0.cmp(&right.0));
+            list.dedup_by(|left, right| left.0 == right.0);
+        }
+        Ok(files)
+    }
+
+    /// Whether the workspace is small enough to walk (A16): its complete
+    /// root catalogues hold at most `SMALL_WORKSPACE_SOURCES` sources and
+    /// `SMALL_WORKSPACE_PROJECTS` descriptors.
+    pub(crate) fn is_small_workspace(&mut self, cancel: &AtomicBool) -> Result<bool, String> {
+        Ok(self.root_files(cancel)?.small())
     }
 
     /// The target an owner context stands for. A context with a project
@@ -1617,6 +1649,22 @@ impl Workspace {
             .iter()
             .map(|root| root.path.join(project))
             .find(|candidate| candidate.is_file())
+    }
+}
+
+/// What the root catalogues list, keyed by `path_key` and deduplicated.
+#[derive(Default)]
+struct RootFiles {
+    complete: bool,
+    sources: Vec<(String, PathBuf)>,
+    descriptors: Vec<(String, PathBuf)>,
+}
+
+impl RootFiles {
+    fn small(&self) -> bool {
+        self.complete
+            && self.sources.len() <= small_workspace_sources()
+            && self.descriptors.len() <= small_workspace_projects()
     }
 }
 

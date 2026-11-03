@@ -1134,7 +1134,8 @@ pub(crate) fn highlights_from_input(
 /// References over index candidates (l4d-33 §6.1). Phase 1 resolves the
 /// binding in the bounded snapshot hover uses and decides the candidate
 /// rule (A3); phase 2 binds only the candidates the target indexes chose.
-/// When the index cannot answer, the request walks the workspace as before.
+/// When the index cannot answer, a small workspace (A16) is walked as
+/// before; a larger one is answered from phase 1 with a gap (U4).
 fn indexed_reference_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
@@ -1143,17 +1144,19 @@ fn indexed_reference_snapshot(
     classification: BindingClassification,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
-    let phase_one =
-        match binding_snapshot(input, uri, position, true, classification.clone(), cancel)
-            .and_then(|snapshot| snapshot.reference_targets(uri, position, cancel))
-        {
-            Ok(targets) => Some(targets),
-            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-            Err(error) => {
-                crate::trace::trace!("  references: phase 1 failed, member rule: {error}");
-                None
-            }
-        };
+    let local = binding_snapshot(input, uri, position, true, classification.clone(), cancel);
+    let phase_one = match local
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|snapshot| snapshot.reference_targets(uri, position, cancel))
+    {
+        Ok(targets) => Some(targets),
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(error) => {
+            crate::trace::trace!("  references: phase 1 failed, member rule: {error}");
+            None
+        }
+    };
     let scope = match indexed_reference_scope(
         input,
         uri,
@@ -1163,16 +1166,36 @@ fn indexed_reference_snapshot(
         phase_one.as_ref(),
         cancel,
     ) {
-        Ok(Some(sources)) => SnapshotScope::Indexed(sources),
-        Ok(None) => SnapshotScope::Walk,
+        Ok(Some(sources)) => Some(SnapshotScope::Indexed(sources)),
+        Ok(None) => None,
         Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
         Err(error) => {
-            crate::trace::trace!("  references: the index cannot answer, walking: {error}");
-            SnapshotScope::Walk
+            crate::trace::trace!("  references: the index cannot answer: {error}");
+            None
+        }
+    };
+    let small = || match Workspace::from_analysis_input(input).is_small_workspace(cancel) {
+        Ok(small) => Ok(small),
+        Err(error) if error == CANCELLATION_MESSAGE => Err(error),
+        Err(_) => Ok(false),
+    };
+    let scope = match scope {
+        Some(scope) => scope,
+        None if small()? => SnapshotScope::Walk,
+        None => {
+            let mut snapshot = local?;
+            snapshot.index_gaps.push(INDEX_UNAVAILABLE_GAP.to_owned());
+            return Ok(snapshot);
         }
     };
     binding_snapshot_scoped(input, uri, position, false, classification, scope, cancel)
 }
+
+const SYMBOLS_INDEX_UNAVAILABLE_GAP: &str =
+    "the workspace index is unavailable; no workspace symbols were searched";
+
+const INDEX_UNAVAILABLE_GAP: &str =
+    "the workspace index is unavailable; only the current context's imports were searched";
 
 /// The candidate sources of the target contexts (A8), or `None` when no
 /// target context resolves.
@@ -2601,8 +2624,28 @@ pub(crate) fn workspace_symbols_from_input(
                 return cancelled(source_generation, configuration_generation);
             }
             Err(error) => {
-                crate::trace::trace!("  workspace symbols: no index targets, walking: {error}");
-                return walked_workspace_symbols(input, query, cancel);
+                crate::trace::trace!("  workspace symbols: no index targets: {error}");
+                // U4: only a small workspace (A16) is walked without the index.
+                return match workspace.is_small_workspace(cancel) {
+                    Ok(true) => walked_workspace_symbols(input, query, cancel),
+                    Ok(false) => {
+                        let mut coverage = Coverage::default();
+                        coverage.note(None, SYMBOLS_INDEX_UNAVAILABLE_GAP);
+                        super::rename::Computed {
+                            source_generation,
+                            configuration_generation,
+                            value: Ok(Partial {
+                                value: Vec::new(),
+                                coverage,
+                            }),
+                            records: Vec::new(),
+                        }
+                    }
+                    Err(error) if error == CANCELLATION_MESSAGE => {
+                        cancelled(source_generation, configuration_generation)
+                    }
+                    Err(error) => failed(source_generation, configuration_generation, error),
+                };
             }
         };
     // A16: a small workspace with nothing open or configured keeps the walk.
@@ -4426,6 +4469,112 @@ mod tests {
             found.coverage
         );
         assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+    }
+
+    /// Index targets fail and the small-workspace source cap is `small`
+    /// until dropped.
+    struct TargetFailure;
+
+    impl TargetFailure {
+        fn new(small: Option<usize>) -> Self {
+            crate::workspace::indexing::test_set_target_error(true);
+            crate::workspace::indexing::test_set_small_workspace_sources(small);
+            Self
+        }
+    }
+
+    impl Drop for TargetFailure {
+        fn drop(&mut self) {
+            crate::workspace::indexing::test_set_target_error(false);
+            crate::workspace::indexing::test_set_small_workspace_sources(None);
+        }
+    }
+
+    const INDEX_UNAVAILABLE: &str =
+        "the workspace index is unavailable; only the current context's imports were searched";
+
+    #[test]
+    fn references_without_the_index_on_a_large_workspace_search_only_the_imports() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.consumer),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("partial references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == INDEX_UNAVAILABLE),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn references_without_the_index_on_a_small_workspace_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(None);
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("walked references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_without_the_index_on_a_large_workspace_do_not_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(found.value.is_empty(), "{:?}", found.value);
+        assert!(
+            found.coverage.gaps.iter().any(|gap| gap.reason
+                == "the workspace index is unavailable; no workspace symbols were searched"),
+            "{:?}",
+            found.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_without_the_index_on_a_small_workspace_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(None);
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(!found.value.is_empty());
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
     }
 
     #[test]

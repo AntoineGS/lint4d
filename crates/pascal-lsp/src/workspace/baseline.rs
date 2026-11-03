@@ -373,7 +373,6 @@ impl Workspace {
 
     /// Seal when due (§6.3 amendment); `check` runs between store batches
     /// (gate, cancellation) and an `Err` retires the build.
-    #[cfg_attr(not(test), allow(dead_code))] // the warmer (l4d-zf1b.8)
     pub(crate) fn seal_baseline_if_due(
         &self,
         key: &ContextKey,

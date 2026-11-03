@@ -320,13 +320,6 @@ impl WorkspaceInput {
     /// overrides, so everything analysed from it reads saved files only
     /// (spec §4.4, D37). Roots, options, selections, owners, caches and
     /// generations are kept.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
-        )
-    )]
     pub(crate) fn disk_baseline(&self) -> WorkspaceInput {
         // An open buffer equal to its saved file is no private input of a
         // context (controller ruling, l4d-zf1b.8); member roots stay

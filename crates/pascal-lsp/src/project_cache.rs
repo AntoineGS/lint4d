@@ -34,6 +34,13 @@ pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09
 const CATALOGUE_BUDGET_SHARE: usize = 8;
 /// The workspace index may hold a quarter of `maxCacheBytes` (l4d-33).
 const INDEX_BUDGET_SHARE: usize = 4;
+/// Open-file crawl pins may hold half of `maxCacheBytes` (l4d-axsn), so the
+/// index share, interactive parses and persistence transients keep the
+/// other half.
+const PIN_BUDGET_SHARE: usize = 2;
+/// The room an index batch needs to dispatch: one small member's charge.
+/// It publishes no parses (A13), so it needs no room for crawl entries.
+const INDEX_BATCH_DISPATCH_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
 const MAX_OWNERS: usize = 4_096;
@@ -2356,6 +2363,54 @@ mod cache_tests {
     }
 
     #[test]
+    fn capped_pins_stay_within_half_the_budget_unpinning_the_oldest_owner_first() {
+        let cache = ProjectCache::new(40);
+        let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        for name in ["A.pas", "B.pas", "C.pas", "D.pas", "E.pas"] {
+            fill(&cache, name, &ctx, 1, 8);
+        }
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (uri(name), fingerprint))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            cache
+                .pin_capped(&uri("Old.pas"), keys(&["A.pas", "B.pas"]), &[])
+                .is_empty()
+        );
+        assert_eq!(cache.stats().pinned_bytes, 16);
+
+        // 16 more would pass the cap of 20: the oldest owner goes first.
+        let unpinned = cache.pin_capped(
+            &uri("New.pas"),
+            keys(&["C.pas", "D.pas"]),
+            &[uri("Old.pas"), uri("New.pas")],
+        );
+        assert_eq!(unpinned, vec![uri("Old.pas")]);
+        assert_eq!(cache.stats().pinned_bytes, 16);
+
+        // A closure over the cap on its own keeps what fits, in order.
+        let unpinned = cache.pin_capped(
+            &uri("Big.pas"),
+            keys(&["A.pas", "B.pas", "C.pas", "E.pas"]),
+            &[uri("New.pas"), uri("Big.pas")],
+        );
+        assert_eq!(unpinned, vec![uri("New.pas")]);
+        assert_eq!(cache.stats().pinned_bytes, 16);
+        assert!(cache.stats().pinned_bytes <= cache.max_bytes() / 2);
+        assert!(cache.has_room());
+        fill(&cache, "F.pas", &ctx, 1, 24);
+        assert!(ready(&cache, "A.pas") && ready(&cache, "B.pas"), "pinned");
+        assert!(
+            !ready(&cache, "C.pas"),
+            "unpinned with New.pas, then evicted"
+        );
+    }
+
+    #[test]
     fn pinned_entries_over_budget_report_no_room() {
         let cache = ProjectCache::new(5);
         let ctx = context("A.dproj");
@@ -3279,6 +3334,8 @@ pub(crate) struct CacheStats {
     pub units: usize,
     pub imports: usize,
     pub bytes: usize,
+    /// Bytes of ready entries some owner pins.
+    pub pinned_bytes: usize,
     /// Bytes of removed values that workers still hold.
     pub outstanding_bytes: usize,
     /// Pinned bytes alone exceed the budget; reserved and outstanding bytes are reported separately.
@@ -4376,6 +4433,31 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
 
 const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
 
+/// Whether some owner pins `(uri, fingerprint)`.
+fn pin_counted(state: &State, (uri, fingerprint): &(Url, u64)) -> bool {
+    state
+        .pin_counts
+        .get(uri)
+        .is_some_and(|fingerprints| fingerprints.contains_key(fingerprint))
+}
+
+/// The bytes of the ready entries a pin of `(uri, fingerprint)` covers.
+fn pin_key_bytes(state: &State, (uri, fingerprint): &(Url, u64)) -> usize {
+    LAYERS
+        .iter()
+        .filter_map(|&layer| {
+            match state.slots.get(&Key {
+                layer,
+                uri: uri.clone(),
+                fingerprint: *fingerprint,
+            }) {
+                Some(Slot::Ready(entry)) => Some(entry.bytes),
+                _ => None,
+            }
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
 fn is_pinned(state: &State, key: &Key) -> bool {
     state
         .pin_counts
@@ -4864,6 +4946,77 @@ impl ProjectCache {
         }
     }
 
+    /// `pin` within half of `maxCacheBytes` (l4d-axsn): while `keys` do not
+    /// fit, the owners in `oldest_first` (least recently opened first;
+    /// `owner` is skipped) are unpinned whole, then `owner`'s keys are pinned
+    /// in order, each only if it still fits. Returns the owners unpinned.
+    pub(crate) fn pin_capped(
+        &self,
+        owner: &Url,
+        keys: Vec<(Url, u64)>,
+        oldest_first: &[Url],
+    ) -> Vec<Url> {
+        let mut state = lock(&self.inner);
+        let cap = state.max_bytes / PIN_BUDGET_SHARE;
+        if let Some(previous) = state.pins.remove(owner) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
+        let mut seen = HashSet::new();
+        let keys = keys
+            .into_iter()
+            .filter(|key| seen.insert(key.clone()))
+            .collect::<Vec<_>>();
+        let added = |state: &State, key: &(Url, u64)| {
+            if pin_counted(state, key) {
+                0
+            } else {
+                pin_key_bytes(state, key)
+            }
+        };
+        let mut unpinned = Vec::new();
+        for other in oldest_first.iter().filter(|other| *other != owner) {
+            let wanted = keys.iter().fold(0usize, |total, key| {
+                total.saturating_add(added(&state, key))
+            });
+            if state.pinned_bytes.saturating_add(wanted) <= cap {
+                break;
+            }
+            if let Some(previous) = state.pins.remove(other) {
+                for key in &previous {
+                    remove_pin(&mut state, key);
+                }
+                unpinned.push(other.clone());
+            }
+        }
+        let mut kept = HashSet::new();
+        for key in keys {
+            if state.pinned_bytes.saturating_add(added(&state, &key)) > cap {
+                continue;
+            }
+            add_pin(&mut state, &key);
+            kept.insert(key);
+        }
+        if !kept.is_empty() {
+            state.pins.insert(owner.clone(), kept);
+        }
+        evict_to_budget(&mut state);
+        self.release(state);
+        unpinned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_owners_for_test(&self) -> Vec<Url> {
+        let mut owners = lock(&self.inner).pins.keys().cloned().collect::<Vec<_>>();
+        owners.sort();
+        owners
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        lock(&self.inner).max_bytes
+    }
+
     pub(crate) fn unpin(&self, owner: &Url) {
         let mut state = lock(&self.inner);
         if let Some(previous) = state.pins.remove(owner) {
@@ -5038,6 +5191,16 @@ impl ProjectCache {
         self.inner.changed.notify_all();
     }
 
+    /// Whether an index batch may dispatch: its first member's charge fits
+    /// next to pinned, outstanding and reserved bytes, evicting unpinned
+    /// entries (l4d-axsn). Unlike `has_room`, which gates the crawl, it
+    /// asks for no room for parses (A13).
+    pub(crate) fn index_batch_fits(&self) -> bool {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        fits(&state, state.pinned_bytes, INDEX_BATCH_DISPATCH_BYTES)
+    }
+
     pub(crate) fn has_room(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
@@ -5066,6 +5229,7 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
+            pinned_bytes: state.pinned_bytes,
             outstanding_bytes: state.outstanding_bytes,
             pinned_over_budget: state.pinned_bytes > state.max_bytes,
             reserved_facts_bytes: state.reserved[ReservationKind::Facts.index()],

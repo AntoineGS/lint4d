@@ -7,13 +7,16 @@ use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Message, Request, RequestId, Response};
 use lsp_types::{ProgressToken, Url};
 
+use crate::persistent_cache::CacheState;
 use crate::project_cache::IndexAnchor;
 use crate::workspace::Workspace;
-use crate::workspace::indexing::{IndexBound, IndexProgress};
+use crate::workspace::baseline::SealOutcome;
+use crate::workspace::indexing::{IndexBound, IndexMode, IndexProgress};
 use crate::workspace::rename::WorkspaceInput;
 
-/// Pending members one warmer index batch publishes before it yields.
-const INDEX_BATCH_UNITS: usize = 64;
+/// Pending members one warmer extraction batch publishes before it yields.
+#[cfg(test)]
+const INDEX_BATCH_UNITS: usize = crate::workspace::indexing::EXTRACTION_BATCH_UNITS;
 /// Index anchors the warmer holds; further requests are dropped.
 const MAX_INDEX_ANCHORS: usize = 16;
 
@@ -28,10 +31,21 @@ pub(crate) struct InteractiveGate {
     /// use no CPU meanwhile, so the dispatcher lends their slots to client
     /// requests.
     paused: std::sync::atomic::AtomicUsize,
-    /// Test seam: after this many passing `try_wait_idle` checks, mark the
-    /// gate busy so a pause lands at an exact unit boundary.
+    /// Running Bulk client requests; index batches wait for them (D33).
+    running_bulk: std::sync::atomic::AtomicUsize,
+    /// Test seam: after this many passing `try_wait_idle` or
+    /// `index_may_run` checks, mark the gate busy so a pause lands at an
+    /// exact unit boundary.
     #[cfg(test)]
     busy_after_checks: Mutex<Option<usize>>,
+    /// Test seam: as `busy_after_checks`, but a client request queues.
+    #[cfg(test)]
+    waiting_after_checks: Mutex<Option<usize>>,
+    /// Test seam: the next seal after a complete batch finds the gate busy.
+    #[cfg(test)]
+    busy_before_seal: AtomicBool,
+    #[cfg(test)]
+    index_turn_waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl InteractiveGate {
@@ -64,6 +78,87 @@ impl InteractiveGate {
         self.waiting_clients.store(waiting, Ordering::Relaxed);
         if waiting == 0 {
             self.idle.notify_all();
+        }
+    }
+
+    /// Records how many Bulk client requests run. Index batches wait for
+    /// them, the crawl does not.
+    pub(crate) fn set_running_bulk(&self, running: usize) {
+        self.running_bulk.store(running, Ordering::Relaxed);
+        if running == 0 {
+            // Under the lock, so a waiter between its check and its wait
+            // cannot miss the notification.
+            let _busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            self.idle.notify_all();
+        }
+    }
+
+    fn index_may_run_with(&self, busy: usize) -> bool {
+        self.background_may_run(busy) && self.running_bulk.load(Ordering::Relaxed) == 0
+    }
+
+    /// Whether an index batch may take its next step: no interactive request
+    /// runs or is queued, no client request waits for a worker and no Bulk
+    /// request runs (D33).
+    pub(crate) fn index_may_run(&self, cancel: &AtomicBool) -> bool {
+        self.tick_test_seams();
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let busy = *self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        self.index_may_run_with(busy) && !cancel.load(Ordering::Relaxed)
+    }
+
+    /// Waits, without a time limit, until `index_may_run` would pass: true
+    /// then, false if cancelled.
+    pub(crate) fn wait_index_turn(&self, cancel: &AtomicBool) -> bool {
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        self.index_turn_waiters.fetch_add(1, Ordering::Relaxed);
+        while !self.index_may_run_with(*busy) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            busy = self
+                .idle
+                .wait_timeout(busy, Duration::from_millis(25))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        #[cfg(test)]
+        self.index_turn_waiters.fetch_sub(1, Ordering::Relaxed);
+        !cancel.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_turn_waiters(&self) -> usize {
+        self.index_turn_waiters.load(Ordering::Relaxed)
+    }
+
+    /// Counts one passing check against the test seams.
+    fn tick_test_seams(&self) {
+        #[cfg(test)]
+        {
+            let tick = |slot: &Mutex<Option<usize>>| {
+                let mut remaining = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                match remaining.as_mut() {
+                    Some(0) => {
+                        *remaining = None;
+                        true
+                    }
+                    Some(checks) => {
+                        *checks -= 1;
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if tick(&self.busy_after_checks) {
+                self.set(1);
+            }
+            if tick(&self.waiting_after_checks) {
+                self.set_waiting_clients(1);
+            }
         }
     }
 
@@ -117,22 +212,7 @@ impl InteractiveGate {
 
     /// Checks whether warming may proceed without waiting while it owns a cache claim.
     pub(crate) fn try_wait_idle(&self, cancel: &AtomicBool) -> bool {
-        #[cfg(test)]
-        {
-            let mut remaining = self
-                .busy_after_checks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match remaining.as_mut() {
-                Some(0) => {
-                    *remaining = None;
-                    drop(remaining);
-                    self.set(1);
-                }
-                Some(checks) => *checks -= 1,
-                None => {}
-            }
-        }
+        self.tick_test_seams();
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
@@ -250,11 +330,13 @@ pub(crate) enum WarmEvent {
         generation: u64,
         open_epoch: u64,
     },
-    /// One workspace-index batch finished.
+    /// One workspace-index batch finished (its mode is `progress.mode`).
     IndexProgress {
         anchor: IndexAnchor,
         /// Boxed: it carries the context key.
         progress: Box<IndexProgress>,
+        /// What sealing the baseline after a complete batch gave.
+        seal: Option<SealOutcome>,
         generation: u64,
     },
     /// A workspace-index batch ended without a result: `paused` when
@@ -262,6 +344,7 @@ pub(crate) enum WarmEvent {
     /// are kept), otherwise it failed.
     IndexStopped {
         anchor: IndexAnchor,
+        mode: IndexMode,
         paused: bool,
         generation: u64,
     },
@@ -515,21 +598,51 @@ enum WarmJobKind {
         uri: Url,
         open_epoch: u64,
     },
-    /// The flag is set while an open-file crawl is queued.
-    Index(IndexAnchor, Arc<AtomicBool>),
+    /// The flag is set while an open-file crawl is queued; a `Full` batch
+    /// yields to it, a `Reuse` one runs before it by design (D33).
+    Index(IndexAnchor, Arc<AtomicBool>, IndexMode),
 }
 
 struct WarmJob {
     kind: WarmJobKind,
+    /// The session's input; `job_input` derives what the job analyses.
     input: WorkspaceInput,
+    /// The store was enabled at dispatch.
+    persisting: bool,
     cancel: Arc<AtomicBool>,
     generation: u64,
+}
+
+impl WarmJob {
+    /// What the job analyses: an index batch reads the disk-only baseline
+    /// view while the store is enabled (D31), so it may publish. Built on
+    /// the warmer thread: comparing open buffers with their files reads
+    /// them.
+    fn job_input(&self) -> std::borrow::Cow<'_, WorkspaceInput> {
+        match self.kind {
+            WarmJobKind::Index(..) if self.persisting => {
+                std::borrow::Cow::Owned(self.input.disk_baseline())
+            }
+            WarmJobKind::Index(..) | WarmJobKind::Crawl { .. } => {
+                std::borrow::Cow::Borrowed(&self.input)
+            }
+        }
+    }
 }
 
 pub(crate) struct Warmer {
     queue: WarmQueue,
     /// Workspace-index anchors, project anchors first, deduplicated.
     index_queue: VecDeque<IndexAnchor>,
+    /// Anchors whose reuse pass (D33) is due, project anchors first; only
+    /// filled while the store is enabled.
+    reuse_queue: VecDeque<IndexAnchor>,
+    /// Anchors whose reuse pass ended; extraction batches take them on.
+    reuse_done: HashSet<IndexAnchor>,
+    /// The index batch in flight.
+    index_in_flight: Option<(IndexAnchor, IndexMode)>,
+    /// The configured project's absolute path, as of the last poll.
+    configured_project: Option<std::path::PathBuf>,
     /// Set while a crawl is queued; a running index batch yields to it.
     crawl_pending: Arc<AtomicBool>,
     open_order: VecDeque<Url>,
@@ -564,6 +677,10 @@ impl Warmer {
         Self {
             queue: WarmQueue::default(),
             index_queue: VecDeque::new(),
+            reuse_queue: VecDeque::new(),
+            reuse_done: HashSet::new(),
+            index_in_flight: None,
+            configured_project: None,
             crawl_pending: Arc::new(AtomicBool::new(false)),
             open_order: VecDeque::new(),
             jobs: Some(jobs),
@@ -666,6 +783,9 @@ impl Warmer {
     }
 
     pub(crate) fn close(&mut self, uri: &Url, cache: &crate::project_cache::ProjectCache) {
+        let anchor = IndexAnchor::Document(uri.clone());
+        self.reuse_queue.retain(|queued| *queued != anchor);
+        self.reuse_done.remove(&anchor);
         self.queue.remove(uri);
         self.dispatched_epochs.remove(uri);
         self.crawled_epochs.remove(uri);
@@ -688,6 +808,8 @@ impl Warmer {
         self.generation = self.generation.wrapping_add(1);
         self.queue.clear();
         self.index_queue.clear();
+        self.reuse_queue.clear();
+        self.reuse_done.clear();
         self.dispatched_epochs.clear();
         self.crawled_epochs.clear();
         let open = open.into_iter().collect::<HashSet<_>>();
@@ -700,10 +822,61 @@ impl Warmer {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        !self.busy && self.queue.is_empty() && self.index_queue.is_empty()
+        !self.busy
+            && self.queue.is_empty()
+            && self.index_queue.is_empty()
+            && self.reuse_queue.is_empty()
     }
 
-    pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
+    /// The receiver the main loop waits on with the client's lanes, so an
+    /// event is handled as soon as it is ready (l4d-axsn).
+    pub(crate) fn events(&self) -> &Receiver<WarmEvent> {
+        &self.events
+    }
+
+    /// Whether `uri` is open as far as the warmer knows.
+    pub(crate) fn is_open(&self, uri: &Url) -> bool {
+        self.open_epochs.contains_key(uri)
+    }
+
+    /// Pins a finished crawl's closure within half of `maxCacheBytes`,
+    /// unpinning the least recently opened files' closures first
+    /// (l4d-axsn). Returns the owners unpinned.
+    pub(crate) fn pin_crawl(
+        &self,
+        cache: &crate::project_cache::ProjectCache,
+        uri: &Url,
+        pins: Vec<(Url, u64)>,
+    ) -> Vec<Url> {
+        let oldest_first = self.open_order.iter().rev().cloned().collect::<Vec<_>>();
+        let unpinned = cache.pin_capped(uri, pins, &oldest_first);
+        for owner in &unpinned {
+            crate::trace::trace!("warm pins of {owner} released for {uri} (pin cap)");
+        }
+        unpinned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_events_for_test(&mut self, events: Receiver<WarmEvent>) {
+        self.events = events;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_epoch_for_test(&self, uri: &Url) -> u64 {
+        self.open_epochs[uri]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_index_request_for_test(&self, anchor: &IndexAnchor) -> bool {
+        self.index_queue.contains(anchor)
+    }
+
+    /// Takes and accepts the finished jobs' events without dispatching; the
+    /// main loop calls it while the workspace is with a mutation worker.
+    pub(crate) fn drain_events(
+        &mut self,
+        cache: &crate::project_cache::ProjectCache,
+    ) -> Vec<WarmEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.events.try_recv() {
             match &event {
@@ -711,23 +884,107 @@ impl Warmer {
                 WarmEvent::End { uri, pins, .. } => crate::trace::trace!(
                     "warm end {uri}: {} pins, cache epoch {}",
                     pins.len(),
-                    workspace.project_cache().invalidation_epoch()
+                    cache.invalidation_epoch()
                 ),
                 other => crate::trace::trace!("warm event {other:?}"),
             }
-            if self.accept_event(&event, workspace.project_cache()) {
+            if self.accept_event(&event, cache) {
                 if let WarmEvent::End { uri, .. } = &event {
                     self.request_index(IndexAnchor::Document(uri.clone()));
-                    if let Some(project) = workspace
-                        .configured_project_file()
-                        .filter(|project| project.is_absolute())
-                    {
-                        self.request_index(IndexAnchor::Project(project.to_path_buf()));
+                    if let Some(project) = self.configured_project.clone() {
+                        self.request_index(IndexAnchor::Project(project));
                     }
                 }
                 events.push(event);
             }
         }
+        events
+    }
+
+    /// The configured project's anchor, then each open file's, that has not
+    /// had its reuse pass, join `reuse_queue` (D33).
+    fn queue_reuse_passes(&mut self) {
+        let anchors = self
+            .configured_project
+            .clone()
+            .map(IndexAnchor::Project)
+            .into_iter()
+            .chain(self.open_order.iter().cloned().map(IndexAnchor::Document))
+            .collect::<Vec<_>>();
+        for anchor in anchors {
+            let in_flight = self
+                .index_in_flight
+                .as_ref()
+                .is_some_and(|(running, mode)| *mode == IndexMode::Reuse && *running == anchor);
+            if in_flight || self.reuse_done.contains(&anchor) || self.reuse_queue.contains(&anchor)
+            {
+                continue;
+            }
+            match anchor {
+                IndexAnchor::Project(_) => {
+                    let at = self
+                        .reuse_queue
+                        .iter()
+                        .take_while(|queued| matches!(queued, IndexAnchor::Project(_)))
+                        .count();
+                    self.reuse_queue.insert(at, anchor);
+                }
+                IndexAnchor::Document(_) => self.reuse_queue.push_back(anchor),
+            }
+        }
+        self.reuse_queue.truncate(MAX_INDEX_ANCHORS);
+    }
+
+    fn dispatch_index(
+        &mut self,
+        workspace: &Workspace,
+        anchor: IndexAnchor,
+        mode: IndexMode,
+        persisting: bool,
+    ) {
+        let kind = WarmJobKind::Index(anchor.clone(), self.crawl_pending.clone(), mode);
+        let job = WarmJob {
+            kind,
+            input: workspace.analysis_input(),
+            persisting,
+            cancel: self.cancel.clone(),
+            generation: self.generation,
+        };
+        if self
+            .jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok())
+        {
+            crate::trace::trace!("warm index dispatch {anchor:?} ({mode:?})");
+            self.busy = true;
+            self.index_in_flight = Some((anchor, mode));
+        }
+    }
+
+    pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
+        self.configured_project = workspace
+            .configured_project_file()
+            .filter(|project| project.is_absolute())
+            .map(std::path::Path::to_path_buf);
+        let events = self.drain_events(workspace.project_cache());
+        let persisting = workspace.persistent_cache().state() == CacheState::Enabled;
+        if persisting {
+            self.queue_reuse_passes();
+        } else {
+            self.reuse_queue.clear();
+        }
+        // Index batches publish no parses (A13): they need room for their
+        // own charges, not `has_room`, which pins can fill (l4d-axsn).
+        let index_fits = || workspace.project_cache().index_batch_fits();
+        // 1. A reuse pass, even while a crawl is queued (D33).
+        if !self.busy
+            && !self.reuse_queue.is_empty()
+            && index_fits()
+            && let Some(anchor) = self.reuse_queue.pop_front()
+        {
+            self.dispatch_index(workspace, anchor, IndexMode::Reuse, persisting);
+        }
+        // 2. The crawl.
         if !self.busy && workspace.project_cache().has_room() {
             while let Some(uri) = self.queue.pop() {
                 let Some(open_epoch) = self.open_epochs.get(&uri).copied() else {
@@ -738,9 +995,11 @@ impl Warmer {
                     busy_uri.clone(),
                     workspace.project_cache().invalidation_epoch(),
                 );
+                let kind = WarmJobKind::Crawl { uri, open_epoch };
                 let job = WarmJob {
-                    kind: WarmJobKind::Crawl { uri, open_epoch },
+                    kind,
                     input: workspace.analysis_input(),
+                    persisting,
                     cancel: self.cancel.clone(),
                     generation: self.generation,
                 };
@@ -762,27 +1021,28 @@ impl Warmer {
         if self.queue.is_empty() {
             self.crawl_pending.store(false, Ordering::Relaxed);
         }
+        // 3. Extraction, once no crawl is queued.
         if !self.busy
             && self.queue.is_empty()
-            && workspace.project_cache().has_room()
+            && index_fits()
             && let Some(anchor) = self.index_queue.pop_front()
         {
-            let job = WarmJob {
-                kind: WarmJobKind::Index(anchor.clone(), self.crawl_pending.clone()),
-                input: workspace.analysis_input(),
-                cancel: self.cancel.clone(),
-                generation: self.generation,
-            };
-            if self
-                .jobs
-                .as_ref()
-                .is_some_and(|jobs| jobs.send(job).is_ok())
-            {
-                crate::trace::trace!("warm index dispatch {anchor:?}");
-                self.busy = true;
-            }
+            self.dispatch_index(workspace, anchor, IndexMode::Full, persisting);
         }
         events
+    }
+
+    /// Where a batch of `mode` for `anchor` goes back to: the front of
+    /// `reuse_queue` until its pass is done, else the index queue.
+    fn requeue_index(&mut self, anchor: &IndexAnchor, mode: IndexMode) {
+        match mode {
+            IndexMode::Reuse => {
+                self.reuse_queue.retain(|queued| queued != anchor);
+                self.reuse_queue.push_front(anchor.clone());
+                self.reuse_queue.truncate(MAX_INDEX_ANCHORS);
+            }
+            IndexMode::Full => self.request_index(anchor.clone()),
+        }
     }
 
     fn accept_event(
@@ -831,9 +1091,11 @@ impl Warmer {
             WarmEvent::IndexProgress {
                 anchor,
                 progress,
+                seal,
                 generation,
             } => {
                 self.busy = false;
+                self.index_in_flight = None;
                 if *generation != self.generation {
                     return false;
                 }
@@ -841,21 +1103,36 @@ impl Warmer {
                 // (deferred or open-only members), or hit the memory limit,
                 // cannot gain from a retry.
                 if progress.worth_requeue() {
+                    self.requeue_index(anchor, progress.mode);
+                } else if progress.mode == IndexMode::Reuse {
+                    // The pass is done: extraction follows the crawl.
+                    self.reuse_done.insert(anchor.clone());
+                    if !progress.complete {
+                        self.request_index(anchor.clone());
+                    }
+                }
+                // A seal stopped by interactive work is tried again.
+                if *seal == Some(SealOutcome::Interrupted) {
                     self.request_index(anchor.clone());
                 }
                 true
             }
             WarmEvent::IndexStopped {
                 anchor,
+                mode,
                 paused,
                 generation,
             } => {
                 self.busy = false;
+                self.index_in_flight = None;
                 if *generation != self.generation {
                     return false;
                 }
                 if *paused {
-                    self.request_index(anchor.clone());
+                    self.requeue_index(anchor, *mode);
+                } else if *mode == IndexMode::Reuse {
+                    // A failed pass is not retried, as a failed Full batch.
+                    self.reuse_done.insert(anchor.clone());
                 }
                 true
             }
@@ -889,8 +1166,10 @@ impl Warmer {
         drop(self.jobs.take());
         self.queue.clear();
         self.index_queue.clear();
+        self.reuse_queue.clear();
         self.busy = false;
         self.busy_attempt = None;
+        self.index_in_flight = None;
 
         let Some(thread) = self.thread.take() else {
             return true;
@@ -929,6 +1208,7 @@ impl Drop for Warmer {
 fn run_index_job(
     anchor: IndexAnchor,
     crawl_pending: &AtomicBool,
+    mode: IndexMode,
     job: &WarmJob,
     gate: &InteractiveGate,
     events: &Sender<WarmEvent>,
@@ -936,32 +1216,37 @@ fn run_index_job(
     let stopped = |paused| {
         let _ = events.send(WarmEvent::IndexStopped {
             anchor: anchor.clone(),
+            mode,
             paused,
             generation: job.generation,
         });
     };
-    if !gate.wait_idle(&job.cancel) {
+    if !gate.wait_index_turn(&job.cancel) {
         return stopped(!job.cancel.load(Ordering::Relaxed));
     }
-    let _span = crate::trace::Span::new(|| format!("warm index {anchor:?}"));
+    let _span = crate::trace::Span::new(|| format!("warm index {anchor:?} ({mode:?})"));
     let started = Instant::now();
-    let mut workspace = Workspace::from_analysis_input(&job.input);
-    let result = workspace.advance_workspace_index(
-        &anchor,
-        IndexBound::units(INDEX_BATCH_UNITS),
-        &mut || {
-            if !crawl_pending.load(Ordering::Relaxed) && gate.try_wait_idle(&job.cancel) {
-                Ok(())
-            } else {
-                Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
-            }
-        },
-        &job.cancel,
-    );
+    let mut workspace = Workspace::from_analysis_input(&job.job_input());
+    // A reuse pass runs before the crawl by design (D33); extraction yields
+    // to a queued crawl.
+    let mut before_io = || {
+        if (mode == IndexMode::Reuse || !crawl_pending.load(Ordering::Relaxed))
+            && gate.index_may_run(&job.cancel)
+        {
+            Ok(())
+        } else {
+            Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
+        }
+    };
+    let bound = match mode {
+        IndexMode::Reuse => IndexBound::reuse_pass(),
+        IndexMode::Full => IndexBound::extraction(),
+    };
+    let result = workspace.advance_workspace_index(&anchor, bound, &mut before_io, &job.cancel);
     match result {
         Ok(progress) => {
             crate::trace::trace!(
-                "index batch {anchor:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
+                "index batch {anchor:?} mode={mode:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} reused={} reuse_pending={} persisted={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
                 progress.indexed,
                 progress.refreshed,
                 progress.refused,
@@ -969,20 +1254,37 @@ fn run_index_job(
                 progress.deferred,
                 progress.skipped_open,
                 progress.pending,
+                progress.reused,
+                progress.reuse_pending,
+                progress.persisted,
                 progress.complete,
                 progress.memory,
                 started.elapsed().as_secs_f64() * 1000.0,
                 workspace.project_cache().stats().reserved_index_bytes,
             );
+            let seal = progress
+                .key
+                .as_ref()
+                .filter(|_| progress.complete && workspace.persistent_cache().is_enabled())
+                .map(|key| {
+                    #[cfg(test)]
+                    if gate.busy_before_seal.swap(false, Ordering::Relaxed) {
+                        gate.set(1);
+                    }
+                    let outcome = workspace.seal_baseline_if_due(key, &mut before_io);
+                    crate::trace::trace!("index seal {anchor:?}: {outcome:?}");
+                    outcome
+                });
             let _ = events.send(WarmEvent::IndexProgress {
                 anchor,
                 progress: Box::new(progress),
+                seal,
                 generation: job.generation,
             });
         }
         Err(message) if message == crate::workspace::rename::CANCELLATION_MESSAGE => {
             crate::trace::trace!(
-                "index batch {anchor:?} stopped paused={} elapsed_ms={:.1} reserved_index_bytes={}",
+                "index batch {anchor:?} mode={mode:?} stopped paused={} elapsed_ms={:.1} reserved_index_bytes={}",
                 !job.cancel.load(Ordering::Relaxed),
                 started.elapsed().as_secs_f64() * 1000.0,
                 workspace.project_cache().stats().reserved_index_bytes,
@@ -991,7 +1293,7 @@ fn run_index_job(
         }
         Err(message) => {
             crate::trace::trace!(
-                "index batch {anchor:?} stopped error={message} elapsed_ms={:.1} reserved_index_bytes={}",
+                "index batch {anchor:?} mode={mode:?} stopped error={message} elapsed_ms={:.1} reserved_index_bytes={}",
                 started.elapsed().as_secs_f64() * 1000.0,
                 workspace.project_cache().stats().reserved_index_bytes,
             );
@@ -1003,8 +1305,8 @@ fn run_index_job(
 fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>) {
     let (uri, open_epoch) = match &job.kind {
         WarmJobKind::Crawl { uri, open_epoch } => (uri.clone(), *open_epoch),
-        WarmJobKind::Index(anchor, pending) => {
-            return run_index_job(anchor.clone(), pending, &job, &gate, events);
+        WarmJobKind::Index(anchor, pending, mode) => {
+            return run_index_job(anchor.clone(), pending, *mode, &job, &gate, events);
         }
     };
     let end = |fingerprint, pins| {
@@ -1023,7 +1325,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
         job.cancel.clone(),
     ));
     let _span = crate::trace::Span::new(|| format!("warm crawl {}", uri));
-    let mut workspace = Workspace::from_analysis_input(&job.input);
+    let mut workspace = Workspace::from_analysis_input(&job.job_input());
     let hook_events = events.clone();
     let hook_uri = uri.clone();
     let hook_generation = job.generation;
@@ -2385,5 +2687,461 @@ mod tests {
             .position(|event| matches!(event, WarmEvent::IndexProgress { .. }))
             .unwrap();
         assert!(end < resumed, "{events:?}");
+    }
+
+    fn index_mode(event: &WarmEvent) -> Option<IndexMode> {
+        match event {
+            WarmEvent::IndexProgress { progress, .. } => Some(progress.mode),
+            WarmEvent::IndexStopped { mode, .. } => Some(*mode),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn index_batches_wait_for_running_bulk_requests() {
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set_running_bulk(1);
+        assert!(!gate.index_may_run(&AtomicBool::new(false)));
+        assert!(
+            gate.try_wait_idle(&AtomicBool::new(false)),
+            "the crawl gate is unchanged"
+        );
+        gate.set_running_bulk(0);
+        assert!(gate.index_may_run(&AtomicBool::new(false)));
+        gate.set_waiting_clients(1);
+        assert!(!gate.index_may_run(&AtomicBool::new(false)));
+        gate.set_waiting_clients(0);
+        assert!(!gate.index_may_run(&AtomicBool::new(true)), "cancelled");
+    }
+
+    #[test]
+    fn an_index_turn_waits_without_a_time_limit_until_bulk_work_ends() {
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set_running_bulk(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(gate.wait_index_turn(&AtomicBool::new(false)))
+                    .unwrap();
+            })
+        };
+        // Wait until the waiter is parked on the condvar, then check it has
+        // not returned (a returned turn would be in the channel already).
+        while gate.index_turn_waiters() == 0 {
+            std::thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err(), "the turn waits for bulk work");
+        gate.set_running_bulk(0);
+        assert!(done_rx.recv().unwrap());
+        waiter.join().unwrap();
+        let cancelled = AtomicBool::new(true);
+        gate.set_running_bulk(1);
+        assert!(!gate.wait_index_turn(&cancelled));
+    }
+
+    #[test]
+    fn an_index_batch_stops_between_members_when_a_client_request_queues() {
+        let (_temp, workspace, anchor) = index_fixture(6, Default::default());
+        let (_other_temp, mut reference, reference_anchor) = index_fixture(6, Default::default());
+        let total = reference
+            .advance_workspace_index(
+                &reference_anchor,
+                IndexBound::all(),
+                &mut || Ok(()),
+                &AtomicBool::new(false),
+            )
+            .expect("reference batch")
+            .indexed;
+        assert!(total > 2, "{total}");
+
+        let gate = Arc::new(InteractiveGate::default());
+        // Two members pass their check; a client request then queues.
+        *gate.waiting_after_checks.lock().unwrap() = Some(2);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.request_index(anchor.clone());
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(is_index_event)
+        });
+        assert!(
+            matches!(
+                events.last(),
+                Some(WarmEvent::IndexStopped {
+                    paused: true,
+                    mode: IndexMode::Full,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        assert_eq!(gate.waiting_clients_for_tests(), 1);
+        assert!(!gate.index_may_run(&AtomicBool::new(false)));
+        assert!(
+            warmer.busy,
+            "the paused anchor was queued again and dispatched, waiting for its turn"
+        );
+
+        gate.set_waiting_clients(0);
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(is_index_event)
+        });
+        let Some(WarmEvent::IndexProgress { progress, .. }) = events.last() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(progress.indexed, total - 2, "the published members stayed");
+        assert!(progress.complete);
+    }
+
+    #[test]
+    fn a_disabled_cache_schedules_exactly_as_before() {
+        let (_temp, workspace, main) = fixture();
+        assert!(!workspace.persistent_cache().is_enabled());
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        warmer.request_index(IndexAnchor::Document(main.clone()));
+
+        warmer.poll(&workspace);
+        assert!(warmer.busy_attempt.is_some(), "the crawl goes first");
+        assert!(
+            warmer.reuse_queue.is_empty(),
+            "no reuse pass without a store"
+        );
+        assert_eq!(warmer.index_queue.len(), 1, "the index job waits");
+
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(is_index_event)
+        });
+        let end = events
+            .iter()
+            .position(|event| matches!(event, WarmEvent::End { .. }))
+            .expect("the crawl ended");
+        let index = events.iter().position(is_index_event).unwrap();
+        assert!(end < index, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .filter_map(index_mode)
+                .all(|mode| mode == IndexMode::Full),
+            "{events:?}"
+        );
+        assert!(warmer.reuse_queue.is_empty() && warmer.reuse_done.is_empty());
+    }
+
+    #[test]
+    fn a_full_of_pins_cache_still_dispatches_an_index_batch() {
+        let (_temp, workspace, main, _base) = closure_fixture();
+        let cache = workspace.project_cache();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        let events = run_until_end(&mut warmer, &workspace);
+        let Some(WarmEvent::End { pins, .. }) = events
+            .iter()
+            .find(|event| matches!(event, WarmEvent::End { .. }))
+        else {
+            panic!("{events:?}");
+        };
+        // The open file's closure alone fills `maxCacheBytes` (multidev:
+        // 2 GiB of pins, no index batch for 1,500 s).
+        cache.set_max_bytes(cache.stats().bytes);
+        cache.pin(&main, pins.clone());
+        assert!(!cache.has_room(), "uncapped pins fill the budget");
+
+        warmer.pin_crawl(cache, &main, pins.clone());
+        let stats = cache.stats();
+        assert!(
+            stats.pinned_bytes <= stats_max(cache) / 2,
+            "crawl pins are capped at half the budget: {stats:?}"
+        );
+        assert!(stats.pinned_bytes > 0, "the closure keeps what fits");
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(is_index_event)
+        });
+        assert!(
+            events.iter().any(is_index_event),
+            "an index batch was dispatched: {events:?}"
+        );
+    }
+
+    fn stats_max(cache: &crate::project_cache::ProjectCache) -> usize {
+        cache.max_bytes()
+    }
+
+    #[test]
+    fn crawl_pins_unpin_the_least_recently_opened_closure_first() {
+        let (temp, mut workspace, main, base) = closure_fixture();
+        let other_text = "unit Other;\ninterface\nuses Base;\nimplementation\nend.\n".to_string();
+        std::fs::write(temp.path().join("Other.pas"), &other_text).unwrap();
+        let other = Url::from_file_path(temp.path().join("Other.pas")).unwrap();
+        workspace
+            .open_document(other.clone(), other_text, 1)
+            .unwrap();
+        let cache = workspace.project_cache();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        let main_pins = match run_until_end(&mut warmer, &workspace).last() {
+            Some(WarmEvent::End { pins, .. }) => pins.clone(),
+            other => panic!("{other:?}"),
+        };
+        warmer.open(other.clone());
+        let other_pins = match run_until_end(&mut warmer, &workspace)
+            .iter()
+            .rev()
+            .find(|event| matches!(event, WarmEvent::End { uri, .. } if *uri == other))
+        {
+            Some(WarmEvent::End { pins, .. }) => pins.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(other_pins.iter().any(|(uri, _)| *uri == base));
+        cache.set_max_bytes(cache.stats().bytes);
+        assert!(warmer.pin_crawl(cache, &main, main_pins).is_empty());
+        let unpinned = warmer.pin_crawl(cache, &other, other_pins);
+        assert_eq!(unpinned, vec![main], "Main was opened first");
+        assert!(cache.stats().pinned_bytes <= cache.max_bytes() / 2);
+    }
+
+    /// Index scheduling with an enabled store (D33). Every test opens one.
+    #[cfg(unix)]
+    mod persisting {
+        use super::*;
+        use crate::persistent_cache::{CacheOptions, CacheState, PersistentCache};
+        use crate::workspace::baseline::SealOutcome;
+
+        fn write(path: &std::path::Path, text: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+
+        /// `App.dproj` searching `lib`, where `Main` uses `Provider`, plus
+        /// `extra` units `U<n>`; `Main` is open, the project configured, and
+        /// the workspace's cache handle has an open store.
+        fn fixture_persisting_with(
+            extra: usize,
+            gate: &Arc<InteractiveGate>,
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            crate::workspace::Workspace,
+            Url,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(
+                &root.join("App.dproj"),
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup><ItemGroup></ItemGroup></Project>",
+            );
+            write(&root.join("App.dpr"), "program App; begin end.\n");
+            let main_text =
+                "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n".to_string();
+            write(&root.join("lib/Main.pas"), &main_text);
+            write(
+                &root.join("lib/Provider.pas"),
+                "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+            );
+            for index in 0..extra {
+                write(
+                    &root.join(format!("lib/U{index}.pas")),
+                    &format!(
+                        "unit U{index};\ninterface\nprocedure P{index};\nimplementation\nprocedure P{index};\nbegin\nend;\nend.\n"
+                    ),
+                );
+            }
+            pascal_project::backdate_tree_for_test(root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let mut workspace = crate::workspace::Workspace::with_override_session(
+                vec![root.to_path_buf()],
+                crate::workspace::WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..Default::default()
+                },
+                pascal_project::delphi_overrides::OverrideSession::new(None),
+            );
+            let cache = PersistentCache::start_unscheduled_for_test(
+                CacheOptions {
+                    enabled: true,
+                    directory: Some(store.path().to_path_buf()),
+                    ..CacheOptions::default()
+                },
+                workspace.project_cache().clone(),
+                gate.clone(),
+                pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([11; 32])),
+            );
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            workspace.set_persistent_cache(cache);
+            let main = Url::from_file_path(root.join("lib/Main.pas")).unwrap();
+            workspace
+                .open_document(main.clone(), main_text, 1)
+                .expect("open main unit");
+            (temp, store, workspace, main)
+        }
+
+        fn fixture_persisting(
+            gate: &Arc<InteractiveGate>,
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            crate::workspace::Workspace,
+            Url,
+        ) {
+            fixture_persisting_with(2, gate)
+        }
+
+        fn is_full_progress(event: &WarmEvent) -> bool {
+            matches!(event, WarmEvent::IndexProgress { progress, .. } if progress.mode == IndexMode::Full)
+        }
+
+        #[test]
+        fn a_reuse_pass_runs_before_the_crawl_and_extraction_after() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main.clone());
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events
+                    .iter()
+                    .position(|event| matches!(event, WarmEvent::End { .. }))
+                    .is_some_and(|end| events[end..].iter().any(is_full_progress))
+            });
+            let reuse = events
+                .iter()
+                .position(is_index_event)
+                .expect("a reuse batch ran");
+            let end = events
+                .iter()
+                .position(|event| matches!(event, WarmEvent::End { .. }))
+                .unwrap();
+            assert!(reuse < end, "the reuse pass precedes the crawl: {events:?}");
+            assert_eq!(index_mode(&events[reuse]), Some(IndexMode::Reuse));
+            assert!(
+                events[..end]
+                    .iter()
+                    .filter_map(index_mode)
+                    .all(|mode| mode == IndexMode::Reuse),
+                "nothing is extracted before the crawl: {events:?}"
+            );
+            let Some(WarmEvent::IndexProgress { progress, .. }) =
+                events[end..].iter().find(|event| is_full_progress(event))
+            else {
+                unreachable!()
+            };
+            assert!(
+                progress.indexed > 0,
+                "extraction follows the crawl: {progress:?}"
+            );
+            assert!(warmer.reuse_done.contains(&IndexAnchor::Document(main)));
+            workspace.persistent_cache().shutdown();
+        }
+
+        #[test]
+        fn a_large_reuse_pass_runs_in_several_batches_before_the_crawl() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting_with(600, &gate);
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &workspace, Duration::from_secs(60));
+            let end = events
+                .iter()
+                .position(|event| matches!(event, WarmEvent::End { .. }))
+                .unwrap();
+            let reuse_batches = events[..end]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WarmEvent::IndexProgress { anchor: IndexAnchor::Project(_), progress, .. }
+                            if progress.mode == IndexMode::Reuse
+                    )
+                })
+                .count();
+            assert!(
+                reuse_batches >= 2,
+                "{reuse_batches} reuse batches: {events:?}"
+            );
+            workspace.persistent_cache().shutdown();
+        }
+
+        fn run_until_end_within(
+            warmer: &mut Warmer,
+            workspace: &crate::workspace::Workspace,
+            limit: Duration,
+        ) -> Vec<WarmEvent> {
+            let deadline = std::time::Instant::now() + limit;
+            let mut events = Vec::new();
+            while std::time::Instant::now() < deadline {
+                events.extend(warmer.poll(workspace));
+                if events
+                    .iter()
+                    .any(|event| matches!(event, WarmEvent::End { .. }))
+                {
+                    return events;
+                }
+                std::thread::yield_now();
+            }
+            panic!("warmer did not finish: {events:?}");
+        }
+
+        fn sealed(event: &WarmEvent, outcome: &SealOutcome) -> bool {
+            matches!(
+                event,
+                WarmEvent::IndexProgress { anchor: IndexAnchor::Project(_), seal: Some(seal), .. }
+                    if seal == outcome
+            )
+        }
+
+        #[test]
+        fn a_complete_batch_seals_and_an_interrupted_seal_requeues() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (temp, _store, workspace, main) = fixture_persisting(&gate);
+            // The first seal finds interactive work queued and stops.
+            gate.busy_before_seal.store(true, Ordering::Relaxed);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Interrupted))
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed)),
+                "{events:?}"
+            );
+            let project = IndexAnchor::Project(temp.path().join("App.dproj"));
+            assert!(
+                warmer.index_queue.contains(&project) || warmer.busy,
+                "the interrupted anchor was requeued"
+            );
+            let key = events
+                .iter()
+                .find_map(|event| match event {
+                    WarmEvent::IndexProgress {
+                        progress,
+                        seal: Some(_),
+                        ..
+                    } => progress.key.clone(),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(workspace.project_cache().baseline_hint(&key).is_none());
+
+            gate.set(0);
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed))
+            });
+            assert!(
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed))
+            );
+            let hint = workspace
+                .project_cache()
+                .baseline_hint(&key)
+                .expect("sealed");
+            assert!(hint.sealed() && hint.held());
+            workspace.persistent_cache().shutdown();
+        }
     }
 }

@@ -251,6 +251,9 @@ fn max_unverified_symbol_candidates() -> usize {
     MAX_UNVERIFIED_SYMBOL_CANDIDATES
 }
 
+/// Pending members one extraction batch takes.
+pub(crate) const EXTRACTION_BATCH_UNITS: usize = 64;
+
 /// What an index batch may do for a member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexMode {
@@ -271,6 +274,7 @@ pub(crate) struct IndexBound {
 
 impl IndexBound {
     /// `Full`, without a time bound.
+    #[cfg(test)]
     pub(crate) fn units(units: usize) -> Self {
         Self {
             units,
@@ -280,7 +284,6 @@ impl IndexBound {
     }
 
     /// The reuse pass: 512 members or 200 ms, never a parse.
-    #[cfg_attr(not(test), allow(dead_code))] // the warmer's reuse pass (l4d-zf1b.8)
     pub(crate) fn reuse_pass() -> Self {
         Self {
             units: 512,
@@ -290,10 +293,9 @@ impl IndexBound {
     }
 
     /// An extraction batch: 64 members or 2 s.
-    #[cfg_attr(not(test), allow(dead_code))] // the warmer's extraction batches (l4d-zf1b.8)
     pub(crate) fn extraction() -> Self {
         Self {
-            units: 64,
+            units: EXTRACTION_BATCH_UNITS,
             time: Some(Duration::from_secs(2)),
             mode: IndexMode::Full,
         }

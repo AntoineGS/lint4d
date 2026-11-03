@@ -20972,6 +20972,134 @@ mod tests {
         assert!(error.contains("unsupported directive"), "{error}");
     }
 
+    /// Like `unsupported_provider_fixture`, but `Provider` takes its
+    /// `{$SCOPEDENUMS ON}` from `Provider.inc`.
+    fn unsupported_provider_include_fixture(body: &str) -> (tempfile::TempDir, Url, Workspace) {
+        let (temp, main, workspace) = unsupported_provider_fixture("", body);
+        let root = temp.path();
+        fs::write(root.join("Provider.inc"), "{$SCOPEDENUMS ON}\n").unwrap();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$I Provider.inc}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
+        )
+        .unwrap();
+        drop(workspace);
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        (temp, main, workspace)
+    }
+
+    #[test]
+    fn hover_tolerates_an_unsupported_directive_in_an_imported_units_include() {
+        let (_temp, main, workspace) = unsupported_provider_include_fixture("Value.Hello;");
+
+        let hover = super::queries::hover_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(6, 9),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover is not blocked")
+        .expect("hover for Hello");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Hello;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn completion_tolerates_an_unsupported_directive_in_an_imported_units_include() {
+        let (_temp, main, workspace) = unsupported_provider_include_fixture("Value.;");
+
+        let completion = super::queries::completion_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(6, 8),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("completion is not blocked");
+
+        assert!(
+            completion.items.iter().any(|item| item.label == "Hello"),
+            "{:?}",
+            completion.items
+        );
+    }
+
+    #[test]
+    fn references_withhold_the_owner_of_an_include_with_an_unsupported_directive() {
+        let (_temp, main, workspace) = unsupported_provider_include_fixture("Value.Hello;");
+
+        let references = super::queries::references_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(4, 23),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("an imported unit's include directive does not reject references");
+
+        assert_eq!(
+            references
+                .value
+                .iter()
+                .map(|location| (&location.uri, location.range.start))
+                .collect::<Vec<_>>(),
+            vec![(&main, lsp_types::Position::new(4, 21))],
+            "only the use in Main is proven"
+        );
+        let provider = main.join("Provider.pas").unwrap();
+        assert!(
+            !references.coverage.is_complete()
+                && references
+                    .coverage
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.uri.as_ref() == Some(&provider)),
+            "{:?}",
+            references.coverage
+        );
+    }
+
+    #[test]
+    fn hover_still_fails_closed_in_the_owner_of_an_include_with_an_unsupported_directive() {
+        let (_temp, main, workspace) = unsupported_provider_include_fixture("Value.Hello;");
+        let provider = main.join("Provider.pas").unwrap();
+
+        let hover = super::queries::hover_from_input(
+            workspace.analysis_input(),
+            &provider,
+            lsp_types::Position::new(4, 4),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        );
+
+        let error = hover
+            .value
+            .expect_err("the owner's own include directive blocks");
+        assert!(error.contains("unsupported directive"), "{error}");
+    }
+
+    #[test]
+    fn rename_still_fails_closed_on_an_unsupported_directive_in_a_dependency_include() {
+        let (_temp, main, workspace) = unsupported_provider_include_fixture("Value.Hello;");
+
+        let rename = super::rename::rename_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(4, 23),
+            "TRenamed",
+            false,
+            &AtomicBool::new(false),
+        );
+
+        rename.value.expect_err("rename must fail closed");
+    }
+
     #[test]
     fn document_owners_share_unchanged_context_state() {
         let temp = tempfile::tempdir().expect("workspace root");

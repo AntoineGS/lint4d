@@ -8234,6 +8234,9 @@ struct IncludeAnalysis {
     relevant: bool,
     reason: Option<String>,
     environment: Option<conditional::ConditionalEnvironment>,
+    /// The include, or one it includes, has a potentially active unsupported
+    /// directive. It belongs to the include owner, like one in the owner.
+    unsupported_directive: Option<PathBuf>,
 }
 
 impl IncludeAnalysis {
@@ -8246,6 +8249,7 @@ impl IncludeAnalysis {
             relevant,
             reason: None,
             environment,
+            unsupported_directive: None,
         }
     }
 
@@ -8255,6 +8259,7 @@ impl IncludeAnalysis {
             relevant,
             reason: Some(reason.into()),
             environment: None,
+            unsupported_directive: None,
         }
     }
 }
@@ -8831,6 +8836,13 @@ impl IncludeAuditor<'_> {
                 .unwrap_or_else(|| format!("include {:?} contains source content", source.path));
             self.record_error(format!("rename cannot prove completeness because {reason}"));
             self.stopped = true;
+        } else if let Some(path) = &analysis.unsupported_directive {
+            self.push_error(format!(
+                "rename cannot prove completeness because include {path:?} of owner {uri} contains an unsupported directive"
+            ));
+            if !self.result.unsupported_directive_owners.contains(uri) {
+                self.result.unsupported_directive_owners.push(uri.clone());
+            }
         }
         Ok(analysis)
     }
@@ -9021,6 +9033,7 @@ impl IncludeAuditor<'_> {
         self.active.insert(active_key.clone());
         let cancel = self.cancel;
         let mut nested_failure = None;
+        let mut unsupported_directive = None;
         let conditional = self
             .session
             .as_ref()
@@ -9067,6 +9080,9 @@ impl IncludeAuditor<'_> {
             }
             if let Some(next) = child.environment {
                 environment = next;
+            }
+            if unsupported_directive.is_none() {
+                unsupported_directive = child.unsupported_directive;
             }
         }
         self.active.remove(&active_key);
@@ -9131,20 +9147,26 @@ impl IncludeAuditor<'_> {
                 format!("include {path:?} has conditional compilation affecting the rename"),
                 relevant,
             )
-        } else if conditional.directives.iter().any(|directive| {
-            directive.potentially_active() && directive.kind == ConditionalDirectiveKind::Other
-        }) {
-            IncludeAnalysis::unsafe_with_reason(
-                format!("include {path:?} contains an unsupported directive"),
-                relevant,
-            )
         } else if self.name_free_assistance && relevant {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} contains source content"),
                 true,
             )
         } else {
-            IncludeAnalysis::safe_with_environment(relevant, Some(environment))
+            let mut analysis = IncludeAnalysis::safe_with_environment(relevant, Some(environment));
+            // Attributed to the include owner by `inspect_top_level`, so it
+            // blocks the owner but not the units that only import it.
+            analysis.unsupported_directive = unsupported_directive.or_else(|| {
+                conditional
+                    .directives
+                    .iter()
+                    .any(|directive| {
+                        directive.potentially_active()
+                            && directive.kind == ConditionalDirectiveKind::Other
+                    })
+                    .then(|| path.clone())
+            });
+            analysis
         };
         self.cache.insert(cache_key, analysis.clone());
         Ok(analysis)

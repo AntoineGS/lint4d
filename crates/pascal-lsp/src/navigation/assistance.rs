@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, MissingUnitUseKind,
     NavigationIndex, Origin, ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind,
@@ -31,6 +32,12 @@ const MAX_HOVER_VALUE_BYTES: usize = 64 * 1024;
 const MAX_HOVER_RESOLUTION_WORK: usize = super::semantic_tokens::MAX_SEMANTIC_RESOLUTION_WORK;
 const MAX_HOVER_RESOLUTION_BYTES: usize = super::semantic_tokens::MAX_SEMANTIC_RESOLUTION_BYTES;
 const MAX_COMPLETION_ITEMS: usize = 256;
+/// Context and candidate collection of one completion. The member list of a
+/// deep class hierarchy (a VCL component) materializes several hundred
+/// candidates, each charged its unit's URI.
+const MAX_COMPLETION_CANDIDATE_BYTES: usize = 1024 * 1024;
+/// Detail, documentation and snippets of the completion items returned.
+const MAX_COMPLETION_RENDER_BYTES: usize = 256 * 1024;
 const MAX_MISSING_UNIT_CANDIDATES: usize = 32;
 const MAX_COMPLETION_SCANNED_SYMBOLS: usize = 100_000;
 const MAX_COMPLETION_CONTEXT_NODES: usize = 100_000;
@@ -111,7 +118,10 @@ impl<'a> CompletionAccumulator<'a> {
     }
 
     fn take_scan_slot(&mut self, cancel: &AtomicBool) -> Result<bool, String> {
-        if self.scanned >= MAX_COMPLETION_SCANNED_SYMBOLS || !self.budget.take_work(1, cancel)? {
+        if self.exhausted
+            || self.scanned >= MAX_COMPLETION_SCANNED_SYMBOLS
+            || !self.budget.take_work(1, cancel)?
+        {
             self.exhausted = true;
             self.is_incomplete = true;
             return Ok(false);
@@ -120,6 +130,16 @@ impl<'a> CompletionAccumulator<'a> {
         #[cfg(test)]
         COMPLETION_SYMBOL_VISITS.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Past its budget the walk keeps the candidates it collected and stops.
+    fn stop_if_exhausted(&mut self, error: String, cancel: &AtomicBool) -> Result<(), String> {
+        if self.budget.exhausted_by(&error, cancel) {
+            self.exhausted = true;
+            self.is_incomplete = true;
+            return Ok(());
+        }
+        Err(error)
     }
 
     fn insert(
@@ -390,7 +410,7 @@ impl NavigationIndex {
         check_cancel(cancel)?;
         let mut budget = AssistanceBudget::new(
             MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
-            MAX_HOVER_VALUE_BYTES,
+            MAX_COMPLETION_CANDIDATE_BYTES,
             "completion",
         );
         let Some(document) = self.documents.get(uri) else {
@@ -486,7 +506,7 @@ impl NavigationIndex {
         } else {
             CompletionCallContext::Conservative
         };
-        let (candidates, mut is_incomplete) = self.completion_candidates(
+        let (candidates, mut is_incomplete) = match self.completion_candidates(
             uri,
             document,
             anchor,
@@ -495,7 +515,19 @@ impl NavigationIndex {
             identifier,
             cancel,
             &mut budget,
-        )?;
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) if budget.exhausted_by(&error, cancel) => {
+                return Ok(CompletionResult {
+                    list: CompletionList {
+                        is_incomplete: true,
+                        items: Vec::new(),
+                    },
+                    seeds: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let range = Range {
             start: text::offset_to_position(&document.source, prefix_start)
                 .ok_or_else(|| "completion prefix start is not a UTF-16 boundary".to_string())?,
@@ -505,79 +537,106 @@ impl NavigationIndex {
         let response_truncated = candidates.len() > MAX_COMPLETION_ITEMS;
         let mut items = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
         let mut seeds = Vec::with_capacity(candidates.len().min(MAX_COMPLETION_ITEMS));
+        let completion_item =
+            |completion_candidate: CompletionCandidate,
+             budget: &mut AssistanceBudget|
+             -> Result<Option<(CompletionItem, CompletionResolutionSeed)>, String> {
+                let candidate = &completion_candidate.candidate;
+                let Some(symbol) = self.symbol(candidate) else {
+                    return Ok(None);
+                };
+                budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
+                let display = if !options.defer_detail {
+                    self.declaration_display(
+                        candidate,
+                        completion_candidate.substitution.as_ref(),
+                        cancel,
+                        budget,
+                    )?
+                } else {
+                    None
+                };
+                let documentation = if options.defer_documentation {
+                    None
+                } else {
+                    let documentation = self
+                        .documents
+                        .get(&candidate.uri)
+                        .and_then(|document| document.documentation.get(candidate.index))
+                        .and_then(Option::as_ref);
+                    render_lsp_documentation(documentation, options.format.clone(), cancel)?
+                };
+                budget
+                    .require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
+                budget.require_bytes(
+                    display.as_ref().map_or(0, |display| display.excerpt.len()),
+                    cancel,
+                )?;
+                let auto_import = completion_candidate.auto_import.clone();
+                let detail =
+                    completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
+                budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
+                let snippet = if matches!(call_context, CompletionCallContext::Callable)
+                    && symbol.kind == SymbolKind::Routine
+                    && !completion_candidate.signature_ambiguous
+                {
+                    routine_call_snippet(
+                        self,
+                        candidate,
+                        symbol,
+                        completion_candidate.substitution.as_ref(),
+                        cancel,
+                        budget,
+                    )?
+                } else {
+                    None
+                };
+                budget.require_bytes(snippet.as_ref().map_or(0, String::len), cancel)?;
+                let insertion_text = snippet.as_deref().unwrap_or(&symbol.name);
+                let item = CompletionItem {
+                    label: symbol.name.clone(),
+                    kind: Some(completion_kind(symbol.kind)),
+                    detail,
+                    documentation,
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                        range,
+                        insertion_text.to_owned(),
+                    ))),
+                    additional_text_edits: auto_import
+                        .as_ref()
+                        .map(|auto_import| auto_import.additional_text_edits.clone()),
+                    insert_text_format: snippet.map(|_| InsertTextFormat::SNIPPET),
+                    ..CompletionItem::default()
+                };
+                let seed = CompletionResolutionSeed {
+                    candidate: candidate.clone(),
+                    substitution: completion_candidate.substitution,
+                    auto_import,
+                };
+                Ok(Some((item, seed)))
+            };
+        // Rendering has its own budget: the candidate walk may have spent
+        // most of the first one on a deep inherited member list.
+        let mut render_budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_COMPLETION_RENDER_BYTES,
+            "completion",
+        );
         for completion_candidate in candidates.into_iter().take(MAX_COMPLETION_ITEMS) {
             check_cancel(cancel)?;
-            let candidate = &completion_candidate.candidate;
-            let Some(symbol) = self.symbol(candidate) else {
-                continue;
-            };
-            budget.require_bytes(symbol.name.len().saturating_mul(2), cancel)?;
-            let display = if !options.defer_detail {
-                self.declaration_display(
-                    candidate,
-                    completion_candidate.substitution.as_ref(),
-                    cancel,
-                    &mut budget,
-                )?
-            } else {
-                None
-            };
-            let documentation = if options.defer_documentation {
-                None
-            } else {
-                let documentation = self
-                    .documents
-                    .get(&candidate.uri)
-                    .and_then(|document| document.documentation.get(candidate.index))
-                    .and_then(Option::as_ref);
-                render_lsp_documentation(documentation, options.format.clone(), cancel)?
-            };
-            budget.require_bytes(documentation.as_ref().map_or(0, documentation_size), cancel)?;
-            budget.require_bytes(
-                display.as_ref().map_or(0, |display| display.excerpt.len()),
-                cancel,
-            )?;
-            let auto_import = completion_candidate.auto_import.clone();
-            let detail =
-                completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
-            budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
-            let snippet = if matches!(call_context, CompletionCallContext::Callable)
-                && symbol.kind == SymbolKind::Routine
-                && !completion_candidate.signature_ambiguous
-            {
-                routine_call_snippet(
-                    self,
-                    candidate,
-                    symbol,
-                    completion_candidate.substitution.as_ref(),
-                    cancel,
-                    &mut budget,
-                )?
-            } else {
-                None
-            };
-            budget.require_bytes(snippet.as_ref().map_or(0, String::len), cancel)?;
-            let insertion_text = snippet.as_deref().unwrap_or(&symbol.name);
-            items.push(CompletionItem {
-                label: symbol.name.clone(),
-                kind: Some(completion_kind(symbol.kind)),
-                detail,
-                documentation,
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
-                    range,
-                    insertion_text.to_owned(),
-                ))),
-                additional_text_edits: auto_import
-                    .as_ref()
-                    .map(|auto_import| auto_import.additional_text_edits.clone()),
-                insert_text_format: snippet.map(|_| InsertTextFormat::SNIPPET),
-                ..CompletionItem::default()
-            });
-            seeds.push(CompletionResolutionSeed {
-                candidate: candidate.clone(),
-                substitution: completion_candidate.substitution,
-                auto_import,
-            });
+            match completion_item(completion_candidate, &mut render_budget) {
+                Ok(Some((item, seed))) => {
+                    items.push(item);
+                    seeds.push(seed);
+                }
+                Ok(None) => {}
+                // Past its byte budget completion returns what it rendered.
+                Err(error) if render_budget.exhausted_by(&error, cancel) => {
+                    is_incomplete = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         if response_truncated {
             is_incomplete = true;
@@ -2199,7 +2258,16 @@ impl NavigationIndex {
         let Some(current_document) = self.documents.get(current_uri) else {
             return Ok((false, false));
         };
-        let lookup = self.member_candidates_for_completion_with_budget(
+        #[cfg(test)]
+        if super::rename::TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(Cell::get) {
+            let error = accumulator
+                .budget
+                .require_bytes(usize::MAX, cancel)
+                .expect_err("an unbounded charge exhausts the budget");
+            accumulator.stop_if_exhausted(error, cancel)?;
+            return Ok((false, false));
+        }
+        let lookup = match self.member_candidates_for_completion_with_budget(
             current_uri,
             current_document,
             offset,
@@ -2211,7 +2279,14 @@ impl NavigationIndex {
             type_uri == current_uri,
             cancel,
             accumulator.budget,
-        )?;
+        ) {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                // The inherited members are unknown: conservative status.
+                accumulator.stop_if_exhausted(error, cancel)?;
+                return Ok((false, false));
+            }
+        };
         let status = (lookup.ancestry_known, !lookup.ambiguous_names.is_empty());
         let mut routine_keys = HashSet::new();
         for candidate in lookup.candidates {
@@ -2355,7 +2430,7 @@ impl NavigationIndex {
             return Ok(());
         } else {
             let mut access_state = super::ResolutionState::new();
-            self.candidate_access_decision_with_budget(
+            match self.candidate_access_decision_with_budget(
                 current_uri,
                 current_document,
                 offset,
@@ -2363,7 +2438,10 @@ impl NavigationIndex {
                 &mut access_state,
                 cancel,
                 accumulator.budget,
-            )?
+            ) {
+                Ok(access) => access,
+                Err(error) => return accumulator.stop_if_exhausted(error, cancel),
+            }
         };
         match access {
             super::AccessDecision::Visible => {}
@@ -3505,7 +3583,7 @@ fn member_expression_for_completion<'a>(
                 .source
                 .get(node.start_byte()..node.end_byte())
                 .is_some_and(|text| text == ".")
-            && let Some(parent) = node.parent()
+            && let Some(parent) = node.tree_parent()
         {
             budget.require_work(parent.named_child_count(), cancel)?;
             let mut receiver = None;
@@ -4315,7 +4393,7 @@ fn type_declaration_type_node<'a>(
         if current.kind() == "declType" {
             return Ok(current.child_by_field_name("type"));
         }
-        let Some(parent) = current.parent() else {
+        let Some(parent) = current.tree_parent() else {
             return Ok(None);
         };
         current = parent;
@@ -6305,7 +6383,7 @@ struct Ancestors<'a> {
 impl<'a> Ancestors<'a> {
     fn new(node: Node<'a>) -> Self {
         Self {
-            current: node.parent(),
+            current: node.tree_parent(),
         }
     }
 }
@@ -6315,7 +6393,7 @@ impl<'a> Iterator for Ancestors<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current?;
-        self.current = current.parent();
+        self.current = current.tree_parent();
         Some(current)
     }
 }
@@ -6388,7 +6466,7 @@ fn is_implicit_result_reference_with_budget(
                 .child_by_field_name("body")
                 .is_some_and(|body| Span::from_node(body).contains(identifier_span)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
 
     Ok(false)

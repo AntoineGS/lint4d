@@ -1451,6 +1451,13 @@ pub struct ResolvedImports {
     pub bindings: Vec<ResolvedImport>,
     pub dependencies: Vec<ResolvedUnit>,
     pub complete: bool,
+    /// The result follows from its inputs and the recorded lookup evidence:
+    /// it is complete, or incomplete only because active imports resolved
+    /// to `Unavailable` or `Ambiguous` outcomes, and nothing else in the
+    /// session (conditional analysis, limits, lookup errors, catalogues,
+    /// diagnostics) was incomplete. Such a result is stable and may be
+    /// reused while its evidence holds.
+    pub settled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3284,17 +3291,21 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut dependencies = Vec::new();
         let mut dependency_ids = HashSet::new();
         let mut complete = true;
+        // Cleared by every incompleteness that is not a settled outcome.
+        let mut settled = true;
         self.check_cancel(cancel)?;
         if (require_byte_preserving_coordinates && text.len() != importer.source.bytes.len())
             || !analysis.complete
         {
             complete = false;
+            settled = false;
             self.mark_incomplete(format!(
                 "conditional analysis is incomplete for {}",
                 importer.source.path.display()
             ));
         } else if !analysis.unknown_spans.is_empty() {
             complete = false;
+            settled = false;
             self.mark_incomplete(format!(
                 "source {} contains unknown conditional activity",
                 importer.source.path.display()
@@ -3322,6 +3333,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     ids.len().saturating_sub(1) >= self.limits.max_dependency_units
                 }) {
                     complete = false;
+                    settled = false;
                     self.mark_incomplete(format!(
                         "dependency unit limit ({}) reached",
                         self.limits.max_dependency_units
@@ -3376,6 +3388,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     });
                     if !dependency_allowed {
                         complete = false;
+                        settled = false;
                         self.mark_incomplete(format!(
                             "dependency unit limit ({}) reached",
                             self.limits.max_dependency_units
@@ -3447,6 +3460,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
                 Resolution::Incomplete { .. } => {
                     complete = false;
+                    settled = false;
                     (
                         ResolutionTarget::Incomplete,
                         qualifiers_for_unresolved(
@@ -3464,6 +3478,8 @@ impl<S: SourceStore> UnitResolver<S> {
             });
         }
         self.check_cancel(cancel)?;
+        // Read before the generic reason below marks the report incomplete.
+        let settled = (complete || settled) && self.report.complete;
         if !complete {
             self.mark_incomplete("import resolution was incomplete".to_string());
         }
@@ -3471,6 +3487,7 @@ impl<S: SourceStore> UnitResolver<S> {
             bindings,
             dependencies,
             complete,
+            settled,
         })
     }
 

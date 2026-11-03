@@ -1,6 +1,7 @@
 use super::Store;
+use super::health::Access;
 use super::limits::MAX_INDEX_PAGE;
-use super::namespaces::{ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use crate::Digest;
@@ -13,7 +14,7 @@ pub const INDEX_QUERY: &str = "SELECT r.artifact_id, r.ordinal FROM artifact_row
      JOIN artifacts a ON a.namespace_id = r.namespace_id AND a.reset_epoch = r.reset_epoch \
          AND a.artifact_id = r.artifact_id \
      WHERE r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.row_kind = ?3 AND r.index_key = ?4 \
-         AND (r.artifact_id, r.ordinal) > (?5, ?6) AND a.lifecycle = 1 \
+         AND (r.artifact_id, r.ordinal) > (?5, ?6) AND a.lifecycle = ?8 \
      ORDER BY r.artifact_id, r.ordinal LIMIT ?7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,55 +45,58 @@ impl Store {
         after: Option<IndexHit>,
         limit: usize,
     ) -> Result<IndexPage, Bypass> {
-        let limit = limit.clamp(1, MAX_INDEX_PAGE);
-        // The page, charged before it is allocated (spec §10).
-        let Some(_scratch) = self
-            .scratch
-            .reserve(((limit + 1) * std::mem::size_of::<IndexHit>()) as u64)
-        else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let fail = |error: rusqlite::Error| classify(&error);
-        let (after_id, after_ordinal) = match after {
-            Some(hit) => (hit.artifact_id.as_bytes().to_vec(), hit.ordinal as i64),
-            None => (Vec::new(), -1),
-        };
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        let mut statement = transaction.prepare_cached(INDEX_QUERY).map_err(fail)?;
-        let rows = statement
-            .query_map(
-                params![
-                    self.scope.namespace.as_bytes().as_slice(),
-                    epoch(self.scope),
-                    i64::from(row_kind),
-                    index_key,
-                    after_id,
-                    after_ordinal,
-                    (limit + 1) as i64
-                ],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .map_err(fail)?;
-        let mut hits = Vec::with_capacity(limit + 1);
-        for row in rows {
-            let (id, ordinal) = row.map_err(fail)?;
-            let artifact_id = <[u8; 32]>::try_from(id.as_slice())
-                .map(Digest::from_bytes)
-                .map_err(|_| Bypass::Corrupt)?;
-            let ordinal = u64::try_from(ordinal).map_err(|_| Bypass::Corrupt)?;
-            hits.push(IndexHit {
-                artifact_id,
-                ordinal,
-            });
-        }
-        let next = if hits.len() > limit {
-            hits.truncate(limit);
-            hits.last().copied()
-        } else {
-            None
-        };
-        Ok(IndexPage { hits, next })
+        self.guarded(Access::Read, || {
+            let limit = limit.clamp(1, MAX_INDEX_PAGE);
+            // The page, charged before it is allocated (spec §10).
+            let Some(_scratch) = self
+                .scratch
+                .reserve(((limit + 1) * std::mem::size_of::<IndexHit>()) as u64)
+            else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let fail = |error: rusqlite::Error| classify(&error);
+            let (after_id, after_ordinal) = match after {
+                Some(hit) => (hit.artifact_id.as_bytes().to_vec(), hit.ordinal as i64),
+                None => (Vec::new(), -1),
+            };
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            let mut statement = transaction.prepare_cached(INDEX_QUERY).map_err(fail)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        self.scope.namespace.as_bytes().as_slice(),
+                        epoch(self.scope),
+                        i64::from(row_kind),
+                        index_key,
+                        after_id,
+                        after_ordinal,
+                        (limit + 1) as i64,
+                        LIVE
+                    ],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(fail)?;
+            let mut hits = Vec::with_capacity(limit + 1);
+            for row in rows {
+                let (id, ordinal) = row.map_err(fail)?;
+                let artifact_id = <[u8; 32]>::try_from(id.as_slice())
+                    .map(Digest::from_bytes)
+                    .map_err(|_| Bypass::Corrupt)?;
+                let ordinal = u64::try_from(ordinal).map_err(|_| Bypass::Corrupt)?;
+                hits.push(IndexHit {
+                    artifact_id,
+                    ordinal,
+                });
+            }
+            let next = if hits.len() > limit {
+                hits.truncate(limit);
+                hits.last().copied()
+            } else {
+                None
+            };
+            Ok(IndexPage { hits, next })
+        })
     }
 }

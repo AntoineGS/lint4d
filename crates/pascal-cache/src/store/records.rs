@@ -4,6 +4,8 @@
 //! the record ID.
 
 use super::Store;
+use super::budget::WriteEstimate;
+use super::health::Access;
 use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS,
     MAX_ROW_BATCH_BYTES,
@@ -11,6 +13,7 @@ use super::limits::{
 use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::reader::ScratchLease;
+use super::sequence::next_publication_seq;
 use super::sqlite::{begin, classify, classify_read};
 use super::stream::{Expected, ManifestReader, RowError, RowSource};
 use crate::evidence::path_key;
@@ -228,6 +231,7 @@ fn insert_record(
     scope: Scope,
     encoded: &EncodedRecord,
     expected: &StoredRecord,
+    sequence: i64,
 ) -> Result<(), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let namespace = scope.namespace.as_bytes().as_slice();
@@ -236,8 +240,8 @@ fn insert_record(
     transaction
         .execute(
             "INSERT INTO member_records (namespace_id, reset_epoch, record_id, lifecycle, header, \
-             source_key, artifact_id, member_evidence, binding_count, content_bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             source_key, artifact_id, member_evidence, binding_count, content_bytes, \
+             publication_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 namespace,
                 reset_epoch,
@@ -248,7 +252,8 @@ fn insert_record(
                 expected.artifact_id,
                 expected.member_evidence,
                 expected.binding_count,
-                expected.content_bytes
+                expected.content_bytes,
+                sequence
             ],
         )
         .map_err(fail)?;
@@ -307,122 +312,153 @@ impl MemberRecordHeader {
 impl Store {
     /// Publish `record` and its bindings in one transaction, only if every
     /// artifact and evidence set it references is live in this scope (spec
-    /// §6.3 amendment, item 1). An identical record converges; a different
-    /// record under the same ID is an integrity failure.
+    /// §6.3 amendment, item 1). An identical record converges, but it is
+    /// still a write: it commits with a new `publication_seq` and passes
+    /// write admission (`OverBudget`, `WalPressure`, `LowDiskSpace`). A
+    /// different record under the same ID is an integrity failure.
     pub fn publish_member_record(&self, record: &MemberRecord) -> Result<PublishedRecord, Bypass> {
-        record.validate().map_err(Bypass::InvalidRecord)?;
-        if record.bindings.len() > MAX_MEMBER_BINDINGS {
-            return Err(Bypass::TooLarge(TooLarge::Bindings {
-                count: record.bindings.len(),
-            }));
-        }
-        // Charged from input sizes before anything is encoded (spec §10),
-        // then kept at what the encoding takes.
-        let Some(mut scratch) = self.scratch.reserve(record.encoded_bytes_bound() as u64) else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let encoded = encode_record(record)?;
-        scratch.shrink_to(
-            (encoded.header.len() + encoded.source_key.len()) as u64 + encoded.content_bytes,
-        );
-        let expected = expected_row(record, &encoded);
-        let fail = |error: rusqlite::Error| classify(&error);
-        let mut writer = self.writer()?;
-        let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
-        ensure_live(&transaction, self.scope)?;
-        if let Some(artifact) = record.header.artifact {
-            require_artifact(&transaction, self.scope, artifact)?;
-        }
-        if let Some(evidence) = record.header.member_evidence {
-            require_evidence(
+        self.guarded(Access::Write, || {
+            record.validate().map_err(Bypass::InvalidRecord)?;
+            if record.bindings.len() > MAX_MEMBER_BINDINGS {
+                return Err(Bypass::TooLarge(TooLarge::Bindings {
+                    count: record.bindings.len(),
+                }));
+            }
+            // Charged from input sizes before anything is encoded (spec §10),
+            // then kept at what the encoding takes.
+            let Some(mut scratch) = self.scratch.reserve(record.encoded_bytes_bound() as u64)
+            else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let encoded = encode_record(record)?;
+            scratch.shrink_to(
+                (encoded.header.len() + encoded.source_key.len()) as u64 + encoded.content_bytes,
+            );
+            let expected = expected_row(record, &encoded);
+            let fail = |error: rusqlite::Error| classify(&error);
+            let mut writer = self.writer()?;
+            let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            ensure_live(&transaction, self.scope)?;
+            self.admit_write(
                 &transaction,
-                self.scope,
-                evidence,
-                EvidencePurpose::Artifact,
-                record.header.artifact,
+                WriteEstimate {
+                    bytes: (encoded.header.len() + encoded.source_key.len()) as u64
+                        + encoded.content_bytes,
+                    rows: (encoded.bindings.len() as u64).saturating_add(1),
+                },
             )?;
-        }
-        let mut checked = BTreeSet::new();
-        for evidence in record
-            .bindings
-            .iter()
-            .filter_map(|binding| binding.evidence)
-        {
-            if checked.insert(evidence) {
+            if let Some(artifact) = record.header.artifact {
+                require_artifact(&transaction, self.scope, artifact)?;
+            }
+            if let Some(evidence) = record.header.member_evidence {
                 require_evidence(
                     &transaction,
                     self.scope,
                     evidence,
-                    EvidencePurpose::Binding,
-                    None,
+                    EvidencePurpose::Artifact,
+                    record.header.artifact,
                 )?;
             }
-        }
-        let published = match read_record_row(&transaction, self.scope, encoded.id).map_err(fail)? {
-            Some(stored) if stored.lifecycle != LIVE => return Err(Bypass::Retiring),
-            // Only the record row is compared: the ID is the digest of the
-            // header and every binding, so the same ID means the same
-            // bindings, and stored rows that disagree fail every read.
-            Some(stored) if stored == expected => Published::AlreadyPresent,
-            Some(_) => return Err(Bypass::Integrity(Integrity::ConflictingRecord)),
-            None => {
-                insert_record(&transaction, self.scope, &encoded, &expected)?;
-                Published::Inserted
+            let mut checked = BTreeSet::new();
+            for evidence in record
+                .bindings
+                .iter()
+                .filter_map(|binding| binding.evidence)
+            {
+                if checked.insert(evidence) {
+                    require_evidence(
+                        &transaction,
+                        self.scope,
+                        evidence,
+                        EvidencePurpose::Binding,
+                        None,
+                    )?;
+                }
             }
-        };
-        fault_point!(self, RecordBeforeCommit);
-        self.before_commit();
-        transaction.commit().map_err(fail)?;
-        Ok(PublishedRecord {
-            record_id: encoded.id,
-            published,
+            let sequence = next_publication_seq(&transaction)?;
+            let published =
+                match read_record_row(&transaction, self.scope, encoded.id).map_err(fail)? {
+                    Some(stored) if stored.lifecycle != LIVE => return Err(Bypass::Retiring),
+                    // Only the record row is compared: the ID is the digest of the
+                    // header and every binding, so the same ID means the same
+                    // bindings, and stored rows that disagree fail every read.
+                    Some(stored) if stored == expected => {
+                        transaction
+                            .execute(
+                                "UPDATE member_records SET publication_seq = ?4 \
+                         WHERE namespace_id = ?1 AND reset_epoch = ?2 AND record_id = ?3",
+                                params![
+                                    self.scope.namespace.as_bytes().as_slice(),
+                                    epoch(self.scope),
+                                    encoded.id.as_bytes().as_slice(),
+                                    sequence
+                                ],
+                            )
+                            .map_err(fail)?;
+                        Published::AlreadyPresent
+                    }
+                    Some(_) => return Err(Bypass::Integrity(Integrity::ConflictingRecord)),
+                    None => {
+                        insert_record(&transaction, self.scope, &encoded, &expected, sequence)?;
+                        Published::Inserted
+                    }
+                };
+            fault_point!(self, RecordBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(fail)?;
+            Ok(PublishedRecord {
+                record_id: encoded.id,
+                published,
+            })
         })
     }
 
     /// Admit the live record `id`: its stored header decodes and agrees with
     /// its index columns. Its content is unverified until read.
     pub fn open_member_record(&self, id: Digest) -> Result<Lookup<MemberRecordHeader>, Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        let stored = match read_record_row(&transaction, self.scope, id) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-            Err(error) => return classify_read(&error).map(Lookup::Miss),
-        };
-        if stored.lifecycle != LIVE {
-            return Ok(Lookup::Miss(Miss::Retired));
-        }
-        let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Member)));
-        let (Ok(binding_count), Ok(content_bytes)) = (
-            u64::try_from(stored.binding_count),
-            u64::try_from(stored.content_bytes),
-        ) else {
-            return malformed;
-        };
-        if binding_count > MAX_MEMBER_BINDINGS as u64
-            || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
-            || stored.header.len() > MAX_MANIFEST_BYTES
-        {
-            return malformed;
-        }
-        let Ok(member) = decode_member_header(&stored.header) else {
-            return malformed;
-        };
-        if path_key(&member.source.canonical) != stored.source_key
-            || digest_column(member.artifact) != stored.artifact_id
-            || digest_column(member.member_evidence) != stored.member_evidence
-        {
-            return malformed;
-        }
-        Ok(Lookup::Hit(MemberRecordHeader {
-            scope: self.scope,
-            record_id: id,
-            member,
-            encoded_header: stored.header,
-            binding_count,
-            content_bytes,
-        }))
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            let stored = match read_record_row(&transaction, self.scope, id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+                Err(error) => return classify_read(&error).map(Lookup::Miss),
+            };
+            if stored.lifecycle != LIVE {
+                return Ok(Lookup::Miss(Miss::Retired));
+            }
+            let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Member)));
+            let (Ok(binding_count), Ok(content_bytes)) = (
+                u64::try_from(stored.binding_count),
+                u64::try_from(stored.content_bytes),
+            ) else {
+                return malformed;
+            };
+            if binding_count > MAX_MEMBER_BINDINGS as u64
+                || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
+                || stored.header.len() > MAX_MANIFEST_BYTES
+            {
+                return malformed;
+            }
+            let Ok(member) = decode_member_header(&stored.header) else {
+                return malformed;
+            };
+            if path_key(&member.source.canonical) != stored.source_key
+                || digest_column(member.artifact) != stored.artifact_id
+                || digest_column(member.member_evidence) != stored.member_evidence
+            {
+                return malformed;
+            }
+            Ok(Lookup::Hit(MemberRecordHeader {
+                scope: self.scope,
+                record_id: id,
+                member,
+                encoded_header: stored.header,
+                binding_count,
+                content_bytes,
+            }))
+        })
     }
 
     pub fn read_member_record(&self, header: &MemberRecordHeader) -> MemberRecordReader<'_> {

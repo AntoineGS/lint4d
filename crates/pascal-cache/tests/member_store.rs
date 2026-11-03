@@ -446,3 +446,28 @@ fn a_record_whose_bound_exceeds_the_scratch_is_refused_before_encoding() {
         "the refusal releases its scratch"
     );
 }
+
+#[test]
+fn an_identical_republish_takes_the_next_sequence() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let record = member("/w/Main.pas", &[], Digest::from_bytes([0; 32]));
+    assert_eq!(
+        store.publish_member_record(&record).unwrap().published,
+        Published::Inserted
+    );
+    let sequence = || -> i64 {
+        raw(directory.path())
+            .query_row("SELECT publication_seq FROM member_records", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let first = sequence();
+    assert!(first >= 1);
+    assert_eq!(
+        store.publish_member_record(&record).unwrap().published,
+        Published::AlreadyPresent
+    );
+    assert!(sequence() > first, "the republish committed its recency");
+}

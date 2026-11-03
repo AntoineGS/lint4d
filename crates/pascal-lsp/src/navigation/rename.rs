@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, ROOT_SCOPE,
     ResolutionState, Span, Symbol, SymbolKind, canonical_name, collect_nodes_matching,
@@ -141,6 +142,29 @@ pub(crate) enum TestCancellationPhase {
 pub(crate) struct TestCancellationPhaseGuard(Option<TestCancellationPhase>);
 
 #[cfg(test)]
+thread_local! {
+    pub(super) static TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP: Cell<bool> =
+        const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestExhaustMemberLookupGuard;
+
+/// Completion's member lookups run out of budget while the guard lives.
+#[cfg(test)]
+pub(crate) fn test_exhaust_completion_member_lookup() -> TestExhaustMemberLookupGuard {
+    TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(|flag| flag.set(true));
+    TestExhaustMemberLookupGuard
+}
+
+#[cfg(test)]
+impl Drop for TestExhaustMemberLookupGuard {
+    fn drop(&mut self) {
+        TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn test_cancel_after_checks(checks: usize) -> TestCancellationGuard {
     let previous = TEST_CANCEL_AFTER_CHECKS.with(|budget| {
         let previous = budget.get();
@@ -260,6 +284,19 @@ pub(crate) struct RenameBindingInfo {
     pub(crate) unit_provider_uri: Option<Url>,
     pub(crate) unit_provider_position: Option<lsp_types::Position>,
     pub(crate) names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceTargetMember {
+    pub(crate) uri: Url,
+    pub(crate) unit: String,
+    pub(crate) top_level: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReferenceTargets {
+    pub(crate) names: Vec<String>,
+    pub(crate) members: Vec<ReferenceTargetMember>,
 }
 
 fn is_explicit_uses_path_keyword(identifier: Node<'_>, document: &Document, span: Span) -> bool {
@@ -938,6 +975,57 @@ impl NavigationIndex {
         })
     }
 
+    /// The binding at `position` as the indexed references query needs it
+    /// (l4d-33 A3): its names, and for each member the declaring document,
+    /// that document's unit and whether the member is top-level.
+    pub(crate) fn reference_targets_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: &AtomicBool,
+    ) -> Result<ReferenceTargets, String> {
+        check_cancel(Some(cancel))?;
+        let (binding, _) = self.binding_plan_with_cancel(uri, position, Some(cancel), true)?;
+        let mut names = binding.names.iter().cloned().collect::<Vec<_>>();
+        names.sort_by_key(|name| canonical_name(name));
+        names.dedup_by(|left, right| canonical_name(left) == canonical_name(right));
+        let mut members = binding
+            .members
+            .iter()
+            .map(|member| self.reference_target_member(member))
+            .collect::<Result<Vec<_>, _>>()?;
+        members.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then(left.top_level.cmp(&right.top_level))
+        });
+        members.dedup();
+        check_cancel(Some(cancel))?;
+        Ok(ReferenceTargets { names, members })
+    }
+
+    /// A member whose declaring document is not indexed has no unit to scope
+    /// the query by: phase 1 fails and the caller uses the member rule.
+    fn reference_target_member(&self, member: &SymbolId) -> Result<ReferenceTargetMember, String> {
+        let document = self.documents.get(&member.uri).ok_or_else(|| {
+            format!(
+                "the declaring document of the reference target is not indexed: {}",
+                member.uri
+            )
+        })?;
+        Ok(ReferenceTargetMember {
+            uri: member.uri.clone(),
+            unit: canonical_name(&document.unit_name),
+            top_level: member.scope == ROOT_SCOPE
+                && member.owner_type.is_none()
+                && !matches!(
+                    member.kind,
+                    SymbolKind::EnumValue | SymbolKind::Field | SymbolKind::Property
+                ),
+        })
+    }
+
     /// Prove that the rename target can be resolved without any imported
     /// documents. This is deliberately narrower than classifying a binding as
     /// local: public bindings still require the workspace snapshot and its
@@ -1019,6 +1107,12 @@ impl NavigationIndex {
         check_cancel(Some(cancel)).is_ok()
     }
 
+    /// Bind globals best effort; see `best_effort_bindings`. Only read-only
+    /// features may set it.
+    pub(crate) fn set_best_effort_bindings(&mut self, best_effort: bool) {
+        self.best_effort_bindings = best_effort;
+    }
+
     pub(super) fn is_unknown_global_fallback(
         &self,
         document: &Document,
@@ -1043,7 +1137,8 @@ impl NavigationIndex {
         candidates: &[Candidate],
     ) -> bool {
         let type_reference = has_ancestor_kind(identifier, "typeref");
-        owner_type.is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
+        let unknown = owner_type
+            .is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
             && member_expression_at(identifier).is_none()
             && qualified_type_path_at(identifier, &document.source).is_none()
             && use_name_at(identifier, &document.source).is_none()
@@ -1053,7 +1148,27 @@ impl NavigationIndex {
                         || self
                             .symbol(candidate)
                             .is_none_or(|symbol| symbol.kind != SymbolKind::Type))
-            })
+            });
+        if unknown && self.best_effort_bindings {
+            // D16: bind the global, but say an inherited member may shadow it.
+            let owner = owner_type.unwrap_or_default();
+            let key = canonical_name(owner);
+            let name = document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Type && symbol.key == key)
+                .map_or(owner, |symbol| symbol.name.as_str());
+            self.relaxed_bindings.record(format!(
+                "Members inherited by {name} are unknown; the result may be shadowed."
+            ));
+            return false;
+        }
+        unknown
+    }
+
+    /// The relaxed binding decisions recorded since the last call.
+    pub(crate) fn take_relaxed_bindings(&self) -> Vec<String> {
+        self.relaxed_bindings.take()
     }
 
     fn candidate_is_global(&self, candidate: &Candidate) -> bool {
@@ -1894,6 +2009,8 @@ impl NavigationIndex {
             {
                 continue;
             }
+            #[cfg(test)]
+            super::test_record_bound_document(uri);
             if options.strict_resolution
                 && document.opaque_ranges.iter().any(|range| {
                     binding
@@ -2752,7 +2869,7 @@ fn call_argument_for_identifier_with_budget<'a>(
     budget: &mut super::AssistanceBudget,
 ) -> Result<Option<(Node<'a>, usize, Node<'a>)>, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2780,7 +2897,7 @@ fn call_argument_for_identifier_with_budget<'a>(
             }
             return Ok(None);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -2846,7 +2963,7 @@ fn assignment_lhs_for_identifier_with_budget<'a>(
     budget: &mut super::AssistanceBudget,
 ) -> Result<Option<(Node<'a>, Node<'a>)>, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2856,7 +2973,7 @@ fn assignment_lhs_for_identifier_with_budget<'a>(
             };
             return Ok(Span::from_node(lhs).contains(span).then_some((node, lhs)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -2904,7 +3021,7 @@ fn identifier_is_foreach_iterator_with_budget(
     budget: &mut super::AssistanceBudget,
 ) -> Result<bool, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2915,7 +3032,7 @@ fn identifier_is_foreach_iterator_with_budget(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -2925,7 +3042,7 @@ fn is_address_operand_with_budget(
     cancel: &AtomicBool,
     budget: &mut super::AssistanceBudget,
 ) -> Result<bool, String> {
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2936,7 +3053,7 @@ fn is_address_operand_with_budget(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -3876,16 +3993,16 @@ fn parameter_binding_key(
             argument = Some(node);
             break;
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     let argument = argument?;
 
-    let mut routine_node = argument.parent();
+    let mut routine_node = argument.tree_parent();
     while let Some(node) = routine_node {
         if matches!(node.kind(), "declProc" | "defProc") {
             break;
         }
-        routine_node = node.parent();
+        routine_node = node.tree_parent();
     }
     let routine_node = routine_node?;
     let header = if routine_node.kind() == "defProc" {
@@ -3948,7 +4065,7 @@ fn candidate_key_site(document: &Document, symbol: &Symbol) -> Span {
         if matches!(node.kind(), "declProc" | "defProc") {
             return Span::from_node(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     symbol.span
 }
@@ -4025,7 +4142,7 @@ fn declaration_node_for_span(root: Node<'_>, span: Span) -> Option<Node<'_>> {
         {
             return Some(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }
@@ -4065,7 +4182,7 @@ fn cacheable_unqualified_use_with_budget(
         if node.kind() == "lambda" {
             return Ok(false);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(!document.cache_unsafe_scopes.contains(&scope))
 }
@@ -4226,6 +4343,115 @@ mod tests {
     use super::super::{Span, collect_nodes_matching};
     use super::NavigationIndex;
     use lsp_types::Url;
+    use std::sync::atomic::AtomicBool;
+
+    fn indexed(documents: &[(&str, &str)]) -> NavigationIndex {
+        let mut index = NavigationIndex::new();
+        for (name, source) in documents {
+            let uri = Url::parse(&format!("file:///{name}.pas")).expect("valid file URL");
+            index
+                .update(uri, (*source).to_owned())
+                .expect("Pascal unit parses");
+        }
+        index
+    }
+
+    fn targets_at(
+        index: &NavigationIndex,
+        name: &str,
+        source: &str,
+        needle: &str,
+    ) -> super::ReferenceTargets {
+        let uri = Url::parse(&format!("file:///{name}.pas")).expect("valid file URL");
+        let offset = source.find(needle).expect("needle is present");
+        let position = crate::text::offset_to_position(source, offset).expect("position");
+        index
+            .reference_targets_with_cancel(&uri, position, &AtomicBool::new(false))
+            .expect("targets")
+    }
+
+    #[test]
+    fn reference_targets_mark_unit_scope_constants_top_level() {
+        let shared = "unit Shared;\ninterface\nconst\n  SharedValue = 1;\nimplementation\nend.\n";
+        let user = "unit User;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  WriteLn(SharedValue);\nend;\nend.\n";
+        let index = indexed(&[("Shared", shared), ("User", user)]);
+        let targets = targets_at(&index, "User", user, "SharedValue);");
+        assert_eq!(targets.names, ["sharedvalue"]);
+        assert_eq!(targets.members.len(), 1);
+        let member = &targets.members[0];
+        assert_eq!(member.uri.as_str(), "file:///Shared.pas");
+        assert_eq!(member.unit, "shared");
+        assert!(member.top_level);
+    }
+
+    #[test]
+    fn reference_targets_mark_fields_methods_properties_and_enum_values_as_members() {
+        let source = "unit Types;\ninterface\ntype\n  TColor = (Red, Green);\n  TBox = class\n  private\n    FValue: Integer;\n  public\n    procedure Run;\n    property Value: Integer read FValue;\n  end;\nimplementation\nprocedure TBox.Run;\nvar\n  Color: TColor;\nbegin\n  Color := Green;\n  FValue := Value;\nend;\nend.\n";
+        let index = indexed(&[("Types", source)]);
+        for needle in ["FValue := ", "Green);", "Value;\nend;", "Run;\nvar"] {
+            let targets = targets_at(&index, "Types", source, needle);
+            assert!(!targets.members.is_empty(), "{needle}");
+            assert!(
+                targets.members.iter().all(|member| !member.top_level),
+                "{needle}: {:?}",
+                targets.members
+            );
+        }
+    }
+
+    #[test]
+    fn overloads_within_one_unit_list_their_declaring_document() {
+        let both = "unit Both;\ninterface\nprocedure Run(Value: Integer); overload;\nprocedure Run(Value: string); overload;\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Run(Value: string);\nbegin\nend;\nend.\n";
+        let first = "unit First;\ninterface\nprocedure Go(Value: Integer); overload;\nimplementation\nprocedure Go(Value: Integer);\nbegin\nend;\nend.\n";
+        let second = "unit Second;\ninterface\nprocedure Go(Value: string); overload;\nimplementation\nprocedure Go(Value: string);\nbegin\nend;\nend.\n";
+        let user = "unit User;\ninterface\nuses First, Second;\nimplementation\nprocedure Call;\nbegin\n  Go(1);\nend;\nend.\n";
+        let index = indexed(&[
+            ("Both", both),
+            ("First", first),
+            ("Second", second),
+            ("User", user),
+        ]);
+        for needle in [
+            "Run(Value: Integer); overload",
+            "Run(Value: string);\nbegin",
+        ] {
+            let targets = targets_at(&index, "Both", both, needle);
+            assert_eq!(targets.names, ["run"]);
+            assert_eq!(
+                targets.members,
+                [super::ReferenceTargetMember {
+                    uri: Url::parse("file:///Both.pas").unwrap(),
+                    unit: "both".to_owned(),
+                    top_level: true,
+                }],
+                "{needle}"
+            );
+        }
+        // Overloads of different units never form one binding today: phase 1
+        // fails, and the caller falls back to the member rule (A3).
+        let uri = Url::parse("file:///User.pas").unwrap();
+        let offset = user.find("Go(1)").unwrap();
+        let position = crate::text::offset_to_position(user, offset).unwrap();
+        assert!(
+            index
+                .reference_targets_with_cancel(&uri, position, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_member_of_an_unknown_document_fails_phase_one() {
+        let index = indexed(&[("Known", "unit Known;\ninterface\nimplementation\nend.\n")]);
+        let member = super::SymbolId {
+            uri: Url::parse("file:///Gone.pas").unwrap(),
+            span: Span { start: 0, end: 1 },
+            scope: super::ROOT_SCOPE,
+            kind: super::SymbolKind::Constant,
+            origin: super::super::Origin::Declaration,
+            owner_type: None,
+        };
+        assert!(index.reference_target_member(&member).is_err());
+    }
 
     #[test]
     fn parsed_direct_symbol_index_matches_linear_span_membership() {

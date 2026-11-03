@@ -1,4 +1,4 @@
-use super::limits::SQLITE_LENGTH_LIMIT;
+use super::limits::{JOURNAL_SIZE_LIMIT_BYTES, SQLITE_LENGTH_LIMIT};
 use super::outcome::{Bypass, Malformed, Miss};
 use super::pool::Deadline;
 use rusqlite::config::DbConfig;
@@ -37,6 +37,11 @@ pub(crate) fn check_sqlite_version(version_number: i32) -> Result<(), Bypass> {
 pub(crate) fn classify(error: &rusqlite::Error) -> Bypass {
     match error {
         rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
+            ErrorCode::DatabaseBusy
+                if failure.extended_code == rusqlite::ffi::SQLITE_BUSY_RECOVERY =>
+            {
+                Bypass::Recovering
+            }
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Bypass::Busy,
             ErrorCode::ReadOnly => Bypass::ReadOnly,
             ErrorCode::DiskFull => Bypass::Full,
@@ -98,6 +103,13 @@ fn configure(connection: &Connection, page_cache_bytes: u64) -> Result<(), Bypas
     connection
         .pragma_update(None, "synchronous", "NORMAL")
         .map_err(fail)?;
+    // Only maintenance checkpoints (spec §10 amendment 2026-11-03, D13).
+    connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .map_err(fail)?;
+    connection
+        .pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(fail)?;
     connection
         .pragma_update(None, "mmap_size", 0)
         .map_err(fail)?;
@@ -124,9 +136,17 @@ pub(crate) fn begin(
     connection: &mut Connection,
     behavior: TransactionBehavior,
 ) -> Result<Transaction<'_>, Bypass> {
-    connection
+    let started = std::time::Instant::now();
+    let result = connection
         .transaction_with_behavior(behavior)
-        .map_err(|error| classify(&error))
+        .map_err(|error| classify(&error));
+    if !matches!(behavior, TransactionBehavior::Deferred) {
+        super::waits::record_lock_wait(started.elapsed());
+    }
+    if matches!(result, Err(Bypass::Busy)) {
+        super::waits::record_busy();
+    }
+    result
 }
 
 /// Bound the SQLite lock waits of the next statements by what is left of
@@ -137,16 +157,13 @@ pub(crate) fn limit_wait(connection: &Connection, deadline: Deadline) -> Result<
         .map_err(|error| classify(&error))
 }
 
-/// [`begin`] within an operation's cumulative allowance: no attempt once
-/// nothing remains.
+/// [`begin`] within an operation's cumulative allowance: once nothing
+/// remains, one attempt that does not wait.
 pub(crate) fn begin_within(
     connection: &mut Connection,
     behavior: TransactionBehavior,
     deadline: Deadline,
 ) -> Result<Transaction<'_>, Bypass> {
-    if deadline.remaining().is_zero() {
-        return Err(Bypass::Busy);
-    }
     limit_wait(connection, deadline)?;
     begin(connection, behavior)
 }
@@ -176,6 +193,11 @@ mod tests {
     fn sqlite_failures_map_to_bypass_reasons() {
         assert_eq!(classify(&failure(ffi::SQLITE_BUSY)), Bypass::Busy);
         assert_eq!(classify(&failure(ffi::SQLITE_LOCKED)), Bypass::Busy);
+        assert_eq!(
+            classify(&failure(ffi::SQLITE_BUSY_RECOVERY)),
+            Bypass::Recovering
+        );
+        assert_eq!(classify(&failure(ffi::SQLITE_BUSY_SNAPSHOT)), Bypass::Busy);
         assert_eq!(classify(&failure(ffi::SQLITE_READONLY)), Bypass::ReadOnly);
         assert_eq!(classify(&failure(ffi::SQLITE_FULL)), Bypass::Full);
         assert_eq!(classify(&failure(ffi::SQLITE_CORRUPT)), Bypass::Corrupt);
@@ -227,6 +249,8 @@ mod tests {
         assert_eq!(pragma("cache_size"), -5461);
         assert_eq!(pragma("synchronous"), 1);
         assert_eq!(pragma("cell_size_check"), 1);
+        assert_eq!(pragma("wal_autocheckpoint"), 0);
+        assert_eq!(pragma("journal_size_limit"), 4 << 20);
         use rusqlite::limits::Limit;
         assert_eq!(
             connection.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(),
@@ -271,6 +295,30 @@ mod tests {
         drop(holder);
         let live = Deadline::after(Duration::from_secs(1));
         assert!(begin_within(&mut second, TransactionBehavior::Immediate, live).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spent_allowance_still_tries_once_without_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        let mut first = open_connection(&path, 1 << 20, Duration::from_secs(5)).unwrap();
+        first
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+            .unwrap();
+        let mut second = open_connection(&path, 1 << 20, Duration::from_secs(5)).unwrap();
+        let spent = Deadline::after(Duration::ZERO);
+        drop(begin_within(&mut second, TransactionBehavior::Immediate, spent).unwrap());
+        let holder = begin(&mut first, TransactionBehavior::Immediate).unwrap();
+        let busy = super::super::waits::lock_waits().busy;
+        let start = std::time::Instant::now();
+        assert_eq!(
+            begin_within(&mut second, TransactionBehavior::Immediate, spent).err(),
+            Some(Bypass::Busy)
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(super::super::waits::lock_waits().busy > busy);
+        drop(holder);
     }
 
     #[cfg(unix)]

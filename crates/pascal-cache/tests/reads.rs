@@ -425,7 +425,8 @@ fn index_lookup_uses_the_index_without_sorting() {
                 b"tfoo".as_slice(),
                 Vec::<u8>::new(),
                 -1i64,
-                257i64
+                257i64,
+                1i64
             ],
             |row| row.get::<_, String>(3),
         )

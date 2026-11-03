@@ -115,7 +115,7 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
-mod admitted;
+pub(crate) mod admitted;
 mod authorize;
 pub(crate) mod capture;
 mod catalogues;
@@ -127,16 +127,23 @@ mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
-mod persist;
+#[cfg(test)]
+mod navigation_walk_tests;
+pub(crate) mod persist;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
+#[cfg(test)]
+mod shared_discovery_tests;
 pub(crate) mod signature;
+#[cfg(all(test, unix))]
+mod storage_failures;
 mod validate;
 
 pub(super) fn conditional_context_for_path(
@@ -403,6 +410,32 @@ const DEFAULT_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_FILE_BYTES_CEILING: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+/// Units whose imports a navigation request loads while a name binds
+/// nowhere. A negative definition over a large closure walked 256 units in
+/// three minutes.
+const MAX_NAVIGATION_WALK_WORK: usize = 128;
+/// Source bytes of dependencies a navigation walk indexes before it stops.
+const MAX_NAVIGATION_WALK_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NAVIGATION_WALK_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Every warning a workspace logged to stderr.
+    static TEST_LOGGED_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Loading the imports of a unit whose file name this is fails.
+    static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn navigation_walk_byte_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_NAVIGATION_WALK_BYTES.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_NAVIGATION_WALK_BYTES
+}
 const MAX_PENDING_FILE_RENAMES: usize = 64;
 const MAX_PENDING_FILE_RENAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
@@ -490,12 +523,19 @@ fn filename_catalogue_entry_limit() -> usize {
     MAX_FILENAME_CATALOGUE_ENTRIES
 }
 
+/// Compact catalogue members per project/configuration (spec §8);
+/// `l4d-zf1b.8` is its first consumer.
+pub(crate) const DEFAULT_MAX_WORKSPACE_UNITS: usize = pascal_cache::MAX_SNAPSHOT_MEMBERS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
     pub max_cache_bytes: usize,
+    /// Compact catalogue members per project/configuration (spec §8);
+    /// `l4d-zf1b.8` is its first consumer.
+    pub max_workspace_units: usize,
 }
 
 impl Default for ResourceLimits {
@@ -505,6 +545,7 @@ impl Default for ResourceLimits {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+            max_workspace_units: DEFAULT_MAX_WORKSPACE_UNITS,
         }
     }
 }
@@ -543,6 +584,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
     pub(crate) max_cache_bytes: RuntimeOption<usize>,
+    pub(crate) max_workspace_units: RuntimeOption<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -557,6 +599,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -670,6 +713,7 @@ impl RuntimeOptionsUpdate {
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
             max_cache_bytes: RuntimeOption::Reset,
+            max_workspace_units: RuntimeOption::Reset,
         }
     }
 }
@@ -705,6 +749,9 @@ impl RuntimeOptionsOverride {
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
                 max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
                 max_cache_bytes: self.max_cache_bytes.unwrap_or(base.limits.max_cache_bytes),
+                max_workspace_units: self
+                    .max_workspace_units
+                    .unwrap_or(base.limits.max_workspace_units),
             },
         }
     }
@@ -762,11 +809,17 @@ impl RuntimeOptionsOverride {
             "maxCacheBytes",
             &mut warnings,
         );
+        apply_runtime_field(
+            &mut self.max_workspace_units,
+            update.max_workspace_units,
+            "maxWorkspaceUnits",
+            &mut warnings,
+        );
         warnings
     }
 }
 
-fn apply_runtime_field<T: Clone>(
+pub(crate) fn apply_runtime_field<T: Clone>(
     target: &mut Option<T>,
     value: RuntimeOption<T>,
     name: &str,
@@ -833,6 +886,11 @@ pub(crate) fn parse_runtime_options(
             object,
             "maxCacheBytes",
             crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+        ),
+        max_workspace_units: parse_runtime_limit(
+            object,
+            "maxWorkspaceUnits",
+            DEFAULT_MAX_WORKSPACE_UNITS,
         ),
     })
 }
@@ -1111,6 +1169,7 @@ struct RawWorkspaceOptions {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 fn parse_conditional_context_values(
@@ -1298,6 +1357,10 @@ impl WorkspaceOptions {
                 crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
                 "maxCacheBytes",
             )?;
+        }
+        if let Some(value) = raw.max_workspace_units {
+            limits.max_workspace_units =
+                bounded_limit(value, 1, DEFAULT_MAX_WORKSPACE_UNITS, "maxWorkspaceUnits")?;
         }
         Ok(Self {
             source_paths: raw.source_paths,
@@ -2163,6 +2226,24 @@ fn selected_installation_id(context: &ProjectContext) -> Option<String> {
 }
 
 impl ContextKey {
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self {
+            project_file: None,
+            installation_id: None,
+            workspace_root: Some(PathBuf::from(name)),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -2335,6 +2416,93 @@ impl ContextState {
                     .push(search.clone());
             }
         }
+    }
+}
+
+/// Discovered project contexts shared by a workspace and the request
+/// workspaces built from its inputs, so a request does not re-evaluate the
+/// project files for every document it touches. An entry is keyed by the
+/// document and every discovery input; it is reused only while its watched
+/// files prove it fresh, exactly like a context the workspace retained.
+#[derive(Clone, Default)]
+pub(crate) struct SharedDiscoveries(Arc<Mutex<DiscoveryStore>>);
+
+impl std::fmt::Debug for SharedDiscoveries {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedDiscoveries")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Discoveries retained before the store is emptied.
+const MAX_SHARED_DISCOVERIES: usize = 512;
+/// Distinct project warnings remembered as already logged.
+const MAX_LOGGED_PROJECT_WARNINGS: usize = 4096;
+
+#[derive(Default)]
+struct DiscoveryStore {
+    /// Keyed by configuration generation, document and discovery inputs.
+    /// Jobs of an older generation may still run after a newer one started,
+    /// so generations are kept apart rather than cleared on each switch.
+    entries: HashMap<(u64, Url, u64), SharedDiscovery>,
+    logged_warnings: HashSet<(u64, String)>,
+}
+
+#[derive(Clone)]
+struct SharedDiscovery {
+    key: ContextKey,
+    state: ContextState,
+    warnings: Vec<String>,
+}
+
+impl SharedDiscoveries {
+    fn get(
+        &self,
+        configuration_generation: u64,
+        uri: &Url,
+        inputs: u64,
+    ) -> Option<SharedDiscovery> {
+        lock(&self.0)
+            .entries
+            .get(&(configuration_generation, uri.clone(), inputs))
+            .cloned()
+    }
+
+    fn insert(
+        &self,
+        configuration_generation: u64,
+        uri: Url,
+        inputs: u64,
+        discovery: SharedDiscovery,
+    ) {
+        let mut store = lock(&self.0);
+        if store.entries.len() >= MAX_SHARED_DISCOVERIES {
+            store.entries.clear();
+        }
+        store
+            .entries
+            .insert((configuration_generation, uri, inputs), discovery);
+    }
+
+    fn remove(&self, configuration_generation: u64, uri: &Url, inputs: u64) {
+        lock(&self.0)
+            .entries
+            .remove(&(configuration_generation, uri.clone(), inputs));
+    }
+
+    /// Whether `warning` was not yet logged in this configuration generation.
+    fn first_report(&self, configuration_generation: u64, warning: &str) -> bool {
+        let mut store = lock(&self.0);
+        let key = (configuration_generation, warning.to_string());
+        if store.logged_warnings.contains(&key) {
+            return false;
+        }
+        if store.logged_warnings.len() >= MAX_LOGGED_PROJECT_WARNINGS {
+            store.logged_warnings.clear();
+        }
+        store.logged_warnings.insert(key);
+        true
     }
 }
 
@@ -2917,6 +3085,22 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    /// The process's persistent-cache handle; inert by default.
+    persistent_cache: crate::persistent_cache::PersistentCache,
+    /// Project contexts discovered by this workspace and the request
+    /// workspaces derived from it.
+    shared_discoveries: SharedDiscoveries,
+    /// Navigation answers best effort (D16): a dependency whose imports fail
+    /// to load is skipped. The implementation code lens stays strict.
+    best_effort_navigation: bool,
+    /// `true` in an index build view: loads then drop their cache claim
+    /// instead of publishing the parse (l4d-33 A13).
+    pub(crate) index_build: bool,
+    /// The context an index build is working in: no prune drops it.
+    pinned_context: Option<ContextKey>,
+    /// Why the last load that returned `Ok(false)` skipped its file: a read
+    /// error, a cache limit or a failed expansion.
+    load_refusal: Option<String>,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3389,9 +3573,15 @@ impl Workspace {
         }
 
         let project_file_changed = self.options.project_file != prepared.options.project_file;
+        let budget_changed =
+            self.options.limits.max_cache_bytes != prepared.options.limits.max_cache_bytes;
         self.options = prepared.options;
         self.project_cache
             .set_max_bytes(self.options.limits.max_cache_bytes);
+        if budget_changed {
+            // Re-admit the store against the new budget (spec §11.1 amendment).
+            self.persistent_cache.readmit();
+        }
         self.roots = prepared.roots;
 
         self.bump_source_generation();
@@ -3488,6 +3678,8 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
+            persistent_cache: input.persistent_cache.clone(),
+            shared_discoveries: input.shared_discoveries.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
@@ -3498,6 +3690,11 @@ impl Workspace {
             request_generation: input.request_generation,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
+        self.best_effort_navigation = best_effort;
+        self.index.set_best_effort_bindings(best_effort);
     }
 
     pub(crate) fn navigation_state(&self) -> NavigationState {
@@ -6959,6 +7156,12 @@ impl Workspace {
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
         let mut work = 0;
+        // Source bytes of the dependencies the walk indexed. The document's
+        // own imports are always loaded; the walk past them is bounded so a
+        // name that binds nowhere answers promptly.
+        let mut walked_bytes = 0usize;
+        let mut walk_exhausted = false;
+        let walk_byte_limit = navigation_walk_byte_limit();
         let resolver_session_cache = ResolverSessionCache::default();
 
         loop {
@@ -6968,33 +7171,57 @@ impl Workspace {
                 self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
-            if frontier.is_empty() || work >= MAX_DEPENDENCY_WORK {
+            if frontier.is_empty() || walk_exhausted {
                 break;
             }
 
             let mut next = Vec::new();
             for current in frontier.drain(..) {
                 check_workspace_cancel(cancel)?;
-                if !visited.insert(current.clone()) {
+                if visited.contains(&current) {
                     continue;
                 }
+                if work > 0 && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
+                {
+                    walk_exhausted = true;
+                    break;
+                }
+                visited.insert(current.clone());
                 work += 1;
-                let dependencies = self.load_imports_with_session_cache(
+                let dependencies = match self.load_imports_with_session_cache(
                     &current,
                     context_key,
                     pinned,
                     cancel,
                     &resolver_session_cache,
-                )?;
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(error)
+                        if error == CANCELLATION_MESSAGE
+                            || error == compile_time::HEADER_CHANGED =>
+                    {
+                        return Err(error);
+                    }
+                    // D16: a dependency that cannot be loaded only hides what
+                    // binds through it; navigation returns what still binds.
+                    // Each request rebuilds the walk, so log it once.
+                    Err(error) if self.best_effort_navigation && &current != uri => {
+                        self.warn_project(format!(
+                            "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
+                        ));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 for dependency in dependencies {
                     check_workspace_cancel(cancel)?;
                     if initialized.insert(dependency.clone()) {
                         self.index.clear_import_bindings(&dependency);
+                        walked_bytes = walked_bytes.saturating_add(
+                            self.index.source_text(&dependency).map_or(0, str::len),
+                        );
                     }
                     next.push(dependency);
-                }
-                if work >= MAX_DEPENDENCY_WORK {
-                    break;
                 }
             }
             next.retain(|dependency| !visited.contains(dependency));
@@ -7003,9 +7230,9 @@ impl Workspace {
             frontier = next;
         }
 
-        if work >= MAX_DEPENDENCY_WORK {
+        if walk_exhausted {
             self.warn(format!(
-                "dependency work limit ({MAX_DEPENDENCY_WORK}) reached while resolving {uri}; result is incomplete"
+                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {walk_byte_limit} source bytes) reached while resolving {uri}; result is incomplete"
             ));
         }
 
@@ -7122,6 +7349,14 @@ impl Workspace {
         )>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
+        #[cfg(test)]
+        if TEST_FAIL_IMPORTS_OF.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("injected import failure for {uri}"));
+        }
         let imports = self.index.imports(uri);
         let effective_context_key = self
             .document_contexts
@@ -7233,88 +7468,138 @@ impl Workspace {
             self.cache_epoch,
             lookup_cancel,
         );
-        let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
-            match import_lookup {
-                crate::project_cache::Lookup::Hit(hit) => (
-                    std::sync::Arc::clone(&hit.resolved),
-                    Some(std::sync::Arc::clone(&hit.report)),
-                    Some(hit.probes.clone()),
-                    None,
-                    None,
-                ),
-                crate::project_cache::Lookup::Compute(claim) => {
-                    #[cfg(feature = "test-support")]
-                    if !claim.is_detached()
-                        && !crate::project_cache::claim_waits_are_limited_on_this_thread()
-                    {
-                        wait_at_import_claim_test_barrier();
-                    }
-                    let input = self.analysis_input();
-                    let mut resolver = resolver::resolver_for_context_with_session_cache(
-                        context.clone(),
-                        &context_observations,
-                        input.roots.clone(),
-                        &input,
-                        resolver_session_cache,
-                    );
-                    let root = match resolver.load_source(
-                        &path,
-                        legacy_route.as_ref(),
-                        SourceKind::Unit,
-                        resolver_cancel,
-                    ) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            let report = resolver.finish();
-                            self.merge_resolution_report(&effective_context_key, &report);
-                            if matches!(error, pascal_core::ResolverError::Cancelled) {
-                                return Err(CANCELLATION_MESSAGE.to_string());
-                            }
-                            self.warn(format!("could not load indexed source {uri}: {error}"));
-                            self.index.bind_imports(uri, bindings);
-                            return Ok(Vec::new());
+        let (resolved, cached_report, cached_probes, import_claim, resolver) = match import_lookup {
+            crate::project_cache::Lookup::Hit(hit) => (
+                std::sync::Arc::clone(&hit.resolved),
+                Some(std::sync::Arc::clone(&hit.report)),
+                Some(hit.probes.clone()),
+                None,
+                None,
+            ),
+            crate::project_cache::Lookup::Compute(claim) => {
+                #[cfg(feature = "test-support")]
+                if !claim.is_detached()
+                    && !crate::project_cache::claims_are_interactive_on_this_thread()
+                {
+                    wait_at_import_claim_test_barrier();
+                }
+                let input = self.analysis_input();
+                let mut resolver = resolver::resolver_for_context_with_session_cache(
+                    context.clone(),
+                    &context_observations,
+                    input.roots.clone(),
+                    &input,
+                    resolver_session_cache,
+                );
+                let root = match resolver.load_source(
+                    &path,
+                    legacy_route.as_ref(),
+                    SourceKind::Unit,
+                    resolver_cancel,
+                ) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        let report = resolver.finish();
+                        self.merge_resolution_report(&effective_context_key, &report);
+                        if matches!(error, pascal_core::ResolverError::Cancelled) {
+                            return Err(CANCELLATION_MESSAGE.to_string());
                         }
-                    };
-                    let root = pascal_core::ResolvedUnit {
-                        requested_name: unit_name,
-                        declared_name: self
-                            .index
-                            .unit_name(uri)
-                            .expect("indexed source unit name remains available"),
-                        source: root,
-                    };
-                    #[cfg(test)]
-                    TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-                    let resolved = resolver
-                        .resolve_imports_with_text_skipping_browsing(
-                            &root,
-                            &sites,
-                            &indexed_text,
-                            &validated_compiled_names,
-                            resolver_cancel,
-                        )
-                        .map_err(|error| {
-                            if matches!(error, pascal_core::ResolverError::Cancelled) {
-                                CANCELLATION_MESSAGE.to_string()
-                            } else {
-                                error.to_string()
-                            }
-                        })?;
-                    (
-                        std::sync::Arc::new(resolved),
-                        None,
-                        None,
-                        Some(claim),
-                        Some(resolver),
+                        self.warn(format!("could not load indexed source {uri}: {error}"));
+                        self.index.bind_imports(uri, bindings);
+                        return Ok(Vec::new());
+                    }
+                };
+                let root = pascal_core::ResolvedUnit {
+                    requested_name: unit_name,
+                    declared_name: self
+                        .index
+                        .unit_name(uri)
+                        .expect("indexed source unit name remains available"),
+                    source: root,
+                };
+                #[cfg(test)]
+                TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+                let resolved = resolver
+                    .resolve_imports_with_text_skipping_browsing(
+                        &root,
+                        &sites,
+                        &indexed_text,
+                        &validated_compiled_names,
+                        resolver_cancel,
                     )
-                }
-                crate::project_cache::Lookup::Cancelled => {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
+                    .map_err(|error| {
+                        if matches!(error, pascal_core::ResolverError::Cancelled) {
+                            CANCELLATION_MESSAGE.to_string()
+                        } else {
+                            error.to_string()
+                        }
+                    })?;
+                (
+                    std::sync::Arc::new(resolved),
+                    None,
+                    None,
+                    Some(claim),
+                    Some(resolver),
+                )
+            }
+            crate::project_cache::Lookup::Cancelled => {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+        };
+        let computed = import_claim.is_some();
+        let report = match cached_report {
+            Some(report) => report,
+            None => std::sync::Arc::new(
+                resolver
+                    .expect("a resolver is present when imports were computed")
+                    .finish(),
+            ),
+        };
+        let graph_complete = report.complete
+            && !report.observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    pascal_core::ResolutionObservation::Directory {
+                        complete: false,
+                        ..
+                    }
+                )
+            });
+        let mut computed_probes =
+            computed.then(|| crate::project_cache::report_probes(&report, &resolved));
+        // Store the resolution before walking its dependencies, so that a
+        // lookup waiting for this claim waits for the resolution only: each
+        // dependency is then its own unit claim. A resolution incomplete
+        // only through settled missing or ambiguous imports is stable and
+        // reused too; its report keeps the incompleteness.
+        let reusable = resolved.settled
+            && !report.observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    pascal_core::ResolutionObservation::Directory {
+                        complete: false,
+                        ..
+                    }
+                )
+            });
+        // An unstored claim is dropped here too, so that no lookup waits for
+        // it through the walk.
+        if let Some(claim) = import_claim
+            && reusable
+            && let Some((probes, watch_dirs)) = computed_probes.take()
+        {
+            // The interface entry below keeps the probes, not the watches.
+            computed_probes = Some((probes.clone(), Vec::new()));
+            let value = crate::project_cache::ImportValue {
+                resolved: std::sync::Arc::clone(&resolved),
+                report: std::sync::Arc::clone(&report),
+                probes,
+                watch_dirs,
             };
-        let resolved_for_cache = import_claim
-            .as_ref()
-            .map(|_| std::sync::Arc::clone(&resolved));
+            let bytes = value.retained_bytes();
+            self.project_cache
+                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
+        }
         if let Some((site, location, compiled)) = selected_header {
             let selected = resolved.bindings.iter().find(|binding| {
                 binding.site.byte_range == (site.span.start..site.span.end)
@@ -7331,15 +7616,6 @@ impl Workspace {
                 .is_some_and(|binding| matches!(binding.target, ResolutionTarget::Unavailable))
                 && compiled_by_name.contains_key(&compiled_name);
             if !*compiled {
-                let report = match cached_report {
-                    Some(report) => report,
-                    None => Arc::new(
-                        resolver
-                            .take()
-                            .expect("computed selection resolver")
-                            .finish(),
-                    ),
-                };
                 self.merge_resolution_report(&effective_context_key, &report);
                 if report
                     .warnings
@@ -7393,6 +7669,15 @@ impl Workspace {
         let mut dependencies = Vec::new();
         for (index, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
+            // Background work over a whole closure gives way to interactive
+            // requests between units.
+            #[cfg(feature = "test-support")]
+            if index == 1 && crate::warmer::has_background_gate_on_this_thread() {
+                wait_at_background_walk_test_barrier();
+            }
+            if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
             let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
                 format!(
                     "resolved unit is not a file URI: {}",
@@ -7488,15 +7773,6 @@ impl Workspace {
             }
         }
         check_workspace_cancel(cancel)?;
-        let report = match cached_report {
-            Some(report) => report,
-            None => std::sync::Arc::new(
-                resolver
-                    .take()
-                    .expect("a resolver is present when imports were computed")
-                    .finish(),
-            ),
-        };
         let rejected_dependency = report
             .warnings
             .iter()
@@ -7506,38 +7782,11 @@ impl Workspace {
         if let Some(reason) = rejected_dependency {
             return Err(format!("required dependency was rejected: {reason}"));
         }
-        let graph_complete = report.complete
-            && !report.observations.iter().any(|observation| {
-                matches!(
-                    observation,
-                    pascal_core::ResolutionObservation::Directory {
-                        complete: false,
-                        ..
-                    }
-                )
-            });
-        let interface_probes = cached_probes.or_else(|| {
-            resolved_for_cache
-                .as_ref()
-                .map(|resolved| crate::project_cache::report_probes(&report, resolved).0)
-        });
+        let interface_probes = cached_probes.or_else(|| computed_probes.map(|(probes, _)| probes));
         if let Some(probes) = interface_probes {
             let bindings =
                 interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
             self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
-        }
-        if graph_complete && let (Some(claim), Some(resolved)) = (import_claim, resolved_for_cache)
-        {
-            let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
-            let value = crate::project_cache::ImportValue {
-                resolved,
-                report: std::sync::Arc::clone(&report),
-                probes,
-                watch_dirs,
-            };
-            let bytes = value.retained_bytes();
-            self.project_cache
-                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
         }
 
         // Source providers resolved above always win. Only unresolved imports
@@ -7888,10 +8137,12 @@ impl Workspace {
                 provenance: ProjectPathProvenance::LegacyNative,
             },
             None => {
-                self.warn(format!(
+                let message = format!(
                     "source path is outside the effective project read roots: {}",
                     path.display()
-                ));
+                );
+                self.warn(message.clone());
+                self.load_refusal = Some(message);
                 return Ok(false);
             }
         };
@@ -7916,10 +8167,12 @@ impl Workspace {
             )
         };
         if !readable {
-            self.warn(format!(
+            let message = format!(
                 "source path is outside the effective project read roots: {}",
                 path.display()
-            ));
+            );
+            self.warn(message.clone());
+            self.load_refusal = Some(message);
             return Ok(false);
         }
 
@@ -8029,6 +8282,7 @@ impl Workspace {
             }
             Err(error) => {
                 self.warn(format!("skipping {}: {error}", path.display()));
+                self.load_refusal = Some(error);
                 self.remove_indexed_with_control(uri, cancel, budget, true)?;
                 return Ok(false);
             }
@@ -8125,6 +8379,11 @@ impl Workspace {
                     uri
                 ));
             }
+            self.load_refusal = Some(format!(
+                "source cache limit: {} files, {} bytes retained",
+                self.indexed_files.len(),
+                self.indexed_bytes
+            ));
             return Ok(false);
         }
         let context = self
@@ -8156,6 +8415,7 @@ impl Workspace {
             }
             None => (None, None),
         };
+        let claim = claim.filter(|_| !self.index_build);
         let expansion = if let Some(expansion) =
             cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
         {
@@ -8178,6 +8438,7 @@ impl Workspace {
                         self.warn(format!(
                             "include expansion failed for {uri}; navigation is incomplete: {error}"
                         ));
+                        self.load_refusal = Some(format!("include expansion failed: {error}"));
                         return Ok(false);
                     }
                 };
@@ -8237,6 +8498,7 @@ impl Workspace {
             }
             self.remove_indexed_with_control(uri, cancel, budget, true)?;
             self.warn(format!("cannot index {uri}: {error}"));
+            self.load_refusal = Some(format!("the parse failed: {error}"));
             return Ok(false);
         }
         // The index now holds this source's new parse; an older lease is stale.
@@ -9549,8 +9811,18 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
+        // A resolver report repeats its context's discovery warnings.
+        let project_warnings = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context_observations.warnings.clone())
+            .unwrap_or_default();
         for warning in &report.warnings {
-            self.warn(warning.clone());
+            if project_warnings.contains(warning) {
+                self.warn_project(warning.clone());
+            } else {
+                self.warn(warning.clone());
+            }
         }
         for reason in &report.incomplete_reasons {
             self.warn(reason.clone());
@@ -9808,6 +10080,18 @@ impl Workspace {
                 return Ok(owner.key);
             }
         }
+        let discovery_inputs =
+            self.discovery_inputs_fingerprint(&roots, &project_options, &deleted_paths);
+        if let Some(key) = self.reuse_shared_discovery(
+            uri,
+            &path,
+            discovery_inputs,
+            cancel,
+            budget,
+            defer_context_pruning,
+        )? {
+            return Ok(key);
+        }
         let discovered =
             discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
                 &path,
@@ -9839,8 +10123,9 @@ impl Workspace {
             project_selection,
             project_scope,
         } = discovery;
-        for warning in context_observations.warnings.iter().cloned() {
-            self.warn(warning);
+        let warnings = context_observations.warnings.clone();
+        for warning in warnings.iter().cloned() {
+            self.warn_project(warning);
         }
         let key = self.context_key_for_project_discovery(
             &path,
@@ -9867,7 +10152,121 @@ impl Workspace {
             budget,
             !defer_context_pruning,
         )?;
+        if let Some(state) = self.contexts.get(&key) {
+            self.shared_discoveries.insert(
+                self.configuration_generation,
+                uri.clone(),
+                discovery_inputs,
+                SharedDiscovery {
+                    key: key.clone(),
+                    state: state.clone(),
+                    warnings,
+                },
+            );
+        }
         Ok(key)
+    }
+
+    /// Everything automatic discovery for a document reads besides the
+    /// files its context watches. The cache epoch advances on every file
+    /// event, including Delphi override files.
+    fn discovery_inputs_fingerprint(
+        &self,
+        roots: &[PathBuf],
+        project_options: &ProjectOptions,
+        deleted_paths: &impl std::fmt::Debug,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn sorted<K: std::fmt::Debug, V: std::fmt::Debug>(map: &HashMap<K, V>) -> Vec<String> {
+            let mut entries = map
+                .iter()
+                .map(|entry| format!("{entry:?}"))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{roots:?}").hash(&mut hasher);
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            project_options.project_file,
+            project_options.build_config,
+            project_options.platform,
+            project_options.source_paths,
+            project_options.conditional_context
+        )
+        .hash(&mut hasher);
+        sorted(&project_options.installation_selections).hash(&mut hasher);
+        sorted(&project_options.build_selections).hash(&mut hasher);
+        sorted(&self.project_selections).hash(&mut hasher);
+        format!("{:?}", self.options.exclude).hash(&mut hasher);
+        format!("{deleted_paths:?}").hash(&mut hasher);
+        self.project_cache.invalidation_epoch().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Adopt the context another workspace sharing this one's discoveries
+    /// found for `uri` with the same inputs, if its watched files still
+    /// prove it current.
+    fn reuse_shared_discovery(
+        &mut self,
+        uri: &Url,
+        path: &Path,
+        discovery_inputs: u64,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
+    ) -> Result<Option<ContextKey>, String> {
+        let generation = self.configuration_generation;
+        let Some(discovery) = self
+            .shared_discoveries
+            .get(generation, uri, discovery_inputs)
+        else {
+            return Ok(None);
+        };
+        let installed = !self.contexts.contains_key(&discovery.key);
+        if installed {
+            self.contexts
+                .insert(discovery.key.clone(), discovery.state.clone());
+        } else if let Some(state) = self.contexts.get_mut(&discovery.key) {
+            // The installed state was discovered for another document; record
+            // the candidate memberships of this one's directories, as
+            // `install_context` would.
+            for (directory, membership) in &discovery.state.project_candidate_memberships {
+                state
+                    .project_candidate_memberships
+                    .entry(directory.clone())
+                    .or_insert_with(|| membership.clone());
+            }
+        }
+        self.extend_context_watch_paths(&discovery.key, path, cancel, budget)?;
+        if !(self.context_is_fresh_with_cancel(&discovery.key, cancel, budget)?
+            && self.context_matches_current_selection_with_cancel_and_budget(
+                path,
+                &discovery.key,
+                cancel,
+                budget,
+            )?)
+        {
+            if installed {
+                self.contexts.remove(&discovery.key);
+            }
+            self.shared_discoveries
+                .remove(generation, uri, discovery_inputs);
+            return Ok(None);
+        }
+        for warning in discovery.warnings {
+            self.warn_project(warning);
+        }
+        self.select_document_context_with_pruning(
+            uri,
+            &discovery.key,
+            self.owner_origin_for_context_key(&discovery.key),
+            cancel,
+            budget,
+            !defer_context_pruning,
+        )?;
+        Ok(Some(discovery.key))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12904,6 +13303,7 @@ impl Workspace {
             .document_contexts
             .values()
             .chain(self.open_document_contexts.values())
+            .chain(self.pinned_context.iter())
         {
             if unused.is_empty() {
                 break;
@@ -13096,6 +13496,19 @@ impl Workspace {
 
     pub(crate) fn project_cache(&self) -> &crate::project_cache::ProjectCache {
         &self.project_cache
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
+    pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
+        &self.persistent_cache
+    }
+
+    pub(crate) fn set_persistent_cache(&mut self, cache: crate::persistent_cache::PersistentCache) {
+        self.persistent_cache = cache;
+    }
+
+    pub(crate) fn configured_project_file(&self) -> Option<&Path> {
+        self.options.project_file.as_deref()
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {
@@ -13465,6 +13878,21 @@ impl Workspace {
         self.global_configuration_change_generation = self.configuration_generation;
     }
 
+    /// A project discovery warning: kept like any warning, but logged once
+    /// per configuration generation across the workspaces sharing
+    /// discoveries, which each rediscover the same project.
+    fn warn_project(&mut self, message: String) {
+        if self
+            .shared_discoveries
+            .first_report(self.configuration_generation, &message)
+        {
+            self.warn(message);
+        } else if !self.warnings.contains(&message) && self.warnings.len() < MAX_WORKSPACE_WARNINGS
+        {
+            self.warnings.push(message);
+        }
+    }
+
     fn warn(&mut self, message: String) {
         if self.warnings.iter().any(|warning| warning == &message) {
             return;
@@ -13472,6 +13900,8 @@ impl Workspace {
         match self.warnings.len().cmp(&MAX_WORKSPACE_WARNINGS) {
             std::cmp::Ordering::Less => {
                 eprintln!("pascal-lsp: warning: {message}");
+                #[cfg(test)]
+                TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().push(message.clone()));
                 self.warnings.push(message);
             }
             std::cmp::Ordering::Equal => {
@@ -15431,6 +15861,30 @@ fn wait_at_import_claim_test_barrier() {
     use std::io::Write as _;
 
     let Ok(spec) = std::env::var("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER") else {
+        return;
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    {
+        let _ = marker.write_all(b"x");
+    }
+    while !Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Holds background work (diagnostics) after the first unit of a closure
+/// walk, so protocol tests can issue interactive work while it runs.
+#[cfg(feature = "test-support")]
+fn wait_at_background_walk_test_barrier() {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER") else {
         return;
     };
     let Some((entered, release)) = spec.split_once('|') else {
@@ -19849,6 +20303,93 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_unit_appearing_in_a_search_directory_invalidates_the_stored_imports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().join("ws");
+        let lib = temp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let (main_uri, provider_uri) = provider_fixture(&root);
+        fs::write(
+            main_uri.to_file_path().unwrap(),
+            "unit Main;\ninterface\nuses Provider, Missing;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let options = WorkspaceOptions {
+            source_paths: vec![lib.display().to_string()],
+            ..Default::default()
+        };
+        let main = test_workspace(vec![root.clone()], options);
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(located[0].uri, provider_uri);
+        assert!(
+            main.project_cache
+                .ready_layers(&main_uri)
+                .contains(&"Import".to_string()),
+            "the settled resolution is stored"
+        );
+
+        let missing = lib.join("Missing.pas");
+        fs::write(&missing, "unit Missing;\ninterface\nimplementation\nend.\n").unwrap();
+        let affected = crate::file_watch::apply_watch_event(
+            &main.project_cache,
+            crate::file_watch::WatchEvent::Changed(vec![missing]),
+        );
+        assert!(affected.contains(&main_uri), "{affected:?}");
+        assert!(
+            !main
+                .project_cache
+                .ready_layers(&main_uri)
+                .contains(&"Import".to_string()),
+            "the watcher event removes the stored resolution"
+        );
+    }
+
+    #[test]
+    fn imports_with_a_missing_unit_are_resolved_once() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main_path = main_uri.to_file_path().unwrap();
+        fs::write(
+            &main_path,
+            "unit Main;\ninterface\nuses Provider, Missing;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let navigate = || {
+            worker_view(&main).navigate(
+                &main_uri,
+                Position::new(6, 2),
+                NavigationTarget::Definition,
+            )
+        };
+
+        super::test_reset_import_resolution_count();
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(super::test_import_resolution_count(), 1);
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(
+            super::test_import_resolution_count(),
+            1,
+            "an import resolution that stays incomplete only through a missing unit is reused"
+        );
+
+        // The missing unit's lookup is evidence: once it appears, the
+        // resolution is computed again.
+        fs::write(
+            temp.path().join("Missing.pas"),
+            "unit Missing;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(super::test_import_resolution_count(), 2);
+    }
+
+    #[test]
     fn dependency_hook_sees_each_dependency_and_can_cancel() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
@@ -19863,6 +20404,177 @@ mod tests {
         let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
         assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
         assert_eq!(*seen.lock().unwrap(), vec![(0, 1)]);
+    }
+
+    /// A diagnostics-like job walks `Main`'s closure (`First`, `Second`,
+    /// `Third`) and an interactive request needing the same closure arrives
+    /// after the first unit: the job pauses at its next unit, the request
+    /// does the rest itself without waiting, and the job then finishes from
+    /// the cache. Each unit is parsed once and the resolution computed once.
+    #[test]
+    fn background_closure_walk_yields_to_interactive_requests_between_units() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main;\ninterface\nuses First, Second, Third;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        for name in ["First", "Second", "Third"] {
+            fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name};\ninterface\nimplementation\nend.\n"),
+            )
+            .unwrap();
+        }
+        let main_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let main = test_workspace(vec![root.to_path_buf()], Default::default());
+        let gate = Arc::new(crate::warmer::InteractiveGate::default());
+
+        let (at_boundary_tx, at_boundary_rx) = std::sync::mpsc::channel();
+        let walked = Arc::new(Mutex::new(Vec::new()));
+        let mut background = worker_view(&main);
+        let hook_gate = gate.clone();
+        let hook_walked = walked.clone();
+        background.set_dependency_hook(Arc::new(move |_, done, _| {
+            hook_walked.lock().unwrap().push(done);
+            if done == 1 {
+                // An interactive request arrives after the first unit.
+                hook_gate.set(1);
+                at_boundary_tx.send(()).unwrap();
+            }
+            Ok(())
+        }));
+        let background_cancel = Arc::new(AtomicBool::new(false));
+        let background_gate = gate.clone();
+        let job = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::job(background_cancel.clone()),
+            );
+            crate::warmer::set_background_gate_on_this_thread(Some((
+                background_gate,
+                std::time::Duration::MAX,
+            )));
+            crate::navigation::test_reset_document_parse_count();
+            super::test_reset_import_resolution_count();
+            let result = background.warm_with_cancel(&main_uri, &background_cancel);
+            (
+                result.map(|outcome| outcome.dependencies.len()),
+                crate::navigation::test_document_parse_count(),
+                super::test_import_resolution_count(),
+            )
+        });
+        at_boundary_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the job walked its first unit");
+
+        let interactive_input = main.analysis_input();
+        let interactive_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let interactive = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    std::time::Duration::ZERO,
+                ),
+            );
+            crate::navigation::test_reset_document_parse_count();
+            super::test_reset_import_resolution_count();
+            let result = Workspace::from_analysis_input(&interactive_input)
+                .warm_with_cancel(&interactive_uri, &AtomicBool::new(false));
+            done_tx
+                .send((
+                    result.map(|outcome| outcome.dependencies.len()),
+                    crate::navigation::test_document_parse_count(),
+                    super::test_import_resolution_count(),
+                ))
+                .unwrap();
+        });
+        let (interactive_result, interactive_parses, interactive_resolutions) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the interactive request finishes while the job is paused");
+        let walked_while_interactive = walked.lock().unwrap().clone();
+        gate.set(0);
+        interactive.join().unwrap();
+        let (job_result, job_parses, job_resolutions) = job.join().unwrap();
+
+        assert_eq!(interactive_result, Ok(3));
+        assert_eq!(job_result, Ok(3), "the job completes after the request");
+        assert_eq!(
+            walked_while_interactive,
+            vec![0, 1],
+            "the job paused at the unit boundary"
+        );
+        assert_eq!(
+            (job_resolutions, interactive_resolutions),
+            (1, 0),
+            "the resolution is computed once and reused"
+        );
+        assert_eq!(
+            (job_parses, interactive_parses),
+            (2, 2),
+            "the job parsed Main and First, the request Second and Third, and nothing twice"
+        );
+    }
+
+    #[test]
+    fn uses_clause_definitions_reuse_the_import_resolution() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        super::test_reset_import_resolution_count();
+        for _ in 0..2 {
+            let located = worker_view(&main).navigate(
+                &main_uri,
+                Position::new(2, 6),
+                NavigationTarget::Definition,
+            );
+            assert_eq!(located[0].uri, provider_uri);
+        }
+        assert_eq!(super::test_import_resolution_count(), 1);
+    }
+
+    #[test]
+    fn import_resolution_is_stored_before_its_dependencies_are_walked() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let mut worker = worker_view(&main);
+        let cache = main.project_cache.clone();
+        let importer = main_uri.clone();
+        let layers_at_walk = Arc::new(Mutex::new(None));
+        let recorded = layers_at_walk.clone();
+        worker.set_dependency_hook(Arc::new(move |_, done, _| {
+            if done == 0 {
+                *recorded.lock().unwrap() = Some(cache.ready_layers(&importer));
+            }
+            Err(super::CANCELLATION_MESSAGE.to_string())
+        }));
+        let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
+        assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
+        assert!(
+            layers_at_walk
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the walk started")
+                .contains(&"Import".to_string()),
+            "{layers_at_walk:?}"
+        );
+
+        super::test_reset_import_resolution_count();
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(located[0].uri, provider_uri);
+        assert_eq!(
+            super::test_import_resolution_count(),
+            0,
+            "a walk stopped in its dependencies keeps the resolution"
+        );
     }
 
     #[test]
@@ -23849,6 +24561,7 @@ BDS = '/fake/37'
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
+                    settled: true,
                 }),
                 report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
@@ -23862,6 +24575,40 @@ BDS = '/fake/37'
             bytes,
             &cancel,
         );
+    }
+
+    #[test]
+    fn max_workspace_units_defaults_to_one_hundred_thousand() {
+        let options = WorkspaceOptions::parse(None).unwrap();
+        assert_eq!(options.limits.max_workspace_units, 100_000);
+    }
+
+    #[test]
+    fn max_workspace_units_is_configurable_downward_and_clamped() {
+        let parse = |value| WorkspaceOptions::parse(Some(&json!({"maxWorkspaceUnits": value})));
+        assert_eq!(parse(500).unwrap().limits.max_workspace_units, 500);
+        assert_eq!(parse(250_000).unwrap().limits.max_workspace_units, 100_000);
+        assert_eq!(
+            parse(0).unwrap_err(),
+            "initializationOptions.maxWorkspaceUnits must be at least 1"
+        );
+    }
+
+    #[test]
+    fn max_workspace_units_runtime_option_applies_keeps_and_resets() {
+        let base = WorkspaceOptions::default();
+        let mut runtime = super::RuntimeOptionsOverride::default();
+        runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 42})).unwrap());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        let warnings =
+            runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 0})).unwrap());
+        assert_eq!(
+            warnings,
+            ["ignoring runtime maxWorkspaceUnits: must be at least 1"]
+        );
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        runtime.apply(super::RuntimeOptionsUpdate::reset());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 100_000);
     }
 
     #[test]
@@ -23966,6 +24713,47 @@ BDS = '/fake/37'
 
         assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
         assert!(!workspace.project_cache.has_room());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_cache_budget_change_readmits_the_persistent_store() {
+        use crate::persistent_cache::{CacheOptions, CacheState, PersistentCache, StatusCause};
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let store = super::persist::tests::private_dir();
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let cache = PersistentCache::start_unscheduled_for_test(
+            CacheOptions {
+                directory: Some(store.path().to_path_buf()),
+                ..CacheOptions::default()
+            },
+            workspace.project_cache.clone(),
+            Arc::default(),
+            pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([0x5d; 32])),
+        );
+        let settle = std::time::Duration::from_secs(10);
+        assert_eq!(cache.settle(settle), CacheState::Enabled);
+        workspace.set_persistent_cache(cache.clone());
+        let update = super::parse_runtime_options(&json!({"maxCacheBytes": 1_048_576}))
+            .expect("runtime cache budget option");
+        let mut overrides = RuntimeOptionsOverride::default();
+        assert!(overrides.apply(update).is_empty());
+        let prepared = Workspace::prepare_runtime_options_for_roots(
+            workspace.configuration_root_paths(),
+            overrides.effective(&workspace.options),
+            &AtomicBool::new(false),
+        )
+        .expect("prepared runtime options");
+
+        assert!(workspace.apply_prepared_runtime_options(prepared));
+
+        assert_eq!(
+            cache.settle(settle),
+            CacheState::Bypassed(StatusCause::Memory)
+        );
+        assert_eq!(workspace.project_cache.stats().reserved_bytes(), 0);
+        cache.shutdown();
     }
 
     #[test]
@@ -24233,6 +25021,8 @@ BDS = '/fake/37'
             overlays,
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
+            persistent_cache: Default::default(),
+            shared_discoveries: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
@@ -25196,6 +25986,7 @@ BDS = '/fake/37'
                 max_file_bytes: source.len() + 3,
                 max_total_bytes: source.len() * 3,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };
@@ -25261,6 +26052,7 @@ BDS = '/fake/37'
                 max_file_bytes: 1024,
                 max_total_bytes: first_source.len() * 2 + second_source.len() * 2,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };
@@ -26306,6 +27098,26 @@ BDS = '/fake/37'
 
         assert!(workspace.contexts.contains_key(&live));
         assert!(!workspace.contexts.contains_key(&orphan));
+    }
+
+    #[test]
+    fn request_workspaces_carry_the_persistent_cache_handle() {
+        let mut workspace = Workspace::default();
+        let inert = format!("{:?}", workspace.persistent_cache());
+        assert!(inert.contains("inert: true"), "{inert}");
+        // Disabled: no worker, no store, no IO.
+        let options = crate::persistent_cache::CacheOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        workspace.set_persistent_cache(crate::persistent_cache::PersistentCache::start(
+            options,
+            workspace.project_cache().clone(),
+            Arc::default(),
+        ));
+        let request = Workspace::from_analysis_input(&workspace.analysis_input());
+        let carried = format!("{:?}", request.persistent_cache());
+        assert!(carried.contains("inert: false"), "{carried}");
     }
 
     #[test]

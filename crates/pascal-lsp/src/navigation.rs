@@ -18,6 +18,63 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
+/// `Node::parent` for the navigation code, which tests can measure.
+///
+/// Tree-sitter keeps no parent links: `parent` descends from the root and
+/// scans the children of every node on the way, so its cost grows with the
+/// depth of the node and the number of its ancestors' earlier siblings. A
+/// walk that already holds the ancestors (see
+/// `collect_nodes_with_ancestors`) should use them instead.
+pub(super) trait TreeParent<'tree> {
+    fn tree_parent(&self) -> Option<Node<'tree>>;
+}
+
+impl<'tree> TreeParent<'tree> for Node<'tree> {
+    fn tree_parent(&self) -> Option<Node<'tree>> {
+        #[cfg(test)]
+        test_record_parent_lookup(*self);
+        self.parent()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sibling steps the measured `tree_parent` calls cost, while measuring.
+    static TEST_PARENT_LOOKUP_STEPS: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Charges a parent lookup with the children tree-sitter scans to find it:
+/// at each level from the root down to `node`, the children before the one
+/// that leads to `node`.
+#[cfg(test)]
+fn test_record_parent_lookup(node: Node<'_>) {
+    if TEST_PARENT_LOOKUP_STEPS.with(Cell::get).is_none() {
+        return;
+    }
+    let mut steps = 0u64;
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        let mut cursor = parent.walk();
+        let position = parent
+            .children(&mut cursor)
+            .position(|candidate| candidate.id() == child.id())
+            .unwrap_or_default();
+        steps += position as u64 + 1;
+        child = parent;
+    }
+    TEST_PARENT_LOOKUP_STEPS.with(|value| value.set(value.get().map(|total| total + steps)));
+}
+
+/// Runs `work` and returns the sibling steps its `tree_parent` calls cost.
+#[cfg(test)]
+fn test_parent_lookup_steps(work: impl FnOnce()) -> u64 {
+    let previous = TEST_PARENT_LOOKUP_STEPS.with(|value| value.replace(Some(0)));
+    work();
+    TEST_PARENT_LOOKUP_STEPS
+        .with(|value| value.replace(previous))
+        .unwrap_or_default()
+}
+
 fn map_verified_header_location(uri: &Url, range: Range) -> Location {
     Location::new(uri.clone(), range)
 }
@@ -28,6 +85,8 @@ pub mod compiled_dcu;
 mod documentation;
 mod facts;
 mod folding;
+#[cfg(test)]
+mod index_characterization;
 mod inlay;
 mod overload;
 mod rename;
@@ -36,6 +95,9 @@ mod selection;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
+#[cfg(test)]
+pub(crate) use symbols::test_set_symbol_result_cap;
+pub(crate) use symbols::{lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap};
 mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
@@ -98,6 +160,10 @@ pub(crate) use inlay::InlayHintOptions;
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
+#[cfg(test)]
+pub(crate) use rename::test_exhaust_completion_member_lookup;
+#[allow(unused_imports)] // read by the query tasks of l4d-33
+pub(crate) use rename::{ReferenceTargetMember, ReferenceTargets};
 #[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
 pub(crate) use selection::validate_selection_position_count;
@@ -376,6 +442,28 @@ pub(super) fn test_document_parse_count() -> usize {
     TEST_DOCUMENT_PARSE_CALLS.with(Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BOUND_DOCUMENTS: std::cell::RefCell<Vec<Url>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_record_bound_document(uri: &Url) {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().push(uri.clone()));
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_bound_documents() {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().clear());
+}
+
+/// Documents whose identifiers `collect_occurrences_bounded` walked, in order.
+#[cfg(test)]
+pub(crate) fn test_bound_documents() -> Vec<Url> {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow().clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum IntegerKind {
     Literal,
@@ -433,6 +521,48 @@ pub struct NavigationIndex {
     auto_import_unit_providers: HashMap<String, Vec<Url>>,
     compiled_unit_uris: HashSet<Url>,
     compiled_unit_bytes: usize,
+    /// Read-only features bind best effort (D16): an imported or unit-level
+    /// global referenced in a method binds even when an inherited member the
+    /// index cannot prove absent could shadow it.
+    best_effort_bindings: bool,
+    /// What best-effort binding decided that the strict rule would not.
+    relaxed_bindings: RelaxedBindings,
+}
+
+/// Distinct relaxed binding decisions retained for one answer.
+const MAX_RELAXED_BINDINGS: usize = 8;
+
+/// Reasons a best-effort answer may be shadowed, recorded while a query
+/// resolves through a shared index. A clone starts empty: the record belongs
+/// to the queries of one index.
+#[derive(Default)]
+struct RelaxedBindings(std::sync::Mutex<Vec<String>>);
+
+impl Clone for RelaxedBindings {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl RelaxedBindings {
+    fn record(&self, reason: String) {
+        let mut reasons = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reasons.len() < MAX_RELAXED_BINDINGS && !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -1084,6 +1214,8 @@ impl NavigationIndex {
             )?,
             compiled_unit_uris: self.compiled_unit_uris.clone(),
             compiled_unit_bytes: self.compiled_unit_bytes,
+            best_effort_bindings: false,
+            relaxed_bindings: RelaxedBindings::default(),
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
@@ -6167,7 +6299,7 @@ impl NavigationIndex {
             {
                 return Ok(false);
             }
-            current = node.parent();
+            current = node.tree_parent();
         }
         Ok(true)
     }
@@ -6223,7 +6355,7 @@ impl NavigationIndex {
             {
                 return Ok(MissingUnitUseKind::WritableValue);
             }
-            current = node.parent();
+            current = node.tree_parent();
         }
         Ok(MissingUnitUseKind::Value)
     }
@@ -9102,7 +9234,7 @@ impl NavigationIndex {
         match node.kind() {
             "identifier" => {
                 let name = node_text_with_budget(node, &current_document.source, cancel, budget)?;
-                let is_qualified_receiver = node.parent().is_some_and(|parent| {
+                let is_qualified_receiver = node.tree_parent().is_some_and(|parent| {
                     matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
                         && parent
                             .child_by_field_name("lhs")
@@ -14756,6 +14888,17 @@ impl AssistanceBudget {
         Ok(true)
     }
 
+    /// Whether `error` reports this budget running out, rather than a
+    /// cancellation or a failure a partial answer must not hide.
+    pub(super) fn exhausted_by(&self, error: &str, cancel: &AtomicBool) -> bool {
+        self.exhausted
+            && !cancel.load(Ordering::Relaxed)
+            && error.starts_with(self.operation)
+            && (error.ends_with("-byte scan limit")
+                || error.ends_with("-node traversal limit")
+                || error.ends_with("-byte proof/materialization limit"))
+    }
+
     pub(super) fn require_work(
         &mut self,
         amount: usize,
@@ -16353,14 +16496,21 @@ impl Document {
             })
             .collect();
 
-        let mut module_names = Vec::new();
+        // Module names, whether they are in a uses clause, and their region.
+        let mut module_names: Vec<(Node<'_>, bool, Region)> = Vec::new();
         let mut sections = Vec::new();
         let mut uses_clauses = Vec::new();
         let mut has_initialization = false;
         let mut has_finalization = false;
-        collect_nodes(root, &mut |node| {
+        collect_nodes_with_ancestors(root, &mut |node, ancestors| {
             if node.kind() == "moduleName" {
-                module_names.push(node);
+                module_names.push((
+                    node,
+                    ancestors
+                        .iter()
+                        .any(|ancestor| ancestor.kind() == "declUses"),
+                    region_among(node, nearest_first(ancestors)),
+                ));
             } else if node.kind() == "interface" {
                 sections.push((Region::Interface, Span::from_node(node)));
             } else if node.kind() == "implementation" {
@@ -16371,7 +16521,7 @@ impl Document {
                         start: node.start_byte(),
                         end: node.end_byte(),
                     },
-                    interface: region_for_node(node) == Region::Interface,
+                    interface: region_among(node, nearest_first(ancestors)) == Region::Interface,
                 });
             } else if node.kind() == "initialization" {
                 has_initialization = true;
@@ -16382,8 +16532,8 @@ impl Document {
 
         let unit_module = module_names
             .iter()
-            .copied()
-            .find(|node| !has_ancestor_kind(*node, "declUses"));
+            .find(|(_, in_uses, _)| !in_uses)
+            .map(|(node, _, _)| *node);
         let unit_name = unit_module
             .map(|node| canonical_path(&identifier_texts(node, &source)))
             .filter(|name| !name.is_empty())
@@ -16403,15 +16553,14 @@ impl Document {
         let mut interface_uses = Vec::new();
         let mut implementation_uses = Vec::new();
         let mut imports = Vec::new();
-        for module_name in &module_names {
-            if !has_ancestor_kind(*module_name, "declUses") {
+        for &(module_name, in_uses, region) in &module_names {
+            if !in_uses {
                 continue;
             }
-            let name = canonical_path(&identifier_texts(*module_name, &source));
+            let name = canonical_path(&identifier_texts(module_name, &source));
             if name.is_empty() || name.eq_ignore_ascii_case("in") {
                 continue;
             }
-            let region = region_for_node(*module_name);
             imports.push(ImportMetadata {
                 name: name.clone(),
                 span: SourceSpan {
@@ -16445,8 +16594,7 @@ impl Document {
             .map(|import| canonical_name(&import.name))
             .collect();
 
-        let definitions = collect_nodes_matching(root, "defProc");
-        let (scopes, scope_by_span) = build_scopes(source.len(), root, &definitions, &source);
+        let (scopes, scope_by_span) = build_scopes(source.len(), root, &source);
         let scope_intervals =
             SourceIntervalIndex::from_intervals(scopes.iter().enumerate().map(|(index, scope)| {
                 (
@@ -16993,13 +17141,18 @@ fn symbol_is_available_at(
         })
 }
 
-fn visibility_for_declaration(node: Node<'_>, source: &str) -> Visibility {
-    if enclosing_type(node, source).is_none() {
+/// The visibility section a member declaration is in, given its ancestors
+/// nearest first.
+fn visibility_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>> + Clone,
+    source: &str,
+) -> Visibility {
+    if enclosing_type_among(node, ancestors.clone(), source).is_none() {
         return Visibility::Public;
     }
 
-    let mut current = node.parent();
-    while let Some(parent) = current {
+    for parent in ancestors {
         match parent.kind() {
             "declSection" | "ppDeclSection" => {
                 let strict = has_direct_child_kind(parent, "kStrict");
@@ -17021,7 +17174,7 @@ fn visibility_for_declaration(node: Node<'_>, source: &str) -> Visibility {
                 };
             }
             "declType" => break,
-            _ => current = parent.parent(),
+            _ => {}
         }
     }
     Visibility::Public
@@ -17136,20 +17289,27 @@ fn collect_symbols(
     scope_by_span: &HashMap<Span, usize>,
     symbols: &mut Vec<Symbol>,
 ) {
-    collect_nodes(root, &mut |node| match node.kind() {
-        "defProc" => add_definition_symbol(node, source, scopes, scope_by_span, symbols),
-        "declProc" if !is_definition_header(node) => {
-            add_routine_symbol(node, source, scope_by_span, symbols);
+    collect_nodes_with_ancestors(root, &mut |node, ancestors| match node.kind() {
+        "defProc" => add_definition_symbol(node, ancestors, source, scopes, scope_by_span, symbols),
+        "declProc" if !is_definition_header_under(node, ancestors.last().copied()) => {
+            add_routine_symbol(node, ancestors, source, scope_by_span, symbols);
         }
-        "declType" => {
-            add_named_symbol(node, source, scope_by_span, symbols, SymbolKind::Type, None)
-        }
+        "declType" => add_named_symbol(
+            node,
+            ancestors,
+            source,
+            scope_by_span,
+            symbols,
+            SymbolKind::Type,
+            None,
+        ),
         "declVar" | "varDef" | "varAssignDef" => {
             let type_name = node
                 .child_by_field_name("type")
                 .and_then(|type_node| simple_type_path(type_node, source));
             add_named_symbol(
                 node,
+                ancestors,
                 source,
                 scope_by_span,
                 symbols,
@@ -17159,6 +17319,7 @@ fn collect_symbols(
         }
         "declConst" => add_named_symbol(
             node,
+            ancestors,
             source,
             scope_by_span,
             symbols,
@@ -17171,6 +17332,7 @@ fn collect_symbols(
                 .and_then(|type_node| simple_type_path(type_node, source));
             add_named_symbol(
                 node,
+                ancestors,
                 source,
                 scope_by_span,
                 symbols,
@@ -17184,6 +17346,7 @@ fn collect_symbols(
                 .and_then(|type_node| simple_type_path(type_node, source));
             add_named_symbol(
                 node,
+                ancestors,
                 source,
                 scope_by_span,
                 symbols,
@@ -17197,6 +17360,7 @@ fn collect_symbols(
                 .and_then(|type_node| simple_type_path(type_node, source));
             add_named_symbol(
                 node,
+                ancestors,
                 source,
                 scope_by_span,
                 symbols,
@@ -17206,6 +17370,7 @@ fn collect_symbols(
         }
         "declEnumValue" => add_named_symbol(
             node,
+            ancestors,
             source,
             scope_by_span,
             symbols,
@@ -17214,6 +17379,7 @@ fn collect_symbols(
         ),
         "declLabel" => add_named_symbol(
             node,
+            ancestors,
             source,
             scope_by_span,
             symbols,
@@ -17355,11 +17521,15 @@ fn pair_abbreviated_definitions(
     }
 
     let mut declaration_nodes_by_key: HashMap<String, Vec<Node<'_>>> = HashMap::new();
-    for node in collect_nodes_matching(root, "declProc") {
-        if is_definition_header(node) || !is_routine_declaration_region(region_for_node(node)) {
+    for (node, ancestors) in collect_nodes_matching_with_ancestors(root, "declProc") {
+        if is_definition_header_under(node, ancestors.last().copied())
+            || !is_routine_declaration_region(region_among(node, nearest_first(&ancestors)))
+        {
             continue;
         }
-        let Some((name, _, owner_type)) = routine_name(node, source) else {
+        let Some((name, _, owner_type)) =
+            routine_name_among(node, nearest_first(&ancestors), source)
+        else {
             continue;
         };
         let signature = routine_signature(node, source);
@@ -17369,7 +17539,7 @@ fn pair_abbreviated_definitions(
             &name,
             &signature,
             &generic_parameters,
-            scope_for_declaration(node, scope_by_span),
+            scope_among(node, nearest_first(&ancestors), scope_by_span),
         );
         declaration_nodes_by_key
             .entry(routine_key)
@@ -17567,8 +17737,9 @@ fn inject_abbreviated_parameters(
     });
 }
 
-fn add_definition_symbol(
-    node: Node<'_>,
+fn add_definition_symbol<'a>(
+    node: Node<'a>,
+    ancestors: &[Node<'a>],
     source: &str,
     scopes: &[Scope],
     scope_by_span: &HashMap<Span, usize>,
@@ -17577,10 +17748,13 @@ fn add_definition_symbol(
     let Some(header) = node.child_by_field_name("header") else {
         return;
     };
-    let Some((name, span, owner_type)) = routine_name(header, source) else {
+    let header_ancestors = std::iter::once(node).chain(nearest_first(ancestors));
+    let Some((name, span, owner_type)) =
+        routine_name_among(header, header_ancestors.clone(), source)
+    else {
         return;
     };
-    let owner_type_name = routine_owner_name(header, source);
+    let owner_type_name = routine_owner_name_among(header, header_ancestors, source);
     let own_scope = scope_by_span
         .get(&Span::from_node(node))
         .copied()
@@ -17593,6 +17767,7 @@ fn add_definition_symbol(
         .and_then(|type_node| type_ref_from_node(type_node, source));
     let generic_parameters = generic_parameters_for_node(header, source);
     let routine_parameters = direct_routine_parameters(header, source);
+    let region = region_among(node, nearest_first(ancestors));
     let routine_key = routine_key_with_owner(
         owner_type.as_deref(),
         &name,
@@ -17615,7 +17790,7 @@ fn add_definition_symbol(
         owner_type: owner_type.clone(),
         owner_type_name,
         visibility: Visibility::Public,
-        declaration_ordered: scope != ROOT_SCOPE || region_for_node(node) != Region::Interface,
+        declaration_ordered: scope != ROOT_SCOPE || region != Region::Interface,
         generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
@@ -17624,7 +17799,7 @@ fn add_definition_symbol(
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
-        region: region_for_node(node),
+        region,
         origin: Origin::Definition,
         is_static: has_class_modifier(header),
         local_only: false,
@@ -17646,21 +17821,24 @@ fn add_definition_symbol(
         &generic_parameters,
         &routine_key,
         scope,
-        region_for_node(node),
+        region,
     );
 }
 
-fn add_routine_symbol(
-    node: Node<'_>,
+fn add_routine_symbol<'a>(
+    node: Node<'a>,
+    ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
     symbols: &mut Vec<Symbol>,
 ) {
-    let Some((name, span, owner_type)) = routine_name(node, source) else {
+    let Some((name, span, owner_type)) = routine_name_among(node, nearest_first(ancestors), source)
+    else {
         return;
     };
-    let owner_type_name = routine_owner_name(node, source);
-    let scope = scope_for_declaration(node, scope_by_span);
+    let owner_type_name = routine_owner_name_among(node, nearest_first(ancestors), source);
+    let scope = scope_among(node, nearest_first(ancestors), scope_by_span);
+    let region = region_among(node, nearest_first(ancestors));
     let signature = routine_signature(node, source);
     let result_type = routine_result_type(node, source);
     let result_type_ref = node
@@ -17689,8 +17867,8 @@ fn add_routine_symbol(
         scope,
         owner_type: owner_type.clone(),
         owner_type_name,
-        visibility: visibility_for_declaration(node, source),
-        declaration_ordered: scope != ROOT_SCOPE || region_for_node(node) != Region::Interface,
+        visibility: visibility_among(node, nearest_first(ancestors), source),
+        declaration_ordered: scope != ROOT_SCOPE || region != Region::Interface,
         generic_parameters: generic_parameters.clone(),
         generic_parameter: None,
         type_name: None,
@@ -17699,7 +17877,7 @@ fn add_routine_symbol(
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
-        region: region_for_node(node),
+        region,
         origin: Origin::Declaration,
         is_static: has_class_modifier(node),
         local_only: false,
@@ -17721,7 +17899,7 @@ fn add_routine_symbol(
         &generic_parameters,
         &routine_key,
         scope,
-        region_for_node(node),
+        region,
     );
 }
 
@@ -17774,24 +17952,27 @@ fn push_routine_generic_parameter_symbols(
     }
 }
 
-fn add_named_symbol(
-    node: Node<'_>,
+fn add_named_symbol<'a>(
+    node: Node<'a>,
+    ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
     symbols: &mut Vec<Symbol>,
     kind: SymbolKind,
     type_name: Option<String>,
 ) {
-    let owner_type = enclosing_type(node, source);
-    let owner_type_name = enclosing_type_name(node, source);
-    let scope = scope_for_declaration(node, scope_by_span);
+    let owner_type = enclosing_type_among(node, nearest_first(ancestors), source);
+    let owner_type_name = enclosing_type_name_among(node, nearest_first(ancestors), source);
+    let scope = scope_among(node, nearest_first(ancestors), scope_by_span);
+    let visibility = visibility_among(node, nearest_first(ancestors), source);
+    let region = region_among(node, nearest_first(ancestors));
     let local_only = kind == SymbolKind::Parameter && scope == ROOT_SCOPE;
     let type_kind = if kind == SymbolKind::Type {
         type_kind_for_declaration(node)
     } else {
         TypeKind::Other
     };
-    let is_static = declaration_is_static(node);
+    let is_static = declaration_is_static(node, ancestors.last().copied());
     let type_excerpt_end = if kind == SymbolKind::Type {
         type_declaration_excerpt_end(node, type_kind)
     } else {
@@ -17846,7 +18027,7 @@ fn add_named_symbol(
             scope,
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
-            visibility: visibility_for_declaration(node, source),
+            visibility,
             declaration_ordered: scope != ROOT_SCOPE && owner_type.is_none(),
             generic_parameters: generic_parameters.clone(),
             generic_parameter: None,
@@ -17856,7 +18037,7 @@ fn add_named_symbol(
             result_type_name: None,
             result_type_ref: None,
             result_type_span: None,
-            region: region_for_node(node),
+            region,
             origin: Origin::Declaration,
             is_static,
             local_only,
@@ -17898,7 +18079,7 @@ fn add_named_symbol(
                 result_type_name: None,
                 result_type_ref: None,
                 result_type_span: None,
-                region: region_for_node(node),
+                region,
                 origin: Origin::Declaration,
                 is_static: false,
                 local_only: false,
@@ -17916,15 +18097,15 @@ fn add_named_symbol(
     }
 }
 
-fn declaration_is_static(node: Node<'_>) -> bool {
+fn declaration_is_static(node: Node<'_>, parent: Option<Node<'_>>) -> bool {
     match node.kind() {
         "declProc" | "declProp" => has_class_modifier(node),
-        "declVar" => node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "declVars" && has_class_modifier(parent)),
-        "declConst" => node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "declConsts" && has_class_modifier(parent)),
+        "declVar" => {
+            parent.is_some_and(|parent| parent.kind() == "declVars" && has_class_modifier(parent))
+        }
+        "declConst" => {
+            parent.is_some_and(|parent| parent.kind() == "declConsts" && has_class_modifier(parent))
+        }
         _ => false,
     }
 }
@@ -18086,8 +18267,8 @@ fn helper_parent_node<'a>(node: Node<'a>, for_start: usize, source: &str) -> Opt
 
 fn collect_helpers(root: Node<'_>, source: &str) -> Vec<HelperDefinition> {
     let mut helpers = Vec::new();
-    for declaration in collect_nodes_matching(root, "declType") {
-        if enclosing_type(declaration, source).is_some() {
+    for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declType") {
+        if enclosing_type_among(declaration, nearest_first(&ancestors), source).is_some() {
             continue;
         }
         let Some(type_node) = declaration.child_by_field_name("type") else {
@@ -18138,7 +18319,7 @@ fn collect_helpers(root: Node<'_>, source: &str) -> Vec<HelperDefinition> {
             generic_parameters,
             target,
             parent,
-            region: region_for_node(declaration),
+            region: region_among(declaration, nearest_first(&ancestors)),
         });
     }
     helpers.sort_by_key(|helper| helper.declaration_span.start);
@@ -18289,8 +18470,8 @@ fn collect_type_ancestry(
 ) -> (HashMap<String, Vec<TypeAncestry>>, HashSet<Span>) {
     let mut ancestry = HashMap::new();
     let mut forward_spans = HashSet::new();
-    for declaration in collect_nodes_matching(root, "declType") {
-        if enclosing_type(declaration, source).is_some() {
+    for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declType") {
+        if enclosing_type_among(declaration, nearest_first(&ancestors), source).is_some() {
             continue;
         }
         let Some(name) = declaration_name_identifiers(declaration).last().copied() else {
@@ -18410,8 +18591,10 @@ fn collect_type_ancestry(
 
 fn collect_method_resolutions(root: Node<'_>, source: &str) -> Vec<MethodResolution> {
     let mut resolutions = Vec::new();
-    for declaration in collect_nodes_matching(root, "declProc") {
-        let Some(class_owner) = enclosing_type(declaration, source) else {
+    for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declProc") {
+        let Some(class_owner) =
+            enclosing_type_among(declaration, nearest_first(&ancestors), source)
+        else {
             continue;
         };
         let names = declaration_name_identifiers(declaration);
@@ -18448,8 +18631,10 @@ fn collect_method_resolutions(root: Node<'_>, source: &str) -> Vec<MethodResolut
 
 fn collect_interface_delegations(root: Node<'_>, source: &str) -> Vec<InterfaceDelegation> {
     let mut delegations = Vec::new();
-    for declaration in collect_nodes_matching(root, "declProp") {
-        let Some(class_owner) = enclosing_type(declaration, source) else {
+    for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declProp") {
+        let Some(class_owner) =
+            enclosing_type_among(declaration, nearest_first(&ancestors), source)
+        else {
             continue;
         };
         let mut cursor = declaration.walk();
@@ -18539,6 +18724,15 @@ fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {
 }
 
 fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<String>)> {
+    routine_name_among(node, tree_ancestors(node), source)
+}
+
+/// `routine_name`, given the ancestors of `node` nearest first.
+fn routine_name_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>>,
+    source: &str,
+) -> Option<(String, Span, Option<String>)> {
     let identifiers = declaration_name_identifiers(node);
     let last = identifiers.last().copied()?;
     let name = node_text(last, source);
@@ -18547,19 +18741,25 @@ fn routine_name(node: Node<'_>, source: &str) -> Option<(String, Span, Option<St
             .get(identifiers.len().saturating_sub(2))
             .map(|identifier| canonical_name(&node_text(*identifier, source)))
     } else {
-        enclosing_type(node, source)
+        enclosing_type_among(node, ancestors, source)
     };
     Some((name, Span::from_node(last), owner_type))
 }
 
-fn routine_owner_name(node: Node<'_>, source: &str) -> Option<String> {
+/// The owner type spelling of a routine, given the ancestors of `node`
+/// nearest first.
+fn routine_owner_name_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>>,
+    source: &str,
+) -> Option<String> {
     let identifiers = declaration_name_identifiers(node);
     if identifiers.len() > 1 {
         return identifiers
             .get(identifiers.len().saturating_sub(2))
             .map(|identifier| node_text(*identifier, source));
     }
-    enclosing_type_name(node, source)
+    enclosing_type_name_among(node, ancestors, source)
 }
 
 fn routine_signature(node: Node<'_>, source: &str) -> String {
@@ -18696,43 +18896,38 @@ fn generic_parameter_shape(parameter: &GenericParameter) -> String {
     }
 }
 
-fn enclosing_type(node: Node<'_>, source: &str) -> Option<String> {
+/// The type declaration whose type contains `node`, given the ancestors of
+/// `node` nearest first.
+fn enclosing_type_declaration<'a>(
+    node: Node<'a>,
+    mut ancestors: impl Iterator<Item = Node<'a>>,
+) -> Option<Node<'a>> {
     let node_span = Span::from_node(node);
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "declType" {
-            let Some(type_node) = parent.child_by_field_name("type") else {
-                current = parent.parent();
-                continue;
-            };
-            if Span::from_node(type_node).contains(node_span) {
-                let identifiers = declaration_name_identifiers(parent);
-                return identifiers
-                    .last()
-                    .map(|identifier| canonical_name(&node_text(*identifier, source)));
-            }
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    let node_span = Span::from_node(node);
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "declType"
+    ancestors.find(|parent| {
+        parent.kind() == "declType"
             && parent
                 .child_by_field_name("type")
                 .is_some_and(|type_node| Span::from_node(type_node).contains(node_span))
-        {
-            return declaration_name_identifiers(parent)
-                .last()
-                .map(|identifier| node_text(*identifier, source));
-        }
-        current = parent.parent();
-    }
-    None
+    })
+}
+
+fn enclosing_type_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>>,
+    source: &str,
+) -> Option<String> {
+    enclosing_type_name_among(node, ancestors, source).map(|name| canonical_name(&name))
+}
+
+fn enclosing_type_name_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>>,
+    source: &str,
+) -> Option<String> {
+    let declaration = enclosing_type_declaration(node, ancestors)?;
+    declaration_name_identifiers(declaration)
+        .last()
+        .map(|identifier| node_text(*identifier, source))
 }
 
 fn simple_type_path(node: Node<'_>, source: &str) -> Option<String> {
@@ -18934,7 +19129,7 @@ pub(super) fn is_declaration_identifier(identifier: Node<'_>) -> bool {
         {
             return true;
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     false
 }
@@ -18945,7 +19140,7 @@ fn enclosing_module_name(identifier: Node<'_>) -> Option<Node<'_>> {
         if node.kind() == "moduleName" {
             return Some(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }
@@ -19085,22 +19280,31 @@ fn generic_constraint_type_node(node: Node<'_>) -> Option<Node<'_>> {
 fn build_scopes(
     source_len: usize,
     root: Node<'_>,
-    definitions: &[Node<'_>],
     source: &str,
 ) -> (Vec<Scope>, HashMap<Span, usize>) {
-    let mut scope_nodes = definitions.to_vec();
-    scope_nodes.extend(collect_nodes_matching(root, "lambda"));
-    scope_nodes.extend(collect_nodes_matching(root, "block"));
-    let mut seeds: Vec<(Span, Option<String>)> = scope_nodes
-        .iter()
-        .map(|node| {
-            let owner_type = node
-                .child_by_field_name("header")
-                .and_then(|header| routine_name(header, source))
-                .and_then(|(_, _, owner)| owner);
-            (Span::from_node(*node), owner_type)
-        })
-        .collect();
+    // Routine definitions first, then lambdas, then blocks: the stable sort
+    // below keeps that order between scopes with one span.
+    let mut seeds_by_kind: [Vec<(Span, Option<String>)>; 3] = Default::default();
+    collect_nodes_with_ancestors(root, &mut |node, ancestors| {
+        let seeds = match node.kind() {
+            "defProc" => &mut seeds_by_kind[0],
+            "lambda" => &mut seeds_by_kind[1],
+            "block" => &mut seeds_by_kind[2],
+            _ => return,
+        };
+        let owner_type = node
+            .child_by_field_name("header")
+            .and_then(|header| {
+                routine_name_among(
+                    header,
+                    std::iter::once(node).chain(nearest_first(ancestors)),
+                    source,
+                )
+            })
+            .and_then(|(_, _, owner)| owner);
+        seeds.push((Span::from_node(node), owner_type));
+    });
+    let mut seeds: Vec<(Span, Option<String>)> = seeds_by_kind.into_iter().flatten().collect();
     seeds.sort_by_key(|(span, _)| (span.start, std::cmp::Reverse(span.end)));
 
     let mut scopes = vec![Scope {
@@ -19192,29 +19396,26 @@ fn collect_with_contexts(root: Node<'_>) -> Vec<WithContext> {
 }
 
 fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> HashSet<usize> {
-    let declarations = ["declConst", "declType", "declVar", "varDef", "varAssignDef"]
-        .into_iter()
-        .flat_map(|kind| collect_nodes_matching(root, kind))
-        .collect::<Vec<_>>();
-
     let mut unsafe_scopes = HashSet::new();
-    for declaration in declarations {
-        let mut current = Some(declaration);
+    collect_nodes_with_ancestors(root, &mut |declaration, ancestors| {
+        if !matches!(
+            declaration.kind(),
+            "declConst" | "declType" | "declVar" | "varDef" | "varAssignDef"
+        ) {
+            return;
+        }
         let mut marked = false;
-        while let Some(node) = current {
+        for node in std::iter::once(declaration).chain(nearest_first(ancestors)) {
             if let Some(scope) = scope_by_span.get(&Span::from_node(node)).copied() {
                 unsafe_scopes.insert(scope);
                 marked = true;
                 break;
             }
-            match node.kind() {
-                "lambda" => {
-                    // Lambda occurrences are rejected by the per-use check;
-                    // they must not disable caching for unrelated root uses.
-                    marked = true;
-                    break;
-                }
-                _ => current = node.parent(),
+            if node.kind() == "lambda" {
+                // Lambda occurrences are rejected by the per-use check;
+                // they must not disable caching for unrelated root uses.
+                marked = true;
+                break;
             }
         }
         if !marked {
@@ -19222,31 +19423,36 @@ fn cache_unsafe_scopes(root: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> 
             // distinct scope in the current model, so disable root caching.
             unsafe_scopes.insert(ROOT_SCOPE);
         }
-    }
+    });
     unsafe_scopes
 }
 
-fn scope_for_declaration(node: Node<'_>, scope_by_span: &HashMap<Span, usize>) -> usize {
-    let mut current = Some(node);
-    while let Some(item) = current {
-        if let Some(scope) = scope_by_span.get(&Span::from_node(item)).copied() {
-            return scope;
-        }
-        current = item.parent();
-    }
-    ROOT_SCOPE
+/// The innermost scope of `node` or its ancestors, given nearest first.
+fn scope_among<'a>(
+    node: Node<'a>,
+    ancestors: impl Iterator<Item = Node<'a>>,
+    scope_by_span: &HashMap<Span, usize>,
+) -> usize {
+    std::iter::once(node)
+        .chain(ancestors)
+        .find_map(|item| scope_by_span.get(&Span::from_node(item)).copied())
+        .unwrap_or(ROOT_SCOPE)
 }
 
 fn region_for_node(node: Node<'_>) -> Region {
-    let mut current = Some(node);
-    while let Some(item) = current {
-        match item.kind() {
-            "interface" => return Region::Interface,
-            "implementation" => return Region::Implementation,
-            _ => current = item.parent(),
-        }
-    }
-    Region::Other
+    region_among(node, tree_ancestors(node))
+}
+
+/// The unit section `node` is in, given its ancestors nearest first.
+fn region_among<'a>(node: Node<'a>, ancestors: impl Iterator<Item = Node<'a>>) -> Region {
+    std::iter::once(node)
+        .chain(ancestors)
+        .find_map(|item| match item.kind() {
+            "interface" => Some(Region::Interface),
+            "implementation" => Some(Region::Implementation),
+            _ => None,
+        })
+        .unwrap_or(Region::Other)
 }
 
 fn is_routine_declaration_region(region: Region) -> bool {
@@ -19254,7 +19460,11 @@ fn is_routine_declaration_region(region: Region) -> bool {
 }
 
 fn is_definition_header(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
+    is_definition_header_under(node, node.tree_parent())
+}
+
+fn is_definition_header_under(node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+    parent.is_some_and(|parent| {
         parent.kind() == "defProc"
             && parent
                 .child_by_field_name("header")
@@ -19320,6 +19530,55 @@ fn collect_nodes<'a>(root: Node<'a>, callback: &mut impl FnMut(Node<'a>)) {
         let children: Vec<_> = node.children(&mut cursor).collect();
         pending.extend(children.into_iter().rev());
     }
+}
+
+/// `collect_nodes` that also passes each node's ancestors, root first, so the
+/// callback never has to ask tree-sitter for a parent.
+fn collect_nodes_with_ancestors<'a>(
+    root: Node<'a>,
+    callback: &mut impl FnMut(Node<'a>, &[Node<'a>]),
+) {
+    let mut cursor = root.walk();
+    let mut ancestors = Vec::new();
+    loop {
+        let node = cursor.node();
+        callback(node, &ancestors);
+        if cursor.goto_first_child() {
+            ancestors.push(node);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+            ancestors.pop();
+        }
+    }
+}
+
+/// The nodes of `kind` under `root`, in `collect_nodes` order, each with its
+/// ancestors root first.
+fn collect_nodes_matching_with_ancestors<'a>(
+    root: Node<'a>,
+    kind: &str,
+) -> Vec<(Node<'a>, Vec<Node<'a>>)> {
+    let mut result = Vec::new();
+    collect_nodes_with_ancestors(root, &mut |node, ancestors| {
+        if node.kind() == kind {
+            result.push((node, ancestors.to_vec()));
+        }
+    });
+    result
+}
+
+/// The ancestors `collect_nodes_with_ancestors` passes, nearest first.
+fn nearest_first<'s, 'a>(ancestors: &'s [Node<'a>]) -> impl Iterator<Item = Node<'a>> + Clone + 's {
+    ancestors.iter().rev().copied()
+}
+
+/// The ancestors of `node`, nearest first, from tree-sitter.
+fn tree_ancestors<'a>(node: Node<'a>) -> impl Iterator<Item = Node<'a>> + Clone {
+    std::iter::successors(node.tree_parent(), |node| node.tree_parent())
 }
 
 fn collect_parser_recovery_spans(root: Node<'_>) -> Vec<Span> {
@@ -19433,7 +19692,7 @@ fn qualified_path_at<'a>(
     source: &str,
 ) -> Option<(Node<'a>, Vec<String>, usize)> {
     let target_span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     let mut qualified_node = None;
     while let Some(node) = current {
         if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
@@ -19441,7 +19700,7 @@ fn qualified_path_at<'a>(
         {
             qualified_node = Some(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     let node = qualified_node?;
     let parts = qualified_name_parts(&node, source)?;
@@ -19478,7 +19737,7 @@ fn is_qualified_identifier_node_kind(kind: &str) -> bool {
 }
 
 fn is_nested_qualified_identifier_node(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = node.tree_parent() else {
         return false;
     };
     is_qualified_identifier_node_kind(parent.kind())
@@ -19562,7 +19821,7 @@ fn qualified_identifier_matches_spelling_with_budget(
             break;
         }
         check_navigation_cancel(cancel)?;
-        let Some(parent) = current.parent() else {
+        let Some(parent) = current.tree_parent() else {
             return Ok(None);
         };
         if !is_qualified_identifier_node_kind(parent.kind())
@@ -19610,7 +19869,7 @@ fn qualified_identifier_matches_spelling_with_budget(
 
 fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
             && Span::from_node(node).contains(span)
@@ -19619,7 +19878,7 @@ fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool 
                 .child_by_field_name("rhs")
                 .is_some_and(|rhs| Span::from_node(rhs).contains(span));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     false
 }
@@ -19630,7 +19889,7 @@ fn is_identifier_in_qualified_path_with_budget(
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -19642,7 +19901,7 @@ fn is_identifier_in_qualified_path_with_budget(
                 .is_some_and(|rhs| Span::from_node(rhs).contains(span));
             return Ok(is_rhs);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -19892,7 +20151,7 @@ fn use_name_at_with_budget(
             budget.require_owned_bytes(path_bytes, cancel)?;
             return Ok(Some(canonical_path(&names)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -19903,14 +20162,14 @@ fn has_ancestor_kind_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    let mut current = node.parent();
+    let mut current = node.tree_parent();
     while let Some(ancestor) = current {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         if ancestor.kind() == kind {
             return Ok(true);
         }
-        current = ancestor.parent();
+        current = ancestor.tree_parent();
     }
     Ok(false)
 }
@@ -19983,7 +20242,7 @@ fn qualified_node_at_with_budget<'a>(
 ) -> Result<Option<Node<'a>>, String> {
     let mut current = identifier;
     let mut qualified_node = None;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = current.tree_parent() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         if !matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot") {
@@ -20040,7 +20299,7 @@ fn qualified_identifier_index_with_budget(
 }
 
 fn qualified_type_path_at(identifier: Node<'_>, source: &str) -> Option<(Vec<String>, usize)> {
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     let mut qualified_node = None;
     while let Some(node) = current {
         if matches!(node.kind(), "typerefDot" | "genericDot") {
@@ -20049,7 +20308,7 @@ fn qualified_type_path_at(identifier: Node<'_>, source: &str) -> Option<(Vec<Str
                 qualified_node = Some(node);
             }
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     let node = qualified_node?;
     let parts = qualified_name_parts(&node, source)?;
@@ -20063,7 +20322,7 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     (0..node.named_child_count()).find_map(|index| node.named_child(index))
 }
 
-fn canonical_name(name: &str) -> String {
+pub(crate) fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
 }
 
@@ -20140,7 +20399,7 @@ fn ancestor_routine_declaration<'a>(
             }
             return Ok(None);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -20150,7 +20409,7 @@ fn ancestor_declared_type<'a>(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<Node<'a>>, String> {
-    let mut current = declaration.parent();
+    let mut current = declaration.tree_parent();
     while let Some(node) = current {
         check_navigation_cancel(cancel)?;
         if !budget.take_work(1, cancel)? {
@@ -20159,7 +20418,7 @@ fn ancestor_declared_type<'a>(
         if node.kind() == "declType" {
             return Ok(Some(node));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -20471,7 +20730,7 @@ fn identifier_is_dot_rhs_with_budget(
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
     let identifier_span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -20485,7 +20744,7 @@ fn identifier_is_dot_rhs_with_budget(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -20495,7 +20754,7 @@ fn identifier_is_decl_arg_name_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    let Some(parent) = identifier.parent() else {
+    let Some(parent) = identifier.tree_parent() else {
         return Ok(false);
     };
     if parent.kind() != "declArg" {
@@ -20629,7 +20888,7 @@ fn declared_type_qualification(
             };
             names.push(name);
         }
-        current = candidate.parent();
+        current = candidate.tree_parent();
     }
     if names.is_empty() {
         return Ok(None);
@@ -21431,12 +21690,12 @@ fn fallback_unit_name(uri: &Url) -> String {
 }
 
 fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut current = node.parent();
+    let mut current = node.tree_parent();
     while let Some(parent) = current {
         if parent.kind() == kind {
             return true;
         }
-        current = parent.parent();
+        current = parent.tree_parent();
     }
     false
 }
@@ -21481,7 +21740,7 @@ fn declared_type_node_for_span_with_budget<'a>(
         {
             return Ok(Some(node));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -21506,7 +21765,7 @@ fn declaration_node_for_symbol_with_budget<'a>(
         {
             return Ok(Some(node));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -21631,7 +21890,7 @@ pub(super) fn is_non_value_identifier_with_budget_and_declaration(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -21720,7 +21979,7 @@ fn is_type_valued_intrinsic_argument_with_budget(
         return Ok(false);
     };
     let _ = builtin;
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -21745,7 +22004,7 @@ fn is_type_valued_intrinsic_argument_with_budget(
         if matches!(node.kind(), "assignment" | "block" | "statements") {
             return Ok(false);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -21756,13 +22015,13 @@ pub(super) fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> 
         if node.kind() == "moduleName" && has_ancestor_kind(node, "declUses") {
             return Some(canonical_path(&identifier_texts(node, source)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }
 
 pub(super) fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         if node.kind() == "exprDot" {
             return Some(node);
@@ -21770,7 +22029,7 @@ pub(super) fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
         if matches!(node.kind(), "assignment" | "block" | "statements") {
             return None;
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }

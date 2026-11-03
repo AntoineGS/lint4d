@@ -1253,6 +1253,7 @@ mod tests {
             max_file_bytes: 128,
             max_total_bytes: 512,
             max_cache_bytes: 256,
+            max_workspace_units: super::super::DEFAULT_MAX_WORKSPACE_UNITS,
         };
         let expansion = ExpansionLimits {
             max_expanded_bytes: 384,

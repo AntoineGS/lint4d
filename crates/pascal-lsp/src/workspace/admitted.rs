@@ -6,7 +6,7 @@
 //!
 //! One admitted store per process: each `Store` has its own page cache,
 //! scratch and connections, so a second one would be charged again.
-//! `l4d-zf1b.8` owns the single production open; this phase has no caller.
+//! `crate::persistent_cache` owns the single production open (`l4d-zf1b.11`).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::project_cache::{ProjectCache, Reservation, ReservationKind};
@@ -165,6 +165,7 @@ mod tests {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
+                settled: true,
             }),
             report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],

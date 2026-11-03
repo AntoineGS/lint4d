@@ -1,18 +1,21 @@
+use super::indexing::TargetPurpose;
 use super::rename::{
-    BindingClassification, CANCELLATION_MESSAGE, MAX_SNAPSHOT_MAPPING_WORK, RenameSnapshot,
-    SnapshotMode, SnapshotSeed, SourceRecord, WorkspaceInput, auto_import_source_is_relevant,
-    build_snapshot, input_source_is_readable_with_owner, is_cancelled, owner_for_input,
+    BindingClassification, CANCELLATION_MESSAGE, IndexedSources, MAX_SNAPSHOT_MAPPING_WORK,
+    RenameSnapshot, SnapshotMode, SnapshotScope, SnapshotSeed, SourceRecord, WorkspaceInput,
+    auto_import_source_is_relevant, build_scoped_snapshot, build_snapshot,
+    input_source_is_readable_with_owner, is_cancelled, owner_for_input,
     project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
-use super::{KnownDocumentOwner, conditional_context_for_uri};
+use super::{KnownDocumentOwner, Workspace, conditional_context_for_uri};
 use crate::coverage::{Coverage, Partial};
 use crate::include_expansion::{MappingBudget, VirtualMapping};
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
     PhysicalProjection, SemanticTokenResolutionMode, completion_prefix_at_position,
 };
+use crate::workspace_index::CandidateQuery;
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
 use lsp_types::CompletionList;
@@ -115,11 +118,115 @@ pub(crate) fn hover_from_input(
     }
     let value = snapshot
         .index
-        .hover_with_cancel(&uri, position, format, cancel);
+        .hover_with_cancel(&uri, position, format, cancel)
+        .map(|hover| hover.map(|hover| with_coverage_note(hover, &answer_coverage(&snapshot))));
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     with_records(source_generation, configuration_generation, value, records)
+}
+
+/// Units named in a hover's incompleteness note.
+const MAX_HOVER_NOTE_UNITS: usize = 3;
+
+/// D16: a hover answered over unproven dependencies says so.
+fn with_coverage_note(mut hover: Hover, coverage: &Coverage) -> Hover {
+    let Some(note) = coverage_note(coverage) else {
+        return hover;
+    };
+    match &mut hover.contents {
+        lsp_types::HoverContents::Markup(markup) => {
+            let separator = if markup.kind == MarkupKind::Markdown {
+                "\n\n---\n"
+            } else {
+                "\n\n"
+            };
+            markup.value.push_str(separator);
+            markup.value.push_str(&note);
+        }
+        lsp_types::HoverContents::Scalar(marked) => {
+            hover.contents = lsp_types::HoverContents::Array(vec![
+                marked.clone(),
+                lsp_types::MarkedString::String(note),
+            ]);
+        }
+        lsp_types::HoverContents::Array(items) => {
+            items.push(lsp_types::MarkedString::String(note));
+        }
+    }
+    hover
+}
+
+fn coverage_note(coverage: &Coverage) -> Option<String> {
+    if coverage.is_complete() {
+        return None;
+    }
+    let mut units = Vec::new();
+    let mut reasons = Vec::new();
+    for gap in &coverage.gaps {
+        let Some(name) = gap
+            .uri
+            .as_ref()
+            .and_then(|uri| uri.path_segments()?.next_back().map(str::to_string))
+        else {
+            let reason = sentence(&gap.reason);
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+            continue;
+        };
+        if !units.contains(&name) {
+            units.push(name);
+        }
+    }
+    let mut sentences = Vec::new();
+    if !units.is_empty() || coverage.omitted > 0 {
+        let named = units
+            .iter()
+            .take(MAX_HOVER_NOTE_UNITS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut subject = if named.is_empty() {
+            "some dependencies".to_string()
+        } else {
+            named.join(", ")
+        };
+        // Gaps past the coverage's retention limit are units too.
+        let more = units
+            .len()
+            .saturating_sub(named.len())
+            .saturating_add(coverage.omitted);
+        if more > 0 {
+            subject.push_str(&format!(" and {more} more"));
+        }
+        sentences.push(format!(
+            "Analysis of {subject} is incomplete; the result may be shadowed."
+        ));
+    }
+    sentences.extend(reasons);
+    Some(sentences.join(" "))
+}
+
+fn sentence(reason: &str) -> String {
+    let mut characters = reason.trim().chars();
+    let mut text = characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect::<String>())
+        .unwrap_or_default();
+    if !text.ends_with('.') {
+        text.push('.');
+    }
+    text
+}
+
+/// The coverage of a best-effort answer: the dependencies the snapshot
+/// could not prove and the bindings the relaxed rules decided.
+fn answer_coverage(snapshot: &RenameSnapshot) -> Coverage {
+    let mut coverage = snapshot.dependency_coverage.clone();
+    for reason in snapshot.index.take_relaxed_bindings() {
+        coverage.note(None, reason);
+    }
+    coverage
 }
 
 #[cfg(test)]
@@ -203,7 +310,12 @@ pub(crate) fn completion_from_input_with_options(
     }
     let value = snapshot
         .index
-        .completion_with_cancel_and_options(&uri, position, options, cancel);
+        .completion_with_cancel_and_options(&uri, position, options, cancel)
+        .map(|mut result| {
+            // D16: candidates from unproven dependencies may be missing.
+            result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
+            result
+        });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -973,7 +1085,20 @@ pub(crate) fn references_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, false, classification, cancel) {
+    let local = classification
+        .info
+        .as_ref()
+        .is_some_and(|(info, _)| info.local);
+    // Local bindings and include documents keep the walk (A17).
+    let pascal_source = uri
+        .to_file_path()
+        .is_ok_and(|path| super::is_pascal_path(&path));
+    let snapshot = if local || !pascal_source {
+        binding_snapshot(&input, &uri, position, false, classification, cancel)
+    } else {
+        indexed_reference_snapshot(&input, &uri, position, &owner, classification, cancel)
+    };
+    let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -989,6 +1114,9 @@ pub(crate) fn references_from_input(
             );
         }
     };
+    for gap in &snapshot.index_gaps {
+        coverage.note(None, gap.clone());
+    }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1063,10 +1191,14 @@ pub(crate) fn highlights_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel) {
+    let mut snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    // Highlights mark every occurrence of one binding, like references: an
+    // inherited member the index cannot see must still withhold a global.
+    snapshot.index.set_best_effort_bindings(false);
     let records = snapshot_records(&snapshot);
     if let Err(error) = ensure_document_ready(&snapshot, &uri) {
         return with_records(
@@ -1112,12 +1244,198 @@ pub(crate) fn highlights_from_input(
     )
 }
 
+/// References over index candidates (l4d-33 §6.1). Phase 1 resolves the
+/// binding in the bounded snapshot hover uses and decides the candidate
+/// rule (A3); phase 2 binds only the candidates the target indexes chose.
+/// When the index cannot answer, a small workspace (A16) is walked as
+/// before; a larger one is answered from phase 1 with a gap (U4).
+fn indexed_reference_snapshot(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    owner: &KnownDocumentOwner,
+    classification: BindingClassification,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    let local = binding_snapshot(input, uri, position, true, classification.clone(), cancel);
+    let phase_one = match local
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|snapshot| snapshot.reference_targets(uri, position, cancel))
+    {
+        Ok(targets) => Some(targets),
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(error) => {
+            crate::trace::trace!("  references: phase 1 failed, member rule: {error}");
+            None
+        }
+    };
+    let scope = match indexed_reference_scope(
+        input,
+        uri,
+        position,
+        owner,
+        &classification,
+        phase_one.as_ref(),
+        cancel,
+    ) {
+        Ok(Some(sources)) => Some(SnapshotScope::Indexed(sources)),
+        Ok(None) => None,
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(error) => {
+            crate::trace::trace!("  references: the index cannot answer: {error}");
+            None
+        }
+    };
+    let small = || match Workspace::from_analysis_input(input).is_small_workspace(cancel) {
+        Ok(small) => Ok(small),
+        Err(error) if error == CANCELLATION_MESSAGE => Err(error),
+        Err(_) => Ok(false),
+    };
+    let scope = match scope {
+        Some(scope) => scope,
+        None if small()? => SnapshotScope::Walk,
+        None => {
+            let mut snapshot = local?;
+            snapshot.index_gaps.push(INDEX_UNAVAILABLE_GAP.to_owned());
+            return Ok(snapshot);
+        }
+    };
+    binding_snapshot_scoped(input, uri, position, false, classification, scope, cancel)
+}
+
+const SYMBOLS_INDEX_UNAVAILABLE_GAP: &str =
+    "the workspace index is unavailable; no workspace symbols were searched";
+
+const INDEX_UNAVAILABLE_GAP: &str =
+    "the workspace index is unavailable; only the current context's imports were searched";
+
+/// The candidate sources of the target contexts (A8), or `None` when no
+/// target context resolves.
+fn indexed_reference_scope(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    owner: &KnownDocumentOwner,
+    classification: &BindingClassification,
+    phase_one: Option<&crate::navigation::ReferenceTargets>,
+    cancel: &AtomicBool,
+) -> Result<Option<IndexedSources>, String> {
+    let started = std::time::Instant::now();
+    let mut names = binding_candidate_names(
+        &classification.record.text,
+        classification
+            .info
+            .as_ref()
+            .map(|(info, _)| info.names.clone()),
+        position,
+        uri,
+    )?;
+    if let Some(targets) = phase_one {
+        names.extend(targets.names.iter().cloned());
+        names.sort();
+        names.dedup();
+    }
+    let top_level_units = phase_one
+        .filter(|targets| {
+            !targets.members.is_empty() && targets.members.iter().all(|member| member.top_level)
+        })
+        .map(|targets| {
+            let mut units = targets
+                .members
+                .iter()
+                .map(|member| member.unit.clone())
+                .collect::<Vec<_>>();
+            units.sort();
+            units.dedup();
+            units
+        });
+
+    let mut workspace = Workspace::from_analysis_input(input);
+    let targets = workspace.index_targets(input, Some(uri), TargetPurpose::References, cancel)?;
+    if targets.contexts.is_empty() {
+        return Ok(None);
+    }
+    // Every target's aliases: a superset of the import names keeps the
+    // importer rule sound in each context.
+    let mut aliases = HashSet::new();
+    let contexts =
+        std::iter::once(&*owner.state).chain(targets.contexts.iter().filter_map(|(key, _)| {
+            workspace.contexts.get(key).or_else(|| {
+                input
+                    .document_owners
+                    .values()
+                    .find(|known| known.key == *key)
+                    .map(|known| &*known.state)
+            })
+        }));
+    for state in contexts {
+        aliases.extend(state.context.unit_aliases().iter().map(|(alias, target)| {
+            (
+                crate::navigation::canonical_name(alias),
+                crate::navigation::canonical_name(target),
+            )
+        }));
+    }
+    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+    aliases.sort();
+    let query = CandidateQuery {
+        names,
+        top_level_units,
+        aliases,
+    };
+
+    let mut must_include = vec![uri.clone()];
+    if let Some(targets) = phase_one {
+        must_include.extend(targets.members.iter().map(|member| member.uri.clone()));
+    }
+    must_include.extend(input.overlays.keys().cloned());
+    must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    must_include.dedup();
+    let sources = workspace.indexed_sources(
+        input,
+        &targets,
+        Some(&query),
+        &must_include,
+        Some(targets.requesting.as_ref().unwrap_or(&owner.key)),
+        cancel,
+    )?;
+    crate::trace::trace!(
+        "indexed references targets={} sources={} gaps={} elapsed_ms={:.1}",
+        targets.contexts.len(),
+        sources.sources.len(),
+        sources.gaps.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    Ok(Some(sources))
+}
+
 fn binding_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
     position: Position,
     document_local: bool,
     classification: BindingClassification,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    binding_snapshot_scoped(
+        input,
+        uri,
+        position,
+        document_local,
+        classification,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+fn binding_snapshot_scoped(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    document_local: bool,
+    classification: BindingClassification,
+    scope: SnapshotScope,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let uri = super::canonical_file_uri(uri);
@@ -1148,7 +1466,7 @@ fn binding_snapshot(
     } else {
         &[]
     };
-    build_binding_snapshot(
+    build_binding_snapshot_scoped(
         input,
         &uri,
         position,
@@ -1157,6 +1475,7 @@ fn binding_snapshot(
         consumed_configuration,
         mode,
         skip_imports_for,
+        scope,
         cancel,
     )
 }
@@ -1182,7 +1501,8 @@ fn assistance_snapshot(
         Some(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
-                .with_completion_position(completion_position),
+                .with_completion_position(completion_position)
+                .best_effort(),
         ),
         &[],
         cancel,
@@ -1228,13 +1548,73 @@ fn build_binding_snapshot(
     skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
-    let original_name = super::rename::identifier_at_position(&target_record.text, position)
+    build_binding_snapshot_scoped(
+        input,
+        uri,
+        position,
+        target_record,
+        binding_info,
+        consumed_configuration,
+        mode,
+        skip_imports_for,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_binding_snapshot_scoped(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target_record: super::rename::SourceRecord,
+    binding_info: Option<crate::navigation::RenameBindingInfo>,
+    consumed_configuration: Vec<super::rename::SourceRecord>,
+    mode: SnapshotMode,
+    skip_imports_for: &[Url],
+    scope: SnapshotScope,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    let candidate_names = binding_candidate_names(
+        &target_record.text,
+        binding_info.map(|info| info.names),
+        position,
+        uri,
+    )?;
+    let seed =
+        SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration);
+    // Only the document-local read-only features (hover, highlights, type
+    // definition) bind in `LocalWithImports`; they answer best effort (D16).
+    let seed = if mode == SnapshotMode::LocalWithImports {
+        seed.best_effort()
+    } else {
+        seed
+    };
+    build_scoped_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &candidate_names,
+        mode,
+        Some(seed),
+        skip_imports_for,
+        scope,
+        cancel,
+    )
+}
+
+/// The binding's names, or the identifier at `position` when it has none.
+fn binding_candidate_names(
+    text: &str,
+    names: Option<Vec<String>>,
+    position: Position,
+    uri: &Url,
+) -> Result<Vec<String>, String> {
+    let original_name = super::rename::identifier_at_position(text, position)
         .ok_or_else(|| format!("no identifier at navigation position in {uri}"))?;
-    let mut candidate_names = match binding_info {
-        Some(info) => {
-            let mut names = info.names;
+    let mut candidate_names = match names {
+        Some(mut names) => {
             if names.is_empty() {
-                names.push(original_name.clone());
+                names.push(original_name);
             }
             names
         }
@@ -1242,30 +1622,54 @@ fn build_binding_snapshot(
     };
     candidate_names.sort();
     candidate_names.dedup();
-    build_snapshot(
-        input,
-        std::slice::from_ref(uri),
-        &candidate_names,
-        mode,
-        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
-        skip_imports_for,
-        cancel,
-    )
+    Ok(candidate_names)
 }
 
-/// The include error that blocks a read-only feature on `uri`. An unsupported
-/// directive in a unit the document only imports cannot change how the
-/// document parses, and at worst misclassifies an identifier bound through
-/// that unit. One in the document itself, or any other include error, still
-/// blocks. Rename, references, and code actions stay fail-closed.
+/// The include error that blocks a read-only feature on `uri`: the first one
+/// recorded for the document itself, or for an owner of it when it is an
+/// include file. A failure in a unit the document only imports cannot change
+/// how the document parses; a best-effort snapshot reports it as coverage
+/// (D16). Rename, references, and code actions stay fail-closed.
 fn blocking_include_error<'a>(snapshot: &'a RenameSnapshot, uri: &Url) -> Option<&'a str> {
-    let first = snapshot.include_errors.first()?;
-    let blocks = snapshot.other_include_errors
-        || snapshot
-            .unsupported_directive_owners
+    let owns_document = |owner: &Url| {
+        owner == uri
+            || snapshot
+                .expansions
+                .get(owner)
+                .is_some_and(|expansion| expansion.dependencies.contains(uri))
+    };
+    if let Some((_, error)) = snapshot
+        .include_error_owners
+        .iter()
+        .find(|(owner, _)| owns_document(owner))
+    {
+        return Some(error.as_str());
+    }
+    // Past the error limit owners are no longer recorded, but an owner with
+    // an unsupported directive still is.
+    if snapshot
+        .unsupported_directive_owners
+        .iter()
+        .any(owns_document)
+    {
+        return snapshot
+            .include_errors
             .iter()
-            .any(|owner| owner == uri);
-    blocks.then_some(first.as_str())
+            .find(|error| error.contains(uri.as_str()))
+            .or(snapshot.include_errors.last())
+            .map(String::as_str);
+    }
+    // Without a best-effort audit an early stop leaves later owners,
+    // possibly the document, unaudited.
+    if snapshot.other_include_errors && !snapshot.best_effort {
+        return snapshot
+            .include_errors
+            .iter()
+            .find(|error| !error.contains("unsupported directive"))
+            .or(snapshot.include_errors.first())
+            .map(String::as_str);
+    }
+    None
 }
 
 fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -1655,6 +2059,29 @@ pub(crate) fn navigation_from_input(
     target: NavigationTarget,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<NavigationResult> {
+    navigation_from_input_with_policy(input, uri, position, target, true, cancel)
+}
+
+/// Navigation for a caller that must not answer best effort: the
+/// implementation code lens shows a bare count, like the references lens.
+pub(crate) fn strict_navigation_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target: NavigationTarget,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<NavigationResult> {
+    navigation_from_input_with_policy(input, uri, position, target, false, cancel)
+}
+
+fn navigation_from_input_with_policy(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target: NavigationTarget,
+    best_effort: bool,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<NavigationResult> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = super::canonical_file_uri(uri);
@@ -1663,8 +2090,14 @@ pub(crate) fn navigation_from_input(
     }
 
     let mut workspace = super::Workspace::from_analysis_input(&input);
+    workspace.set_best_effort_navigation(best_effort);
     let value = match workspace.navigate_with_cancel(&uri, position, target, cancel) {
-        Ok(locations) => Ok(locations),
+        Ok(locations) => {
+            for reason in workspace.index.take_relaxed_bindings() {
+                workspace.warn_project(format!("navigation in {uri}: {reason}"));
+            }
+            Ok(locations)
+        }
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
         }
@@ -2337,6 +2770,25 @@ pub(crate) fn workspace_diagnostics_from_input(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_FACT_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_FACT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Files read to answer workspace symbols from index facts since the last
+/// call.
+#[cfg(test)]
+pub(crate) fn test_take_fact_reads() -> usize {
+    TEST_FACT_READS.with(|count| count.replace(0))
+}
+
+/// Workspace symbols answered from index facts since the last call.
+#[cfg(test)]
+pub(crate) fn test_take_fact_symbols() -> usize {
+    TEST_FACT_SYMBOLS.with(|count| count.replace(0))
+}
+
 pub(crate) fn workspace_symbols_from_input(
     input: WorkspaceInput,
     query: &str,
@@ -2348,6 +2800,274 @@ pub(crate) fn workspace_symbols_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
+    let mut workspace = Workspace::from_analysis_input(&input);
+    let targets =
+        match workspace.index_targets(&input, None, TargetPurpose::WorkspaceSymbols, cancel) {
+            Ok(targets) => targets,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => {
+                crate::trace::trace!("  workspace symbols: no index targets: {error}");
+                // U4: only a small workspace (A16) is walked without the index.
+                return match workspace.is_small_workspace(cancel) {
+                    Ok(true) => walked_workspace_symbols(input, query, cancel),
+                    Ok(false) => {
+                        let mut coverage = Coverage::default();
+                        coverage.note(None, SYMBOLS_INDEX_UNAVAILABLE_GAP);
+                        super::rename::Computed {
+                            source_generation,
+                            configuration_generation,
+                            value: Ok(Partial {
+                                value: Vec::new(),
+                                coverage,
+                            }),
+                            records: Vec::new(),
+                        }
+                    }
+                    Err(error) if error == CANCELLATION_MESSAGE => {
+                        cancelled(source_generation, configuration_generation)
+                    }
+                    Err(error) => failed(source_generation, configuration_generation, error),
+                };
+            }
+        };
+    // A16: a small workspace with nothing open or configured keeps the walk.
+    if targets.from_open_or_configured == 0 && targets.small_workspace {
+        return walked_workspace_symbols(input, query, cancel);
+    }
+    match indexed_workspace_symbols(&mut workspace, &input, &targets, query, cancel) {
+        Ok((value, records)) => super::rename::Computed {
+            source_generation,
+            configuration_generation,
+            value: Ok(value),
+            records,
+        },
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            cancelled(source_generation, configuration_generation)
+        }
+        Err(error) => failed(source_generation, configuration_generation, error),
+    }
+}
+
+/// Workspace symbols of the target contexts (§6.2): index facts of the
+/// members proven current, merged with the parses of unverified members
+/// and open documents.
+fn indexed_workspace_symbols(
+    workspace: &mut Workspace,
+    input: &WorkspaceInput,
+    targets: &super::indexing::Targets,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<(Partial<Vec<SymbolInformation>>, Vec<SourceRecord>), String> {
+    let started = std::time::Instant::now();
+    let direct = targets.from_open_or_configured > 0;
+    let mut must_include = input.overlays.keys().cloned().collect::<Vec<_>>();
+    must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let (sources, facts) =
+        workspace.indexed_symbols(input, targets, query, direct, &must_include, cancel)?;
+    crate::trace::trace!(
+        "indexed symbols targets={} sources={} facts={} gaps={} elapsed_ms={:.1}",
+        targets.contexts.len(),
+        sources.sources.len(),
+        facts.len(),
+        sources.gaps.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    // The facts are distinct declarations, so an answer over the cap is
+    // known before any indexed file is read.
+    if let Some(error) = crate::navigation::too_many_workspace_symbols(facts.len()) {
+        return Err(error);
+    }
+    let mut coverage = Coverage::default();
+    if !direct {
+        coverage.note(
+            None,
+            "no project context is open; open a source or select a project",
+        );
+    }
+    let mut found = Vec::new();
+    let records = if sources.sources.is_empty() && input.overlays.is_empty() {
+        for gap in &sources.gaps {
+            coverage.note(None, gap.as_str());
+        }
+        sources
+            .baseline
+            .iter()
+            .filter_map(|(path, stamp)| {
+                super::rename::path_record_at(
+                    path.clone(),
+                    stamp.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    } else {
+        let snapshot = super::rename::build_indexed_snapshot(
+            input,
+            &[],
+            &[],
+            SnapshotMode::WorkspaceSymbols,
+            None,
+            sources,
+            cancel,
+        )?;
+        if !snapshot.complete {
+            coverage.note(
+                None,
+                snapshot
+                    .incomplete_reason
+                    .as_deref()
+                    .unwrap_or("bounded source discovery did not finish"),
+            );
+        }
+        for gap in &snapshot.index_gaps {
+            coverage.note(None, gap.as_str());
+        }
+        found.extend(
+            snapshot
+                .index
+                .workspace_symbols_with_cancel(query, cancel)?
+                .into_iter()
+                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri)),
+        );
+        snapshot_records(&snapshot)
+    };
+    let fact_files = facts
+        .iter()
+        .filter_map(|(_, symbol)| Url::from_file_path(&symbol.path).ok())
+        .collect::<HashSet<_>>();
+    let parsed_elsewhere = found
+        .iter()
+        .filter(|symbol| !fact_files.contains(&symbol.location.uri))
+        .count();
+    if let Some(error) =
+        crate::navigation::too_many_workspace_symbols(facts.len() + parsed_elsewhere)
+    {
+        return Err(error);
+    }
+    found.extend(fact_symbols(workspace, facts, &mut coverage, cancel)?);
+
+    // The parses come first, so a duplicate keeps the live answer.
+    let key = |symbol: &SymbolInformation| {
+        let range = symbol.location.range;
+        (
+            symbol.location.uri.to_string(),
+            (range.start.line, range.start.character),
+            std::cmp::Reverse((range.end.line, range.end.character)),
+        )
+    };
+    found.sort_by_cached_key(key);
+    let mut seen = HashSet::new();
+    found.retain(|symbol| {
+        seen.insert((
+            symbol.location.uri.clone(),
+            symbol.location.range,
+            symbol.name.clone(),
+        ))
+    });
+    if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
+        return Err(error);
+    }
+    Ok((
+        Partial {
+            value: found,
+            coverage,
+        },
+        records,
+    ))
+}
+
+/// Index declarations as symbol information. Each file with a match is read
+/// once to convert its byte ranges to UTF-16 positions.
+fn fact_symbols(
+    workspace: &Workspace,
+    facts: Vec<(super::ContextKey, crate::workspace_index::IndexedSymbol)>,
+    coverage: &mut Coverage,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let mut by_file = std::collections::BTreeMap::<String, Vec<_>>::new();
+    for (key, symbol) in facts {
+        by_file
+            .entry(super::rename::path_key(&symbol.path))
+            .or_default()
+            .push((key, symbol));
+    }
+    let mut result = Vec::new();
+    for symbols in by_file.into_values() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let (key, first) = &symbols[0];
+        let path = first.path.clone();
+        let Ok(uri) = Url::from_file_path(&path) else {
+            continue;
+        };
+        #[cfg(test)]
+        TEST_FACT_READS.with(|count| count.set(count.get() + 1));
+        let text = match super::rename::read_context_source(workspace, key, &path, cancel) {
+            Ok(text) => text,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                coverage.note(
+                    Some(&uri),
+                    format!("indexed symbols could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let positions = crate::text::PositionIndex::new_with_cancel(&text, cancel)
+            .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+        let mut stale = false;
+        for (_, symbol) in symbols {
+            let declaration = symbol.declaration;
+            let Some((_, range)) = declaration.location else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                positions.offset_to_position(&text, range.start as usize),
+                positions.offset_to_position(&text, range.end as usize),
+            ) else {
+                stale = true;
+                continue;
+            };
+            #[cfg(test)]
+            TEST_FACT_SYMBOLS.with(|count| count.set(count.get() + 1));
+            #[allow(deprecated)]
+            result.push(SymbolInformation {
+                name: declaration.display.into(),
+                kind: crate::navigation::lsp_kind_for_shape(declaration.shape),
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: Range { start, end },
+                },
+                container_name: symbol.container,
+            });
+        }
+        if stale {
+            coverage.note(
+                Some(&uri),
+                "the file changed after it was indexed; some symbols were not listed",
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn walked_workspace_symbols(
+    input: WorkspaceInput,
+    query: &str,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Partial<Vec<SymbolInformation>>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
     let snapshot = match build_snapshot(
         &input,
         &[],
@@ -2522,16 +3242,22 @@ fn completion_observations_equal(
 }
 
 #[cfg(test)]
+#[path = "queries_best_effort_tests.rs"]
+mod best_effort_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         completion_from_input, completion_from_input_with_options, completion_metadata_from_input,
         document_symbols_from_input, highlights_from_input, hover_from_input,
         references_from_input, selection_ranges_from_input, semantic_tokens_from_input,
-        signature_help_from_input, type_definitions_from_input,
+        signature_help_from_input, type_definitions_from_input, workspace_symbols_from_input,
     };
     use crate::navigation::CompletionOptions;
+    use crate::project_cache::IndexAnchor;
     #[cfg(target_os = "linux")]
     use crate::workspace::content_hash_bytes;
+    use crate::workspace::indexing::IndexBound;
     use crate::workspace::rename::{
         CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input,
         install_snapshot_priority_barrier, owner_for_input, project_context_and_metadata_for_input,
@@ -3003,6 +3729,1188 @@ mod tests {
             consumer_source,
             input: workspace.analysis_input(),
         }
+    }
+
+    /// 500 units: `Shared` declares `SharedValue`; 20 importers use it; the
+    /// others declare their own `SharedValue` and never import `Shared`.
+    struct ManyUnits {
+        _temp: TempDir,
+        shared: PathBuf,
+        importers: Vec<PathBuf>,
+        input: WorkspaceInput,
+    }
+
+    fn many_units(importers: usize, others: usize) -> ManyUnits {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        let importers = (0..importers)
+            .map(|index| {
+                let path = root.join(format!("Importer{index:03}.pas"));
+                fs::write(
+                    &path,
+                    format!(
+                        "unit Importer{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                )
+                .expect("importer");
+                path
+            })
+            .collect();
+        for index in 0..others {
+            fs::write(
+                root.join(format!("Other{index:03}.pas")),
+                format!(
+                    "unit Other{index:03};\ninterface\nconst SharedValue = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("other");
+        }
+        // Settled stamps, so the index proves the excluded units unchanged.
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        ManyUnits {
+            _temp: temp,
+            shared,
+            importers,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    /// Indexes every member of the context that owns `uri`.
+    fn build_index_for(input: &WorkspaceInput, uri: &Url) {
+        build_index_at(input, &IndexAnchor::Document(uri.clone()));
+    }
+
+    fn build_index_at(input: &WorkspaceInput, anchor: &IndexAnchor) {
+        let cancel = AtomicBool::new(false);
+        let progress = Workspace::from_analysis_input(input)
+            .advance_workspace_index(anchor, IndexBound::all(), &mut || Ok(()), &cancel)
+            .expect("index batch");
+        assert!(progress.complete, "{progress:?}");
+    }
+
+    fn located(locations: &[lsp_types::Location]) -> Vec<(Url, u32, u32)> {
+        let mut found = locations
+            .iter()
+            .map(|location| {
+                (
+                    location.uri.clone(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    }
+
+    fn bound_documents() -> Vec<Url> {
+        let mut bound = crate::navigation::test_bound_documents();
+        bound.sort();
+        bound.dedup();
+        bound
+    }
+
+    /// l4d-33 acceptance: with a built index, 500 units and one shared symbol
+    /// bind only the importers and the declaring unit.
+    #[test]
+    fn indexed_references_bind_only_the_importing_units() {
+        let fixture = many_units(20, 479);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert_eq!(partial.value.len(), 21);
+        let mut bound = crate::navigation::test_bound_documents();
+        bound.sort();
+        bound.dedup();
+        let mut expected = fixture
+            .importers
+            .iter()
+            .map(|p| source_uri(p))
+            .collect::<Vec<_>>();
+        expected.push(source_uri(&fixture.shared));
+        expected.sort();
+        assert_eq!(bound, expected);
+    }
+
+    #[test]
+    fn references_on_an_unindexed_context_search_unverified_members_directly() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        // Recorded on the walk (Task 9 commit e9ae98e).
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+    }
+
+    #[test]
+    fn unverified_members_beyond_the_bound_are_a_gap() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        fs::write(
+            root.join("Another.pas"),
+            "unit Another;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("another consumer");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_unverified_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_unverified_cap(Some(1));
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(!partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.contains("not indexed yet")),
+            "{:?}",
+            partial.coverage
+        );
+        // Another.pas is first in path order; Provider.pas is the declaring
+        // document; Consumer.pas is beyond the bound.
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("Another.pas")), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_members_are_a_gap_not_a_candidate() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let big = root.join("Big.pas");
+        fs::write(
+            &big,
+            format!(
+                "unit Big;\ninterface\nuses Provider;\n{}implementation\nend.\n",
+                "{ SharedValue }\n".repeat(60)
+            ),
+        )
+        .expect("big");
+        pascal_project::backdate_tree_for_test(&root);
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let input = test_workspace(vec![root], options).analysis_input();
+        build_index_for(&input, &source_uri(&provider));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.starts_with("1 units could not be indexed: ")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(located(&partial.value), vec![(source_uri(&provider), 2, 6)]);
+        assert!(!bound_documents().contains(&source_uri(&big)));
+    }
+
+    #[test]
+    fn references_search_every_target_context_sharing_the_declaring_unit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().to_path_buf());
+        let shared = root.join("shared/Shared.pas");
+        fs::create_dir_all(shared.parent().unwrap()).expect("shared directory");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for name in ["P1", "P2"] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).expect("project directory");
+            fs::write(
+                directory.join(format!("{name}.dproj")),
+                format!(
+                    "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource><DCC_UnitSearchPath>..\\shared</DCC_UnitSearchPath></PropertyGroup></Project>"
+                ),
+            )
+            .expect("descriptor");
+            fs::write(
+                directory.join(format!("{name}.dpr")),
+                format!("program {name};\nuses C{name};\nbegin\nend.\n"),
+            )
+            .expect("main source");
+            fs::write(
+                directory.join(format!("C{name}.pas")),
+                format!(
+                    "unit C{name};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                ),
+            )
+            .expect("consumer");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let mut workspace = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                project_file: Some(root.join("P2/P2.dproj")),
+                ..WorkspaceOptions::default()
+            },
+        );
+        let opened = root.join("P1/CP1.pas");
+        workspace
+            .open_document(
+                source_uri(&opened),
+                fs::read_to_string(&opened).expect("consumer text"),
+                1,
+            )
+            .expect("open P1 consumer");
+        let input = workspace.analysis_input();
+        for name in ["P1", "P2"] {
+            build_index_at(
+                &input,
+                &IndexAnchor::Project(root.join(name).join(format!("{name}.dproj"))),
+            );
+        }
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input,
+            &source_uri(&shared),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("P1/CP1.pas")), 6, 6),
+                (source_uri(&root.join("P2/CP2.pas")), 6, 6),
+                (source_uri(&shared), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+    }
+
+    #[test]
+    fn phase_one_failure_falls_back_to_the_member_rule() {
+        let fixture = many_units(2, 2);
+        let root = fixture.shared.parent().unwrap().to_path_buf();
+        let plain = root.join("Plain.pas");
+        fs::write(&plain, "unit Plain;\ninterface\nimplementation\nend.\n").expect("plain");
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.shared),
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+        let scoped = references();
+        crate::navigation::test_reset_bound_documents();
+        let failing = crate::workspace::rename::test_fail_reference_targets();
+        let fallback = references();
+        drop(failing);
+        assert_eq!(located(&fallback.value), located(&scoped.value));
+        assert!(fallback.coverage.is_complete(), "{:?}", fallback.coverage);
+        let mut expected = fixture
+            .importers
+            .iter()
+            .map(|path| source_uri(path))
+            .chain([
+                source_uri(&fixture.shared),
+                source_uri(&root.join("Other000.pas")),
+                source_uri(&root.join("Other001.pas")),
+            ])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(bound_documents(), expected);
+    }
+
+    #[test]
+    fn an_include_document_keeps_the_old_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main;\ninterface\n{$I Values.inc}\nimplementation\nend.\n",
+        )
+        .expect("main");
+        let include = root.join("Values.inc");
+        fs::write(&include, "const SharedValue = 1;\n").expect("include");
+        fs::write(
+            root.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Main;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input,
+            &source_uri(&include),
+            Position::new(0, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+        assert!(
+            located(&partial.value).contains(&(source_uri(&root.join("Consumer.pas")), 6, 6)),
+            "{:?}",
+            partial.value
+        );
+    }
+
+    #[test]
+    fn a_local_binding_keeps_the_old_path() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let local = fixture.provider.parent().unwrap().join("Local.pas");
+        fs::write(
+            &local,
+            "unit Local;\ninterface\nimplementation\nprocedure Run;\nvar\n  Count: Integer;\nbegin\n  Count := 1;\nend;\nend.\n",
+        )
+        .expect("local");
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&local),
+            Position::new(5, 2),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(partial.value.len(), 2, "{:?}", partial.value);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn a_delivered_result_is_rejected_when_an_excluded_member_changes() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        let plain = root.join("Plain.pas");
+        fs::write(&plain, "unit Plain;\ninterface\nimplementation\nend.\n").expect("plain");
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.provider));
+        let cancel = AtomicBool::new(false);
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &cancel,
+        );
+        assert!(computed.value.is_ok(), "{computed:?}");
+        assert!(
+            !bound_documents().contains(&source_uri(&plain)),
+            "Plain.pas is excluded"
+        );
+        revalidate_input(&fixture.input, &computed.records, &cancel)
+            .expect("unchanged reference inputs must remain valid");
+
+        fs::write(
+            &plain,
+            "unit Plain;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("changed excluded member");
+        revalidate_input(&fixture.input, &computed.records, &cancel)
+            .expect_err("a changed excluded member must stale delivered references");
+    }
+
+    #[test]
+    fn references_do_not_walk_the_workspace_once_indexed() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.provider));
+        let cancel = AtomicBool::new(false);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.provider),
+                shared_value_position(),
+                true,
+                &cancel,
+            )
+        };
+        let first = references();
+        assert!(first.value.is_ok(), "{first:?}");
+        crate::catalogue::test_reset_listings();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let second = references();
+        let partial = second.value.expect("second references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "{:?}",
+            crate::catalogue::test_listings()
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+    }
+
+    /// The indexed scope does not walk mapped roots (l4d-33 §6.1): a mapped
+    /// search-path member the index excludes is not bound.
+    #[cfg(unix)]
+    #[test]
+    fn indexed_references_bind_only_index_candidates_under_a_mapped_search_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().join("project"));
+        let sdk = crate::workspace::absolute_path(temp.path().join("sdk"));
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&sdk).expect("SDK directory");
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("main");
+        let provider = sdk.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let consumer = sdk.join("Consumer.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        // A posting for the name, but no import of Provider: excluded.
+        let other = sdk.join("Other.pas");
+        fs::write(
+            &other,
+            "unit Other;\ninterface\nconst SharedValue = 2;\nimplementation\nend.\n",
+        )
+        .expect("other");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project metadata");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("path mapping");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        build_index_at(&input, &IndexAnchor::Project(root.join("App.dproj")));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&main),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("Main.pas")), 6, 6),
+                (source_uri(&consumer), 6, 6),
+                (source_uri(&provider), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        let bound = bound_documents();
+        assert!(bound.contains(&source_uri(&consumer)), "{bound:?}");
+        assert!(!bound.contains(&source_uri(&other)), "{bound:?}");
+    }
+
+    /// Members of another target context outside the workspace roots are a
+    /// gap, not candidates (they would not be read by the walk either).
+    #[cfg(unix)]
+    #[test]
+    fn other_contexts_members_outside_the_roots_are_a_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().join("workspace"));
+        let sdk = crate::workspace::absolute_path(temp.path().join("sdk"));
+        let project_a = root.join("A");
+        let project_b = root.join("B");
+        for directory in [&project_a, &project_b, &sdk] {
+            fs::create_dir_all(directory).expect("directory");
+        }
+        let provider = project_a.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        fs::write(
+            project_a.join("Main.pas"),
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("main A");
+        fs::write(
+            project_a.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project A");
+        let consumer = sdk.join("Consumer.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        fs::write(
+            project_b.join("Main.pas"),
+            "unit Main; interface implementation end.\n",
+        )
+        .expect("main B");
+        fs::write(
+            project_b.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"..\\A\\Provider.pas\" /></ItemGroup></Project>",
+        )
+        .expect("project B");
+        fs::write(
+            project_b.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("path mapping");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&project_a.join("Main.pas")), 6, 6),
+                (source_uri(&provider), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial.coverage.gaps.iter().any(|gap| gap.reason
+                == "1 units of App.dproj outside the workspace roots were not searched"),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(!bound_documents().contains(&source_uri(&consumer)));
+    }
+
+    #[test]
+    fn member_references_reach_units_that_never_import_the_declaring_unit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let base = root.join("Base.pas");
+        fs::write(
+            &base,
+            "unit Base;\ninterface\ntype\n  TBase = class\n    Field: Integer;\n  end;\nimplementation\nend.\n",
+        )
+        .expect("base");
+        fs::write(
+            root.join("Mid.pas"),
+            "unit Mid;\ninterface\nuses Base;\nvar\n  Shared: TBase;\nfunction MakeBase: TBase;\nimplementation\nfunction MakeBase: TBase;\nbegin\n  Result := Shared;\nend;\nend.\n",
+        )
+        .expect("mid");
+        fs::write(
+            root.join("User.pas"),
+            "unit User;\ninterface\nuses Mid;\nimplementation\nprocedure Run;\nbegin\n  Shared.Field := 1;\n  MakeBase.Field := 2;\nend;\nend.\n",
+        )
+        .expect("user");
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let walked = references_from_input(
+            input.clone(),
+            &source_uri(&base),
+            Position::new(4, 4),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references before indexing")
+        .value;
+        build_index_for(&input, &source_uri(&base));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&base),
+            Position::new(4, 4),
+            true,
+            &AtomicBool::new(false),
+        );
+        let locations = computed.value.expect("references").value;
+        // The member rule took effect: User.pas never imports Base but has
+        // a posting for `Field`, so it is bound.
+        assert!(
+            bound_documents().contains(&source_uri(&temp.path().join("User.pas"))),
+            "{:?}",
+            bound_documents()
+        );
+        // Characterization: neither `Shared.Field` nor `MakeBase.Field` in
+        // `User.pas` (which never imports `Base`) is found today, nor are
+        // inherited or `with` receivers; only the declaration is reported.
+        // With a built index the result stays equal to the walk's.
+        assert_eq!(
+            located(&locations),
+            vec![(source_uri(&base), 4, 4)],
+            "{locations:?}"
+        );
+        assert_eq!(located(&locations), located(&walked));
+    }
+
+    fn symbols(
+        input: &WorkspaceInput,
+        query: &str,
+    ) -> crate::coverage::Partial<Vec<lsp_types::SymbolInformation>> {
+        workspace_symbols_from_input(input.clone(), query, &AtomicBool::new(false))
+            .value
+            .expect("workspace symbols")
+    }
+
+    fn symbol_names(found: &[lsp_types::SymbolInformation]) -> Vec<(String, String)> {
+        found
+            .iter()
+            .map(|symbol| {
+                let file = symbol
+                    .location
+                    .uri
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                (symbol.name.clone(), file)
+            })
+            .collect()
+    }
+
+    /// A workspace of `files` under a fresh root with settled stamps, so the
+    /// index proves its members unchanged.
+    fn symbol_workspace(files: &[(&str, String)]) -> (TempDir, PathBuf, Workspace) {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        for (name, text) in files {
+            fs::write(root.join(name), text).expect("source");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        (temp, root, workspace)
+    }
+
+    fn open_source(workspace: &mut Workspace, path: &Path) -> Url {
+        let uri = source_uri(path);
+        workspace
+            .open_document(uri.clone(), fs::read_to_string(path).expect("text"), 1)
+            .expect("open source");
+        uri
+    }
+
+    fn reset_symbol_counters() {
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        super::test_take_fact_symbols();
+    }
+
+    /// No whole-workspace walk: every snapshot built read index candidates.
+    fn walks() -> usize {
+        crate::workspace::rename::test_workspace_snapshots()
+            - crate::workspace::rename::test_indexed_snapshots()
+    }
+
+    fn unit_text(name: &str, declarations: &str) -> String {
+        format!("unit {name};\ninterface\n{declarations}implementation\nend.\n")
+    }
+
+    #[test]
+    fn workspace_symbols_answer_from_the_index_without_a_snapshot() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        pascal_project::backdate_tree_for_test(&root);
+        let walked = symbols(&fixture.input, "Shared").value;
+        assert!(!walked.is_empty(), "the query must find SharedValue");
+
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        open_source(&mut workspace, &fixture.consumer);
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&fixture.provider));
+        reset_symbol_counters();
+        let first = symbols(&input, "Shared");
+        let second = symbols(&input, "Shared");
+        assert!(first.coverage.is_complete(), "{:?}", first.coverage);
+        // No A14 difference applies: SharedValue is a unit-scope constant
+        // of slot 0, so the index answer equals the walk's.
+        assert_eq!(first.value, walked);
+        assert_eq!(first.value, second.value);
+        // SharedValue from the facts, once per request.
+        assert_eq!(super::test_take_fact_symbols(), 2);
+        // The open document is answered from its parse by an indexed
+        // snapshot; nothing walks the workspace.
+        assert_eq!(walks(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_in_an_include_slot_report_the_include_file() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Provider.pas",
+                "unit Provider;\ninterface\n{$I Decls.inc}\nimplementation\nend.\n".to_owned(),
+            ),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Provider.pas")));
+        reset_symbol_counters();
+        let found = symbols(&input, "IncludedValue");
+        assert_eq!(found.value.len(), 1, "{:?}", found.value);
+        let symbol = &found.value[0];
+        assert_eq!(symbol.location.uri, source_uri(&root.join("Decls.inc")));
+        assert_eq!(symbol.location.range.start, Position::new(1, 2));
+        assert_eq!(symbol.container_name.as_deref(), Some("Provider"));
+        assert_eq!(super::test_take_fact_symbols(), 1);
+    }
+
+    #[test]
+    fn nested_routines_of_closed_files_are_not_listed_but_open_ones_are() {
+        let provider_text = "unit Provider;\ninterface\nimplementation\nprocedure Outer;\n  procedure NestedHelper;\n  begin\n  end;\nbegin\nend;\nend.\n";
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Provider.pas", provider_text.to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        let provider = root.join("Provider.pas");
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&provider));
+        let closed = symbols(&input, "NestedHelper");
+        assert!(closed.value.is_empty(), "{:?}", closed.value);
+
+        open_source(&mut workspace, &provider);
+        let opened = symbols(&workspace.analysis_input(), "NestedHelper");
+        assert_eq!(
+            symbol_names(&opened.value),
+            [("NestedHelper".to_owned(), "Provider.pas".to_owned())]
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_on_a_partial_index_report_coverage() {
+        let mut files = (1..=5)
+            .map(|n| {
+                (
+                    ["A1.pas", "A2.pas", "A3.pas", "A4.pas", "A5.pas"][n - 1],
+                    unit_text(&format!("A{n}"), &format!("const PartialValue{n} = {n};\n")),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.push(("Opened.pas", unit_text("Opened", "")));
+        let (_temp, root, mut workspace) = symbol_workspace(&files);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        Workspace::from_analysis_input(&input)
+            .advance_workspace_index(
+                &IndexAnchor::Document(source_uri(&root.join("A1.pas"))),
+                IndexBound::units(2),
+                &mut || Ok(()),
+                &AtomicBool::new(false),
+            )
+            .expect("index batch");
+        reset_symbol_counters();
+        let found = symbols(&input, "PartialValue");
+        let expected = (1..=5)
+            .map(|n| (format!("PartialValue{n}"), format!("A{n}.pas")))
+            .collect::<Vec<_>>();
+        assert_eq!(symbol_names(&found.value), expected);
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        assert_eq!(super::test_take_fact_symbols(), 2);
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_unverified_symbol_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_unverified_symbol_cap(Some(1));
+        let bounded = symbols(&input, "PartialValue");
+        assert_eq!(symbol_names(&bounded.value), expected[..3]);
+        assert!(
+            bounded
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.starts_with("2 units of ")
+                    && gap
+                        .reason
+                        .contains("are not indexed yet; 1 were searched directly")),
+            "{:?}",
+            bounded.coverage
+        );
+    }
+
+    #[test]
+    fn a_small_workspace_without_a_project_keeps_todays_answer() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(!found.value.is_empty());
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn a_large_workspace_without_a_project_reports_no_context() {
+        let fixture = query_fixture();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(found.value.is_empty(), "{:?}", found.value);
+        assert!(
+            found
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason
+                    == "no project context is open; open a source or select a project"),
+            "{:?}",
+            found.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+    }
+
+    /// Index targets fail and the small-workspace source cap is `small`
+    /// until dropped.
+    struct TargetFailure;
+
+    impl TargetFailure {
+        fn new(small: Option<usize>) -> Self {
+            crate::workspace::indexing::test_set_target_error(true);
+            crate::workspace::indexing::test_set_small_workspace_sources(small);
+            Self
+        }
+    }
+
+    impl Drop for TargetFailure {
+        fn drop(&mut self) {
+            crate::workspace::indexing::test_set_target_error(false);
+            crate::workspace::indexing::test_set_small_workspace_sources(None);
+        }
+    }
+
+    const INDEX_UNAVAILABLE: &str =
+        "the workspace index is unavailable; only the current context's imports were searched";
+
+    #[test]
+    fn references_without_the_index_on_a_large_workspace_search_only_the_imports() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.consumer),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("partial references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == INDEX_UNAVAILABLE),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn references_without_the_index_on_a_small_workspace_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(None);
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("walked references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_without_the_index_on_a_large_workspace_do_not_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(found.value.is_empty(), "{:?}", found.value);
+        assert!(
+            found.coverage.gaps.iter().any(|gap| gap.reason
+                == "the workspace index is unavailable; no workspace symbols were searched"),
+            "{:?}",
+            found.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_without_the_index_on_a_small_workspace_walk() {
+        let fixture = query_fixture();
+        let _failure = TargetFailure::new(None);
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(!found.value.is_empty());
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+    }
+
+    #[test]
+    fn results_beyond_ten_thousand_keep_todays_error() {
+        let constants = |prefix: &str| {
+            let mut text = String::from("const\n");
+            for index in 0..5_001 {
+                text.push_str(&format!("  Val{prefix}{index} = 0;\n"));
+            }
+            text
+        };
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Alpha.pas", unit_text("Alpha", &constants("A"))),
+            ("Beta.pas", unit_text("Beta", &constants("B"))),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Alpha.pas")));
+        reset_symbol_counters();
+        let error = workspace_symbols_from_input(input, "Val", &AtomicBool::new(false))
+            .value
+            .expect_err("more than 10,000 results");
+        assert_eq!(
+            error,
+            "workspace symbol query returned more than 10000 results; narrow the query"
+        );
+        assert_eq!(walks(), 0);
+    }
+
+    #[test]
+    fn names_declared_together_are_all_listed_like_the_walk() {
+        let pair = "unit Pair;\ninterface\ntype\n  TPair = class\n    FA, FB: Integer;\n  end;\nvar A, B: Integer;\nconst\n  C1 = 1; C2 = 2;\nimplementation\nend.\n";
+        let files = [
+            ("Pair.pas", pair.to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ];
+        let (_walk_temp, _, walk_workspace) = symbol_workspace(&files);
+        let walked = symbols(&walk_workspace.analysis_input(), "").value;
+        assert!(
+            symbol_names(&walked).contains(&("FB".to_owned(), "Pair.pas".to_owned())),
+            "{walked:?}"
+        );
+
+        let (_temp, root, mut workspace) = symbol_workspace(&files);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Pair.pas")));
+        reset_symbol_counters();
+        let indexed = symbols(&input, "").value;
+        assert!(super::test_take_fact_symbols() > 0);
+        let strip = |found: &[lsp_types::SymbolInformation]| {
+            found
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.name.clone(),
+                        symbol.kind,
+                        symbol
+                            .location
+                            .uri
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                            .to_owned(),
+                        symbol.location.range,
+                        symbol.container_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&indexed), strip(&walked));
+    }
+
+    #[test]
+    fn an_answer_over_the_cap_reads_no_indexed_file() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Alpha.pas", unit_text("Alpha", "const CapValueA = 1;\n")),
+            ("Beta.pas", unit_text("Beta", "const CapValueB = 2;\n")),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Alpha.pas")));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::navigation::test_set_symbol_result_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::navigation::test_set_symbol_result_cap(Some(1));
+        super::test_take_fact_reads();
+        let error =
+            workspace_symbols_from_input(input.clone(), "CapValue", &AtomicBool::new(false))
+                .value
+                .expect_err("two results over a cap of one");
+        assert_eq!(
+            error,
+            "workspace symbol query returned more than 1 results; narrow the query"
+        );
+        assert_eq!(super::test_take_fact_reads(), 0);
+
+        crate::navigation::test_set_symbol_result_cap(Some(2));
+        let found = symbols(&input, "CapValue");
+        assert_eq!(found.value.len(), 2);
+        assert_eq!(super::test_take_fact_reads(), 2);
+    }
+
+    #[test]
+    fn open_and_deleted_documents_are_not_served_from_disk_facts() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Provider.pas",
+                unit_text("Provider", "const SharedValue = 1;\n"),
+            ),
+            ("Gone.pas", unit_text("Gone", "const SharedGone = 3;\n")),
+            ("Kept.pas", unit_text("Kept", "const SharedKept = 4;\n")),
+        ]);
+        let provider = root.join("Provider.pas");
+        let gone = root.join("Gone.pas");
+        build_index_for(
+            &workspace.analysis_input(),
+            &source_uri(&root.join("Kept.pas")),
+        );
+        workspace
+            .open_document(
+                source_uri(&provider),
+                unit_text("Provider", "const SharedEdited = 1;\n"),
+                2,
+            )
+            .expect("open provider");
+        let mut input = workspace.analysis_input();
+        input
+            .deleted_overrides
+            .insert(source_uri(&gone), super::super::disk_stamp(&gone));
+        reset_symbol_counters();
+        let found = symbols(&input, "Shared");
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("SharedKept".to_owned(), "Kept.pas".to_owned()),
+                ("SharedEdited".to_owned(), "Provider.pas".to_owned()),
+            ]
+        );
+        assert_eq!(super::test_take_fact_symbols(), 1);
+        assert_eq!(walks(), 0);
     }
 
     #[test]

@@ -281,6 +281,38 @@ pub(in crate::workspace) mod tests {
     }
 
     #[test]
+    fn an_extent_crossing_an_include_is_expanded() {
+        let indexed = index(
+            &[
+                (
+                    "Main.pas",
+                    b"unit Main;\ninterface\ntype\n  TFoo = class\n    procedure Run;\n{$I Tail.inc}\nconst After = 1;\nimplementation\nend.\n"
+                        .as_slice(),
+                ),
+                ("Tail.inc", b"  end;\n".as_slice()),
+            ],
+            &["Main.pas"],
+        );
+        let facts = indexed.facts("Main.pas").extracted.facts;
+        let foo = facts
+            .declarations
+            .iter()
+            .find(|d| d.name == "tfoo")
+            .expect("the class is declared");
+        assert!(
+            matches!(foo.extent, FactLocation::Expanded { .. }),
+            "{:?}",
+            foo.extent
+        );
+        assert!(matches!(foo.location, FactLocation::Source { slot: 0, .. }));
+        assert!(
+            !facts.coverage.contains(&CoverageReason::UnmappedLocation),
+            "{:?}",
+            facts.coverage
+        );
+    }
+
+    #[test]
     fn a_source_map_from_another_session_is_inconsistent() {
         let (a, b) = (includes(), includes());
         let parsed = a

@@ -11,14 +11,21 @@ macro_rules! fault_point {
     };
 }
 
+pub mod admin;
 mod artifacts;
+mod budget;
+mod clock;
 mod container;
 mod evidence;
 mod facts;
+mod gc;
+mod health;
 mod index;
 mod keys;
+mod leases;
 mod limits;
 mod location;
+mod maintenance;
 mod namespaces;
 mod nonce;
 mod outcome;
@@ -32,6 +39,8 @@ mod sqlite;
 mod stream;
 #[cfg(feature = "test-support")]
 mod testing;
+mod waits;
+mod wal;
 
 pub use artifacts::{
     ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
@@ -45,6 +54,7 @@ pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
 pub use index::{IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
+pub use maintenance::{Maintenance, Phase, StepBudget, StepReport};
 pub use outcome::SealRefusal;
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
 #[cfg(feature = "test-support")]
@@ -60,20 +70,38 @@ pub use snapshots::{
 };
 #[cfg(feature = "test-support")]
 pub use testing::FaultPoint;
+#[cfg(feature = "test-support")]
+pub(crate) use testing::count_operation;
+#[cfg(feature = "test-support")]
+pub use testing::store_operations_for_test;
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn count_operation() {}
+pub use waits::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 
+pub use budget::{
+    LOW_SPACE_MARGIN_BYTES, MIN_BUDGET_TO_WAL_RATIO, MIN_WAL_THRESHOLD_BYTES, PolicyError,
+    PolicyState, Pressure, ROW_OVERHEAD_BYTES, StorePolicy, Usage,
+};
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
+pub use gc::{MaintenanceLimits, MaintenanceLimitsError, RetireStep};
+use health::Access;
+pub use health::{MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
+pub use leases::{
+    Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,
+};
 pub use limits::{
-    CONNECTION_OVERHEAD_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS,
-    MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE,
-    MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
-    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES,
-    MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
-    SQLITE_LENGTH_LIMIT, StoreLimits,
+    CONNECTION_OVERHEAD_BYTES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES,
+    MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
+    MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES,
+    MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES,
+    MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
+    MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT, StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
 #[cfg(feature = "test-support")]
-pub use testing::{HeldConnection, ScratchHold};
+pub use testing::{HeldConnection, MaintenanceLockHold, ScratchHold};
+pub use wal::Checkpointed;
 
 use crate::Namespace;
 use namespaces::NamespaceLock;
@@ -97,6 +125,10 @@ pub struct Store {
     pool: Pool,
     scratch: std::sync::Arc<reader::ScratchBudget>,
     _lock: NamespaceLock,
+    clock: clock::Clock,
+    lease: leases::ProcessLease,
+    hints: leases::Hints,
+    health: health::Health,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
 }
@@ -110,6 +142,7 @@ impl Store {
         namespace: &Namespace,
         limits: StoreLimits,
     ) -> Result<Self, Bypass> {
+        count_operation();
         limits.validate().map_err(Bypass::InvalidLimits)?;
         sqlite::check_sqlite_version(rusqlite::version_number())?;
         let location = StoreLocation::prepare(directory)?;
@@ -120,10 +153,24 @@ impl Store {
         let deadline = Deadline::after(limits.open_wait);
         let lock = NamespaceLock::share(location.namespace_lock(namespace.id()), deadline)?;
         let pool = Pool::new(location.database(), limits);
+        let clock = clock::Clock::default();
+        let lease = leases::ProcessLease::new(nonce::nonce());
         let scope = {
             let mut writer = pool.acquire(Role::Writer, deadline)?;
             container::prepare_container(&mut writer, deadline)?;
-            namespaces::register(&mut writer, namespace, unix_seconds(), deadline)?
+            let scope = namespaces::register(&mut writer, namespace, unix_seconds(), deadline)?;
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            namespaces::ensure_live(&transaction, scope)?;
+            // Not refused at the WAL threshold: a renewal keeps the lease live.
+            leases::renew(&transaction, scope, &lease, clock.unix_seconds())?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite::classify(&error))?;
+            scope
         };
         let store = Self {
             location,
@@ -133,6 +180,10 @@ impl Store {
             pool,
             scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
+            clock,
+            lease,
+            hints: leases::Hints::default(),
+            health: health::Health::default(),
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),
         };
@@ -159,13 +210,17 @@ impl Store {
 
     /// Whether this store's scope is still live (not reset or retired).
     pub fn check_scope(&self) -> Result<(), Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = sqlite::begin(&mut reader, rusqlite::TransactionBehavior::Deferred)?;
-        namespaces::ensure_live(&transaction, self.scope)
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = sqlite::begin(&mut reader, rusqlite::TransactionBehavior::Deferred)?;
+            namespaces::ensure_live(&transaction, self.scope)
+        })
     }
 
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
-        self.retire_within(Deadline::after(self.limits.open_wait))
+        self.guarded(Access::Maintenance, || {
+            self.retire_within(Deadline::after(self.limits.open_wait))
+        })
     }
 
     fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
@@ -173,12 +228,89 @@ impl Store {
         namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace, deadline)
     }
 
-    /// Delete at most `max_rows` rows of retired scopes. Run off
-    /// interactive paths and repeat until `complete`.
+    /// Delete at most `max_rows` rows in one `IMMEDIATE` transaction: rows
+    /// of retired scopes first, then retired rows nothing references and
+    /// orphan key manifests of this store's scope while it is live. Run off
+    /// interactive paths and repeat until `complete`. At the WAL threshold
+    /// it writes nothing (`WalPressure`: only a checkpoint makes room, spec
+    /// D13).
     pub fn reclaim(&self, max_rows: usize) -> Result<Reclaimed, Bypass> {
-        let deadline = Deadline::after(self.limits.wait);
-        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-        namespaces::reclaim(&mut writer, max_rows, deadline)
+        self.guarded(Access::Maintenance, || {
+            let fail = |error: rusqlite::Error| sqlite::classify(&error);
+            let deadline = Deadline::after(self.limits.wait);
+            let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            let policy = budget::read_policy(&transaction)?.policy;
+            if budget::pressure_of(policy, &budget::read_usage(self, &transaction)?)
+                == budget::Pressure::WalPressure
+            {
+                return Err(Bypass::WalPressure);
+            }
+            let reclaimed = namespaces::reclaim(&transaction, max_rows, self.scope)?;
+            fault_point!(self, GcDeleteBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(fail)?;
+            Ok(reclaimed)
+        })
+    }
+
+    /// Retire this store's scope and move its namespace to the next epoch in
+    /// one transaction (spec §11.2). Every handle of the old scope, this one
+    /// included, is `Fenced` from its next transaction; reopen to use the new
+    /// epoch. The old rows are deleted in batches by [`Self::reclaim`].
+    /// Allowed at the WAL threshold: it is the administrator's escape hatch
+    /// (see [`crate::admin::reset`]).
+    pub fn reset_namespace(&self) -> Result<(), Bypass> {
+        self.guarded(Access::Maintenance, || {
+            let fail = |error: rusqlite::Error| sqlite::classify(&error);
+            let deadline = Deadline::after(self.limits.open_wait);
+            let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            namespaces::reset(&transaction, self.scope)?;
+            fault_point!(self, ResetBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(fail)
+        })
+    }
+
+    /// The process-level health state, if the store is unhealthy.
+    pub fn health(&self) -> Option<Unhealthy> {
+        self.health.state()
+    }
+
+    /// Run `operation` unless the health state blocks `access`, then
+    /// record its outcome (spec §10 amendment 2026-11-03, D15). Only the
+    /// outermost guarded call on a thread checks and records, so a failure
+    /// in a nested call counts once.
+    pub(crate) fn guarded<T>(
+        &self,
+        access: Access,
+        operation: impl FnOnce() -> Result<T, Bypass>,
+    ) -> Result<T, Bypass> {
+        let depth = GuardDepth::enter();
+        if !depth.outermost {
+            return operation();
+        }
+        if let Some(bypass) = self.health.blocked(access, self.clock.now()) {
+            return Err(bypass);
+        }
+        #[cfg(feature = "test-support")]
+        let result = match self.hooks.take_injected() {
+            Some(bypass) => Err(bypass),
+            None => operation(),
+        };
+        #[cfg(not(feature = "test-support"))]
+        let result = operation();
+        self.health.record(access, &result, self.clock.now());
+        result
     }
 
     pub(crate) fn writer(&self) -> Result<Lease<'_>, Bypass> {
@@ -205,8 +337,75 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        leases::release(self);
+    }
+}
+
+thread_local! {
+    static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a thread as inside a guarded operation until dropped (also on
+/// unwind or early return).
+struct GuardDepth {
+    outermost: bool,
+}
+
+impl GuardDepth {
+    fn enter() -> Self {
+        let outermost = GUARD_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            current == 0
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for GuardDepth {
+    fn drop(&mut self) {
+        GUARD_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::Digest;
+
+    #[test]
+    fn a_failure_in_a_nested_guarded_call_is_recorded_once() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let store = Store::open(
+            directory.path(),
+            &Namespace::new(Digest::from_bytes([3; 32])),
+            StoreLimits::default(),
+        )
+        .unwrap();
+        let nested = store.guarded(Access::Write, || {
+            store.guarded(Access::Write, || Err::<(), _>(Bypass::Full))
+        });
+        assert_eq!(nested, Err(Bypass::Full));
+        assert_eq!(store.health(), Some(Unhealthy::Full));
+        store.advance_clock_for_test(MIN_HEALTH_BACKOFF);
+        assert_eq!(
+            store.guarded(Access::Write, || Ok(())),
+            Ok(()),
+            "recorded once: the backoff is the minimum, not doubled"
+        );
+        assert_eq!(store.health(), None);
+    }
 }

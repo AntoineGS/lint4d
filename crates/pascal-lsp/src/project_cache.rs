@@ -9,12 +9,16 @@ use std::time::Duration;
 use lsp_types::Url;
 use pascal_project::{ProjectContext, ProjectReadStamp};
 
-use crate::catalogue::{Catalogue, CatalogueKey, CatalogueStore, Removed, SharedCatalogue};
+use crate::catalogue::{Catalogue, CatalogueKey, CatalogueStore, Depth, Removed, SharedCatalogue};
 use crate::file_watch::DirectoryWatch;
 use crate::include_expansion::ExpansionResult;
 use crate::navigation::ParsedDocument;
 use crate::navigation::compiled_dcu::project_context_fingerprint;
+use crate::workspace::ContextKey;
 use crate::workspace::rename::OverlayInput;
+use crate::workspace_index::{
+    ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
+};
 
 /// Default for the `maxCacheBytes` limit.
 pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -28,6 +32,11 @@ pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09
 /// `maxCacheBytes`. Like a reservation, they may evict unpinned entries to
 /// make room, but never past that eighth of the budget.
 const CATALOGUE_BUDGET_SHARE: usize = 8;
+/// The workspace index may hold a quarter of `maxCacheBytes` (l4d-33).
+const INDEX_BUDGET_SHARE: usize = 4;
+pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
+const MAX_INDEX_REQUESTS: usize = 64;
+const MAX_OWNERS: usize = 4_096;
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +605,7 @@ mod cache_tests {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
+                settled: true,
             }),
             report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
@@ -966,6 +976,7 @@ mod cache_tests {
                 },
             }],
             complete: true,
+            settled: true,
         };
 
         assert_eq!(
@@ -1198,8 +1209,341 @@ mod cache_tests {
         );
     }
 
+    fn claimed_unit(cache: &ProjectCache, main: &Url, ctx: &ProjectContext) -> Option<u64> {
+        match lock(&cache.inner).slots.get(&Key {
+            layer: Layer::Unit,
+            uri: main.clone(),
+            fingerprint: project_context_fingerprint(ctx),
+        }) {
+            Some(Slot::Computing { claim, .. }) => Some(*claim),
+            _ => None,
+        }
+    }
+
+    fn main_unit_value() -> UnitValue {
+        UnitValue {
+            parsed: parsed_unit("Main.pas"),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        }
+    }
+
+    /// Looks the unit `main` up on a new thread with `role`, and
+    /// reports the outcome: `Hit`, `Cancelled`, or the claim to compute.
+    fn spawn_lookup(
+        cache: &ProjectCache,
+        main: &Url,
+        ctx: &ProjectContext,
+        role: ClaimRole,
+        cancel: Arc<AtomicBool>,
+    ) -> std::sync::mpsc::Receiver<Lookup<UnitValue>> {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let cache = cache.clone();
+        let ctx = ctx.clone();
+        let main = main.clone();
+        std::thread::spawn(move || {
+            set_claim_role_on_this_thread(role);
+            let lookup = cache.unit(&main, &ctx, 1, &HashMap::new(), &cancel);
+            result_tx.send(lookup).unwrap();
+        });
+        result_rx
+    }
+
+    /// Claims the unit `main` on a new thread with `role`, then holds
+    /// the claim until told to store (`true`) or drop (`false`) it.
+    fn spawn_owner(
+        cache: &ProjectCache,
+        main: &Url,
+        ctx: &ProjectContext,
+        role: ClaimRole,
+    ) -> (std::sync::mpsc::Sender<bool>, std::thread::JoinHandle<()>) {
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<bool>();
+        let cache = cache.clone();
+        let ctx = ctx.clone();
+        let main = main.clone();
+        let owner = std::thread::spawn(move || {
+            set_claim_role_on_this_thread(role);
+            let Lookup::Compute(claim) = cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+            else {
+                panic!("the owner claims the slot")
+            };
+            assert!(!claim.is_detached());
+            claimed_tx.send(()).unwrap();
+            if finish_rx.recv().unwrap() {
+                cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+            }
+        });
+        claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owner claimed the slot");
+        (finish_tx, owner)
+    }
+
     #[test]
-    fn limited_waits_compute_without_caching_and_leave_the_claim() {
+    fn interactive_lookup_waits_for_a_unit_claim_instead_of_parsing_it_again() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let owner_cancel = Arc::new(AtomicBool::new(false));
+        let (finish, owner) = spawn_owner(&cache, &main, &ctx, ClaimRole::job(owner_cancel));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_every_wait_hook(waiting_tx);
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // Each wait lasts one slice at most; outlast any bounded wait the
+        // claim may be given before it is computed a second time.
+        let slices = 2 + (Duration::from_secs(1).as_millis() / WAIT_SLICE.as_millis()) as usize;
+        for _ in 0..slices {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the interactive lookup keeps waiting for the claim");
+        }
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let lookup = interactive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the interactive lookup answers once the claim is stored");
+        assert!(
+            matches!(lookup, Lookup::Hit(_)),
+            "one computation serves both: the waiter must adopt the stored claim"
+        );
+    }
+
+    #[test]
+    fn cancelled_interactive_waiter_returns_while_the_claim_is_held() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::job(Arc::new(AtomicBool::new(false))),
+        );
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_waiter_hook(waiting_tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(cancel.clone(), Duration::ZERO),
+            cancel.clone(),
+        );
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the interactive lookup waits for the claim");
+        cancel.store(true, Ordering::Relaxed);
+        cache.inner.changed.notify_all();
+        let lookup = interactive.recv_timeout(Duration::from_secs(5));
+        let still_claimed = claimed_unit(&cache, &main, &ctx).is_some();
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        assert!(
+            matches!(lookup, Ok(Lookup::Cancelled)),
+            "a cancelled waiter must return without waiting out the claim"
+        );
+        assert!(still_claimed, "the owner still held the claim");
+    }
+
+    #[test]
+    fn a_failed_owner_lets_the_waiter_compute() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::job(Arc::new(AtomicBool::new(false))),
+        );
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_waiter_hook(waiting_tx);
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
+            Arc::new(AtomicBool::new(false)),
+        );
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the interactive lookup waits for the claim");
+        finish.send(false).unwrap();
+        owner.join().unwrap();
+        let Ok(Lookup::Compute(claim)) = interactive.recv_timeout(Duration::from_secs(5)) else {
+            panic!("the waiter computes once the owner drops its claim")
+        };
+        assert!(!claim.is_detached(), "the waiter claims the freed slot");
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_owners_claim_is_taken_over() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let owner_cancel = Arc::new(AtomicBool::new(false));
+        let (finish, owner) =
+            spawn_owner(&cache, &main, &ctx, ClaimRole::job(owner_cancel.clone()));
+        let owner_claim = claimed_unit(&cache, &main, &ctx).expect("owner claim");
+        owner_cancel.store(true, Ordering::Relaxed);
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let Ok(Lookup::Compute(claim)) = interactive.recv_timeout(Duration::from_secs(5)) else {
+            panic!("the waiter takes over a cancelled owner's claim")
+        };
+        assert!(!claim.is_detached(), "the take-over claims the slot");
+        let taken = claimed_unit(&cache, &main, &ctx).expect("taken-over claim");
+        assert_ne!(taken, owner_claim);
+        // The cancelled owner finishing late neither stores nor frees the slot.
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        assert_eq!(claimed_unit(&cache, &main, &ctx), Some(taken));
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn interactive_lookup_takes_over_a_yielding_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::yielding(Arc::new(AtomicBool::new(false))),
+        );
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let Ok(Lookup::Compute(claim)) = interactive.recv_timeout(Duration::from_secs(5)) else {
+            panic!("interactive work takes the warmer's claim over")
+        };
+        assert!(!claim.is_detached());
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn interactive_unit_waits_on_a_roleless_owner_are_bounded() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(&cache, &main, &ctx, ClaimRole::default());
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::from_millis(50)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lookup = interactive.recv_timeout(Duration::from_secs(5));
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let Ok(Lookup::Compute(claim)) = lookup else {
+            panic!("a wait on a roleless owner gives up")
+        };
+        assert!(claim.is_detached());
+    }
+
+    #[test]
+    fn interactive_lookup_waits_for_a_jobs_import_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let owner = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                set_claim_role_on_this_thread(ClaimRole::job(Arc::new(AtomicBool::new(false))));
+                let Lookup::Compute(claim) =
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("the owner claims the slot")
+                };
+                assert_eq!(claims_held_on_this_thread(), 1);
+                claimed_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+                assert_eq!(claims_held_on_this_thread(), 0);
+            })
+        };
+        claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owner claimed the slot");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_every_wait_hook(waiting_tx);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let interactive = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                set_claim_role_on_this_thread(ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::ZERO,
+                ));
+                let hit = matches!(
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+                    Lookup::Hit(_)
+                );
+                result_tx.send(hit).unwrap();
+            })
+        };
+        // An import claim covers one resolution, like a unit claim one
+        // parse: the interactive lookup keeps waiting for it.
+        let slices = 2 + (Duration::from_secs(1).as_millis() / WAIT_SLICE.as_millis()) as usize;
+        for _ in 0..slices {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the interactive lookup keeps waiting for the claim");
+        }
+        finish_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the interactive lookup answers once the claim is stored"),
+            "the waiter adopts the stored resolution"
+        );
+        interactive.join().unwrap();
+    }
+
+    #[test]
+    fn interactive_import_waits_are_bounded_and_leave_the_claim() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
@@ -1213,12 +1557,16 @@ mod cache_tests {
             let ctx = ctx.clone();
             let main = main.clone();
             std::thread::spawn(move || {
-                limit_claim_waits_on_this_thread(Some(Duration::from_millis(50)));
+                set_claim_role_on_this_thread(ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::from_millis(50),
+                ));
                 let Lookup::Compute(local) =
                     cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
                 else {
-                    panic!("a limited wait computes locally")
+                    panic!("a bounded import wait computes locally")
                 };
+                assert!(local.is_detached());
                 cache.store_imports(local, import_value(vec![]), 1, &no_cancel());
                 result_tx.send(()).unwrap();
             })
@@ -1234,12 +1582,65 @@ mod cache_tests {
         );
         cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
         interactive.join().unwrap();
-        result.expect("a limited wait must give up on the claim");
+        result.expect("a bounded import wait must give up on the claim");
         assert!(still_claimed, "the local computation must leave the claim");
         assert!(matches!(
             cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Hit(_)
         ));
+    }
+
+    #[test]
+    fn a_wait_that_would_close_a_cycle_computes_detached() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let first = uri("First.pas");
+        let second = uri("Second.pas");
+        // This thread claims First; another claims Second and then waits
+        // for First.
+        let Lookup::Compute(first_claim) =
+            cache.imports(&first, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected initial miss")
+        };
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_waiter_hook(waiting_tx);
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let other = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let first = first.clone();
+            let second = second.clone();
+            std::thread::spawn(move || {
+                let Lookup::Compute(second_claim) =
+                    cache.imports(&second, &ctx, 1, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("the other thread claims Second")
+                };
+                claimed_tx.send(()).unwrap();
+                let first_lookup = cache.imports(&first, &ctx, 1, &HashMap::new(), &no_cancel());
+                cache.store_imports(second_claim, import_value(vec![]), 1, &no_cancel());
+                matches!(first_lookup, Lookup::Hit(_))
+            })
+        };
+        claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the other thread claimed Second");
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the other thread waits for First");
+        let Lookup::Compute(detached) =
+            cache.imports(&second, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("waiting for Second would close a cycle")
+        };
+        assert!(
+            detached.is_detached(),
+            "a cycle must not take the claim over"
+        );
+        drop(detached);
+        cache.store_imports(first_claim, import_value(vec![]), 1, &no_cancel());
+        assert!(other.join().unwrap(), "the other thread adopts First");
     }
 
     #[test]
@@ -2541,8 +2942,78 @@ struct Entry {
 #[derive(Debug)]
 enum Slot {
     Ready(Entry),
-    Computing { generation: u64, input_hash: u64 },
+    Computing {
+        generation: u64,
+        input_hash: u64,
+        /// Tells this claim from one that took the slot over.
+        claim: u64,
+        owner: ClaimOwner,
+    },
 }
+
+/// The claim a thread computes and who it computes for, so that waiters can
+/// tell when to stop waiting for it.
+#[derive(Debug, Clone)]
+struct ClaimOwner {
+    thread: std::thread::ThreadId,
+    role: ClaimRole,
+}
+
+/// How the work running on a thread takes part in cache claims.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClaimRole {
+    /// The work answers an interactive request.
+    interactive: bool,
+    /// The work's cancellation: once set, a waiter takes its claims over.
+    cancel: Option<Arc<AtomicBool>>,
+    /// Interactive work takes this work's claims over instead of waiting:
+    /// the warmer pauses for interactive requests and runs at low priority.
+    yields_to_interactive: bool,
+    /// How long the work waits for a slot that a thread without a role
+    /// (the main thread) computes, before computing it without caching:
+    /// such a claim can be neither cancelled nor taken over. Claims of
+    /// other owners cover one parse or one import resolution (the importer's
+    /// dependency walk runs after the resolution is stored), so they are
+    /// waited for as long as they are held.
+    roleless_claim_wait: Option<Duration>,
+}
+
+impl ClaimRole {
+    pub(crate) fn interactive(cancel: Arc<AtomicBool>, roleless_claim_wait: Duration) -> Self {
+        Self {
+            interactive: true,
+            cancel: Some(cancel),
+            yields_to_interactive: false,
+            roleless_claim_wait: Some(roleless_claim_wait),
+        }
+    }
+
+    pub(crate) fn job(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            interactive: false,
+            cancel: Some(cancel),
+            yields_to_interactive: false,
+            roleless_claim_wait: None,
+        }
+    }
+
+    pub(crate) fn yielding(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            interactive: false,
+            cancel: Some(cancel),
+            yields_to_interactive: true,
+            roleless_claim_wait: None,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    }
+}
+
+static NEXT_CLAIM: AtomicU64 = AtomicU64::new(0);
 
 struct State {
     slots: HashMap<Key, Slot>,
@@ -2590,6 +3061,9 @@ struct State {
     closure_crawl_requests: Vec<Url>,
     /// Each root's uncached closure units at its last snapshot walk.
     closure_misses: HashMap<Url, HashSet<Url>>,
+    /// The slot each thread waits for, to find waits that would close a
+    /// cycle.
+    waiting: HashMap<std::thread::ThreadId, Key>,
     /// Ready entries looked at by eviction and invalidation.
     #[cfg(test)]
     examined: std::cell::Cell<usize>,
@@ -2621,6 +3095,7 @@ impl Default for State {
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
+            waiting: HashMap::new(),
             #[cfg(test)]
             examined: std::cell::Cell::new(0),
         }
@@ -2644,7 +3119,10 @@ struct WatcherState {
 /// queues watch-count changes in `State::watch_changes`, and `sync_watches`
 /// applies them after `state` is released. `witnesses` is never held together
 /// with either lock. `catalogues` is never held together with any other lock:
-/// what it drops is released (charge, watches) after it is unlocked.
+/// what it drops is released (charge, watches) after it is unlocked. `index`
+/// is likewise never held together with `state`, `watcher`, `witnesses` or
+/// `catalogues`: the charges of what it drops are released after it is
+/// unlocked.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
@@ -2654,6 +3132,8 @@ struct Inner {
     witnesses: Mutex<HashMap<PathBuf, Witness>>,
     /// Never held together with `state`, `watcher` or `witnesses`.
     catalogues: Mutex<CatalogueStore>,
+    /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
+    index: Mutex<IndexStore>,
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
@@ -2661,6 +3141,9 @@ struct Inner {
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     waiter_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Told each time a lookup starts waiting for a claim.
+    #[cfg(test)]
+    every_wait_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2719,6 +3202,13 @@ impl ProjectCache {
         if let Some(sender) = self.inner.waiter_hook.lock().unwrap().take() {
             let _ = sender.send(());
         }
+        if let Some(sender) = self.inner.every_wait_hook.lock().unwrap().as_ref() {
+            let _ = sender.send(());
+        }
+    }
+
+    fn set_every_wait_hook(&self, sender: std::sync::mpsc::Sender<()>) {
+        *self.inner.every_wait_hook.lock().unwrap() = Some(sender);
     }
 
     fn poison_state(&self) {
@@ -2741,11 +3231,15 @@ pub(crate) enum Lookup<V> {
 
 /// Exclusive right to compute one slot. Dropping it without storing frees the
 /// slot and wakes waiters so one of them can take over.
+///
+/// A claim must stay on the thread that obtained it: cycle detection between
+/// waiters identifies a claim's owner by that thread.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Claim {
     inner: Arc<Inner>,
     key: Key,
     generation: u64,
+    claim: u64,
     invalidation_epoch: u64,
     context: Arc<ProjectContext>,
     input_hash: u64,
@@ -2767,8 +3261,10 @@ impl Drop for Claim {
         if self.detached {
             return;
         }
+        HELD_CLAIMS.with(|held| held.set(held.get().saturating_sub(1)));
         let mut state = lock(&self.inner);
-        if matches!(state.slots.get(&self.key), Some(Slot::Computing { generation, .. }) if *generation == self.generation)
+        if matches!(state.slots.get(&self.key), Some(Slot::Computing { generation, claim, .. })
+            if *generation == self.generation && *claim == self.claim)
         {
             state.slots.remove(&self.key);
         }
@@ -2792,6 +3288,7 @@ pub(crate) struct CacheStats {
     pub reserved_scratch_bytes: usize,
     pub reserved_pages_bytes: usize,
     pub reserved_catalogue_bytes: usize,
+    pub reserved_index_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2801,6 +3298,7 @@ impl CacheStats {
             .saturating_add(self.reserved_scratch_bytes)
             .saturating_add(self.reserved_pages_bytes)
             .saturating_add(self.reserved_catalogue_bytes)
+            .saturating_add(self.reserved_index_bytes)
     }
 }
 
@@ -2819,10 +3317,13 @@ pub(crate) enum ReservationKind {
     /// bytes itself, not through a `Reservation`: a stored `Reservation`
     /// would keep `Inner` alive through its own `Arc`.
     Catalogues,
+    /// The workspace index (l4d-33). Held by the index store like the
+    /// catalogues, and released with `release_index`.
+    WorkspaceIndex,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
 
     fn index(self) -> usize {
         match self {
@@ -2830,6 +3331,7 @@ impl ReservationKind {
             Self::Scratch => 1,
             Self::Pages => 2,
             Self::Catalogues => 3,
+            Self::WorkspaceIndex => 4,
         }
     }
 }
@@ -2949,6 +3451,11 @@ fn recover_poisoned_state<'a>(
 }
 
 fn lock(inner: &Inner) -> MutexGuard<'_, State> {
+    #[cfg(test)]
+    assert!(
+        !HELD_INDEX.with(std::cell::Cell::get),
+        "the index lock is never held with the state lock"
+    );
     match inner.state.lock() {
         Ok(state) => state,
         Err(poisoned) => recover_poisoned_state(inner, poisoned.into_inner()),
@@ -2956,28 +3463,75 @@ fn lock(inner: &Inner) -> MutexGuard<'_, State> {
 }
 
 thread_local! {
-    static CLAIM_WAIT_LIMIT: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
+    static CLAIM_ROLE: std::cell::RefCell<ClaimRole> =
+        std::cell::RefCell::new(ClaimRole::default());
+    /// Claims this thread holds on slots, which other lookups may wait for.
+    static HELD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Bounds how long lookups on the calling thread wait for a slot another
-/// thread is computing. Past the limit the lookup computes without caching,
-/// so an interactive worker never waits out a bulk job's or the warmer's
-/// claim.
-pub(crate) fn limit_claim_waits_on_this_thread(limit: Option<Duration>) {
-    CLAIM_WAIT_LIMIT.with(|cell| cell.set(limit));
+/// The number of slot claims the calling thread holds. Work that pauses for
+/// other work must hold none, or a lookup waiting for its claims would wait
+/// out the pause.
+pub(crate) fn claims_held_on_this_thread() -> usize {
+    HELD_CLAIMS.with(std::cell::Cell::get)
+}
+
+/// Sets how the work on the calling thread takes part in cache claims.
+///
+/// A lookup of a slot another thread computes for the same input waits for
+/// that claim rather than computing the slot a second time, while its own
+/// cancellation is clear. It takes the claim over instead once the owner's
+/// work is cancelled, or when it is interactive and the owner yields to
+/// interactive work. It computes without caching when waiting would close a
+/// cycle of waits, or when an import slot outlasts the role's import wait.
+pub(crate) fn set_claim_role_on_this_thread(role: ClaimRole) {
+    CLAIM_ROLE.with(|cell| *cell.borrow_mut() = role);
 }
 
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-pub(crate) fn claim_waits_are_limited_on_this_thread() -> bool {
-    CLAIM_WAIT_LIMIT.with(|cell| cell.get().is_some())
+pub(crate) fn claims_are_interactive_on_this_thread() -> bool {
+    CLAIM_ROLE.with(|cell| cell.borrow().interactive)
 }
 
-fn wait_timeout_recovering_poison<'a>(
-    inner: &'a Inner,
-    state: MutexGuard<'a, State>,
-) -> (MutexGuard<'a, State>, WaitTimeoutResult) {
-    wait_timeout_recovering_poison_for(inner, state, WAIT_SLICE)
+/// Lets protocol tests see that an interactive lookup waits for a claim, and
+/// for how many wait slices.
+#[cfg(feature = "test-support")]
+fn mark_interactive_claim_wait_for_tests() {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PASCAL_LSP_TEST_INTERACTIVE_CLAIM_WAIT_MARKER") else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
+        let _ = marker.write_all(b"x");
+    }
+}
+
+/// Whether `waiter` waiting for a slot `owner` computes would close a cycle
+/// of threads each waiting for a slot the next one computes.
+fn wait_closes_cycle(
+    state: &State,
+    waiter: std::thread::ThreadId,
+    owner: std::thread::ThreadId,
+) -> bool {
+    let mut current = owner;
+    for _ in 0..=state.waiting.len() {
+        if current == waiter {
+            return true;
+        }
+        let Some(key) = state.waiting.get(&current) else {
+            return false;
+        };
+        let Some(Slot::Computing { owner, .. }) = state.slots.get(key) else {
+            return false;
+        };
+        current = owner.thread;
+    }
+    false
 }
 
 fn wait_timeout_recovering_poison_for<'a>(
@@ -3537,30 +4091,51 @@ impl ProjectCache {
             uri: uri.clone(),
             fingerprint: project_context_fingerprint(context),
         };
-        let wait_limit = CLAIM_WAIT_LIMIT.with(std::cell::Cell::get);
-        let mut waiting_since = None;
+        let role = CLAIM_ROLE.with(|cell| cell.borrow().clone());
+        let thread = std::thread::current().id();
         let mut wait_started: Option<std::time::Instant> = None;
+        let mut taking_over = false;
+        #[cfg(feature = "test-support")]
+        let mut wait_marked = false;
         let mut state = lock(&self.inner);
         loop {
             match state.slots.get(&key) {
                 Some(Slot::Computing {
                     generation,
                     input_hash: claimed_input,
+                    owner,
+                    ..
                 }) => {
-                    wait_started.get_or_insert_with(std::time::Instant::now);
+                    let waiting_since = *wait_started.get_or_insert_with(std::time::Instant::now);
                     if cancel.load(Ordering::Relaxed) {
                         return Lookup::Cancelled;
                     }
-                    let waited_out = wait_limit.is_some_and(|limit| {
-                        waiting_since
-                            .get_or_insert_with(std::time::Instant::now)
-                            .elapsed()
-                            >= limit
-                    });
-                    // The claim computes another revision of the input, or
-                    // this thread may not wait longer: compute without
+                    // The owner's work was cancelled, so its result will be
+                    // discarded, or it yields to this interactive work: take
+                    // the slot over.
+                    if *claimed_input == input_hash
+                        && (owner.role.cancelled()
+                            || (role.interactive && owner.role.yields_to_interactive))
+                    {
+                        taking_over = true;
+                        break;
+                    }
+                    // Claims of threads without a role (the main thread, which
+                    // parses opened documents) cannot be cancelled or taken
+                    // over, so waits for them are bounded.
+                    let bounded_wait = role
+                        .roleless_claim_wait
+                        .filter(|_| owner.role.cancel.is_none())
+                        .map(|limit| limit.saturating_sub(waiting_since.elapsed()));
+                    // The claim computes another revision of the input, this
+                    // thread may not wait longer for a role-less owner, or
+                    // waiting would close a cycle of waits: compute without
                     // caching instead of waiting on it.
-                    if *claimed_input != input_hash || waited_out {
+                    if *claimed_input != input_hash
+                        || bounded_wait.is_some_and(|remaining| remaining.is_zero())
+                        || wait_closes_cycle(&state, thread, owner.thread)
+                    {
+                        let generation = *generation;
                         crate::trace::count(|counters| {
                             counters.detached += 1;
                             counters.wait +=
@@ -3569,7 +4144,8 @@ impl ProjectCache {
                         return Lookup::Compute(Claim {
                             inner: self.inner.clone(),
                             key: key.clone(),
-                            generation: *generation,
+                            generation,
+                            claim: NEXT_CLAIM.fetch_add(1, Ordering::Relaxed),
                             context: Arc::new(context.clone()),
                             input_hash,
                             invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
@@ -3577,22 +4153,27 @@ impl ProjectCache {
                             started: std::time::Instant::now(),
                         });
                     }
+                    // One mark per wait slice, so tests can see a wait last.
+                    #[cfg(feature = "test-support")]
+                    if role.interactive && !wait_marked {
+                        // The marker is a file: write it without the lock.
+                        wait_marked = true;
+                        drop(state);
+                        mark_interactive_claim_wait_for_tests();
+                        state = lock(&self.inner);
+                        continue;
+                    }
+                    state.waiting.insert(thread, key.clone());
                     #[cfg(test)]
                     self.signal_waiter_hook();
-                    state = match wait_limit {
-                        Some(limit) => {
-                            let remaining = limit.saturating_sub(
-                                waiting_since.map_or(Duration::ZERO, |since| since.elapsed()),
-                            );
-                            wait_timeout_recovering_poison_for(
-                                &self.inner,
-                                state,
-                                remaining.min(WAIT_SLICE),
-                            )
-                            .0
-                        }
-                        None => wait_timeout_recovering_poison(&self.inner, state).0,
-                    };
+                    let slice =
+                        bounded_wait.map_or(WAIT_SLICE, |remaining| remaining.min(WAIT_SLICE));
+                    state = wait_timeout_recovering_poison_for(&self.inner, state, slice).0;
+                    state.waiting.remove(&thread);
+                    #[cfg(feature = "test-support")]
+                    {
+                        wait_marked = false;
+                    }
                 }
                 Some(Slot::Ready(entry))
                     if *entry.context == *context && entry.input_hash == input_hash =>
@@ -3652,6 +4233,7 @@ impl ProjectCache {
                     )
                 }
                 Some(Slot::Ready(_)) => "probes failed".to_string(),
+                Some(Slot::Computing { .. }) if taking_over => "taken over".to_string(),
                 Some(Slot::Computing { .. }) => "computing".to_string(),
             };
             crate::trace::trace!(
@@ -3662,20 +4244,25 @@ impl ProjectCache {
         }
         remove_ready(&mut state, &key);
         let generation = state.generation;
+        let claim = NEXT_CLAIM.fetch_add(1, Ordering::Relaxed);
         state.slots.insert(
             key.clone(),
             Slot::Computing {
                 generation,
                 input_hash,
+                claim,
+                owner: ClaimOwner { thread, role },
             },
         );
         let invalidation_epoch = snapshot_epoch.unwrap_or(state.invalidation_epoch);
         let context = intern_context(&mut state, key.fingerprint, context);
         self.release(state);
+        HELD_CLAIMS.with(|held| held.set(held.get() + 1));
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,
             generation,
+            claim,
             context,
             input_hash,
             invalidation_epoch,
@@ -4162,7 +4749,10 @@ impl ProjectCache {
             && !cancel.load(Ordering::Relaxed)
             && claim.invalidation_epoch == state.invalidation_epoch
             && matches!(state.slots.get(&claim.key),
-            Some(Slot::Computing { generation, .. }) if *generation == claim.generation && claim.generation == state.generation);
+            Some(Slot::Computing { generation, claim: id, .. })
+                if *generation == claim.generation
+                    && claim.generation == state.generation
+                    && *id == claim.claim);
         crate::trace::trace!(
             "  cache {} {:?} {} after {:.1} ms",
             if current { "stored" } else { "discarded" },
@@ -4339,6 +4929,7 @@ impl ProjectCache {
         self.drop_witnesses(path, include_parent);
         let removed = self.catalogues().invalidate(path, include_parent);
         self.release_catalogues(removed);
+        self.invalidate_index(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
         }
@@ -4375,6 +4966,8 @@ impl ProjectCache {
         // Overflow lost which directories changed: no catalogue survives it.
         let removed = self.catalogues().clear();
         self.release_catalogues(removed);
+        // Overflow lost which paths changed: every member is suspect.
+        self.invalidate_index_all();
     }
 
     /// Remember that `path`, while it has `stamp`, holds what `proven` says.
@@ -4479,6 +5072,7 @@ impl ProjectCache {
             reserved_scratch_bytes: state.reserved[ReservationKind::Scratch.index()],
             reserved_pages_bytes: state.reserved[ReservationKind::Pages.index()],
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
+            reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
         }
     }
 
@@ -4619,6 +5213,11 @@ impl ProjectCache {
     /// took, since their `Removed` never reaches `release_catalogues`. Poison
     /// is cleared, not recovered from.
     fn catalogues(&self) -> MutexGuard<'_, CatalogueStore> {
+        #[cfg(test)]
+        assert!(
+            !HELD_INDEX.with(std::cell::Cell::get),
+            "the index lock is never held with the catalogues lock"
+        );
         self.inner.catalogues.lock().unwrap_or_else(|poisoned| {
             self.inner.catalogues.clear_poison();
             poisoned.into_inner()
@@ -4659,6 +5258,512 @@ impl ProjectCache {
             }
         }
         self.release(state);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set while this thread holds the index guard.
+    static HELD_INDEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What names the documents of an index: a document, or a project.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum IndexAnchor {
+    Document(Url),
+    Project(PathBuf),
+}
+
+/// The documents one context indexes, and what they were computed from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IndexMembership {
+    pub(crate) paths: Vec<PathBuf>,
+    /// The catalogues the paths came from, with the generation each had.
+    pub(crate) scopes: Vec<(CatalogueKey, u64)>,
+    pub(crate) complete: bool,
+    pub(crate) limit: Option<String>,
+    pub(crate) packages: bool,
+    pub(crate) owner_pending: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    Indexed,
+    NotAMember,
+    /// No room in the index share: the member stays unindexed.
+    Memory,
+}
+
+struct StoredIndex {
+    index: ContextIndex,
+    membership: IndexMembership,
+    anchor: IndexAnchor,
+    dirty: bool,
+    last_used: u64,
+    /// The membership's own charge. The members' charges are
+    /// `index.bytes()`.
+    charged: usize,
+    memory_exhausted: bool,
+}
+
+impl StoredIndex {
+    fn total_charge(&self) -> usize {
+        self.charged.saturating_add(self.index.bytes())
+    }
+}
+
+struct IndexStore {
+    contexts: HashMap<ContextKey, StoredIndex>,
+    clock: u64,
+    owners: HashMap<PathBuf, ContextKey>,
+    requests: Vec<IndexAnchor>,
+    unit_limit: usize,
+}
+
+impl Default for IndexStore {
+    fn default() -> Self {
+        Self {
+            contexts: HashMap::new(),
+            clock: 0,
+            owners: HashMap::new(),
+            requests: Vec::new(),
+            unit_limit: MAX_WORKSPACE_UNITS,
+        }
+    }
+}
+
+impl IndexStore {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn request(&mut self, anchor: &IndexAnchor) {
+        if self.requests.len() < MAX_INDEX_REQUESTS && !self.requests.contains(anchor) {
+            self.requests.push(anchor.clone());
+        }
+    }
+
+    /// Removes the least recently used context other than `except` and
+    /// returns the charge it held, for the caller to release once the store
+    /// is unlocked.
+    fn evict_lru(&mut self, except: &ContextKey) -> Option<usize> {
+        let victim = self
+            .contexts
+            .iter()
+            .filter(|(key, _)| *key != except)
+            .min_by_key(|(_, stored)| stored.last_used)
+            .map(|(key, _)| key.clone())?;
+        let stored = self.contexts.remove(&victim)?;
+        self.owners.retain(|_, owner| *owner != victim);
+        Some(stored.total_charge())
+    }
+}
+
+/// The index lock; in tests it flags the thread so `lock` can refuse to run
+/// under it.
+struct IndexGuard<'a>(MutexGuard<'a, IndexStore>);
+
+impl<'a> IndexGuard<'a> {
+    fn new(guard: MutexGuard<'a, IndexStore>) -> Self {
+        #[cfg(test)]
+        HELD_INDEX.with(|held| held.set(true));
+        Self(guard)
+    }
+}
+
+impl std::ops::Deref for IndexGuard<'_> {
+    type Target = IndexStore;
+
+    fn deref(&self) -> &IndexStore {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for IndexGuard<'_> {
+    fn deref_mut(&mut self) -> &mut IndexStore {
+        &mut self.0
+    }
+}
+
+impl Drop for IndexGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        HELD_INDEX.with(|held| held.set(false));
+    }
+}
+
+fn membership_bytes(paths: &[PathBuf]) -> usize {
+    paths.iter().map(|path| membership_charge(path)).sum()
+}
+
+/// The workspace index store (l4d-33): one `ContextIndex` per context, at
+/// most `MAX_INDEXED_CONTEXTS`, charged to a quarter of `maxCacheBytes`.
+impl ProjectCache {
+    /// A panic under the index lock can leave a charge unreleased; poison
+    /// is cleared, not recovered from.
+    fn index(&self) -> IndexGuard<'_> {
+        IndexGuard::new(self.inner.index.lock().unwrap_or_else(|poisoned| {
+            self.inner.index.clear_poison();
+            poisoned.into_inner()
+        }))
+    }
+
+    /// Charge `bytes` to the index share, evicting cache entries (never
+    /// pinned) like a reservation. The store holds the charge and releases
+    /// it with `release_index`.
+    fn charge_index(&self, bytes: usize) -> bool {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let slot = ReservationKind::WorkspaceIndex.index();
+        let share = state.max_bytes / INDEX_BUDGET_SHARE;
+        let admitted = state.reserved[slot]
+            .checked_add(bytes)
+            .is_some_and(|total| total <= share)
+            && make_room(&mut state, bytes);
+        if admitted {
+            state.reserved[slot] += bytes;
+        }
+        self.release(state);
+        admitted
+    }
+
+    fn release_index(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = lock(&self.inner);
+        let slot = ReservationKind::WorkspaceIndex.index();
+        state.reserved[slot] = state.reserved[slot].saturating_sub(bytes);
+        self.release(state);
+    }
+
+    /// `charge_index`, and when it fails evict the least recently used
+    /// context other than `except` once and try again.
+    fn charge_index_evicting(&self, bytes: usize, except: &ContextKey) -> bool {
+        if self.charge_index(bytes) {
+            return true;
+        }
+        let evicted = self.index().evict_lru(except);
+        let Some(evicted) = evicted else {
+            return false;
+        };
+        self.release_index(evicted);
+        self.charge_index(bytes)
+    }
+
+    pub(crate) fn index_membership_current(&self, key: &ContextKey) -> bool {
+        let scopes = {
+            let store = self.index();
+            match store.contexts.get(key) {
+                Some(stored) if !stored.dirty => stored.membership.scopes.clone(),
+                _ => return false,
+            }
+        };
+        scopes.iter().all(|(scope, generation)| {
+            self.catalogue(scope)
+                .is_some_and(|shared| shared.generation == *generation)
+        })
+    }
+
+    pub(crate) fn set_index_membership(
+        &self,
+        key: ContextKey,
+        anchor: IndexAnchor,
+        mut membership: IndexMembership,
+    ) {
+        let limit = self.index().unit_limit;
+        if membership.paths.len() > limit {
+            membership.paths.truncate(limit);
+            membership.complete = false;
+            membership.limit = Some(format!("more than {limit} documents"));
+        }
+        let mut exhausted = false;
+        for _ in 0..4 {
+            let wanted = membership_bytes(&membership.paths);
+            let held = self
+                .index()
+                .contexts
+                .get(&key)
+                .map_or(0, |stored| stored.charged);
+            let paid = wanted.saturating_sub(held);
+            if paid > 0 && !self.charge_index_evicting(paid, &key) {
+                // A stored context keeps the membership and members it
+                // holds; the gap stays visible until the share has room.
+                if let Some(stored) = self.index().contexts.get_mut(&key) {
+                    stored.memory_exhausted = true;
+                    stored.dirty = true;
+                    stored.membership.complete = false;
+                    return;
+                }
+                exhausted = true;
+                membership.paths.clear();
+                membership.complete = false;
+                membership.limit = Some("the index memory share is exhausted".to_owned());
+                continue;
+            }
+            let mut store = self.index();
+            let clock = store.tick();
+            let current = store.contexts.get(&key).map_or(0, |stored| stored.charged);
+            if current != held {
+                drop(store);
+                self.release_index(paid);
+                continue;
+            }
+            let stored = store
+                .contexts
+                .entry(key.clone())
+                .or_insert_with(|| StoredIndex {
+                    index: ContextIndex::new(),
+                    membership: IndexMembership::default(),
+                    anchor: anchor.clone(),
+                    dirty: false,
+                    last_used: clock,
+                    charged: 0,
+                    memory_exhausted: false,
+                });
+            let (_, removed) = stored.index.set_members(membership.paths.clone());
+            stored.membership = membership;
+            stored.anchor = anchor;
+            stored.dirty = false;
+            stored.last_used = clock;
+            stored.charged = wanted;
+            stored.memory_exhausted |= exhausted;
+            let mut released = removed + held.saturating_sub(wanted);
+            while store.contexts.len() > MAX_INDEXED_CONTEXTS {
+                match store.evict_lru(&key) {
+                    Some(evicted) => released += evicted,
+                    None => break,
+                }
+            }
+            drop(store);
+            self.release_index(released);
+            return;
+        }
+        // Retries lost to concurrent changes: leave the gap visible.
+        if let Some(stored) = self.index().contexts.get_mut(&key) {
+            stored.memory_exhausted = true;
+        }
+    }
+
+    pub(crate) fn publish_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+    ) -> PublishOutcome {
+        // The charge covers the names the context does not hold yet, so it
+        // is computed under the lock and checked again before inserting.
+        let charge_for = |store: &IndexStore| {
+            store
+                .contexts
+                .get(key)
+                .filter(|stored| stored.index.stamps_of(path).is_some())
+                .map(|stored| stored.index.charge_for(&facts, &stamps))
+        };
+        for _ in 0..4 {
+            let Some(bytes) = charge_for(&self.index()) else {
+                return PublishOutcome::NotAMember;
+            };
+            if !self.charge_index_evicting(bytes, key) {
+                if let Some(stored) = self.index().contexts.get_mut(key) {
+                    stored.memory_exhausted = true;
+                }
+                return PublishOutcome::Memory;
+            }
+            let mut store = self.index();
+            if charge_for(&store).is_some_and(|needed| needed > bytes) {
+                drop(store);
+                self.release_index(bytes);
+                continue;
+            }
+            let clock = store.tick();
+            let old = store.contexts.get_mut(key).and_then(|stored| {
+                stored.last_used = clock;
+                let old = stored
+                    .index
+                    .insert_paid(path, facts, stamps, content_hash, bytes);
+                if old.is_some() {
+                    stored.memory_exhausted = false;
+                }
+                old
+            });
+            drop(store);
+            return match old {
+                Some(old) => {
+                    self.release_index(old);
+                    PublishOutcome::Indexed
+                }
+                None => {
+                    self.release_index(bytes);
+                    PublishOutcome::NotAMember
+                }
+            };
+        }
+        // Retries lost to concurrent compactions: the member stays unindexed.
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.memory_exhausted = true;
+        }
+        PublishOutcome::Memory
+    }
+
+    pub(crate) fn refresh_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        stamps: Vec<MemberStamp>,
+    ) -> bool {
+        self.index()
+            .contexts
+            .get_mut(key)
+            .is_some_and(|stored| stored.index.refresh(path, stamps))
+    }
+
+    pub(crate) fn refuse_index_member(&self, key: &ContextKey, path: &Path, reason: String) {
+        let old = self
+            .index()
+            .contexts
+            .get_mut(key)
+            .and_then(|stored| stored.index.refuse(path, reason));
+        if let Some(old) = old {
+            self.release_index(old);
+        }
+    }
+
+    pub(crate) fn limit_index_member(&self, key: &ContextKey, path: &Path) {
+        let old = self
+            .index()
+            .contexts
+            .get_mut(key)
+            .and_then(|stored| stored.index.limit(path));
+        if let Some(old) = old {
+            self.release_index(old);
+        }
+    }
+
+    pub(crate) fn defer_index_member(&self, key: &ContextKey, path: &Path, reason: &str) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.defer(path, reason);
+        }
+    }
+
+    pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_stale(path);
+        }
+    }
+
+    /// `read` runs under the index lock: it must not call back into the cache.
+    pub(crate) fn read_index<R>(
+        &self,
+        key: &ContextKey,
+        read: impl FnOnce(&ContextIndex, &IndexMembership) -> R,
+    ) -> Option<R> {
+        let mut store = self.index();
+        let clock = store.tick();
+        let stored = store.contexts.get_mut(key)?;
+        stored.last_used = clock;
+        Some(read(&stored.index, &stored.membership))
+    }
+
+    /// Whether the store holds an index of `key`; its use is not recorded.
+    pub(crate) fn holds_index(&self, key: &ContextKey) -> bool {
+        self.index().contexts.contains_key(key)
+    }
+
+    /// Whether the store holds an index built for `anchor`.
+    pub(crate) fn holds_index_for(&self, anchor: &IndexAnchor) -> bool {
+        self.index()
+            .contexts
+            .values()
+            .any(|stored| stored.anchor == *anchor)
+    }
+
+    pub(crate) fn request_index(&self, anchor: IndexAnchor) {
+        self.index().request(&anchor);
+    }
+
+    pub(crate) fn take_index_requests(&self) -> Vec<IndexAnchor> {
+        std::mem::take(&mut self.index().requests)
+    }
+
+    pub(crate) fn index_memory_exhausted(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.memory_exhausted)
+    }
+
+    pub(crate) fn owner_of(&self, directory: &Path) -> Option<ContextKey> {
+        self.index().owners.get(directory).cloned()
+    }
+
+    pub(crate) fn remember_owner(&self, directory: PathBuf, key: ContextKey) {
+        let mut store = self.index();
+        if store.owners.len() >= MAX_OWNERS && !store.owners.contains_key(&directory) {
+            store.owners.clear();
+        }
+        store.owners.insert(directory, key);
+    }
+
+    /// `path` changed: mark the members it is (or includes into) stale, and
+    /// the memberships whose listing it may have changed dirty.
+    fn invalidate_index(&self, path: &Path, include_parent: bool) {
+        let mut store = self.index();
+        let parent = path.parent();
+        let mut touched = Vec::new();
+        for stored in store.contexts.values_mut() {
+            let stale = stored.index.mark_stale(path);
+            let listed = include_parent
+                && stored
+                    .membership
+                    .scopes
+                    .iter()
+                    .any(|(scope, _)| match scope.depth {
+                        Depth::Listing => {
+                            parent == Some(scope.root.as_path()) || path == scope.root
+                        }
+                        Depth::Recursive => path != scope.root && path.starts_with(&scope.root),
+                    });
+            let newly_dirty = listed && !stored.dirty;
+            stored.dirty |= listed;
+            if stale || newly_dirty {
+                touched.push(stored.anchor.clone());
+            }
+        }
+        for anchor in &touched {
+            store.request(anchor);
+        }
+        if let Some(parent) = parent {
+            store.owners.remove(parent);
+        }
+    }
+
+    fn invalidate_index_all(&self) {
+        let mut store = self.index();
+        let mut anchors = Vec::new();
+        for stored in store.contexts.values_mut() {
+            stored.index.mark_all_stale();
+            stored.dirty = true;
+            anchors.push(stored.anchor.clone());
+        }
+        for anchor in &anchors {
+            store.request(anchor);
+        }
+        store.owners.clear();
+    }
+}
+
+#[cfg(test)]
+impl ProjectCache {
+    pub(crate) fn set_index_unit_limit_for_test(&self, units: usize) {
+        self.index().unit_limit = units;
+    }
+
+    pub(crate) fn indexed_context_count(&self) -> usize {
+        self.index().contexts.len()
     }
 }
 
@@ -4970,5 +6075,532 @@ mod catalogue_tests {
         cache.invalidate_after_overflow();
         assert_eq!(cache.catalogue_count(), 0);
         assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::workspace::ContextKey;
+    use crate::workspace_index::{CandidateQuery, MemberFacts, MemberStamp};
+    use pascal_core::facts::{ArtifactFacts, PostingFact};
+
+    fn key(name: &str) -> ContextKey {
+        ContextKey::for_test(name)
+    }
+
+    fn anchor(name: &str) -> IndexAnchor {
+        IndexAnchor::Project(PathBuf::from(format!("/anchors/{name}")))
+    }
+
+    fn membership(paths: &[&str]) -> IndexMembership {
+        IndexMembership {
+            paths: paths.iter().map(PathBuf::from).collect(),
+            complete: true,
+            ..IndexMembership::default()
+        }
+    }
+
+    fn membership_cost(paths: &[&str]) -> usize {
+        paths
+            .iter()
+            .map(|path| crate::workspace_index::membership_charge(Path::new(path)))
+            .sum()
+    }
+
+    fn facts_with(path: &str, posting: &str, slots: Vec<Option<PathBuf>>) -> MemberFacts {
+        let facts = ArtifactFacts {
+            postings: vec![PostingFact {
+                name: posting.to_owned(),
+                occurrences: Vec::new(),
+            }],
+            ..ArtifactFacts::default()
+        };
+        MemberFacts::from_facts(Path::new(path), &facts, slots)
+    }
+
+    fn facts(path: &str) -> MemberFacts {
+        facts_with(path, "thing", Vec::new())
+    }
+
+    fn charge(facts: &MemberFacts) -> usize {
+        crate::workspace_index::ContextIndex::new().charge_for(facts, &[])
+    }
+
+    /// What a member's names cost its context, charged once.
+    fn names(facts: &MemberFacts) -> usize {
+        charge(facts) - crate::workspace_index::ContextIndex::member_charge(facts, &[])
+    }
+
+    fn stamps() -> Vec<MemberStamp> {
+        Vec::new()
+    }
+
+    fn publish(cache: &ProjectCache, key: &ContextKey, path: &str) -> PublishOutcome {
+        cache.publish_index_member(key, Path::new(path), facts(path), stamps(), 1)
+    }
+
+    fn unverified(cache: &ProjectCache, key: &ContextKey) -> Vec<PathBuf> {
+        cache
+            .read_index(key, |index, _| {
+                index
+                    .candidates(&CandidateQuery {
+                        names: Vec::new(),
+                        top_level_units: None,
+                        aliases: Vec::new(),
+                    })
+                    .unverified
+            })
+            .expect("context is stored")
+    }
+
+    fn generation(cache: &ProjectCache, key: &ContextKey) -> u64 {
+        cache
+            .read_index(key, |index, _| index.generation())
+            .expect("context is stored")
+    }
+
+    #[test]
+    fn index_bytes_are_charged_before_insertion_and_released_on_removal() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let base = cache.stats().reserved_index_bytes;
+        assert_eq!(base, membership_cost(&["/w/A.pas", "/w/B.pas"]));
+        let member = facts("/w/A.pas");
+        let expected = charge(&member);
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), member, stamps(), 1),
+            PublishOutcome::Indexed
+        );
+        assert_eq!(cache.stats().reserved_index_bytes, base + expected);
+        assert_eq!(cache.stats().reserved_bytes(), base + expected);
+        // A's names stay with the context until its interner is compacted.
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/B.pas"]));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            membership_cost(&["/w/B.pas"]) + names(&facts("/w/A.pas"))
+        );
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]));
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
+    }
+
+    #[test]
+    fn a_member_over_the_quarter_share_is_left_unindexed_with_a_gap() {
+        let cache = ProjectCache::new(4096);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let held = cache.stats().reserved_index_bytes;
+        let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, held);
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+    }
+
+    #[test]
+    fn the_least_recently_used_context_is_evicted_once_for_room() {
+        let m = membership_cost(&["/w/A.pas"]);
+        let c = charge(&facts("/w/A.pas"));
+        let share = 3 * m + 2 * c + c / 2;
+        let cache = ProjectCache::new(share * 4);
+        let (a, b, third) = (key("a"), key("b"), key("c"));
+        for (key, name) in [(&a, "a"), (&b, "b")] {
+            cache.set_index_membership(key.clone(), anchor(name), membership(&["/w/A.pas"]));
+            assert_eq!(publish(&cache, key, "/w/A.pas"), PublishOutcome::Indexed);
+        }
+        cache.read_index(&a, |_, _| ());
+        cache.set_index_membership(third.clone(), anchor("c"), membership(&["/w/A.pas"]));
+        assert_eq!(cache.indexed_context_count(), 3);
+        assert_eq!(publish(&cache, &third, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(cache.indexed_context_count(), 2);
+        assert!(cache.read_index(&a, |_, _| ()).is_some());
+        assert!(cache.read_index(&b, |_, _| ()).is_none());
+        assert_eq!(cache.stats().reserved_index_bytes, 2 * m + 2 * c);
+
+        let big = facts_with("/w/A.pas", &"x".repeat(share), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&third, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert_eq!(cache.indexed_context_count(), 1, "one eviction, not all");
+        assert!(cache.read_index(&third, |_, _| ()).is_some());
+        assert!(cache.index_memory_exhausted(&third));
+    }
+
+    #[test]
+    fn the_store_keeps_at_most_eight_contexts() {
+        let cache = ProjectCache::new(1 << 30);
+        for index in 0..=MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+        }
+        assert_eq!(cache.indexed_context_count(), MAX_INDEXED_CONTEXTS);
+        assert!(cache.read_index(&key("k0"), |_, _| ()).is_none());
+        assert!(cache.read_index(&key("k8"), |_, _| ()).is_some());
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            MAX_INDEXED_CONTEXTS * membership_cost(&["/w/A.pas"])
+        );
+    }
+
+    #[test]
+    fn two_contexts_sharing_a_document_each_charge_their_member() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        let c = charge(&facts("/w/A.pas"));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(publish(&cache, &b, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(cache.stats().reserved_index_bytes, base + 2 * c);
+    }
+
+    #[test]
+    fn the_membership_charge_covers_what_a_member_retains() {
+        let path = Path::new("/w/A.pas");
+        let charge = crate::workspace_index::membership_charge(path);
+        let retained = 3 * path.as_os_str().len() + crate::workspace_index::member_slot_bytes();
+        assert!(charge >= retained, "{charge} < {retained}");
+    }
+
+    #[test]
+    fn a_successful_publish_clears_the_memory_gap() {
+        let cache = ProjectCache::new(4096);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        assert!(!cache.index_memory_exhausted(&a));
+    }
+
+    #[test]
+    fn a_membership_that_cannot_be_charged_records_the_gap() {
+        let cache = ProjectCache::new(256);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
+    }
+
+    #[test]
+    fn a_grown_membership_that_cannot_be_charged_keeps_the_warm_index() {
+        let m = membership_cost(&["/w/A.pas"]);
+        let c = charge(&facts("/w/A.pas"));
+        let cache = ProjectCache::new((m + c + 16) * INDEX_BUDGET_SHARE);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        let held = cache.stats().reserved_index_bytes;
+        let grown = (0..20)
+            .map(|index| format!("/w/U{index:02}.pas"))
+            .chain(["/w/A.pas".to_owned()])
+            .collect::<Vec<_>>();
+        let grown = grown.iter().map(String::as_str).collect::<Vec<_>>();
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown));
+        let (paths, complete, members) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    membership.paths.clone(),
+                    membership.complete,
+                    index.member_paths(),
+                )
+            })
+            .expect("the context stays stored");
+        assert_eq!(paths, [PathBuf::from("/w/A.pas")]);
+        assert_eq!(members, [PathBuf::from("/w/A.pas")]);
+        assert!(!complete);
+        assert!(unverified(&cache, &a).is_empty(), "the member stays fresh");
+        assert!(cache.index_memory_exhausted(&a));
+        assert!(!cache.index_membership_current(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, held);
+    }
+
+    #[test]
+    fn a_path_outside_the_membership_is_not_charged() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::NotAMember);
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        assert_eq!(publish(&cache, &a, "/w/Z.pas"), PublishOutcome::NotAMember);
+        assert_eq!(cache.stats().reserved_index_bytes, base);
+    }
+
+    #[test]
+    fn refusing_and_replacing_a_member_releases_its_old_charge() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        publish(&cache, &a, "/w/A.pas");
+        publish(&cache, &a, "/w/A.pas");
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            base + charge(&facts("/w/A.pas"))
+        );
+        cache.refuse_index_member(&a, Path::new("/w/A.pas"), "too big".into());
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            base + names(&facts("/w/A.pas"))
+        );
+    }
+
+    #[test]
+    fn members_sharing_names_charge_them_once_per_context() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let base = cache.stats().reserved_index_bytes;
+        publish(&cache, &a, "/w/A.pas");
+        let first = cache.stats().reserved_index_bytes - base;
+        assert_eq!(first, charge(&facts("/w/A.pas")));
+        publish(&cache, &a, "/w/B.pas");
+        let second = cache.stats().reserved_index_bytes - base - first;
+        // B shares the posting; only its file stem is new.
+        assert!(second < charge(&facts("/w/B.pas")), "{second}");
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            cache.read_index(&a, |index, _| index.bytes()).unwrap()
+                + membership_cost(&["/w/A.pas", "/w/B.pas"])
+        );
+    }
+
+    #[test]
+    fn invalidating_a_member_path_marks_it_stale_and_bumps_the_generation() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        publish(&cache, &a, "/w/A.pas");
+        assert!(unverified(&cache, &a).is_empty());
+        cache.take_index_requests();
+        let before = generation(&cache, &a);
+        cache.invalidate_file_contents(Path::new("/w/A.pas"));
+        cache.invalidate_file_contents(Path::new("/w/A.pas"));
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+        assert!(generation(&cache, &a) > before);
+        assert_eq!(cache.take_index_requests(), vec![anchor("a")]);
+        assert!(cache.take_index_requests().is_empty());
+    }
+
+    #[test]
+    fn invalidation_reaches_every_context_holding_the_path() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b, other) = (key("a"), key("b"), key("o"));
+        for (key, name, path) in [
+            (&a, "a", "/w/A.pas"),
+            (&b, "b", "/w/A.pas"),
+            (&other, "o", "/w/O.pas"),
+        ] {
+            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]));
+            publish(&cache, key, path);
+        }
+        cache.take_index_requests();
+        cache.invalidate_path(Path::new("/w/A.pas"));
+        assert_eq!(unverified(&cache, &a).len(), 1);
+        assert_eq!(unverified(&cache, &b).len(), 1);
+        assert!(unverified(&cache, &other).is_empty());
+        let mut requests = cache.take_index_requests();
+        requests.sort_by_key(|anchor| format!("{anchor:?}"));
+        assert_eq!(requests, vec![anchor("a"), anchor("b")]);
+    }
+
+    fn listing_scope(directory: &Path) -> (crate::catalogue::CatalogueKey, Arc<Catalogue>) {
+        use crate::catalogue::{Bound, Depth, Exclusions, MAX_CATALOGUE_ENTRIES};
+        let mut io = || -> Result<(), String> { Ok(()) };
+        let mut catalogue = Catalogue::new(directory, Depth::Listing, &mut io).unwrap();
+        catalogue
+            .advance(Bound::entries(MAX_CATALOGUE_ENTRIES), &|_| false, &mut io)
+            .unwrap();
+        let key = CatalogueKey {
+            root: directory.to_path_buf(),
+            depth: Depth::Listing,
+            exclusions: Exclusions::Nothing,
+        };
+        (key, Arc::new(catalogue))
+    }
+
+    #[test]
+    fn a_listing_change_dirties_the_membership_that_listed_the_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("A.pas"), b"").unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let (scope, catalogue) = listing_scope(&dir);
+        let generation = cache
+            .publish_catalogue(scope.clone(), None, catalogue)
+            .unwrap();
+        let a = key("a");
+        let mut recorded = membership(&["/w/A.pas"]);
+        recorded.scopes = vec![(scope, generation)];
+        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        assert!(cache.index_membership_current(&a));
+        cache.invalidate_file_contents(&dir.join("New.pas"));
+        assert!(
+            cache.index_membership_current(&a),
+            "a file's bytes are not membership"
+        );
+        cache.invalidate_path(&dir.join("New.pas"));
+        assert!(!cache.index_membership_current(&a));
+        assert!(!cache.index_membership_current(&key("absent")));
+    }
+
+    #[test]
+    fn deleting_a_listed_directory_dirties_the_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let (scope, catalogue) = listing_scope(&dir);
+        let generation = cache
+            .publish_catalogue(scope.clone(), None, catalogue)
+            .unwrap();
+        let a = key("a");
+        let mut recorded = membership(&["/w/A.pas"]);
+        recorded.scopes = vec![(scope, generation)];
+        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        // Keep the catalogue current so only the membership's flag decides.
+        cache.invalidate_index(&dir, true);
+        assert!(!cache.index_membership_current(&a));
+    }
+
+    #[test]
+    fn a_listing_change_leaves_unrelated_memberships_current() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert!(cache.index_membership_current(&a));
+        cache.invalidate_path(Path::new("/elsewhere/New.pas"));
+        assert!(cache.index_membership_current(&a));
+    }
+
+    #[test]
+    fn a_changed_include_marks_its_dependents_stale() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let slots = vec![None, Some(PathBuf::from("/w/shared.inc"))];
+        let with_include = facts_with("/w/A.pas", "thing", slots);
+        cache.publish_index_member(&a, Path::new("/w/A.pas"), with_include, stamps(), 1);
+        publish(&cache, &a, "/w/B.pas");
+        cache.invalidate_file_contents(Path::new("/w/shared.inc"));
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+    }
+
+    #[test]
+    fn overflow_marks_every_member_stale_and_clears_owners() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/B.pas"]));
+        publish(&cache, &a, "/w/A.pas");
+        publish(&cache, &b, "/w/B.pas");
+        cache.remember_owner(PathBuf::from("/w"), a.clone());
+        assert_eq!(cache.owner_of(Path::new("/w")), Some(a.clone()));
+        cache.invalidate_after_overflow();
+        assert_eq!(unverified(&cache, &a).len(), 1);
+        assert_eq!(unverified(&cache, &b).len(), 1);
+        assert_eq!(cache.owner_of(Path::new("/w")), None);
+        assert!(!cache.index_membership_current(&a));
+    }
+
+    #[test]
+    fn a_listing_change_forgets_the_owner_of_the_directory() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.remember_owner(PathBuf::from("/w"), key("a"));
+        cache.remember_owner(PathBuf::from("/x"), key("a"));
+        cache.invalidate_path(Path::new("/w/New.pas"));
+        assert_eq!(cache.owner_of(Path::new("/w")), None);
+        assert_eq!(cache.owner_of(Path::new("/x")), Some(key("a")));
+    }
+
+    #[test]
+    fn requests_are_deduplicated() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.request_index(anchor("a"));
+        cache.request_index(anchor("a"));
+        cache.request_index(anchor("b"));
+        assert_eq!(cache.take_index_requests(), vec![anchor("a"), anchor("b")]);
+    }
+
+    #[test]
+    fn the_unit_limit_truncates_the_membership_and_records_it() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.set_index_unit_limit_for_test(2);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+        );
+        let (count, limited, complete) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    index.member_paths().len(),
+                    membership.limit.is_some(),
+                    membership.complete,
+                )
+            })
+            .unwrap();
+        assert_eq!((count, limited, complete), (2, true, false));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            membership_cost(&["/w/A.pas", "/w/B.pas"])
+        );
+    }
+
+    #[test]
+    fn the_index_lock_is_never_held_with_state() {
+        let cache = ProjectCache::new(1 << 20);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        cache.invalidate_path(Path::new("/w/A.pas"));
+        cache.invalidate_after_overflow();
+        for index in 0..=MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+        }
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]));
+        assert!(
+            cache
+                .read_index(&b, |_, _| HELD_INDEX.with(std::cell::Cell::get))
+                .unwrap(),
+            "the flag tracks the guard"
+        );
+        assert!(!HELD_INDEX.with(std::cell::Cell::get));
+        let inside = cache
+            .read_index(&b, |_, _| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.stats())).is_err()
+            })
+            .unwrap();
+        assert!(inside, "state is refused while the index guard lives");
+        assert!(!HELD_INDEX.with(std::cell::Cell::get));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            cache.stats().reserved_bytes()
+        );
     }
 }

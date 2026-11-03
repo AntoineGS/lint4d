@@ -1112,10 +1112,19 @@ configuration schema:
     "conditionalConstants": {"BuildNumber": 42},
     "maxFiles": 10000,
     "maxFileBytes": 4194304,
-    "maxTotalBytes": 268435456
+    "maxTotalBytes": 268435456,
+    "maxWorkspaceUnits": 100000,
+    "persistentCacheEnabled": true,
+    "persistentCachePageBytes": 16777216,
+    "persistentCacheScratchBytes": 16777216,
+    "persistentCacheWaitMs": 25
   }
 }
 ```
+
+The `persistentCache*` keys are described under
+[Persistent analysis cache](#persistent-analysis-cache);
+`persistentCacheDirectory` is accepted in `initializationOptions` only.
 
 Clients that advertise `workspace.configuration: true` receive a standard
 `workspace/configuration` request for section `pascalLsp` after the server has
@@ -1340,6 +1349,195 @@ bounded set of documents retained by the workspace's `maxFiles` and source-byte
 limits, and reuse a cached model only after exact source/context checks. Open
 overlay text, disk reloads, project changes, and evictions therefore invalidate
 or bypass the reusable model safely.
+
+### Persistent analysis cache
+
+`pascal-lsp` can keep compact analysis facts and their evidence in an SQLite
+database shared by every `pascal-lsp` process of the same user. It is on by
+default and never required: when it is off or unusable, every feature works
+from memory.
+
+**Current state.** The store is opened, kept within its disk budget and closed
+by this server. Nothing reads facts from it or writes facts to it yet; that
+arrives with `l4d-zf1b.8` and `l4d-zf1b.9`. Until then analysis results come
+only from memory and the cache makes no request faster.
+
+**Location.** One store per process, in `$XDG_CACHE_HOME/lint4d/analysis`
+(`~/.cache/lint4d/analysis` when `XDG_CACHE_HOME` is unset or not absolute) on
+Linux and `~/Library/Caches/lint4d/analysis` on macOS. On Windows persistence
+is bypassed until `l4d-x2ft`. Entries are keyed by content. Editor buffers are
+never stored.
+
+#### Options
+
+| Option | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `persistentCacheEnabled` | `true` | boolean | `false` opens nothing and creates nothing |
+| `persistentCacheDirectory` | platform directory | absolute path, at most 4,096 bytes | initialization only; `~` is not expanded |
+| `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
+| `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
+| `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
+| `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
+
+The limits can be lowered, not raised. In `initializationOptions`, a value
+above the maximum is clamped and a warning is written to stderr. A value below
+the minimum, of the wrong type, or an invalid directory does not fail
+`initialize`: persistence is off for the whole session, the cause is reported
+as `configuration` with a message naming the option, and a runtime setting
+cannot repair it. Restart the server with a corrected value. `maxWorkspaceUnits`
+is different: `0` rejects `initialize`, as `maxFiles` does.
+
+At runtime (`pascalLsp` settings), `persistentCacheEnabled`,
+`persistentCachePageBytes`, `persistentCacheScratchBytes` and
+`persistentCacheWaitMs` apply as in the table. A value above the maximum clamps
+silently, an invalid value is ignored with a warning and keeps the previous
+one, and `null` resets an option. `persistentCacheDirectory` is ignored with a
+warning, because runtime settings can come from workspace files and a project
+must not redirect where the server writes.
+
+#### Runtime changes
+
+- **Turning it off.** The server stops accepting new cache work, cancels what
+  is queued, waits for operations already running to finish or roll back and
+  closes the store. Reaching `disabled` is the acknowledgement: one line on
+  stderr, and `pascal/cacheStatus` reports `disabled`. After it the server
+  makes no cache IO. Open documents, indexes and every in-memory cache stay as
+  they were. The wait is bounded by 2 seconds; an operation that outlives it
+  completes the transition when it ends.
+- **Turning it on.** Opens the store again.
+- **Changing page bytes, scratch bytes or wait**, or changing `maxCacheBytes`
+  while the cache is on: the store is closed and opened again, so its memory
+  reservation is admitted against the current `maxCacheBytes`. If it no longer
+  fits, the cache is bypassed and nothing is evicted to make room.
+- **Changing the directory** needs a restart.
+
+#### Sharing
+
+Processes share the database file, not memory. Each process holds its own page
+cache and scratch buffers: about 35 MiB at the defaults (16 MiB of pages,
+16 MiB of scratch and 3 MiB for the three connections' schema and statements),
+charged to `maxCacheBytes` before they are allocated. If they do not fit in
+`maxCacheBytes`, the cache is bypassed.
+
+#### Requirements
+
+- A local filesystem. SQLite's write-ahead log needs shared memory between
+  processes on one host, so network and FUSE filesystems are refused.
+- A directory owned by the user with no group or other access (mode `0700`).
+  The server creates the default directory with that mode. It does not change
+  the mode of an existing directory; it bypasses it.
+- The directory, and the database files in it, must not be symlinks.
+
+#### Privacy
+
+Unsaved buffers and anything derived from them are never written. The store
+holds facts about files as they are on disk. `pascal/cacheStatus` and the
+administration output report counts, sizes and fixed names, never source text
+or paths of projects. The one path they contain is the cache directory itself.
+
+#### Disk use
+
+The managed budget is 8 GiB for the database, WAL and shared-memory files
+together. The WAL is checkpointed once it passes 256 MiB. Both are targets for
+background maintenance, not quotas: the files can briefly exceed them. Writes
+stop (`lowDiskSpace`) when they would leave the filesystem with less than
+256 MiB free. Maintenance
+runs on a background thread in short steps (50 ms or 256 rows at most), only
+while no interactive request is waiting, and renews the process's lease at
+least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
+`--cache-wal-threshold-bytes` (below).
+
+#### Diagnostics
+
+`pascal/cacheStatus` takes no parameters and performs no IO. It returns at most
+8 KiB:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `1` |
+| `state` | `disabled`, `opening`, `enabled`, `disabling`, `reopening` or `bypassed` |
+| `generation` | Increases on every state change |
+| `enabled` | The effective `persistentCacheEnabled` |
+| `cause` | `null`, or `kind`, `advice` and (for `configuration`) a `message` of at most 1 KiB; `kind` is `configuration`, `memory` or a bypass name such as `location`, `lowDiskSpace` or `corrupt`; a `location` cause adds `location` (`notPrivate`, `notLocal`, `symlink`, ...) |
+| `advice` (in `cause`) | `none`, `retry`, `prune`, `resetNamespace` or `freshDirectory` |
+| `directory` | The store directory, cut at 4,096 escaped bytes |
+| `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
+| `resetEpoch` | The namespace's reset counter while open |
+| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes` |
+| `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
+| `lockWaits` | Process-wide `poolWaits`, `lockWaits`, their `*Micros` totals and `busy` outcomes. Waits inside a statement after `BEGIN` are not measured |
+| `counters` | `hits`, `decodedBytes`, `misses` by cause (`input`, `version`, `freshness`, `budget`, `authorization`, `integrity`), non-zero `bypasses` by name, and `maintenance` (`steps`, `cycles`, `rows`, `skipped`) |
+
+Every state that settles writes one line to stderr (`pascal-lsp: persistent
+cache bypassed: ...`); a repeated cause is written at most once every 10
+minutes. With `PASCAL_LSP_TRACE` set to a file, the worker also appends a
+`cache-status` line with the same document, at most every 10 minutes and only
+when it changed.
+
+#### Administration
+
+These forms do not start the server. Each writes one JSON line (at most 4 KiB)
+to stdout. `--cache-directory DIR` (absolute) selects another store.
+
+```sh
+pascal-lsp --cache-status         # report; does not create the store
+pascal-lsp --cache-prune          # bounded maintenance until within budget
+pascal-lsp --cache-reset          # drop this build's entries
+pascal-lsp --cache-max-disk-bytes 4294967296 --cache-wal-threshold-bytes 134217728
+```
+
+Exit codes: `0` done (an absent store, including an empty directory, is
+success), `1` refused or failed (the JSON has an `error` field with `bypass`,
+`location` and `advice`, and stderr has one line), `2` usage error. A
+directory longer than 2,048 escaped bytes is cut in the output and
+`directoryTruncated` is `true`.
+
+- **Status** reports container version and compatibility, usage, policy,
+  pressure, live and retired namespaces, live leases and advice. A store in
+  a directory that is not private is refused and left unchanged.
+- **Prune** repeats maintenance cycles until a full cycle leaves the store
+  within its headroom (`withinBudget`), a full cycle changes nothing
+  (`noProgress`), or 30 seconds pass (`timeLimit`). It does at least one full
+  cycle. `busy` means another process is running maintenance; `walPressure`
+  means a reader in another process keeps the WAL from being checkpointed.
+  Rerun later in both cases.
+- **Reset** resets the namespace of the build that runs the command. Servers
+  of that build see the store fenced and reopen it; servers of other builds are
+  unaffected. No file is deleted.
+- **Policy** sets the disk budget and/or the WAL threshold, creating the store
+  if needed. The WAL threshold is at least 8 MiB and the disk budget at least
+  four times the threshold. Values you omit keep their current value. If
+  another administrator changed the policy first, the command fails with
+  `revisionChanged` and advice `rerun`.
+
+#### Failure modes
+
+A bypass never fails a request: the feature answers from memory and
+`pascal/cacheStatus` says why. Each cause has an advice.
+
+| Advice | Causes | What to do |
+| --- | --- | --- |
+| `retry` | `busy`, `recovering`, `namespaceLockBusy`, `fenced`, `scratchExhausted`, `factBudget` | Transient. The server retries an open after 1 second, doubling up to 5 minutes |
+| `prune` | `full`, `overBudget`, `walPressure`, `lowDiskSpace` | Run `--cache-prune`; free disk space for `lowDiskSpace` |
+| `resetNamespace` | `integrity` | Run `--cache-reset` |
+| `freshDirectory` | `location` (not private, not local, symlink, not owned), `corrupt`, `readOnly`, `foreignDatabase`, `unsupportedContainer`, `walUnavailable`, `sqliteTooOld` | Set `persistentCacheDirectory` to a new private local directory and restart. Delete the old directory only when no `pascal-lsp` is running |
+| `none` | `configuration`, other internal causes | Correct the setting and restart |
+
+A directory that fails the location checks is left untouched.
+
+#### What it does not solve
+
+- A cache directory inside a workspace root currently makes requests fail with
+  `-32803` and a `retry` message. Choose `persistentCacheDirectory` outside the
+  workspace, or set `persistentCacheEnabled` to `false`.
+- Processes do not share cold work: two servers indexing the same project both
+  read and parse every source until facts are reused (`l4d-zf1b.8`).
+- It does not bound process memory. Only the pages, scratch and decoded facts
+  are charged to `maxCacheBytes`; see the unaccounted list in
+  `docs/shared-resolver-architecture.md`.
+- No speedup before `l4d-zf1b.8` and `l4d-zf1b.9`, no network or team-shared
+  cache, and no Windows support yet.
+- Cold indexing still reads every source file.
 
 ## Symbols, References and Highlights
 
@@ -2292,6 +2490,12 @@ effective observations remain unchanged. Other clients receive an eager edit.
 | `maxFiles` | 10,000 indexed files |
 | `maxFileBytes` | 4,194,304 bytes per document; may be raised to 16,777,216 |
 | `maxTotalBytes` | 268,435,456 source bytes per budget |
+| `maxWorkspaceUnits` | 100,000 units per workspace snapshot; 0 rejects `initialize` |
+| `persistentCacheEnabled` | `true`; `false` keeps all analysis in memory |
+| `persistentCacheDirectory` | Platform cache directory; absolute path, at most 4,096 bytes, initialization only |
+| `persistentCachePageBytes` | 16,777,216; minimum 786,432, larger values clamp |
+| `persistentCacheScratchBytes` | 16,777,216; minimum 1,048,576, larger values clamp |
+| `persistentCacheWaitMs` | 25; 0 to 25, larger values clamp |
 
 Resource-limit options may lower limits, not raise the hard caps, except
 `maxFileBytes`, which may be raised up to its 16 MiB ceiling. Larger values

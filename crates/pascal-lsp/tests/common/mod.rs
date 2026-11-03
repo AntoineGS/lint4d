@@ -178,6 +178,9 @@ pub(super) struct TestServer {
     pub(super) messages: Receiver<io::Result<Option<Message>>>,
     pub(super) pending: VecDeque<Message>,
     pub(super) _environment: Option<TempDir>,
+    /// The test server's `XDG_CACHE_HOME` (see [`TestServer::separate_cache_home`]).
+    #[cfg(feature = "test-support")]
+    pub(super) _cache_home: Option<TempDir>,
     #[cfg(feature = "test-support")]
     pub(super) stdout_paused: Arc<AtomicBool>,
 }
@@ -783,23 +786,36 @@ impl TestServer {
         )
     }
 
+    /// Test-server callers often pass the workspace root as the environment;
+    /// a store created there would change the workspace's membership. The
+    /// default store lives in this private directory instead; pass
+    /// `XDG_CACHE_HOME` among the variables to choose its location.
+    #[cfg(feature = "test-support")]
+    fn separate_cache_home() -> TempDir {
+        tempfile::tempdir().expect("isolated persistent-cache home")
+    }
+
     #[cfg(feature = "test-support")]
     pub(super) fn launch_test_server_with_environment_path_and_variables<'a>(
         environment: &Path,
         variables: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp-test-server");
+        let cache_home = Self::separate_cache_home();
         let child = Command::new(executable)
             .arg("--stdio")
             .env("HOME", environment.join("home"))
             .env("XDG_CONFIG_HOME", environment.join("config"))
+            .env("XDG_CACHE_HOME", cache_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .envs(variables)
             .spawn()
             .expect("launch pascal-lsp test server");
-        Self::from_child(child)
+        let mut server = Self::from_child(child);
+        server._cache_home = Some(cache_home);
+        server
     }
 
     #[cfg(feature = "test-support")]
@@ -809,18 +825,22 @@ impl TestServer {
         stderr_file: &Path,
     ) -> Self {
         let executable = env!("CARGO_BIN_EXE_pascal-lsp-test-server");
+        let cache_home = Self::separate_cache_home();
         let stderr = fs::File::create(stderr_file).expect("create test server stderr log");
         let child = Command::new(executable)
             .arg("--stdio")
             .env("HOME", environment.join("home"))
             .env("XDG_CONFIG_HOME", environment.join("config"))
+            .env("XDG_CACHE_HOME", cache_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
             .envs(variables)
             .spawn()
             .expect("launch pascal-lsp test server");
-        Self::from_child(child)
+        let mut server = Self::from_child(child);
+        server._cache_home = Some(cache_home);
+        server
     }
 
     pub(super) fn launch_with_environment_path_and_variable(
@@ -833,6 +853,7 @@ impl TestServer {
             .arg("--stdio")
             .env("HOME", environment.join("home"))
             .env("XDG_CONFIG_HOME", environment.join("config"))
+            .env("XDG_CACHE_HOME", environment.join("cache"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -876,6 +897,8 @@ impl TestServer {
             messages: receiver,
             pending: VecDeque::new(),
             _environment: None,
+            #[cfg(feature = "test-support")]
+            _cache_home: None,
             #[cfg(feature = "test-support")]
             stdout_paused,
         }

@@ -15990,7 +15990,14 @@ fn package_only_mapping_scans_external_consumers_and_rejects_partial_rename() {
         .filter_map(|location| location["uri"].as_str())
         .collect::<HashSet<_>>();
     assert!(reference_uris.contains(uri(&main).as_str()));
-    assert!(reference_uris.contains(uri(&consumer).as_str()));
+    // l4d-33 A10: units reached only through runtime packages are not index
+    // members; the result says so instead of searching the mapped package.
+    assert!(!reference_uris.contains(uri(&consumer).as_str()));
+    let message = incomplete_result_log(&mut server, "textDocument/references");
+    assert!(
+        message.contains("units provided through runtime packages of App.dproj were not searched"),
+        "{message}"
+    );
 
     let rename_id = RequestId::from("package-only-rename".to_string());
     server.send_request(
@@ -45057,6 +45064,12 @@ mod build_selection;
 
 #[path = "protocol/cache_baseline.rs"]
 mod cache_baseline;
+
+#[path = "protocol/persistent_cache_status.rs"]
+mod persistent_cache_status;
+
+#[path = "protocol/best_effort.rs"]
+mod best_effort;
 
 fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
     write_file(

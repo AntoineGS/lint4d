@@ -167,6 +167,7 @@ mod tests {
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
+                    settled: true,
                 }),
                 report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
@@ -358,6 +359,7 @@ mod tests {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
+                settled: true,
             }),
             report: std::sync::Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],

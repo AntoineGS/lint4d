@@ -52,7 +52,6 @@ impl CatalogueScope {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn key(&self) -> &CatalogueKey {
         &self.key
     }

@@ -64,6 +64,8 @@ pub(crate) struct Targets {
     /// configured project (A8 items 1-3).
     pub(crate) from_open_or_configured: usize,
     pub(crate) small_workspace: bool,
+    /// The target the requesting document resolved to.
+    pub(crate) requesting: Option<ContextKey>,
 }
 
 impl Targets {
@@ -911,28 +913,38 @@ impl Workspace {
             }
         };
 
+        let mut projects = HashMap::<String, Option<ContextKey>>::new();
         if let Some(uri) = requesting {
             let known = input
                 .document_owners
                 .get(uri)
                 .or_else(|| input.document_owners.get(&super::canonical_file_uri(uri)));
-            if let Some(owner) = known {
-                let anchor = owner_anchor(owner.state.context.project_file(), uri);
-                push(&mut targets, owner.key.clone(), anchor);
-            } else {
-                match self.index_context_for(&IndexAnchor::Document(uri.clone()), cancel) {
+            let owner = match known {
+                Some(owner) => Some((
+                    owner.key.clone(),
+                    owner.state.context.project_file().map(Path::to_path_buf),
+                )),
+                None => match self.index_context_for(&IndexAnchor::Document(uri.clone()), cancel) {
                     Ok(key) => {
                         let project = self
                             .contexts
                             .get(&key)
                             .and_then(|state| state.context.project_file().map(Path::to_path_buf));
-                        push(&mut targets, key, owner_anchor(project.as_deref(), uri));
+                        Some((key, project))
                     }
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                     Err(error) => {
                         crate::trace::trace!("  index target: {uri} did not resolve: {error}");
+                        None
                     }
-                }
+                },
+            };
+            if let Some((owner, project)) = owner
+                && let Some((key, anchor)) =
+                    self.owner_target(owner, project, uri, &mut projects, cancel)?
+            {
+                targets.requesting = Some(key.clone());
+                push(&mut targets, key, anchor);
             }
         }
 
@@ -945,21 +957,19 @@ impl Workspace {
         });
         for (uri, _) in open {
             if let Some(owner) = input.document_owners.get(uri) {
-                let anchor = owner_anchor(owner.state.context.project_file(), uri);
-                push(&mut targets, owner.key.clone(), anchor);
+                let project = owner.state.context.project_file().map(Path::to_path_buf);
+                if let Some((key, anchor)) =
+                    self.owner_target(owner.key.clone(), project, uri, &mut projects, cancel)?
+                {
+                    push(&mut targets, key, anchor);
+                }
             }
         }
 
-        if let Some(project) = self.configured_project_path() {
-            match self.index_context_for(&IndexAnchor::Project(project.clone()), cancel) {
-                Ok(key) => push(&mut targets, key, IndexAnchor::Project(project)),
-                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(error) => {
-                    crate::trace::trace!(
-                        "  index target: configured project did not resolve: {error}"
-                    );
-                }
-            }
+        if let Some(project) = self.configured_project_path()
+            && let Some(key) = self.project_target(&project, &mut projects, cancel)?
+        {
+            push(&mut targets, key, IndexAnchor::Project(project));
         }
         targets.from_open_or_configured = targets.contexts.len();
 
@@ -1071,15 +1081,16 @@ impl Workspace {
                         .contexts
                         .get(&owner)
                         .and_then(|state| state.context.project_file().map(Path::to_path_buf));
-                    let anchor = match (project, Url::from_file_path(file)) {
-                        (Some(project), _) => IndexAnchor::Project(project),
-                        (None, Ok(uri)) => IndexAnchor::Document(uri),
-                        (None, Err(())) => {
-                            outside += 1;
-                            continue;
+                    let target = match Url::from_file_path(file) {
+                        Ok(uri) => {
+                            self.owner_target(owner, project, &uri, &mut projects, cancel)?
                         }
+                        Err(()) => None,
                     };
-                    push(&mut targets, owner, anchor);
+                    match target {
+                        Some((key, anchor)) => push(&mut targets, key, anchor),
+                        None => outside += 1,
+                    }
                 }
                 _ => outside += 1,
             }
@@ -1090,6 +1101,54 @@ impl Workspace {
             ));
         }
         Ok(targets)
+    }
+
+    /// The target an owner context stands for. A context with a project
+    /// file is searched under the key its Project anchor resolves to, the
+    /// key the warmer indexes: a document owner can hold an older
+    /// resolution of the same project. `None` when the project no longer
+    /// resolves.
+    fn owner_target(
+        &mut self,
+        owner: ContextKey,
+        project: Option<PathBuf>,
+        uri: &Url,
+        projects: &mut HashMap<String, Option<ContextKey>>,
+        cancel: &AtomicBool,
+    ) -> Result<Option<(ContextKey, IndexAnchor)>, String> {
+        let Some(project) = project else {
+            return Ok(Some((owner, IndexAnchor::Document(uri.clone()))));
+        };
+        Ok(self
+            .project_target(&project, projects, cancel)?
+            .map(|key| (key, IndexAnchor::Project(project))))
+    }
+
+    /// The key `project`'s anchor resolves to, once per request.
+    fn project_target(
+        &mut self,
+        project: &Path,
+        projects: &mut HashMap<String, Option<ContextKey>>,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ContextKey>, String> {
+        let project_key = path_key(project);
+        if let Some(key) = projects.get(&project_key) {
+            return Ok(key.clone());
+        }
+        let key = match self.index_context_for(&IndexAnchor::Project(project.to_path_buf()), cancel)
+        {
+            Ok(key) => Some(key),
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                crate::trace::trace!(
+                    "  index target: {} did not resolve: {error}",
+                    project.display()
+                );
+                None
+            }
+        };
+        projects.insert(project_key, key.clone());
+        Ok(key)
     }
 
     /// The sources an indexed snapshot reads for `targets` (l4d-33 §6): per
@@ -1218,12 +1277,28 @@ impl Workspace {
         for (key, anchor) in &targets.contexts {
             check_workspace_cancel(Some(cancel))?;
             if !self.contexts.contains_key(key) {
-                let resolved = self.index_context_for(anchor, cancel)?;
-                if &resolved != key {
-                    return Err(format!(
-                        "index target {} resolved to another context",
-                        anchor_display(anchor)
-                    ));
+                let known = input
+                    .document_owners
+                    .values()
+                    .find(|known| known.key == *key)
+                    .map(|known| super::ContextState::clone(&known.state));
+                if let Some(state) = known {
+                    self.contexts.insert(key.clone(), state);
+                } else {
+                    let resolved = match self.index_context_for(anchor, cancel) {
+                        Ok(resolved) => Some(resolved),
+                        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                        Err(_) => None,
+                    };
+                    // The anchor now names another context: this target is
+                    // a gap, never an error.
+                    if resolved.as_ref() != Some(key) {
+                        result.gaps.push(format!(
+                            "{} changed while the request ran; it was not searched",
+                            anchor_display(anchor)
+                        ));
+                        continue;
+                    }
                 }
             }
             let mut computed = self.ensure_index_membership_computed(key, anchor, cancel)?;
@@ -1669,13 +1744,6 @@ fn anchor_display(anchor: &IndexAnchor) -> String {
         IndexAnchor::Document(uri) => uri
             .to_file_path()
             .map_or_else(|()| uri.to_string(), |path| path.display().to_string()),
-    }
-}
-
-fn owner_anchor(project: Option<&Path>, uri: &Url) -> IndexAnchor {
-    match project {
-        Some(project) => IndexAnchor::Project(project.to_path_buf()),
-        None => IndexAnchor::Document(uri.clone()),
     }
 }
 
@@ -3408,6 +3476,130 @@ mod tests {
         assert_eq!(
             found.gaps,
             ["1 requested sources belong to no searched context and were not searched"]
+        );
+    }
+
+    /// `app/` with two project candidates, `B.dproj` selected for the open
+    /// `app/Main.pas`, and an open `lib/Other.pas` from the projects' search
+    /// path outside their directory.
+    fn selected_project(root: &Path) -> (Workspace, PathBuf, Url, Url) {
+        let app = root.join("app");
+        for name in ["A", "B"] {
+            write(
+                &app.join(format!("{name}.dproj")),
+                &format!(
+                    "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource><DCC_Define>DEBUG</DCC_Define><DCC_UnitSearchPath>..\\lib</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>"
+                ),
+            );
+            write(
+                &app.join(format!("{name}.dpr")),
+                &format!("program {name}; begin end.\n"),
+            );
+        }
+        let main_text = USER.replace("unit User", "unit Main");
+        write(&app.join("Main.pas"), &main_text);
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/Other.pas"), OTHER);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let main = Url::from_file_path(app.join("Main.pas")).unwrap();
+        let other = Url::from_file_path(root.join("lib/Other.pas")).unwrap();
+        workspace.open_document(main.clone(), main_text, 1).unwrap();
+        let descriptor = app.join("B.dproj");
+        workspace
+            .select_project(&main, Some(&Url::from_file_path(&descriptor).unwrap()))
+            .expect("select");
+        workspace
+            .open_document(other.clone(), OTHER.to_owned(), 2)
+            .unwrap();
+        (workspace, descriptor, main, other)
+    }
+
+    /// A request works on a workspace built from its input, whose document
+    /// owners may hold an older resolution of their project (here: the
+    /// descriptor changed after they were recorded). The project is still one
+    /// target, under the key its anchor resolves to (the key the warmer
+    /// indexes), and a mismatch is never an error.
+    #[test]
+    fn a_selected_project_is_one_target_under_its_anchors_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (workspace, descriptor, main, other) = selected_project(root);
+        let text = fs::read_to_string(&descriptor).unwrap();
+        write(&descriptor, &text.replace("DEBUG", "DEBUG;EXTRA"));
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let anchor = IndexAnchor::Project(descriptor.clone());
+        let resolved = Workspace::from_analysis_input(&input)
+            .index_context_for(&anchor, &cancel)
+            .expect("the project resolves");
+        assert_ne!(
+            input.document_owners[&main].key, resolved,
+            "the owner must hold an older resolution"
+        );
+
+        let mut request = Workspace::from_analysis_input(&input);
+        let found = request
+            .index_targets(&input, Some(&main), TargetPurpose::References, &cancel)
+            .expect("targets");
+        let projects = found
+            .contexts
+            .iter()
+            .filter(|(_, target)| *target == anchor)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(projects, std::slice::from_ref(&resolved));
+        assert_eq!(found.requesting.as_ref(), Some(&resolved));
+        assert!(
+            found
+                .contexts
+                .iter()
+                .any(|(key, _)| *key == input.document_owners[&other].key)
+        );
+        let query = shared_query(Some(&["shared"]));
+        let sources = request
+            .indexed_sources(
+                &input,
+                &found,
+                Some(&query),
+                std::slice::from_ref(&main),
+                None,
+                &cancel,
+            )
+            .expect("indexed sources");
+        assert!(
+            sources
+                .sources
+                .iter()
+                .any(|(path, key)| *path == root.join("app/Main.pas") && *key == resolved)
+        );
+    }
+
+    #[test]
+    fn an_index_target_that_resolves_to_another_context_is_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (workspace, descriptor, main, _) = selected_project(root);
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let anchor = IndexAnchor::Project(descriptor);
+        let mut stale = input.document_owners[&main].key.clone();
+        stale.config = Some("not retained".to_owned());
+        let mut request = Workspace::from_analysis_input(&input);
+        let sources = request
+            .indexed_sources(
+                &input,
+                &one_target(&stale, &anchor),
+                Some(&shared_query(None)),
+                &[],
+                None,
+                &cancel,
+            )
+            .expect("a mismatch is not an error");
+        assert!(sources.sources.iter().all(|(_, key)| *key != stale));
+        assert_eq!(
+            sources.gaps,
+            ["B.dproj changed while the request ran; it was not searched"]
         );
     }
 

@@ -1261,7 +1261,7 @@ fn indexed_reference_scope(
         &targets,
         Some(&query),
         &must_include,
-        Some(&owner.key),
+        Some(targets.requesting.as_ref().unwrap_or(&owner.key)),
         cancel,
     )?;
     crate::trace::trace!(

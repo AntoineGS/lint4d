@@ -1,4 +1,5 @@
 use super::Store;
+use super::health::Access;
 use super::keys::{
     ArtifactKeyRef, admit_manifest, admit_manifest_by_digest, check_manifest_size, put_manifest,
 };
@@ -391,84 +392,92 @@ impl Store {
     /// the artifact counts as recently used (and, once write admission exists,
     /// it passes admission like any other write).
     pub fn publish_artifact(&self, write: &ArtifactWrite<'_>) -> Result<Published, Bypass> {
-        let prepared = prepare_artifact(write)?;
-        let mut writer = self.writer()?;
-        let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
-        ensure_live(&transaction, self.scope)?;
-        let published = insert_prepared(&transaction, self.scope, write, &prepared)?;
-        self.before_commit();
-        transaction.commit().map_err(|error| classify(&error))?;
-        Ok(published)
+        self.guarded(Access::Write, || {
+            let prepared = prepare_artifact(write)?;
+            let mut writer = self.writer()?;
+            let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            ensure_live(&transaction, self.scope)?;
+            let published = insert_prepared(&transaction, self.scope, write, &prepared)?;
+            self.before_commit();
+            transaction.commit().map_err(|error| classify(&error))?;
+            Ok(published)
+        })
     }
 
     /// Admit the artifact's key manifests (and its root's) and its header.
     pub fn open_artifact(&self, key: ArtifactKeyRef<'_>) -> Result<Lookup<ArtifactHeader>, Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        for manifest in std::iter::once(key.key()).chain(key.root()) {
-            if let Lookup::Miss(miss) =
-                admit_manifest(&transaction, &self.namespace, self.scope, manifest)?
-            {
-                return Ok(Lookup::Miss(miss));
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            for manifest in std::iter::once(key.key()).chain(key.root()) {
+                if let Lookup::Miss(miss) =
+                    admit_manifest(&transaction, &self.namespace, self.scope, manifest)?
+                {
+                    return Ok(Lookup::Miss(miss));
+                }
             }
-        }
-        let stored = match read_header(&transaction, self.scope, key.digest()) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-            Err(error) => return classify_read(&error).map(Lookup::Miss),
-        };
-        if stored.lifecycle != LIVE {
-            return Ok(Lookup::Miss(Miss::Retired));
-        }
-        let expected_root = key.root().map(|root| root.digest().as_bytes().to_vec());
-        Ok(admit_header(
-            self.scope,
-            key.digest(),
-            stored,
-            key.key().kind(),
-            expected_root,
-        ))
+            let stored = match read_header(&transaction, self.scope, key.digest()) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+                Err(error) => return classify_read(&error).map(Lookup::Miss),
+            };
+            if stored.lifecycle != LIVE {
+                return Ok(Lookup::Miss(Miss::Retired));
+            }
+            let expected_root = key.root().map(|root| root.digest().as_bytes().to_vec());
+            Ok(admit_header(
+                self.scope,
+                key.digest(),
+                stored,
+                key.key().kind(),
+                expected_root,
+            ))
+        })
     }
 
     /// Admit the artifact stored under `id` when only its digest is known,
     /// as the conclusion of validated evidence is. Its manifest, and its
     /// root's, must hash to the stored digests (`admit_manifest_by_digest`).
     pub fn open_artifact_by_id(&self, id: Digest) -> Result<Lookup<ArtifactHeader>, Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        let stored = match read_header(&transaction, self.scope, id) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-            Err(error) => return classify_read(&error).map(Lookup::Miss),
-        };
-        if stored.lifecycle != LIVE {
-            return Ok(Lookup::Miss(Miss::Retired));
-        }
-        let kind = match stored.kind {
-            2 => KeyKind::LocalArtifact,
-            3 => KeyKind::ExpandedArtifact,
-            _ => return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header))),
-        };
-        if let Lookup::Miss(miss) = admit_manifest_by_digest(&transaction, self.scope, id, kind)? {
-            return Ok(Lookup::Miss(miss));
-        }
-        if let Some(root) = &stored.root_key {
-            let Ok(root) = <[u8; 32]>::try_from(root.as_slice()) else {
-                return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header)));
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            let stored = match read_header(&transaction, self.scope, id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+                Err(error) => return classify_read(&error).map(Lookup::Miss),
             };
-            if let Lookup::Miss(miss) = admit_manifest_by_digest(
-                &transaction,
-                self.scope,
-                Digest::from_bytes(root),
-                KeyKind::LocalArtifact,
-            )? {
+            if stored.lifecycle != LIVE {
+                return Ok(Lookup::Miss(Miss::Retired));
+            }
+            let kind = match stored.kind {
+                2 => KeyKind::LocalArtifact,
+                3 => KeyKind::ExpandedArtifact,
+                _ => return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header))),
+            };
+            if let Lookup::Miss(miss) =
+                admit_manifest_by_digest(&transaction, self.scope, id, kind)?
+            {
                 return Ok(Lookup::Miss(miss));
             }
-        }
-        let expected_root = stored.root_key.clone();
-        Ok(admit_header(self.scope, id, stored, kind, expected_root))
+            if let Some(root) = &stored.root_key {
+                let Ok(root) = <[u8; 32]>::try_from(root.as_slice()) else {
+                    return Ok(Lookup::Miss(Miss::Malformed(Malformed::Header)));
+                };
+                if let Lookup::Miss(miss) = admit_manifest_by_digest(
+                    &transaction,
+                    self.scope,
+                    Digest::from_bytes(root),
+                    KeyKind::LocalArtifact,
+                )? {
+                    return Ok(Lookup::Miss(miss));
+                }
+            }
+            let expected_root = stored.root_key.clone();
+            Ok(admit_header(self.scope, id, stored, kind, expected_root))
+        })
     }
 }
 

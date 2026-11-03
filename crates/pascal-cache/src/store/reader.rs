@@ -1,5 +1,6 @@
 use super::Store;
 use super::artifacts::{ArtifactHeader, FactHasher, hash_row};
+use super::health::Access;
 use super::limits::{MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS};
 use super::namespaces::{ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
@@ -182,6 +183,11 @@ impl ArtifactReader<'_> {
     /// Rows are unverified until then. A header from another store (another
     /// scope) is fenced before any SQL.
     pub fn next_batch(&mut self) -> Result<Lookup<Option<RowBatch>>, Bypass> {
+        let store = self.store;
+        store.guarded(Access::Read, || self.next_batch_unguarded())
+    }
+
+    fn next_batch_unguarded(&mut self) -> Result<Lookup<Option<RowBatch>>, Bypass> {
         if self.header.scope != self.store.scope() {
             return Err(Bypass::Fenced);
         }

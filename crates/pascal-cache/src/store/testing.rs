@@ -14,6 +14,7 @@ pub(crate) struct Hooks {
     before_commit: Mutex<Option<Hook>>,
     row_fault: Mutex<Option<usize>>,
     faults: Mutex<HashMap<FaultPoint, Hook>>,
+    injected: Mutex<Option<Bypass>>,
 }
 
 impl Hooks {
@@ -27,9 +28,29 @@ impl Hooks {
             hook();
         }
     }
+
+    pub(crate) fn take_injected(&self) -> Option<Bypass> {
+        self.injected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl Store {
+    pub fn advance_clock_for_test(&self, by: std::time::Duration) {
+        self.clock.advance(by);
+    }
+
+    /// The next guarded operation returns `bypass` without running.
+    pub fn fail_next_for_test(&self, bypass: Bypass) {
+        *self
+            .hooks
+            .injected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(bypass);
+    }
+
     /// Take the one-shot row fault: the number of rows to read before the
     /// next `next_batch` call fails with a SQLite I/O error.
     pub(crate) fn take_row_fault(&self) -> Option<usize> {

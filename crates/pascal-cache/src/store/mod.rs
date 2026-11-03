@@ -12,9 +12,11 @@ macro_rules! fault_point {
 }
 
 mod artifacts;
+mod clock;
 mod container;
 mod evidence;
 mod facts;
+mod health;
 mod index;
 mod keys;
 mod limits;
@@ -62,6 +64,7 @@ pub use snapshots::{
 pub use testing::FaultPoint;
 
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
+pub use health::{Access, MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
 pub use limits::{
     CONNECTION_OVERHEAD_BYTES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES,
     MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
@@ -97,6 +100,8 @@ pub struct Store {
     pool: Pool,
     scratch: std::sync::Arc<reader::ScratchBudget>,
     _lock: NamespaceLock,
+    clock: clock::Clock,
+    health: health::Health,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
 }
@@ -133,6 +138,8 @@ impl Store {
             pool,
             scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
+            clock: clock::Clock::default(),
+            health: health::Health::default(),
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),
         };
@@ -159,13 +166,17 @@ impl Store {
 
     /// Whether this store's scope is still live (not reset or retired).
     pub fn check_scope(&self) -> Result<(), Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = sqlite::begin(&mut reader, rusqlite::TransactionBehavior::Deferred)?;
-        namespaces::ensure_live(&transaction, self.scope)
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = sqlite::begin(&mut reader, rusqlite::TransactionBehavior::Deferred)?;
+            namespaces::ensure_live(&transaction, self.scope)
+        })
     }
 
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
-        self.retire_within(Deadline::after(self.limits.open_wait))
+        self.guarded(Access::Maintenance, || {
+            self.retire_within(Deadline::after(self.limits.open_wait))
+        })
     }
 
     fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
@@ -176,9 +187,43 @@ impl Store {
     /// Delete at most `max_rows` rows of retired scopes. Run off
     /// interactive paths and repeat until `complete`.
     pub fn reclaim(&self, max_rows: usize) -> Result<Reclaimed, Bypass> {
-        let deadline = Deadline::after(self.limits.wait);
-        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-        namespaces::reclaim(&mut writer, max_rows, deadline)
+        self.guarded(Access::Maintenance, || {
+            let deadline = Deadline::after(self.limits.wait);
+            let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+            namespaces::reclaim(&mut writer, max_rows, deadline)
+        })
+    }
+
+    /// The process-level health state, if the store is unhealthy.
+    pub fn health(&self) -> Option<Unhealthy> {
+        self.health.state()
+    }
+
+    /// Run `operation` unless the health state blocks `access`, then
+    /// record its outcome (spec §10 amendment 2026-11-03, D15). Only the
+    /// outermost guarded call on a thread checks and records, so a failure
+    /// in a nested call counts once.
+    pub(crate) fn guarded<T>(
+        &self,
+        access: Access,
+        operation: impl FnOnce() -> Result<T, Bypass>,
+    ) -> Result<T, Bypass> {
+        let depth = GuardDepth::enter();
+        if !depth.outermost {
+            return operation();
+        }
+        if let Some(bypass) = self.health.blocked(access, self.clock.now()) {
+            return Err(bypass);
+        }
+        #[cfg(feature = "test-support")]
+        let result = match self.hooks.take_injected() {
+            Some(bypass) => Err(bypass),
+            None => operation(),
+        };
+        #[cfg(not(feature = "test-support"))]
+        let result = operation();
+        self.health.record(access, &result, self.clock.now());
+        result
     }
 
     pub(crate) fn writer(&self) -> Result<Lease<'_>, Bypass> {
@@ -205,8 +250,69 @@ impl Store {
     }
 }
 
+thread_local! {
+    static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a thread as inside a guarded operation until dropped (also on
+/// unwind or early return).
+struct GuardDepth {
+    outermost: bool,
+}
+
+impl GuardDepth {
+    fn enter() -> Self {
+        let outermost = GUARD_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            current == 0
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for GuardDepth {
+    fn drop(&mut self) {
+        GUARD_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::Digest;
+
+    #[test]
+    fn a_failure_in_a_nested_guarded_call_is_recorded_once() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let store = Store::open(
+            directory.path(),
+            &Namespace::new(Digest::from_bytes([3; 32])),
+            StoreLimits::default(),
+        )
+        .unwrap();
+        let nested = store.guarded(Access::Write, || {
+            store.guarded(Access::Write, || Err::<(), _>(Bypass::Full))
+        });
+        assert_eq!(nested, Err(Bypass::Full));
+        assert_eq!(store.health(), Some(Unhealthy::Full));
+        store.advance_clock_for_test(MIN_HEALTH_BACKOFF);
+        assert_eq!(
+            store.guarded(Access::Write, || Ok(())),
+            Ok(()),
+            "recorded once: the backoff is the minimum, not doubled"
+        );
+        assert_eq!(store.health(), None);
+    }
 }

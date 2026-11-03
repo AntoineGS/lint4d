@@ -6,8 +6,8 @@ mod common;
 use common::private_tempdir;
 use common::records::open;
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, DATABASE_FILE, LocalArtifactKey, SourceContent,
-    Store,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, LocalArtifactKey, Lookup,
+    MIN_HEALTH_BACKOFF, Miss, Published, SourceContent, Store, Unhealthy,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
@@ -63,4 +63,51 @@ fn commits_never_checkpoint_in_the_writer() {
         main_before,
         "no checkpoint copied pages into the database on the commit path"
     );
+}
+
+#[test]
+fn a_full_disk_makes_writes_back_off_until_a_probe_succeeds() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store.limit_growth_for_test(4).unwrap();
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 10, 200_000),
+        Err(Bypass::Full)
+    );
+    assert_eq!(store.health(), Some(Unhealthy::Full));
+    store.limit_growth_for_test(1 << 20).unwrap(); // space is back
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Err(Bypass::Full),
+        "blocked without touching SQLite until the backoff ends"
+    );
+    assert_eq!(
+        store.open_artifact(ArtifactKeyRef::local(&key("unit A;"))),
+        Ok(Lookup::Miss(Miss::Absent)),
+        "reads continue"
+    );
+    store.advance_clock_for_test(MIN_HEALTH_BACKOFF);
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Ok(Published::Inserted)
+    );
+    assert_eq!(store.health(), None);
+}
+
+#[test]
+fn corruption_mid_session_bypasses_every_operation_and_leaves_the_files() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let before = std::fs::read(root.path().join(DATABASE_FILE)).unwrap();
+    store.fail_next_for_test(Bypass::Corrupt);
+    assert_eq!(store.check_scope(), Err(Bypass::Corrupt));
+    assert_eq!(store.check_scope(), Err(Bypass::Corrupt), "blocked");
+    assert_eq!(publish_bulk(&store, "unit A;", 1, 10), Err(Bypass::Corrupt));
+    assert_eq!(
+        std::fs::read(root.path().join(DATABASE_FILE)).unwrap(),
+        before
+    );
+    store.advance_clock_for_test(MIN_HEALTH_BACKOFF);
+    assert_eq!(store.check_scope(), Ok(()));
+    assert_eq!(store.health(), None);
 }

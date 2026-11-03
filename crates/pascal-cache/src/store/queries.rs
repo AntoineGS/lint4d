@@ -6,6 +6,7 @@
 //! was read is a miss, never an empty answer (spec §9).
 
 use super::Store;
+use super::health::Access;
 use super::limits::{MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE};
 use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
@@ -72,64 +73,66 @@ impl Store {
         snapshot: &SnapshotHeader,
         source: &Path,
     ) -> Result<Lookup<SnapshotMember>, Bypass> {
-        if snapshot.scope != self.scope {
-            return Err(Bypass::Fenced);
-        }
-        if over_long(source) {
-            return Ok(Lookup::Miss(Miss::Absent));
-        }
-        // The member and its source key, charged before they are read.
-        let Some(_scratch) = self
-            .scratch
-            .reserve((std::mem::size_of::<SnapshotMember>() + MAX_INDEX_KEY_BYTES) as u64)
-        else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
-            return Ok(Lookup::Miss(miss));
-        }
-        let row = transaction
-            .prepare_cached(MEMBER_QUERY)
-            .and_then(|mut statement| {
-                statement
-                    .query_row(
-                        params![
-                            self.scope.namespace.as_bytes().as_slice(),
-                            epoch(self.scope),
-                            snapshot.id.as_bytes().as_slice(),
-                            path_key(source),
-                            LIVE
-                        ],
-                        |row| {
-                            let record = record_id(row, 1)?;
-                            let length = row.get::<_, i64>(3)?;
-                            let source_key = usize::try_from(length)
-                                .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
-                                .then(|| row.get::<_, Vec<u8>>(4))
-                                .transpose()?;
-                            Ok((row.get::<_, i64>(0)?, record, source_key))
-                        },
-                    )
-                    .optional()
-            });
-        let (ordinal, record, source_key) = match row {
-            Ok(Some(row)) => row,
-            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-            Err(error) => return classify_read(&error).map(Lookup::Miss),
-        };
-        let (Ok(ordinal), Some(record), Some(source_key)) =
-            (u64::try_from(ordinal), record, source_key)
-        else {
-            return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
-        };
-        Ok(Lookup::Hit(SnapshotMember {
-            ordinal,
-            record_id: Digest::from_bytes(record),
-            source_key,
-        }))
+        self.guarded(Access::Read, || {
+            if snapshot.scope != self.scope {
+                return Err(Bypass::Fenced);
+            }
+            if over_long(source) {
+                return Ok(Lookup::Miss(Miss::Absent));
+            }
+            // The member and its source key, charged before they are read.
+            let Some(_scratch) = self
+                .scratch
+                .reserve((std::mem::size_of::<SnapshotMember>() + MAX_INDEX_KEY_BYTES) as u64)
+            else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
+                return Ok(Lookup::Miss(miss));
+            }
+            let row = transaction
+                .prepare_cached(MEMBER_QUERY)
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(
+                            params![
+                                self.scope.namespace.as_bytes().as_slice(),
+                                epoch(self.scope),
+                                snapshot.id.as_bytes().as_slice(),
+                                path_key(source),
+                                LIVE
+                            ],
+                            |row| {
+                                let record = record_id(row, 1)?;
+                                let length = row.get::<_, i64>(3)?;
+                                let source_key = usize::try_from(length)
+                                    .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
+                                    .then(|| row.get::<_, Vec<u8>>(4))
+                                    .transpose()?;
+                                Ok((row.get::<_, i64>(0)?, record, source_key))
+                            },
+                        )
+                        .optional()
+                });
+            let (ordinal, record, source_key) = match row {
+                Ok(Some(row)) => row,
+                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+                Err(error) => return classify_read(&error).map(Lookup::Miss),
+            };
+            let (Ok(ordinal), Some(record), Some(source_key)) =
+                (u64::try_from(ordinal), record, source_key)
+            else {
+                return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
+            };
+            Ok(Lookup::Hit(SnapshotMember {
+                ordinal,
+                record_id: Digest::from_bytes(record),
+                source_key,
+            }))
+        })
     }
 
     /// The members of `snapshot` with a precise binding to the canonical
@@ -146,89 +149,91 @@ impl Store {
         after: Option<ImporterHit>,
         limit: usize,
     ) -> Result<Lookup<ImporterPage>, Bypass> {
-        if snapshot.scope != self.scope {
-            return Err(Bypass::Fenced);
-        }
-        if over_long(target) {
-            return Ok(Lookup::Miss(Miss::Absent));
-        }
-        let limit = limit.clamp(1, MAX_INDEX_PAGE);
-        // The page, charged before it is allocated (spec §10).
-        let Some(_scratch) = self
-            .scratch
-            .reserve(((limit + 1) * std::mem::size_of::<ImporterHit>()) as u64)
-        else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        // No binding ordinal exceeds `i64::MAX`, so a larger (forged) one
-        // means "after every binding of this record", never a wrap.
-        let (after_record, after_ordinal) = match after {
-            Some(hit) => (
-                hit.record_id.as_bytes().to_vec(),
-                i64::try_from(hit.binding_ordinal).unwrap_or(i64::MAX),
-            ),
-            None => (Vec::new(), -1),
-        };
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
-            return Ok(Lookup::Miss(miss));
-        }
-        let read = |error: rusqlite::Error| classify_read(&error).map(Lookup::Miss);
-        let mut statement = match transaction.prepare_cached(IMPORTERS_QUERY) {
-            Ok(statement) => statement,
-            Err(error) => return read(error),
-        };
-        let rows = statement.query_map(
-            params![
-                self.scope.namespace.as_bytes().as_slice(),
-                epoch(self.scope),
-                snapshot.id.as_bytes().as_slice(),
-                path_key(target),
-                after_record,
-                after_ordinal,
-                (limit + 1) as i64,
-                LIVE
-            ],
-            |row| {
-                Ok((
-                    record_id(row, 0)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        );
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(error) => return read(error),
-        };
-        let mut hits = Vec::with_capacity(limit + 1);
-        for row in rows {
-            let (record, binding_ordinal, member_ordinal) = match row {
-                Ok(row) => row,
+        self.guarded(Access::Read, || {
+            if snapshot.scope != self.scope {
+                return Err(Bypass::Fenced);
+            }
+            if over_long(target) {
+                return Ok(Lookup::Miss(Miss::Absent));
+            }
+            let limit = limit.clamp(1, MAX_INDEX_PAGE);
+            // The page, charged before it is allocated (spec §10).
+            let Some(_scratch) = self
+                .scratch
+                .reserve(((limit + 1) * std::mem::size_of::<ImporterHit>()) as u64)
+            else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            // No binding ordinal exceeds `i64::MAX`, so a larger (forged) one
+            // means "after every binding of this record", never a wrap.
+            let (after_record, after_ordinal) = match after {
+                Some(hit) => (
+                    hit.record_id.as_bytes().to_vec(),
+                    i64::try_from(hit.binding_ordinal).unwrap_or(i64::MAX),
+                ),
+                None => (Vec::new(), -1),
+            };
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
+                return Ok(Lookup::Miss(miss));
+            }
+            let read = |error: rusqlite::Error| classify_read(&error).map(Lookup::Miss);
+            let mut statement = match transaction.prepare_cached(IMPORTERS_QUERY) {
+                Ok(statement) => statement,
                 Err(error) => return read(error),
             };
-            let (Some(record), Ok(binding_ordinal), Ok(member_ordinal)) = (
-                record,
-                u64::try_from(binding_ordinal),
-                u64::try_from(member_ordinal),
-            ) else {
-                return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
+            let rows = statement.query_map(
+                params![
+                    self.scope.namespace.as_bytes().as_slice(),
+                    epoch(self.scope),
+                    snapshot.id.as_bytes().as_slice(),
+                    path_key(target),
+                    after_record,
+                    after_ordinal,
+                    (limit + 1) as i64,
+                    LIVE
+                ],
+                |row| {
+                    Ok((
+                        record_id(row, 0)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            );
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => return read(error),
             };
-            hits.push(ImporterHit {
-                record_id: Digest::from_bytes(record),
-                binding_ordinal,
-                member_ordinal,
-            });
-        }
-        let next = if hits.len() > limit {
-            hits.truncate(limit);
-            hits.last().copied()
-        } else {
-            None
-        };
-        Ok(Lookup::Hit(ImporterPage { hits, next }))
+            let mut hits = Vec::with_capacity(limit + 1);
+            for row in rows {
+                let (record, binding_ordinal, member_ordinal) = match row {
+                    Ok(row) => row,
+                    Err(error) => return read(error),
+                };
+                let (Some(record), Ok(binding_ordinal), Ok(member_ordinal)) = (
+                    record,
+                    u64::try_from(binding_ordinal),
+                    u64::try_from(member_ordinal),
+                ) else {
+                    return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
+                };
+                hits.push(ImporterHit {
+                    record_id: Digest::from_bytes(record),
+                    binding_ordinal,
+                    member_ordinal,
+                });
+            }
+            let next = if hits.len() > limit {
+                hits.truncate(limit);
+                hits.last().copied()
+            } else {
+                None
+            };
+            Ok(Lookup::Hit(ImporterPage { hits, next }))
+        })
     }
 }
 

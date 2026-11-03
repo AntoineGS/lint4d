@@ -122,10 +122,9 @@ fn program_uses_with_explicit_unit_paths() {
     assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
 }
 
-/// An anonymous method's local declarations are not admitted, so the scanner
-/// leaves its state unknown after it.
-const UNSCANNABLE: &str = "procedure Run; begin \
-    TTask.Run(procedure var Local: Integer; begin Local := 1; end); end;";
+/// A root-level declaration the scanner cannot admit leaves its state
+/// unknown after it.
+const UNSCANNABLE: &str = "function Local: ; begin end;";
 
 #[test]
 fn unscanned_declarations_leave_a_file_without_declaration_queries_complete() {
@@ -184,5 +183,120 @@ fn inline_variable_initialized_by_an_anonymous_method_stays_balanced() {
         .analyze()
         .unwrap();
     assert!(analysis.root.complete, "{:?}", analysis.reasons);
-    assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::Unknown);
+    assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
+}
+
+/// Declarations the scanner skips inside a statement scope hide only that
+/// scope: queries outside it keep their proofs, queries inside it do not.
+fn assert_scope_local(body: &str) {
+    assert_inside(body, Truth::Unknown);
+}
+
+fn assert_inside(body: &str, inside: Truth) {
+    let source = format!(
+        "unit T; interface const C = 1; implementation {body} \
+         const After = 1; \
+         {{$IF Declared(After) and (C = 1)}}{{$DEFINE OUTSIDE}}{{$ENDIF}} \
+         end."
+    );
+    let analysis = Fixture::new(&source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}\n{body}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE OUTSIDE"), Truth::True, "{body}");
+    assert_eq!(activity(&analysis, "DEFINE INSIDE"), inside, "{body}");
+}
+
+#[test]
+fn anonymous_method_local_declarations_hide_only_the_method() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Parallel.Async( \
+             procedure (const task: IOmniTask) \
+             var Local: Integer; \
+             const C = 2; \
+             begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} Local := C; end); \
+         end;",
+    );
+}
+
+#[test]
+fn inline_declarations_are_admitted_in_their_block_and_end_at_their_statement() {
+    // The inline constant shadows the unit's C inside its block only.
+    assert_inside(
+        "procedure Run; begin \
+           var X: Integer := 1; X := 2; \
+           if X > 0 then begin const C = 2; X := C; {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end; \
+           case X of 1: X := 3; end; \
+         end;",
+        Truth::False,
+    );
+}
+
+#[test]
+fn inline_declarations_in_an_anonymous_method_argument_hide_only_their_block() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Go(procedure begin var Y := 1; const C = 2; \
+             if Y > 0 then begin Y := C; end; {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end); \
+         end;",
+    );
+}
+
+#[test]
+fn inline_variable_initialized_by_an_anonymous_method_hides_only_its_block() {
+    assert_scope_local(
+        "procedure Run; begin \
+           var C: TProc := procedure begin if A then begin B; end; end; \
+           {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} C; \
+         end;",
+    );
+}
+
+#[test]
+fn method_reference_type_in_a_statement_is_not_an_anonymous_method() {
+    assert_scope_local(
+        "procedure Run; begin \
+           var C: reference to procedure; \
+           if A then begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end; \
+         end;",
+    );
+}
+
+/// Reduced from a real unit: a class method with a nested routine whose body
+/// starts an OmniThread task with local variables and nested try blocks.
+#[test]
+fn background_task_with_locals_in_a_class_method() {
+    let source = "unit T; interface type TEnv = class procedure Log(Id: Integer); end; \
+        implementation \
+        procedure TEnv.Log(Id: Integer); \
+          procedure Convert(var Value: string); begin case Id of 1: Value := ''; else Value := 'x'; end; end; \
+        begin \
+          if Id <> 0 then begin \
+            try \
+              Parallel.Async( \
+                procedure (const task: IOmniTask) \
+                var Connection: IConnectionSet; \
+                begin \
+                  try \
+                    Connection := Pool.Get; \
+                    try Insert(Id); finally Pool.Release(Connection); end; \
+                  except on e: Exception do \
+                    begin if Pos('x', e.Message) > 0 then begin Reset := True; end; end; \
+                  end \
+                end); \
+            except on e: Exception do begin Log(0); end; \
+            end \
+          end; \
+        end; \
+        {$IFDEF DEBUG}{$DEFINE TRACE}{$ENDIF} \
+        const After = 1; \
+        {$IF Declared(After) and Declared(TEnv)}{$DEFINE SEEN}{$ENDIF} \
+        end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert!(analysis.reasons.is_empty(), "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
 }

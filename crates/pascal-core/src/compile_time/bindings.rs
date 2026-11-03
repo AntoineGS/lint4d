@@ -567,6 +567,11 @@ pub(super) fn layout_name(
     if state.unknown {
         return Fact::Unknown(UnknownReason::UnknownActivity);
     }
+    match state.hidden_at(&site, budget) {
+        Ok(true) => return Fact::Unknown(UnknownReason::UnknownActivity),
+        Ok(false) => {}
+        Err(reason) => return Fact::Incomplete(reason),
+    }
     if site.scope.0 as usize >= state.scopes.len() || site.sequence.0 > state.sequence.0 {
         return Fact::Unknown(UnknownReason::UnresolvedName);
     }

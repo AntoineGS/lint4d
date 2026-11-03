@@ -271,7 +271,7 @@ impl CompileTimeState {
             if let Some(reason) = &self.failure {
                 return Ok(Fact::Incomplete(reason.clone()));
             }
-            if self.unknown {
+            if self.unknown || self.hidden_at(&site, budget)? {
                 return Ok(Fact::Unknown(UnknownReason::UnknownActivity));
             }
             if site.scope.0 as usize >= self.scopes.len() || site.sequence.0 > self.sequence.0 {

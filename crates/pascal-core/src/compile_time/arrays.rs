@@ -929,7 +929,9 @@ pub(super) fn scalar_query(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     use crate::conditional::ExpressionQuery;
-    if state.unknown && !matches!(query, ExpressionQuery::Defined(..)) {
+    if !matches!(query, ExpressionQuery::Defined(..))
+        && (state.unknown || state.hidden_at(site, budget)?)
+    {
         // A declaration may be missing or misplaced: neither a binding, its
         // absence nor a constant value is proven. Defines do not depend on it.
         budget.charge(1, 0, 0)?;

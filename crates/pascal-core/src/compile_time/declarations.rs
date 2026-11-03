@@ -42,6 +42,16 @@ enum ScopeKind {
 pub(super) struct Scope {
     pub(super) parent: Option<ScopeId>,
     kind: ScopeKind,
+    /// Some declarations of this statement scope were not admitted. Only
+    /// queries from inside it can be affected; they are never proven.
+    opaque: bool,
+}
+#[derive(Clone, Copy, Debug, Hash)]
+struct AnonymousHeader {
+    /// Paren depth at the method keyword: deeper ones are its parameters.
+    parens: usize,
+    /// Its own local declarations have started.
+    locals: bool,
 }
 #[derive(Clone, Debug, Hash)]
 struct Span {
@@ -83,9 +93,9 @@ pub struct CompileTimeState {
     implementation: bool,
     finished: bool,
     root_ended: bool,
-    /// Paren depth at the keyword of an anonymous method whose `begin` has
-    /// not been seen yet. Its parameters and result are not declarations.
-    anonymous_header: Option<usize>,
+    /// An anonymous method whose `begin` has not been seen yet. Its
+    /// parameters, result and locals are not admitted.
+    anonymous_header: Option<AnonymousHeader>,
     pub(super) failure: Option<IncompleteReason>,
     pub(super) unknown: bool,
     /// Independent reachable continuations; never a synthesized graph.
@@ -197,6 +207,7 @@ impl CompileTimeState {
             scopes: vec![Scope {
                 parent: None,
                 kind: ScopeKind::Root,
+                opaque: false,
             }],
             stack: vec![ScopeId(0)],
             declarations: Vec::new(),
@@ -506,13 +517,13 @@ impl CompileTimeState {
         }
         self.flush_word(budget)?;
         if ch == ';'
-            && self
-                .anonymous_header
-                .is_some_and(|parens| self.parens <= parens)
+            && let Some(header) = self.anonymous_header
+            && self.parens <= header.parens
+            && !header.locals
         {
-            // Not an anonymous method header after all (`reference to
-            // procedure;`), or its local declarations: frame what follows.
+            // Not an anonymous method after all (`reference to procedure;`).
             self.anonymous_header = None;
+            self.stack.pop();
         }
         if ch == ';' && self.pending_class {
             // A bare composite header is retained as unsupported, not treated
@@ -560,6 +571,7 @@ impl CompileTimeState {
         self.scopes.push(Scope {
             parent: self.stack.last().copied(),
             kind,
+            opaque: false,
         });
         self.stack.push(id);
         self.section = Section::None;
@@ -568,6 +580,41 @@ impl CompileTimeState {
 
     fn scope_kind(&self) -> ScopeKind {
         self.scopes[self.site().scope.0 as usize].kind
+    }
+
+    /// A declaration of the current scope is not admitted. In a statement
+    /// or anonymous method scope only queries from inside it can see it.
+    fn hide_scope_declarations(&mut self) {
+        let scope = self.site().scope.0 as usize;
+        if matches!(
+            self.scopes[scope].kind,
+            ScopeKind::Body | ScopeKind::Block | ScopeKind::Routine
+        ) && scope != 0
+        {
+            self.scopes[scope].opaque = true;
+        } else {
+            self.unknown = true;
+        }
+    }
+
+    /// Whether a query from `site` may miss a declaration of an opaque scope.
+    pub(super) fn hidden_at(
+        &self,
+        site: &BindingSite,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        let mut scope = Some(site.scope);
+        while let Some(id) = scope {
+            budget.charge(1, 0, 0)?;
+            let Some(entry) = self.scopes.get(id.0 as usize) else {
+                return Ok(true);
+            };
+            if entry.opaque {
+                return Ok(true);
+            }
+            scope = entry.parent;
+        }
+        Ok(false)
     }
 
     fn flush_word(&mut self, budget: &mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason> {
@@ -594,37 +641,62 @@ impl CompileTimeState {
             self.unknown = true;
             return Ok(());
         }
+        if let Some(header) = self.anonymous_header {
+            match word {
+                "begin" => self.anonymous_header = None,
+                "end" => {
+                    // Not an anonymous method after all.
+                    self.anonymous_header = None;
+                    self.stack.pop();
+                }
+                // Inside its parentheses `const`/`var` are parameter
+                // modifiers. Outside them they open its local declarations,
+                // hidden by its own (opaque) scope.
+                "var" | "const" | "type" | "threadvar" | "resourcestring" | "label"
+                    if self.parens == header.parens =>
+                {
+                    self.anonymous_header = Some(AnonymousHeader {
+                        locals: true,
+                        ..header
+                    });
+                    self.hide_scope_declarations();
+                    return Ok(());
+                }
+                // A local routine of an anonymous method is not framed.
+                "procedure" | "function" if header.locals => {
+                    self.unknown = true;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
         let in_statements = matches!(self.scope_kind(), ScopeKind::Body | ScopeKind::Block);
         if in_statements && matches!(word, "procedure" | "function") {
             // Statements contain no routine declarations: this is an
-            // anonymous method. Only its begin..end is framed, as a block.
+            // anonymous method. It is framed as a routine of its own.
             if self.section != Section::None {
                 // An inline declaration initialized by an anonymous method
-                // is not admitted; its name may be missing.
-                self.unknown = true;
+                // is not admitted.
+                self.hide_scope_declarations();
                 self.section = Section::None;
                 self.rhs = false;
             }
-            self.anonymous_header = Some(self.parens);
+            self.push_scope(ScopeKind::Routine, budget)?;
+            self.anonymous_header = Some(AnonymousHeader {
+                parens: self.parens,
+                locals: false,
+            });
             return Ok(());
         }
-        if let Some(parens) = self.anonymous_header {
-            if !matches!(word, "begin" | "end") {
-                // Inside its parentheses `const`/`var` are parameter
-                // modifiers. Outside them they open the method's own local
-                // declarations, which are not admitted: a query inside the
-                // method must not prove their absence.
-                if self.parens == parens
-                    && matches!(
-                        word,
-                        "var" | "const" | "type" | "threadvar" | "resourcestring"
-                    )
-                {
-                    self.unknown = true;
-                }
-                return Ok(());
-            }
-            self.anonymous_header = None;
+        if in_statements
+            && self.parens > 0
+            && matches!(word, "var" | "const")
+            && self.section == Section::None
+        {
+            // An inline declaration inside an argument (an anonymous method
+            // body) never reaches a top-level `;`: it is not admitted.
+            self.hide_scope_declarations();
+            return Ok(());
         }
         if matches!(
             self.section,
@@ -802,6 +874,10 @@ impl CompileTimeState {
             Section::Routine => ("unit T; interface ", " implementation end.", "declProc"),
             Section::None => return Ok(()),
         };
+        // An inline declaration is one statement; the next one is not part
+        // of a declaration section.
+        let inline = matches!(self.scope_kind(), ScopeKind::Body | ScopeKind::Block)
+            && matches!(self.section, Section::Vars | Section::Consts);
         let len = prefix
             .len()
             .checked_add(self.pending.len())
@@ -827,7 +903,7 @@ impl CompileTimeState {
                 .ok_or(IncompleteReason::MalformedSource)?;
             let valid = !tree.root_node().has_error();
             let Some(decl) = find_node(tree.root_node(), kind, budget)? else {
-                self.unknown = true;
+                self.hide_scope_declarations();
                 return Ok(());
             };
             if self.section == Section::Imports {
@@ -865,6 +941,9 @@ impl CompileTimeState {
             Ok(())
         });
         drop(source);
+        if inline {
+            self.section = Section::None;
+        }
         result
     }
 

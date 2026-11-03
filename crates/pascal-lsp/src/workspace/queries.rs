@@ -1804,6 +1804,31 @@ fn read_only_reference_coverage(
         coverage.note(Some(owner), "include expansion is incomplete for the unit");
         withheld.insert(owner.clone());
     }
+    // An indexed snapshot audits its candidates relaxed (l4d-jeh4): a
+    // candidate whose include audit failed is withheld. A gap naming no
+    // unit withholds every unit with an include directive.
+    let dependency_gaps = &snapshot.dependency_coverage;
+    let mut unattributed = dependency_gaps.omitted > 0;
+    for gap in &dependency_gaps.gaps {
+        coverage.note(gap.uri.as_ref(), gap.reason.as_str());
+        match &gap.uri {
+            Some(owner) => {
+                withheld.insert(owner.clone());
+            }
+            None => unattributed = true,
+        }
+    }
+    if unattributed {
+        withheld.extend(
+            snapshot
+                .sources
+                .iter()
+                .filter(|(_, source)| {
+                    super::rename::may_contain_include_directive(source.as_bytes())
+                })
+                .map(|(owner, _)| owner.clone()),
+        );
+    }
     // Include files are reported under their own URIs; a withheld owner
     // withholds what it includes.
     let included = withheld
@@ -3998,6 +4023,77 @@ mod tests {
         let edit = rename.value.expect("rename walks the whole workspace");
         let changes = edit.changes.expect("plain changes");
         assert_eq!(changes.len(), 21, "{:?}", changes.keys());
+    }
+
+    /// l4d-jeh4: a candidate unit whose include expansion hits a resolver
+    /// limit is a coverage gap of the references answer, not its failure;
+    /// rename still refuses.
+    #[test]
+    fn a_candidate_whose_expansion_fails_is_a_reference_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        let failing = root.join("Failing.pas");
+        fs::write(
+            &failing,
+            "unit Failing;\ninterface\nuses Shared;\nimplementation\n{$I Extra.inc}\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("failing");
+        fs::write(root.join("Extra.inc"), "const ExtraValue = 2;\n").expect("include");
+        let other = root.join("Other.pas");
+        fs::write(
+            &other,
+            "unit Other;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("other");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::compile_time::test_fail_expansion_of(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::compile_time::test_fail_expansion_of(Some("/Failing.pas"));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input.clone(),
+            &source_uri(&shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&failing))
+                    && gap.reason.contains("resolver limit")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![(source_uri(&other), 6, 6), (source_uri(&shared), 2, 6)]
+        );
+        let rename = crate::workspace::rename::rename_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        assert!(rename.value.is_err(), "{:?}", rename.value);
     }
 
     #[test]

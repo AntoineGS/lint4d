@@ -7246,7 +7246,9 @@ fn build_snapshot_with_policy(
         }
         let include_audit = audit_includes(IncludeAuditor {
             requested: &requested,
-            best_effort,
+            // Only read-only references build an indexed snapshot here: a
+            // candidate whose audit fails is their coverage gap (l4d-jeh4).
+            best_effort: best_effort || indexed,
             current_owner: None,
             input,
             sources: &sources,

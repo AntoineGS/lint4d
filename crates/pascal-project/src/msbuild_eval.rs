@@ -425,10 +425,12 @@ impl ProjectBuilder {
                 &self.property_provenance_ranges,
                 &self.property_default_provenances,
                 &self.unknown_properties,
+                self.unknown_import_taint,
                 &mut self.warnings,
                 source_file,
                 source_provenance,
             );
+            self.incomplete |= value.environment_property_unknown;
             let trimmed = value.value.trim();
             let trim_start = value.value.len() - value.value.trim_start().len();
             let configured_ranges =
@@ -638,6 +640,7 @@ impl ProjectBuilder {
             &self.property_provenance_ranges,
             &self.property_default_provenances,
             &self.unknown_properties,
+            self.unknown_import_taint,
             &mut self.warnings,
             source_file,
             source_provenance,
@@ -1164,6 +1167,10 @@ pub(super) struct ExpandedValue {
     pub(super) explicit_dependency: bool,
     pub(super) configured_ranges: Vec<Range<usize>>,
     pub(super) provenance_ranges: Vec<ProvenanceRange>,
+    /// A property the build environment always provides (see
+    /// [`is_environment_provided_property`]) is undefined here, so the value
+    /// is unknowable and the project context is incomplete.
+    pub(super) environment_property_unknown: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1176,12 +1183,14 @@ pub(super) fn expand_value(
     property_provenance_ranges: &HashMap<String, Vec<ProvenanceRange>>,
     property_default_provenances: &HashMap<String, ProjectPathProvenance>,
     unknown_properties: &HashSet<String>,
+    unknown_import_taint: bool,
     warnings: &mut Vec<String>,
     source_file: &Path,
     source_provenance: &ProjectPathProvenance,
 ) -> ExpandedValue {
     let mut expanded = String::new();
     let mut unknown = false;
+    let mut environment_property_unknown = false;
     let mut explicit_dependency = false;
     let mut configured_ranges = Vec::new();
     let mut provenance_ranges = Vec::new();
@@ -1202,6 +1211,7 @@ pub(super) fn expand_value(
                 explicit_dependency,
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
+                environment_property_unknown,
             };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
@@ -1215,6 +1225,7 @@ pub(super) fn expand_value(
                 explicit_dependency,
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
+                environment_property_unknown,
             };
         };
         let end = start + 2 + relative_end;
@@ -1243,6 +1254,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    environment_property_unknown,
                 };
             }
         } else if let Some(replacement) = properties.get(&key) {
@@ -1254,6 +1266,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    environment_property_unknown,
                 };
             }
             let replacement_end = expanded.len();
@@ -1300,12 +1313,16 @@ pub(super) fn expand_value(
             // Delphi project files commonly terminate list properties with
             // their own unset value. This is an intentional empty default.
             unknown |= unknown_properties.contains(&key);
+        } else if !unknown_import_taint && !is_environment_provided_property(name) {
+            // MSBuild expands an undefined property to the empty string.
+            warnings.push(undefined_property_warning(name, source_file));
         } else {
             warnings.push(format!(
                 "unresolved property path $({name}) in {}",
                 source_file.display()
             ));
             unknown = true;
+            environment_property_unknown = true;
             if !append_expansion(
                 &mut expanded,
                 &UNRESOLVED_MARKER.to_string(),
@@ -1318,6 +1335,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    environment_property_unknown,
                 };
             }
         }
@@ -1337,6 +1355,7 @@ pub(super) fn expand_value(
             explicit_dependency,
             configured_ranges: Vec::new(),
             provenance_ranges: Vec::new(),
+            environment_property_unknown,
         };
     }
     ExpandedValue {
@@ -1345,7 +1364,89 @@ pub(super) fn expand_value(
         explicit_dependency,
         configured_ranges,
         provenance_ranges,
+        environment_property_unknown,
     }
+}
+
+fn undefined_property_warning(name: &str, source_file: &Path) -> String {
+    format!(
+        "undefined property $({name}) in {} was taken as empty (MSBuild default)",
+        source_file.display()
+    )
+}
+
+/// Properties that MSBuild, the Delphi targets, the IDE or Windows always
+/// define in a real build. An undefined one here means the build environment
+/// was not captured (configure it under `[properties]`), not that it is
+/// empty, so it stays unknown instead of taking the MSBuild empty default.
+pub(super) fn is_environment_provided_property(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    // MSBuild reserved and well-known properties.
+    if name.starts_with("msbuild") {
+        return true;
+    }
+    matches!(
+        name.as_str(),
+        // IDE and rsvars.bat environment of a Delphi installation.
+        "bds"
+            | "bdsbin"
+            | "bdsinclude"
+            | "bdslib"
+            | "bdscommondir"
+            | "bdsuserdir"
+            | "bdsappdatabasedir"
+            | "bdsplatformsdksdir"
+            | "bdsprojectsdir"
+            | "bdscatalogrepository"
+            | "bdscatalogrepositoryallusers"
+            | "appdata"
+            | "delphi"
+            | "productversion"
+            | "ibredistdir"
+            | "frameworkdir"
+            | "frameworkversion"
+            | "frameworksdkdir"
+            // Defined by the MSBuild common and Delphi targets.
+            | "targetname"
+            | "targetext"
+            | "targetfilename"
+            | "targetpath"
+            | "targetdir"
+            | "outdir"
+            | "outputpath"
+            | "projectdir"
+            | "projectname"
+            | "projectpath"
+            | "projectfilename"
+            | "projectext"
+            // Always set in a Windows process environment.
+            | "allusersprofile"
+            | "commonprogramfiles"
+            | "commonprogramfiles(x86)"
+            | "commonprogramw6432"
+            | "computername"
+            | "homedrive"
+            | "homepath"
+            | "localappdata"
+            | "number_of_processors"
+            | "os"
+            | "path"
+            | "pathext"
+            | "processor_architecture"
+            | "programdata"
+            | "programfiles"
+            | "programfiles(x86)"
+            | "programw6432"
+            | "public"
+            | "systemdrive"
+            | "systemroot"
+            | "temp"
+            | "tmp"
+            | "userdomain"
+            | "username"
+            | "userprofile"
+            | "windir"
+    )
 }
 
 fn append_expansion(
@@ -1456,7 +1557,12 @@ fn expand_condition_value(
             }
             missing |= replacement.contains(UNRESOLVED_MARKER)
                 || unknown_properties.contains(&name.to_ascii_lowercase());
-        } else if unknown_import_taint || !is_known_project_local_configuration_property(name) {
+        } else if !unknown_import_taint && !is_environment_provided_property(name) {
+            // MSBuild compares an undefined property as the empty string.
+            if !is_known_project_local_configuration_property(name) {
+                warnings.push(undefined_property_warning(name, source_file));
+            }
+        } else {
             missing = true;
             if !append_expansion(
                 &mut expanded,

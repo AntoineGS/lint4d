@@ -1521,7 +1521,7 @@ fn unresolved_condition_paths_are_unknown_and_never_guessed() {
         root.join("App.dproj").as_path(),
         r#"<Project>
   <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
-  <PropertyGroup Condition="Exists('$(Unavailable)units')"><DCC_Define>GUESSED</DCC_Define></PropertyGroup>
+  <PropertyGroup Condition="Exists('$(BDSPROJECTSDIR)units')"><DCC_Define>GUESSED</DCC_Define></PropertyGroup>
 </Project>"#,
     );
 

@@ -269,6 +269,7 @@ fn parse_dproj_package_metadata(
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
             &builder.unknown_properties,
+            builder.unknown_import_taint,
             &mut metadata.warnings,
             &reference.source_file,
             &reference.source_provenance,

@@ -843,7 +843,7 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
 
     write(
         &project,
-        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project="conditional.props" Condition="'$(UnknownProperty)'=='enabled'" /></Project>"#,
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project="conditional.props" Condition="'$(BDSPROJECTSDIR)'=='enabled'" /></Project>"#,
     );
     write(
         &project_dir.join("conditional.props"),

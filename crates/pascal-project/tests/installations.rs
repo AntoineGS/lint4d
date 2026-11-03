@@ -933,7 +933,7 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
     write(
         &project,
         r#"<Project><PropertyGroup>
-          <CompilerVersion Condition="'$(UNKNOWN_PROPERTY)' == 'x'">24.0</CompilerVersion>
+          <CompilerVersion Condition="'$(BDSPROJECTSDIR)' == 'x'">24.0</CompilerVersion>
           <MainSource>App.dpr</MainSource>
         </PropertyGroup></Project>"#,
     );

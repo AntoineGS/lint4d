@@ -18,7 +18,8 @@ use super::rename::{
     CANCELLATION_MESSAGE, is_safe_source_path, path_key, snapshot_context_for_uri,
 };
 use super::{
-    ContextKey, Workspace, absolute_path, check_workspace_cancel, path_stamp, path_starts_with_ci,
+    ContextKey, PathStamp, Workspace, absolute_path, check_workspace_cancel, path_stamp,
+    path_stamp_from_project_read, path_starts_with_ci,
 };
 use crate::catalogue::{Catalogue, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
@@ -53,7 +54,16 @@ pub(crate) struct IndexProgress {
     /// Members still `Unindexed` or `Stale` after the batch.
     pub(crate) pending: usize,
     pub(crate) generation: u64,
+    /// No closed member is pending and the share has room.
     pub(crate) complete: bool,
+    /// Pending members open in the editor: never published, always candidates
+    /// of a query (A4), so they do not hold `complete` back.
+    pub(crate) skipped_open: usize,
+    /// Members left pending because their load failed for a reason that may
+    /// pass (a source cache limit, a missing context). A batch with
+    /// `deferred > 0` and no `indexed`, `refreshed` or `refused` made no
+    /// progress: the caller must not requeue it in a loop.
+    pub(crate) deferred: usize,
     /// The batch stopped because the index share has no room left; asking
     /// again cannot help until memory is released.
     pub(crate) memory: bool,
@@ -79,8 +89,24 @@ fn is_unit_source(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
 }
 
+#[cfg(test)]
+type LoadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_LOAD: std::cell::RefCell<Option<LoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_after_load_hook(hook: Option<LoadHook>) {
+    AFTER_LOAD.with(|slot| *slot.borrow_mut() = hook);
+}
+
 enum MemberOutcome {
     Published,
+    /// The load failed for a reason that may pass: still pending.
+    Deferred,
     Refused,
     /// Not a member any more, or an unsaved buffer: nothing to publish.
     Skipped,
@@ -122,9 +148,9 @@ impl Workspace {
         before_io: &mut dyn FnMut() -> Result<(), String>,
         cancel: &AtomicBool,
     ) -> Result<IndexProgress, String> {
-        let previous = std::mem::replace(&mut self.retain_units, false);
+        let previous = std::mem::replace(&mut self.index_build, true);
         let result = self.advance_index_batch(anchor, bound, before_io, cancel);
-        self.retain_units = previous;
+        self.index_build = previous;
         self.pinned_context = None;
         result
     }
@@ -148,13 +174,25 @@ impl Workspace {
             pending: 0,
             generation: 0,
             complete: false,
+            skipped_open: 0,
+            deferred: 0,
             memory: false,
         };
+        // Open members are skipped, so ask for enough to fill the bound.
+        let wanted = bound.units.saturating_add(self.open_documents.len());
         let pending = self
             .project_cache
-            .read_index(&key, |index, _| index.pending(bound.units))
+            .read_index(&key, |index, _| index.pending(wanted))
             .unwrap_or_default();
+        let mut taken = 0;
         for path in pending {
+            if taken >= bound.units {
+                break;
+            }
+            if self.is_open_member(&path) {
+                continue;
+            }
+            taken += 1;
             // The stamp precedes the bytes it describes (A7); `before_io`
             // runs between them.
             let own_stamp = path_stamp(&path);
@@ -172,6 +210,7 @@ impl Workspace {
                 MemberOutcome::Published => progress.indexed += 1,
                 MemberOutcome::Refused => progress.refused += 1,
                 MemberOutcome::Skipped => {}
+                MemberOutcome::Deferred => progress.deferred += 1,
                 MemberOutcome::Memory => {
                     progress.memory = true;
                     break;
@@ -179,16 +218,32 @@ impl Workspace {
             }
         }
         self.ensure_index_membership(&key, anchor, cancel)?;
-        let (pending, generation) = self
+        let (all_pending, generation) = self
             .project_cache
             .read_index(&key, |index, _| {
-                (index.pending(usize::MAX).len(), index.generation())
+                (index.pending(usize::MAX), index.generation())
             })
             .unwrap_or_default();
-        progress.pending = pending;
+        let open = all_pending
+            .iter()
+            .filter(|path| self.is_open_member(path))
+            .count();
+        progress.pending = all_pending.len() - open;
+        progress.skipped_open = open;
         progress.generation = generation;
-        progress.complete = pending == 0 && !progress.memory;
+        progress.complete = progress.pending == 0 && !progress.memory;
         Ok(progress)
+    }
+
+    /// An open document (rejected ones included) is answered from the
+    /// editor's buffer, never from the index.
+    fn is_open_member(&self, path: &Path) -> bool {
+        Url::from_file_path(path).is_ok_and(|uri| {
+            self.open_documents.contains_key(&uri)
+                || self
+                    .open_documents
+                    .contains_key(&super::canonical_file_uri(&uri))
+        })
     }
 
     fn ensure_index_membership(
@@ -268,24 +323,48 @@ impl Workspace {
         let held = self.index.contains(&uri);
         self.load_refusal = None;
         let loaded = self.load_source_with_cancel(&uri, key, &HashSet::new(), Some(cancel));
+        #[cfg(test)]
+        if let Some(mut hook) = AFTER_LOAD.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+            AFTER_LOAD.with(|slot| *slot.borrow_mut() = Some(hook));
+        }
         let outcome = match loaded {
             Err(error) if is_stable_load_refusal(&error) => {
-                Ok(self.refuse_member(key, path, error))
+                Ok(self.refuse_unless_vanished(key, path, error))
             }
             Err(error) => Err(error),
-            Ok(false) => {
-                let reason = self
-                    .load_refusal
-                    .take()
-                    .unwrap_or_else(|| "the document could not be loaded".to_owned());
-                Ok(self.refuse_member(key, path, reason))
-            }
+            Ok(false) => match self.load_refusal.take() {
+                Some(reason) if is_stable_load_refusal(&reason) => {
+                    Ok(self.refuse_unless_vanished(key, path, reason))
+                }
+                // No stable reason: the member stays pending (a file that
+                // vanished is relisted by the membership instead).
+                _ if path_stamp(path).is_none() => {
+                    self.project_cache.invalidate_path(path);
+                    Ok(MemberOutcome::Skipped)
+                }
+                _ => Ok(MemberOutcome::Deferred),
+            },
             Ok(true) => self.publish_member(key, path, &uri, own_stamp, cancel),
         };
         if !held {
             let _ = self.remove_indexed_with_control(&uri, None, None, false);
         }
         outcome
+    }
+
+    /// A file that is gone is not a refusal: its directory listing changed.
+    fn refuse_unless_vanished(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        reason: String,
+    ) -> MemberOutcome {
+        if path_stamp(path).is_none() {
+            self.project_cache.invalidate_path(path);
+            return MemberOutcome::Skipped;
+        }
+        self.refuse_member(key, path, reason)
     }
 
     fn publish_member(
@@ -321,9 +400,27 @@ impl Workspace {
             path: path.to_path_buf(),
             stamp: Some(own_stamp),
         }];
+        // The include stamps are the ones the load observed when it read the
+        // include (A7); a stat now could describe newer bytes.
+        let observed: HashMap<String, PathStamp> = self
+            .expansions
+            .get(uri)
+            .map(|record| {
+                record
+                    .include_observations
+                    .iter()
+                    .filter_map(|observation| {
+                        Some((
+                            path_key(&absolute_path(observation.path.clone())),
+                            path_stamp_from_project_read(observation.stamp.as_ref()?),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         stamps.extend(slots.iter().skip(1).flatten().map(|slot| MemberStamp {
             path: slot.clone(),
-            stamp: path_stamp(slot),
+            stamp: observed.get(&path_key(slot)).cloned(),
         }));
         let member = MemberFacts::from_facts(path, &facts.extracted.facts, slots);
         let hash = facts.root_content_hash.unwrap_or(0);
@@ -1003,7 +1100,7 @@ mod tests {
         for path in members(&workspace, &key) {
             assert_eq!(state(&workspace, &key, &path), Some(MemberState::Fresh));
         }
-        assert!(workspace.retain_units);
+        assert!(!workspace.index_build);
     }
 
     #[test]
@@ -1026,7 +1123,7 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
-        assert!(workspace.retain_units);
+        assert!(!workspace.index_build);
         let all = members(&workspace, &key);
         let states: Vec<_> = all
             .iter()
@@ -1305,13 +1402,143 @@ mod tests {
         assert!(!progress.complete);
         assert!(progress.pending > 0);
         assert!(progress.indexed > 0);
-        assert!(workspace.retain_units);
+        assert!(!workspace.index_build);
         assert!(
             workspace
                 .project_cache
                 .read_index(&key, |index, _| index.coverage().fresh > 0)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn an_include_stamp_is_the_one_the_load_observed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let include = root.join("lib/x.inc");
+        let original = "procedure FromInclude;\n";
+        write(&include, original);
+        write(
+            &root.join("lib/A.pas"),
+            "unit A;\ninterface\n{$I x.inc}\nimplementation\nprocedure FromInclude;\nbegin\nend;\nend.\n",
+        );
+        let (mut workspace, key, anchor) = indexed_project(root, 2, WorkspaceOptions::default());
+        let rewritten = include.clone();
+        set_after_load_hook(Some(Box::new(move |loaded| {
+            if loaded.ends_with("A.pas") {
+                write(
+                    &rewritten,
+                    "procedure RewrittenAfterTheLoad_ThatIsLonger;\n",
+                );
+            }
+        })));
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        set_after_load_hook(None);
+        assert_eq!(progress.indexed, members(&workspace, &key).len());
+        let member = root.join("lib/A.pas");
+        let stored = workspace
+            .project_cache
+            .read_index(&key, |index, _| index.stamps_of(&member).map(<[_]>::to_vec))
+            .flatten()
+            .expect("stamps");
+        assert_eq!(stored.len(), 2);
+        let observed = stored[1].stamp.as_ref().expect("an observed stamp");
+        assert_eq!(observed.bytes, original.len() as u64);
+        let current = crate::workspace::path_stamp(&include).expect("current");
+        assert!(!observed.proves_unchanged(&current));
+    }
+
+    #[test]
+    fn a_load_that_cannot_retain_leaves_the_member_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_total_bytes = 10;
+        let (mut workspace, key, anchor) = indexed_project(root, 3, options);
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!((progress.indexed, progress.refused), (0, 0));
+        assert!(progress.deferred > 0);
+        assert_eq!(progress.pending, members(&workspace, &key).len());
+        assert!(!progress.complete);
+        for path in members(&workspace, &key) {
+            assert_eq!(state(&workspace, &key, &path), Some(MemberState::Unindexed));
+        }
+    }
+
+    #[test]
+    fn open_members_are_skipped_and_do_not_hold_the_index_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 4, WorkspaceOptions::default());
+        let open = root.join("lib/U1.pas");
+        let uri = Url::from_file_path(&open).unwrap();
+        workspace
+            .open_document(
+                uri,
+                "unit U1; interface implementation end.\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(progress.skipped_open, 1);
+        assert_eq!(progress.indexed, members(&workspace, &key).len() - 1);
+        assert_eq!(progress.pending, 0);
+        assert!(progress.complete);
+        assert_eq!(state(&workspace, &key, &open), Some(MemberState::Unindexed));
+    }
+
+    #[test]
+    fn a_rejected_open_document_is_skipped_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (mut workspace, key, anchor) = indexed_project(root, 4, options);
+        let open = root.join("lib/U1.pas");
+        let uri = Url::from_file_path(&open).unwrap();
+        let oversized = format!(
+            "unit U1; {}\ninterface implementation end.\n",
+            " ".repeat(400)
+        );
+        workspace.open_document(uri.clone(), oversized, 1).unwrap();
+        assert!(workspace.open_documents[&uri].rejection.is_some());
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(progress.skipped_open, 1);
+        assert_eq!(progress.indexed, members(&workspace, &key).len() - 1);
+        assert!(progress.complete);
+    }
+
+    #[test]
+    fn a_file_that_vanishes_before_its_read_is_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 3, WorkspaceOptions::default());
+        let doomed = root.join("lib/U1.pas");
+        let removed = doomed.clone();
+        let mut calls = 0;
+        let progress = workspace
+            .advance_workspace_index(
+                &anchor,
+                IndexBound::all(),
+                &mut || {
+                    calls += 1;
+                    // Members run in path order: App.dpr, U0, then U1.
+                    if calls == 3 {
+                        fs::remove_file(&removed).unwrap();
+                    }
+                    Ok(())
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(progress.refused, 0);
+        assert!(!matches!(
+            state(&workspace, &key, &doomed),
+            Some(MemberState::Refused(_))
+        ));
+        let again = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(state(&workspace, &key, &doomed), None);
+        assert!(again.complete);
     }
 
     #[test]

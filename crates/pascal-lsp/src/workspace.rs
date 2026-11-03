@@ -2934,10 +2934,9 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
-    /// `false` in an index build view: loads then drop their cache claim
-    /// instead of publishing the parse (l4d-33 A13). `Default` is `false`,
-    /// so every constructor sets it.
-    pub(crate) retain_units: bool,
+    /// `true` in an index build view: loads then drop their cache claim
+    /// instead of publishing the parse (l4d-33 A13).
+    pub(crate) index_build: bool,
     /// The context an index build is working in: no prune drops it.
     pinned_context: Option<ContextKey>,
     /// The read error of the last closed-source load that skipped its file.
@@ -3353,7 +3352,6 @@ impl Workspace {
             options,
             overrides,
             roots,
-            retain_units: true,
             ..Self::default()
         };
         workspace
@@ -3522,7 +3520,6 @@ impl Workspace {
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
-            retain_units: true,
             ..Self::default()
         }
     }
@@ -7915,10 +7912,12 @@ impl Workspace {
                 provenance: ProjectPathProvenance::LegacyNative,
             },
             None => {
-                self.warn(format!(
+                let message = format!(
                     "source path is outside the effective project read roots: {}",
                     path.display()
-                ));
+                );
+                self.warn(message.clone());
+                self.load_refusal = Some(message);
                 return Ok(false);
             }
         };
@@ -7943,10 +7942,12 @@ impl Workspace {
             )
         };
         if !readable {
-            self.warn(format!(
+            let message = format!(
                 "source path is outside the effective project read roots: {}",
                 path.display()
-            ));
+            );
+            self.warn(message.clone());
+            self.load_refusal = Some(message);
             return Ok(false);
         }
 
@@ -8184,7 +8185,7 @@ impl Workspace {
             }
             None => (None, None),
         };
-        let claim = claim.filter(|_| self.retain_units);
+        let claim = claim.filter(|_| !self.index_build);
         let expansion = if let Some(expansion) =
             cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
         {

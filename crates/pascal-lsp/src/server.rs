@@ -1008,6 +1008,38 @@ impl AnalysisPriority {
     }
 }
 
+/// Which queued work a worker may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerAdmission {
+    interactive_only: bool,
+    diagnostics: bool,
+}
+
+/// Whether a worker may start with `interactive` interactive and `general`
+/// other jobs running, `paused` of which are diagnostics paused for
+/// interactive work. A paused job uses no CPU, so its slot is lent to client
+/// requests (never to another diagnostics job, which would pause in turn).
+fn worker_admission(interactive: usize, general: usize, paused: usize) -> Option<WorkerAdmission> {
+    let paused = paused.min(general);
+    if general < MAX_GENERAL_ANALYSIS_JOBS && interactive + general < MAX_ANALYSIS_JOBS {
+        return Some(WorkerAdmission {
+            interactive_only: false,
+            diagnostics: true,
+        });
+    }
+    let active = general - paused;
+    if active < MAX_GENERAL_ANALYSIS_JOBS && interactive + active < MAX_ANALYSIS_JOBS {
+        return Some(WorkerAdmission {
+            interactive_only: false,
+            diagnostics: false,
+        });
+    }
+    (interactive + active < MAX_ANALYSIS_JOBS).then_some(WorkerAdmission {
+        interactive_only: true,
+        diagnostics: false,
+    })
+}
+
 /// A small weighted priority queue used by the analysis dispatcher.
 ///
 /// Each priority is FIFO. Interactive requests are preferred, but after a
@@ -1066,13 +1098,20 @@ impl<T> PriorityQueue<T> {
     }
 
     fn pop_for_worker(&mut self, interactive_only: bool) -> Option<T> {
-        let lower_pending = !self.diagnostics.is_empty() || !self.bulk.is_empty();
+        self.pop_for_worker_with(interactive_only, true)
+    }
+
+    /// `pop_for_worker`, leaving queued diagnostics in place unless
+    /// `diagnostics` is set.
+    fn pop_for_worker_with(&mut self, interactive_only: bool, diagnostics: bool) -> Option<T> {
+        let diagnostics_pending = diagnostics && !self.diagnostics.is_empty();
+        let lower_pending = diagnostics_pending || !self.bulk.is_empty();
         let priority = if interactive_only
             || !self.interactive.is_empty()
                 && (!lower_pending || self.interactive_burst < MAX_INTERACTIVE_BURST)
         {
             AnalysisPriority::Interactive
-        } else if !self.diagnostics.is_empty()
+        } else if diagnostics_pending
             && (self.bulk.is_empty() || self.diagnostic_burst < MAX_DIAGNOSTIC_BURST)
         {
             AnalysisPriority::Diagnostics
@@ -5164,6 +5203,12 @@ impl AnalysisJobs {
             })
             .count();
         self.interactive_gate.set(running + queued);
+        self.interactive_gate.set_waiting_clients(
+            self.queue
+                .iter()
+                .filter(|queued| matches!(queued, QueuedAnalysis::Client(_)))
+                .count(),
+        );
     }
 
     fn fence_automatic_answers_for_scope(&mut self, scope_uri: &Url) {
@@ -5582,8 +5627,10 @@ impl AnalysisJobs {
                     },
                 );
                 // Diagnostics walk whole import closures; they pause between
-                // units while interactive requests run or wait, so that they
-                // only go on at a fraction of their speed meanwhile.
+                // units while interactive requests run or wait, or other
+                // client requests wait for a worker (lending them their
+                // slot), so that they go on at a fraction of their speed
+                // meanwhile.
                 crate::warmer::set_background_gate_on_this_thread(
                     (priority == AnalysisPriority::Diagnostics)
                         .then_some((interactive_gate, crate::warmer::BACKGROUND_PAUSE_LIMIT)),
@@ -7690,19 +7737,28 @@ impl AnalysisJobs {
             self.publish_interactive_load();
             return failures;
         }
-        while self.pending.len().saturating_add(self.diagnostics.len()) < MAX_ANALYSIS_JOBS {
+        loop {
             // Any running interactive job can occupy the reserved slot. This
             // also lets the general slots be refilled as jobs finish in any
             // order, without pinning a particular thread to a slot forever.
-            let general_jobs = self.diagnostics.len()
-                + self
-                    .pending
-                    .values()
-                    .filter(|job| job.priority != AnalysisPriority::Interactive)
-                    .count();
+            let interactive_jobs = self
+                .pending
+                .values()
+                .filter(|job| job.priority == AnalysisPriority::Interactive)
+                .count();
+            let general_jobs = self.diagnostics.len() + (self.pending.len() - interactive_jobs);
+            let Some(admission) = worker_admission(
+                interactive_jobs,
+                general_jobs,
+                self.interactive_gate
+                    .paused_background()
+                    .min(self.diagnostics.len()),
+            ) else {
+                break;
+            };
             let Some(queued) = self
                 .queue
-                .pop_for_worker(general_jobs >= MAX_GENERAL_ANALYSIS_JOBS)
+                .pop_for_worker_with(admission.interactive_only, admission.diagnostics)
             else {
                 break;
             };
@@ -18885,6 +18941,42 @@ mod tests {
         assert_eq!(queue.pop_for_worker(true), None);
         assert_eq!(queue.pop(), Some("diagnostic"));
         assert_eq!(queue.pop(), Some("bulk"));
+    }
+
+    #[test]
+    fn paused_diagnostics_lend_their_slots_to_client_requests_only() {
+        let any = |interactive_only| {
+            Some(super::WorkerAdmission {
+                interactive_only,
+                diagnostics: true,
+            })
+        };
+        let lent = |interactive_only| {
+            Some(super::WorkerAdmission {
+                interactive_only,
+                diagnostics: false,
+            })
+        };
+        assert_eq!(super::worker_admission(0, 1, 0), any(false));
+        assert_eq!(super::worker_admission(0, 2, 0), lent(true));
+        assert_eq!(super::worker_admission(1, 2, 0), None);
+        // The reserved slot is free, but a paused diagnostic's general slot
+        // goes to any client request.
+        assert_eq!(super::worker_admission(0, 2, 1), lent(false));
+        // Two diagnostics hold the general slots and an interactive request
+        // the reserved one: a paused diagnostic lends its slot.
+        assert_eq!(super::worker_admission(1, 2, 1), lent(false));
+        assert_eq!(super::worker_admission(1, 3, 1), None);
+        assert_eq!(super::worker_admission(1, 3, 2), lent(false));
+        assert_eq!(super::worker_admission(0, 3, 1), lent(true));
+        assert_eq!(super::worker_admission(1, 2, 5), lent(false));
+
+        let mut queue = PriorityQueue::new();
+        queue.push(AnalysisPriority::Diagnostics, "diagnostic");
+        queue.push(AnalysisPriority::Bulk, "symbols");
+        assert_eq!(queue.pop_for_worker_with(false, false), Some("symbols"));
+        assert_eq!(queue.pop_for_worker_with(false, false), None);
+        assert_eq!(queue.pop_for_worker_with(false, true), Some("diagnostic"));
     }
 
     #[test]

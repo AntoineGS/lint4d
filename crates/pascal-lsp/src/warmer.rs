@@ -14,6 +14,12 @@ use crate::workspace::rename::WorkspaceInput;
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
     idle: Condvar,
+    /// Queued client requests of any priority, which wait for a worker.
+    waiting_clients: std::sync::atomic::AtomicUsize,
+    /// Background jobs paused in `yield_to_interactive_work`. Their workers
+    /// use no CPU meanwhile, so the dispatcher lends their slots to client
+    /// requests.
+    paused: std::sync::atomic::AtomicUsize,
     /// Test seam: after this many passing `try_wait_idle` checks, mark the
     /// gate busy so a pause lands at an exact unit boundary.
     #[cfg(test)]
@@ -44,12 +50,31 @@ impl InteractiveGate {
         !cancel.load(Ordering::Relaxed)
     }
 
-    /// `wait_idle` for at most `limit`: true once idle or after `limit`,
+    /// Records how many client requests wait for a worker. Background work
+    /// pauses for them as for interactive work, and lends them its slot.
+    pub(crate) fn set_waiting_clients(&self, waiting: usize) {
+        self.waiting_clients.store(waiting, Ordering::Relaxed);
+        if waiting == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    /// The number of background jobs paused for interactive work.
+    pub(crate) fn paused_background(&self) -> usize {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    fn background_may_run(&self, busy: usize) -> bool {
+        busy == 0 && self.waiting_clients.load(Ordering::Relaxed) == 0
+    }
+
+    /// Waits until no interactive request runs or waits and no client request
+    /// waits for a worker, for at most `limit`: true then or after `limit`,
     /// false if cancelled.
-    pub(crate) fn wait_idle_at_most(&self, cancel: &AtomicBool, limit: Duration) -> bool {
+    fn wait_background_turn(&self, cancel: &AtomicBool, limit: Duration) -> bool {
         let deadline = Instant::now().checked_add(limit);
         let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        while *busy > 0 {
+        while !self.background_may_run(*busy) {
             if cancel.load(Ordering::Relaxed) {
                 return false;
             }
@@ -121,19 +146,27 @@ pub(crate) fn has_background_gate_on_this_thread() -> bool {
     BACKGROUND_GATE.with(|cell| cell.borrow().is_some())
 }
 
-/// Waits while interactive requests run or are queued, up to the thread's
-/// pause limit, when the calling thread does background work and holds no
-/// cache claim (a lookup waiting for one would wait out the pause). False
-/// when cancelled.
+/// Waits while interactive requests run or are queued, or other client
+/// requests wait for a worker, up to the thread's pause limit, when the
+/// calling thread does background work and holds no cache claim (a lookup
+/// waiting for one would wait out the pause). False when cancelled.
 pub(crate) fn yield_to_interactive_work(cancel: &AtomicBool) -> bool {
     let Some((gate, limit)) = BACKGROUND_GATE.with(|cell| cell.borrow().clone()) else {
         return true;
     };
-    if crate::project_cache::claims_held_on_this_thread() > 0 || gate.try_wait_idle(cancel) {
-        return !cancel.load(Ordering::Relaxed);
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    if crate::project_cache::claims_held_on_this_thread() > 0
+        || gate.background_may_run(*gate.busy.lock().unwrap_or_else(PoisonError::into_inner))
+    {
+        return true;
     }
     let _span = crate::trace::Span::new(|| "background work paused for interactive work".into());
-    gate.wait_idle_at_most(cancel, limit)
+    gate.paused.fetch_add(1, Ordering::Relaxed);
+    let resumed = gate.wait_background_turn(cancel, limit);
+    gate.paused.fetch_sub(1, Ordering::Relaxed);
+    resumed
 }
 
 #[derive(Debug, Default)]
@@ -1364,11 +1397,45 @@ mod tests {
                 .send(yield_to_interactive_work(&AtomicBool::new(false)))
                 .unwrap();
         });
+        // The pause is reported to the dispatcher, which lends its slot.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.paused_background() == 0 {
+            assert!(Instant::now() < deadline, "the work pauses");
+            std::thread::yield_now();
+        }
+        assert!(paused_rx.try_recv().is_err(), "the work is still paused");
         gate.set(0);
         assert!(
             paused_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the work resumes once interactive work is done")
+        );
+        paused.join().unwrap();
+        assert_eq!(gate.paused_background(), 0);
+
+        // A client request waiting for a worker pauses background work too.
+        gate.set_waiting_clients(1);
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let paused_gate = gate.clone();
+        let paused = std::thread::spawn(move || {
+            set_background_gate_on_this_thread(Some((paused_gate, Duration::MAX)));
+            paused_tx
+                .send(yield_to_interactive_work(&AtomicBool::new(false)))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.paused_background() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the work pauses for a waiting request"
+            );
+            std::thread::yield_now();
+        }
+        gate.set_waiting_clients(0);
+        assert!(
+            paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the work resumes once the request has a worker")
         );
         paused.join().unwrap();
 

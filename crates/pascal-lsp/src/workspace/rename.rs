@@ -7729,12 +7729,17 @@ fn enumerate_assistance_provider_sources(
             .filter_map(|(uri, _)| uri.to_file_path().ok().map(absolute_path))
             .collect::<Vec<_>>();
         let scopes = assistance_provider_scopes(workspace, &context, &importers);
-        let mut candidates = scopes
-            .files
-            .iter()
-            .filter(|path| path.is_file())
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for path in &scopes.files {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            // Recorded present or absent: creating a missing one stales the result.
+            add_baseline_path(&mut enumeration.baseline, path.clone());
+            if path.is_file() {
+                candidates.push(path.clone());
+            }
+        }
         for directory in &scopes.listed {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -11134,6 +11139,127 @@ mod tests {
                 .any(|path| path_key(path) == path_key(&provider)),
             "the shared listing lost the provider"
         );
+    }
+
+    /// l4d-20 F4: a projectless context's recursive workspace-root tier covers
+    /// the directories under it, so they are not listed again; a context with
+    /// a project has no recursive tier and keeps every listed directory.
+    #[test]
+    fn listed_directories_under_a_recursive_root_are_dropped_only_when_that_tier_exists() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = super::absolute_path(temp.path().to_path_buf());
+        let sub = ws.join("sub");
+        fs::create_dir_all(&sub).expect("importer directory");
+        let workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let importers = [sub.join("Consumer.pas")];
+        let context = |project_file: Option<PathBuf>| {
+            ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                project_file,
+                ..pascal_project::ProjectContextParts::default()
+            })
+        };
+
+        let projectless = super::assistance_provider_scopes(&workspace, &context(None), &importers);
+        assert!(projectless.listed.is_empty(), "{:?}", projectless.listed);
+        assert!(
+            projectless
+                .recursive
+                .iter()
+                .any(|root| path_key(root) == path_key(&ws)),
+            "{:?}",
+            projectless.recursive
+        );
+
+        let with_project = super::assistance_provider_scopes(
+            &workspace,
+            &context(Some(ws.join("App.dproj"))),
+            &importers,
+        );
+        assert!(with_project.recursive.is_empty());
+        assert!(
+            with_project
+                .listed
+                .iter()
+                .any(|directory| path_key(directory) == path_key(&sub)),
+            "{:?}",
+            with_project.listed
+        );
+    }
+
+    /// A missing explicit `in` file is part of the completion's inputs: its
+    /// absence is recorded, so creating it stales the delivered result.
+    #[test]
+    fn a_missing_explicit_unit_file_is_recorded_in_the_completion_baseline() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = temp.path().to_path_buf();
+        let consumer = ws.join("Consumer.pas");
+        let generated = ws.join("gen").join("Gen.pas");
+        fs::create_dir_all(generated.parent().unwrap()).expect("generated directory");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("consumer");
+        let mut workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let key = ContextKey {
+            installation_id: None,
+            project_file: Some(ws.join("App.dpr")),
+            workspace_root: Some(ws.clone()),
+            project_scope: Some(ws.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: Default::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                    discovery_complete: true,
+                    project_file: Some(ws.join("App.dpr")),
+                    explicit_unit_entries: HashMap::from([(
+                        "gen".to_string(),
+                        vec![ProjectPathEntry::configured(generated.clone())],
+                    )]),
+                    read_policy: ReadPolicy::new(
+                        std::slice::from_ref(&ws),
+                        &[],
+                        &[],
+                        &EffectiveOverrides::default(),
+                    ),
+                    ..pascal_project::ProjectContextParts::default()
+                })
+                .into(),
+                ..ContextState::default()
+            },
+        );
+        let input = workspace.analysis_input();
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut enumeration = Enumeration {
+            complete: true,
+            auto_import_complete: true,
+            ..Enumeration::default()
+        };
+        super::enumerate_assistance_provider_sources(
+            &mut workspace,
+            &input,
+            &HashMap::from([(consumer_uri, key)]),
+            &mut enumeration,
+            &AtomicBool::new(false),
+        )
+        .expect("provider enumeration");
+        let recorded = enumeration
+            .baseline
+            .paths
+            .iter()
+            .find(|baseline| path_key(&baseline.path) == path_key(&generated))
+            .expect("the missing explicit file is in the baseline");
+        assert!(recorded.stamp.is_none(), "recorded as absent: {recorded:?}");
     }
 
     #[test]

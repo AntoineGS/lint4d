@@ -703,7 +703,7 @@ pub(crate) fn lsp_compatibility_retention(
     let document = resources
         .max_file_bytes
         .min(source)
-        .min(super::DEFAULT_MAX_FILE_BYTES);
+        .min(super::MAX_FILE_BYTES_CEILING);
     let expanded = expansion
         .max_expanded_bytes
         .min(source)

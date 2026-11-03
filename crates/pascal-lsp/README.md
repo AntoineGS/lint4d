@@ -1111,7 +1111,7 @@ configuration schema:
     "conditionalUndefines": ["LEGACY"],
     "conditionalConstants": {"BuildNumber": 42},
     "maxFiles": 10000,
-    "maxFileBytes": 2097152,
+    "maxFileBytes": 4194304,
     "maxTotalBytes": 268435456
   }
 }
@@ -2283,10 +2283,12 @@ effective observations remain unchanged. Other clients receive an eager edit.
 | `sourcePaths` | Additional ordered unit search paths |
 | `exclude` | Additional source-discovery exclude globs |
 | `maxFiles` | 10,000 indexed files |
-| `maxFileBytes` | 2,097,152 bytes per document |
+| `maxFileBytes` | 4,194,304 bytes per document; may be raised to 16,777,216 |
 | `maxTotalBytes` | 268,435,456 source bytes per budget |
 
-Resource-limit options may lower limits, not raise the hard caps. Open buffers
+Resource-limit options may lower limits, not raise the hard caps, except
+`maxFileBytes`, which may be raised up to its 16 MiB ceiling. Larger values
+are clamped to the cap, as for the other limits. Open buffers
 take priority over closed parsed-cache entries, which can be evicted and loaded
 again on demand. Current-request dependencies are protected during resolution;
 if they cannot fit, navigation reports incomplete resolution rather than

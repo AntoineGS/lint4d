@@ -1009,6 +1009,40 @@ pub(in crate::workspace) mod tests {
         assert_eq!(header.member_count(), members.len() as u64);
     }
 
+    /// l4d-9bxx: a root above the store's 2 MiB SQLite value limit but
+    /// within the default `maxFileBytes` publishes; facts are batched into
+    /// rows, never stored as one value of the source's size.
+    #[test]
+    fn a_root_larger_than_the_sqlite_value_limit_publishes_its_facts() {
+        let mut text = String::from("unit Big;\ninterface\nconst\n");
+        let mut n = 0;
+        while text.len() < 3 * 1024 * 1024 {
+            text.push_str(&format!(
+                "  Constant{n:07} = {n}; {{ padding padding padding padding }}\n"
+            ));
+            n += 1;
+        }
+        text.push_str("implementation\nend.\n");
+        assert!(text.len() > pascal_cache::SQLITE_LENGTH_LIMIT as usize);
+        let indexed = index(&[("Big.pas", text.as_bytes())], &["Big.pas"]);
+        let uri = indexed.uri("Big.pas");
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        indexed
+            .workspace
+            .persist_source(&uri, &store, &mut budget(), &no_cancel())
+            .unwrap();
+        let record = indexed
+            .workspace
+            .eligible_member(&uri, draft(), &mut budget(), &no_cancel())
+            .unwrap();
+        assert!(record.value().header.artifact.is_some());
+        assert_eq!(
+            publish_record(&store, &record).unwrap().published,
+            Published::Inserted
+        );
+    }
+
     #[test]
     fn facts_over_a_store_limit_make_an_artifact_less_member() {
         let name = "L".repeat(pascal_cache::MAX_INDEX_KEY_BYTES + 1);

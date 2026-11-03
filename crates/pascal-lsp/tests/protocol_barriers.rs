@@ -7,3 +7,6 @@
 mod common;
 
 include!("protocol/barrier_cases.rs");
+
+#[path = "protocol/persistent_cache.rs"]
+mod persistent_cache;

@@ -5215,7 +5215,7 @@ pub(crate) fn is_cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
-fn snapshot_context_for_uri(
+pub(super) fn snapshot_context_for_uri(
     loader: &mut Workspace,
     uri: &Url,
     cancel: &AtomicBool,
@@ -8103,7 +8103,7 @@ pub(crate) fn is_project_metadata_path(path: &Path) -> bool {
     })
 }
 
-fn is_safe_source_path(workspace: &Workspace, path: &Path) -> bool {
+pub(super) fn is_safe_source_path(workspace: &Workspace, path: &Path) -> bool {
     let Some(canonical_path) = canonical_source_path(path) else {
         return false;
     };

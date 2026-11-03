@@ -127,6 +127,7 @@ mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
 mod persist;

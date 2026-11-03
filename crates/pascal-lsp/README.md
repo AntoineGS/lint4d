@@ -1926,8 +1926,8 @@ Documentation processing is bounded and cancellable:
 
 | Documentation limit | Value |
 | --- | ---: |
-| Source scan | 2 MiB |
-| Scanned comments | 8,192 |
+| Source scan | 16 MiB (the `maxFileBytes` ceiling) |
+| Scanned comments | 8,192, or one per 32 scanned bytes if more |
 | Individual comment body | 64 KiB |
 | Individual XML tag | 4 KiB |
 | XML nesting depth | 64 levels |

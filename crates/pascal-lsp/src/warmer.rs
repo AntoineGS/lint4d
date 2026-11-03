@@ -835,6 +835,7 @@ fn run_index_job(
         return stopped(!job.cancel.load(Ordering::Relaxed));
     }
     let _span = crate::trace::Span::new(|| format!("warm index {anchor:?}"));
+    let started = Instant::now();
     let mut workspace = Workspace::from_analysis_input(&job.input);
     let result = workspace.advance_workspace_index(
         &anchor,
@@ -850,6 +851,19 @@ fn run_index_job(
     );
     match result {
         Ok(progress) => {
+            crate::trace::trace!(
+                "index batch {anchor:?} indexed={} refreshed={} refused={} deferred={} skipped_open={} pending={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
+                progress.indexed,
+                progress.refreshed,
+                progress.refused,
+                progress.deferred,
+                progress.skipped_open,
+                progress.pending,
+                progress.complete,
+                progress.memory,
+                started.elapsed().as_secs_f64() * 1000.0,
+                workspace.project_cache().stats().reserved_index_bytes,
+            );
             let _ = events.send(WarmEvent::IndexProgress {
                 anchor,
                 progress,
@@ -857,9 +871,22 @@ fn run_index_job(
             });
         }
         Err(message) if message == crate::workspace::rename::CANCELLATION_MESSAGE => {
+            crate::trace::trace!(
+                "index batch {anchor:?} stopped paused={} elapsed_ms={:.1} reserved_index_bytes={}",
+                !job.cancel.load(Ordering::Relaxed),
+                started.elapsed().as_secs_f64() * 1000.0,
+                workspace.project_cache().stats().reserved_index_bytes,
+            );
             stopped(!job.cancel.load(Ordering::Relaxed));
         }
-        Err(_) => stopped(false),
+        Err(message) => {
+            crate::trace::trace!(
+                "index batch {anchor:?} stopped error={message} elapsed_ms={:.1} reserved_index_bytes={}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                workspace.project_cache().stats().reserved_index_bytes,
+            );
+            stopped(false);
+        }
     }
 }
 

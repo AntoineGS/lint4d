@@ -1185,6 +1185,7 @@ fn indexed_reference_scope(
     phase_one: Option<&crate::navigation::ReferenceTargets>,
     cancel: &AtomicBool,
 ) -> Result<Option<IndexedSources>, String> {
+    let started = std::time::Instant::now();
     let mut names = binding_candidate_names(
         &classification.record.text,
         classification
@@ -1255,16 +1256,22 @@ fn indexed_reference_scope(
     must_include.extend(input.overlays.keys().cloned());
     must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     must_include.dedup();
-    workspace
-        .indexed_sources(
-            input,
-            &targets,
-            Some(&query),
-            &must_include,
-            Some(&owner.key),
-            cancel,
-        )
-        .map(Some)
+    let sources = workspace.indexed_sources(
+        input,
+        &targets,
+        Some(&query),
+        &must_include,
+        Some(&owner.key),
+        cancel,
+    )?;
+    crate::trace::trace!(
+        "indexed references targets={} sources={} gaps={} elapsed_ms={:.1}",
+        targets.contexts.len(),
+        sources.sources.len(),
+        sources.gaps.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    Ok(Some(sources))
 }
 
 fn binding_snapshot(
@@ -2626,11 +2633,20 @@ fn indexed_workspace_symbols(
     query: &str,
     cancel: &AtomicBool,
 ) -> Result<(Partial<Vec<SymbolInformation>>, Vec<SourceRecord>), String> {
+    let started = std::time::Instant::now();
     let direct = targets.from_open_or_configured > 0;
     let mut must_include = input.overlays.keys().cloned().collect::<Vec<_>>();
     must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     let (sources, facts) =
         workspace.indexed_symbols(input, targets, query, direct, &must_include, cancel)?;
+    crate::trace::trace!(
+        "indexed symbols targets={} sources={} facts={} gaps={} elapsed_ms={:.1}",
+        targets.contexts.len(),
+        sources.sources.len(),
+        facts.len(),
+        sources.gaps.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
     // The facts are distinct declarations, so an answer over the cap is
     // known before any indexed file is read.
     if let Some(error) = crate::navigation::too_many_workspace_symbols(facts.len()) {

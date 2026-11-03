@@ -1660,3 +1660,22 @@ fn legacy_vcl_switches_are_harmless() {
     let analysis = fixture.analyze().unwrap();
     assert!(analysis.root.complete, "{:?}", analysis.reasons);
 }
+
+/// l4d-4nbs R11: HPPEMIT emits raw C++ text, and DCC ends the directive at
+/// the first closer whatever quotes it holds. ShlObj, msxml, OleDB, StdVCL
+/// and DXFile have such bodies: an unterminated literal
+/// (`'#pragma link "shell32.lib"}`), an apostrophe in the text (`don't`)
+/// and a `{` inside `(*$ … *)`.
+#[test]
+fn hppemit_bodies_end_at_the_first_closer() {
+    let source = "unit T; interface\n\
+         {$HPPEMIT '#pragma link \"shell32.lib\"}\n\
+         (*$HPPEMIT '// we don't '*)\n\
+         (*$HPPEMIT '#include \"dxfile.h\"'{*)\n\
+         {$DEFINE AFTER}{$IFDEF AFTER}const A = 1;{$ENDIF}\n\
+         implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
+}

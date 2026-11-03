@@ -1790,6 +1790,7 @@ impl DirectiveScanner {
         };
         if !protected {
             self.body_mode = match byte {
+                b'{' | b'(' | b'/' | b'\'' if self.opaque_body() => Normal,
                 b'{' => Brace,
                 b'(' => Paren,
                 b'/' => Slash,
@@ -1798,6 +1799,18 @@ impl DirectiveScanner {
             };
         }
         Ok(protected)
+    }
+
+    /// Whether the directive read so far is `HPPEMIT`, whose body is raw C++
+    /// text: DCC ends it at the first closer, whatever quotes or comment
+    /// openers it holds (ShlObj's `'#pragma link "shell32.lib"}`, StdVCL's
+    /// `'… we don't '*)`, DXFile's `'#include "dxfile.h"'{*)`).
+    fn opaque_body(&self) -> bool {
+        const KEYWORD: &str = "HPPEMIT";
+        let body = self.pending.get(self.prefix..).unwrap_or("").trim_start();
+        body.len() > KEYWORD.len()
+            && body.as_bytes()[..KEYWORD.len()].eq_ignore_ascii_case(KEYWORD.as_bytes())
+            && !is_identifier_byte(body.as_bytes()[KEYWORD.len()])
     }
 
     fn append(

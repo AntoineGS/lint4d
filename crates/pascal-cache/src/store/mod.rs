@@ -12,6 +12,7 @@ macro_rules! fault_point {
 }
 
 mod artifacts;
+mod budget;
 mod clock;
 mod container;
 mod evidence;
@@ -63,6 +64,10 @@ pub use snapshots::{
 #[cfg(feature = "test-support")]
 pub use testing::FaultPoint;
 
+pub use budget::{
+    LOW_SPACE_MARGIN_BYTES, MIN_BUDGET_TO_WAL_RATIO, MIN_WAL_THRESHOLD_BYTES, PolicyError,
+    PolicyState, Pressure, ROW_OVERHEAD_BYTES, StorePolicy, Usage,
+};
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use health::{Access, MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
 pub use limits::{

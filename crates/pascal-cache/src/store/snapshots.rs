@@ -7,10 +7,12 @@
 //! snapshot is current or verified.
 
 use super::Store;
+use super::budget::WriteEstimate;
 use super::health::Access;
 use super::keys::{admit_manifest, check_manifest_size, put_manifest};
 use super::limits::{
-    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS,
+    MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SNAPSHOT_CANDIDATES,
+    MAX_SNAPSHOT_MEMBERS,
 };
 use super::namespaces::{LIVE, RETIRED as RECORD_RETIRED, Scope, ensure_live, epoch};
 use super::nonce::nonce;
@@ -256,6 +258,13 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: context.key().manifest().len() as u64 + 128,
+                    rows: 2,
+                },
+            )?;
             put_manifest(&transaction, self.scope, context.key())?;
             transaction
                 .execute(
@@ -312,6 +321,14 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: (records.len() as u64 * (32 + MAX_INDEX_KEY_BYTES as u64))
+                        .min(MAX_ROW_BATCH_BYTES as u64),
+                    rows: records.len() as u64,
+                },
+            )?;
             let start: Option<i64> = transaction
                 .query_row(
                     "UPDATE snapshots SET build_revision = build_revision + 1, \
@@ -501,6 +518,13 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: 128,
+                    rows: 1,
+                },
+            )?;
             let Some(member_count) = held_count(&transaction, &builder).map_err(fail)? else {
                 return Err(Bypass::BuilderFenced);
             };

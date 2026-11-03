@@ -25,6 +25,12 @@ pub enum Bypass {
     Recovering,
     ReadOnly,
     Full,
+    /// The WAL is at the policy threshold; writes wait for a checkpoint.
+    WalPressure,
+    /// The write would leave the store without its maintenance headroom.
+    OverBudget,
+    /// The cache directory's filesystem is low on free space.
+    LowDiskSpace,
     Corrupt,
     OutOfMemory,
     ScratchExhausted,

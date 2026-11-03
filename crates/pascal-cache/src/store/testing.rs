@@ -15,6 +15,8 @@ pub(crate) struct Hooks {
     row_fault: Mutex<Option<usize>>,
     faults: Mutex<HashMap<FaultPoint, Hook>>,
     injected: Mutex<Option<Bypass>>,
+    pretend_usage: std::sync::atomic::AtomicU64,
+    pretend_free_space: Mutex<Option<u64>>,
 }
 
 impl Hooks {
@@ -29,6 +31,18 @@ impl Hooks {
         }
     }
 
+    pub(crate) fn pretend_usage(&self) -> u64 {
+        self.pretend_usage
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pretend_free_space(&self) -> Option<u64> {
+        *self
+            .pretend_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn take_injected(&self) -> Option<Bypass> {
         self.injected
             .lock()
@@ -40,6 +54,22 @@ impl Hooks {
 impl Store {
     pub fn advance_clock_for_test(&self, by: std::time::Duration) {
         self.clock.advance(by);
+    }
+
+    /// Count `extra_bytes` more as the store's physical size.
+    pub fn pretend_usage_for_test(&self, extra_bytes: u64) {
+        self.hooks
+            .pretend_usage
+            .store(extra_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace the filesystem's free space; `None` restores the real value.
+    pub fn pretend_free_space_for_test(&self, free: Option<u64>) {
+        *self
+            .hooks
+            .pretend_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = free;
     }
 
     /// The next guarded operation returns `bypass` without running.

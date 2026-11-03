@@ -1,4 +1,5 @@
 use super::Store;
+use super::budget::WriteEstimate;
 use super::health::Access;
 use super::limits::MAX_MANIFEST_BYTES;
 use super::namespaces::{Scope, ensure_live, epoch};
@@ -194,6 +195,13 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: key.manifest().len() as u64,
+                    rows: 1,
+                },
+            )?;
             let published = put_manifest(&transaction, self.scope, key)?;
             self.before_commit();
             transaction.commit().map_err(|error| classify(&error))?;

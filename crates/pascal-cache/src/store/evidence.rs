@@ -6,6 +6,7 @@
 
 use super::Store;
 use super::artifacts::{ArtifactWrite, insert_prepared, prepare_artifact};
+use super::budget::WriteEstimate;
 use super::health::Access;
 use super::keys::{
     ArtifactKeyRef, admit_manifest, admit_manifest_by_digest, check_manifest_size, put_manifest,
@@ -402,6 +403,13 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                artifact_prepared.estimate(&write).plus(WriteEstimate {
+                    bytes: prepared.bytes,
+                    rows: (evidence.observations.len() as u64).saturating_add(2),
+                }),
+            )?;
             let artifact = insert_prepared(&transaction, self.scope, &write, &artifact_prepared)?;
             put_manifest(&transaction, self.scope, evidence.context.key())?;
             let published = insert_evidence(&transaction, self.scope, &prepared)?;
@@ -443,6 +451,16 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: prepared.bytes.saturating_add(
+                        (evidence.context.key().manifest().len() + target.key().manifest().len())
+                            as u64,
+                    ),
+                    rows: (evidence.observations.len() as u64).saturating_add(3),
+                },
+            )?;
             put_manifest(&transaction, self.scope, evidence.context.key())?;
             put_manifest(&transaction, self.scope, target.key())?;
             let published = insert_evidence(&transaction, self.scope, &prepared)?;

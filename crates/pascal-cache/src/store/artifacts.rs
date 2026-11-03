@@ -1,4 +1,5 @@
 use super::Store;
+use super::budget::WriteEstimate;
 use super::health::Access;
 use super::keys::{
     ArtifactKeyRef, admit_manifest, admit_manifest_by_digest, check_manifest_size, put_manifest,
@@ -228,6 +229,21 @@ pub(crate) struct PreparedArtifact {
     checksums: Vec<Digest>,
 }
 
+impl PreparedArtifact {
+    /// The size of the artifact write for admission: content, supplemental
+    /// bytes and key manifests; its header, rows and two manifests.
+    pub(crate) fn estimate(&self, write: &ArtifactWrite<'_>) -> WriteEstimate {
+        let manifests = write.key.key().manifest().len()
+            + write.key.root().map_or(0, |root| root.manifest().len());
+        WriteEstimate {
+            bytes: (self.expected.content_bytes.max(0) as u64)
+                .saturating_add(write.supplemental.len() as u64)
+                .saturating_add(manifests as u64),
+            rows: (write.rows.len() as u64).saturating_add(3),
+        }
+    }
+}
+
 /// Admit and hash `write`: everything a publication does before its
 /// transaction starts.
 pub(crate) fn prepare_artifact(write: &ArtifactWrite<'_>) -> Result<PreparedArtifact, Bypass> {
@@ -388,15 +404,17 @@ impl Store {
     /// Publish an immutable artifact: key manifests, header and rows in one
     /// transaction. Hashing happens before the transaction starts.
     ///
-    /// An identical republish commits: it takes a new publication sequence so
-    /// the artifact counts as recently used (and, once write admission exists,
-    /// it passes admission like any other write).
+    /// An identical republish is a write: it commits its publication
+    /// sequence bump, so the artifact counts as recently used, and it is
+    /// subject to write admission like any other publication
+    /// (`OverBudget`, `WalPressure`, `LowDiskSpace`).
     pub fn publish_artifact(&self, write: &ArtifactWrite<'_>) -> Result<Published, Bypass> {
         self.guarded(Access::Write, || {
             let prepared = prepare_artifact(write)?;
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(&transaction, prepared.estimate(write))?;
             let published = insert_prepared(&transaction, self.scope, write, &prepared)?;
             self.before_commit();
             transaction.commit().map_err(|error| classify(&error))?;

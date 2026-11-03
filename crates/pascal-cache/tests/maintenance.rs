@@ -4,10 +4,11 @@
 mod common;
 
 use common::private_tempdir;
-use common::records::open;
+use common::records::{context, open, records, sealed};
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, LocalArtifactKey, Lookup,
-    MIN_HEALTH_BACKOFF, Miss, Published, SourceContent, Store, Unhealthy,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, LOW_SPACE_MARGIN_BYTES,
+    LocalArtifactKey, Lookup, MIN_HEALTH_BACKOFF, Miss, PolicyError, PolicyState, Pressure,
+    Published, SourceContent, Store, StorePolicy, Unhealthy,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
@@ -42,6 +43,8 @@ fn publish_bulk(
         rows: &rows,
     })
 }
+
+const MIB: u64 = 1 << 20;
 
 fn file_len(directory: &Path, suffix: &str) -> u64 {
     std::fs::metadata(directory.join(format!("{DATABASE_FILE}{suffix}"))).map_or(0, |m| m.len())
@@ -110,4 +113,137 @@ fn corruption_mid_session_bypasses_every_operation_and_leaves_the_files() {
     store.advance_clock_for_test(MIN_HEALTH_BACKOFF);
     assert_eq!(store.check_scope(), Ok(()));
     assert_eq!(store.health(), None);
+}
+
+#[test]
+fn the_policy_is_read_from_the_store_and_changed_against_its_revision() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let state = store.policy().unwrap();
+    assert_eq!(state.revision, 0);
+    assert_eq!(
+        state.policy,
+        StorePolicy {
+            max_disk_bytes: 8 << 30,
+            wal_threshold_bytes: 256 << 20
+        }
+    );
+    let small = StorePolicy {
+        max_disk_bytes: 64 * MIB,
+        wal_threshold_bytes: 8 * MIB,
+    };
+    assert_eq!(
+        store.set_policy(0, small).unwrap(),
+        PolicyState {
+            revision: 1,
+            policy: small
+        }
+    );
+    assert_eq!(
+        store.set_policy(0, small),
+        Err(PolicyError::RevisionChanged { current: 1 })
+    );
+}
+
+#[test]
+fn a_policy_change_applies_to_the_next_write() {
+    let root = private_tempdir();
+    let writer = open(root.path());
+    let administrator = open(root.path());
+    writer.pretend_usage_for_test(60 * MIB);
+    assert_eq!(
+        publish_bulk(&writer, "unit A;", 1, 10),
+        Ok(Published::Inserted)
+    );
+    administrator
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        publish_bulk(&writer, "unit B;", 1, 10),
+        Err(Bypass::OverBudget)
+    );
+    assert_eq!(writer.pressure(), Ok(Pressure::OverHeadroom));
+    assert_eq!(writer.health(), None, "over budget is not unhealthy");
+}
+
+#[test]
+fn writes_are_refused_without_maintenance_headroom_and_maintenance_is_exempt() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let header = sealed(&store, &records(&store, "M", 1));
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 16 * MIB,
+            },
+        )
+        .unwrap();
+    store.pretend_usage_for_test(50 * MIB);
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 1, 10),
+        Err(Bypass::OverBudget)
+    );
+    assert_eq!(
+        store.begin_snapshot(&context()).err(),
+        Some(Bypass::OverBudget)
+    );
+    assert_eq!(
+        store.retire_snapshot(header.id()),
+        Ok(true),
+        "retirement frees space"
+    );
+}
+
+#[test]
+fn low_free_space_refuses_writes() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store.pretend_free_space_for_test(Some(LOW_SPACE_MARGIN_BYTES));
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 1, 10),
+        Err(Bypass::LowDiskSpace)
+    );
+    assert_eq!(store.pressure(), Ok(Pressure::LowDiskSpace));
+}
+
+#[test]
+fn the_wal_threshold_stops_writes_until_a_checkpoint_makes_room() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        publish_bulk(&store, "unit A;", 9, 1_000_000),
+        Ok(Published::Inserted)
+    );
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Err(Bypass::WalPressure)
+    );
+    assert_eq!(store.pressure(), Ok(Pressure::WalPressure));
+    // Task 8 replaces this with a maintenance checkpoint.
+    let _: (i64, i64, i64) = common::records::raw(root.path())
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Ok(Published::Inserted)
+    );
 }

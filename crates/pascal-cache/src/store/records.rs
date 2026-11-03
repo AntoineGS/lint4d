@@ -4,6 +4,7 @@
 //! the record ID.
 
 use super::Store;
+use super::budget::WriteEstimate;
 use super::health::Access;
 use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_INDEX_KEY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS,
@@ -311,8 +312,10 @@ impl MemberRecordHeader {
 impl Store {
     /// Publish `record` and its bindings in one transaction, only if every
     /// artifact and evidence set it references is live in this scope (spec
-    /// §6.3 amendment, item 1). An identical record converges; a different
-    /// record under the same ID is an integrity failure.
+    /// §6.3 amendment, item 1). An identical record converges, but it is
+    /// still a write: it commits with a new `publication_seq` and passes
+    /// write admission (`OverBudget`, `WalPressure`, `LowDiskSpace`). A
+    /// different record under the same ID is an integrity failure.
     pub fn publish_member_record(&self, record: &MemberRecord) -> Result<PublishedRecord, Bypass> {
         self.guarded(Access::Write, || {
             record.validate().map_err(Bypass::InvalidRecord)?;
@@ -336,6 +339,14 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: (encoded.header.len() + encoded.source_key.len()) as u64
+                        + encoded.content_bytes,
+                    rows: (encoded.bindings.len() as u64).saturating_add(1),
+                },
+            )?;
             if let Some(artifact) = record.header.artifact {
                 require_artifact(&transaction, self.scope, artifact)?;
             }

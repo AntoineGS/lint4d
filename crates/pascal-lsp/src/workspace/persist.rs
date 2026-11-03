@@ -466,12 +466,12 @@ impl Workspace {
         decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
-        let overlays = self.overlay_inputs();
-        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
         if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
+        let overlays = self.overlay_inputs();
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let context = Arc::clone(
             &self
                 .contexts
@@ -757,7 +757,7 @@ pub(crate) mod tests {
     /// D31: a library unit whose discovered owner is another context is reused
     /// under the index context that lists it, never under its own owner.
     #[test]
-    fn reuse_in_context_uses_the_given_context_not_the_discovered_owner() {
+    fn reuse_in_context_reports_ids_stamps_and_root_hash() {
         let indexed = index(
             &[
                 ("Main.pas", MAIN.as_bytes()),
@@ -798,7 +798,16 @@ pub(crate) mod tests {
         assert_eq!(evidence, prepared.member_evidence_id());
         assert!(evidence.is_some());
         assert_eq!(artifact, prepared.artifact_id());
-        assert!(prepared.transient_bytes() > 0);
+        let observations = &prepared.expanded.as_ref().unwrap().observations;
+        assert!(!observations.is_empty());
+        assert_eq!(
+            prepared.transient_bytes(),
+            pascal_cache::encoded_content_bytes(&prepared.facts).unwrap()
+                + observations
+                    .iter()
+                    .map(|observation| observation.encoded().len())
+                    .sum::<usize>()
+        );
         let bytes = std::fs::read(indexed.root.join("Main.pas")).unwrap();
         assert_eq!(root_hash, pascal_project::content_hash_bytes(&bytes));
         let mut stamped: Vec<_> = include_stamps
@@ -817,6 +826,96 @@ pub(crate) mod tests {
             restarted.index.parsed_document(&uri).is_none(),
             "nothing was parsed"
         );
+    }
+
+    /// D31: `Main.pas` is analysed and persisted under the project context
+    /// `App.dproj`; a restarted workspace without that project discovers
+    /// another owner for it. `reuse_in_context` reuses it under the project
+    /// key it is given, and `reuse_persisted_facts` (the discovered owner)
+    /// cannot.
+    #[test]
+    fn reuse_in_context_uses_the_given_context_not_the_discovered_owner() {
+        use crate::project_cache::IndexAnchor;
+        use crate::workspace::WorkspaceOptions;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for (name, bytes) in [
+            ("lib/Main.pas", MAIN.as_bytes()),
+            ("lib/Types.inc", TYPES.as_bytes()),
+            ("lib/Nested.inc", NESTED.as_bytes()),
+            (
+                "app/App.dproj",
+                b"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>"
+                    as &[u8],
+            ),
+            ("app/App.dpr", b"program App; begin end.\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let uri = Url::from_file_path(root.join("lib/Main.pas")).unwrap();
+        let session = || OverrideSession::new(None);
+        let configured = Workspace::with_override_session(
+            vec![root.clone()],
+            WorkspaceOptions {
+                project_file: Some("app/App.dproj".into()),
+                ..WorkspaceOptions::default()
+            },
+            session(),
+        );
+        let mut analysed = Workspace::from_analysis_input(&configured.analysis_input());
+        analysed
+            .warm_with_cancel(&uri, &AtomicBool::new(false))
+            .unwrap();
+        let project_key = analysed.document_contexts[&uri].clone();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        analysed
+            .persist_source(
+                &uri,
+                &store,
+                &mut FactBudget::new(1 << 26),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        let plain = Workspace::with_override_session(
+            vec![root.clone()],
+            WorkspaceOptions::default(),
+            session(),
+        );
+        let mut restarted = Workspace::from_analysis_input(&plain.analysis_input());
+        let installed = restarted
+            .index_context_for(
+                &IndexAnchor::Project(root.join("app/App.dproj")),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(installed, project_key, "the same project context");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = ReconciliationBudget::new(Arc::clone(&cancel));
+        let reuse = restarted
+            .reuse_in_context(&uri, &project_key, &store, &work, DECODE_LIMIT, &cancel)
+            .unwrap();
+        assert!(
+            matches!(
+                reuse,
+                Reuse::Hit {
+                    via: ReuseVia::Evidence,
+                    ..
+                }
+            ),
+            "{reuse:?}"
+        );
+        assert!(restarted.index.parsed_document(&uri).is_none());
+        let discovered = restarted.context_for_uri_with_cancel(&uri, None).unwrap();
+        assert_ne!(discovered, project_key, "another owner is discovered");
+        let owner_reuse = restarted
+            .reuse_persisted_facts(&uri, &store, &work, DECODE_LIMIT, &cancel)
+            .unwrap();
+        assert!(matches!(owner_reuse, Reuse::Miss(_)), "{owner_reuse:?}");
     }
 
     #[test]

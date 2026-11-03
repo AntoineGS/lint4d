@@ -1671,6 +1671,11 @@ struct StoreCache {
     reuse: HashMap<DirectoryReuseKey, (AdmittedOwned<()>, AdmittedShared<DirectoryListing>)>,
     reuse_capacity: Option<AdmittedOwned<()>>,
     reuse_policy: Option<ReadPolicy>,
+    /// l4d-4nbs R13: this session's disk reads, one per file and entry, for
+    /// lookups of the same unit through the same entry. `loaded` keeps only
+    /// the latest read of a source, which alternating entries would replace.
+    reads: Vec<LoadedSource>,
+    reads_capacity: Option<AdmittedOwned<()>>,
     recorded_work: usize,
     recorded_byte_work: usize,
 }
@@ -6009,6 +6014,7 @@ impl<S: SourceStore> UnitResolver<S> {
             max_bytes,
         };
         let reused = self.reusable_loaded(&path, &entry, stamp.as_ref(), max_bytes, cancel)?;
+        let fresh_read = reused.is_none();
         let before_load = self.store_budget(cancel).map(|budget| budget.snapshot());
         let mut loaded = if let Some(reused) = reused {
             reused
@@ -6049,6 +6055,9 @@ impl<S: SourceStore> UnitResolver<S> {
                         .fund_charged(work, bytes)
                         .map_err(|r| store_admission_error(r, &budget))?;
                 }
+            }
+            if fresh_read {
+                self.keep_read(&loaded, &mut budget);
             }
             Some((key, cached))
         } else {
@@ -6149,9 +6158,9 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut budget = root.view.store_budget(root.limits, cancel);
         let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
         budget
-            .charge(cache.loaded.len() + 1, 0, 0)
+            .charge(cache.reads.len() + 1, 0, 0)
             .map_err(|r| store_admission_error(r, &budget))?;
-        let Some(source) = cache.loaded.values().find(|source| {
+        let Some(source) = cache.reads.iter().find(|source| {
             source.path == path
                 && source.bytes.len() <= max_bytes
                 && matches!(
@@ -6164,7 +6173,39 @@ impl<S: SourceStore> UnitResolver<S> {
         }) else {
             return Ok(None);
         };
-        source.admitted_copy(&mut budget).map(Some)
+        // A copy this budget cannot admit is simply read again.
+        Ok(source.admitted_copy(&mut budget).ok())
+    }
+
+    /// Keep a settled disk read for reuse within the session. Refused
+    /// retained bytes only stop caching.
+    fn keep_read(&self, loaded: &LoadedSource, budget: &mut CompileTimeBudget<'_>) {
+        let (Some(root), SourceRevision::Disk { stamp, .. }) =
+            (self.compile_time_store.as_ref(), &loaded.revision)
+        else {
+            return;
+        };
+        if !stamp.settled {
+            return;
+        }
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.value_mut();
+        if cache.reads.len() == cache.reads.capacity() {
+            let count = (cache.reads.len() + 1).next_power_of_two().max(4);
+            let Ok(capacity) =
+                budget.admit_owned(1, 0, count * std::mem::size_of::<LoadedSource>(), || ())
+            else {
+                return;
+            };
+            cache.reads.reserve_exact(count - cache.reads.len());
+            cache.reads_capacity = Some(capacity);
+        }
+        if let Ok(copy) = loaded.admitted_copy(budget) {
+            cache
+                .reads
+                .retain(|read| !(read.path == loaded.path && read.revision == loaded.revision));
+            cache.reads.push(copy);
+        }
     }
 
     fn source_request_scratch(
@@ -10644,6 +10685,53 @@ mod tests {
             Default::default(),
         );
         (dir, root, resolver)
+    }
+
+    /// l4d-4nbs R13: a file read through two entries (provenances) in
+    /// alternation is read once per entry: the session keeps each read,
+    /// not only the latest read of the source.
+    #[test]
+    fn alternating_entries_reuse_each_read() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        pascal_project::backdate_for_test(&path);
+        let configured = ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let legacy = ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let mut read = |entry: &ProjectPathEntry| {
+            call.load_candidate_with_limit(
+                &path,
+                entry,
+                None,
+                SourceKind::Unit,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap()
+        };
+        let first = read(&configured);
+        let second = read(&legacy);
+        let third = read(&configured);
+        let fourth = read(&legacy);
+        assert_ne!(first.revision, second.revision, "two entries");
+        assert_eq!(
+            first.bytes.as_ptr(),
+            third.bytes.as_ptr(),
+            "configured read reused"
+        );
+        assert_eq!(
+            second.bytes.as_ptr(),
+            fourth.bytes.as_ptr(),
+            "legacy read reused"
+        );
     }
 
     #[test]

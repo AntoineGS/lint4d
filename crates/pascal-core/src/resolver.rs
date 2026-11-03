@@ -4088,14 +4088,20 @@ impl<S: SourceStore> UnitResolver<S> {
             })?;
         // The search and browsing entries are borrowed from a shared context
         // handle, not copied (l4d-4nbs D19): only their sizing pass reads them.
-        let reserve = paths
-            .saturating_add(explicit.saturating_mul(2))
-            .saturating_add(names.saturating_mul(
-                self.context.search_path_entries().len()
-                    + self.context.browsing_path_entries().len()
-                    + 2,
-            ))
-            .saturating_add(request.requested_name.len().saturating_mul(8));
+        // A typed lookup admits its tiers and the looked-up name's explicit
+        // paths where it copies them, so it reserves only the namespace copy.
+        let reserve = if self.compile_time_store.is_some() {
+            names.saturating_mul(2)
+        } else {
+            paths
+                .saturating_add(explicit.saturating_mul(2))
+                .saturating_add(names.saturating_mul(
+                    self.context.search_path_entries().len()
+                        + self.context.browsing_path_entries().len()
+                        + 2,
+                ))
+        }
+        .saturating_add(request.requested_name.len().saturating_mul(8));
         self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         let requested = request.requested_name.trim();
         if requested.is_empty() {

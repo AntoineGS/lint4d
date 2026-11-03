@@ -2089,6 +2089,14 @@ impl ProviderEngine<'_, '_> {
             .iter()
             .chain(self.providers.identities.iter())
         {
+            // The identity checks below stop at a different source; only a
+            // same-source key compares contexts, revisions and qualifiers.
+            self.budget
+                .charge(1, key.source.as_str().len(), 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if key.source != provider.unit.source.id {
+                continue;
+            }
             admit_provider_context(&provider.context, self.budget, false)?;
             admit_provider_context(&key.context, self.budget, false)?;
             let n = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)

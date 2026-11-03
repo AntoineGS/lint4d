@@ -44,6 +44,34 @@ impl InteractiveGate {
         !cancel.load(Ordering::Relaxed)
     }
 
+    /// `wait_idle` for at most `limit`: true once idle or after `limit`,
+    /// false if cancelled.
+    pub(crate) fn wait_idle_at_most(&self, cancel: &AtomicBool, limit: Duration) -> bool {
+        let deadline = Instant::now().checked_add(limit);
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while *busy > 0 {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            let slice = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    remaining.min(Duration::from_millis(25))
+                }
+                None => Duration::from_millis(25),
+            };
+            busy = self
+                .idle
+                .wait_timeout(busy, slice)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !cancel.load(Ordering::Relaxed)
+    }
+
     /// Checks whether warming may proceed without waiting while it owns a cache claim.
     pub(crate) fn try_wait_idle(&self, cancel: &AtomicBool) -> bool {
         #[cfg(test)]
@@ -68,6 +96,44 @@ impl InteractiveGate {
         *self.busy.lock().unwrap_or_else(PoisonError::into_inner) == 0
             && !cancel.load(Ordering::Relaxed)
     }
+}
+
+thread_local! {
+    static BACKGROUND_GATE: std::cell::RefCell<Option<(Arc<InteractiveGate>, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The longest background work pauses at once for interactive work. It
+/// then does one more step and pauses again, so that it slows down to a
+/// fraction of its speed while interactive work runs, but a long or held
+/// interactive request does not stall it.
+pub(crate) const BACKGROUND_PAUSE_LIMIT: Duration = Duration::from_millis(500);
+
+/// Makes the background work on the calling thread pause for interactive
+/// work at `yield_to_interactive_work` points, each time for at most the
+/// given duration (`None`: it never pauses).
+pub(crate) fn set_background_gate_on_this_thread(gate: Option<(Arc<InteractiveGate>, Duration)>) {
+    BACKGROUND_GATE.with(|cell| *cell.borrow_mut() = gate);
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn has_background_gate_on_this_thread() -> bool {
+    BACKGROUND_GATE.with(|cell| cell.borrow().is_some())
+}
+
+/// Waits while interactive requests run or are queued, up to the thread's
+/// pause limit, when the calling thread does background work and holds no
+/// cache claim (a lookup waiting for one would wait out the pause). False
+/// when cancelled.
+pub(crate) fn yield_to_interactive_work(cancel: &AtomicBool) -> bool {
+    let Some((gate, limit)) = BACKGROUND_GATE.with(|cell| cell.borrow().clone()) else {
+        return true;
+    };
+    if crate::project_cache::claims_held_on_this_thread() > 0 || gate.try_wait_idle(cancel) {
+        return !cancel.load(Ordering::Relaxed);
+    }
+    let _span = crate::trace::Span::new(|| "background work paused for interactive work".into());
+    gate.wait_idle_at_most(cancel, limit)
 }
 
 #[derive(Debug, Default)]
@@ -1261,6 +1327,63 @@ mod tests {
         }
 
         assert_eq!(dispatched, vec![c.clone(), b.clone(), a.clone()]);
+    }
+
+    #[test]
+    fn background_work_pauses_for_interactive_work_only_without_claims() {
+        let gate = Arc::new(InteractiveGate::default());
+        let cancel = AtomicBool::new(false);
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "work without a background gate never pauses"
+        );
+        gate.set(1);
+        set_background_gate_on_this_thread(Some((gate.clone(), Duration::MAX)));
+
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let context = pascal_project::ProjectContext::from_parts(
+            pascal_project::ProjectContextParts::default(),
+        );
+        let uri = Url::parse("file:///ws/Main.pas").unwrap();
+        let crate::project_cache::Lookup::Compute(claim) =
+            cache.imports(&uri, &context, 1, &HashMap::new(), &cancel)
+        else {
+            panic!("expected a claim")
+        };
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "work holding a claim does not pause: a waiter would wait out the pause"
+        );
+        drop(claim);
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let paused_gate = gate.clone();
+        let paused = std::thread::spawn(move || {
+            set_background_gate_on_this_thread(Some((paused_gate, Duration::MAX)));
+            paused_tx
+                .send(yield_to_interactive_work(&AtomicBool::new(false)))
+                .unwrap();
+        });
+        gate.set(0);
+        assert!(
+            paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the work resumes once interactive work is done")
+        );
+        paused.join().unwrap();
+
+        gate.set(1);
+        set_background_gate_on_this_thread(Some((gate.clone(), Duration::ZERO)));
+        assert!(
+            yield_to_interactive_work(&cancel),
+            "a pause ends at its limit while interactive work still runs"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            !yield_to_interactive_work(&cancel),
+            "a cancelled pause fails"
+        );
+        set_background_gate_on_this_thread(None);
     }
 
     #[test]

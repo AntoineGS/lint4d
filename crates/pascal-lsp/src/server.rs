@@ -73,10 +73,10 @@ const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
 // One additional slot is reserved for interactive work. Bulk analysis and
 // diagnostics must never occupy all workers while a navigation request waits.
 const MAX_ANALYSIS_JOBS: usize = MAX_GENERAL_ANALYSIS_JOBS + 1;
-/// How long an interactive worker waits for an import slot that a bulk job
-/// or diagnostics is computing before it computes the slot itself, uncached.
-/// It waits for unit slots as long as their claims are held.
-const INTERACTIVE_IMPORT_CLAIM_WAIT: Duration = Duration::from_millis(50);
+/// How long an interactive worker waits for a slot that the main thread is
+/// computing before it computes the slot itself, uncached. It waits for the
+/// slots of analysis jobs as long as their claims are held.
+const INTERACTIVE_ROLELESS_CLAIM_WAIT: Duration = Duration::from_millis(50);
 /// Maximum number of accepted analysis requests waiting for a worker.
 ///
 /// Queued requests retain only their parsed request parameters, never a
@@ -5398,6 +5398,7 @@ impl AnalysisJobs {
             _ => Vec::new(),
         };
         let test_barriers = self.test_barriers.clone();
+        let interactive_gate = Arc::clone(&self.interactive_gate);
         let sender = self.sender.clone();
         let worker_id = id;
         let panic_id = id;
@@ -5574,11 +5575,18 @@ impl AnalysisJobs {
                     if priority == AnalysisPriority::Interactive {
                         crate::project_cache::ClaimRole::interactive(
                             Arc::clone(&worker_cancellation),
-                            INTERACTIVE_IMPORT_CLAIM_WAIT,
+                            INTERACTIVE_ROLELESS_CLAIM_WAIT,
                         )
                     } else {
                         crate::project_cache::ClaimRole::job(Arc::clone(&worker_cancellation))
                     },
+                );
+                // Diagnostics walk whole import closures; they pause between
+                // units while interactive requests run or wait, so that they
+                // only go on at a fraction of their speed meanwhile.
+                crate::warmer::set_background_gate_on_this_thread(
+                    (priority == AnalysisPriority::Diagnostics)
+                        .then_some((interactive_gate, crate::warmer::BACKGROUND_PAUSE_LIMIT)),
                 );
                 let validation_input = input.clone();
                 let result =

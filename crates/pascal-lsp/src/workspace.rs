@@ -7349,9 +7349,11 @@ impl Workspace {
                     }
                 )
             });
-        if reusable
-            && let (Some(claim), Some((probes, watch_dirs))) =
-                (import_claim, computed_probes.clone())
+        // An unstored claim is dropped here too, so that no lookup waits for
+        // it through the walk.
+        if let Some(claim) = import_claim
+            && reusable
+            && let Some((probes, watch_dirs)) = computed_probes.clone()
         {
             let value = crate::project_cache::ImportValue {
                 resolved: std::sync::Arc::clone(&resolved),
@@ -7432,6 +7434,15 @@ impl Workspace {
         let mut dependencies = Vec::new();
         for (index, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
+            // Background work over a whole closure gives way to interactive
+            // requests between units.
+            #[cfg(feature = "test-support")]
+            if index == 1 && crate::warmer::has_background_gate_on_this_thread() {
+                wait_at_background_walk_test_barrier();
+            }
+            if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
             let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
                 format!(
                     "resolved unit is not a file URI: {}",
@@ -15451,6 +15462,30 @@ fn wait_at_import_claim_test_barrier() {
     }
 }
 
+/// Holds background work (diagnostics) after the first unit of a closure
+/// walk, so protocol tests can issue interactive work while it runs.
+#[cfg(feature = "test-support")]
+fn wait_at_background_walk_test_barrier() {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER") else {
+        return;
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    {
+        let _ = marker.write_all(b"x");
+    }
+    while !Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// FNV-1a over the ASCII-folded path text: paths that `paths_equal_ci`
 /// considers equal hash equal, without allocating.
 fn case_folded_path_hash(path: &Path) -> u64 {
@@ -19906,6 +19941,117 @@ mod tests {
         let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
         assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
         assert_eq!(*seen.lock().unwrap(), vec![(0, 1)]);
+    }
+
+    /// A diagnostics-like job walks `Main`'s closure (`First`, `Second`,
+    /// `Third`) and an interactive request needing the same closure arrives
+    /// after the first unit: the job pauses at its next unit, the request
+    /// does the rest itself without waiting, and the job then finishes from
+    /// the cache. Each unit is parsed once and the resolution computed once.
+    #[test]
+    fn background_closure_walk_yields_to_interactive_requests_between_units() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main;\ninterface\nuses First, Second, Third;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        for name in ["First", "Second", "Third"] {
+            fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name};\ninterface\nimplementation\nend.\n"),
+            )
+            .unwrap();
+        }
+        let main_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let main = test_workspace(vec![root.to_path_buf()], Default::default());
+        let gate = Arc::new(crate::warmer::InteractiveGate::default());
+
+        let (at_boundary_tx, at_boundary_rx) = std::sync::mpsc::channel();
+        let walked = Arc::new(Mutex::new(Vec::new()));
+        let mut background = worker_view(&main);
+        let hook_gate = gate.clone();
+        let hook_walked = walked.clone();
+        background.set_dependency_hook(Arc::new(move |_, done, _| {
+            hook_walked.lock().unwrap().push(done);
+            if done == 1 {
+                // An interactive request arrives after the first unit.
+                hook_gate.set(1);
+                at_boundary_tx.send(()).unwrap();
+            }
+            Ok(())
+        }));
+        let background_cancel = Arc::new(AtomicBool::new(false));
+        let background_gate = gate.clone();
+        let job = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::job(background_cancel.clone()),
+            );
+            crate::warmer::set_background_gate_on_this_thread(Some((
+                background_gate,
+                std::time::Duration::MAX,
+            )));
+            crate::navigation::test_reset_document_parse_count();
+            super::test_reset_import_resolution_count();
+            let result = background.warm_with_cancel(&main_uri, &background_cancel);
+            (
+                result.map(|outcome| outcome.dependencies.len()),
+                crate::navigation::test_document_parse_count(),
+                super::test_import_resolution_count(),
+            )
+        });
+        at_boundary_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the job walked its first unit");
+
+        let interactive_input = main.analysis_input();
+        let interactive_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let interactive = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    std::time::Duration::ZERO,
+                ),
+            );
+            crate::navigation::test_reset_document_parse_count();
+            super::test_reset_import_resolution_count();
+            let result = Workspace::from_analysis_input(&interactive_input)
+                .warm_with_cancel(&interactive_uri, &AtomicBool::new(false));
+            done_tx
+                .send((
+                    result.map(|outcome| outcome.dependencies.len()),
+                    crate::navigation::test_document_parse_count(),
+                    super::test_import_resolution_count(),
+                ))
+                .unwrap();
+        });
+        let (interactive_result, interactive_parses, interactive_resolutions) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the interactive request finishes while the job is paused");
+        let walked_while_interactive = walked.lock().unwrap().clone();
+        gate.set(0);
+        interactive.join().unwrap();
+        let (job_result, job_parses, job_resolutions) = job.join().unwrap();
+
+        assert_eq!(interactive_result, Ok(3));
+        assert_eq!(job_result, Ok(3), "the job completes after the request");
+        assert_eq!(
+            walked_while_interactive,
+            vec![0, 1],
+            "the job paused at the unit boundary"
+        );
+        assert_eq!(
+            (job_resolutions, interactive_resolutions),
+            (1, 0),
+            "the resolution is computed once and reused"
+        );
+        assert_eq!(
+            (job_parses, interactive_parses),
+            (2, 2),
+            "the job parsed Main and First, the request Second and Third, and nothing twice"
+        );
     }
 
     #[test]

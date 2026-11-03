@@ -1468,6 +1468,72 @@ mod cache_tests {
     }
 
     #[test]
+    fn interactive_lookup_waits_for_a_jobs_import_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let owner = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                set_claim_role_on_this_thread(ClaimRole::job(Arc::new(AtomicBool::new(false))));
+                let Lookup::Compute(claim) =
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("the owner claims the slot")
+                };
+                assert_eq!(claims_held_on_this_thread(), 1);
+                claimed_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+                assert_eq!(claims_held_on_this_thread(), 0);
+            })
+        };
+        claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owner claimed the slot");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        cache.set_every_wait_hook(waiting_tx);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let interactive = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                set_claim_role_on_this_thread(ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::ZERO,
+                ));
+                let hit = matches!(
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+                    Lookup::Hit(_)
+                );
+                result_tx.send(hit).unwrap();
+            })
+        };
+        // An import claim covers one resolution, like a unit claim one
+        // parse: the interactive lookup keeps waiting for it.
+        let slices = 2 + (Duration::from_secs(1).as_millis() / WAIT_SLICE.as_millis()) as usize;
+        for _ in 0..slices {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the interactive lookup keeps waiting for the claim");
+        }
+        finish_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the interactive lookup answers once the claim is stored"),
+            "the waiter adopts the stored resolution"
+        );
+        interactive.join().unwrap();
+    }
+
+    #[test]
     fn interactive_import_waits_are_bounded_and_leave_the_claim() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
@@ -2894,20 +2960,22 @@ pub(crate) struct ClaimRole {
     /// Interactive work takes this work's claims over instead of waiting:
     /// the warmer pauses for interactive requests and runs at low priority.
     yields_to_interactive: bool,
-    /// How long the work waits for an import slot another thread computes
-    /// before computing it without caching. An import claim covers the
-    /// owner's own walk of the importer's closure, which can take much
-    /// longer than the walk the waiter needs; a unit claim is one parse.
-    import_claim_wait: Option<Duration>,
+    /// How long the work waits for a slot that a thread without a role
+    /// (the main thread) computes, before computing it without caching:
+    /// such a claim can be neither cancelled nor taken over. Claims of
+    /// other owners cover one parse or one import resolution (the importer's
+    /// dependency walk runs after the resolution is stored), so they are
+    /// waited for as long as they are held.
+    roleless_claim_wait: Option<Duration>,
 }
 
 impl ClaimRole {
-    pub(crate) fn interactive(cancel: Arc<AtomicBool>, import_claim_wait: Duration) -> Self {
+    pub(crate) fn interactive(cancel: Arc<AtomicBool>, roleless_claim_wait: Duration) -> Self {
         Self {
             interactive: true,
             cancel: Some(cancel),
             yields_to_interactive: false,
-            import_claim_wait: Some(import_claim_wait),
+            roleless_claim_wait: Some(roleless_claim_wait),
         }
     }
 
@@ -2916,7 +2984,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: false,
-            import_claim_wait: None,
+            roleless_claim_wait: None,
         }
     }
 
@@ -2925,7 +2993,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: true,
-            import_claim_wait: None,
+            roleless_claim_wait: None,
         }
     }
 
@@ -3179,6 +3247,7 @@ impl Drop for Claim {
         if self.detached {
             return;
         }
+        HELD_CLAIMS.with(|held| held.set(held.get().saturating_sub(1)));
         let mut state = lock(&self.inner);
         if matches!(state.slots.get(&self.key), Some(Slot::Computing { generation, claim, .. })
             if *generation == self.generation && *claim == self.claim)
@@ -3371,6 +3440,15 @@ fn lock(inner: &Inner) -> MutexGuard<'_, State> {
 thread_local! {
     static CLAIM_ROLE: std::cell::RefCell<ClaimRole> =
         std::cell::RefCell::new(ClaimRole::default());
+    /// Claims this thread holds on slots, which other lookups may wait for.
+    static HELD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of slot claims the calling thread holds. Work that pauses for
+/// other work must hold none, or a lookup waiting for its claims would wait
+/// out the pause.
+pub(crate) fn claims_held_on_this_thread() -> usize {
+    HELD_CLAIMS.with(std::cell::Cell::get)
 }
 
 /// Sets how the work on the calling thread takes part in cache claims.
@@ -3388,6 +3466,23 @@ pub(crate) fn set_claim_role_on_this_thread(role: ClaimRole) {
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 pub(crate) fn claims_are_interactive_on_this_thread() -> bool {
     CLAIM_ROLE.with(|cell| cell.borrow().interactive)
+}
+
+/// Lets protocol tests see that an interactive lookup waits for a claim.
+#[cfg(feature = "test-support")]
+fn mark_interactive_claim_wait_for_tests() {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PASCAL_LSP_TEST_INTERACTIVE_CLAIM_WAIT_MARKER") else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
+        let _ = marker.write_all(b"x");
+    }
 }
 
 /// Whether `waiter` waiting for a slot `owner` computes would close a cycle
@@ -3974,6 +4069,8 @@ impl ProjectCache {
         let thread = std::thread::current().id();
         let mut wait_started: Option<std::time::Instant> = None;
         let mut taking_over = false;
+        #[cfg(feature = "test-support")]
+        let mut wait_marked = false;
         let mut state = lock(&self.inner);
         loop {
             match state.slots.get(&key) {
@@ -3999,17 +4096,17 @@ impl ProjectCache {
                     }
                     // Claims of threads without a role (the main thread, which
                     // parses opened documents) cannot be cancelled or taken
-                    // over, so they are bounded like import claims.
-                    let import_wait = role
-                        .import_claim_wait
-                        .filter(|_| layer == Layer::Import || owner.role.cancel.is_none())
+                    // over, so waits for them are bounded.
+                    let bounded_wait = role
+                        .roleless_claim_wait
+                        .filter(|_| owner.role.cancel.is_none())
                         .map(|limit| limit.saturating_sub(waiting_since.elapsed()));
                     // The claim computes another revision of the input, this
-                    // thread may not wait longer for an import slot, or
+                    // thread may not wait longer for a role-less owner, or
                     // waiting would close a cycle of waits: compute without
                     // caching instead of waiting on it.
                     if *claimed_input != input_hash
-                        || import_wait.is_some_and(|remaining| remaining.is_zero())
+                        || bounded_wait.is_some_and(|remaining| remaining.is_zero())
                         || wait_closes_cycle(&state, thread, owner.thread)
                     {
                         let generation = *generation;
@@ -4030,11 +4127,20 @@ impl ProjectCache {
                             started: std::time::Instant::now(),
                         });
                     }
+                    #[cfg(feature = "test-support")]
+                    if role.interactive && !wait_marked {
+                        // The marker is a file: write it without the lock.
+                        wait_marked = true;
+                        drop(state);
+                        mark_interactive_claim_wait_for_tests();
+                        state = lock(&self.inner);
+                        continue;
+                    }
                     state.waiting.insert(thread, key.clone());
                     #[cfg(test)]
                     self.signal_waiter_hook();
                     let slice =
-                        import_wait.map_or(WAIT_SLICE, |remaining| remaining.min(WAIT_SLICE));
+                        bounded_wait.map_or(WAIT_SLICE, |remaining| remaining.min(WAIT_SLICE));
                     state = wait_timeout_recovering_poison_for(&self.inner, state, slice).0;
                     state.waiting.remove(&thread);
                 }
@@ -4120,6 +4226,7 @@ impl ProjectCache {
         let invalidation_epoch = snapshot_epoch.unwrap_or(state.invalidation_epoch);
         let context = intern_context(&mut state, key.fingerprint, context);
         self.release(state);
+        HELD_CLAIMS.with(|held| held.set(held.get() + 1));
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,

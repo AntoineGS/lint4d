@@ -283,6 +283,17 @@ fn list_remove(map: &mut Inverted, name: NameId, id: MemberId) {
     }
 }
 
+pub(crate) fn member_slot_bytes() -> usize {
+    size_of::<Member>()
+}
+
+/// What listing one path in the membership costs: the path is kept three
+/// times (the membership, `Member::path`, the `by_path` key) beside a whole
+/// `Member` slot, plus a margin for map overhead.
+pub(crate) fn membership_charge(path: &Path) -> usize {
+    3 * path.as_os_str().len() + size_of::<Member>() + 64
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ContextIndex {
     generation: u64,

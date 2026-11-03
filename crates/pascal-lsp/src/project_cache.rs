@@ -16,7 +16,9 @@ use crate::navigation::ParsedDocument;
 use crate::navigation::compiled_dcu::project_context_fingerprint;
 use crate::workspace::ContextKey;
 use crate::workspace::rename::OverlayInput;
-use crate::workspace_index::{ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp};
+use crate::workspace_index::{
+    ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
+};
 
 /// Default for the `maxCacheBytes` limit.
 pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -4832,7 +4834,7 @@ impl Drop for IndexGuard<'_> {
 }
 
 fn membership_bytes(paths: &[PathBuf]) -> usize {
-    paths.iter().map(|path| path.as_os_str().len() + 48).sum()
+    paths.iter().map(|path| membership_charge(path)).sum()
 }
 
 /// The workspace index store (l4d-33): one `ContextIndex` per context, at
@@ -4971,6 +4973,10 @@ impl ProjectCache {
             self.release_index(released);
             return;
         }
+        // Retries lost to concurrent changes: leave the gap visible.
+        if let Some(stored) = self.index().contexts.get_mut(&key) {
+            stored.memory_exhausted = true;
+        }
     }
 
     pub(crate) fn publish_index_member(
@@ -5001,7 +5007,11 @@ impl ProjectCache {
         let clock = store.tick();
         let old = store.contexts.get_mut(key).and_then(|stored| {
             stored.last_used = clock;
-            stored.index.insert(path, facts, stamps, content_hash)
+            let old = stored.index.insert(path, facts, stamps, content_hash);
+            if old.is_some() {
+                stored.memory_exhausted = false;
+            }
+            old
         });
         drop(store);
         match old {
@@ -5476,7 +5486,10 @@ mod index_tests {
     }
 
     fn membership_cost(paths: &[&str]) -> usize {
-        paths.iter().map(|path| path.len() + 48).sum()
+        paths
+            .iter()
+            .map(|path| crate::workspace_index::membership_charge(Path::new(path)))
+            .sum()
     }
 
     fn facts_with(path: &str, posting: &str, slots: Vec<Option<PathBuf>>) -> MemberFacts {
@@ -5625,6 +5638,38 @@ mod index_tests {
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
         assert_eq!(publish(&cache, &b, "/w/A.pas"), PublishOutcome::Indexed);
         assert_eq!(cache.stats().reserved_index_bytes, base + 2 * c);
+    }
+
+    #[test]
+    fn the_membership_charge_covers_what_a_member_retains() {
+        let path = Path::new("/w/A.pas");
+        let charge = crate::workspace_index::membership_charge(path);
+        let retained = 3 * path.as_os_str().len() + crate::workspace_index::member_slot_bytes();
+        assert!(charge >= retained, "{charge} < {retained}");
+    }
+
+    #[test]
+    fn a_successful_publish_clears_the_memory_gap() {
+        let cache = ProjectCache::new(4096);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        assert!(!cache.index_memory_exhausted(&a));
+    }
+
+    #[test]
+    fn a_membership_that_cannot_be_charged_records_the_gap() {
+        let cache = ProjectCache::new(256);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
 
     #[test]

@@ -225,6 +225,7 @@ impl Store {
         self.guarded(Access::Maintenance, || {
             let fail = |error: rusqlite::Error| classify(&error);
             let since = live_since(self.clock.unix_seconds());
+            let limit = |rows: usize| i64::try_from(rows).unwrap_or(i64::MAX);
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             let holds = transaction
@@ -233,7 +234,7 @@ impl Store {
                      JOIN process_leases l ON l.namespace_id = h.namespace_id \
                      AND l.reset_epoch = h.reset_epoch AND l.lease_id = h.lease_id \
                      WHERE l.renewed_unix_seconds < ?1 LIMIT ?2)",
-                    params![since, max_rows as i64],
+                    params![since, limit(max_rows)],
                 )
                 .map_err(fail)?;
             let leases = transaction
@@ -242,7 +243,7 @@ impl Store {
                      WHERE l.renewed_unix_seconds < ?1 AND NOT EXISTS (SELECT 1 FROM lease_holds h \
                      WHERE h.namespace_id = l.namespace_id AND h.reset_epoch = l.reset_epoch \
                      AND h.lease_id = l.lease_id) LIMIT ?2)",
-                    params![since, (max_rows - holds) as i64],
+                    params![since, limit(max_rows - holds)],
                 )
                 .map_err(fail)?;
             transaction.commit().map_err(fail)?;

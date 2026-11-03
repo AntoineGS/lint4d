@@ -12,13 +12,15 @@ use pascal_cache::{
     ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, DiscoveryInputs,
     DiscoveryScope, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint,
     HintStats, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup,
-    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, MaintenanceLimits, Miss, Observation,
-    PolicyError, PolicyState, Pressure, Published, Reclaimed, RetireStep, ScannedDirectory,
-    SnapshotSeal, SourceContent, Store, StorePolicy, Unhealthy,
+    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Maintenance, MaintenanceLimits,
+    MaintenanceLimitsError, Miss, Observation, Phase, PolicyError, PolicyState, Pressure,
+    Published, Reclaimed, RetireStep, ScannedDirectory, SnapshotSeal, SourceContent, StepBudget,
+    Store, StorePolicy, Unhealthy,
 };
 use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 fn key(text: &str) -> LocalArtifactKey {
     LocalArtifactKey::new(
@@ -1243,4 +1245,303 @@ fn a_vacuum_batch_passes_its_fault_point_before_commit() {
     });
     store.checkpoint().unwrap();
     assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn reclaiming_zero_rows_with_nothing_retired_is_complete() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    assert_eq!(
+        store.reclaim(0),
+        Ok(Reclaimed {
+            rows: 0,
+            complete: true
+        })
+    );
+}
+
+const ROOMY: StepBudget = StepBudget {
+    time: std::time::Duration::from_secs(60),
+    rows: 10,
+};
+
+fn strays(store: &Store, count: usize) {
+    for index in 0..count {
+        artifact(store, &format!("unit Stray{index};"));
+        binding_evidence(store, &format!("stray{index}"), "/w/Stray.pas");
+    }
+    records(store, "Stray", count);
+}
+
+#[test]
+fn a_cycle_reclaims_everything_unreferenced_within_its_row_budget() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let evidence = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    let kept = store
+        .publish_member_record(&local_member(
+            &store,
+            "/w/Main.pas",
+            "unit Main;",
+            "/w/Shapes.pas",
+            evidence,
+        ))
+        .unwrap()
+        .record_id;
+    let snapshot = sealed(&store, &[kept]);
+    strays(&store, 12);
+    age_past_grace(&store);
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let never = AtomicBool::new(false);
+    let mut steps = 0;
+    loop {
+        let report = maintenance.step(&store, ROOMY, &never).unwrap();
+        assert!(report.rows <= ROOMY.rows, "{report:?}");
+        assert_eq!(check_invariant(root.path()), 0);
+        steps += 1;
+        if report.cycle_complete {
+            break;
+        }
+        assert!(steps < 100);
+    }
+    assert!(steps > 1, "the row budget split the cycle");
+    for table in ["artifacts", "evidence_sets", "member_records"] {
+        assert_eq!(
+            count(root.path(), &format!("SELECT count(*) FROM {table}")),
+            1,
+            "{table}"
+        );
+    }
+    assert_eq!(read_members(&store, &snapshot).map(|m| m.len()), Ok(1));
+    assert_eq!(maintenance.phase(), Phase::Done);
+    let next = maintenance.step(&store, ROOMY, &never).unwrap();
+    assert!(
+        next.cycle_complete && next.rows == 0,
+        "a new cycle: {next:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_step_stops_between_transactions_and_resumes() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    strays(&store, 3);
+    age_past_grace(&store);
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&cancel);
+    store.set_fault_for_test(FaultPoint::GcRetireBeforeCommit, move || {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let report = maintenance
+        .step(
+            &store,
+            StepBudget {
+                rows: 1000,
+                ..ROOMY
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(report.cancelled && !report.cycle_complete, "{report:?}");
+    let stopped = maintenance.phase();
+    assert!(stopped >= Phase::AbandonedBuilds && stopped < Phase::Done);
+    store.clear_fault_for_test(FaultPoint::GcRetireBeforeCommit);
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let report = maintenance
+        .step(
+            &store,
+            StepBudget {
+                rows: 1000,
+                ..ROOMY
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(report.cycle_complete, "{report:?}");
+    assert_eq!(count(root.path(), "SELECT count(*) FROM artifacts"), 0);
+}
+
+#[test]
+fn a_step_is_skipped_while_another_holder_has_the_maintenance_lock() {
+    let root = private_tempdir();
+    let first = open(root.path());
+    let second = open(root.path());
+    let held = first.hold_maintenance_lock_for_test().unwrap();
+    assert!(root.path().join("maintenance.lock").is_file());
+    assert_eq!(
+        second.location().maintenance_lock(),
+        root.path().join("maintenance.lock")
+    );
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let report = maintenance
+        .step(&second, ROOMY, &AtomicBool::new(false))
+        .unwrap();
+    assert!(report.skipped && report.rows == 0, "{report:?}");
+    drop(held);
+    assert!(
+        !maintenance
+            .step(&second, ROOMY, &AtomicBool::new(false))
+            .unwrap()
+            .skipped
+    );
+}
+
+fn newest_renewal(directory: &Path) -> i64 {
+    count(
+        directory,
+        "SELECT max(renewed_unix_seconds) FROM process_leases",
+    )
+}
+
+#[test]
+fn a_skipped_step_still_renews_a_due_lease_and_every_step_does() {
+    let root = private_tempdir();
+    let first = open(root.path());
+    let second = open(root.path());
+    let opened = newest_renewal(root.path());
+    let held = first.hold_maintenance_lock_for_test().unwrap();
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let never = AtomicBool::new(false);
+    assert!(maintenance.step(&second, ROOMY, &never).unwrap().skipped);
+    assert_eq!(newest_renewal(root.path()), opened, "not due: no write");
+    second.advance_clock_for_test(LEASE_RENEWAL);
+    assert!(maintenance.step(&second, ROOMY, &never).unwrap().skipped);
+    let renewed = newest_renewal(root.path());
+    assert!(renewed >= opened + 60, "{opened} -> {renewed}");
+    drop(held);
+    // A step resuming past the Leases phase renews too.
+    let limited = StepBudget { rows: 0, ..ROOMY };
+    let report = maintenance.step(&second, limited, &never).unwrap();
+    assert_eq!((report.rows, maintenance.phase()), (0, Phase::Hints));
+    second.advance_clock_for_test(LEASE_RENEWAL);
+    maintenance.step(&second, limited, &never).unwrap();
+    assert!(newest_renewal(root.path()) >= renewed + 60);
+}
+
+#[test]
+fn the_driver_refuses_invalid_limits() {
+    assert_eq!(
+        Maintenance::new(MaintenanceLimits {
+            batch_rows: 0,
+            ..EAGER
+        })
+        .err(),
+        Some(MaintenanceLimitsError::BatchRows)
+    );
+    assert_eq!(Maintenance::new(EAGER).unwrap().phase(), Phase::Hints);
+}
+
+#[test]
+fn under_wal_pressure_maintenance_only_checkpoints() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    strays(&store, 2);
+    age_past_grace(&store);
+    let reader = raw(root.path());
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .unwrap();
+    publish_bulk(&store, "unit Bulk;", 9, 1_000_000).unwrap();
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let never = AtomicBool::new(false);
+    store.advance_clock_for_test(LEASE_RENEWAL);
+    let renewal = newest_renewal(root.path());
+    let report = maintenance.step(&store, ROOMY, &never).unwrap();
+    assert_eq!(
+        (report.pressure, report.rows, maintenance.phase()),
+        (Pressure::WalPressure, 0, Phase::Hints)
+    );
+    assert_eq!(
+        newest_renewal(root.path()),
+        renewal,
+        "not even a lease renewal"
+    );
+    reader.execute_batch("COMMIT").unwrap();
+    let report = maintenance.step(&store, ROOMY, &never).unwrap();
+    assert!(report.rows > 0, "{report:?}");
+}
+
+#[test]
+fn a_full_store_still_runs_maintenance() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    strays(&store, 2);
+    age_past_grace(&store);
+    store.limit_growth_for_test(4).unwrap();
+    assert_eq!(
+        publish_bulk(&store, "unit Big;", 10, 200_000),
+        Err(Bypass::Full)
+    );
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let report = maintenance
+        .step(
+            &store,
+            StepBudget {
+                rows: 1000,
+                ..ROOMY
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(report.cycle_complete && report.rows > 0, "{report:?}");
+}
+
+#[test]
+fn wal_pressure_reached_mid_cycle_stops_the_writes_not_the_step() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    strays(&store, 2);
+    age_past_grace(&store);
+    // Opened after the strays, so its lease does not hold them back.
+    let publisher = std::sync::Arc::new(open(root.path()));
+    let reader = std::sync::Arc::new(std::sync::Mutex::new(raw(root.path())));
+    let (racer, held) = (std::sync::Arc::clone(&publisher), reader.clone());
+    let once = std::sync::Once::new();
+    store.set_fault_for_test(FaultPoint::CheckpointCompleted, move || {
+        once.call_once(|| {
+            let held = held.lock().unwrap();
+            held.execute_batch("BEGIN").unwrap();
+            let _: i64 = held
+                .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+                .unwrap();
+            publish_bulk(&racer, "unit Bulk;", 9, 1_000_000).unwrap();
+        })
+    });
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let never = AtomicBool::new(false);
+    let budget = StepBudget {
+        rows: 1000,
+        ..ROOMY
+    };
+    let report = maintenance.step(&store, budget, &never).unwrap();
+    assert_eq!(
+        (report.pressure, report.rows, report.phase),
+        (Pressure::WalPressure, 0, Phase::ObsoleteNamespaces),
+        "{report:?}"
+    );
+    assert_eq!(maintenance.phase(), Phase::ObsoleteNamespaces);
+    assert_eq!(store.health(), None, "not a failure");
+    reader.lock().unwrap().execute_batch("COMMIT").unwrap();
+    let report = maintenance.step(&store, budget, &never).unwrap();
+    assert!(report.cycle_complete && report.rows > 0, "{report:?}");
 }

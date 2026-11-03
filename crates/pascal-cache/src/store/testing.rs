@@ -258,6 +258,19 @@ impl Store {
     }
 }
 
+/// `maintenance.lock` held by a test until dropped.
+pub struct MaintenanceLockHold(#[allow(dead_code)] super::maintenance::MaintenanceLock);
+
+impl Store {
+    /// Take `maintenance.lock` as another maintainer would; `Busy` when
+    /// someone holds it.
+    pub fn hold_maintenance_lock_for_test(&self) -> Result<MaintenanceLockHold, Bypass> {
+        super::maintenance::MaintenanceLock::try_take(&self.location)?
+            .map(MaintenanceLockHold)
+            .ok_or(Bypass::Busy)
+    }
+}
+
 /// Scratch held by a test until dropped.
 #[derive(Debug)]
 pub struct ScratchHold {

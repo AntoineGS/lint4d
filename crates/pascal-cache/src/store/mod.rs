@@ -24,6 +24,7 @@ mod keys;
 mod leases;
 mod limits;
 mod location;
+mod maintenance;
 mod namespaces;
 mod nonce;
 mod outcome;
@@ -51,6 +52,7 @@ pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
 pub use index::{IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
+pub use maintenance::{Maintenance, Phase, StepBudget, StepReport};
 pub use outcome::SealRefusal;
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
 #[cfg(feature = "test-support")]
@@ -88,7 +90,7 @@ pub use limits::{
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
 #[cfg(feature = "test-support")]
-pub use testing::{HeldConnection, ScratchHold};
+pub use testing::{HeldConnection, MaintenanceLockHold, ScratchHold};
 pub use wal::Checkpointed;
 
 use crate::Namespace;

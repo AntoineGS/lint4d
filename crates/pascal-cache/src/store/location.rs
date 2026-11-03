@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub const DATABASE_FILE: &str = "analysis.sqlite3";
 const NAMESPACE_LOCKS: &str = "namespaces";
+const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
 /// The default cache directory: the platform user cache directory plus
 /// `lint4d/analysis` (spec §11.1).
@@ -75,6 +76,11 @@ impl StoreLocation {
         self.directory
             .join(NAMESPACE_LOCKS)
             .join(format!("{}.lock", namespace.to_hex()))
+    }
+
+    /// The lock file one maintenance step holds exclusively; never removed.
+    pub fn maintenance_lock(&self) -> PathBuf {
+        self.directory.join(MAINTENANCE_LOCK)
     }
 
     pub fn prepare_namespace_locks(&self) -> Result<(), Bypass> {

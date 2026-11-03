@@ -72,7 +72,7 @@ pub(crate) struct NamespaceLock {
     path: PathBuf,
 }
 
-fn open_lock_file(path: &Path) -> Result<File, Bypass> {
+pub(crate) fn open_lock_file(path: &Path) -> Result<File, Bypass> {
     StoreLocation::check_file(path)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -329,7 +329,10 @@ pub(crate) fn reclaim(
             )
             .map_err(fail)?;
     }
+    // With no rows left to spend, the live scope is not examined:
+    // `complete` then speaks for the retired scopes only.
     let drained = match ensure_live(transaction, live) {
+        Ok(()) if budget == 0 => true,
         Ok(()) => {
             let (deleted, drained) = gc::delete_retired(transaction, live, budget)?;
             rows += deleted;

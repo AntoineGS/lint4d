@@ -121,3 +121,26 @@ fn pathological_work_on_a_small_source_still_trips_the_step_limit() {
         CompileTimeLimits::default().max_work
     );
 }
+
+/// Directive bodies are charged for the bytes their application reads, not
+/// a multiple of each body byte.
+#[test]
+fn directive_bodies_are_charged_for_the_bytes_they_read() {
+    let usage = |padding: usize| {
+        let pad = " ".repeat(padding);
+        let mut text = String::from("unit T;\ninterface\n");
+        for _ in 0..1000 {
+            text.push_str(&format!("{{$HINTS OFF{pad}}}{{$WARNINGS ON{pad}}}\n"));
+        }
+        text.push_str("implementation\nend.\n");
+        let (result, usage) = analyze(&text);
+        assert!(matches!(result, Ok(true)), "{result:?}");
+        usage
+    };
+    let (short, long) = (usage(0), usage(100));
+    let body_bytes = 2 * 1000 * 100;
+    let work = (long.work - short.work) as f64 / body_bytes as f64;
+    let bytes = (long.byte_work - short.byte_work) as f64 / body_bytes as f64;
+    assert!(work <= 3.0, "{work} steps per directive body byte");
+    assert!(bytes <= 24.0, "{bytes} byte work per directive body byte");
+}

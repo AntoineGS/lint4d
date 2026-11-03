@@ -3162,11 +3162,16 @@ fn apply_path_directive(
 ) -> Result<(), IncompleteReason> {
     // Bound shared-decoder scratch and scan/copy work before parsing switch
     // lists or invoking the legacy scalar mutator's independent safety limits.
+    // The body is read by a bounded number of passes (key, value, option and
+    // switch-list decoding, member keys, this member count): byte work per
+    // pass. Steps are one per directive and one per list member.
+    const BODY_PASSES: usize = 8;
     let bytes = directive.body.len();
     let scratch = bytes.saturating_mul(2 * size_of::<&str>());
+    let members = directive.body.bytes().filter(|b| *b == b',').count() + 1;
     budget.charge(
-        bytes.saturating_mul(8).saturating_add(1),
-        bytes.saturating_mul(32),
+        members.saturating_add(1),
+        bytes.saturating_mul(BODY_PASSES),
         scratch,
     )?;
     let result = apply_path_directive_inner(path, directive, budget);
@@ -3451,31 +3456,32 @@ mod tests {
         assert!(output.root.complete);
         assert!(output.reasons.is_empty());
         assert_eq!(output.directive_fragments.len(), 8_000);
-        assert!(spent.work > 1_000_000);
+        assert!(spent.work > 100_000);
         assert!(spent.work < 2_000_000);
         assert!(spent.byte_work < 64 * 1024 * 1024);
-        let old = analyze_source(
+        // A fixed step cap one short of the actual processing refuses it.
+        let short = analyze_source(
             &root,
             &ConditionalContext::default(),
             &mut NoGraphCallbacks,
             CompileTimeLimits {
-                max_work: 1_000_000,
-                // The old fixed profile: no steps granted per source byte.
+                max_work: spent.work - 1,
                 work_per_source_byte: 0,
-                max_byte_work: 16 * 1024 * 1024,
                 ..limits
             },
             &NoCancellation,
         );
-        eprintln!("old work defaults on the same normal fixture: {old:?}");
-        assert!(matches!(
-            old,
-            Err(ResolverError::LimitExceeded {
-                limit: "max_work",
-                observed: 1_000_001,
-                maximum: 1_000_000
-            })
-        ));
+        assert!(
+            matches!(
+                short,
+                Err(ResolverError::LimitExceeded {
+                    limit: "max_work",
+                    observed,
+                    maximum,
+                }) if maximum == spent.work - 1 && observed == spent.work
+            ),
+            "{short:?}"
+        );
         let extreme = graph_source(&format!(
             "unit Dense; interface {} implementation end.",
             "{$DEFINE LOCAL}\n".repeat(16_000)
@@ -3487,12 +3493,12 @@ mod tests {
             limits,
             &NoCancellation,
         );
-        // Dense directives cost a linear number of steps beyond the fixed
-        // 2M profile; the steps granted per scanned source byte admit them
-        // (superlinear work still trips: tests/compile_time_work_scaling.rs).
+        // Dense directives cost a linear number of steps; the steps granted
+        // per scanned source byte bound them (superlinear work still trips:
+        // tests/compile_time_work_scaling.rs).
         let output = dense.expect("dense directives fit the per-byte grant");
         assert!(output.root.complete);
-        assert!(output.budget.budget_snapshot().work > 2_000_000);
+        assert!(output.budget.budget_snapshot().work > spent.work);
         assert!(
             output.budget.budget_snapshot().work
                 < 2_000_000 + extreme.bytes.len() * limits.work_per_source_byte
@@ -3878,6 +3884,7 @@ mod tests {
             },
             CompileTimeLimits {
                 max_work: 32,
+                work_per_source_byte: 0,
                 ..limits
             },
         ] {

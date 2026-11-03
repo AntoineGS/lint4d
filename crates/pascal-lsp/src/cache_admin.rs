@@ -202,10 +202,15 @@ fn failure(
 ) -> (Value, i32, String) {
     let mut base = base;
     base["error"] = error;
+    // The policy mode has two flags, so it is named by what failed.
+    let operation = match mode {
+        "policy" => "policy change".to_owned(),
+        _ => format!("--cache-{mode}"),
+    };
     (
         base,
         1,
-        format!("pascal-lsp: --cache-{mode} failed: {kind}; advice: {advice}"),
+        format!("pascal-lsp: {operation} failed: {kind}; advice: {advice}"),
     )
 }
 
@@ -356,17 +361,13 @@ fn set_policy(
             (base, 0, String::new())
         }
         Err(PolicyError::Store(bypass)) => bypass_failure(base, "policy", &bypass),
-        Err(PolicyError::RevisionChanged { current }) => {
-            let mut result = failure(
-                base,
-                "policy",
-                json!({ "policy": "revisionChanged", "current": current }),
-                "revisionChanged",
-                "rerun",
-            );
-            result.2 = "pascal-lsp: --cache-policy failed: revisionChanged; advice: rerun".into();
-            result
-        }
+        Err(PolicyError::RevisionChanged { current }) => failure(
+            base,
+            "policy",
+            json!({ "policy": "revisionChanged", "current": current }),
+            "revisionChanged",
+            "rerun",
+        ),
         Err(other) => {
             let kind = match other {
                 PolicyError::WalThresholdTooSmall => "walThresholdTooSmall",

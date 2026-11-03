@@ -9,14 +9,23 @@ fn print_help() {
     );
 }
 
+fn usage_error(error: impl std::fmt::Display) -> ! {
+    eprintln!("pascal-lsp: {error}\n");
+    eprintln!("Use --help for usage.");
+    std::process::exit(2);
+}
+
 fn main() {
-    let arguments: Vec<String> = env::args().skip(1).collect();
+    let arguments: Vec<String> = env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .unwrap_or_else(|_| usage_error("arguments must be valid UTF-8"))
+        })
+        .collect();
     match pascal_lsp::cache_admin::parse_arguments(&arguments) {
-        Err(error) => {
-            eprintln!("pascal-lsp: {error}\n");
-            eprintln!("Use --help for usage.");
-            std::process::exit(2);
-        }
+        Err(error) => usage_error(error),
         Ok(Invocation::Help) => print_help(),
         Ok(Invocation::Version) => println!("pascal-lsp {VERSION}"),
         Ok(Invocation::Cache { directory, mode }) => {

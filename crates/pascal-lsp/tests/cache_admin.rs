@@ -174,6 +174,10 @@ fn an_invalid_policy_is_refused_and_leaves_the_policy_unchanged() {
         assert_eq!(code, 1, "{json}");
         assert_eq!(json["error"]["policy"], kind, "{json}");
         assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with(&format!("pascal-lsp: policy change failed: {kind};")),
+            "{stderr}"
+        );
     }
     assert_eq!(revision(environment.path()), before);
 }
@@ -228,6 +232,29 @@ fn usage_errors_exit_two_with_nothing_on_stdout_and_nothing_created() {
         assert!(json.is_none(), "{case:?}");
         assert!(stderr.contains("--help"), "{case:?}: {stderr}");
     }
+    assert!(!Path::new(directory).exists());
+}
+
+#[test]
+fn a_non_utf8_argument_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let environment = tempfile::tempdir().unwrap();
+    let mut directory = environment.path().as_os_str().as_bytes().to_vec();
+    directory.extend_from_slice(b"/store\xff");
+    let directory = std::ffi::OsStr::from_bytes(&directory);
+    let output = Command::new(env!("CARGO_BIN_EXE_pascal-lsp"))
+        .arg("--cache-status")
+        .arg("--cache-directory")
+        .arg(directory)
+        .env("HOME", environment.path().join("home"))
+        .env("XDG_CACHE_HOME", environment.path().join("cache"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run pascal-lsp");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("--help"), "{stderr}");
     assert!(!Path::new(directory).exists());
 }
 

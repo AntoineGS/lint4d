@@ -127,7 +127,7 @@ mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
-mod indexing;
+pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
 mod persist;
@@ -13127,6 +13127,10 @@ impl Workspace {
 
     pub(crate) fn project_cache(&self) -> &crate::project_cache::ProjectCache {
         &self.project_cache
+    }
+
+    pub(crate) fn configured_project_file(&self) -> Option<&Path> {
+        self.options.project_file.as_deref()
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {

@@ -12054,6 +12054,9 @@ fn maintain_warmer(
             warmer.request_closure_crawl(uri, cache.invalidation_epoch());
         }
     }
+    for anchor in cache.take_index_requests() {
+        warmer.request_index(anchor);
+    }
     for event in warmer.poll(workspace) {
         if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event
             && workspace.is_open(uri)

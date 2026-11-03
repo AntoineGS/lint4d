@@ -19,15 +19,15 @@ use super::persist::PersistError;
 use super::{ContextKey, Workspace};
 use lsp_types::Url;
 use pascal_cache::{
-    Binding, Bypass, ContextKey as CacheContextKey, CoverageStatus, Digest, DiscoveryScope,
-    EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite, IncompleteReason, LookupKey,
-    MAX_ROW_BATCH_ROWS, MemberCoverage, MemberError, MemberHeader, MemberRecord, Observation,
-    PublishedRecord, SnapshotCoverage, SnapshotHeader, SnapshotSeal, SourceIdentity, Store,
-    encoded_content_bytes, evidence_id,
+    Binding, BindingKind, BindingOutcome, Bypass, ContextKey as CacheContextKey, CoverageStatus,
+    Digest, DiscoveryScope, EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite, Hint,
+    IncompleteReason, Lookup, LookupKey, MAX_ROW_BATCH_ROWS, MemberCoverage, MemberError,
+    MemberHeader, MemberRecord, Observation, PublishedRecord, SnapshotCoverage, SnapshotHeader,
+    SnapshotSeal, SourceIdentity, Store, encoded_content_bytes, evidence_id,
 };
-use pascal_core::facts::FactBudget;
+use pascal_core::facts::{ArtifactFacts, CoverageReason, DeclarationKind, FactBudget};
 use pascal_core::resolver::ResolutionObservation;
-use pascal_project::{ProjectContext, ProjectObservations, ProjectPathProvenance};
+use pascal_project::{ProjectContext, ProjectObservations, ProjectPathProvenance, SourceOrigin};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -181,17 +181,7 @@ impl Workspace {
         budget: &mut FactBudget,
         cancel: &AtomicBool,
     ) -> Result<Eligible<MemberRecord>, Ineligible> {
-        if self.root_is_session_private(uri) {
-            return Err(Ineligible::SessionPrivate(uri.clone()));
-        }
-        let state = self
-            .document_contexts
-            .get(uri)
-            .and_then(|key| self.contexts.get(key))
-            .ok_or(Ineligible::NoContext)?;
-        let path = uri
-            .to_file_path()
-            .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
+        let (state, path) = self.member_site(uri)?;
         let prepared = if self.root_over_size_limit(&path, &state.context) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Ineligible::Artifact(PersistError::Cancelled));
@@ -236,15 +226,9 @@ impl Workspace {
             }
             bindings.push(checked.binding);
         }
-        let canonical = super::absolute_path(path);
         let record = MemberRecord {
             header: MemberHeader {
-                source: SourceIdentity {
-                    canonical: canonical.clone(),
-                    logical: canonical,
-                    spelling: None,
-                    uri: Some(uri.to_string()),
-                },
+                source: member_source(path, uri),
                 artifact,
                 member_evidence,
                 origin,
@@ -259,6 +243,48 @@ impl Workspace {
             context,
             evidence,
         })
+    }
+
+    /// The record of a member the index holds, if this session may publish
+    /// it: the session-private and context checks of `eligible_member`, with
+    /// the record derived from `inputs` alone (`member_record`). No binding
+    /// is recorded, so the proof carries no pending evidence.
+    pub(crate) fn eligible_indexed_member(
+        &self,
+        key: &ContextKey,
+        inputs: &RecordInputs<'_>,
+    ) -> Result<Eligible<MemberRecord>, Ineligible> {
+        let uri = Url::from_file_path(inputs.path)
+            .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
+        let (state, _) = self.member_site(&uri)?;
+        if self.document_contexts.get(&uri) != Some(key) {
+            return Err(Ineligible::NoContext);
+        }
+        let record = member_record(inputs);
+        record.validate().map_err(Ineligible::Record)?;
+        Ok(Eligible {
+            value: record,
+            context: CacheContextKey::new(&state.context),
+            evidence: Vec::new(),
+        })
+    }
+
+    /// The checks `eligible_member` and `eligible_indexed_member` share:
+    /// `uri` is no session-private root, belongs to a known context, and is
+    /// a file; returns that context's state and the file path.
+    fn member_site(&self, uri: &Url) -> Result<(&super::ContextState, PathBuf), Ineligible> {
+        if self.root_is_session_private(uri) {
+            return Err(Ineligible::SessionPrivate(uri.clone()));
+        }
+        let state = self
+            .document_contexts
+            .get(uri)
+            .and_then(|key| self.contexts.get(key))
+            .ok_or(Ineligible::NoContext)?;
+        let path = uri
+            .to_file_path()
+            .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
+        Ok((state, path))
     }
 
     /// Whether the saved root at `path` exceeds `maxFileBytes`, by its
@@ -351,6 +377,184 @@ impl Workspace {
             context: cache_context,
             evidence: vec![PendingEvidence::Discovery(scope, captured)],
         })
+    }
+}
+
+fn member_source(path: PathBuf, uri: &Url) -> SourceIdentity {
+    let canonical = super::absolute_path(path);
+    SourceIdentity {
+        canonical: canonical.clone(),
+        logical: canonical,
+        spelling: None,
+        uri: Some(uri.to_string()),
+    }
+}
+
+/// Why a listed member has no artifact (spec §5 amendment 2026-11-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unindexed {
+    OverSize,
+    NotRecorded,
+}
+
+/// Everything a member record derives from: a record rebuilt from reused
+/// facts is byte-identical to the one extraction published.
+pub(crate) struct RecordInputs<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) facts: Option<&'a ArtifactFacts>,
+    pub(crate) artifact: Option<Digest>,
+    pub(crate) member_evidence: Option<Digest>,
+    pub(crate) origin: SourceOrigin,
+    pub(crate) unindexed: Option<Unindexed>,
+}
+
+/// The member record `inputs` derive: bindings are not recorded (each is
+/// `Incomplete(NotRecorded)`), imports by ID then includes by slot.
+pub(crate) fn member_record(inputs: &RecordInputs<'_>) -> MemberRecord {
+    let canonical = super::absolute_path(inputs.path.to_path_buf());
+    let uri = Url::from_file_path(&canonical).ok();
+    let has_unit = inputs.facts.is_some_and(|facts| {
+        facts
+            .declarations
+            .iter()
+            .any(|declaration| declaration.kind == DeclarationKind::Unit)
+    });
+    let fallback_unit_name = if has_unit {
+        None
+    } else {
+        inputs
+            .path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    };
+    let not_recorded = || {
+        (
+            BindingOutcome::Incomplete(IncompleteReason::NotRecorded),
+            None::<Digest>,
+        )
+    };
+    let mut bindings = Vec::new();
+    if let Some(facts) = inputs.facts {
+        let mut imports = facts
+            .imports
+            .iter()
+            .map(|import| import.id)
+            .collect::<Vec<_>>();
+        imports.sort_unstable();
+        let mut includes = facts
+            .includes
+            .iter()
+            .map(|include| include.slot)
+            .collect::<Vec<_>>();
+        includes.sort_unstable();
+        for (kind, occurrences) in [
+            (BindingKind::Import, imports),
+            (BindingKind::Include, includes),
+        ] {
+            for occurrence in occurrences {
+                let (outcome, evidence) = not_recorded();
+                bindings.push(Binding {
+                    kind,
+                    occurrence: u64::from(occurrence),
+                    outcome,
+                    evidence,
+                });
+            }
+        }
+    }
+    let extraction = match (inputs.unindexed, inputs.facts) {
+        (Some(Unindexed::OverSize), _) => {
+            CoverageStatus::Incomplete(IncompleteReason::OverSizeLimit)
+        }
+        (Some(Unindexed::NotRecorded), _) => {
+            CoverageStatus::Incomplete(IncompleteReason::NotRecorded)
+        }
+        (None, Some(facts)) if facts.coverage.is_empty() => CoverageStatus::Complete,
+        (None, Some(facts)) if facts.coverage.contains(&CoverageReason::ConditionalUnknown) => {
+            CoverageStatus::Incomplete(IncompleteReason::UnknownConditional)
+        }
+        (None, _) => CoverageStatus::Incomplete(IncompleteReason::Unsupported),
+    };
+    let resolution = if bindings.is_empty() {
+        CoverageStatus::Complete
+    } else {
+        CoverageStatus::Incomplete(IncompleteReason::NotRecorded)
+    };
+    MemberRecord {
+        header: MemberHeader {
+            source: SourceIdentity {
+                canonical: canonical.clone(),
+                logical: canonical,
+                spelling: None,
+                uri: uri.map(|uri| uri.to_string()),
+            },
+            artifact: inputs.artifact,
+            member_evidence: inputs.member_evidence,
+            origin: inputs.origin,
+            fallback_unit_name,
+            coverage: MemberCoverage {
+                extraction,
+                resolution,
+            },
+        },
+        bindings,
+    }
+}
+
+/// A record this session published, or found live, after proving it
+/// eligible under `context` (D37). Only this module builds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvenRecord {
+    record_id: Digest,
+    path: PathBuf,
+    context: Digest,
+}
+
+impl ProvenRecord {
+    pub(crate) fn record_id(&self) -> Digest {
+        self.record_id
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn context(&self) -> Digest {
+        self.context
+    }
+}
+
+/// Publish (`publish_record`) and prove.
+pub(crate) fn publish_proven(
+    store: &Store,
+    record: &Eligible<MemberRecord>,
+) -> Result<ProvenRecord, Bypass> {
+    let published = publish_record(store, record)?;
+    Ok(ProvenRecord {
+        record_id: published.record_id,
+        path: record.value.header.source.canonical.clone(),
+        context: record.context.digest(),
+    })
+}
+
+/// Prove without writing when the record is already live (a restart).
+pub(crate) fn prove_existing(
+    store: &Store,
+    record: &Eligible<MemberRecord>,
+) -> Result<Option<ProvenRecord>, Bypass> {
+    let Ok(id) = record.value.id() else {
+        return Ok(None);
+    };
+    match store.open_member_record(id)? {
+        Lookup::Hit(_) => {
+            store.hint_used(Hint::Record(id));
+            Ok(Some(ProvenRecord {
+                record_id: id,
+                path: record.value.header.source.canonical.clone(),
+                context: record.context.digest(),
+            }))
+        }
+        Lookup::Miss(_) => Ok(None),
     }
 }
 
@@ -1147,5 +1351,211 @@ pub(in crate::workspace) mod tests {
                 .err(),
             Some(Ineligible::SessionPrivate(b))
         );
+    }
+
+    fn inputs<'a>(
+        path: &'a Path,
+        facts: Option<&'a ArtifactFacts>,
+        unindexed: Option<Unindexed>,
+    ) -> RecordInputs<'a> {
+        RecordInputs {
+            path,
+            facts,
+            artifact: None,
+            member_evidence: None,
+            origin: SourceOrigin::ProjectCompiled,
+            unindexed,
+        }
+    }
+
+    /// D36: the record extraction publishes and the record rebuilt from the
+    /// reused facts after a restart have one ID.
+    #[test]
+    fn extraction_and_reuse_build_the_same_record() {
+        use crate::workspace::persist::Reuse;
+        use crate::workspace::persist::tests::{restart, reuse};
+        let indexed = index(
+            &[
+                ("Main.pas", MAIN.as_bytes()),
+                ("Types.inc", TYPES.as_bytes()),
+                ("Nested.inc", NESTED.as_bytes()),
+            ],
+            &["Main.pas"],
+        );
+        let uri = indexed.uri("Main.pas");
+        let key = indexed.workspace.document_contexts[&uri].clone();
+        let path = indexed.root.join("Main.pas");
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let prepared = indexed
+            .workspace
+            .prepare_artifact(&uri, &mut budget(), &no_cancel())
+            .unwrap();
+        prepared.publish(&store).unwrap();
+        let extracted = indexed
+            .workspace
+            .eligible_indexed_member(
+                &key,
+                &RecordInputs {
+                    path: &path,
+                    facts: Some(&prepared.facts),
+                    artifact: Some(prepared.artifact_id()),
+                    member_evidence: prepared.member_evidence_id(),
+                    origin: prepared.origin,
+                    unindexed: None,
+                },
+            )
+            .unwrap();
+        let proven = publish_proven(&store, &extracted).unwrap();
+        assert_eq!(proven.path(), path);
+        assert_eq!(proven.context(), extracted.context().digest());
+        let mut restarted = restart(&indexed);
+        let Reuse::Hit {
+            facts, evidence, ..
+        } = reuse(&mut restarted, &uri, &store).unwrap()
+        else {
+            panic!("the published facts are reused")
+        };
+        let rebuilt = restarted
+            .eligible_indexed_member(
+                &key,
+                &RecordInputs {
+                    path: &path,
+                    facts: Some(&*facts.facts),
+                    artifact: Some(prepared.artifact_id()),
+                    member_evidence: evidence,
+                    origin: prepared.origin,
+                    unindexed: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(rebuilt.value(), extracted.value());
+        assert_eq!(rebuilt.value().id().unwrap(), proven.record_id());
+        assert_eq!(
+            prove_existing(&store, &rebuilt).unwrap(),
+            Some(proven.clone())
+        );
+        let other = private_dir();
+        let empty = open_store(other.path());
+        assert_eq!(
+            prove_existing(&empty, &rebuilt).unwrap(),
+            None,
+            "a record the store does not hold is not proven"
+        );
+    }
+
+    #[test]
+    fn bindings_are_not_recorded_and_ordered_imports_then_includes() {
+        let source = "unit Main;\ninterface\nuses Shapes;\n{$I Types.inc}\n{$I Missing.inc}\nimplementation\nend.\n";
+        let indexed = index(
+            &[
+                ("Main.pas", source.as_bytes()),
+                ("Types.inc", TYPES.as_bytes()),
+                ("Nested.inc", NESTED.as_bytes()),
+            ],
+            &["Main.pas"],
+        );
+        let facts = indexed.facts("Main.pas").extracted.facts;
+        assert_eq!(facts.imports.len(), 1);
+        assert!(facts.includes.len() >= 3, "{:?}", facts.includes);
+        let path = indexed.root.join("Main.pas");
+        let record = member_record(&inputs(&path, Some(&facts), None));
+        let kinds = record
+            .bindings
+            .iter()
+            .map(|binding| (binding.kind, binding.occurrence))
+            .collect::<Vec<_>>();
+        let mut expected = vec![(BindingKind::Import, u64::from(facts.imports[0].id))];
+        expected.extend(
+            facts
+                .includes
+                .iter()
+                .map(|include| (BindingKind::Include, u64::from(include.slot))),
+        );
+        assert_eq!(kinds, expected);
+        for binding in &record.bindings {
+            assert_eq!(
+                binding.outcome,
+                BindingOutcome::Incomplete(IncompleteReason::NotRecorded)
+            );
+            assert_eq!(binding.evidence, None);
+        }
+        assert_eq!(
+            record.header.coverage.resolution,
+            CoverageStatus::Incomplete(IncompleteReason::NotRecorded)
+        );
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unindexed_member_has_no_artifact_and_says_why() {
+        let path = Path::new("/w/Plain.pas");
+        for (why, reason) in [
+            (Unindexed::NotRecorded, IncompleteReason::NotRecorded),
+            (Unindexed::OverSize, IncompleteReason::OverSizeLimit),
+        ] {
+            let record = member_record(&inputs(path, None, Some(why)));
+            assert_eq!(record.header.artifact, None);
+            assert_eq!(record.header.member_evidence, None);
+            assert_eq!(
+                record.header.coverage.extraction,
+                CoverageStatus::Incomplete(reason)
+            );
+            assert!(record.bindings.is_empty());
+            assert_eq!(record.header.coverage.resolution, CoverageStatus::Complete);
+            assert_eq!(record.header.fallback_unit_name.as_deref(), Some("Plain"));
+            assert!(record.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn extraction_coverage_follows_the_fact_coverage() {
+        let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let path = indexed.root.join("Cond.pas");
+        let mut facts = indexed.facts("Cond.pas").extracted.facts;
+        assert!(facts.coverage.contains(&CoverageReason::ConditionalUnknown));
+        let coverage = |facts: &ArtifactFacts| {
+            let record = member_record(&inputs(&path, Some(facts), None));
+            assert_eq!(record.header.fallback_unit_name, None, "it declares a unit");
+            record.header.coverage.extraction
+        };
+        assert_eq!(
+            coverage(&facts),
+            CoverageStatus::Incomplete(IncompleteReason::UnknownConditional)
+        );
+        facts.coverage = vec![CoverageReason::ParserRecovery];
+        assert_eq!(
+            coverage(&facts),
+            CoverageStatus::Incomplete(IncompleteReason::Unsupported)
+        );
+        facts.coverage.clear();
+        assert_eq!(coverage(&facts), CoverageStatus::Complete);
+    }
+
+    #[test]
+    fn an_open_member_is_never_an_eligible_indexed_member() {
+        let edited = "unit Cond;\ninterface\nconst Edited = 1;\nimplementation\nend.\n";
+        let open = index_with_buffers(
+            &[("Cond.pas", CONDITIONAL)],
+            &[("Cond.pas", edited)],
+            &["Cond.pas"],
+        );
+        let uri = open.uri("Cond.pas");
+        let key = open.workspace.document_contexts[&uri].clone();
+        let path = open.root.join("Cond.pas");
+        assert_eq!(
+            open.workspace
+                .eligible_indexed_member(&key, &inputs(&path, None, Some(Unindexed::NotRecorded)))
+                .err(),
+            Some(Ineligible::SessionPrivate(uri))
+        );
+        let saved = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let key = saved.workspace.document_contexts[&saved.uri("Cond.pas")].clone();
+        let path = saved.root.join("Cond.pas");
+        let eligible = saved
+            .workspace
+            .eligible_indexed_member(&key, &inputs(&path, None, Some(Unindexed::NotRecorded)))
+            .unwrap();
+        assert_eq!(eligible.value().header.source.canonical, path);
     }
 }

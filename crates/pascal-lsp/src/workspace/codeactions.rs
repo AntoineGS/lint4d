@@ -7221,6 +7221,59 @@ mod tests {
 
     const PASCAL_CASE_LOCALS: &str = "[rules.naming]\nlocal_variable_style = \"PascalCase\"\n";
 
+    /// Whether `source.fixAll` offers an action on a `Main` that uses `Other`,
+    /// whose include `Other.inc` holds `include`.
+    fn fix_all_offered_with_other_include(include: &str) -> bool {
+        let temp = tempfile::tempdir().expect("fix-all workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(root.join(".lint4d.toml"), PASCAL_CASE_LOCALS).expect("lint configuration");
+        fs::write(root.join("Other.inc"), format!("{include}\n")).expect("include");
+        fs::write(
+            root.join("Other.pas"),
+            "unit Other;\n{$I Other.inc}\ninterface\nimplementation\nend.\n",
+        )
+        .expect("other unit");
+        let path = root.join("Main.pas");
+        fs::write(
+            &path,
+            "unit Main;\ninterface\nuses Other;\nimplementation\nprocedure Work;\nvar my_var: Integer;\nbegin\n  my_var := 1;\nend;\nend.\n",
+        )
+        .expect("source");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let input = test_workspace(vec![root], Default::default()).analysis_input();
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }))
+        .expect("code action parameters");
+        let actions = code_actions_from_input(
+            input,
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("fix-all request");
+        !actions.is_empty()
+    }
+
+    #[test]
+    fn fix_all_is_gated_by_an_unsupported_directive_in_a_dependency_include() {
+        assert!(
+            fix_all_offered_with_other_include("{$HINTS ON}"),
+            "a harmless include does not block fix-all"
+        );
+        assert!(
+            !fix_all_offered_with_other_include("{$SCOPEDENUMS ON}"),
+            "an unsupported directive in a dependency include blocks fix-all"
+        );
+    }
+
     /// Captured from the prefix-validation implementation before LSP-20.
     #[test]
     fn fix_all_output_matches_the_prefix_validation_on_existing_fixtures() {

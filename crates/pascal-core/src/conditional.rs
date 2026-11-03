@@ -5393,8 +5393,12 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "typeinfo"
             | "weaklinkrtti"
             // String literal code page, like the `-codepage` compiler option.
+            // Safe only because `$IF` evaluation of `Length` and `Ord`
+            // refuses non-ASCII strings (and `Low`/`High` are not evaluated),
+            // so no evaluated fact depends on how literals are decoded.
             | "codepage"
-            // FPC layout switches, like `ALIGN` and `MINENUMSIZE`.
+            // FPC-only layout switches. DCC does not model or apply them: it
+            // reports an unknown directive (W1030) and ignores it.
             | "packset"
             | "packrecords"
             | "packenum"
@@ -5420,6 +5424,9 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "importeddata"
             | "inline"
             // Values of character and string expressions, not their names.
+            // Safe for the same reason as `CODEPAGE`: the `$IF` evaluator
+            // refuses non-ASCII `Length`/`Ord` and does not evaluate `Low`
+            // or `High` of strings, so these switches cannot change a fact.
             | "highcharunicode"
             | "zerobasedstrings"
             // Output file naming, stack sizes and package options.

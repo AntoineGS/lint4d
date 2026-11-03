@@ -933,7 +933,7 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
     write(
         &project,
         r#"<Project><PropertyGroup>
-          <CompilerVersion Condition="'$(BDSPROJECTSDIR)' == 'x'">24.0</CompilerVersion>
+          <CompilerVersion Condition="'$(UNKNOWN_PROPERTY)' == 'x'">24.0</CompilerVersion>
           <MainSource>App.dpr</MainSource>
         </PropertyGroup></Project>"#,
     );
@@ -958,6 +958,33 @@ fn bootstrap_conditions_do_not_accept_false_or_unknown_identity_groups() {
         Some(&InstallationSelection::NeedsChoice {
             candidates: vec!["10.0".into()]
         })
+    );
+
+    // The bootstrap tracks only Config and Platform, so a property defined
+    // earlier in the project is undecidable there, never empty (l4d-xsvq).
+    write(
+        &project,
+        r#"<Project><PropertyGroup>
+          <Ver>24</Ver>
+          <CompilerVersion Condition="'$(Ver)' == '24'">24.0</CompilerVersion>
+          <MainSource>App.dpr</MainSource>
+        </PropertyGroup></Project>"#,
+    );
+    let untracked_context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project.clone()),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(Some(configuration.clone())),
+    )
+    .unwrap()
+    .context;
+    assert!(
+        untracked_context.installation_evidence().conflicting,
+        "{:?}",
+        untracked_context.installation_evidence()
     );
 
     write(

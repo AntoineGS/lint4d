@@ -681,12 +681,12 @@ pub(super) fn build_project_context(
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
             &builder.unknown_properties,
-            builder.unknown_import_taint,
+            builder.undefined_is_empty(),
             &mut builder.warnings,
             &reference.source_file,
             &reference.source_provenance,
         );
-        builder.incomplete |= expanded.environment_property_unknown;
+        builder.incomplete |= expanded.undefined_property_unknown;
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             continue;
         }
@@ -1622,6 +1622,7 @@ fn parse_project_bootstrap(
                         properties: &properties,
                         unknown_properties: &unknown_properties,
                         unknown_import_taint,
+                        undefined_is_empty: false,
                         overrides,
                         read_policy,
                     },
@@ -1651,6 +1652,9 @@ fn parse_project_bootstrap(
                 properties: &properties,
                 unknown_properties: &unknown_properties,
                 unknown_import_taint,
+                // Only Config and Platform are tracked here, so any other
+                // undefined property may have been set earlier.
+                undefined_is_empty: false,
                 overrides,
                 read_policy,
             },
@@ -1673,6 +1677,7 @@ fn parse_project_bootstrap(
                     properties: &properties,
                     unknown_properties: &unknown_properties,
                     unknown_import_taint,
+                    undefined_is_empty: false,
                     overrides,
                     read_policy,
                 },

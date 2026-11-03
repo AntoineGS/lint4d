@@ -21100,6 +21100,61 @@ mod tests {
         rename.value.expect_err("rename must fail closed");
     }
 
+    /// `Main` uses `Provider` (declares `TProvided`, no includes) and `Other`,
+    /// which takes `include` from `Other.inc` and does not mention `TProvided`.
+    fn other_owner_include_fixture(include: &str) -> (tempfile::TempDir, Url, Workspace) {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\ninterface\ntype\n  TProvided = class\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(root.join("Other.inc"), format!("{include}\n")).unwrap();
+        fs::write(
+            root.join("Other.pas"),
+            "unit Other;\n{$I Other.inc}\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider, Other;\nimplementation\nprocedure Run(Value: TProvided);\nbegin\nend;\nend.\n",
+        )
+        .unwrap();
+        let main = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        (temp, main, workspace)
+    }
+
+    fn rename_tprovided(
+        main: &Url,
+        workspace: &Workspace,
+    ) -> Result<lsp_types::WorkspaceEdit, String> {
+        super::rename::rename_from_input(
+            workspace.analysis_input(),
+            main,
+            lsp_types::Position::new(4, 23),
+            "TRenamed",
+            false,
+            &AtomicBool::new(false),
+        )
+        .value
+    }
+
+    #[test]
+    fn rename_is_gated_by_an_unsupported_directive_in_another_owners_include() {
+        let (_temp, main, workspace) = other_owner_include_fixture("{$HINTS ON}");
+        rename_tprovided(&main, &workspace).expect("a harmless include does not block rename");
+
+        let (_temp, main, workspace) = other_owner_include_fixture("{$SCOPEDENUMS ON}");
+        let error = rename_tprovided(&main, &workspace).expect_err("rename must fail closed");
+        assert!(
+            error.contains("unsupported directive") && error.contains("Other.inc"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn document_owners_share_unchanged_context_state() {
         let temp = tempfile::tempdir().expect("workspace root");

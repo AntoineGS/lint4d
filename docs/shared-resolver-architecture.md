@@ -453,9 +453,13 @@ a walk.
   path order.
 
 Owner discovery reuses a sibling directory's owner only when its context is
-retained and fresh, memoized per key per request, and discovers at most 256
+retained and fresh, memoized per key per request. A membership (computed by
+the warmer, or for a searched target of a query) discovers at most 256
 directories per call (`MAX_REQUEST_OWNER_DISCOVERY`); the rest stay pending and
-the membership is marked incomplete. A `.dpr`/`.dpk` descriptor with a
+the membership is marked incomplete. An interactive request discovers at most
+32 directory owners for its outside sources (`MAX_INTERACTIVE_OWNER_DISCOVERY`);
+the rest are the outside-source gap, and the owners it found are remembered for
+the next request. A `.dpr`/`.dpk` descriptor with a
 same-stem `.dproj` in its directory is skipped as a symbol target, since the
 `.dproj` is its project.
 
@@ -466,6 +470,24 @@ workspace roots, then the owners of workspace sources no target holds. At most
 16 targets (`MAX_TARGET_CONTEXTS`); descriptor resolution attempts are capped at
 twice that. Indexed requests do not walk mapped roots: units reachable only
 through runtime-package mappings are a coverage gap, not searched.
+
+Only the first three kinds (requesting owner, open documents' owners,
+configured project) are searched in full: their membership is computed when it
+is not current, their unverified members are read within the bound, and their
+index is requested from the warmer. Descriptor and outside-source targets
+contribute only the members an existing, current index already holds `Fresh`:
+a descriptor or owner without an index is not a target at all (its sources are
+the outside-source gap and it is never resolved or requested), a stored index
+whose membership is no longer current is the gap "`<context>` is not indexed
+yet; it was not searched", and unindexed or stale members are the gap "`<n>`
+units of `<context>` are not indexed yet; 0 were searched directly". A query
+therefore never computes such a membership nor stores such an index, so the
+contexts the warmer builds for the searched targets are not evicted by them.
+On a small workspace (A16) every target is searched, as before. On multidev
+this took `indexed_reference_scope` from 16.7–18.7 s (the memberships of 15
+outside owners, four projectless ones walking the 20,893-file root catalogue
+with up to 256 owner discoveries each, plus the requesting project's
+membership again because it had been evicted) to 0.35–1.0 s.
 
 A context with a project file is searched under the key its `Project` anchor
 resolves to, once per request: the key the warmer indexes. A document owner can
@@ -529,9 +551,12 @@ paths and stamps, and the membership catalogue directories (from the catalogue
 generation the membership recorded), join the snapshot baseline, so a result is
 rejected when one of them changed.
 
-Unindexed, stale and unverified members are candidates: the snapshot reads and
-filters them as before, at most `MAX_UNVERIFIED_CANDIDATES = 2,048` per request
-in path order. Members refused for a stable reason (over the size limit,
+Unindexed, stale and unverified members of a searched target are candidates:
+the snapshot reads and filters them as before, in path order, at most
+`MAX_UNVERIFIED_CANDIDATES = 2,048` per references request and
+`MAX_UNVERIFIED_SYMBOL_CANDIDATES = 256` per `workspace/symbol` request (an
+interactive bound: on multidev 2,050 direct reads took about 65 s, 258 about
+10 s). Members refused for a stable reason (over the size limit,
 unreadable) are reported, not searched. Transient failures leave a member
 pending, and one member's failure never stops a batch: it is counted as
 deferred and the batch goes on. A member whose session was limited (a
@@ -598,7 +623,8 @@ gate, and also when a new crawl is pending (a crawl flag checked between
 units); a paused batch is requeued. A batch is requeued when it made progress
 (indexed, refreshed, refused or limited something), is not complete and did not
 hit the memory limit, which avoids livelock. Warm `End` of an open file requests its
-context. Requests that find an incomplete index request its anchor too. Each
+context. Requests that find an incomplete index of a searched target request
+its anchor too; descriptor and outside-source targets are never requested. Each
 batch stamps a member before its read, one `before_io` call per member.
 Configuration changes produce new `ContextKey`s and so new indexes. Rename,
 code actions and references on `.inc` documents keep the whole-workspace walk.
@@ -618,6 +644,7 @@ Each gap is one coverage note (at most 32 are kept). The wordings emitted:
 - `the workspace index memory share is exhausted`
 - `no project context is open; open a source or select a project`
 - `<context> changed while the request ran; it was not searched`
+- `<context> is not indexed yet; it was not searched`
 - `the workspace index is unavailable; only the current context's imports were searched`
 - `the workspace index is unavailable; no workspace symbols were searched`
 
@@ -628,7 +655,8 @@ and its imports, and `workspace/symbol` answers nothing; each says so with the
 corresponding message above (U4).
 
 `workspace/symbol` answers from the Fresh members' declarations of the target
-contexts, merged with unverified members and open documents, deduplicated on
+contexts, merged with the unverified members of searched targets (at most
+256) and open documents, deduplicated on
 `(uri, range, name)`, ordered by URI then start. The 10,000-result error fires
 early, on deduplicated facts. A workspace with no target from the first three
 target kinds keeps today's snapshot path only when it is small (at most 2,048

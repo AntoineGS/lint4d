@@ -5097,6 +5097,19 @@ impl ProjectCache {
         Some(read(&stored.index, &stored.membership))
     }
 
+    /// Whether the store holds an index of `key`; its use is not recorded.
+    pub(crate) fn holds_index(&self, key: &ContextKey) -> bool {
+        self.index().contexts.contains_key(key)
+    }
+
+    /// Whether the store holds an index built for `anchor`.
+    pub(crate) fn holds_index_for(&self, anchor: &IndexAnchor) -> bool {
+        self.index()
+            .contexts
+            .values()
+            .any(|stored| stored.anchor == *anchor)
+    }
+
     pub(crate) fn request_index(&self, anchor: IndexAnchor) {
         self.index().request(&anchor);
     }

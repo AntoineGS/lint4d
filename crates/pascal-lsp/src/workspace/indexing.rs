@@ -26,22 +26,39 @@ use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
 use crate::workspace_index::{
     CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
-    MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp, MemberState, SymbolKey,
+    MAX_UNVERIFIED_CANDIDATES, MAX_UNVERIFIED_SYMBOL_CANDIDATES, MemberFacts, MemberStamp,
+    MemberState, SymbolKey,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
 /// the membership says so.
 pub(crate) const MAX_REQUEST_OWNER_DISCOVERY: usize = 256;
 
+/// Directories whose owner one interactive request (references, workspace
+/// symbols) may discover for its outside sources (A8 item 5); the rest are
+/// the outside-source gap and are discovered by later requests.
+pub(crate) const MAX_INTERACTIVE_OWNER_DISCOVERY: usize = 32;
+
 /// At most this many contexts are searched by one indexed request.
 pub(crate) const MAX_TARGET_CONTEXTS: usize = 16;
 
 /// What one request has spent on owner discovery: the directories it
-/// discovered, and which owner contexts it already found fresh or stale.
-#[derive(Default)]
+/// discovered (at most `cap`), and which owner contexts it already found
+/// fresh or stale.
 struct OwnerDiscovery {
+    cap: usize,
     discovered: usize,
     fresh: HashMap<ContextKey, bool>,
+}
+
+impl OwnerDiscovery {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            discovered: 0,
+            fresh: HashMap::new(),
+        }
+    }
 }
 
 /// A workspace with at most this many Pascal sources and descriptors under
@@ -72,12 +89,22 @@ impl Targets {
     fn holds(&self, key: &ContextKey) -> bool {
         self.contexts.iter().any(|(held, _)| held == key)
     }
+
+    /// Whether the target at `position` is searched in full: its membership
+    /// computed, its unverified members read, its index requested. The
+    /// others (A8 items 4 and 5) contribute only the members their existing
+    /// index holds Fresh, unless the workspace is small enough to walk.
+    fn searched(&self, position: usize) -> bool {
+        self.small_workspace || position < self.from_open_or_configured
+    }
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
 struct CapOverrides {
     owner_discovery: Option<usize>,
+    interactive_discovery: Option<usize>,
+    unverified_symbols: Option<usize>,
     small_sources: Option<usize>,
     small_projects: Option<usize>,
     max_targets: Option<usize>,
@@ -89,6 +116,8 @@ thread_local! {
     static CAP_OVERRIDES: std::cell::Cell<CapOverrides> = const {
         std::cell::Cell::new(CapOverrides {
             owner_discovery: None,
+            interactive_discovery: None,
+            unverified_symbols: None,
             small_sources: None,
             small_projects: None,
             max_targets: None,
@@ -107,12 +136,31 @@ fn descriptor_attempts() -> usize {
     DESCRIPTOR_ATTEMPTS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static MEMBERSHIP_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Memberships computed on this thread since the last call.
+#[cfg(test)]
+fn take_membership_computes() -> usize {
+    MEMBERSHIP_COMPUTES.with(|count| count.replace(0))
+}
+
 fn owner_discovery_cap() -> usize {
     #[cfg(test)]
     if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().owner_discovery) {
         return cap;
     }
     MAX_REQUEST_OWNER_DISCOVERY
+}
+
+fn interactive_discovery_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().interactive_discovery) {
+        return cap;
+    }
+    MAX_INTERACTIVE_OWNER_DISCOVERY
 }
 
 fn small_workspace_sources() -> usize {
@@ -149,6 +197,16 @@ pub(crate) fn test_set_unverified_cap(cap: Option<usize>) {
     });
 }
 
+/// Sets the workspace-symbol unverified bound for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_set_unverified_symbol_cap(cap: Option<usize>) {
+    CAP_OVERRIDES.with(|caps| {
+        let mut value = caps.get();
+        value.unverified_symbols = cap;
+        caps.set(value);
+    });
+}
+
 /// Sets the small-workspace source cap (A16) for the tests of other modules.
 #[cfg(test)]
 pub(crate) fn test_set_small_workspace_sources(cap: Option<usize>) {
@@ -176,6 +234,14 @@ fn max_unverified_candidates() -> usize {
         return cap;
     }
     MAX_UNVERIFIED_CANDIDATES
+}
+
+fn max_unverified_symbol_candidates() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified_symbols) {
+        return cap;
+    }
+    MAX_UNVERIFIED_SYMBOL_CANDIDATES
 }
 
 /// How many pending members one `advance_workspace_index` call takes.
@@ -713,6 +779,8 @@ impl Workspace {
         key: &ContextKey,
         cancel: &AtomicBool,
     ) -> Result<IndexMembership, String> {
+        #[cfg(test)]
+        MEMBERSHIP_COMPUTES.with(|count| count.set(count.get() + 1));
         let context = self
             .contexts
             .get(key)
@@ -829,7 +897,7 @@ impl Workspace {
         let mut seen = HashSet::new();
         let mut before_io = || check_workspace_cancel(Some(cancel));
         let mut owned = HashMap::<PathBuf, Option<bool>>::new();
-        let mut discovery = OwnerDiscovery::default();
+        let mut discovery = OwnerDiscovery::new(owner_discovery_cap());
         for scope in scopes {
             if !seen.insert(scope.key().clone()) {
                 continue;
@@ -920,7 +988,7 @@ impl Workspace {
         if let Some(owner) = self.fresh_owner_of(directory, sample, cancel, discovery)? {
             return Ok(Some(owner));
         }
-        if discovery.discovered >= owner_discovery_cap() {
+        if discovery.discovered >= discovery.cap {
             return Ok(None);
         }
         discovery.discovered += 1;
@@ -956,6 +1024,7 @@ impl Workspace {
         if TARGET_ERROR.with(std::cell::Cell::get) {
             return Err("an injected target error".to_owned());
         }
+        let started = std::time::Instant::now();
         let maximum = max_target_contexts();
         let mut targets = Targets::default();
         let push = |targets: &mut Targets, key: ContextKey, anchor: IndexAnchor| {
@@ -1023,6 +1092,11 @@ impl Workspace {
             push(&mut targets, key, IndexAnchor::Project(project));
         }
         targets.from_open_or_configured = targets.contexts.len();
+        crate::trace::trace!(
+            "  index targets: {} open or configured after {:.1} ms",
+            targets.contexts.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
 
         let files = self.root_files(cancel)?;
         targets.small_workspace = files.small();
@@ -1031,6 +1105,12 @@ impl Workspace {
             descriptors,
             ..
         } = files;
+        crate::trace::trace!(
+            "  index targets: {} root sources, {} descriptors after {:.1} ms",
+            sources.len(),
+            descriptors.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
 
         if purpose == TargetPurpose::WorkspaceSymbols {
             let roots = self.workspace_root_paths();
@@ -1050,14 +1130,18 @@ impl Workspace {
                 {
                     continue;
                 }
+                // Without an index a descriptor contributes nothing: it is
+                // neither resolved nor requested (M1).
+                let anchor = IndexAnchor::Project(descriptor.clone());
+                if !targets.small_workspace && !self.project_cache.holds_index_for(&anchor) {
+                    continue;
+                }
                 check_workspace_cancel(Some(cancel))?;
                 attempts += 1;
                 #[cfg(test)]
                 DESCRIPTOR_ATTEMPTS.with(|count| count.set(count.get() + 1));
                 match project_metadata_context(self, descriptor, &roots, &mut options, cancel) {
-                    Ok((key, _)) => {
-                        push(&mut targets, key, IndexAnchor::Project(descriptor.clone()));
-                    }
+                    Ok((key, _)) => push(&mut targets, key, anchor),
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                     Err(error) => {
                         crate::trace::trace!(
@@ -1067,6 +1151,11 @@ impl Workspace {
                     }
                 }
             }
+            crate::trace::trace!(
+                "  index targets: {attempts} descriptors tried, {} targets after {:.1} ms",
+                targets.contexts.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         let mut held = HashSet::<String>::new();
@@ -1076,7 +1165,7 @@ impl Workspace {
             });
         }
         let mut owners = HashMap::<PathBuf, Option<ContextKey>>::new();
-        let mut discovery = OwnerDiscovery::default();
+        let mut discovery = OwnerDiscovery::new(interactive_discovery_cap());
         let mut outside = 0usize;
         for (file_key, file) in sources.iter().filter(|(_, path)| is_unit_source(path)) {
             if held.contains(file_key) {
@@ -1106,6 +1195,12 @@ impl Workspace {
             };
             match owner {
                 Some(owner) if targets.holds(&owner) => {}
+                // An owner without an index contributes nothing (M1).
+                Some(owner)
+                    if !targets.small_workspace && !self.project_cache.holds_index(&owner) =>
+                {
+                    outside += 1;
+                }
                 Some(owner) if targets.contexts.len() < maximum => {
                     let project = self
                         .contexts
@@ -1118,13 +1213,24 @@ impl Workspace {
                         Err(()) => None,
                     };
                     match target {
-                        Some((key, anchor)) => push(&mut targets, key, anchor),
-                        None => outside += 1,
+                        Some((key, anchor))
+                            if targets.small_workspace || self.project_cache.holds_index(&key) =>
+                        {
+                            push(&mut targets, key, anchor);
+                        }
+                        _ => outside += 1,
                     }
                 }
                 _ => outside += 1,
             }
         }
+        crate::trace::trace!(
+            "  index targets: {} directories, {} owners discovered, {outside} outside, {} targets after {:.1} ms",
+            owners.len(),
+            discovery.discovered,
+            targets.contexts.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         if outside > 0 {
             targets.gaps.push(format!(
                 "{outside} sources under the workspace roots belong to contexts that were not searched"
@@ -1203,9 +1309,17 @@ impl Workspace {
         if let Some(key) = projects.get(&project_key) {
             return Ok(key.clone());
         }
+        let started = std::time::Instant::now();
         let key = match self.index_context_for(&IndexAnchor::Project(project.to_path_buf()), cancel)
         {
-            Ok(key) => Some(key),
+            Ok(key) => {
+                crate::trace::trace!(
+                    "  index target: {} resolved in {:.1} ms",
+                    project.display(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                Some(key)
+            }
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
             Err(error) => {
                 crate::trace::trace!(
@@ -1295,7 +1409,8 @@ impl Workspace {
         let mut stamps = HashMap::<String, Option<PathStamp>>::new();
         let mut unverified_left = match selection {
             Selection::Symbols { direct: false, .. } => 0,
-            _ => max_unverified_candidates(),
+            Selection::Symbols { direct: true, .. } => max_unverified_symbol_candidates(),
+            Selection::Candidates(_) => max_unverified_candidates(),
         };
         let mut refused = 0usize;
         let mut first_refusal = None::<Box<str>>;
@@ -1342,8 +1457,11 @@ impl Workspace {
             outside
         };
         let mut unowned = 0usize;
-        for (key, anchor) in &targets.contexts {
+        for (position, (key, anchor)) in targets.contexts.iter().enumerate() {
             check_workspace_cancel(Some(cancel))?;
+            let searched = targets.searched(position);
+            let target_started = std::time::Instant::now();
+            let sources_before = result.sources.len();
             if !self.contexts.contains_key(key) {
                 let known = input
                     .document_owners
@@ -1369,11 +1487,32 @@ impl Workspace {
                     }
                 }
             }
-            let mut computed = self.ensure_index_membership_computed(key, anchor, cancel)?;
+            let display = anchor_display(anchor);
+            // A target searched only for its facts never computes a
+            // membership: that is the warmer's work for a searched one.
+            if !searched && !self.project_cache.index_membership_current(key) {
+                result
+                    .gaps
+                    .push(format!("{display} is not indexed yet; it was not searched"));
+                continue;
+            }
+            let mut computed = if searched {
+                self.ensure_index_membership_computed(key, anchor, cancel)?
+            } else {
+                None
+            };
+            crate::trace::trace!(
+                "  index target {display}: membership {} after {:.1} ms",
+                if computed.is_some() {
+                    "computed"
+                } else {
+                    "current"
+                },
+                target_started.elapsed().as_secs_f64() * 1000.0
+            );
             if let Some(state) = self.contexts.get(key) {
                 result.contexts.insert(key.clone(), state.clone());
             }
-            let display = anchor_display(anchor);
             // The directories baseline the membership only while its
             // catalogues are the ones it was computed from; otherwise the
             // membership is computed once more.
@@ -1393,7 +1532,7 @@ impl Workspace {
                     (None, None) => Vec::new(),
                 };
                 let listing = self.membership_listing(&scopes);
-                if listing.is_some() || retried {
+                if listing.is_some() || retried || !searched {
                     break (view, listing);
                 }
                 // The view is read again: its declarations are not seen yet.
@@ -1420,6 +1559,12 @@ impl Workspace {
                     result.baseline.extend(listing.directories);
                     listing.incomplete
                 }
+                None if !searched => {
+                    result
+                        .gaps
+                        .push(format!("{display} is not indexed yet; it was not searched"));
+                    continue;
+                }
                 None => {
                     result.gaps.push(format!(
                         "the directory listings of {display} could not be kept; changes to them may be missed"
@@ -1434,6 +1579,12 @@ impl Workspace {
                     .is_some_and(|limit| !limit.starts_with("more than "))
             });
             let Some(view) = stored else {
+                if !searched {
+                    result
+                        .gaps
+                        .push(format!("{display} is not indexed yet; it was not searched"));
+                    continue;
+                }
                 // The store holds no members (no room for the membership):
                 // read every member as today's walk would, within the bound.
                 let membership = match computed {
@@ -1527,18 +1678,24 @@ impl Workspace {
                     result.sources.push((path, key.clone()));
                 }
             }
-            let (skipped, searched) = take_unverified(
+            // A target searched for its facts reads no unverified member.
+            let mut none_left = 0;
+            let (skipped, read) = take_unverified(
                 unverified,
                 key,
                 &open,
                 &deleted,
                 &mut taken,
-                &mut unverified_left,
+                if searched {
+                    &mut unverified_left
+                } else {
+                    &mut none_left
+                },
                 &mut result.sources,
             );
             if skipped > 0 {
                 result.gaps.push(format!(
-                    "{skipped} units of {display} are not indexed yet; {searched} were searched directly"
+                    "{skipped} units of {display} are not indexed yet; {read} were searched directly"
                 ));
             }
             refused += refused_members.len();
@@ -1568,9 +1725,14 @@ impl Workspace {
                     "units provided through runtime packages of {display} were not searched"
                 ));
             }
-            if coverage.pending > 0 || !complete {
+            if searched && (coverage.pending > 0 || !complete) {
                 self.project_cache.request_index(anchor.clone());
             }
+            crate::trace::trace!(
+                "  index target {display}: {} sources after {:.1} ms",
+                result.sources.len() - sources_before,
+                target_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         for uri in must_include {
@@ -2871,6 +3033,8 @@ mod tests {
             CAP_OVERRIDES.with(|caps| {
                 caps.set(CapOverrides {
                     owner_discovery: None,
+                    interactive_discovery: None,
+                    unverified_symbols: None,
                     small_sources: None,
                     small_projects: None,
                     max_targets: None,
@@ -3031,7 +3195,7 @@ mod tests {
             unit(&root.join(format!("d{index}/U.pas")));
         }
         pascal_project::backdate_tree_for_test(root);
-        let _caps = override_caps(|caps| caps.owner_discovery = Some(2));
+        let _caps = override_caps(|caps| caps.interactive_discovery = Some(2));
         let mut workspace = workspace(root, WorkspaceOptions::default());
         let found = targets(&mut workspace, None, TargetPurpose::References);
         assert_eq!(
@@ -3179,6 +3343,7 @@ mod tests {
     fn one_target(key: &ContextKey, anchor: &IndexAnchor) -> Targets {
         Targets {
             contexts: vec![(key.clone(), anchor.clone())],
+            from_open_or_configured: 1,
             ..Targets::default()
         }
     }
@@ -3811,5 +3976,252 @@ mod tests {
             "{:?}",
             found.gaps
         );
+    }
+
+    #[test]
+    fn a_request_discovers_at_most_the_interactive_owner_cap() {
+        assert_eq!(MAX_INTERACTIVE_OWNER_DISCOVERY, 32);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let directories = MAX_INTERACTIVE_OWNER_DISCOVERY + 3;
+        for index in 0..directories {
+            unit(&root.join(format!("d{index:02}/U.pas")));
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let _caps = override_caps(|caps| caps.small_sources = Some(0));
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let found = targets(&mut workspace, None, TargetPurpose::References);
+        let remembered = (0..directories)
+            .filter(|index| {
+                workspace
+                    .project_cache
+                    .owner_of(&root.join(format!("d{index:02}")))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(remembered, MAX_INTERACTIVE_OWNER_DISCOVERY);
+        // No discovered owner has an index, so every source is outside.
+        assert_eq!(
+            found.gaps,
+            ["35 sources under the workspace roots belong to contexts that were not searched"]
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_read_at_most_the_interactive_unverified_bound() {
+        assert_eq!(MAX_UNVERIFIED_SYMBOL_CANDIDATES, 256);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut workspace, key, anchor) =
+            indexed_project(temp.path(), 5, WorkspaceOptions::default());
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(2));
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["App.dpr", "U0.pas"]);
+        assert_eq!(
+            sources.gaps,
+            ["3 units of App.dproj are not indexed yet; 2 were searched directly"]
+        );
+        let references = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            None,
+            &[],
+        );
+        assert_eq!(references.sources.len(), 5, "references keep their bound");
+    }
+
+    /// `P1` (its `U.pas` open) and `P2`, each with `U`, `V` and `W` naming
+    /// `Target`, in a workspace too large for the walk (A16).
+    fn two_projects(root: &Path) -> (Workspace, Url, IndexAnchor, IndexAnchor) {
+        for name in ["P1", "P2"] {
+            write(
+                &root.join(name).join(format!("{name}.dproj")),
+                &format!(
+                    "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
+                ),
+            );
+            write(
+                &root.join(name).join(format!("{name}.dpr")),
+                &format!("program {name}; begin end.\n"),
+            );
+            for unit in ["U", "V", "W"] {
+                named_unit(&root.join(name).join(format!("{unit}.pas")), "Target");
+            }
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let path = root.join("P1/U.pas");
+        let uri = Url::from_file_path(&path).unwrap();
+        workspace
+            .open_document(uri.clone(), fs::read_to_string(&path).unwrap(), 1)
+            .unwrap();
+        (
+            workspace,
+            uri,
+            IndexAnchor::Project(root.join("P1/P1.dproj")),
+            IndexAnchor::Project(root.join("P2/P2.dproj")),
+        )
+    }
+
+    fn target_query() -> CandidateQuery {
+        CandidateQuery {
+            names: vec!["Target".to_owned()],
+            top_level_units: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn references_of_target(workspace: &mut Workspace, requesting: &Url) -> IndexedSources {
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let found = workspace
+            .index_targets(&input, Some(requesting), TargetPurpose::References, &cancel)
+            .expect("targets");
+        workspace
+            .indexed_sources(&input, &found, Some(&target_query()), &[], None, &cancel)
+            .expect("indexed sources")
+    }
+
+    fn relative_sources(sources: &IndexedSources, root: &Path) -> Vec<String> {
+        let mut found = sources
+            .sources
+            .iter()
+            .map(|(path, _)| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn an_outside_owner_without_an_index_is_a_gap_and_never_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, requesting, p1, _) = two_projects(root);
+        let _caps = override_caps(|caps| caps.small_sources = Some(0));
+        let sources = references_of_target(&mut workspace, &requesting);
+        assert_eq!(
+            relative_sources(&sources, root),
+            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas"]
+        );
+        assert!(
+            sources.gaps.contains(
+                &"3 sources under the workspace roots belong to contexts that were not searched"
+                    .to_owned()
+            ),
+            "{:?}",
+            sources.gaps
+        );
+        assert_eq!(workspace.project_cache.take_index_requests(), [p1]);
+    }
+
+    #[test]
+    fn an_outside_owner_with_an_index_contributes_only_its_fresh_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, requesting, p1, p2) = two_projects(root);
+        context(&mut workspace, p2.clone());
+        // P2.dpr and P2/U.pas are indexed; V and W are not.
+        advance(&mut workspace, &p2, IndexBound::units(2));
+        let _ = workspace.project_cache.take_index_requests();
+        let _caps = override_caps(|caps| caps.small_sources = Some(0));
+        let sources = references_of_target(&mut workspace, &requesting);
+        assert_eq!(
+            relative_sources(&sources, root),
+            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas"]
+        );
+        assert!(
+            sources.gaps.contains(
+                &"2 units of P2.dproj are not indexed yet; 0 were searched directly".to_owned()
+            ),
+            "{:?}",
+            sources.gaps
+        );
+        assert_eq!(workspace.project_cache.take_index_requests(), [p1]);
+    }
+
+    #[test]
+    fn a_small_workspace_still_reads_and_requests_outside_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, requesting, p1, p2) = two_projects(root);
+        let sources = references_of_target(&mut workspace, &requesting);
+        assert_eq!(
+            relative_sources(&sources, root),
+            [
+                "P1/P1.dpr",
+                "P1/U.pas",
+                "P1/V.pas",
+                "P1/W.pas",
+                "P2/P2.dpr",
+                "P2/U.pas",
+                "P2/V.pas",
+                "P2/W.pas"
+            ]
+        );
+        let requests = workspace.project_cache.take_index_requests();
+        assert!(
+            requests.contains(&p1) && requests.contains(&p2),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_targets_without_an_index_are_neither_searched_nor_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = named_project(root, "A", true);
+        let second = named_project(root, "B", true);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let a = context(&mut workspace, IndexAnchor::Project(first.clone()));
+        context(&mut workspace, IndexAnchor::Project(second));
+        advance(
+            &mut workspace,
+            &IndexAnchor::Project(first.clone()),
+            IndexBound::all(),
+        );
+        let _ = workspace.project_cache.take_index_requests();
+        let _caps = override_caps(|caps| caps.small_sources = Some(0));
+        let found = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
+        assert_eq!(keys(&found), [a]);
+        let input = workspace.analysis_input();
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &found, "", false, &[], &AtomicBool::new(false))
+            .expect("indexed symbols");
+        assert!(sources.sources.is_empty());
+        assert!(workspace.project_cache.take_index_requests().is_empty());
+    }
+
+    /// Multidev run 2: each references request computed the membership of
+    /// every outside owner (a projectless one walks the whole root catalogue
+    /// and discovers up to 256 directory owners), stored them, and so evicted
+    /// the requesting context's index (16 targets, 8 retained contexts); the
+    /// next request computed them all again.
+    #[test]
+    fn repeated_requests_compute_no_membership_again_and_keep_the_requesting_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, requesting, p1, _) = two_projects(root);
+        for index in 0..10 {
+            named_project(root, &format!("Q{index}"), true);
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let _caps = override_caps(|caps| caps.small_sources = Some(0));
+        let _ = take_membership_computes();
+        references_of_target(&mut workspace, &requesting);
+        assert_eq!(take_membership_computes(), 1, "only P1 is searched");
+        references_of_target(&mut workspace, &requesting);
+        assert_eq!(take_membership_computes(), 0, "nothing is computed again");
+        assert!(workspace.project_cache.holds_index_for(&p1));
+        assert_eq!(workspace.project_cache.indexed_context_count(), 1);
     }
 }

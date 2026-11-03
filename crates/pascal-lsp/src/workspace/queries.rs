@@ -4413,11 +4413,11 @@ mod tests {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                crate::workspace::indexing::test_set_unverified_cap(None);
+                crate::workspace::indexing::test_set_unverified_symbol_cap(None);
             }
         }
         let _reset = Reset;
-        crate::workspace::indexing::test_set_unverified_cap(Some(1));
+        crate::workspace::indexing::test_set_unverified_symbol_cap(Some(1));
         let bounded = symbols(&input, "PartialValue");
         assert_eq!(symbol_names(&bounded.value), expected[..3]);
         assert!(

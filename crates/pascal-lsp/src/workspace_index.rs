@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_WORKSPACE_UNITS: usize = 100_000;
 pub(crate) const MAX_UNVERIFIED_CANDIDATES: usize = 2_048;
+/// The unverified members one `workspace/symbol` request reads (A5): it
+/// answers while the user types, so its bound is interactive.
+pub(crate) const MAX_UNVERIFIED_SYMBOL_CANDIDATES: usize = 256;
 pub(crate) const MAX_INDEX_CHANGES: usize = 4_096;
 pub(crate) const IMPLICIT_UNITS: [&str; 2] = ["system", "sysinit"];
 

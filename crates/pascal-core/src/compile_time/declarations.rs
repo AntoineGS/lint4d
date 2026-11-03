@@ -83,6 +83,9 @@ pub struct CompileTimeState {
     implementation: bool,
     finished: bool,
     root_ended: bool,
+    /// Paren depth at the keyword of an anonymous method whose `begin` has
+    /// not been seen yet. Its parameters and result are not declarations.
+    anonymous_header: Option<usize>,
     pub(super) failure: Option<IncompleteReason>,
     pub(super) unknown: bool,
     /// Independent reachable continuations; never a synthesized graph.
@@ -222,6 +225,7 @@ impl CompileTimeState {
             implementation: false,
             finished: false,
             root_ended: false,
+            anonymous_header: None,
             failure: None,
             unknown: false,
             alternatives: Vec::new(),
@@ -501,6 +505,15 @@ impl CompileTimeState {
             return Ok(());
         }
         self.flush_word(budget)?;
+        if ch == ';'
+            && self
+                .anonymous_header
+                .is_some_and(|parens| self.parens <= parens)
+        {
+            // Not an anonymous method header after all (`reference to
+            // procedure;`), or its local declarations: frame what follows.
+            self.anonymous_header = None;
+        }
         if ch == ';' && self.pending_class {
             // A bare composite header is retained as unsupported, not treated
             // as an unterminated body. The parser alone admits its syntax.
@@ -553,6 +566,10 @@ impl CompileTimeState {
         Ok(())
     }
 
+    fn scope_kind(&self) -> ScopeKind {
+        self.scopes[self.site().scope.0 as usize].kind
+    }
+
     fn flush_word(&mut self, budget: &mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason> {
         if self.word.is_empty() {
             return Ok(());
@@ -576,6 +593,38 @@ impl CompileTimeState {
             // into a global one. Comments/strings never reach this branch.
             self.unknown = true;
             return Ok(());
+        }
+        let in_statements = matches!(self.scope_kind(), ScopeKind::Body | ScopeKind::Block);
+        if in_statements && matches!(word, "procedure" | "function") {
+            // Statements contain no routine declarations: this is an
+            // anonymous method. Only its begin..end is framed, as a block.
+            if self.section != Section::None {
+                // An inline declaration initialized by an anonymous method
+                // is not admitted; its name may be missing.
+                self.unknown = true;
+                self.section = Section::None;
+                self.rhs = false;
+            }
+            self.anonymous_header = Some(self.parens);
+            return Ok(());
+        }
+        if let Some(parens) = self.anonymous_header {
+            if !matches!(word, "begin" | "end") {
+                // Inside its parentheses `const`/`var` are parameter
+                // modifiers. Outside them they open the method's own local
+                // declarations, which are not admitted: a query inside the
+                // method must not prove their absence.
+                if self.parens == parens
+                    && matches!(
+                        word,
+                        "var" | "const" | "type" | "threadvar" | "resourcestring"
+                    )
+                {
+                    self.unknown = true;
+                }
+                return Ok(());
+            }
+            self.anonymous_header = None;
         }
         if matches!(
             self.section,
@@ -1328,6 +1377,7 @@ impl CompileTimeState {
         self.interface_complete.hash(&mut h);
         self.finished.hash(&mut h);
         self.root_ended.hash(&mut h);
+        self.anonymous_header.hash(&mut h);
         self.unknown.hash(&mut h);
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);

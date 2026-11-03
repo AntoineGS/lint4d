@@ -5,6 +5,7 @@
 use crate::navigation::canonical_name;
 use crate::workspace::PathStamp;
 use crate::workspace::rename::path_key;
+use pascal_cache::Digest;
 use pascal_core::facts::{
     ArtifactFacts, DeclarationKind, DeclarationShape, FactLocation, TextRange,
 };
@@ -277,6 +278,35 @@ struct Member {
     /// When its last load was deferred (a reason that may pass), in the
     /// context's deferral order; 0 when it was not.
     deferred: u64,
+    /// The deferral was "retrying a previous refusal" (`RETRYING_REFUSAL`).
+    retrying: bool,
+    /// The store was asked for this member's facts since it was last
+    /// invalidated.
+    reuse_tried: bool,
+    /// The facts came from the store, not from an extraction.
+    reused: bool,
+    /// The proven record of this member's state, set by this process.
+    record: Option<Digest>,
+}
+
+/// The deferral reason of a member whose previous refusal is tried again.
+pub(crate) const RETRYING_REFUSAL: &str = "retrying a previous refusal";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+pub(crate) struct IndexCounts {
+    pub(crate) members: usize,
+    pub(crate) fresh: usize,
+    pub(crate) reused: usize,
+    pub(crate) extracted: usize,
+    pub(crate) pending: usize,
+    pub(crate) reuse_pending: usize,
+    pub(crate) refused: usize,
+    pub(crate) limited: usize,
+    pub(crate) deferred: usize,
+    pub(crate) retrying: usize,
+    /// Members with a proven record set by this process.
+    pub(crate) persisted: usize,
 }
 
 impl Member {
@@ -542,6 +572,9 @@ impl ContextIndex {
         let charged = std::mem::take(&mut member.charged);
         member.stamps = Vec::new();
         member.deferred = 0;
+        member.retrying = false;
+        member.reused = false;
+        member.record = None;
         for name in posting_ids {
             list_remove(&mut self.postings, name, id);
         }
@@ -612,6 +645,102 @@ impl ContextIndex {
             .collect()
     }
 
+    /// Pending members the store was not asked about since they were last
+    /// invalidated, in path order.
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn reuse_pending(&self, limit: usize) -> Vec<PathBuf> {
+        self.pending_members()
+            .filter(|member| !member.reuse_tried)
+            .take(limit)
+            .map(|member| member.path.clone())
+            .collect()
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn mark_reuse_tried(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            self.members[id.0 as usize].reuse_tried = true;
+        }
+    }
+
+    /// The facts just inserted came from the store.
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn mark_reused(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            let member = &mut self.members[id.0 as usize];
+            if matches!(member.state(), MemberState::Fresh) {
+                member.reused = true;
+            }
+        }
+    }
+
+    /// Only a Fresh, Refused or Limited member holds a record.
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn set_record(&mut self, path: &Path, record: Digest) -> bool {
+        let Some(id) = self.id_of(path) else {
+            return false;
+        };
+        let member = &mut self.members[id.0 as usize];
+        match member.state() {
+            MemberState::Fresh | MemberState::Refused(_) | MemberState::Limited => {
+                member.record = Some(record);
+                true
+            }
+            MemberState::Unindexed | MemberState::Stale => false,
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn record(&self, path: &Path) -> Option<Digest> {
+        self.id_of(path)
+            .and_then(|id| self.members[id.0 as usize].record)
+    }
+
+    /// One entry per member, in path order.
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn records(&self) -> Vec<(PathBuf, Option<Digest>)> {
+        self.by_path
+            .values()
+            .map(|id| {
+                let member = &self.members[id.0 as usize];
+                (member.path.clone(), member.record)
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn counts(&self) -> IndexCounts {
+        let mut counts = IndexCounts {
+            members: self.by_path.len(),
+            ..IndexCounts::default()
+        };
+        for member in self.by_path.values().map(|id| &self.members[id.0 as usize]) {
+            counts.persisted += usize::from(member.record.is_some());
+            match member.state() {
+                MemberState::Fresh => {
+                    counts.fresh += 1;
+                    if member.reused {
+                        counts.reused += 1;
+                    } else {
+                        counts.extracted += 1;
+                    }
+                }
+                MemberState::Unindexed | MemberState::Stale => {
+                    counts.pending += 1;
+                    counts.reuse_pending += usize::from(!member.reuse_tried);
+                    if member.retrying {
+                        counts.retrying += 1;
+                    } else if member.deferred != 0 {
+                        counts.deferred += 1;
+                    }
+                }
+                MemberState::Refused(_) => counts.refused += 1,
+                MemberState::Limited => counts.limited += 1,
+            }
+        }
+        counts
+    }
+
     /// A pending member's load failed for a reason that may pass: it goes
     /// behind every other pending member. The facts do not change, so this
     /// neither bumps the generation nor logs a change.
@@ -625,6 +754,7 @@ impl ContextIndex {
         }
         self.deferrals += 1;
         member.deferred = self.deferrals;
+        member.retrying = reason == RETRYING_REFUSAL;
         if self.last_deferral.as_deref() != Some(reason) {
             self.last_deferral = Some(reason.into());
         }
@@ -773,6 +903,7 @@ impl ContextIndex {
         member.hash = Some(hash);
         member.state = Some(MemberState::Fresh);
         member.charged = charged;
+        member.reuse_tried = false;
         let path = member.path.clone();
         self.member_bytes += charged;
         self.name_bytes += paid.saturating_sub(charged);
@@ -802,6 +933,7 @@ impl ContextIndex {
         member.stamps = stamps;
         member.state = Some(MemberState::Fresh);
         member.deferred = 0;
+        member.retrying = false;
         true
     }
 
@@ -837,6 +969,9 @@ impl ContextIndex {
         match member.state() {
             MemberState::Fresh | MemberState::Refused(_) | MemberState::Limited => {
                 member.state = Some(MemberState::Stale);
+                member.record = None;
+                member.reuse_tried = false;
+                member.reused = false;
                 true
             }
             MemberState::Unindexed | MemberState::Stale => false,
@@ -1215,6 +1350,138 @@ mod tests {
             vec![],
             1,
         );
+    }
+
+    fn facts_for(index: &mut ContextIndex, path: &str) {
+        index.insert(
+            Path::new(path),
+            MemberFacts::from_facts(Path::new(path), &ArtifactFacts::default(), vec![]),
+            vec![],
+            1,
+        );
+    }
+
+    fn digest(byte: u8) -> Digest {
+        Digest::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn reuse_pending_skips_members_tried_since_their_last_invalidation() {
+        let mut index = ContextIndex::new();
+        index.set_members(vec!["/p/A.pas".into(), "/p/B.pas".into()]);
+        index.mark_reuse_tried(Path::new("/p/A.pas"));
+        assert_eq!(index.reuse_pending(10), vec![PathBuf::from("/p/B.pas")]);
+        assert_eq!(index.pending(10).len(), 2);
+        facts_for(&mut index, "/p/A.pas");
+        index.mark_stale(Path::new("/p/A.pas"));
+        assert_eq!(index.reuse_pending(10).len(), 2);
+    }
+
+    #[test]
+    fn reinserting_a_member_clears_its_reuse_flags() {
+        let mut index = ContextIndex::new();
+        index.set_members(vec!["/p/A.pas".into()]);
+        index.mark_reuse_tried(Path::new("/p/A.pas"));
+        facts_for(&mut index, "/p/A.pas");
+        index.mark_reused(Path::new("/p/A.pas"));
+        assert_eq!(index.counts().reused, 1);
+        facts_for(&mut index, "/p/A.pas");
+        let counts = index.counts();
+        assert_eq!((counts.reused, counts.extracted), (0, 1));
+        index.mark_all_stale();
+        assert_eq!(index.reuse_pending(10).len(), 1);
+    }
+
+    #[test]
+    fn an_invalidated_member_loses_its_record() {
+        let mut index = ContextIndex::new();
+        let a = Path::new("/p/A.pas");
+        let b = Path::new("/p/B.pas");
+        let c = Path::new("/p/C.pas");
+        let d = Path::new("/p/D.pas");
+        index.set_members(vec![a.into(), b.into(), c.into(), d.into()]);
+        assert!(
+            !index.set_record(a, digest(1)),
+            "unindexed members hold none"
+        );
+        for path in [a, b, c, d] {
+            facts_for(&mut index, path.to_str().unwrap());
+        }
+        for (path, byte) in [(a, 1), (b, 2), (c, 3), (d, 4)] {
+            assert!(index.set_record(path, digest(byte)));
+        }
+        assert_eq!(index.record(a), Some(digest(1)));
+        assert_eq!(index.counts().persisted, 4);
+        index.mark_stale(a);
+        index.refuse(b, "no".into());
+        index.limit(c);
+        assert_eq!(index.record(a), None);
+        assert_eq!(index.record(b), None);
+        assert_eq!(index.record(c), None);
+        assert_eq!(index.record(d), Some(digest(4)));
+        assert!(
+            index.set_record(b, digest(9)),
+            "a refused member can hold one"
+        );
+        assert!(
+            index.set_record(c, digest(8)),
+            "a limited member can hold one"
+        );
+        index.set_members(vec![a.into(), b.into(), c.into()]);
+        assert_eq!(
+            index.records(),
+            vec![
+                (a.to_path_buf(), None),
+                (b.to_path_buf(), Some(digest(9))),
+                (c.to_path_buf(), Some(digest(8))),
+            ]
+        );
+    }
+
+    #[test]
+    fn counts_separate_reused_from_extracted() {
+        let mut index = ContextIndex::new();
+        index.set_members(vec![
+            "/p/A.pas".into(),
+            "/p/B.pas".into(),
+            "/p/C.pas".into(),
+            "/p/D.pas".into(),
+            "/p/E.pas".into(),
+        ]);
+        facts_for(&mut index, "/p/A.pas");
+        facts_for(&mut index, "/p/B.pas");
+        index.mark_reused(Path::new("/p/A.pas"));
+        index.mark_reuse_tried(Path::new("/p/C.pas"));
+        index.defer(Path::new("/p/C.pas"), "busy");
+        index.defer(Path::new("/p/D.pas"), RETRYING_REFUSAL);
+        let counts = index.counts();
+        assert_eq!(
+            counts,
+            IndexCounts {
+                members: 5,
+                fresh: 2,
+                reused: 1,
+                extracted: 1,
+                pending: 3,
+                reuse_pending: 2,
+                refused: 0,
+                limited: 0,
+                deferred: 1,
+                retrying: 1,
+                persisted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_proven_record_is_charged_with_its_member() {
+        let path = Path::new("/p/A.pas");
+        let slot = size_of::<Option<Digest>>();
+        assert!(
+            membership_charge(path) >= 3 * path.as_os_str().len() + slot + 64,
+            "the slot is charged with the member"
+        );
+        assert!(member_slot_bytes() >= slot);
     }
 
     fn top_level(units: &[&str], names: &[&str]) -> CandidateQuery {

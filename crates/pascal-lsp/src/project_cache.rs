@@ -5304,6 +5304,9 @@ struct StoredIndex {
     /// `index.bytes()`.
     charged: usize,
     memory_exhausted: bool,
+    /// Store reads spent validating members of this context.
+    #[allow(dead_code)] // read by pascal/indexStatus (l4d-zf1b.8)
+    validation_reads: u64,
 }
 
 impl StoredIndex {
@@ -5471,8 +5474,9 @@ impl ProjectCache {
         key: ContextKey,
         anchor: IndexAnchor,
         mut membership: IndexMembership,
+        limit: usize,
     ) {
-        let limit = self.index().unit_limit;
+        let limit = limit.min(self.index().unit_limit);
         if membership.paths.len() > limit {
             membership.paths.truncate(limit);
             membership.complete = false;
@@ -5521,6 +5525,7 @@ impl ProjectCache {
                     last_used: clock,
                     charged: 0,
                     memory_exhausted: false,
+                    validation_reads: 0,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -5647,6 +5652,85 @@ impl ProjectCache {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.defer(path, reason);
         }
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn reuse_pending_index_members(
+        &self,
+        key: &ContextKey,
+        limit: usize,
+    ) -> Vec<PathBuf> {
+        self.index()
+            .contexts
+            .get(key)
+            .map(|stored| stored.index.reuse_pending(limit))
+            .unwrap_or_default()
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn mark_index_reuse_tried(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_reuse_tried(path);
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn mark_index_reused(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_reused(path);
+        }
+    }
+
+    /// `context` is the cache digest of the context the caller indexes
+    /// under (`CacheContextKey::new(&state.context)`); a proof made under
+    /// another context is refused.
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn set_index_record(
+        &self,
+        key: &ContextKey,
+        proof: &crate::workspace::eligible::ProvenRecord,
+        context: pascal_cache::Digest,
+    ) -> bool {
+        proof.context() == context
+            && self
+                .index()
+                .contexts
+                .get_mut(key)
+                .is_some_and(|stored| stored.index.set_record(proof.path(), proof.record_id()))
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.index.record(path).is_some())
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn index_records(
+        &self,
+        key: &ContextKey,
+    ) -> Option<Vec<(PathBuf, Option<pascal_cache::Digest>)>> {
+        self.index()
+            .contexts
+            .get(key)
+            .map(|stored| stored.index.records())
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn add_index_validation_reads(&self, key: &ContextKey, reads: u64) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.validation_reads = stored.validation_reads.saturating_add(reads);
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the index batches (l4d-zf1b.8)
+    pub(crate) fn index_validation_reads(&self, key: &ContextKey) -> u64 {
+        self.index()
+            .contexts
+            .get(key)
+            .map_or(0, |stored| stored.validation_reads)
     }
 
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
@@ -6168,6 +6252,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let base = cache.stats().reserved_index_bytes;
         assert_eq!(base, membership_cost(&["/w/A.pas", "/w/B.pas"]));
@@ -6180,12 +6265,17 @@ mod index_tests {
         assert_eq!(cache.stats().reserved_index_bytes, base + expected);
         assert_eq!(cache.stats().reserved_bytes(), base + expected);
         // A's names stay with the context until its interner is compacted.
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/B.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/B.pas"]),
+            usize::MAX,
+        );
         assert_eq!(
             cache.stats().reserved_index_bytes,
             membership_cost(&["/w/B.pas"]) + names(&facts("/w/A.pas"))
         );
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]), usize::MAX);
         assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
 
@@ -6193,7 +6283,12 @@ mod index_tests {
     fn a_member_over_the_quarter_share_is_left_unindexed_with_a_gap() {
         let cache = ProjectCache::new(4096);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let held = cache.stats().reserved_index_bytes;
         let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
         assert_eq!(
@@ -6213,11 +6308,21 @@ mod index_tests {
         let cache = ProjectCache::new(share * 4);
         let (a, b, third) = (key("a"), key("b"), key("c"));
         for (key, name) in [(&a, "a"), (&b, "b")] {
-            cache.set_index_membership(key.clone(), anchor(name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key.clone(),
+                anchor(name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
             assert_eq!(publish(&cache, key, "/w/A.pas"), PublishOutcome::Indexed);
         }
         cache.read_index(&a, |_, _| ());
-        cache.set_index_membership(third.clone(), anchor("c"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            third.clone(),
+            anchor("c"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(cache.indexed_context_count(), 3);
         assert_eq!(publish(&cache, &third, "/w/A.pas"), PublishOutcome::Indexed);
         assert_eq!(cache.indexed_context_count(), 2);
@@ -6240,7 +6345,12 @@ mod index_tests {
         let cache = ProjectCache::new(1 << 30);
         for index in 0..=MAX_INDEXED_CONTEXTS {
             let name = format!("k{index}");
-            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key(&name),
+                anchor(&name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
         }
         assert_eq!(cache.indexed_context_count(), MAX_INDEXED_CONTEXTS);
         assert!(cache.read_index(&key("k0"), |_, _| ()).is_none());
@@ -6255,8 +6365,18 @@ mod index_tests {
     fn two_contexts_sharing_a_document_each_charge_their_member() {
         let cache = ProjectCache::new(1 << 30);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         let c = charge(&facts("/w/A.pas"));
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
@@ -6276,7 +6396,12 @@ mod index_tests {
     fn a_successful_publish_clears_the_memory_gap() {
         let cache = ProjectCache::new(4096);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
         assert_eq!(
             cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
@@ -6291,7 +6416,12 @@ mod index_tests {
     fn a_membership_that_cannot_be_charged_records_the_gap() {
         let cache = ProjectCache::new(256);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert!(cache.index_memory_exhausted(&a));
         assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
@@ -6302,7 +6432,12 @@ mod index_tests {
         let c = charge(&facts("/w/A.pas"));
         let cache = ProjectCache::new((m + c + 16) * INDEX_BUDGET_SHARE);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
         let held = cache.stats().reserved_index_bytes;
         let grown = (0..20)
@@ -6310,7 +6445,7 @@ mod index_tests {
             .chain(["/w/A.pas".to_owned()])
             .collect::<Vec<_>>();
         let grown = grown.iter().map(String::as_str).collect::<Vec<_>>();
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown), usize::MAX);
         let (paths, complete, members) = cache
             .read_index(&a, |index, membership| {
                 (
@@ -6334,7 +6469,12 @@ mod index_tests {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::NotAMember);
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         assert_eq!(publish(&cache, &a, "/w/Z.pas"), PublishOutcome::NotAMember);
         assert_eq!(cache.stats().reserved_index_bytes, base);
@@ -6344,7 +6484,12 @@ mod index_tests {
     fn refusing_and_replacing_a_member_releases_its_old_charge() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         publish(&cache, &a, "/w/A.pas");
         publish(&cache, &a, "/w/A.pas");
@@ -6367,6 +6512,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let base = cache.stats().reserved_index_bytes;
         publish(&cache, &a, "/w/A.pas");
@@ -6387,7 +6533,12 @@ mod index_tests {
     fn invalidating_a_member_path_marks_it_stale_and_bumps_the_generation() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         publish(&cache, &a, "/w/A.pas");
         assert!(unverified(&cache, &a).is_empty());
         cache.take_index_requests();
@@ -6409,7 +6560,7 @@ mod index_tests {
             (&b, "b", "/w/A.pas"),
             (&other, "o", "/w/O.pas"),
         ] {
-            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]));
+            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]), usize::MAX);
             publish(&cache, key, path);
         }
         cache.take_index_requests();
@@ -6451,7 +6602,7 @@ mod index_tests {
         let a = key("a");
         let mut recorded = membership(&["/w/A.pas"]);
         recorded.scopes = vec![(scope, generation)];
-        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        cache.set_index_membership(a.clone(), anchor("a"), recorded, usize::MAX);
         assert!(cache.index_membership_current(&a));
         cache.invalidate_file_contents(&dir.join("New.pas"));
         assert!(
@@ -6476,7 +6627,7 @@ mod index_tests {
         let a = key("a");
         let mut recorded = membership(&["/w/A.pas"]);
         recorded.scopes = vec![(scope, generation)];
-        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        cache.set_index_membership(a.clone(), anchor("a"), recorded, usize::MAX);
         // Keep the catalogue current so only the membership's flag decides.
         cache.invalidate_index(&dir, true);
         assert!(!cache.index_membership_current(&a));
@@ -6486,7 +6637,12 @@ mod index_tests {
     fn a_listing_change_leaves_unrelated_memberships_current() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert!(cache.index_membership_current(&a));
         cache.invalidate_path(Path::new("/elsewhere/New.pas"));
         assert!(cache.index_membership_current(&a));
@@ -6500,6 +6656,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let slots = vec![None, Some(PathBuf::from("/w/shared.inc"))];
         let with_include = facts_with("/w/A.pas", "thing", slots);
@@ -6513,8 +6670,18 @@ mod index_tests {
     fn overflow_marks_every_member_stale_and_clears_owners() {
         let cache = ProjectCache::new(1 << 30);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/B.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/B.pas"]),
+            usize::MAX,
+        );
         publish(&cache, &a, "/w/A.pas");
         publish(&cache, &b, "/w/B.pas");
         cache.remember_owner(PathBuf::from("/w"), a.clone());
@@ -6554,6 +6721,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+            usize::MAX,
         );
         let (count, limited, complete) = cache
             .read_index(&a, |index, membership| {
@@ -6572,18 +6740,64 @@ mod index_tests {
     }
 
     #[test]
+    fn max_workspace_units_bounds_the_membership() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+            2,
+        );
+        let (paths, limit, complete) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    index.member_paths().len(),
+                    membership.limit.clone(),
+                    membership.complete,
+                )
+            })
+            .unwrap();
+        assert_eq!(paths, 2);
+        assert!(!complete);
+        assert_eq!(limit.as_deref(), Some("more than 2 documents"));
+        cache.set_index_unit_limit_for_test(1);
+        let b = key("b");
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+            5,
+        );
+        assert_eq!(
+            cache.read_index(&b, |index, _| index.member_paths().len()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn the_index_lock_is_never_held_with_state() {
         let cache = ProjectCache::new(1 << 20);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
         cache.invalidate_path(Path::new("/w/A.pas"));
         cache.invalidate_after_overflow();
         for index in 0..=MAX_INDEXED_CONTEXTS {
             let name = format!("k{index}");
-            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key(&name),
+                anchor(&name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
         }
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]), usize::MAX);
         assert!(
             cache
                 .read_index(&b, |_, _| HELD_INDEX.with(std::cell::Cell::get))

@@ -577,8 +577,12 @@ impl Workspace {
             return Ok(None);
         }
         let membership = self.index_membership(key, cancel)?;
-        self.project_cache
-            .set_index_membership(key.clone(), anchor.clone(), membership.clone());
+        self.project_cache.set_index_membership(
+            key.clone(),
+            anchor.clone(),
+            membership.clone(),
+            self.options.limits.max_workspace_units,
+        );
         Ok(Some(membership))
     }
 
@@ -1606,6 +1610,7 @@ impl Workspace {
                     key.clone(),
                     anchor.clone(),
                     membership.clone(),
+                    self.options.limits.max_workspace_units,
                 );
                 computed = Some(membership);
             };
@@ -2311,7 +2316,7 @@ mod tests {
         let anchor = IndexAnchor::Project(root.join("App.dproj"));
         workspace
             .project_cache
-            .set_index_membership(key.clone(), anchor, found);
+            .set_index_membership(key.clone(), anchor, found, usize::MAX);
         let (stored, limited, complete) = workspace
             .project_cache
             .read_index(&key, |index, membership| {
@@ -2348,7 +2353,7 @@ mod tests {
         let anchor = IndexAnchor::Project(root.join("App.dproj"));
         workspace
             .project_cache
-            .set_index_membership(key.clone(), anchor, found);
+            .set_index_membership(key.clone(), anchor, found, usize::MAX);
         assert!(workspace.project_cache.index_membership_current(&key));
         workspace
             .project_cache

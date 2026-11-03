@@ -205,8 +205,15 @@ impl Store {
             if !due(&self.lease, now) {
                 return Ok(());
             }
+            fault_point!(self, LeaseRenewDecided);
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            // A write of this store may have renewed while we waited for
+            // the writer; renewing again would raise the floor too soon.
+            let now = self.clock.unix_seconds();
+            if !due(&self.lease, now) {
+                return Ok(());
+            }
             ensure_live(&transaction, self.scope)?;
             renew(&transaction, self.scope, &self.lease, now)?;
             transaction.commit().map_err(|error| classify(&error))

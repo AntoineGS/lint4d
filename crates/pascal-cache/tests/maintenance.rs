@@ -6,10 +6,10 @@ mod common;
 use common::private_tempdir;
 use common::records::{SEAL, binding_evidence, context, open, raw, records, sealed};
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, Hint, HintStats,
-    LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup, MAX_LEASE_HOLDS,
-    MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Miss, PolicyError, PolicyState, Pressure, Published,
-    SourceContent, Store, StorePolicy, Unhealthy,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, FaultPoint, Hint,
+    HintStats, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup,
+    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Miss, PolicyError, PolicyState,
+    Pressure, Published, SourceContent, Store, StorePolicy, Unhealthy,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
@@ -452,4 +452,27 @@ fn expired_leases_and_their_holds_are_deleted_in_bounded_batches() {
     // The dead process's handle re-inserts its row on next use.
     assert_eq!(dead.hold_snapshot(&header), Ok(true));
     assert_eq!(count(root.path(), "SELECT count(*) FROM process_leases"), 2);
+}
+
+#[test]
+fn a_renewal_that_lost_the_race_to_a_write_does_nothing() {
+    let root = private_tempdir();
+    let store = std::sync::Arc::new(open(root.path()));
+    let opened = lease_row(root.path());
+    publish_bulk(&store, "unit First;", 1, 10).unwrap();
+    store.advance_clock_for_test(LEASE_RENEWAL);
+    // Between the "due" decision and the writer, a publisher of the same
+    // store renews inside admit_write.
+    let racer = store.clone();
+    store.set_fault_for_test(FaultPoint::LeaseRenewDecided, move || {
+        publish_bulk(&racer, "unit Racer;", 1, 10).unwrap();
+    });
+    store.renew_lease().unwrap();
+    store.clear_fault_for_test(FaultPoint::LeaseRenewDecided);
+    let row = lease_row(root.path());
+    assert!(row.1 > opened.1, "the publisher renewed");
+    assert_eq!(
+        row.2, opened.1,
+        "renewed once: the floor is still the open-time sequence"
+    );
 }

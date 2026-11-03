@@ -164,10 +164,13 @@ pub enum FaultPoint {
     SealCommitted,
     /// Inside a snapshot retirement, before commit.
     RetireBeforeCommit,
+    /// In `renew_lease`, after it found the lease due and before it takes
+    /// the writer.
+    LeaseRenewDecided,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -176,6 +179,7 @@ impl FaultPoint {
         Self::SealBeforeCommit,
         Self::SealCommitted,
         Self::RetireBeforeCommit,
+        Self::LeaseRenewDecided,
     ];
 
     pub fn name(self) -> &'static str {
@@ -188,6 +192,7 @@ impl FaultPoint {
             Self::SealBeforeCommit => "SealBeforeCommit",
             Self::SealCommitted => "SealCommitted",
             Self::RetireBeforeCommit => "RetireBeforeCommit",
+            Self::LeaseRenewDecided => "LeaseRenewDecided",
         }
     }
 

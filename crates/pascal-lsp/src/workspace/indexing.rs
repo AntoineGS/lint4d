@@ -921,13 +921,14 @@ impl Workspace {
 
     /// The recursive scope of `root` under the exclusions of the workspace
     /// root containing it, the scope `filename_catalogue_with_cancel` uses.
-    fn recursive_scope(&self, root: &Path) -> CatalogueScope {
+    pub(super) fn recursive_scope(&self, root: &Path) -> CatalogueScope {
         let root = absolute_path(root.to_path_buf());
         let matcher = self
             .roots
             .iter()
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
-            .map(|workspace_root| workspace_root.excludes.clone());
+            .map(|workspace_root| workspace_root.excludes.clone())
+            .or_else(|| self.cache_only_excludes(&root));
         CatalogueScope::recursive(&root, matcher.as_ref())
     }
 

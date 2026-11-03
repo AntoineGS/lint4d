@@ -55,7 +55,14 @@ impl WatchEvents {
         )
     }
 
-    pub(crate) fn drain(&self, cache: &ProjectCache, limit: usize) -> Vec<Url> {
+    /// Apply at most `limit` events. Paths `ignored` holds (the store's own
+    /// files, l4d-vrw0) are dropped before anything is invalidated.
+    pub(crate) fn drain(
+        &self,
+        cache: &ProjectCache,
+        limit: usize,
+        ignored: &dyn Fn(&Path) -> bool,
+    ) -> Vec<Url> {
         let mut affected = Vec::new();
         let mut remaining = limit;
         if remaining > 0 && self.overflowed.swap(false, Ordering::AcqRel) {
@@ -67,10 +74,26 @@ impl WatchEvents {
                 Ok(event) => event,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
+            let event = match event {
+                WatchEvent::Modified(paths) => {
+                    WatchEvent::Modified(without_ignored(paths, ignored))
+                }
+                WatchEvent::Changed(paths) => WatchEvent::Changed(without_ignored(paths, ignored)),
+                WatchEvent::Overflow => WatchEvent::Overflow,
+            };
+            if matches!(&event, WatchEvent::Modified(paths) | WatchEvent::Changed(paths) if paths.is_empty())
+            {
+                continue;
+            }
             affected.extend(apply_watch_event(cache, event));
         }
         affected
     }
+}
+
+fn without_ignored(mut paths: Vec<PathBuf>, ignored: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    paths.retain(|path| !ignored(path));
+    paths
 }
 
 fn enqueue(sender: &Sender<WatchEvent>, overflowed: &AtomicBool, event: WatchEvent) {
@@ -255,7 +278,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("unrelated file write must reach the watcher");
         let mut affected = apply_watch_event(&cache, event);
-        affected.extend(events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN));
+        affected.extend(events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false));
 
         assert!(
             affected.is_empty(),
@@ -416,9 +439,50 @@ mod tests {
         );
         assert!(sender.overflowed.load(std::sync::atomic::Ordering::Acquire));
 
-        events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN);
+        events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false);
         assert!(!sender.overflowed.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(cache.stats().imports, 0);
+    }
+
+    /// l4d-vrw0: events for the store's own files invalidate nothing.
+    #[test]
+    fn ignored_paths_are_dropped_before_any_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("cache/lint4d/analysis");
+        std::fs::create_dir_all(&store).unwrap();
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        let probe = |path: &Path| Probe::Stamp {
+            path: path.to_path_buf(),
+            expected: pascal_project::path_stamp_result(path).unwrap(),
+        };
+        store_import(&cache, &main, vec![probe(temp.path()), probe(&store)]);
+        let (sender, events) = WatchEvents::channel();
+        for event in [
+            WatchEvent::Changed(vec![store.join("analysis.sqlite3-wal")]),
+            WatchEvent::Modified(vec![store.join("analysis.sqlite3")]),
+            WatchEvent::Changed(vec![store.clone(), store.join("namespaces")]),
+        ] {
+            enqueue(&sender.sender, &sender.overflowed, event);
+        }
+        let ignored = |path: &Path| path.starts_with(&store);
+        assert!(
+            events
+                .drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &ignored)
+                .is_empty()
+        );
+        assert_eq!(cache.stats().imports, 1);
+
+        // The same events, not ignored, invalidate the import.
+        enqueue(
+            &sender.sender,
+            &sender.overflowed,
+            WatchEvent::Changed(vec![store.join("analysis.sqlite3-wal")]),
+        );
+        assert_eq!(
+            events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false),
+            vec![main]
+        );
     }
 
     #[test]
@@ -440,9 +504,9 @@ mod tests {
             );
         }
 
-        assert_eq!(events.drain(&cache, 2), uris[..2]);
+        assert_eq!(events.drain(&cache, 2, &|_| false), uris[..2]);
         assert_eq!(cache.stats().imports, 1);
-        assert_eq!(events.drain(&cache, 2), vec![uris[2].clone()]);
+        assert_eq!(events.drain(&cache, 2, &|_| false), vec![uris[2].clone()]);
         assert_eq!(cache.stats().imports, 0);
     }
 

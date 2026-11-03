@@ -10,3 +10,6 @@ include!("protocol/barrier_cases.rs");
 
 #[path = "protocol/persistent_cache.rs"]
 mod persistent_cache;
+
+#[path = "protocol/persistent_cache_in_root.rs"]
+mod persistent_cache_in_root;

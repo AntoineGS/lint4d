@@ -10131,11 +10131,8 @@ fn incomplete_filename_catalogue_invalidates_absent_nested_provider_overlay() {
     fs::create_dir_all(&existing_directory).expect("existing source directory");
     write_file(&main, main_source);
     for index in 0..CATALOGUE_LIMIT {
-        fs::write(
-            existing_directory.join(format!("CataloguePadding{index:05}.txt")),
-            [],
-        )
-        .expect("catalogue padding file");
+        fs::create_dir_all(existing_directory.join(format!("CataloguePadding{index:05}")))
+            .expect("catalogue padding directory");
     }
 
     let (mut server, barrier) =

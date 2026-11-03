@@ -678,6 +678,35 @@ pub(crate) fn test_reset_listings() {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TEST_STAMP_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Records one per-request stamp validation of a stored catalogue.
+#[cfg(test)]
+pub(crate) fn test_record_stamp_check() {
+    TEST_STAMP_CHECKS.with(|checks| checks.set(checks.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn test_stamp_checks() -> usize {
+    TEST_STAMP_CHECKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_stamp_checks() {
+    TEST_STAMP_CHECKS.with(|checks| checks.set(0));
+}
+
+#[cfg(test)]
+impl Catalogue {
+    /// Stops the catalogue as `limit` would, without reaching it.
+    pub(crate) fn test_stop(&mut self, limit: Limit) {
+        self.stop(limit);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

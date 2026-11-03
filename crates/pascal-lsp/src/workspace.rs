@@ -1,6 +1,8 @@
 //! Workspace state, bounded source discovery, overlays, diagnostics, and formatting.
 
+use self::catalogues::CatalogueScope;
 use self::rename::CANCELLATION_MESSAGE;
+use crate::catalogue::{Catalogue, Depth, MAX_CATALOGUE_ENTRIES};
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::include_expansion::{ExpandedSource, ExpansionLimits};
 use crate::navigation::compiled_dcu::{
@@ -116,6 +118,7 @@ fn warn_exclude_glob(message: String) {
 mod admitted;
 mod authorize;
 pub(crate) mod capture;
+mod catalogues;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
@@ -407,9 +410,7 @@ enum IncludeOwnerDiscoveryOutcome {
     Complete,
     Incomplete,
 }
-const MAX_DIRECTORY_CATALOGUES: usize = 1024;
 const MAX_FILENAME_CATALOGUE_ENTRIES: usize = 10_000;
-const MAX_FILENAME_CATALOGUES: usize = 256;
 #[cfg(feature = "test-support")]
 const TEST_FILENAME_CATALOGUE_ENTRIES_ENV: &str = "PASCAL_LSP_TEST_FILENAME_CATALOGUE_ENTRIES";
 const MAX_SOURCE_CHANGE_OBSERVATIONS: usize = 4_096;
@@ -2104,21 +2105,6 @@ impl DiskStamp {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DirectoryCatalogue {
-    stamp: Option<PathStamp>,
-    entries: Vec<PathBuf>,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FilenameCatalogue {
-    entries: HashMap<String, Vec<PathBuf>>,
-    complete: bool,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone, Default)]
 struct PackageCatalogue {
     entries: HashMap<String, Vec<PathBuf>>,
     requested_names: HashSet<String>,
@@ -2459,8 +2445,6 @@ struct DiscardedRecoveryState {
     document_contexts: HashMap<Url, ContextKey>,
     open_document_contexts: HashMap<Url, ContextKey>,
     cached_documents: HashMap<Url, rename::CachedDocument>,
-    directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
-    filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
     package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
     package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     source_change_generations: HashMap<Url, u64>,
@@ -2586,6 +2570,8 @@ struct ExcludeGlobs {
     exact: globset::GlobSet,
     case_insensitive_builder: GlobSetBuilder,
     case_insensitive: OnceLock<Option<globset::GlobSet>>,
+    /// The patterns as configured: the exclusion identity of catalogue keys.
+    text: Arc<[String]>,
     #[cfg(test)]
     build_counts: ExcludeGlobBuildCounts,
 }
@@ -2655,6 +2641,18 @@ impl ExcludeMatcher {
             .into_iter()
             .filter_map(|base| native_relative_path(path, base))
             .any(|relative| matches_exclude_patterns(patterns, path, &relative))
+    }
+
+    /// The identity of what this matcher excludes, for catalogue keys.
+    fn exclusions(&self) -> crate::catalogue::Exclusions {
+        match &self.patterns {
+            None => crate::catalogue::Exclusions::Defaults,
+            Some(globs) => crate::catalogue::Exclusions::Globs {
+                root: self.root.clone(),
+                config_root: self.config_root.clone(),
+                patterns: Arc::clone(&globs.text),
+            },
+        }
     }
 }
 
@@ -2735,6 +2733,7 @@ fn compile_exclude_patterns_with_cancel(
         exact,
         case_insensitive_builder: case_insensitive,
         case_insensitive: OnceLock::new(),
+        text: Arc::from(patterns.to_vec()),
         #[cfg(test)]
         build_counts,
     })))
@@ -2939,11 +2938,10 @@ pub struct Workspace {
     project_selections: ProjectSelections,
     installation_selections: HashMap<PathBuf, String>,
     build_selections: HashMap<PathBuf, BuildChoice>,
-    directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
-    filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
     package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
     package_catalogue_epoch: u64,
     package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
+    catalogue_validations: catalogues::CatalogueValidations,
     warnings: Vec<String>,
     analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
     diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
@@ -3449,8 +3447,6 @@ impl Workspace {
             owner.legacy_route = None;
         }
         self.cached_documents.clear();
-        self.directory_catalogues.clear();
-        self.filename_catalogues.clear();
         self.package_catalogues.clear();
         self.package_metadata_cache.clear();
         self.source_change_generations.clear();
@@ -4026,16 +4022,16 @@ impl Workspace {
             }
             let catalogue =
                 self.filename_catalogue_with_cancel_and_budget(&root_path, Some(cancel), budget)?;
-            if !catalogue.complete {
+            if !catalogue.is_complete() {
                 return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
             }
             let mut paths = Vec::new();
-            for path in catalogue.entries.values().flatten() {
+            for path in catalogue.pascal_files() {
                 check_workspace_cancel(Some(cancel))?;
                 if let Some(budget) = budget {
                     budget.charge_include_path_visits(1)?;
                 }
-                paths.push(absolute_path(path.clone()));
+                paths.push(absolute_path(path.to_path_buf()));
             }
             paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             paths.dedup_by(|left, right| paths_equal_ci(left, right));
@@ -4836,8 +4832,6 @@ impl Workspace {
             document_contexts: std::mem::take(&mut self.document_contexts),
             open_document_contexts: std::mem::take(&mut self.open_document_contexts),
             cached_documents: std::mem::take(&mut self.cached_documents),
-            directory_catalogues: std::mem::take(&mut self.directory_catalogues),
-            filename_catalogues: std::mem::take(&mut self.filename_catalogues),
             package_catalogues: std::mem::take(&mut self.package_catalogues),
             package_metadata_cache: std::mem::take(&mut self.package_metadata_cache),
             source_change_generations: std::mem::take(&mut self.source_change_generations),
@@ -5004,8 +4998,6 @@ impl Workspace {
             count_recovery_entries!(self.document_contexts.len());
             count_recovery_entries!(self.open_document_contexts.len());
             count_recovery_entries!(self.cached_documents.len());
-            count_recovery_entries!(self.directory_catalogues.len());
-            count_recovery_entries!(self.filename_catalogues.len());
             count_recovery_entries!(self.package_catalogues.len());
             count_recovery_entries!(self.package_metadata_cache.len());
             count_recovery_entries!(self.source_change_generations.len());
@@ -5185,24 +5177,6 @@ impl Workspace {
             for warning in &self.warnings {
                 charge_retained_payload(warning.len())?;
             }
-            for (key, catalogue) in &self.directory_catalogues {
-                charge_retained_payload(key.as_os_str().len())?;
-                for path in &catalogue.entries {
-                    charge_retained_payload(path.as_os_str().len())?;
-                }
-            }
-            for (key, catalogue) in &self.filename_catalogues {
-                charge_retained_payload(key.as_os_str().len())?;
-                for (name, paths) in &catalogue.entries {
-                    charge_retained_payload(name.len())?;
-                    for path in paths {
-                        charge_retained_payload(path.as_os_str().len())?;
-                    }
-                }
-                for (path, _) in &catalogue.directories {
-                    charge_retained_payload(path.as_os_str().len())?;
-                }
-            }
             self.index
                 .visit_recovery_payload(&mut charge_retained_payload)?;
             for expansion in self.expansions.values() {
@@ -5328,8 +5302,6 @@ impl Workspace {
         clear_recovery_map!(self.document_contexts);
         clear_recovery_map!(self.open_document_contexts);
         clear_recovery_map!(self.cached_documents);
-        clear_recovery_map!(self.directory_catalogues);
-        clear_recovery_map!(self.filename_catalogues);
         clear_recovery_map!(self.package_catalogues);
         clear_recovery_map!(self.package_metadata_cache);
         clear_recovery_map!(self.source_change_generations);
@@ -5790,8 +5762,6 @@ impl Workspace {
         self.document_contexts.clear();
         self.open_document_contexts.clear();
         self.deleted_overrides.clear();
-        self.directory_catalogues.clear();
-        self.filename_catalogues.clear();
         self.package_catalogues.clear();
         self.package_metadata_cache.clear();
         self.expansions.clear();
@@ -12903,57 +12873,16 @@ impl Workspace {
             .collect()
     }
 
+    /// The analyzable sources and project metadata directly in `directory`.
     fn directory_entries(&mut self, directory: &Path) -> Vec<PathBuf> {
-        let directory = absolute_path(directory.to_path_buf());
-        let stamp = path_stamp(&directory);
-        if self
-            .directory_catalogues
-            .get(&directory)
-            .is_some_and(|catalogue| catalogue.stamp == stamp)
-            && let Some(catalogue) = self.directory_catalogues.get_mut(&directory)
-        {
-            self.use_clock = self.use_clock.saturating_add(1);
-            catalogue.last_used = self.use_clock;
-            return catalogue.entries.clone();
-        }
-
-        #[cfg(test)]
-        crate::catalogue::test_record_listing(&directory);
-        let entries = fs::read_dir(&directory)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                (file_type.is_file() && !file_type.is_symlink()).then_some(entry.path())
-            })
-            .collect::<Vec<_>>();
-        self.use_clock = self.use_clock.saturating_add(1);
-        self.directory_catalogues.insert(
-            directory.clone(),
-            DirectoryCatalogue {
-                stamp,
-                entries: entries.clone(),
-                last_used: self.use_clock,
-            },
-        );
-        self.trim_directory_catalogues();
-        entries
-    }
-
-    fn trim_directory_catalogues(&mut self) {
-        while self.directory_catalogues.len() > MAX_DIRECTORY_CATALOGUES {
-            let Some(victim) = self
-                .directory_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.directory_catalogues.remove(&victim);
-        }
+        let scope = CatalogueScope::listing(directory);
+        self.shared_catalogue(
+            &scope,
+            MAX_CATALOGUE_ENTRIES,
+            &mut || -> Result<(), String> { Ok(()) },
+        )
+        .map(|catalogue| catalogue.files().to_vec())
+        .unwrap_or_default()
     }
 
     fn filename_unit_candidates(
@@ -12979,18 +12908,18 @@ impl Workspace {
         let mut result = Vec::new();
         for root in &roots {
             let catalogue = self.filename_catalogue(root);
-            if !catalogue.complete {
+            if !catalogue.is_complete() {
                 self.warn(format!(
                     "projectless filename catalogue reached its bounded entry limit of {entry_limit} under {}",
                     root.display()
                 ));
             }
             let open_entries = self.open_document_entries_under_root(root, context_key);
-            let scope_names = if catalogue.complete {
+            let scope_names = if catalogue.is_complete() {
                 names
                     .iter()
                     .filter(|name| {
-                        !catalogue.entries.contains_key(*name)
+                        catalogue.pascal_files_named(name).next().is_none()
                             && !open_entries.iter().any(|path| {
                                 path.file_name().is_some_and(|file_name| {
                                     file_name.to_string_lossy().eq_ignore_ascii_case(name)
@@ -13019,9 +12948,7 @@ impl Workspace {
                 &path_entry,
             );
             for name in &names {
-                if let Some(paths) = catalogue.entries.get(name) {
-                    result.extend(paths.iter().cloned());
-                }
+                result.extend(catalogue.pascal_files_named(name).map(Path::to_path_buf));
                 result.extend(open_entries.iter().filter_map(|path| {
                     path.file_name()
                         .is_some_and(|file_name| {
@@ -13051,143 +12978,54 @@ impl Workspace {
             .collect()
     }
 
-    fn filename_catalogue(&mut self, root: &Path) -> FilenameCatalogue {
+    fn filename_catalogue(&mut self, root: &Path) -> Arc<Catalogue> {
         self.filename_catalogue_with_cancel(root, None)
-            .unwrap_or_default()
+            .unwrap_or_else(|_| Arc::new(Catalogue::unlisted(root, Depth::Recursive)))
     }
 
     fn filename_catalogue_with_cancel(
         &mut self,
         root: &Path,
         cancel: Option<&AtomicBool>,
-    ) -> Result<FilenameCatalogue, String> {
+    ) -> Result<Arc<Catalogue>, String> {
         self.filename_catalogue_with_cancel_and_budget(root, cancel, None)
     }
 
+    /// The recursive catalogue of `root` under the exclusions of the
+    /// workspace root that contains it (none outside every workspace root),
+    /// extended to the filename limit.
     fn filename_catalogue_with_cancel_and_budget(
         &mut self,
         root: &Path,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
-    ) -> Result<FilenameCatalogue, String> {
+    ) -> Result<Arc<Catalogue>, String> {
         check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
-        let entry_limit = filename_catalogue_entry_limit();
-        let mut fresh = false;
-        if let Some(catalogue) = self.filename_catalogues.get(&root) {
-            fresh = true;
-            for (path, stamp) in &catalogue.directories {
-                check_workspace_cancel(cancel)?;
-                if let Some(budget) = budget {
-                    budget.charge_include_path_visits(1)?;
-                }
-                if path_stamp(path) != *stamp {
-                    fresh = false;
-                    break;
-                }
-            }
-        }
-        if fresh {
-            self.use_clock = self.use_clock.saturating_add(1);
-            if let Some(catalogue) = self.filename_catalogues.get_mut(&root) {
-                catalogue.last_used = self.use_clock;
-                return Ok(catalogue.clone());
-            }
-        }
-        let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        check_workspace_cancel(cancel)?;
-        if let Some(budget) = budget {
-            budget.charge_include_path_visits(1)?;
-        }
-        let mut directories = vec![(root.clone(), path_stamp(&root))];
-        let mut visited = 0;
-        let mut complete = true;
-        let excludes = self
+        let matcher = self
             .roots
             .iter()
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
             .map(|workspace_root| workspace_root.excludes.clone());
-        let mut walk = WalkDir::new(&root).follow_links(false).into_iter();
-        let mut charged_iterator_visits = 0usize;
-        let mut iterator_steps = 0usize;
-        loop {
+        let scope = CatalogueScope::recursive(&root, matcher.as_ref());
+        #[cfg(feature = "test-support")]
+        let mut steps = 0usize;
+        let mut before_io = || -> Result<(), String> {
             check_workspace_cancel(cancel)?;
-            if visited >= entry_limit {
-                complete = false;
-                break;
-            }
             if let Some(budget) = budget {
                 budget.charge_include_path_visits(1)?;
-                charged_iterator_visits = charged_iterator_visits.saturating_add(1);
             }
-            iterator_steps = iterator_steps.saturating_add(1);
+            // The include-catalogue barrier fires on every `before_io`,
+            // including the stamp checks of a cached catalogue.
             #[cfg(feature = "test-support")]
-            wait_at_include_catalogue_test_barrier(
-                cancel,
-                iterator_steps,
-                charged_iterator_visits,
-            )?;
-            let Some(entry) = walk.next() else {
-                break;
-            };
-            let Ok(entry) = entry else {
-                continue;
-            };
-            visited += 1;
-            #[cfg(test)]
             {
-                if entry.file_type().is_dir() {
-                    crate::catalogue::test_record_listing(entry.path());
-                }
+                steps = steps.saturating_add(1);
+                let charged = if budget.is_some() { steps } else { 0 };
+                wait_at_include_catalogue_test_barrier(cancel, steps, charged)?;
             }
-            if entry.file_type().is_dir() && directories.len() < entry_limit {
-                check_workspace_cancel(cancel)?;
-                if let Some(budget) = budget {
-                    budget.charge_include_path_visits(1)?;
-                }
-                directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
-            }
-            if entry.file_type().is_symlink()
-                || excludes
-                    .as_ref()
-                    .is_some_and(|matcher| matcher.is_excluded(entry.path(), &root))
-            {
-                continue;
-            }
-            if !entry.file_type().is_file() || !extension_is(entry.path(), "pas") {
-                continue;
-            }
-            if let Some(name) = entry.path().file_name() {
-                entries
-                    .entry(name.to_string_lossy().to_ascii_lowercase())
-                    .or_default()
-                    .push(entry.path().to_path_buf());
-            }
-        }
-        self.use_clock = self.use_clock.saturating_add(1);
-        let catalogue = FilenameCatalogue {
-            entries,
-            complete,
-            directories,
-            last_used: self.use_clock,
+            Ok(())
         };
-        self.filename_catalogues.insert(root, catalogue.clone());
-        self.trim_filename_catalogues();
-        Ok(catalogue)
-    }
-
-    fn trim_filename_catalogues(&mut self) {
-        while self.filename_catalogues.len() > MAX_FILENAME_CATALOGUES {
-            let Some(victim) = self
-                .filename_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.filename_catalogues.remove(&victim);
-        }
+        self.shared_catalogue(&scope, filename_catalogue_entry_limit(), &mut before_io)
     }
 
     fn remove_indexed(&mut self, uri: &Url) {
@@ -22928,7 +22766,7 @@ BDS = '/fake/37'
             super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
         );
         assert!(
-            !workspace.filename_catalogues.contains_key(&root),
+            workspace.project_cache.catalogue_count() == 0,
             "a partial filename catalogue must not be cached as complete"
         );
     }
@@ -22946,10 +22784,10 @@ BDS = '/fake/37'
         }
     }
 
-    /// l4d-20 characterization: the walk descends the excluded tree and spends
-    /// the 10,000-entry limit on it (Task 4 turns this into the acceptance test).
+    /// l4d-20 AC#1: a node_modules-style excluded tree of 50,000 files does not
+    /// consume the limit (Task 1 recorded that it did).
     #[test]
-    fn an_excluded_node_modules_tree_is_walked_and_exhausts_the_filename_catalogue() {
+    fn excluded_trees_are_pruned_and_do_not_consume_the_catalogue_limit() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path().to_path_buf();
         fs::write(
@@ -22962,21 +22800,21 @@ BDS = '/fake/37'
         crate::catalogue::test_reset_listings();
         let catalogue = workspace.filename_catalogue(&root);
         assert!(
-            !catalogue.complete,
-            "today 50,000 excluded files exhaust the limit"
+            catalogue.is_complete(),
+            "50,000 excluded files must not consume the entry limit"
         );
+        assert_eq!(catalogue.pascal_files_named("unit1.pas").count(), 1);
         let excluded = root.join("node_modules");
         assert!(
             crate::catalogue::test_listings()
                 .iter()
-                .any(|listed| listed.starts_with(&excluded)),
-            "today the walk descends into node_modules"
+                .all(|listed| !listed.starts_with(&excluded)),
+            "an excluded tree is never listed"
         );
     }
 
-    /// l4d-20 characterization: non-Pascal files count against the limit.
     #[test]
-    fn non_pascal_files_count_against_the_filename_catalogue_limit() {
+    fn only_directories_and_pascal_sources_count_against_the_catalogue_limit() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path().to_path_buf();
         fs::write(
@@ -22990,10 +22828,9 @@ BDS = '/fake/37'
             fs::write(assets.join(format!("Asset{index:05}.txt")), b"").expect("asset");
         }
         let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
-        assert!(
-            !workspace.filename_catalogue(&root).complete,
-            "today 10,000 text files exhaust the limit"
-        );
+        let catalogue = workspace.filename_catalogue(&root);
+        assert!(catalogue.is_complete());
+        assert_eq!(catalogue.counted(), 3, "the root, Unit1.pas and assets");
     }
 
     #[test]
@@ -23065,7 +22902,7 @@ BDS = '/fake/37'
             .expect_err("cancellation must be observed before the next filesystem operation");
         assert_eq!(error, super::CANCELLATION_MESSAGE);
         assert!(
-            !workspace.filename_catalogues.contains_key(&root),
+            workspace.project_cache.catalogue_count() == 0,
             "cancelled catalogue work must not publish a partial cache entry"
         );
     }

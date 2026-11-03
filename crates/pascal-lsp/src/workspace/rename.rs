@@ -7514,7 +7514,7 @@ fn enumerate_sources(
                 }
                 let catalogue =
                     workspace.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
-                if !catalogue.complete {
+                if !catalogue.is_complete() {
                     result.complete = false;
                     result.reason.get_or_insert_with(|| {
                         format!(
@@ -7523,14 +7523,10 @@ fn enumerate_sources(
                         )
                     });
                 }
-                for (directory, stamp) in catalogue.directories {
-                    add_baseline_path_with_stamp(&mut result.baseline, directory, stamp);
-                }
+                add_catalogue_directories(&mut result.baseline, &catalogue);
                 let mut owner_paths = catalogue
-                    .entries
-                    .into_values()
-                    .flatten()
-                    .map(absolute_path)
+                    .pascal_files()
+                    .map(|path| absolute_path(path.to_path_buf()))
                     .collect::<Vec<_>>();
                 owner_paths.sort_by_key(|path| path_key(path));
                 owner_paths.dedup_by(|left, right| paths_equal_ci(left, right));
@@ -7742,17 +7738,13 @@ fn enumerate_assistance_provider_sources(
             }
             let root = absolute_path(root);
             let catalogue = workspace.filename_catalogue_with_cancel(&root, Some(cancel))?;
-            if !catalogue.complete {
+            if !catalogue.is_complete() {
                 enumeration.auto_import_complete = false;
             }
-            for (directory, stamp) in catalogue.directories {
-                add_baseline_path_with_stamp(&mut enumeration.baseline, directory, stamp);
-            }
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
             let mut provider_paths = catalogue
-                .entries
-                .into_values()
-                .flatten()
-                .map(absolute_path)
+                .pascal_files()
+                .map(|path| absolute_path(path.to_path_buf()))
                 .collect::<Vec<_>>();
             provider_paths.sort_by_key(|left| path_key(left));
             provider_paths.dedup_by(|left, right| paths_equal_ci(left, right));
@@ -7828,6 +7820,16 @@ fn add_baseline_path_with_stamp(
     stamp: Option<PathStamp>,
 ) {
     baseline.add_path(path, stamp);
+}
+
+/// Every directory `catalogue` listed, with the stamp taken before listing it.
+fn add_catalogue_directories(
+    baseline: &mut BaselineAccumulator,
+    catalogue: &crate::catalogue::Catalogue,
+) {
+    for (directory, stamp) in catalogue.directories() {
+        add_baseline_path_with_stamp(baseline, directory.clone(), stamp.clone());
+    }
 }
 
 fn add_baseline_candidate_membership(

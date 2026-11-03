@@ -235,6 +235,7 @@ fn usage_errors_exit_two_with_nothing_on_stdout_and_nothing_created() {
     assert!(!Path::new(directory).exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_utf8_argument_is_a_usage_error() {
     use std::os::unix::ffi::OsStrExt;

@@ -310,6 +310,7 @@ enum HookPoint {
     Inspected,
     BeforeWal,
     WalBusy,
+    WalRetried,
 }
 
 #[cfg(test)]
@@ -417,10 +418,18 @@ fn switch_to_wal(connection: &mut Connection, deadline: Deadline) -> Result<Stri
                 }
             }
         }
+        // A reader blocks the switch but not the transaction below, so only
+        // the deadline ends the retries.
+        if deadline.remaining().is_zero() {
+            super::waits::record_busy();
+            return Err(Bypass::Busy);
+        }
         #[cfg(test)]
         run_hook(HookPoint::WalBusy);
         let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
         transaction.commit().map_err(|error| classify(&error))?;
+        #[cfg(test)]
+        run_hook(HookPoint::WalRetried);
     }
 }
 
@@ -760,6 +769,43 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    /// A reader that lets go for each retry and reads again before the
+    /// next switch never stops `BEGIN IMMEDIATE`, so only the deadline ends
+    /// the retries.
+    #[test]
+    fn a_wal_switch_blocked_by_a_returning_reader_gives_up_at_the_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.sqlite3");
+        prepare_container(&mut connect(&path), deadline()).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let opener = path.clone();
+        std::thread::spawn(move || {
+            let reader = connect(&opener);
+            let _: String = reader
+                .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+                .unwrap();
+            let read = |reader: &Connection| {
+                reader.execute_batch("BEGIN").unwrap();
+                let _: i64 = reader
+                    .query_row("SELECT count(*) FROM store_state", [], |row| row.get(0))
+                    .unwrap();
+            };
+            read(&reader);
+            set_hook(Box::new(move |point| match point {
+                HookPoint::WalBusy => reader.execute_batch("COMMIT").unwrap(),
+                HookPoint::WalRetried => read(&reader),
+                _ => {}
+            }));
+            let mut connection = connect(&opener);
+            let short = Deadline::after(Duration::from_millis(50));
+            let _ = sender.send(prepare_container(&mut connection, short));
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(Err(Bypass::Busy))
+        );
     }
 
     #[test]

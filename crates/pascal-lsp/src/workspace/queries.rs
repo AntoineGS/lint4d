@@ -1751,6 +1751,40 @@ fn read_only_reference_coverage(
     if requested_has_include && let Some(error) = other_include_error {
         return Err(format!("reference workspace scan incomplete: {error}"));
     }
+    // The requesting document and its imports stay strict: a recorded
+    // include failure leaves every unit with an include directive unproven,
+    // and an unproven provider may declare a name shadowing the binding.
+    if let Some(error) = other_include_error {
+        let requesting = std::iter::once(uri).chain(
+            snapshot
+                .expansions
+                .iter()
+                .filter(|(_, expansion)| expansion.dependencies.contains(uri))
+                .map(|(owner, _)| owner),
+        );
+        let unproven_provider = requesting.flat_map(|document| {
+            snapshot
+                .index
+                .imports(document)
+                .into_iter()
+                .filter_map(|import| {
+                    snapshot
+                        .index
+                        .import_provider_uri(document, &import.name)
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(provider) = unproven_provider.into_iter().find(|provider| {
+            snapshot.sources.get(provider).is_some_and(|source| {
+                super::rename::may_contain_include_directive(source.as_bytes())
+            })
+        }) {
+            return Err(format!(
+                "reference workspace scan incomplete: {error} (the requesting document uses {provider})"
+            ));
+        }
+    }
     if snapshot
         .expansions
         .get(uri)
@@ -1803,6 +1837,54 @@ fn read_only_reference_coverage(
     for owner in incomplete_expansions {
         coverage.note(Some(owner), "include expansion is incomplete for the unit");
         withheld.insert(owner.clone());
+    }
+    // An indexed snapshot audits its candidates relaxed (l4d-jeh4): a
+    // candidate whose include audit failed is withheld. A gap naming no
+    // unit withholds every unit with an include directive.
+    // Its importers are withheld too: what it declares may shadow theirs.
+    // One level is enough: a Pascal unit sees only the interface of the
+    // units it uses itself, never what those use in turn, so a failed
+    // unit's declarations reach no unit beyond its direct importers.
+    let dependency_gaps = &snapshot.dependency_coverage;
+    let mut unattributed = dependency_gaps.omitted > 0;
+    let mut failed = HashSet::new();
+    for gap in &dependency_gaps.gaps {
+        coverage.note(gap.uri.as_ref(), gap.reason.as_str());
+        match &gap.uri {
+            Some(owner) => {
+                failed.insert(owner.clone());
+            }
+            None => unattributed = true,
+        }
+    }
+    if !failed.is_empty() {
+        for importer in snapshot.sources.keys() {
+            let imports_failed = snapshot.index.imports(importer).iter().any(|import| {
+                snapshot
+                    .index
+                    .import_provider_uri(importer, &import.name)
+                    .is_some_and(|provider| failed.contains(provider))
+            });
+            if imports_failed && !failed.contains(importer) {
+                coverage.note(
+                    Some(importer),
+                    "a unit it uses could not be analyzed, so its bindings are unproven",
+                );
+                withheld.insert(importer.clone());
+            }
+        }
+        withheld.extend(failed);
+    }
+    if unattributed {
+        withheld.extend(
+            snapshot
+                .sources
+                .iter()
+                .filter(|(_, source)| {
+                    super::rename::may_contain_include_directive(source.as_bytes())
+                })
+                .map(|(owner, _)| owner.clone()),
+        );
     }
     // Include files are reported under their own URIs; a withheld owner
     // withholds what it includes.
@@ -3917,6 +3999,291 @@ mod tests {
         );
     }
 
+    /// l4d-jeh4: 300 unverified units that never mention the name sort
+    /// before the 20 importers that do. References read at most the
+    /// interactive bound directly, the members that spell the name first,
+    /// and report the rest as a gap; rename keeps the complete walk.
+    #[test]
+    fn references_read_a_bounded_set_of_unverified_members_likely_ones_first() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for index in 0..300 {
+            fs::write(
+                root.join(format!("Alpha{index:03}.pas")),
+                format!(
+                    "unit Alpha{index:03};\ninterface\nuses Shared;\nconst OtherValue = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("alpha");
+        }
+        let importers = (0..20)
+            .map(|index| {
+                let path = root.join(format!("Zed{index:03}.pas"));
+                fs::write(
+                    &path,
+                    format!(
+                        "unit Zed{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                )
+                .expect("importer");
+                path
+            })
+            .collect::<Vec<_>>();
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input.clone(),
+            &source_uri(&shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+        let bound = crate::workspace::indexing::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
+        assert!(
+            partial.coverage.gaps.iter().any(|gap| gap.reason
+                == format!(
+                    "{} units of {} are not indexed yet; {bound} were searched directly",
+                    321 - bound,
+                    shared.display()
+                )),
+            "{:?}",
+            partial.coverage
+        );
+        let mut expected = importers
+            .iter()
+            .map(|path| (source_uri(path), 6, 6))
+            .chain([(source_uri(&shared), 2, 6)])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(located(&partial.value), expected);
+
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let rename = crate::workspace::rename::rename_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+        let edit = rename.value.expect("rename walks the whole workspace");
+        let changes = edit.changes.expect("plain changes");
+        assert_eq!(changes.len(), 21, "{:?}", changes.keys());
+    }
+
+    /// l4d-jeh4: a candidate unit whose include expansion hits a resolver
+    /// limit is a coverage gap of the references answer, not its failure;
+    /// rename still refuses.
+    #[test]
+    fn a_candidate_whose_expansion_fails_is_a_reference_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        let failing = root.join("Failing.pas");
+        fs::write(
+            &failing,
+            "unit Failing;\ninterface\nuses Shared;\nimplementation\n{$I Extra.inc}\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("failing");
+        fs::write(root.join("Extra.inc"), "const ExtraValue = 2;\n").expect("include");
+        let other = root.join("Other.pas");
+        fs::write(
+            &other,
+            "unit Other;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("other");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::compile_time::test_fail_expansion_of(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::compile_time::test_fail_expansion_of(Some("/Failing.pas"));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input.clone(),
+            &source_uri(&shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&failing))
+                    && gap.reason.contains("resolver limit")),
+            "{:?}",
+            partial.coverage
+        );
+        // Failing.pas may declare what Downstream.pas binds.
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![(source_uri(&other), 6, 6), (source_uri(&shared), 2, 6)]
+        );
+        // A provider of the requesting document keeps the strict proof.
+        let refused = references_from_input(
+            input.clone(),
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(refused.value.is_err(), "{:?}", refused.value);
+        let rename = crate::workspace::rename::rename_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        assert!(rename.value.is_err(), "{:?}", rename.value);
+    }
+
+    /// l4d-jeh4 fix round 1: without the index, references answer from the
+    /// best-effort local snapshot; a provider whose analysis failed there
+    /// is a dependency gap that withholds the requesting document too.
+    #[test]
+    fn the_index_unavailable_fallback_withholds_the_importers_of_a_dependency_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            root.join("Failing.pas"),
+            "unit Failing;\ninterface\n{$I Missing.inc}\nimplementation\nend.\n",
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_target_error(false);
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_target_error(true);
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(0));
+        let computed = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == super::INDEX_UNAVAILABLE_GAP),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            !located(&partial.value)
+                .iter()
+                .any(|(uri, _, _)| *uri == source_uri(&downstream)),
+            "{:?}",
+            partial.value
+        );
+    }
+
+    /// l4d-jeh4 fix round 1: a provider of the requesting document whose
+    /// include is unresolved (a recorded audit failure) may declare a
+    /// shadowing name, so references from that document refuse.
+    #[test]
+    fn a_provider_with_an_unresolved_include_refuses_references() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Shared.pas"),
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            root.join("Failing.pas"),
+            "unit Failing;\ninterface\n{$I Missing.inc}\nimplementation\nend.\n",
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let computed = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(computed.value.is_err(), "{:?}", computed.value);
+    }
+
     #[test]
     fn refused_members_are_a_gap_not_a_candidate() {
         let temp = tempfile::tempdir().expect("temporary workspace");
@@ -4080,6 +4447,58 @@ mod tests {
             .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(bound_documents(), expected);
+    }
+
+    /// l4d-vbeh soundness: a unit whose own text never spells the name but
+    /// whose include does is still walked, and the skip changes nothing.
+    #[test]
+    fn an_occurrence_only_through_an_include_survives_the_occurrence_prefilter() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("main");
+        let include = root.join("Body.inc");
+        fs::write(&include, "  Log(SHAREDVALUE);\n").expect("include");
+        fs::write(
+            root.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Main;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n",
+        )
+        .expect("consumer");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::navigation::test_set_occurrence_prefilter(true);
+            }
+        }
+        let _reset = Reset;
+        let mut results = Vec::new();
+        for prefilter in [true, false] {
+            crate::navigation::test_set_occurrence_prefilter(prefilter);
+            crate::navigation::test_reset_bound_documents();
+            let computed = references_from_input(
+                input.clone(),
+                &source_uri(&main),
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            );
+            let partial = computed.value.expect("references");
+            assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+            results.push((located(&partial.value), bound_documents()));
+        }
+        assert_eq!(results[0].0, results[1].0);
+        assert_eq!(
+            results[0].0,
+            vec![(source_uri(&include), 0, 6), (source_uri(&main), 2, 6)]
+        );
+        let consumer = source_uri(&root.join("Consumer.pas"));
+        assert!(results[0].1.contains(&consumer), "{:?}", results[0].1);
     }
 
     #[test]

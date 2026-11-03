@@ -39,6 +39,7 @@ mod sqlite;
 mod stream;
 #[cfg(feature = "test-support")]
 mod testing;
+mod waits;
 mod wal;
 
 pub use artifacts::{
@@ -69,6 +70,13 @@ pub use snapshots::{
 };
 #[cfg(feature = "test-support")]
 pub use testing::FaultPoint;
+#[cfg(feature = "test-support")]
+pub(crate) use testing::count_operation;
+#[cfg(feature = "test-support")]
+pub use testing::store_operations_for_test;
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn count_operation() {}
+pub use waits::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 
 pub use budget::{
     LOW_SPACE_MARGIN_BYTES, MIN_BUDGET_TO_WAL_RATIO, MIN_WAL_THRESHOLD_BYTES, PolicyError,
@@ -134,6 +142,7 @@ impl Store {
         namespace: &Namespace,
         limits: StoreLimits,
     ) -> Result<Self, Bypass> {
+        count_operation();
         limits.validate().map_err(Bypass::InvalidLimits)?;
         sqlite::check_sqlite_version(rusqlite::version_number())?;
         let location = StoreLocation::prepare(directory)?;

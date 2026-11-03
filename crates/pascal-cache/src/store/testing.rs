@@ -291,3 +291,15 @@ impl Store {
             .map(|lease| ScratchHold { _lease: lease })
     }
 }
+
+static STORE_OPERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn count_operation() {
+    STORE_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Store operations of this process: opens, connection leases, maintenance
+/// locks and administration calls.
+pub fn store_operations_for_test() -> u64 {
+    STORE_OPERATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}

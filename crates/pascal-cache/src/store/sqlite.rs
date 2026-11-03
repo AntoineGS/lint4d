@@ -136,9 +136,17 @@ pub(crate) fn begin(
     connection: &mut Connection,
     behavior: TransactionBehavior,
 ) -> Result<Transaction<'_>, Bypass> {
-    connection
+    let started = std::time::Instant::now();
+    let result = connection
         .transaction_with_behavior(behavior)
-        .map_err(|error| classify(&error))
+        .map_err(|error| classify(&error));
+    if !matches!(behavior, TransactionBehavior::Deferred) {
+        super::waits::record_lock_wait(started.elapsed());
+    }
+    if matches!(result, Err(Bypass::Busy)) {
+        super::waits::record_busy();
+    }
+    result
 }
 
 /// Bound the SQLite lock waits of the next statements by what is left of

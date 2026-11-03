@@ -283,6 +283,7 @@ pub(crate) struct MaintenanceLock(#[allow(dead_code)] std::fs::File);
 
 impl MaintenanceLock {
     pub(crate) fn try_take(location: &StoreLocation) -> Result<Option<Self>, Bypass> {
+        super::count_operation();
         let file = open_lock_file(&location.maintenance_lock())?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self(file))),

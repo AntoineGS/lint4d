@@ -79,11 +79,14 @@ pub use store::{
     StepBudget, StepReport, Store, StoreLimits, StoreLocation, StorePolicy, StoredRow, TooLarge,
     Unhealthy, Usage, default_directory,
 };
+pub use store::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 
 #[cfg(feature = "test-support")]
 pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
 pub use store::INDEX_QUERY_FOR_TEST;
+#[cfg(feature = "test-support")]
+pub use store::store_operations_for_test;
 #[cfg(feature = "test-support")]
 pub use store::{HeldConnection, MaintenanceLockHold, ScratchHold};
 #[cfg(feature = "test-support")]

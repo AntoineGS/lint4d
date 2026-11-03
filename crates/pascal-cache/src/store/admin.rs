@@ -134,6 +134,7 @@ fn database_exists(directory: &Path) -> Result<bool, Bypass> {
 /// itself may create the `-wal` and `-shm` side files of a WAL database).
 /// An unreadable container is reported with its advice and left in place.
 pub fn status(directory: &Path) -> StoreStatus {
+    super::count_operation();
     match database_exists(directory) {
         Ok(true) => {}
         Ok(false) => return StoreStatus::Absent,
@@ -220,6 +221,7 @@ pub fn prune(
     limits: StoreLimits,
     budget: StepBudget,
 ) -> Result<Option<StepReport>, Bypass> {
+    super::count_operation();
     if !database_exists(directory)? {
         return Ok(None);
     }
@@ -260,6 +262,7 @@ pub fn prune(
 /// once this returns `true`: a reclamation that cannot run now (WAL
 /// pressure, a busy store) is left to the next prune or open.
 pub fn reset(directory: &Path, namespace: &Namespace, limits: StoreLimits) -> Result<bool, Bypass> {
+    super::count_operation();
     if !database_exists(directory)? {
         return Ok(false);
     }

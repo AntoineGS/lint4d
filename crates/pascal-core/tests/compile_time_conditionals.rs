@@ -1624,3 +1624,22 @@ fn source_routines_block_later_intrinsic_calls_without_rebinding_earlier_constan
     assert_eq!(activity(&a, "DEFINE RUNTIME_CALLS"), Truth::Unknown);
     assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
+
+/// l4d-4nbs R10: Delphi accepts conditional symbols that start with a digit
+/// (FastMM4: `{$define 32Bit}` ... `{$ifdef 32Bit}`); DEFINE, UNDEF, IFDEF
+/// and IFNDEF must apply them instead of marking the source malformed.
+#[test]
+fn digit_leading_conditional_symbols_are_defined_and_tested() {
+    let source = "unit T; interface {$define 32Bit}{$IFDEF 32Bit}const A = 1;{$ELSE}const B = 2;{$ENDIF}{$undef 32Bit}{$IFNDEF 32Bit}const C = 3;{$ENDIF} implementation end.";
+    let legacy = pascal_core::conditional::analyze(source, &[]);
+    assert!(legacy.complete);
+    let active = legacy.projected_source;
+    assert!(
+        active.contains("A = 1") && active.contains("C = 3"),
+        "{active}"
+    );
+    assert!(!active.contains("B = 2"), "{active}");
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}

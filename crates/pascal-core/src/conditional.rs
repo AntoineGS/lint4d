@@ -2432,7 +2432,9 @@ fn canonical_symbol_ref(symbol: &str) -> Option<&str> {
     let symbol = symbol.trim().trim_start_matches('&');
     let mut bytes = symbol.bytes();
     let first = bytes.next()?;
-    if (!first.is_ascii_alphabetic() && first != b'_')
+    // Conditional symbols are not identifiers: Delphi accepts a leading
+    // digit (FastMM4's `{$define 32Bit}` / `{$ifdef 32Bit}`).
+    if (!first.is_ascii_alphanumeric() && first != b'_')
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
     {
         return None;
@@ -3804,7 +3806,7 @@ fn directive_symbol(body: &str) -> Option<String> {
     let symbol = argument.strip_prefix('&').unwrap_or(argument);
     let mut characters = symbol.chars();
     let first = characters.next()?;
-    if !first.is_ascii_alphabetic() && first != '_' {
+    if !first.is_ascii_alphanumeric() && first != '_' {
         return None;
     }
     if !characters

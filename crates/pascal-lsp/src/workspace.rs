@@ -16288,7 +16288,7 @@ fn is_pascal_path(path: &Path) -> bool {
         })
 }
 
-fn is_analyzable_source_path(path: &Path) -> bool {
+pub(crate) fn is_analyzable_source_path(path: &Path) -> bool {
     is_pascal_path(path)
         || path
             .extension()

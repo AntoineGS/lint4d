@@ -8030,7 +8030,7 @@ fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(path)
 }
 
-fn is_project_metadata_path(path: &Path) -> bool {
+pub(crate) fn is_project_metadata_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         matches!(
             extension.to_string_lossy().to_ascii_lowercase().as_str(),

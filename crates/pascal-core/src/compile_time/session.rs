@@ -429,7 +429,27 @@ pub(crate) fn analyze_source_in_session(
     publish_analysis(analysis, budget)
 }
 
+/// What one session has credited for one distinct source (identity and
+/// content): every adapter credits each byte at most once per session and
+/// funds validation once, whatever its resolver hooks do.
+struct ScanCredit {
+    source: crate::SourceId,
+    content: u64,
+    scanned: usize,
+    validated: bool,
+}
+
+fn source_content(source: &LoadedSource) -> u64 {
+    match &source.revision {
+        crate::SourceRevision::Disk { content_hash, .. }
+        | crate::SourceRevision::Overlay { content_hash, .. } => *content_hash,
+    }
+}
+
 struct ProviderSession {
+    /// Per-source session credits; shared by the root and nested provider
+    /// sessions of one compilation.
+    credits: AdmittedOwned<Vec<AdmittedOwned<ScanCredit>>>,
     active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     identities: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     queries: usize,
@@ -543,13 +563,88 @@ impl ProviderSession {
         let identities = budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?;
+        let credits = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
         Ok(Self {
+            credits,
             active,
             identities,
             declarations,
             queries: 0,
             next_occurrence: 1,
         })
+    }
+
+    fn credit(&self, source: &LoadedSource) -> Option<&ScanCredit> {
+        let content = source_content(source);
+        self.credits
+            .iter()
+            .map(|credit| &**credit)
+            .find(|credit| credit.content == content && credit.source == source.id)
+    }
+
+    /// Offset of `source` this session has already credited.
+    fn credit_floor(&self, source: &LoadedSource) -> usize {
+        self.credit(source).map_or(0, |credit| credit.scanned)
+    }
+
+    fn credit_mut(
+        &mut self,
+        source: &LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<&mut ScanCredit, ResolverError> {
+        let content = source_content(source);
+        let index = match self
+            .credits
+            .iter()
+            .position(|credit| credit.content == content && credit.source == source.id)
+        {
+            Some(index) => index,
+            None => {
+                let bytes = source.id.as_str().len();
+                let credit = budget
+                    .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
+                        source: source.id.clone(),
+                        content,
+                        scanned: 0,
+                        validated: false,
+                    })
+                    .map_err(|r| resolver_error(r, budget))?;
+                push_owner(&mut self.credits, credit, budget)?;
+                self.credits.len() - 1
+            }
+        };
+        Ok(self.credits.value_mut()[index].value_mut())
+    }
+
+    /// The session read `source` to `end`.
+    fn note_scanned(
+        &mut self,
+        source: &LoadedSource,
+        end: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if self.credit_floor(source) < end {
+            let credit = self.credit_mut(source, budget)?;
+            credit.scanned = end;
+        }
+        Ok(())
+    }
+
+    /// Whether raw validation of `source` is funded: once per session, and
+    /// only if the resolver funds it too.
+    fn fund_validation(
+        &mut self,
+        source: &LoadedSource,
+        resolver: &mut dyn CompileTimeResolver,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, ResolverError> {
+        if self.credit(source).is_some_and(|credit| credit.validated) {
+            return Ok(false);
+        }
+        self.credit_mut(source, budget)?.validated = true;
+        Ok(resolver.fund_validation(source))
     }
 }
 
@@ -809,7 +904,7 @@ fn analyze_source_with_providers_inner(
         .charge(1, root.id.as_str().len(), reserve)
         .map_err(|r| resolver_error(r, budget))?;
     let coordinate_owner = if prepared_coordinate.is_none() {
-        let funded = resolver.fund_validation(root);
+        let funded = providers.fund_validation(root, resolver, budget)?;
         Some(super::coordinates::text(root, budget, cancel, funded)?)
     } else {
         None
@@ -2343,7 +2438,11 @@ impl RootSession<'_, '_> {
                     )
                     .map_err(|r| resolver_error(r, self.budget))?;
                 let coordinate = {
-                    let funded = self.resolver.fund_validation(&output.source);
+                    let funded = self.providers.fund_validation(
+                        &output.source,
+                        self.resolver,
+                        self.budget,
+                    )?;
                     super::coordinates::text(&output.source, self.budget, self.cancel, funded)?
                 };
                 let text = coordinate.as_ref();
@@ -2811,8 +2910,13 @@ impl SourceOrder for RootSession<'_, '_> {
                 directive: None,
             });
         }
-        self.scanner
-            .set_grant_floor(self.resolver.scan_credit_floor(&self.root));
+        // The session's own floor holds for every adapter; the resolver's
+        // adds what earlier sessions of the request already credited.
+        let floor = self
+            .resolver
+            .scan_credit_floor(&self.root)
+            .max(self.providers.credit_floor(&self.root));
+        self.scanner.set_grant_floor(floor);
         let scanned = self.scanner.next(
             source,
             cursor,
@@ -2821,8 +2925,15 @@ impl SourceOrder for RootSession<'_, '_> {
             self.budget,
             self.cancel,
         );
-        self.resolver
-            .note_scanned(&self.root, self.scanner.read_to());
+        let read_to = self.scanner.read_to();
+        self.resolver.note_scanned(&self.root, read_to);
+        if let Err(error) = self
+            .providers
+            .note_scanned(&self.root, read_to, self.budget)
+        {
+            self.resource_error = Some(error);
+            return Err(());
+        }
         let next = match scanned {
             Ok(next) => next,
             Err(reason) => {
@@ -4794,6 +4905,22 @@ mod tests {
             .unwrap();
         let baseline = observer.budget_snapshot().retained_bytes;
         let mut providers = ProviderSession::new(&mut budget).unwrap();
+        // The shared provider session keeps one live per-source scan credit
+        // (l4d-9bxx) from its first analysis; create it before measuring
+        // publication handoffs.
+        drop(
+            analyze_source_with_providers(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoGraphCallbacks,
+                &mut budget,
+                &NoCancellation,
+                &mut providers,
+                false,
+                OccurrenceId(0),
+            )
+            .unwrap(),
+        );
         let mut cancelled_count = 0;
         let mut completed_calls = None;
         for allowed in 0..64 {

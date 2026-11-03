@@ -432,3 +432,46 @@ fn the_probe_and_session_credit_one_importer_once() {
         "{credited} credited for {distinct} distinct bytes"
     );
 }
+
+/// Round 4: an adapter keeping the default resolver hooks (no request-wide
+/// credit) still credits each source byte at most once per session: 40
+/// includes of one 4 KB file are refused within the cap plus the grant of
+/// the distinct bytes (it spent 486,761 steps, about 24x a 20,000 cap).
+#[test]
+fn repeated_includes_through_a_default_hook_adapter_credit_once_per_session() {
+    let body = "  V := V + 1;\n".repeat(4096 / 15);
+    let root = format!(
+        "unit T; interface implementation procedure P(var V: Integer); begin\n{}end; end.",
+        "{$I body.inc}\n".repeat(40)
+    );
+    let mut fixture = support::Fixture::new(&root, context(LayoutPlatform::Win32));
+    fixture.include("body.inc", &body);
+    fixture.limits.max_work = 20_000;
+    fixture.limits.max_retained_bytes = 64 * 1024 * 1024;
+    let distinct = root.len() + body.len();
+    let limits = CompileTimeLimits::default();
+    let ceiling = 20_000 + distinct * (limits.work_per_source_byte + 3);
+    let result = fixture.analyze();
+    let refused = match &result {
+        Err(ResolverError::LimitExceeded {
+            limit: "max_work",
+            maximum,
+            ..
+        }) => Some(*maximum),
+        Ok(analysis) => analysis.reasons.iter().find_map(|reason| match reason {
+            pascal_core::compile_time::IncompleteReason::Limit {
+                name: "max_work",
+                maximum,
+            } => Some(*maximum),
+            _ => None,
+        }),
+        _ => None,
+    };
+    assert!(
+        refused.is_some_and(|maximum| maximum <= ceiling),
+        "{:?} (ceiling {ceiling})",
+        result
+            .as_ref()
+            .map(|analysis| (&analysis.reasons, analysis.budget.budget_snapshot()))
+    );
+}

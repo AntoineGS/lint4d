@@ -467,6 +467,14 @@ workspace roots, then the owners of workspace sources no target holds. At most
 twice that. Indexed requests do not walk mapped roots: units reachable only
 through runtime-package mappings are a coverage gap, not searched.
 
+A context with a project file is searched under the key its `Project` anchor
+resolves to, once per request: the key the warmer indexes. A document owner can
+hold an older resolution of the same project (its descriptor changed since the
+owner was recorded), so its own key is not used as the target. A target whose
+context is not retained is restored from the request's document owners when one
+holds that key, otherwise resolved again from its anchor; when the anchor now
+names another context the target is a coverage gap, never a request error.
+
 ### Candidate rules and soundness
 
 References resolve the binding first through the bounded `LocalWithImports`
@@ -525,33 +533,57 @@ Unindexed, stale and unverified members are candidates: the snapshot reads and
 filters them as before, at most `MAX_UNVERIFIED_CANDIDATES = 2,048` per request
 in path order. Members refused for a stable reason (over the size limit,
 unreadable) are reported, not searched. Transient failures leave a member
-pending. Members of other targets outside the workspace roots that the indexed
-enumeration may not bind are filtered before that bound and reported.
+pending, and one member's failure never stops a batch: it is counted as
+deferred and the batch goes on. A member whose session was limited (a
+compile-time limit or an incomplete include lookup, `NotPersistable::Transient`)
+is `Limited`: it keeps no facts, is an unverified candidate of every request
+and is not indexed again until it changes. Members of other targets outside
+the workspace roots that the indexed enumeration may not bind are filtered
+before that bound and reported.
 
-Invalidation: a changed member path goes `Stale`; a changed include marks its
-dependents `Stale`; a listing change dirties the membership scopes that listed
-the directory and the next batch or query reconciles them; overflow stales
-every member, dirties every membership and clears the owner map.
+Invalidation: a changed member path goes `Stale` (from `Fresh`, `Refused` or
+`Limited`); a changed include marks its dependents `Stale`; a listing change
+dirties the membership scopes that listed the directory (or that list the
+deleted directory itself) and the next batch or query reconciles them; overflow
+stales every member, dirties every membership and clears the owner map.
 
 ### Memory
 
 Index bytes are charged to `maxCacheBytes` through a
 `ReservationKind::WorkspaceIndex` bucket held by the store (no `Reservation`
 value, to avoid a cycle with the cache), capped at a quarter of
-`maxCacheBytes` and reported as `reserved_index_bytes`. A member's charge is
-computed before it is inserted (`ContextIndex::charge_for`) and deliberately
-overcounts: every distinct name is charged as new to the interner, each list
-entry is counted twice (the inverted list and the per-member list kept for
-removal) and include keys are included. `ContextIndex::bytes()` is the sum of
-member charges, so interner compaction would need no release. The membership
-charge per path is `3 × len + size_of::<Member>() + 64`. When a charge fails
-the least recently used other index is evicted once; if it still fails the
-member stays unindexed and the coverage says so. Two contexts sharing a
-document each charge their own copy: an overcount, never an undercount.
+`maxCacheBytes` and reported as `reserved_index_bytes`. The charge of a
+publish is computed under the index lock before inserting
+(`ContextIndex::charge_for`) and checked again under the lock that inserts;
+names interned in between only make it an overcount. It has two parts:
+
+- **The member** (`ContextIndex::member_charge`): its facts without the names
+  (unit display, declarations, slot paths), its stamps, its include keys, and
+  each list entry twice (the inverted list, with room to grow, and the
+  per-member id list kept for removal). Once inserted, a member keeps only the
+  ids of its names. Released when the member is refused, limited, replaced or
+  removed.
+- **The names**, once per context: each name new to the interner (its length
+  rounded to 16 plus 80 bytes) and each new key of an inverted list (96 bytes).
+  A list that empties keeps its key and gives back its room, so reindexing a
+  member never charges its names twice. Released when the interner is
+  compacted (the context's membership empties) or the context is evicted.
+
+`ContextIndex::bytes()` is the sum of both. The membership charge per path is
+`3 × len + size_of::<Member>() + 64`. When a publish cannot be charged the least
+recently used other index is evicted once; if it still fails the member stays
+unindexed and the coverage says so. When a recomputed membership cannot be
+charged, a stored context keeps the membership and members it holds, is marked
+memory-exhausted and incomplete, and is computed again on the next look; a new
+context is stored empty with the same gap. Two contexts sharing a document each
+charge their own copy: an overcount, never an undercount.
 
 The test `index_bytes_per_member_stay_within_the_estimate` builds 1,000 members
-with 300 distinct postings, 20 imports and 40 declarations each and asserts at
-most 64 KiB per member; it measured 27,326 bytes per member.
+with 300 postings, 20 imports and 40 declarations each. With 30 postings per
+member distinct and the rest drawn from a shared vocabulary of 2,000 names it
+measures 17,100 bytes per member; with every posting distinct (the worst case,
+each member paying for all its names) 72,844 bytes, asserted at most 96 KiB.
+The per-member model it replaced measured 28,406 and 27,326 bytes.
 
 An index build does not publish parses (`Workspace::index_build`): the batch
 view drops its `ProjectCache` claim after extracting facts, so a build does not
@@ -564,8 +596,8 @@ its open-file queue is empty, project anchors before document anchors, at most
 16 queued anchors. A batch yields before every unit through the interactive
 gate, and also when a new crawl is pending (a crawl flag checked between
 units); a paused batch is requeued. A batch is requeued when it made progress
-(indexed, refreshed or refused something), is not complete and did not hit the
-memory limit, which avoids livelock. Warm `End` of an open file requests its
+(indexed, refreshed, refused or limited something), is not complete and did not
+hit the memory limit, which avoids livelock. Warm `End` of an open file requests its
 context. Requests that find an incomplete index request its anchor too. Each
 batch stamps a member before its read, one `before_io` call per member.
 Configuration changes produce new `ContextKey`s and so new indexes. Rename,
@@ -585,6 +617,15 @@ Each gap is one coverage note (at most 32 are kept). The wordings emitted:
 - `<n> units could not be indexed: <first reason>`
 - `the workspace index memory share is exhausted`
 - `no project context is open; open a source or select a project`
+- `<context> changed while the request ran; it was not searched`
+- `the workspace index is unavailable; only the current context's imports were searched`
+- `the workspace index is unavailable; no workspace symbols were searched`
+
+When the index cannot answer (no target resolves, or the targets fail), only a
+small workspace (the A16 test below) is walked. Otherwise references answer
+from the phase-1 `LocalWithImports` snapshot, the current document's context
+and its imports, and `workspace/symbol` answers nothing; each says so with the
+corresponding message above (U4).
 
 `workspace/symbol` answers from the Fresh members' declarations of the target
 contexts, merged with unverified members and open documents, deduplicated on
@@ -600,8 +641,8 @@ and routine-local types are not facts and appear only for open documents.
 - The `maxWorkspaceUnits` client option (the cap is a constant; tests lower it
   through the store).
 - Hash-consing members shared by several contexts.
-- Compaction of the per-context interner (names of removed members stay until
-  the context empties; they are not charged).
+- Compaction of the per-context interner (names of removed members stay, still
+  charged, until the context empties).
 - A native-watch fast path for verifying excluded members (`l4d-20`
   `SharedCatalogue::watched`); each request stats them today.
 - `.inc` references on `ContextIndex::include_dependents` (`l4d-35`).

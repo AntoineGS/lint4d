@@ -2013,7 +2013,9 @@ impl NavigationIndex {
         // (what its tree was parsed from, includes expanded) spells none of
         // them holds none and is not walked (l4d-vbeh). Unit occurrences
         // also come from aliases and namespace prefixes, so they keep the walk.
-        let prefilter_occurrences = binding.kind != SymbolKind::Unit;
+        // A walk restricted to one document (highlights) walks it anyway.
+        let prefilter_occurrences =
+            binding.kind != SymbolKind::Unit && options.document_uri.is_none();
         #[cfg(test)]
         let prefilter_occurrences =
             prefilter_occurrences && TEST_OCCURRENCE_PREFILTER.with(std::cell::Cell::get);
@@ -4693,6 +4695,37 @@ mod tests {
                 .iter()
                 .any(|uri| uri.as_str() == "file:///Big.pas")
         );
+    }
+
+    /// l4d-vbeh fix round 1: a walk restricted to the requested document
+    /// (document highlights) spends nothing on the name scan.
+    #[test]
+    fn highlights_spend_no_bytes_on_the_occurrence_prefilter() {
+        let decl = "unit Decl;\ninterface\nconst Foo = 1;\nimplementation\nend.\n";
+        let user = "unit User;\ninterface\nuses Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(Foo);\nend;\nend.\n";
+        let index = indexed(&[("Decl", decl), ("User", user)]);
+        let uri = Url::parse("file:///User.pas").expect("valid file URL");
+        let offset = user.find("Foo)").expect("needle");
+        let position = crate::text::offset_to_position(user, offset).expect("position");
+        let _reset = PrefilterReset;
+        let mut spent = Vec::new();
+        for prefilter in [false, true] {
+            super::test_set_occurrence_prefilter(prefilter);
+            let mut budget =
+                super::super::AssistanceBudget::new(1_000_000, 32 * 1024 * 1024, "test");
+            let highlights = index
+                .binding_highlights_in_document_with_cancel_and_work_budget_and_shared_budget(
+                    &uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut super::BindingWorkBudget::new(1_000_000),
+                    &mut budget,
+                )
+                .expect("highlights");
+            assert_eq!(highlights.len(), 1);
+            spent.push(budget.byte_limit - budget.remaining_bytes);
+        }
+        assert_eq!(spent[0], spent[1]);
     }
 
     /// l4d-vbeh soundness: the textual skip keeps every occurrence spelled

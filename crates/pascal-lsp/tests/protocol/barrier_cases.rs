@@ -5601,7 +5601,7 @@ fn queued_hover_is_replaced_by_a_newer_hover_for_the_same_document() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
+fn definition_adopts_a_bulk_references_cache_claim() {
     let root = tempfile::tempdir().expect("workspace");
     let provider = root.path().join("Provider.pas");
     let main = root.path().join("Main.pas");
@@ -5646,25 +5646,23 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
     );
     claim.wait_until_entered();
 
+    // The definition waits for the claim the references job computes,
+    // instead of computing the same imports a second time (l4d-16x7).
     let definition_id = RequestId::from("definition-behind-a-bulk-claim".to_string());
-    let started = Instant::now();
     server.send_request(
         definition_id.clone(),
         "textDocument/definition",
         navigation_params(&main, &source, "TProvided", 0),
     );
+    claim.release();
     let definition = server
         .response_with_timeout(&definition_id, IO_TIMEOUT)
-        .expect("definition must not wait for the bulk job's cache claim");
-    eprintln!(
-        "definition answered in {:?} while references held a cache claim",
-        started.elapsed()
-    );
+        .expect("definition answers once the bulk job's claim is stored");
     let locations = result_locations(definition);
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert_eq!(locations[0]["uri"], uri(&provider).to_string());
     // No document is open, so nothing warms: the one held claim is the
-    // references job's, and the definition did not take one at the barrier.
+    // references job's.
     assert_eq!(
         fs::read(&claim.entered)
             .expect("claim barrier marker")
@@ -5672,8 +5670,6 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
         1,
         "only the references job may hold a claim at the barrier"
     );
-
-    claim.release();
     let references = server.response(&references_id);
     assert!(references.error.is_none(), "{references:?}");
     server.shutdown();

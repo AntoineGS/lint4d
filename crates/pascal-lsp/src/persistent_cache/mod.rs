@@ -348,6 +348,15 @@ impl Inner {
         }
     }
 
+    /// Keep the worker's usage reading for the status, unless the
+    /// generation moved on or left `Enabled` meanwhile.
+    fn record_usage(&self, generation: u64, usage: status::UsageView) {
+        let mut shared = self.lock();
+        if shared.generation == generation && shared.state == CacheState::Enabled {
+            shared.usage = Some(usage);
+        }
+    }
+
     pub(super) fn job(self: &Arc<Self>) -> Option<CacheJob> {
         let mut shared = self.lock();
         if shared.state != CacheState::Enabled {
@@ -648,6 +657,29 @@ impl PersistentCache {
             lock_waits,
             counters: inner.counters.snapshot(),
         }
+    }
+
+    /// Run one maintenance step on the worker, gate ignored. `None` without
+    /// a worker, without a job, or when no reply comes within 5 s.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn step_now(&self) -> Option<worker::StepResult> {
+        let inner = self.inner.as_ref()?;
+        let (reply, result) = crossbeam_channel::bounded(1);
+        inner
+            .lock()
+            .commands
+            .as_ref()?
+            .send(worker::Command::StepNow(reply))
+            .ok()?;
+        result.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    }
+
+    /// The scheduled step's path (gate check included, never waiting) on
+    /// the calling thread, with a fresh cycle and no renewal overdue.
+    #[cfg(test)]
+    pub(crate) fn scheduled_step_for_test(&self) -> Option<worker::StepResult> {
+        let inner = self.inner.as_ref()?;
+        worker::scheduled_step(inner, &mut worker::new_cursor(), Duration::ZERO)
     }
 
     /// Wait while the state is `Opening` or `Fencing`; returns the state.

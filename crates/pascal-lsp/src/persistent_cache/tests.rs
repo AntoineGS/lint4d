@@ -540,3 +540,172 @@ fn a_readmission_before_the_open_is_claimed_reopens() {
     assert_ne!(cache.state(), CacheState::Fencing);
     assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
 }
+
+fn report(
+    cycle_complete: bool,
+    pressure: pascal_cache::Pressure,
+    skipped: bool,
+) -> pascal_cache::StepReport {
+    pascal_cache::StepReport {
+        skipped,
+        cancelled: false,
+        phase: pascal_cache::Phase::Done,
+        rows: 0,
+        cycle_complete,
+        pressure,
+    }
+}
+
+/// The lease must be renewed at least every LEASE_EXPIRY - LEASE_RENEWAL
+/// (9 minutes, `maintenance.rs:138-141`); every step renews when due.
+#[test]
+fn maintenance_steps_often_enough_to_keep_the_lease() {
+    use pascal_cache::Pressure::{self, OverHeadroom, WalPressure};
+    use worker::{IDLE_INTERVAL, PRESSURE_INTERVAL, RENEWAL_DEADLINE, next_delay};
+    assert_eq!(
+        next_delay(Option::None),
+        Duration::ZERO,
+        "the first step follows the open"
+    );
+    assert_eq!(
+        next_delay(Some(&Ok(report(false, Pressure::None, false)))),
+        Duration::ZERO
+    );
+    assert_eq!(
+        next_delay(Some(&Ok(report(true, Pressure::None, false)))),
+        IDLE_INTERVAL
+    );
+    assert_eq!(
+        next_delay(Some(&Ok(report(true, OverHeadroom, false)))),
+        PRESSURE_INTERVAL
+    );
+    assert_eq!(
+        next_delay(Some(&Ok(report(false, WalPressure, false)))),
+        PRESSURE_INTERVAL
+    );
+    assert_eq!(
+        next_delay(Some(&Ok(report(false, Pressure::None, true)))),
+        IDLE_INTERVAL
+    );
+    assert_eq!(next_delay(Some(&Err(Bypass::Busy))), IDLE_INTERVAL);
+    let renewal = pascal_cache::LEASE_EXPIRY - pascal_cache::LEASE_RENEWAL;
+    assert!(IDLE_INTERVAL <= renewal);
+    assert!(RENEWAL_DEADLINE <= renewal);
+}
+
+/// D23: a step waits for the gate unless the lease renewal is overdue.
+#[test]
+fn an_overdue_renewal_steps_past_a_busy_gate() {
+    use worker::{RENEWAL_DEADLINE, should_step};
+    assert!(should_step(true, Duration::ZERO));
+    assert!(!should_step(false, Duration::ZERO));
+    assert!(!should_step(
+        false,
+        RENEWAL_DEADLINE - Duration::from_millis(1)
+    ));
+    assert!(should_step(false, RENEWAL_DEADLINE));
+    assert!(should_step(false, RENEWAL_DEADLINE * 2));
+}
+
+#[test]
+fn a_step_runs_under_a_job_and_records_usage() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert_eq!(cache.status().to_json()["store"], serde_json::Value::Null);
+    let report = cache.step_now().expect("enabled").unwrap();
+    assert!(report.rows <= worker::STEP_BUDGET.rows);
+    assert!(cache.counters().unwrap().snapshot().steps >= 1);
+    let status = cache.status().to_json();
+    assert!(
+        status["store"]["databaseBytes"].as_u64().unwrap() > 0,
+        "{status}"
+    );
+    // The step's job is gone: a disable is acknowledged at once.
+    assert_eq!(
+        cache.reconfigure_within(
+            CacheOptions {
+                enabled: false,
+                ..options(root.path())
+            },
+            Duration::ZERO
+        ),
+        Ack::Done
+    );
+}
+
+#[test]
+fn a_disabled_cache_never_steps() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    cache.reconfigure(CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    });
+    assert_eq!(cache.step_now(), None);
+    assert_eq!(cache.status().to_json()["store"], serde_json::Value::Null);
+    assert_eq!(cache.counters().unwrap().snapshot().steps, 0);
+    assert_eq!(PersistentCache::default().step_now(), None);
+}
+
+/// R4: the scheduled path never waits at a busy gate; it defers without
+/// holding a job, so a disable meanwhile is acknowledged at once.
+#[test]
+fn a_busy_gate_defers_the_scheduled_step_and_a_disable_meanwhile_is_acknowledged() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let gate = Arc::new(InteractiveGate::default());
+    let cache = PersistentCache::start_unscheduled_for_test(
+        options(root.path()),
+        project_cache.clone(),
+        gate.clone(),
+        namespace(),
+    );
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let steps = cache.counters().unwrap().snapshot().steps;
+    gate.set(1);
+    assert_eq!(cache.scheduled_step_for_test(), None);
+    assert_eq!(cache.counters().unwrap().snapshot().steps, steps);
+    assert_eq!(
+        cache.reconfigure_within(
+            CacheOptions {
+                enabled: false,
+                ..options(root.path())
+            },
+            Duration::ZERO
+        ),
+        Ack::Done
+    );
+    assert_eq!(cache.counters().unwrap().snapshot().steps, steps);
+    // An idle gate lets the scheduled path step once enabled again.
+    gate.set(0);
+    cache.reconfigure(options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(matches!(cache.scheduled_step_for_test(), Some(Ok(_))));
+    assert_eq!(cache.counters().unwrap().snapshot().steps, steps + 1);
+}
+
+/// R2: a production handle steps on its own once enabled (the first step
+/// follows the open) and records the usage it read.
+#[test]
+fn a_scheduled_cache_steps_after_the_open() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = PersistentCache::start_with(
+        options(root.path()),
+        project_cache.clone(),
+        Arc::default(),
+        namespace(),
+    );
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let inner = cache.inner.as_ref().unwrap();
+    let shared = inner.wait_while(inner.lock(), SETTLE, |shared| shared.usage.is_none());
+    assert!(shared.usage.is_some(), "no step recorded its usage");
+    drop(shared);
+    assert!(cache.counters().unwrap().snapshot().steps >= 1);
+    cache.shutdown();
+    assert_eq!(live_leases(root.path()), 0);
+}

@@ -1,16 +1,186 @@
-//! The `pascal-cache` thread (D23): opens and reopens the store, and
-//! retries opens whose bypass advises it (D24). Task 6 adds maintenance.
+//! The `pascal-cache` thread (D23): opens and reopens the store, retries
+//! opens whose bypass advises it (D24), and runs bounded maintenance steps
+//! while the interactive gate is idle.
 
-use super::{CacheState, Inner, StatusCause};
+use super::{CacheState, Inner, PersistentCache, StatusCause, status};
 use crate::workspace::admitted::{AdmittedStore, StoreBypass};
-use pascal_cache::Bypass;
+use pascal_cache::{Bypass, Maintenance, MaintenanceLimits, Pressure, StepBudget, StepReport};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub(super) const STEP_BUDGET: StepBudget = StepBudget {
+    time: Duration::from_millis(50),
+    rows: 256,
+};
+pub(super) const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const PRESSURE_INTERVAL: Duration = Duration::from_secs(1);
+/// A step deferred by interactive work is tried again this soon.
+const GATE_RETRY: Duration = Duration::from_millis(25);
+/// Past this since the last completed step (or the open), a step runs
+/// whatever the gate says, so the lease is renewed (D23); the step budget
+/// bounds what it takes from interactive work.
+pub(super) const RENEWAL_DEADLINE: Duration = Duration::from_secs(120);
+const TRACE_INTERVAL: Duration = Duration::from_secs(600);
+
+pub(super) type StepResult = Result<StepReport, Bypass>;
+
 pub(super) enum Command {
     Open,
+    /// Run one step now, gate ignored, and reply (tests).
+    StepNow(crossbeam_channel::Sender<Option<StepResult>>),
     Shutdown,
+}
+
+/// The delay before the next scheduled step, given the last one.
+pub(super) fn next_delay(last: Option<&StepResult>) -> Duration {
+    match last {
+        None => Duration::ZERO,
+        Some(Ok(report)) if report.skipped || report.cancelled => IDLE_INTERVAL,
+        Some(Ok(report)) if report.pressure == Pressure::WalPressure => PRESSURE_INTERVAL,
+        Some(Ok(report)) if !report.cycle_complete => Duration::ZERO,
+        Some(Ok(report)) if report.pressure != Pressure::None => PRESSURE_INTERVAL,
+        Some(_) => IDLE_INTERVAL,
+    }
+}
+
+/// Whether a scheduled step runs now: when the gate is idle, or when the
+/// lease renewal is overdue.
+pub(super) fn should_step(gate_idle: bool, since_last: Duration) -> bool {
+    gate_idle || since_last >= RENEWAL_DEADLINE
+}
+
+/// The maintenance cycle's position, kept for one generation.
+pub(super) type Cursor = (u64, Maintenance);
+
+pub(super) fn new_cursor() -> Cursor {
+    (
+        0,
+        Maintenance::new(MaintenanceLimits::default()).expect("default limits"),
+    )
+}
+
+/// One maintenance step under a job, `None` when no job is admitted. The
+/// job is held for the whole store access (usage reading included) and
+/// dropped on return.
+pub(super) fn step(inner: &Arc<Inner>, cursor: &mut Cursor) -> Option<StepResult> {
+    let job = inner.job()?;
+    if cursor.0 != job.generation() {
+        *cursor = (job.generation(), new_cursor().1);
+    }
+    let result = cursor.1.step(job.store(), STEP_BUDGET, job.cancel_flag());
+    match &result {
+        Ok(report) => {
+            job.counters().record_step(report);
+            if !job.is_cancelled() {
+                match status::UsageView::read(job.store()) {
+                    Ok(usage) => inner.record_usage(job.generation(), usage),
+                    Err(bypass) => job.observe(&bypass),
+                }
+            }
+        }
+        Err(bypass) => job.observe(bypass),
+    }
+    Some(result)
+}
+
+/// The scheduled path: never waits at the gate. A busy gate defers the
+/// step (`None`, no job taken) unless the renewal is overdue.
+pub(super) fn scheduled_step(
+    inner: &Arc<Inner>,
+    cursor: &mut Cursor,
+    since_last: Duration,
+) -> Option<StepResult> {
+    let gate_idle = inner.gate.try_wait_idle(&AtomicBool::new(false));
+    if !should_step(gate_idle, since_last) {
+        return None;
+    }
+    step(inner, cursor)
+}
+
+/// The worker's maintenance timetable for the current `Enabled`
+/// generation.
+struct Schedule {
+    generation: u64,
+    last: Option<StepResult>,
+    due: Instant,
+    /// The last completed step, or the open.
+    renewed: Instant,
+    traced: Option<(Instant, String)>,
+}
+
+impl Schedule {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            generation: 0,
+            last: None,
+            due: now,
+            renewed: now,
+            traced: None,
+        }
+    }
+
+    /// When the next step is due, `None` unless maintenance is scheduled
+    /// and the state is `Enabled`. A new generation starts afresh.
+    fn due(&mut self, inner: &Inner) -> Option<Instant> {
+        if !inner.schedule_maintenance {
+            return None;
+        }
+        let generation = {
+            let shared = inner.lock();
+            if shared.state != CacheState::Enabled || shared.shut_down {
+                return None;
+            }
+            shared.generation
+        };
+        if generation != self.generation {
+            let now = Instant::now();
+            self.generation = generation;
+            self.last = None;
+            self.due = now;
+            self.renewed = now;
+        }
+        Some(self.due)
+    }
+
+    fn run(&mut self, inner: &Arc<Inner>, cursor: &mut Cursor) {
+        let since_last = Instant::now().saturating_duration_since(self.renewed);
+        let Some(result) = scheduled_step(inner, cursor, since_last) else {
+            // Deferred by the gate; a state change re-arms through `due`.
+            self.due = Instant::now() + GATE_RETRY;
+            return;
+        };
+        let now = Instant::now();
+        if matches!(&result, Ok(report) if !report.cancelled) {
+            self.renewed = now;
+        }
+        self.due = now + next_delay(Some(&result));
+        self.last = Some(result);
+        self.trace(inner, now);
+    }
+
+    /// At most every [`TRACE_INTERVAL`], and only when the status changed.
+    fn trace(&mut self, inner: &Arc<Inner>, now: Instant) {
+        if !crate::trace::enabled()
+            || self
+                .traced
+                .as_ref()
+                .is_some_and(|(at, _)| now.duration_since(*at) < TRACE_INTERVAL)
+        {
+            return;
+        }
+        let handle = PersistentCache {
+            inner: Some(Arc::clone(inner)),
+        };
+        let json = handle.status().to_json().to_string();
+        if self.traced.as_ref().is_some_and(|(_, last)| *last == json) {
+            return;
+        }
+        crate::trace::trace!("cache-status {json}");
+        self.traced = Some((now, json));
+    }
 }
 
 /// Holds a `Weak<Inner>`: dropping the last handle drops the sender, which
@@ -26,19 +196,35 @@ pub(super) fn spawn(inner: &Arc<Inner>) -> (crossbeam_channel::Sender<Command>, 
 }
 
 fn run(weak: &Weak<Inner>, commands: &crossbeam_channel::Receiver<Command>) {
+    let mut cursor = new_cursor();
+    let mut schedule = Schedule::new();
     loop {
-        let timer = match weak.upgrade() {
-            Some(inner) => retry_timer(&inner),
+        let (timer, step_timer) = match weak.upgrade() {
+            Some(inner) => (
+                retry_timer(&inner),
+                schedule
+                    .due(&inner)
+                    .map_or_else(crossbeam_channel::never, crossbeam_channel::at),
+            ),
             None => return,
         };
         crossbeam_channel::select! {
             recv(commands) -> command => match command {
                 Ok(Command::Open) => {}
+                Ok(Command::StepNow(reply)) => {
+                    let result = weak.upgrade().and_then(|inner| step(&inner, &mut cursor));
+                    let _ = reply.send(result);
+                }
                 Ok(Command::Shutdown) | Err(_) => return,
             },
             recv(timer) -> _ => {
                 if let Some(inner) = weak.upgrade() {
                     retry_due(&inner);
+                }
+            },
+            recv(step_timer) -> _ => {
+                if let Some(inner) = weak.upgrade() {
+                    schedule.run(&inner, &mut cursor);
                 }
             },
         }

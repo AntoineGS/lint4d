@@ -709,3 +709,90 @@ fn a_scheduled_cache_steps_after_the_open() {
     cache.shutdown();
     assert_eq!(live_leases(root.path()), 0);
 }
+
+/// I1: a zero wait still tries each lock once, so closing deletes the lease.
+#[test]
+fn a_zero_wait_cache_enables_and_closing_deletes_its_lease() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(
+        &project_cache,
+        CacheOptions {
+            wait: Duration::ZERO,
+            ..options(root.path())
+        },
+    );
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert_eq!(live_leases(root.path()), 1);
+    cache.shutdown();
+    assert_eq!(live_leases(root.path()), 0);
+}
+
+/// M2: a budget that fits exactly one store still reopens it, so the old
+/// reservation is released before the new one is taken.
+#[test]
+fn a_reopen_within_a_budget_of_exactly_one_store_releases_before_it_reserves() {
+    let root = private_dir();
+    let budget = StoreLimits::default().admission_bytes() as usize;
+    let project_cache = ProjectCache::new(budget);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let generation = cache.generation();
+    cache.readmit();
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(cache.generation() > generation);
+    let generation = cache.generation();
+    cache.reconfigure(CacheOptions {
+        wait: Duration::from_millis(5),
+        ..options(root.path())
+    });
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(cache.generation() > generation);
+    assert_eq!(project_cache.stats().reserved_bytes(), budget);
+    assert_eq!(live_leases(root.path()), 1);
+    cache.shutdown();
+}
+
+/// I2: one reuse outcome is counted once, and a fenced reuse reopens.
+#[test]
+fn record_reuse_counts_each_outcome_once_and_a_fenced_reuse_reopens() {
+    use crate::project_cache::ReservationKind;
+    use crate::workspace::persist::{AdmittedFacts, PersistError, Reuse, ReuseMiss, ReuseVia};
+    use counters::MissCause;
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let job = cache.job().unwrap();
+    let charge = project_cache.reserve(ReservationKind::Facts, 64).unwrap();
+    job.record_reuse(&Ok(Reuse::Hit {
+        facts: AdmittedFacts {
+            facts: Arc::new(pascal_core::facts::ArtifactFacts::default()),
+            charge,
+        },
+        via: ReuseVia::Local,
+        reads: 0,
+    }));
+    job.record_reuse(&Ok(Reuse::Miss(ReuseMiss::Open)));
+    job.record_reuse(&Err(PersistError::Cancelled));
+    job.record_reuse(&Err(PersistError::Store(Bypass::Busy)));
+    let snapshot = cache.counters().unwrap().snapshot();
+    assert_eq!((snapshot.hits, snapshot.decoded_bytes), (1, 64));
+    assert_eq!(snapshot.misses[MissCause::Input as usize], 1);
+    assert_eq!(snapshot.misses[MissCause::Budget as usize], 1);
+    assert_eq!(snapshot.bypasses[names::bypass_index(&Bypass::Busy)], 1);
+    assert!(cache.job().is_some());
+    job.record_reuse(&Err(PersistError::Store(Bypass::Fenced)));
+    job.record_reuse(&Err(PersistError::Store(Bypass::Fenced)));
+    assert!(
+        cache.job().is_none(),
+        "a fenced reuse fences the generation"
+    );
+    drop(job);
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert_eq!(
+        cache.counters().unwrap().snapshot().bypasses[names::bypass_index(&Bypass::Fenced)],
+        1
+    );
+    cache.shutdown();
+}

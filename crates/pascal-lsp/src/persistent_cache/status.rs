@@ -252,8 +252,6 @@ mod tests {
         assert!(text.len() <= 8192, "{} bytes", text.len());
     }
 
-    /// Only the cache directory is a path; a bypass carries names, never
-    /// source paths (spec §11.2: no source text or project membership).
     #[test]
     fn truncation_counts_escaped_bytes() {
         let text = "a\"\\\u{1}\u{e9}";
@@ -266,6 +264,8 @@ mod tests {
         assert_eq!(truncate(text, 100), text);
     }
 
+    /// Only the cache directory is a path; a bypass carries names, never
+    /// source paths (spec §11.2: no source text or project membership).
     #[test]
     fn status_names_no_source_path() {
         let status = CacheStatus {

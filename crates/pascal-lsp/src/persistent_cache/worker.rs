@@ -103,7 +103,6 @@ pub(super) fn scheduled_step(
 /// generation.
 struct Schedule {
     generation: u64,
-    last: Option<StepResult>,
     due: Instant,
     /// The last completed step, or the open.
     renewed: Instant,
@@ -115,7 +114,6 @@ impl Schedule {
         let now = Instant::now();
         Self {
             generation: 0,
-            last: None,
             due: now,
             renewed: now,
             traced: None,
@@ -138,7 +136,6 @@ impl Schedule {
         if generation != self.generation {
             let now = Instant::now();
             self.generation = generation;
-            self.last = None;
             self.due = now;
             self.renewed = now;
         }
@@ -148,7 +145,8 @@ impl Schedule {
     fn run(&mut self, inner: &Arc<Inner>, cursor: &mut Cursor) {
         let since_last = Instant::now().saturating_duration_since(self.renewed);
         let Some(result) = scheduled_step(inner, cursor, since_last) else {
-            // Deferred by the gate; a state change re-arms through `due`.
+            // Deferred by the gate, or no job is admitted; a state change
+            // re-arms through `due`.
             self.due = Instant::now() + GATE_RETRY;
             return;
         };
@@ -157,7 +155,6 @@ impl Schedule {
             self.renewed = now;
         }
         self.due = now + next_delay(Some(&result));
-        self.last = Some(result);
         self.trace(inner, now);
     }
 

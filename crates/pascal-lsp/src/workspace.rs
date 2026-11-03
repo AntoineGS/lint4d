@@ -24052,6 +24052,47 @@ BDS = '/fake/37'
         assert!(!workspace.project_cache.has_room());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_cache_budget_change_readmits_the_persistent_store() {
+        use crate::persistent_cache::{CacheOptions, CacheState, PersistentCache, StatusCause};
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let store = super::persist::tests::private_dir();
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let cache = PersistentCache::start_unscheduled_for_test(
+            CacheOptions {
+                directory: Some(store.path().to_path_buf()),
+                ..CacheOptions::default()
+            },
+            workspace.project_cache.clone(),
+            Arc::default(),
+            pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([0x5d; 32])),
+        );
+        let settle = std::time::Duration::from_secs(10);
+        assert_eq!(cache.settle(settle), CacheState::Enabled);
+        workspace.set_persistent_cache(cache.clone());
+        let update = super::parse_runtime_options(&json!({"maxCacheBytes": 1_048_576}))
+            .expect("runtime cache budget option");
+        let mut overrides = RuntimeOptionsOverride::default();
+        assert!(overrides.apply(update).is_empty());
+        let prepared = Workspace::prepare_runtime_options_for_roots(
+            workspace.configuration_root_paths(),
+            overrides.effective(&workspace.options),
+            &AtomicBool::new(false),
+        )
+        .expect("prepared runtime options");
+
+        assert!(workspace.apply_prepared_runtime_options(prepared));
+
+        assert_eq!(
+            cache.settle(settle),
+            CacheState::Bypassed(StatusCause::Memory)
+        );
+        assert_eq!(workspace.project_cache.stats().reserved_bytes(), 0);
+        cache.shutdown();
+    }
+
     #[test]
     fn runtime_conditional_context_parsing_is_typed_and_bounded() {
         let update = super::parse_runtime_options(&json!({

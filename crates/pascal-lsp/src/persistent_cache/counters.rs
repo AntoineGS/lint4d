@@ -2,7 +2,6 @@
 //! Fixed-size, so the status document stays bounded.
 
 use super::names::{self, BYPASS_KINDS};
-use crate::workspace::persist::{PersistError, Reuse};
 use pascal_cache::{Bypass, StepReport};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -93,18 +92,6 @@ impl Counters {
         self.bypasses[names::bypass_index(bypass)].fetch_add(1, Relaxed);
     }
 
-    /// Record one `reuse_persisted_facts` outcome (`l4d-zf1b.8` calls this).
-    pub(crate) fn record_reuse(&self, result: &Result<Reuse, PersistError>) {
-        match result {
-            Ok(Reuse::Hit { facts, .. }) => self.record_hit(facts.charge.bytes() as u64),
-            Ok(Reuse::Miss(miss)) => self.record_miss(miss.cause()),
-            Err(error) => match error.cause() {
-                Ok(cause) => self.record_miss(cause),
-                Err(bypass) => self.record_bypass(bypass),
-            },
-        }
-    }
-
     pub(crate) fn record_step(&self, report: &StepReport) {
         self.steps.fetch_add(1, Relaxed);
         self.cycles
@@ -143,32 +130,6 @@ mod tests {
         assert_eq!((snapshot.hits, snapshot.decoded_bytes), (2, 128));
         assert_eq!(snapshot.misses[MissCause::Freshness as usize], 1);
         assert_eq!(snapshot.bypasses[names::bypass_index(&Bypass::Busy)], 2);
-    }
-
-    #[test]
-    fn record_reuse_counts_hits_misses_and_bypasses() {
-        use crate::project_cache::{ProjectCache, ReservationKind};
-        use crate::workspace::persist::{AdmittedFacts, ReuseMiss, ReuseVia};
-        use pascal_core::facts::ArtifactFacts;
-        let cache = ProjectCache::new(1 << 20);
-        let charge = cache.reserve(ReservationKind::Facts, 64).unwrap();
-        let counters = Counters::default();
-        counters.record_reuse(&Ok(Reuse::Hit {
-            facts: AdmittedFacts {
-                facts: std::sync::Arc::new(ArtifactFacts::default()),
-                charge,
-            },
-            via: ReuseVia::Local,
-            reads: 0,
-        }));
-        counters.record_reuse(&Ok(Reuse::Miss(ReuseMiss::Open)));
-        counters.record_reuse(&Err(PersistError::Cancelled));
-        counters.record_reuse(&Err(PersistError::Store(Bypass::Busy)));
-        let snapshot = counters.snapshot();
-        assert_eq!((snapshot.hits, snapshot.decoded_bytes), (1, 64));
-        assert_eq!(snapshot.misses[MissCause::Input as usize], 1);
-        assert_eq!(snapshot.misses[MissCause::Budget as usize], 1);
-        assert_eq!(snapshot.bypasses[names::bypass_index(&Bypass::Busy)], 1);
     }
 
     #[test]

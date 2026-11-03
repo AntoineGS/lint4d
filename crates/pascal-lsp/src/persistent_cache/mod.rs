@@ -31,6 +31,7 @@ pub(crate) use status::{CacheStatus, StatusCause};
 use crate::project_cache::ProjectCache;
 use crate::warmer::InteractiveGate;
 use crate::workspace::admitted::AdmittedStore;
+use crate::workspace::persist::{PersistError, Reuse};
 use pascal_cache::{Bypass, MAX_OPEN_WAIT, Namespace, Store, StoreLimits};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -723,6 +724,11 @@ impl Drop for CloseOnDrop {
 /// One admitted operation on the store. While it lives the generation's
 /// fence cannot finish; dropping it releases the store reference first,
 /// then the admitted count.
+///
+/// Analysis (`l4d-zf1b.8`) takes one with `workspace.persistent_cache().job()`,
+/// polls [`Self::cancel_flag`], calls [`Self::observe`] for a store bypass it
+/// gets outside reuse, and [`Self::record_reuse`] after every
+/// `reuse_persisted_facts` (which counts that outcome's bypass itself).
 pub(crate) struct CacheJob {
     inner: Arc<Inner>,
     store: Option<Arc<AdmittedStore>>,
@@ -777,6 +783,21 @@ impl CacheJob {
         let store = self.inner.begin_fence(&mut shared, CacheState::Opening);
         self.inner.unlock(shared);
         self.inner.close(store);
+    }
+
+    /// Record one `reuse_persisted_facts` outcome: hits and misses are
+    /// counted here, a store bypass goes through [`Self::observe`] (so it
+    /// is counted once and `Fenced` reopens). Call it after every reuse.
+    pub(crate) fn record_reuse(&self, result: &Result<Reuse, PersistError>) {
+        let counters = &self.inner.counters;
+        match result {
+            Ok(Reuse::Hit { facts, .. }) => counters.record_hit(facts.charge.bytes() as u64),
+            Ok(Reuse::Miss(miss)) => counters.record_miss(miss.cause()),
+            Err(error) => match error.cause() {
+                Ok(cause) => counters.record_miss(cause),
+                Err(bypass) => self.observe(bypass),
+            },
+        }
     }
 }
 

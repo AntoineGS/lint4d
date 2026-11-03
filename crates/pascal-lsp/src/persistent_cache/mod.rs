@@ -1,8 +1,736 @@
 //! The process's persistent-cache handle (spec §3, §10, §11 amendments
 //! 2026-11-03, `l4d-zf1b.11`).
+//!
+//! One [`AdmittedStore`] per process, opened by the `pascal-cache` worker
+//! thread. Analysis takes a [`CacheJob`] while the state is `Enabled`.
+//! Disabling or reopening fences the generation: no new job, admitted jobs
+//! are cancelled, and the state moves on only once every admitted job (an
+//! in-flight open included) has finished and the store is closed (D21, D22).
+//! Reaching `Disabled` is the acknowledgement; no store IO follows it.
+//!
+//! Locking: `Inner::shared` is never held while a store is opened or
+//! dropped, nor while waiting on anything but its own condition variable.
+//! Commands go over an unbounded channel. Callers of
+//! [`PersistentCache::reconfigure`], [`PersistentCache::readmit`] and
+//! [`PersistentCache::shutdown`] (the main loop) never hold a [`CacheJob`]:
+//! the wait would wait for itself, which is why every wait is bounded.
 #![allow(dead_code)]
 
 pub(crate) mod counters;
 pub(crate) mod names;
 pub(crate) mod options;
 pub(crate) mod status;
+mod worker;
+
+pub(crate) use counters::Counters;
+pub(crate) use options::CacheOptions;
+pub(crate) use status::{CacheStatus, StatusCause};
+
+use crate::project_cache::ProjectCache;
+use crate::warmer::InteractiveGate;
+use crate::workspace::admitted::AdmittedStore;
+use pascal_cache::{Bypass, MAX_OPEN_WAIT, Namespace, Store, StoreLimits};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::{JoinHandle, ThreadId};
+use std::time::{Duration, Instant};
+
+/// A repeated bypass is written to stderr at most this often.
+const LOG_REPEAT_INTERVAL: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheState {
+    Disabled,
+    Opening,
+    Enabled,
+    /// No new job; admitted jobs are finishing. Becomes `Shared::after`.
+    Fencing,
+    Bypassed(StatusCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ack {
+    /// The transition finished (for a disable: no cache IO follows).
+    Done,
+    /// An admitted job outlived the wait; its drop finishes the transition.
+    Pending,
+}
+
+/// The process's handle. `Default` is inert: no store, no thread, no IO.
+#[derive(Clone, Default)]
+pub(crate) struct PersistentCache {
+    inner: Option<Arc<Inner>>,
+}
+
+impl std::fmt::Debug for PersistentCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistentCache")
+            .field("inert", &self.inner.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) struct Inner {
+    shared: Mutex<Shared>,
+    changed: Condvar,
+    counters: Counters,
+    project_cache: ProjectCache,
+    gate: Arc<InteractiveGate>,
+    namespace: Namespace,
+    /// `false` only in unit tests, which step maintenance by hand (Task 6
+    /// honours it).
+    schedule_maintenance: bool,
+    /// Kept apart from `Shared` (which holds the command sender) so
+    /// `shutdown` joins with no lock held.
+    join: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    open_hook: Mutex<Option<OpenHook>>,
+}
+
+/// Test seam: the worker sends on the first and blocks on the second after
+/// taking the open's admitted count and before `AdmittedStore::open`.
+#[cfg(test)]
+type OpenHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+pub(super) struct Shared {
+    state: CacheState,
+    /// What `Fencing` becomes: `Disabled`, or `Opening` for a reopen.
+    after: CacheState,
+    generation: u64,
+    options: CacheOptions,
+    /// Resolved once at start (environment only, no IO); `None` when the
+    /// platform has no default, so the open bypasses with that error.
+    directory: Option<PathBuf>,
+    store: Option<Arc<AdmittedStore>>,
+    cancel: Arc<AtomicBool>,
+    /// Admitted jobs, an in-flight open and a store being closed included.
+    active: usize,
+    /// Written by the worker after each step (no IO when read).
+    usage: Option<status::UsageView>,
+    reset_epoch: Option<u64>,
+    shut_down: bool,
+    commands: Option<crossbeam_channel::Sender<worker::Command>>,
+    worker_thread: Option<ThreadId>,
+    /// The last retry delay, doubled by each retried bypass.
+    retry_delay: Option<Duration>,
+    /// A retry due for the `Bypassed` state of this generation.
+    retry: Option<(u64, Instant)>,
+    logged: [Option<Instant>; names::BYPASS_KINDS],
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    fn new(options: CacheOptions) -> Self {
+        let directory = options
+            .directory
+            .clone()
+            .or_else(|| pascal_cache::default_directory().ok());
+        let state = if let Some(message) = &options.invalid {
+            CacheState::Bypassed(StatusCause::Configuration(message.clone()))
+        } else if options.enabled {
+            CacheState::Opening
+        } else {
+            CacheState::Disabled
+        };
+        Self {
+            state,
+            after: CacheState::Disabled,
+            generation: 0,
+            options,
+            directory,
+            store: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            active: 0,
+            usage: None,
+            reset_epoch: None,
+            shut_down: false,
+            commands: None,
+            worker_thread: None,
+            retry_delay: None,
+            retry: None,
+            logged: [None; names::BYPASS_KINDS],
+        }
+    }
+
+    /// The status name: `Fencing` is named by its target.
+    fn state_name(&self) -> &'static str {
+        match (&self.state, &self.after) {
+            (CacheState::Disabled, _) => "disabled",
+            (CacheState::Opening, _) => "opening",
+            (CacheState::Enabled, _) => "enabled",
+            (CacheState::Fencing, CacheState::Opening) => "reopening",
+            (CacheState::Fencing, _) => "disabling",
+            (CacheState::Bypassed(_), _) => "bypassed",
+        }
+    }
+
+    /// Every transition: a new generation; leaving `Enabled` drops the
+    /// usage reading.
+    fn set_state(&mut self, state: CacheState) {
+        if self.state == CacheState::Enabled {
+            self.usage = None;
+        }
+        self.state = state;
+        self.generation += 1;
+        self.log_transition();
+    }
+
+    /// One stderr line for each settled state; a repeated bypass at most
+    /// once per [`LOG_REPEAT_INTERVAL`].
+    fn log_transition(&mut self) {
+        let cause = match &self.state {
+            CacheState::Opening | CacheState::Fencing => return,
+            CacheState::Disabled | CacheState::Enabled => String::new(),
+            CacheState::Bypassed(StatusCause::Configuration(message)) => {
+                format!(": configuration: {message}")
+            }
+            CacheState::Bypassed(StatusCause::Memory) => ": memory".to_owned(),
+            CacheState::Bypassed(StatusCause::Store(bypass)) => {
+                let now = Instant::now();
+                let last = &mut self.logged[names::bypass_index(bypass)];
+                if last.is_some_and(|last| now.duration_since(last) < LOG_REPEAT_INTERVAL) {
+                    return;
+                }
+                *last = Some(now);
+                match bypass {
+                    Bypass::Location(issue) => format!(
+                        ": {} ({})",
+                        names::bypass_name(bypass),
+                        names::location_issue_name(issue)
+                    ),
+                    _ => format!(": {}", names::bypass_name(bypass)),
+                }
+            }
+        };
+        eprintln!("pascal-lsp: persistent cache {}{cause}", self.state_name());
+    }
+}
+
+impl Inner {
+    fn new(
+        options: CacheOptions,
+        project_cache: ProjectCache,
+        gate: Arc<InteractiveGate>,
+        namespace: Namespace,
+        schedule_maintenance: bool,
+    ) -> Self {
+        Self {
+            shared: Mutex::new(Shared::new(options)),
+            changed: Condvar::new(),
+            counters: Counters::default(),
+            project_cache,
+            gate,
+            namespace,
+            schedule_maintenance,
+            join: Mutex::new(None),
+            #[cfg(test)]
+            open_hook: Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        lock(&self.shared)
+    }
+
+    /// Start the worker unless one runs or the handle shut down.
+    fn ensure_worker(self: &Arc<Self>, shared: &mut Shared) {
+        if shared.commands.is_some() || shared.shut_down {
+            return;
+        }
+        let (commands, handle) = worker::spawn(self);
+        shared.worker_thread = Some(handle.thread().id());
+        shared.commands = Some(commands);
+        *lock(&self.join) = Some(handle);
+    }
+
+    /// Ask the worker to open. The worker itself never sends: it checks
+    /// for `Opening` after every event.
+    fn request_open(self: &Arc<Self>, shared: &mut Shared) {
+        self.ensure_worker(shared);
+        if shared.worker_thread == Some(std::thread::current().id()) {
+            return;
+        }
+        if let Some(commands) = &shared.commands {
+            // Unbounded: never blocks under the lock.
+            let _ = commands.send(worker::Command::Open);
+        }
+    }
+
+    /// Fence the generation: no new job, admitted work cancelled. Returns
+    /// the store for the caller to drop after unlocking, counted in
+    /// `active` until [`Inner::release`] (R1: nothing closes after the
+    /// acknowledgement).
+    fn begin_fence(&self, shared: &mut Shared, after: CacheState) -> Option<Arc<AdmittedStore>> {
+        let after = if shared.shut_down {
+            CacheState::Disabled
+        } else {
+            after
+        };
+        match shared.state {
+            CacheState::Enabled | CacheState::Opening => {
+                shared.after = after;
+                shared.set_state(CacheState::Fencing);
+                shared.cancel.store(true, Ordering::Relaxed);
+                shared.retry = None;
+                let store = shared.store.take();
+                if store.is_some() {
+                    shared.active += 1;
+                }
+                self.changed.notify_all();
+                store
+            }
+            CacheState::Fencing => {
+                shared.after = after;
+                None
+            }
+            CacheState::Disabled | CacheState::Bypassed(_) => None,
+        }
+    }
+
+    /// Finish the fence once nothing admitted is left.
+    fn finish_fence(self: &Arc<Self>, shared: &mut Shared) {
+        if shared.state != CacheState::Fencing || shared.active != 0 || shared.store.is_some() {
+            return;
+        }
+        let after = if shared.shut_down {
+            CacheState::Disabled
+        } else {
+            std::mem::replace(&mut shared.after, CacheState::Disabled)
+        };
+        shared.cancel = Arc::new(AtomicBool::new(false));
+        shared.set_state(after);
+        if shared.state == CacheState::Opening {
+            self.request_open(shared);
+        }
+        self.changed.notify_all();
+    }
+
+    /// One admitted operation ended (its store reference already dropped).
+    fn release(self: &Arc<Self>) {
+        let mut shared = self.lock();
+        shared.active -= 1;
+        self.finish_fence(&mut shared);
+        drop(shared);
+        self.changed.notify_all();
+    }
+
+    /// Drop a store handed out by [`Inner::begin_fence`] with no lock held.
+    fn close(self: &Arc<Self>, store: Option<Arc<AdmittedStore>>) {
+        if let Some(store) = store {
+            drop(store);
+            self.release();
+        }
+    }
+
+    pub(super) fn job(self: &Arc<Self>) -> Option<CacheJob> {
+        let mut shared = self.lock();
+        if shared.state != CacheState::Enabled {
+            return None;
+        }
+        let store = shared.store.clone()?;
+        shared.active += 1;
+        Some(CacheJob {
+            inner: Arc::clone(self),
+            store: Some(store),
+            cancel: Arc::clone(&shared.cancel),
+            generation: shared.generation,
+        })
+    }
+
+    /// Wait up to `timeout` while `waiting` holds; returns the guard.
+    fn wait_while<'a>(
+        &'a self,
+        shared: MutexGuard<'a, Shared>,
+        timeout: Duration,
+        mut waiting: impl FnMut(&Shared) -> bool,
+    ) -> MutexGuard<'a, Shared> {
+        let deadline = Instant::now() + timeout;
+        let mut shared = shared;
+        while waiting(&shared) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            shared = self
+                .changed
+                .wait_timeout(shared, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        shared
+    }
+
+    fn acknowledge(&self, shared: MutexGuard<'_, Shared>, wait: Duration) -> Ack {
+        let shared = self.wait_while(shared, wait, |shared| shared.state == CacheState::Fencing);
+        if shared.state == CacheState::Fencing {
+            Ack::Pending
+        } else {
+            Ack::Done
+        }
+    }
+
+    /// Leave `Disabled`/`Bypassed` for `Opening` (never after shutdown).
+    fn open_from_rest(self: &Arc<Self>, shared: &mut Shared) {
+        if shared.shut_down {
+            return;
+        }
+        shared.retry = None;
+        shared.set_state(CacheState::Opening);
+        self.request_open(shared);
+        self.changed.notify_all();
+    }
+}
+
+impl PersistentCache {
+    pub(crate) fn start(
+        options: CacheOptions,
+        project_cache: ProjectCache,
+        gate: Arc<InteractiveGate>,
+    ) -> Self {
+        Self::start_with(options, project_cache, gate, Namespace::current().clone())
+    }
+
+    pub(crate) fn start_with(
+        options: CacheOptions,
+        project_cache: ProjectCache,
+        gate: Arc<InteractiveGate>,
+        namespace: Namespace,
+    ) -> Self {
+        Self::launch(Inner::new(options, project_cache, gate, namespace, true))
+    }
+
+    fn launch(inner: Inner) -> Self {
+        let inner = Arc::new(inner);
+        {
+            let mut shared = inner.lock();
+            if shared.state == CacheState::Opening {
+                inner.request_open(&mut shared);
+            }
+        }
+        Self { inner: Some(inner) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_unscheduled_for_test(
+        options: CacheOptions,
+        project_cache: ProjectCache,
+        gate: Arc<InteractiveGate>,
+        namespace: Namespace,
+    ) -> Self {
+        Self::launch(Inner::new(options, project_cache, gate, namespace, false))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_paused_for_test(
+        options: CacheOptions,
+        project_cache: ProjectCache,
+        gate: Arc<InteractiveGate>,
+        namespace: Namespace,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        let inner = Inner::new(options, project_cache, gate, namespace, false);
+        *lock(&inner.open_hook) = Some((entered, release));
+        Self::launch(inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_worker_for_test(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.lock().commands.is_some())
+    }
+
+    /// A job while `Enabled`; `None` otherwise (and always when inert).
+    pub(crate) fn job(&self) -> Option<CacheJob> {
+        self.inner.as_ref()?.job()
+    }
+
+    /// Apply runtime options, waiting at most [`MAX_OPEN_WAIT`] for a
+    /// fence to finish.
+    pub(crate) fn reconfigure(&self, options: CacheOptions) -> Ack {
+        self.reconfigure_within(options, MAX_OPEN_WAIT)
+    }
+
+    /// Apply runtime options. The directory and an invalid initialization
+    /// value come from the start options and never change; while that value
+    /// is invalid this is a no-op. Must not be called while holding a job.
+    pub(crate) fn reconfigure_within(&self, options: CacheOptions, wait: Duration) -> Ack {
+        let Some(inner) = &self.inner else {
+            return Ack::Done;
+        };
+        let mut shared = inner.lock();
+        if shared.options.invalid.is_some() {
+            return Ack::Done;
+        }
+        let options = CacheOptions {
+            directory: shared.options.directory.clone(),
+            invalid: None,
+            ..options
+        };
+        let old = std::mem::replace(&mut shared.options, options);
+        let new = &shared.options;
+        let (active, limits_changed) = (new.active(), new.limits() != old.limits());
+        let mut store = None;
+        let state = shared.state.clone();
+        match (&state, active) {
+            (CacheState::Enabled | CacheState::Opening, false) => {
+                store = inner.begin_fence(&mut shared, CacheState::Disabled);
+            }
+            (CacheState::Fencing, false) => shared.after = CacheState::Disabled,
+            (CacheState::Bypassed(_), false) => {
+                shared.retry = None;
+                shared.set_state(CacheState::Disabled);
+                inner.changed.notify_all();
+            }
+            (CacheState::Disabled, false) => {}
+            (CacheState::Disabled | CacheState::Bypassed(_), true) => {
+                inner.open_from_rest(&mut shared);
+            }
+            (CacheState::Enabled | CacheState::Opening, true) if limits_changed => {
+                store = inner.begin_fence(&mut shared, CacheState::Opening);
+            }
+            (CacheState::Enabled | CacheState::Opening, true) => {}
+            (CacheState::Fencing, true) => {
+                if !shared.shut_down {
+                    shared.after = CacheState::Opening;
+                }
+            }
+        }
+        drop(shared);
+        inner.close(store);
+        inner.acknowledge(inner.lock(), wait)
+    }
+
+    /// Admit the store again against the current `maxCacheBytes` (spec
+    /// §11.1 amendment): reopen if open, retry a memory or store bypass.
+    /// Must not be called while holding a job.
+    pub(crate) fn readmit(&self) -> Ack {
+        let Some(inner) = &self.inner else {
+            return Ack::Done;
+        };
+        let mut shared = inner.lock();
+        let mut store = None;
+        let state = shared.state.clone();
+        match &state {
+            CacheState::Enabled | CacheState::Opening => {
+                store = inner.begin_fence(&mut shared, CacheState::Opening);
+            }
+            CacheState::Bypassed(StatusCause::Memory | StatusCause::Store(_))
+                if shared.options.active() =>
+            {
+                inner.open_from_rest(&mut shared);
+            }
+            CacheState::Fencing | CacheState::Disabled | CacheState::Bypassed(_) => {}
+        }
+        drop(shared);
+        inner.close(store);
+        inner.acknowledge(inner.lock(), MAX_OPEN_WAIT)
+    }
+
+    /// Close the store (waiting at most [`MAX_OPEN_WAIT`] for admitted
+    /// jobs) and stop the worker. Idempotent; nothing reopens afterwards.
+    pub(crate) fn shutdown(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut shared = inner.lock();
+        shared.shut_down = true;
+        shared.retry = None;
+        let store = inner.begin_fence(&mut shared, CacheState::Disabled);
+        drop(shared);
+        inner.close(store);
+        let mut shared = inner.wait_while(inner.lock(), MAX_OPEN_WAIT, |shared| {
+            shared.state == CacheState::Fencing
+        });
+        let commands = shared.commands.take();
+        drop(shared);
+        if let Some(commands) = commands {
+            let _ = commands.send(worker::Command::Shutdown);
+        }
+        let handle = lock(&inner.join).take();
+        if let Some(handle) = handle
+            && handle.thread().id() != std::thread::current().id()
+        {
+            let _ = handle.join();
+        }
+    }
+
+    /// A guard that shuts the handle down when dropped.
+    pub(crate) fn close_on_drop(&self) -> CloseOnDrop {
+        CloseOnDrop(self.clone())
+    }
+
+    pub(crate) fn state(&self) -> CacheState {
+        self.inner
+            .as_ref()
+            .map_or(CacheState::Disabled, |inner| inner.lock().state.clone())
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.lock().generation)
+    }
+
+    pub(crate) fn counters(&self) -> Option<&Counters> {
+        self.inner.as_ref().map(|inner| &inner.counters)
+    }
+
+    /// The bounded status document's fields. No store call.
+    pub(crate) fn status(&self) -> CacheStatus {
+        let lock_waits = pascal_cache::lock_waits();
+        let Some(inner) = &self.inner else {
+            return CacheStatus {
+                state: "disabled",
+                generation: 0,
+                enabled: false,
+                cause: None,
+                directory: None,
+                limits: StoreLimits::default(),
+                reset_epoch: None,
+                reserved: status::Reserved {
+                    pages: 0,
+                    scratch: 0,
+                    facts: 0,
+                },
+                usage: None,
+                lock_waits,
+                counters: counters::CounterSnapshot::default(),
+            };
+        };
+        let stats = inner.project_cache.stats();
+        let shared = inner.lock();
+        let enabled = shared.state == CacheState::Enabled;
+        CacheStatus {
+            state: shared.state_name(),
+            generation: shared.generation,
+            enabled: shared.options.active(),
+            cause: match &shared.state {
+                CacheState::Bypassed(cause) => Some(cause.clone()),
+                _ => None,
+            },
+            directory: shared.directory.clone(),
+            limits: shared.options.limits(),
+            reset_epoch: shared.reset_epoch.filter(|_| enabled),
+            reserved: status::Reserved {
+                pages: stats.reserved_pages_bytes,
+                scratch: stats.reserved_scratch_bytes,
+                facts: stats.reserved_facts_bytes,
+            },
+            usage: shared.usage.filter(|_| enabled),
+            lock_waits,
+            counters: inner.counters.snapshot(),
+        }
+    }
+
+    /// Wait while the state is `Opening` or `Fencing`; returns the state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn settle(&self, timeout: Duration) -> CacheState {
+        let Some(inner) = &self.inner else {
+            return CacheState::Disabled;
+        };
+        let shared = inner.wait_while(inner.lock(), timeout, |shared| {
+            matches!(shared.state, CacheState::Opening | CacheState::Fencing)
+        });
+        shared.state.clone()
+    }
+
+    /// Wait up to `timeout` for `predicate` to hold for the state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn wait_for(
+        &self,
+        mut predicate: impl FnMut(&CacheState) -> bool,
+        timeout: Duration,
+    ) -> bool {
+        let Some(inner) = &self.inner else {
+            return predicate(&CacheState::Disabled);
+        };
+        let shared = inner.wait_while(inner.lock(), timeout, |shared| !predicate(&shared.state));
+        predicate(&shared.state)
+    }
+}
+
+/// Shuts the handle down when dropped (the server's exit paths).
+pub(crate) struct CloseOnDrop(PersistentCache);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+/// One admitted operation on the store. While it lives the generation's
+/// fence cannot finish; dropping it releases the store reference first,
+/// then the admitted count.
+pub(crate) struct CacheJob {
+    inner: Arc<Inner>,
+    store: Option<Arc<AdmittedStore>>,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+}
+
+impl std::fmt::Debug for CacheJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheJob")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CacheJob {
+    pub(crate) fn store(&self) -> &Store {
+        self.store.as_deref().expect("held until drop")
+    }
+
+    /// Set when the generation is fenced: stop and roll back.
+    pub(crate) fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn counters(&self) -> &Counters {
+        &self.inner.counters
+    }
+
+    /// Report a bypass the store returned. `Fenced` (D24) fences this
+    /// generation and reopens once the last job drops; it is counted only
+    /// when it does so, so jobs racing on one reset count it once.
+    pub(crate) fn observe(&self, bypass: &Bypass) {
+        if *bypass != Bypass::Fenced {
+            self.inner.counters.record_bypass(bypass);
+            return;
+        }
+        let mut shared = self.inner.lock();
+        if shared.generation != self.generation || shared.state != CacheState::Enabled {
+            return;
+        }
+        self.inner.counters.record_bypass(bypass);
+        let store = self.inner.begin_fence(&mut shared, CacheState::Opening);
+        drop(shared);
+        self.inner.close(store);
+    }
+}
+
+impl Drop for CacheJob {
+    fn drop(&mut self) {
+        drop(self.store.take());
+        self.inner.release();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests;

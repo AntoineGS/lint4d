@@ -1970,3 +1970,35 @@ fn an_incomplete_provider_interface_is_analysed_once() {
         "{four} steps for four importers, {one} for one"
     );
 }
+
+/// l4d-4nbs D19: a unit closure can declare more than 32,768 names
+/// (SFClient2's BOSFBase units: 41,838 across RTL, VCL, DB, IBX, InfoPower
+/// and business objects). The count fuse is a multiple of that; memory
+/// stays bounded by the retained-bytes limit.
+#[test]
+fn a_closure_with_forty_thousand_declarations_is_analysed() {
+    let mut big = String::from("unit W; interface\nconst\n");
+    for n in 0..40_000 {
+        big.push_str(&format!("  C{n} = {n};\n"));
+    }
+    big.push_str("implementation end.");
+    let mut f = Fixture::new(
+        "unit Main; interface uses W; {$IF Declared(Missing)}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit("W", &big, context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 256 * 1024 * 1024;
+    let analysis = f.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}
+
+/// l4d-4nbs D19: measured on SFClient2 (RAD Studio 7.0 RTL/VCL/DB/IBX and
+/// InfoPower closures), a session's byte work needs about 46 per scanned
+/// source byte beyond the fixed budget; the grant keeps a margin of more
+/// than a third over that.
+#[test]
+fn the_byte_grant_covers_the_measured_closure_cost_with_margin() {
+    let grant =
+        pascal_core::compile_time::CompileTimeLimits::default().byte_work_per_source_byte as f64;
+    assert!(grant >= 46.0 * 1.35, "{grant} byte work per source byte");
+}

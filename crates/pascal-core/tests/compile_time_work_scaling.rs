@@ -588,3 +588,26 @@ fn full_reads_of_looked_up_providers_are_funded_once() {
     let (result, usage) = analyze_retaining(&root, &files, 512 * 1024 * 1024);
     assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
 }
+
+/// l4d-4nbs D19: raising the byte grant per source byte keeps superlinear
+/// byte work on a small source refused: each layout query copies the whole
+/// declaration state, so queries times declarations bytes from about 200 KiB.
+#[test]
+fn pathological_byte_work_on_a_small_source_still_trips_the_byte_limit() {
+    let mut text = String::from("unit T;\ninterface\nuses U;\ntype\n");
+    for n in 0..3000 {
+        text.push_str(&format!("  R{n} = record A, B: Integer; end;\n"));
+    }
+    for _ in 0..3000 {
+        text.push_str("{$IF SizeOf(R2999) = 8}{$IFEND}\n");
+    }
+    text.push_str("implementation\nend.\n");
+    assert!(text.len() < 256 * 1024, "{}", text.len());
+    let (result, usage) =
+        analyze_with(&text, &[("U.pas", "unit U; interface implementation end.")]);
+    assert!(
+        matches!(&result, Err(ResolverError::LimitExceeded { limit, .. }) if *limit == "max_byte_work"),
+        "{} bytes: {result:?} {usage:?}",
+        text.len()
+    );
+}

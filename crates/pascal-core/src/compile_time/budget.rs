@@ -20,11 +20,15 @@ pub const WORK_PER_SOURCE_BYTE: usize = 8;
 
 /// Byte work each source byte entering a session adds to `max_byte_work`,
 /// for the same reason: scanning, fragment, snapshot and mapping copies cost
-/// 12 to 15 bytes of byte work per source byte on synthetic library code
-/// (tests/compile_time_work_scaling.rs), and SysUtils.pas with its providers
-/// (about 2 MB) needs more than the fixed 64 MiB. The grant is about twice
-/// the synthetic cost.
-pub const BYTE_WORK_PER_SOURCE_BYTE: usize = 32;
+/// 12 to 18 bytes of byte work per source byte on synthetic library code
+/// (tests/compile_time_work_scaling.rs). Real unit closures cost more per
+/// byte: measured on SFClient2 (l4d-4nbs D19), whose BOSFBase units import
+/// the RAD Studio 7.0 RTL, VCL, DB, IBX and InfoPower interfaces (117
+/// providers, 709 lookups per session), a complete session spent at most
+/// 0.72 of the allowance a grant of 64 gives beyond the fixed budget, that
+/// is about 46 per scanned byte. 64 keeps a margin of about 1.4 over that;
+/// work that grows faster than the input still exhausts it.
+pub const BYTE_WORK_PER_SOURCE_BYTE: usize = 64;
 
 /// Work and byte work granted by source bytes entering a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,7 +63,11 @@ pub struct CompileTimeLimits {
 impl Default for CompileTimeLimits {
     fn default() -> Self {
         Self {
-            max_definitions: 32_768,
+            // Declarations admitted in one session, providers included. A
+            // unit closure can declare more than 32,768 names (SFClient2's
+            // BOSFBase units: 41,838); this is a count fuse, and memory stays
+            // bounded by `max_retained_bytes`.
+            max_definitions: 131_072,
             max_fields: 32_768,
             max_variant_alternatives: 32_768,
             max_pending_bytes: 1_048_576,

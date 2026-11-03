@@ -5178,21 +5178,32 @@ impl<S: SourceStore> UnitResolver<S> {
                 .and_then(|n| n.checked_add(32))
                 .ok_or_else(overflow)
         };
-        let mut key_bytes = 0usize;
+        // The name test is one pass over the listing that reads each file
+        // name once per wanted name, one lossy name live at a time; overlays
+        // compare their whole path. Dedup, entry construction, copies and
+        // sorting only touch the candidates it keeps, so only they pay
+        // pairwise, sort-key or payload terms.
+        let mut read_bytes = 0usize;
         let mut largest_key = 0usize;
-        for path in listing.files.iter().chain(overlays.iter()) {
-            let bound = key_bound(path)?;
-            key_bytes = key_bytes.checked_add(bound).ok_or_else(overflow)?;
-            largest_key = largest_key.max(bound);
+        for path in listing.files.iter() {
+            let name = path.file_name().map_or(0, |name| name.len());
+            read_bytes = read_bytes.checked_add(name).ok_or_else(overflow)?;
+            largest_key = largest_key.max(key_bound(path)?);
         }
-        // The name test is one pass over the listing, one lossy name live at
-        // a time. Dedup, entry construction, copies and sorting only touch
-        // the candidates it keeps, so only they pay pairwise or payload terms.
+        read_bytes = read_bytes
+            .checked_mul(names.len().max(1))
+            .ok_or_else(overflow)?;
+        for path in overlays.iter() {
+            read_bytes = read_bytes
+                .checked_add(path.as_os_str().len())
+                .ok_or_else(overflow)?;
+            largest_key = largest_key.max(key_bound(path)?);
+        }
         let name_work = count
             .checked_mul(names.len().checked_add(1).ok_or_else(overflow)?)
             .ok_or_else(overflow)?;
         budget
-            .charge(name_work, key_bytes, 0)
+            .charge(name_work, read_bytes, 0)
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
         let mut candidates = 0usize;
         let mut candidate_keys = 0usize;
@@ -5239,7 +5250,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .ok_or_else(overflow)?;
         let byte_work = candidate_keys
             .checked_mul(candidates.max(1))
-            .and_then(|n| n.checked_add(key_bytes))
+            .and_then(|n| n.checked_add(read_bytes))
             .ok_or_else(overflow)?;
         let _sorting = budget
             .admit_owned(
@@ -6867,9 +6878,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 .checked_mul(matching.checked_add(1).ok_or_else(overflow)?)
                 .and_then(|n| n.checked_add(count))
                 .ok_or_else(overflow)?;
+            // The name pass runs twice: sizing the matches, then matching.
             let byte_work = matching_bytes
                 .checked_mul(matching.max(1))
-                .and_then(|n| n.checked_add(sort_bytes))
+                .and_then(|n| n.checked_add(sort_bytes.checked_mul(2)?))
                 .ok_or_else(overflow)?;
             // One lossy name is live at a time; only matches keep sort keys.
             let scratch = matching_bytes
@@ -9275,6 +9287,8 @@ fn copy_case_path(
         .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
+/// Bytes the case-insensitive comparison pass reads: every entry's name and
+/// the wanted component, after charging one step per entry.
 fn case_sort_sizing(
     listing: &DirectoryListing,
     wanted: &std::ffi::OsStr,
@@ -9290,24 +9304,13 @@ fn case_sort_sizing(
     budget
         .charge(count, 0, 0)
         .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-    let mut bytes = wanted
-        .len()
-        .checked_mul(8)
-        .and_then(|n| n.checked_add(32))
-        .ok_or_else(overflow)?;
+    let mut bytes = wanted.len();
     for candidate in listing.files.iter().chain(listing.directories.iter()) {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
         bytes = bytes
-            .checked_add(
-                candidate
-                    .as_os_str()
-                    .len()
-                    .checked_mul(8)
-                    .and_then(|n| n.checked_add(32))
-                    .ok_or_else(overflow)?,
-            )
+            .checked_add(candidate.file_name().map_or(0, |name| name.len()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)

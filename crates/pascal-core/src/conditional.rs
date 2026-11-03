@@ -1928,24 +1928,41 @@ impl DirectiveScanner {
     }
 }
 
-/// One bounded standard-library delimiter search, never crossing a UTF-8
-/// boundary. Admit a search step and a visited-byte upper bound before each
-/// chunk; the delimiter itself remains for the normal lexical machine.
+/// One bounded standard-library delimiter search over at most 4 KiB, never
+/// crossing a UTF-8 boundary. Admit a search step and a visited-byte upper
+/// bound before each piece; the delimiter itself remains for the normal
+/// lexical machine.
 pub(crate) fn bounded_trivia_run(
     source: &str,
     start: usize,
     delimiter: char,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<usize, IncompleteReason> {
-    let mut end = source.len().min(start.saturating_add(4096));
-    while !source.is_char_boundary(end) {
-        end -= 1;
+    const RUN: usize = 4096;
+    const PIECE: usize = 512;
+    let limit = source.len().min(start.saturating_add(RUN));
+    let mut from = start;
+    loop {
+        let mut end = limit.min(from.saturating_add(PIECE));
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= from {
+            if from == start {
+                budget.charge(1, 0, 0)?;
+            }
+            return Ok(from - start);
+        }
+        let piece = &source[from..end];
+        // Admit the visited-byte upper bound of this piece BEFORE searching
+        // it. Work is one actual library search operation per piece, not one
+        // evaluator step per byte.
+        budget.charge(1, piece.len(), 0)?;
+        if let Some(found) = piece.find(delimiter) {
+            return Ok(from + found - start);
+        }
+        from = end;
     }
-    let chunk = &source[start..end];
-    // Admit the bounded visited-byte upper bound BEFORE the search. Work is
-    // one actual library search operation, not one evaluator step per byte.
-    budget.charge(1, chunk.len(), 0)?;
-    Ok(chunk.find(delimiter).unwrap_or(chunk.len()))
 }
 
 /// Scanner-only vector growth. Payload invoices attach before cloning identity
@@ -5392,6 +5409,32 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// l4d-9bxx: a trivia search is charged for the bytes it visits, not for
+    /// a 4 KiB window ending far past the delimiter.
+    #[test]
+    fn trivia_run_charges_the_bytes_it_visits() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits};
+        let source = format!("abc}}{}", "x".repeat(8192));
+        let charged = |start: usize| {
+            let mut budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+            let skip = super::bounded_trivia_run(&source, start, '}', &mut budget).unwrap();
+            (skip, budget.snapshot().byte_work)
+        };
+        let (skip, bytes) = charged(0);
+        assert_eq!(skip, 3);
+        assert!(bytes <= 512, "found after 3 bytes, charged {bytes}");
+        let (skip, bytes) = charged(3);
+        assert_eq!(skip, 0);
+        assert!(bytes <= 512, "delimiter at the start, charged {bytes}");
+        let (skip, bytes) = charged(4);
+        assert_eq!(skip, 4096, "one run stays bounded");
+        assert!(
+            bytes >= 4096,
+            "a long run is still charged in full: {bytes}"
+        );
+    }
+
     #[test]
     fn expression_cleanup_is_owner_local_on_add_replace_drop_and_failure() {
         use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, IncompleteReason};

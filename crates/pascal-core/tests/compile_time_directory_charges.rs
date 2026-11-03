@@ -89,3 +89,17 @@ fn large_directory_lookup_stays_far_below_session_limits() {
         limits.max_work
     );
 }
+
+#[test]
+fn directory_entries_are_charged_for_the_bytes_the_lookup_reads() {
+    let small = usage_with_fillers(500);
+    let large = usage_with_fillers(1000);
+    // Each extra entry is listed (the filesystem store charges its 255-byte
+    // name bound per listing) and name-matched a few times; sort-key bounds
+    // over the whole path are charged only for matching entries.
+    let per_entry = (large.byte_work - small.byte_work) / 500;
+    assert!(
+        per_entry < 1024,
+        "{per_entry} byte work per directory entry"
+    );
+}

@@ -3900,6 +3900,29 @@ mod tests {
         );
     }
 
+    /// l4d-20 characterization: every references request walks the workspace
+    /// again (Task 6 turns this into the acceptance test).
+    #[test]
+    fn references_requests_list_the_workspace_root_each_time() {
+        let fixture = query_fixture();
+        let cancel = AtomicBool::new(false);
+        for request in ["first", "second"] {
+            crate::catalogue::test_reset_listings();
+            let computed = references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.provider),
+                shared_value_position(),
+                true,
+                &cancel,
+            );
+            assert!(computed.value.is_ok(), "{request} references: {computed:?}");
+            assert!(
+                !crate::catalogue::test_listings().is_empty(),
+                "today the {request} references request walks the workspace"
+            );
+        }
+    }
+
     #[test]
     fn completed_reference_results_revalidate_changed_sources() {
         let fixture = query_fixture();

@@ -5705,6 +5705,8 @@ fn enumerate_mapped_sources(
                     continue;
                 }
                 if file_type.is_dir() {
+                    #[cfg(test)]
+                    crate::catalogue::test_record_listing(&path);
                     add_baseline_path(&mut enumeration.baseline, path);
                     continue;
                 }
@@ -7615,6 +7617,8 @@ fn enumerate_sources(
                     continue;
                 }
                 if file_type.is_dir() {
+                    #[cfg(test)]
+                    crate::catalogue::test_record_listing(&path);
                     add_baseline_path(&mut result.baseline, path);
                     continue;
                 }

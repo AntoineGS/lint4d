@@ -12605,6 +12605,8 @@ impl Workspace {
             if let Some(budget) = budget {
                 budget.charge_package_path_visits(1)?;
             }
+            #[cfg(test)]
+            crate::catalogue::test_record_listing(&directory);
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(_) => {
@@ -12915,6 +12917,8 @@ impl Workspace {
             return catalogue.entries.clone();
         }
 
+        #[cfg(test)]
+        crate::catalogue::test_record_listing(&directory);
         let entries = fs::read_dir(&directory)
             .ok()
             .into_iter()
@@ -13130,6 +13134,12 @@ impl Workspace {
                 continue;
             };
             visited += 1;
+            #[cfg(test)]
+            {
+                if entry.file_type().is_dir() {
+                    crate::catalogue::test_record_listing(entry.path());
+                }
+            }
             if entry.file_type().is_dir() && directories.len() < entry_limit {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
@@ -22920,6 +22930,69 @@ BDS = '/fake/37'
         assert!(
             !workspace.filename_catalogues.contains_key(&root),
             "a partial filename catalogue must not be cached as complete"
+        );
+    }
+
+    fn write_node_modules_tree(root: &Path, directories: usize, files_per_directory: usize) {
+        for directory in 0..directories {
+            let package = root
+                .join("node_modules")
+                .join(format!("package{directory:03}"));
+            fs::create_dir_all(&package).expect("node_modules package");
+            for file in 0..files_per_directory {
+                fs::write(package.join(format!("module{file:04}.js")), b"")
+                    .expect("node_modules file");
+            }
+        }
+    }
+
+    /// l4d-20 characterization: the walk descends the excluded tree and spends
+    /// the 10,000-entry limit on it (Task 4 turns this into the acceptance test).
+    #[test]
+    fn an_excluded_node_modules_tree_is_walked_and_exhausts_the_filename_catalogue() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Unit1.pas"),
+            "unit Unit1; interface implementation end.\n",
+        )
+        .expect("unit");
+        write_node_modules_tree(&root, 50, 1_000);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        crate::catalogue::test_reset_listings();
+        let catalogue = workspace.filename_catalogue(&root);
+        assert!(
+            !catalogue.complete,
+            "today 50,000 excluded files exhaust the limit"
+        );
+        let excluded = root.join("node_modules");
+        assert!(
+            crate::catalogue::test_listings()
+                .iter()
+                .any(|listed| listed.starts_with(&excluded)),
+            "today the walk descends into node_modules"
+        );
+    }
+
+    /// l4d-20 characterization: non-Pascal files count against the limit.
+    #[test]
+    fn non_pascal_files_count_against_the_filename_catalogue_limit() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Unit1.pas"),
+            "unit Unit1; interface implementation end.\n",
+        )
+        .expect("unit");
+        let assets = root.join("assets");
+        fs::create_dir_all(&assets).expect("assets");
+        for index in 0..10_000 {
+            fs::write(assets.join(format!("Asset{index:05}.txt")), b"").expect("asset");
+        }
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        assert!(
+            !workspace.filename_catalogue(&root).complete,
+            "today 10,000 text files exhaust the limit"
         );
     }
 

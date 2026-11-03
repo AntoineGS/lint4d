@@ -5,6 +5,7 @@
 //! package/index lookup, and the stateful include/rename resolver.
 
 pub mod analysis_metrics;
+mod catalogue;
 pub(crate) mod configuration;
 pub(crate) mod coverage;
 pub(crate) mod file_watch;

@@ -140,8 +140,6 @@ pub(crate) enum WarmEvent {
         generation: u64,
         open_epoch: u64,
     },
-    /// The crawl stored new or changed interface entries, so semantic tokens
-    /// computed earlier may now resolve more members.
     /// One workspace-index batch finished.
     IndexProgress {
         anchor: IndexAnchor,
@@ -156,6 +154,8 @@ pub(crate) enum WarmEvent {
         paused: bool,
         generation: u64,
     },
+    /// The crawl stored new or changed interface entries, so semantic tokens
+    /// computed earlier may now resolve more members.
     ClosureStored {
         uri: Url,
         generation: u64,
@@ -400,8 +400,12 @@ fn is_warm_create_id(id: &RequestId) -> bool {
 }
 
 enum WarmJobKind {
-    Crawl { uri: Url, open_epoch: u64 },
-    Index(IndexAnchor),
+    Crawl {
+        uri: Url,
+        open_epoch: u64,
+    },
+    /// The flag is set while an open-file crawl is queued.
+    Index(IndexAnchor, Arc<AtomicBool>),
 }
 
 struct WarmJob {
@@ -415,6 +419,8 @@ pub(crate) struct Warmer {
     queue: WarmQueue,
     /// Workspace-index anchors, project anchors first, deduplicated.
     index_queue: VecDeque<IndexAnchor>,
+    /// Set while a crawl is queued; a running index batch yields to it.
+    crawl_pending: Arc<AtomicBool>,
     open_order: VecDeque<Url>,
     jobs: Option<Sender<WarmJob>>,
     events: Receiver<WarmEvent>,
@@ -447,6 +453,7 @@ impl Warmer {
         Self {
             queue: WarmQueue::default(),
             index_queue: VecDeque::new(),
+            crawl_pending: Arc::new(AtomicBool::new(false)),
             open_order: VecDeque::new(),
             jobs: Some(jobs),
             events,
@@ -492,6 +499,7 @@ impl Warmer {
             .is_some_and(|(busy_uri, busy_epoch)| busy_uri == &uri && *busy_epoch == open_epoch);
         if already_queued || !already_in_flight {
             self.queue.push_front(uri);
+            self.crawl_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -500,6 +508,7 @@ impl Warmer {
     pub(crate) fn rewarm(&mut self, uri: Url) {
         crate::trace::trace!("warm rewarm {uri}");
         self.queue.push_front(uri);
+        self.crawl_pending.store(true, Ordering::Relaxed);
     }
 
     /// Re-crawls an open file whose snapshot found part of its interface
@@ -575,6 +584,7 @@ impl Warmer {
         self.open_epochs.retain(|uri, _| open.contains(uri));
         for uri in self.open_order.iter().rev() {
             self.queue.push_front(uri.clone());
+            self.crawl_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -638,13 +648,16 @@ impl Warmer {
                 break;
             }
         }
+        if self.queue.is_empty() {
+            self.crawl_pending.store(false, Ordering::Relaxed);
+        }
         if !self.busy
             && self.queue.is_empty()
             && workspace.project_cache().has_room()
             && let Some(anchor) = self.index_queue.pop_front()
         {
             let job = WarmJob {
-                kind: WarmJobKind::Index(anchor.clone()),
+                kind: WarmJobKind::Index(anchor.clone(), self.crawl_pending.clone()),
                 input: workspace.analysis_input(),
                 cancel: self.cancel.clone(),
                 generation: self.generation,
@@ -701,6 +714,7 @@ impl Warmer {
                     return false;
                 }
                 self.queue.push_front(uri.clone());
+                self.crawl_pending.store(true, Ordering::Relaxed);
                 true
             }
             WarmEvent::IndexProgress {
@@ -805,6 +819,7 @@ impl Drop for Warmer {
 
 fn run_index_job(
     anchor: IndexAnchor,
+    crawl_pending: &AtomicBool,
     job: &WarmJob,
     gate: &InteractiveGate,
     events: &Sender<WarmEvent>,
@@ -825,7 +840,7 @@ fn run_index_job(
         &anchor,
         IndexBound::units(INDEX_BATCH_UNITS),
         &mut || {
-            if gate.try_wait_idle(&job.cancel) {
+            if !crawl_pending.load(Ordering::Relaxed) && gate.try_wait_idle(&job.cancel) {
                 Ok(())
             } else {
                 Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
@@ -851,7 +866,9 @@ fn run_index_job(
 fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>) {
     let (uri, open_epoch) = match &job.kind {
         WarmJobKind::Crawl { uri, open_epoch } => (uri.clone(), *open_epoch),
-        WarmJobKind::Index(anchor) => return run_index_job(anchor.clone(), &job, &gate, events),
+        WarmJobKind::Index(anchor, pending) => {
+            return run_index_job(anchor.clone(), pending, &job, &gate, events);
+        }
     };
     let end = |fingerprint, pins| {
         let _ = events.send(WarmEvent::End {
@@ -2085,5 +2102,44 @@ mod tests {
         warmer.request_index(IndexAnchor::Document(main));
         warmer.reset(std::iter::empty(), workspace.project_cache());
         assert!(warmer.index_queue.is_empty());
+    }
+
+    #[test]
+    fn opening_a_file_mid_batch_pauses_the_index_for_its_crawl() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.request_index(IndexAnchor::Document(main.clone()));
+        warmer.poll(&workspace);
+        assert!(warmer.busy, "the index job was dispatched");
+
+        warmer.open(main.clone());
+        gate.set(0);
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(is_index_event)
+        });
+        assert!(
+            matches!(
+                events.last(),
+                Some(WarmEvent::IndexStopped { paused: true, .. })
+            ),
+            "the batch yields to the opened file: {events:?}"
+        );
+
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::IndexProgress { .. }))
+        });
+        let end = events
+            .iter()
+            .position(|event| matches!(event, WarmEvent::End { .. }))
+            .expect("the opened file was crawled");
+        let resumed = events
+            .iter()
+            .position(|event| matches!(event, WarmEvent::IndexProgress { .. }))
+            .unwrap();
+        assert!(end < resumed, "{events:?}");
     }
 }

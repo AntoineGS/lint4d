@@ -469,7 +469,19 @@ fn same_file_state(left: &crate::SourceRevision, right: &crate::SourceRevision) 
 /// prepared so far.
 struct ProviderGraph {
     occurrence: OccurrenceId,
-    graph: AdmittedInterfaceGraph,
+    /// `None`: the interface could not be completed (an Unknown fact), which
+    /// a repeated analysis of the same identity would find again.
+    graph: Option<AdmittedInterfaceGraph>,
+}
+
+/// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
+/// unit and authorize one provider identity (l4d-4nbs D19).
+fn same_qualifiers(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 /// Whether `name` (in `pointers` mode) is prepared in a provider graph:
@@ -2118,7 +2130,7 @@ impl ProviderEngine<'_, '_> {
             key.source == provider.unit.source.id
                 && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
-                && key.qualifiers == provider.authorized_qualifiers
+                && same_qualifiers(&key.qualifiers, &provider.authorized_qualifiers)
         }) {
             return Ok(Fact::Unknown(UnknownReason::CyclicProvider));
         }
@@ -2138,7 +2150,7 @@ impl ProviderEngine<'_, '_> {
             key.source == provider.unit.source.id
                 && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
-                && key.qualifiers == provider.authorized_qualifiers
+                && same_qualifiers(&key.qualifiers, &provider.authorized_qualifiers)
         });
         let new_identity = previous.is_none();
         if let Some(key) = previous {
@@ -2153,10 +2165,12 @@ impl ProviderEngine<'_, '_> {
                 .position(|entry| entry.occurrence == occurrence)
             {
                 drop(provider);
-                let graph = self.providers.graphs[index].graph.clone();
+                let Some(graph) = self.providers.graphs[index].graph.clone() else {
+                    return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                };
                 let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1)?;
                 // Keep the graph with the most names prepared.
-                self.providers.graphs.value_mut()[index].value_mut().graph = prepared.clone();
+                self.providers.graphs.value_mut()[index].value_mut().graph = Some(prepared.clone());
                 return Ok(Fact::Known(prepared));
             }
         }
@@ -2247,6 +2261,15 @@ impl ProviderEngine<'_, '_> {
         move_report_vector(self.observations, observations, self.budget)?;
         move_report_vector(self.warnings, warnings, self.budget)?;
         if !analysis.facts().interface_complete {
+            drop(analysis);
+            let entry = self
+                .budget
+                .admit_owned(1, 0, 0, || ProviderGraph {
+                    occurrence,
+                    graph: None,
+                })
+                .map_err(|r| resolver_error(r, self.budget))?;
+            push_owner(&mut self.providers.graphs, entry, self.budget)?;
             return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
         let output = analysis.value_mut();
@@ -2293,7 +2316,7 @@ impl ProviderEngine<'_, '_> {
             .budget
             .admit_owned(1, 0, 0, || ProviderGraph {
                 occurrence,
-                graph: graph.clone(),
+                graph: Some(graph.clone()),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;

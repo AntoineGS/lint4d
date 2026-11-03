@@ -70,6 +70,9 @@ pub struct Fixture {
     /// Serve each unit read from disk through an entry that depends on its
     /// importer: the same file state, a different authorization route.
     pub importer_entries: bool,
+    /// Find units whatever the spelling of the request, authorized under
+    /// the requested spelling (`uses classes` and `uses Classes`).
+    pub spelled_units: bool,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -92,6 +95,7 @@ impl Fixture {
             unit_requests: vec![],
             importer_revisions: false,
             importer_entries: false,
+            spelled_units: false,
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -276,8 +280,20 @@ impl CompileTimeResolver for Fixture {
             }
         } else if self.ambiguous_units.contains(request.requested_name) {
             Resolution::Ambiguous { candidates: vec![] }
-        } else if let Some(provider) = self.units.get(request.requested_name) {
+        } else if let Some(provider) = self.units.get(request.requested_name).or_else(|| {
+            self.spelled_units
+                .then(|| {
+                    self.units
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(request.requested_name))
+                        .map(|(_, provider)| provider)
+                })
+                .flatten()
+        }) {
             let mut provider = provider.clone();
+            if self.spelled_units {
+                provider.authorized_qualifiers = vec![request.requested_name.into()];
+            }
             if self.importer_revisions {
                 provider.unit.source.revision = SourceRevision::Overlay {
                     version: pascal_project::content_hash_bytes(

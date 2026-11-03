@@ -1895,3 +1895,78 @@ fn repeated_queries_of_one_name_do_not_copy_provider_graphs() {
         "{many} byte work for 25 queries, {one} for one"
     );
 }
+
+/// l4d-4nbs D19: `uses classes` and `uses Classes` name one unit: one
+/// provider identity, analysed once (Classes.pas was analysed for each
+/// spelling in BaseRECORDLOCK's session).
+#[test]
+fn qualifier_spellings_of_one_provider_are_one_identity() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let one_analysis = alone.analyze().unwrap().budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses w; type TB = w.TW; implementation end.",
+            ),
+        ],
+    );
+    twice.spelled_units = true;
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}
+
+/// l4d-4nbs D19: a provider whose interface cannot be completed is
+/// analysed once per session, not again for every importer (Classes.pas:
+/// 14 analyses, 120M of byte work, in BaseRECORDLOCK's session).
+#[test]
+fn an_incomplete_provider_interface_is_analysed_once() {
+    let usage = |importers: usize| {
+        let mut big = String::from("unit W; interface {$I missing.inc}\nconst\n");
+        let comment = "documentation of a provider constant ".repeat(6);
+        let mut n = 0;
+        while big.len() < 2_000_000 {
+            big.push_str(&format!("  C{n} = {n}; {{ {comment} }}\n"));
+            n += 1;
+        }
+        big.push_str("implementation end.");
+        let names = (0..importers).map(|i| format!("A{i}")).collect::<Vec<_>>();
+        let texts = names
+            .iter()
+            .map(|n| format!("unit {n}; interface uses W; implementation end."))
+            .collect::<Vec<_>>();
+        let mut f = Fixture::new(
+            &format!(
+                "unit Main; interface uses {}; {{$IF Declared(Missing)}}{{$DEFINE HIT}}{{$ENDIF}} implementation end.",
+                names.join(", ")
+            ),
+            context(LayoutPlatform::Win32),
+        );
+        for (n, t) in names.iter().zip(&texts) {
+            f.unit(n, t, context(LayoutPlatform::Win32));
+        }
+        f.unit("W", &big, context(LayoutPlatform::Win32));
+        f.limits.max_retained_bytes = 64 * 1024 * 1024;
+        let analysis = f.analyze().unwrap();
+        analysis.budget.budget_snapshot().work
+    };
+    let (one, four) = (usage(1), usage(4));
+    assert!(
+        four < one * 3 / 2,
+        "{four} steps for four importers, {one} for one"
+    );
+}

@@ -14,7 +14,6 @@ use pascal_project::{
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +54,6 @@ struct SourceCredit {
 pub struct ResolverLimits {
     pub max_dependency_units: usize,
     pub max_directory_entries: usize,
-    pub max_scanned_bytes: usize,
     pub max_source_bytes: usize,
     pub max_include_files: usize,
     pub max_include_bytes: usize,
@@ -84,7 +82,6 @@ impl Default for ResolverLimits {
         Self {
             max_dependency_units: 256,
             max_directory_entries: 1_048_576,
-            max_scanned_bytes: 8 * 1024 * 1024 * 1024,
             max_source_bytes: 16 * 1024 * 1024,
             max_include_files: 4_096,
             max_include_bytes: 256 * 1024 * 1024,
@@ -1493,7 +1490,6 @@ pub struct UnitResolver<S> {
     package_lookups: usize,
     package_catalogue_count: usize,
     scanned_entries: usize,
-    scanned_bytes: usize,
     project_includes: Vec<ResolvedInclude>,
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
@@ -2901,7 +2897,6 @@ impl<S: SourceStore> UnitResolver<S> {
             package_lookups: 0,
             package_catalogue_count: 0,
             scanned_entries: 0,
-            scanned_bytes: 0,
             project_includes: Vec::new(),
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
@@ -5570,18 +5565,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 .len()
                 .saturating_add(listing.directories.len()),
         );
-        self.scanned_bytes = self.scanned_bytes.saturating_add(
-            listing
-                .files
-                .iter()
-                .filter_map(|path| fs::symlink_metadata(path).ok())
-                .filter(|metadata| !metadata.file_type().is_symlink())
-                .map(|metadata| metadata.len() as usize)
-                .sum::<usize>(),
-        );
-        let complete = listing.complete
-            && self.scanned_entries <= self.limits.max_directory_entries
-            && self.scanned_bytes <= self.limits.max_scanned_bytes;
+        // A listing reads names only; the listed files' sizes are not
+        // scanned, so only entries count toward the request's scan limit.
+        let complete =
+            listing.complete && self.scanned_entries <= self.limits.max_directory_entries;
         let listing = DirectoryListing {
             complete,
             ..listing
@@ -5708,18 +5695,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 .len()
                 .saturating_add(listing.directories.len()),
         );
-        self.scanned_bytes = self.scanned_bytes.saturating_add(
-            listing
-                .files
-                .iter()
-                .filter_map(|path| fs::symlink_metadata(path).ok())
-                .filter(|metadata| !metadata.file_type().is_symlink())
-                .map(|metadata| metadata.len() as usize)
-                .sum::<usize>(),
-        );
-        let complete = listing.complete
-            && self.scanned_entries <= self.limits.max_directory_entries
-            && self.scanned_bytes <= self.limits.max_scanned_bytes;
+        // A listing reads names only; the listed files' sizes are not
+        // scanned, so only entries count toward the request's scan limit.
+        let complete =
+            listing.complete && self.scanned_entries <= self.limits.max_directory_entries;
         listing.value_mut().complete = complete;
         self.record_observation_build(
             report_path_payload(&canonical, Some(entry)),
@@ -9876,6 +9855,7 @@ fn path_equivalent_ignore_case(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn admission_root(text: &str) -> ResolvedUnit {
         ResolvedUnit {

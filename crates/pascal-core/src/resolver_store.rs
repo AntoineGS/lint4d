@@ -34,8 +34,6 @@ impl OverlaySource {
 pub struct FilesystemSourceStore {
     overlays: HashMap<PathBuf, OverlaySource>,
     max_directory_entries: usize,
-    max_scanned_bytes: usize,
-    scanned_bytes: usize,
 }
 
 impl Default for FilesystemSourceStore {
@@ -218,15 +216,12 @@ impl FilesystemSourceStore {
         Self {
             overlays: HashMap::new(),
             max_directory_entries: ResolverLimits::default().max_directory_entries,
-            max_scanned_bytes: ResolverLimits::default().max_scanned_bytes,
-            scanned_bytes: 0,
         }
     }
 
-    pub fn with_limits(max_directory_entries: usize, max_scanned_bytes: usize) -> Self {
+    pub fn with_limits(max_directory_entries: usize) -> Self {
         Self {
             max_directory_entries,
-            max_scanned_bytes,
             ..Self::new()
         }
     }
@@ -559,18 +554,8 @@ impl SourceStore for FilesystemSourceStore {
             if file_type.is_dir() {
                 directories.push(path);
             } else if file_type.is_file() {
-                let bytes = match entry.metadata() {
-                    Ok(metadata) => metadata.len(),
-                    Err(_) => {
-                        complete = false;
-                        continue;
-                    }
-                };
-                self.scanned_bytes = self.scanned_bytes.saturating_add(bytes as usize);
-                if self.scanned_bytes > self.max_scanned_bytes {
-                    complete = false;
-                    break;
-                }
+                // Names only: a listing reads no file content, so the listed
+                // files' sizes cost nothing here.
                 files.push(path);
             }
         }

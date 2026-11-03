@@ -380,7 +380,6 @@ fn a_runtime_directory_change_is_ignored() {
 }
 
 #[test]
-#[ignore = "needs Task 9"]
 fn an_administrative_reset_fences_the_server_which_reopens() {
     let (_temp, main, _provider, main_source, _provider_source) = standard_workspace();
     let environment = tempfile::tempdir().unwrap();
@@ -399,7 +398,8 @@ fn an_administrative_reset_fences_the_server_which_reopens() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     // The step observes `Fenced`; the next settle sees the reopened store.
-    settle(&mut server, true);
+    let stepped = settle(&mut server, true);
+    assert_eq!(stepped["stepped"], true, "{stepped}");
     let after = settle(&mut server, false);
     let status = &after["status"];
     assert_eq!(status["state"], "enabled", "{after}");

@@ -94,7 +94,7 @@ fn escaped_len(c: char) -> usize {
 
 /// The longest prefix of `text` whose JSON-escaped form is at most
 /// `max_escaped_bytes`, cut at a char boundary.
-fn truncate(text: &str, max_escaped_bytes: usize) -> &str {
+pub(crate) fn truncate(text: &str, max_escaped_bytes: usize) -> &str {
     let mut used = 0;
     for (index, c) in text.char_indices() {
         used += escaped_len(c);
@@ -127,7 +127,7 @@ fn cause_json(cause: &StatusCause) -> Value {
     }
 }
 
-fn usage_json(view: &UsageView) -> Value {
+pub(crate) fn usage_json(view: &UsageView) -> Value {
     json!({
         "databaseBytes": view.usage.database_bytes,
         "walBytes": view.usage.wal_bytes,

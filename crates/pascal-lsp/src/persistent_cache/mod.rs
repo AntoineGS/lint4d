@@ -14,7 +14,7 @@
 //! [`PersistentCache::reconfigure`], [`PersistentCache::readmit`] and
 //! [`PersistentCache::shutdown`] (the main loop) never hold a [`CacheJob`]:
 //! the wait would wait for itself, which is why every wait is bounded.
-#![allow(dead_code)]
+#![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod counters;
 pub(crate) mod names;

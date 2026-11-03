@@ -262,6 +262,19 @@ pub(crate) struct RenameBindingInfo {
     pub(crate) names: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceTargetMember {
+    pub(crate) uri: Url,
+    pub(crate) unit: String,
+    pub(crate) top_level: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReferenceTargets {
+    pub(crate) names: Vec<String>,
+    pub(crate) members: Vec<ReferenceTargetMember>,
+}
+
 fn is_explicit_uses_path_keyword(identifier: Node<'_>, document: &Document, span: Span) -> bool {
     if !node_text(identifier, &document.source).eq_ignore_ascii_case("in")
         || !has_ancestor_kind(identifier, "declUses")
@@ -936,6 +949,49 @@ impl NavigationIndex {
             unit_provider_position,
             names,
         })
+    }
+
+    /// The binding at `position` as the indexed references query needs it
+    /// (l4d-33 A3): its names, and for each member the declaring document,
+    /// that document's unit and whether the member is top-level.
+    pub(crate) fn reference_targets_with_cancel(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: &AtomicBool,
+    ) -> Result<ReferenceTargets, String> {
+        check_cancel(Some(cancel))?;
+        let (binding, _) = self.binding_plan_with_cancel(uri, position, Some(cancel), true)?;
+        let mut names = binding.names.iter().cloned().collect::<Vec<_>>();
+        names.sort_by_key(|name| canonical_name(name));
+        names.dedup_by(|left, right| canonical_name(left) == canonical_name(right));
+        let mut members = binding
+            .members
+            .iter()
+            .map(|member| ReferenceTargetMember {
+                uri: member.uri.clone(),
+                unit: self
+                    .documents
+                    .get(&member.uri)
+                    .map(|document| canonical_name(&document.unit_name))
+                    .unwrap_or_default(),
+                top_level: member.scope == ROOT_SCOPE
+                    && member.owner_type.is_none()
+                    && !matches!(
+                        member.kind,
+                        SymbolKind::EnumValue | SymbolKind::Field | SymbolKind::Property
+                    ),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then(left.top_level.cmp(&right.top_level))
+        });
+        members.dedup();
+        check_cancel(Some(cancel))?;
+        Ok(ReferenceTargets { names, members })
     }
 
     /// Prove that the rename target can be resolved without any imported
@@ -4228,6 +4284,101 @@ mod tests {
     use super::super::{Span, collect_nodes_matching};
     use super::NavigationIndex;
     use lsp_types::Url;
+    use std::sync::atomic::AtomicBool;
+
+    fn indexed(documents: &[(&str, &str)]) -> NavigationIndex {
+        let mut index = NavigationIndex::new();
+        for (name, source) in documents {
+            let uri = Url::parse(&format!("file:///{name}.pas")).expect("valid file URL");
+            index
+                .update(uri, (*source).to_owned())
+                .expect("Pascal unit parses");
+        }
+        index
+    }
+
+    fn targets_at(
+        index: &NavigationIndex,
+        name: &str,
+        source: &str,
+        needle: &str,
+    ) -> super::ReferenceTargets {
+        let uri = Url::parse(&format!("file:///{name}.pas")).expect("valid file URL");
+        let offset = source.find(needle).expect("needle is present");
+        let position = crate::text::offset_to_position(source, offset).expect("position");
+        index
+            .reference_targets_with_cancel(&uri, position, &AtomicBool::new(false))
+            .expect("targets")
+    }
+
+    #[test]
+    fn reference_targets_mark_unit_scope_constants_top_level() {
+        let shared = "unit Shared;\ninterface\nconst\n  SharedValue = 1;\nimplementation\nend.\n";
+        let user = "unit User;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  WriteLn(SharedValue);\nend;\nend.\n";
+        let index = indexed(&[("Shared", shared), ("User", user)]);
+        let targets = targets_at(&index, "User", user, "SharedValue);");
+        assert_eq!(targets.names, ["sharedvalue"]);
+        assert_eq!(targets.members.len(), 1);
+        let member = &targets.members[0];
+        assert_eq!(member.uri.as_str(), "file:///Shared.pas");
+        assert_eq!(member.unit, "shared");
+        assert!(member.top_level);
+    }
+
+    #[test]
+    fn reference_targets_mark_fields_methods_properties_and_enum_values_as_members() {
+        let source = "unit Types;\ninterface\ntype\n  TColor = (Red, Green);\n  TBox = class\n  private\n    FValue: Integer;\n  public\n    procedure Run;\n    property Value: Integer read FValue;\n  end;\nimplementation\nprocedure TBox.Run;\nvar\n  Color: TColor;\nbegin\n  Color := Green;\n  FValue := Value;\nend;\nend.\n";
+        let index = indexed(&[("Types", source)]);
+        for needle in ["FValue := ", "Green);", "Value;\nend;", "Run;\nvar"] {
+            let targets = targets_at(&index, "Types", source, needle);
+            assert!(!targets.members.is_empty(), "{needle}");
+            assert!(
+                targets.members.iter().all(|member| !member.top_level),
+                "{needle}: {:?}",
+                targets.members
+            );
+        }
+    }
+
+    #[test]
+    fn an_overloaded_routine_lists_every_declaring_document() {
+        let both = "unit Both;\ninterface\nprocedure Run(Value: Integer); overload;\nprocedure Run(Value: string); overload;\nimplementation\nprocedure Run(Value: Integer);\nbegin\nend;\nprocedure Run(Value: string);\nbegin\nend;\nend.\n";
+        let first = "unit First;\ninterface\nprocedure Go(Value: Integer); overload;\nimplementation\nprocedure Go(Value: Integer);\nbegin\nend;\nend.\n";
+        let second = "unit Second;\ninterface\nprocedure Go(Value: string); overload;\nimplementation\nprocedure Go(Value: string);\nbegin\nend;\nend.\n";
+        let user = "unit User;\ninterface\nuses First, Second;\nimplementation\nprocedure Call;\nbegin\n  Go(1);\nend;\nend.\n";
+        let index = indexed(&[
+            ("Both", both),
+            ("First", first),
+            ("Second", second),
+            ("User", user),
+        ]);
+        for needle in [
+            "Run(Value: Integer); overload",
+            "Run(Value: string);\nbegin",
+        ] {
+            let targets = targets_at(&index, "Both", both, needle);
+            assert_eq!(targets.names, ["run"]);
+            assert_eq!(
+                targets.members,
+                [super::ReferenceTargetMember {
+                    uri: Url::parse("file:///Both.pas").unwrap(),
+                    unit: "both".to_owned(),
+                    top_level: true,
+                }],
+                "{needle}"
+            );
+        }
+        // Overloads of different units never form one binding today: phase 1
+        // fails, and the caller falls back to the member rule (A3).
+        let uri = Url::parse("file:///User.pas").unwrap();
+        let offset = user.find("Go(1)").unwrap();
+        let position = crate::text::offset_to_position(user, offset).unwrap();
+        assert!(
+            index
+                .reference_targets_with_cancel(&uri, position, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
 
     #[test]
     fn parsed_direct_symbol_index_matches_linear_span_membership() {

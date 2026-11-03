@@ -98,6 +98,8 @@ pub(crate) use inlay::InlayHintOptions;
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
+#[allow(unused_imports)] // read by the query tasks of l4d-33
+pub(crate) use rename::{ReferenceTargetMember, ReferenceTargets};
 #[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
 pub(crate) use selection::validate_selection_position_count;

@@ -106,6 +106,14 @@ thread_local! {
     static TEST_WORKSPACE_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
     static TEST_ENUMERATED_OWNERS: std::cell::RefCell<Vec<(PathBuf, ContextKey)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_SOURCE_OWNER_DISCOVERIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Enumerated sources whose owner the snapshot had to discover, since the
+/// last call.
+#[cfg(test)]
+pub(crate) fn test_take_source_owner_discoveries() -> usize {
+    TEST_SOURCE_OWNER_DISCOVERIES.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
@@ -571,6 +579,9 @@ pub(crate) struct RenameSnapshot {
     pub(crate) declaration_providers: HashSet<Url>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
+    /// What an indexed snapshot did not search (l4d-33 §7); empty for a walk.
+    #[allow(dead_code)] // read by the query tasks of l4d-33
+    pub(crate) index_gaps: Vec<String>,
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
     _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
@@ -891,6 +902,40 @@ impl RenameSnapshot {
             });
         }
         Ok(edits)
+    }
+
+    /// The binding at `position` for the indexed references query (A3),
+    /// merged over every virtual position the physical one maps to.
+    #[allow(dead_code)] // called by the query tasks of l4d-33
+    pub(crate) fn reference_targets(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<crate::navigation::ReferenceTargets, String> {
+        let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let positions = self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        if positions.is_empty() {
+            return Err("reference target is not indexed".to_string());
+        }
+        let mut targets = crate::navigation::ReferenceTargets::default();
+        for (query_uri, query_position) in positions {
+            let found =
+                self.index
+                    .reference_targets_with_cancel(&query_uri, query_position, cancel)?;
+            targets.names.extend(found.names);
+            targets.members.extend(found.members);
+        }
+        targets.names.sort();
+        targets.names.dedup();
+        targets.members.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then(left.top_level.cmp(&right.top_level))
+        });
+        targets.members.dedup();
+        Ok(targets)
     }
 
     /// Read-only references. Occurrences that cannot be proven are left out
@@ -5370,6 +5415,8 @@ fn discover_enumerated_contexts(
             }
             owner
         } else {
+            #[cfg(test)]
+            TEST_SOURCE_OWNER_DISCOVERIES.with(|count| count.set(count.get() + 1));
             let uri = Url::from_file_path(&path)
                 .map_err(|()| format!("could not create a file URI for {path:?}"))?;
             let had_known_owner = loader.document_owners.contains_key(&uri);
@@ -5875,6 +5922,56 @@ pub(crate) fn build_snapshot(
         priority_seed,
         skip_imports_for,
         false,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+/// Where a workspace snapshot finds its sources.
+pub(crate) enum SnapshotScope {
+    /// Every Pascal source under the workspace roots and mapped roots.
+    Walk,
+    /// The candidates an index chose (l4d-33 §6): no walk, no owner discovery
+    /// and no mapped-root walk.
+    #[allow(dead_code)] // built by the query tasks of l4d-33
+    Indexed(IndexedSources),
+}
+
+/// The sources of an indexed snapshot, each with the target context that
+/// owns it.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) struct IndexedSources {
+    pub(crate) sources: Vec<(PathBuf, ContextKey)>,
+    /// What proves the members left out still current (A7): their stamps and
+    /// the directories of the catalogues their membership came from.
+    pub(crate) baseline: Vec<(PathBuf, Option<PathStamp>)>,
+    pub(crate) gaps: Vec<String>,
+    /// The states of the owners in `sources`, which the snapshot does not
+    /// resolve again.
+    pub(crate) contexts: HashMap<ContextKey, ContextState>,
+}
+
+/// A workspace snapshot over `sources` instead of the whole workspace.
+#[allow(dead_code)] // called by the query tasks of l4d-33
+pub(crate) fn build_indexed_snapshot(
+    input: &WorkspaceInput,
+    priority: &[Url],
+    candidate_names: &[String],
+    mode: SnapshotMode,
+    priority_seed: Option<SnapshotSeed>,
+    sources: IndexedSources,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    build_snapshot_with_policy(
+        input,
+        priority,
+        candidate_names,
+        mode,
+        priority_seed,
+        &[],
+        false,
+        SnapshotScope::Indexed(sources),
         cancel,
     )
 }
@@ -5898,6 +5995,7 @@ pub(crate) fn build_rejectable_workspace_snapshot(
         None,
         &[],
         true,
+        SnapshotScope::Walk,
         cancel,
     )
 }
@@ -5911,6 +6009,7 @@ fn build_snapshot_with_policy(
     priority_seed: Option<SnapshotSeed>,
     skip_imports_for: &[Url],
     stop_at_incomplete_context: bool,
+    mut scope: SnapshotScope,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     if is_cancelled(cancel) {
@@ -6045,6 +6144,16 @@ fn build_snapshot_with_policy(
             }
         }
     }
+    let index_gaps = match &mut scope {
+        SnapshotScope::Walk => Vec::new(),
+        SnapshotScope::Indexed(sources) => {
+            for (key, state) in std::mem::take(&mut sources.contexts) {
+                loader.contexts.entry(key).or_insert(state);
+            }
+            std::mem::take(&mut sources.gaps)
+        }
+    };
+    let indexed = matches!(scope, SnapshotScope::Indexed(_));
     let mut enumeration = enumerate_sources(
         &mut loader,
         input,
@@ -6052,9 +6161,10 @@ fn build_snapshot_with_policy(
         &priority_contexts,
         candidate_names,
         mode,
+        &scope,
         cancel,
     )?;
-    let project_contexts = if mode == SnapshotMode::WorkspaceSymbols {
+    let project_contexts = if mode == SnapshotMode::WorkspaceSymbols && !indexed {
         discover_project_metadata_contexts(&mut loader, &mut enumeration, cancel)?
     } else {
         HashSet::new()
@@ -6089,6 +6199,7 @@ fn build_snapshot_with_policy(
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
+                    index_gaps,
                     _cache_leases: HashMap::new(),
                 });
             }
@@ -6108,14 +6219,16 @@ fn build_snapshot_with_policy(
         } else {
             priority_contexts.values().cloned().collect()
         };
-        let context_states = enumeration.contexts.clone();
-        enumerate_mapped_sources(
-            &mut loader,
-            &context_states,
-            &mapped_contexts,
-            &mut enumeration,
-            cancel,
-        )?;
+        if !indexed {
+            let context_states = enumeration.contexts.clone();
+            enumerate_mapped_sources(
+                &mut loader,
+                &context_states,
+                &mapped_contexts,
+                &mut enumeration,
+                cancel,
+            )?;
+        }
         enumerate_external_overlays(
             &mut loader,
             input,
@@ -7091,6 +7204,7 @@ fn build_snapshot_with_policy(
         declaration_providers,
         baseline_records,
         mode,
+        index_gaps,
         _cache_leases: loader.cache_leases,
     })
 }
@@ -7476,6 +7590,7 @@ fn retain_resolvable_auto_import_providers(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_sources(
     workspace: &mut Workspace,
     input: &WorkspaceInput,
@@ -7483,6 +7598,7 @@ fn enumerate_sources(
     priority_contexts: &HashMap<Url, ContextKey>,
     candidate_names: &[String],
     mode: SnapshotMode,
+    scope: &SnapshotScope,
     cancel: &AtomicBool,
 ) -> Result<Enumeration, String> {
     let mut result = Enumeration {
@@ -7583,7 +7699,11 @@ fn enumerate_sources(
         return Ok(result);
     }
     let entry_limit = MAX_RENAME_TRAVERSAL_ENTRIES;
-    'roots: for root_index in 0..workspace.roots.len() {
+    let walk_roots = match scope {
+        SnapshotScope::Walk => workspace.roots.len(),
+        SnapshotScope::Indexed(_) => 0,
+    };
+    'roots: for root_index in 0..walk_roots {
         for source_index in 0..workspace.roots[root_index].source_roots.len() {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -7663,6 +7783,20 @@ fn enumerate_sources(
                     format!("open overlay {uri} exceeds the configured per-file limit")
                 });
             }
+        }
+    }
+    if let SnapshotScope::Indexed(indexed) = scope {
+        for (path, owner) in &indexed.sources {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if is_pascal_path(path) && workspace.index_accepts(owner, path) {
+                add_baseline_path(&mut result.baseline, path.clone());
+                result.add_path(path.clone(), Some(owner.clone()));
+            }
+        }
+        for (path, stamp) in &indexed.baseline {
+            add_baseline_path_with_stamp(&mut result.baseline, path.clone(), stamp.clone());
         }
     }
 
@@ -10667,6 +10801,112 @@ mod tests {
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn an_indexed_snapshot_lists_no_directory_and_discovers_no_owner() {
+        use super::super::indexing::{IndexBound, Targets};
+        use crate::project_cache::IndexAnchor;
+        use crate::workspace_index::CandidateQuery;
+
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let files = [
+            (
+                "App.dproj",
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+            ),
+            ("App.dpr", "program App; begin end.\n"),
+            (
+                "lib/Shared.pas",
+                "unit Shared;\ninterface\nconst\n  SharedValue = 1;\nimplementation\nend.\n",
+            ),
+            (
+                "lib/User.pas",
+                "unit User;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  WriteLn(SharedValue);\nend;\nend.\n",
+            ),
+            (
+                "lib/Plain.pas",
+                "unit Plain;\ninterface\nimplementation\nend.\n",
+            ),
+        ];
+        for (name, text) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let cancel = AtomicBool::new(false);
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        let key = workspace
+            .index_context_for(&anchor, &cancel)
+            .expect("context");
+        workspace
+            .advance_workspace_index(&anchor, IndexBound::all(), &mut || Ok(()), &cancel)
+            .expect("index");
+        let targets = Targets {
+            contexts: vec![(key.clone(), anchor)],
+            ..Targets::default()
+        };
+        let query = CandidateQuery {
+            names: vec!["SharedValue".to_owned()],
+            top_level_units: Some(vec!["shared".to_owned()]),
+            aliases: Vec::new(),
+        };
+        let input = workspace.analysis_input();
+        let sources = workspace
+            .indexed_sources(&input, &targets, Some(&query), &[], &cancel)
+            .expect("indexed sources");
+        let user = Url::from_file_path(root.join("lib/User.pas")).unwrap();
+        let names = vec!["sharedvalue".to_owned()];
+
+        crate::catalogue::test_reset_listings();
+        let _ = super::test_take_source_owner_discoveries();
+        super::test_take_enumerated_owners();
+        let snapshot = super::build_indexed_snapshot(
+            &input,
+            std::slice::from_ref(&user),
+            &names,
+            SnapshotMode::Workspace,
+            None,
+            sources,
+            &cancel,
+        )
+        .expect("indexed snapshot");
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "{:?}",
+            crate::catalogue::test_listings()
+        );
+        assert_eq!(super::test_take_source_owner_discoveries(), 0);
+        let owners = super::test_take_enumerated_owners();
+        assert!(!owners.is_empty());
+        assert!(owners.iter().all(|(_, owner)| *owner == key));
+        assert!(snapshot.index.contains(&user));
+        let plain = Url::from_file_path(root.join("lib/Plain.pas")).unwrap();
+        assert!(!snapshot.index.contains(&plain));
+        assert!(snapshot.index_gaps.is_empty());
+        assert!(
+            snapshot
+                .baseline_records
+                .iter()
+                .any(|record| record.path.as_deref() == Some(root.join("lib/Plain.pas").as_path())),
+            "the excluded member is in the baseline"
+        );
+
+        let walked = build_snapshot(
+            &input,
+            std::slice::from_ref(&user),
+            &names,
+            SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("walked snapshot");
+        assert!(walked.index_gaps.is_empty());
+        assert!(super::test_take_source_owner_discoveries() > 0);
     }
 
     #[test]

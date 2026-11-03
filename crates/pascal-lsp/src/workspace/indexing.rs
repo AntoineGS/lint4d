@@ -15,16 +15,19 @@ use pascal_project::ProjectContext;
 
 use super::catalogues::CatalogueScope;
 use super::rename::{
-    CANCELLATION_MESSAGE, WorkspaceInput, is_safe_source_path, path_key, project_metadata_context,
-    snapshot_context_for_uri,
+    CANCELLATION_MESSAGE, IndexedSources, WorkspaceInput, is_safe_source_path, path_key,
+    project_metadata_context, snapshot_context_for_uri,
 };
 use super::{
-    ContextKey, PathStamp, Workspace, absolute_path, check_workspace_cancel, path_stamp,
-    path_stamp_from_project_read, path_starts_with_ci,
+    ContextKey, PathStamp, Workspace, absolute_path, check_workspace_cancel, disk_stamp,
+    path_stamp, path_stamp_from_project_read, path_starts_with_ci,
 };
-use crate::catalogue::{Catalogue, MAX_CATALOGUE_ENTRIES};
+use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
-use crate::workspace_index::{MemberFacts, MemberStamp, MemberState};
+use crate::workspace_index::{
+    CandidateQuery, Candidates, IndexCoverage, MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp,
+    MemberState,
+};
 
 /// Directories whose owner one call may discover; the rest stay pending and
 /// the membership says so.
@@ -81,6 +84,7 @@ struct CapOverrides {
     small_sources: Option<usize>,
     small_projects: Option<usize>,
     max_targets: Option<usize>,
+    unverified: Option<usize>,
 }
 
 #[cfg(test)]
@@ -91,6 +95,7 @@ thread_local! {
             small_sources: None,
             small_projects: None,
             max_targets: None,
+            unverified: None,
         })
     };
 }
@@ -135,6 +140,14 @@ fn max_target_contexts() -> usize {
         return cap;
     }
     MAX_TARGET_CONTEXTS
+}
+
+fn max_unverified_candidates() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified) {
+        return cap;
+    }
+    MAX_UNVERIFIED_CANDIDATES
 }
 
 /// How many pending members one `advance_workspace_index` call takes.
@@ -643,7 +656,7 @@ impl Workspace {
     /// The acceptance today's enumeration applies: workspace sources must be
     /// safe source paths, mapped library sources only readable (mapped roots
     /// are deliberately not workspace source roots).
-    fn index_accepts(&self, key: &ContextKey, path: &Path) -> bool {
+    pub(super) fn index_accepts(&self, key: &ContextKey, path: &Path) -> bool {
         (self.accepts_path(path) && is_safe_source_path(self, path))
             || self.mapped_path_is_readable(path, key)
     }
@@ -1016,6 +1029,282 @@ impl Workspace {
         Ok(targets)
     }
 
+    /// The sources an indexed snapshot reads for `targets` (l4d-33 §6): per
+    /// target, the members `query` selects, then its unverified members
+    /// within one request-wide bound (A5), then `must_include` (declaring
+    /// documents and open buffers, A4). A member left out is excluded only
+    /// while every stamp it was indexed under still proves it unchanged
+    /// (A7); those stamps and the membership's directories become the
+    /// baseline. `query: None` (workspace symbols) reads the unverified
+    /// members only. Client-deleted files are never sources.
+    #[allow(dead_code)] // called by the query tasks of l4d-33
+    pub(crate) fn indexed_sources(
+        &mut self,
+        input: &WorkspaceInput,
+        targets: &Targets,
+        query: Option<&CandidateQuery>,
+        must_include: &[Url],
+        cancel: &AtomicBool,
+    ) -> Result<IndexedSources, String> {
+        let mut result = IndexedSources {
+            gaps: targets.gaps.clone(),
+            ..IndexedSources::default()
+        };
+        let mut taken = HashSet::<String>::new();
+        let mut stamps = HashMap::<String, Option<PathStamp>>::new();
+        let mut unverified_left = max_unverified_candidates();
+        let mut refused = 0usize;
+        let mut first_refusal = None::<Box<str>>;
+        let mut memory = false;
+        let open = input
+            .overlays
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .map(|path| path_key(&absolute_path(path)))
+            .collect::<HashSet<_>>();
+        let deleted = |path: &Path| {
+            Url::from_file_path(path).is_ok_and(|uri| {
+                [&uri, &super::canonical_file_uri(&uri)]
+                    .into_iter()
+                    .any(|uri| {
+                        input
+                            .deleted_overrides
+                            .get(uri)
+                            .is_some_and(|stamp| disk_stamp(path) == *stamp)
+                    })
+            })
+        };
+        for (key, anchor) in &targets.contexts {
+            check_workspace_cancel(Some(cancel))?;
+            if !self.contexts.contains_key(key) {
+                let resolved = self.index_context_for(anchor, cancel)?;
+                if &resolved != key {
+                    return Err(format!(
+                        "index target {} resolved to another context",
+                        anchor_display(anchor)
+                    ));
+                }
+            }
+            self.ensure_index_membership(key, anchor, cancel)?;
+            if let Some(state) = self.contexts.get(key) {
+                result.contexts.insert(key.clone(), state.clone());
+            }
+            let display = anchor_display(anchor);
+            let view = self.project_cache.read_index(key, |index, membership| {
+                let candidates = match query {
+                    Some(query) => index.candidates(query),
+                    None => {
+                        let mut all = index.candidates(&CandidateQuery {
+                            names: Vec::new(),
+                            top_level_units: None,
+                            aliases: Vec::new(),
+                        });
+                        all.selected.clear();
+                        all.excluded.clear();
+                        all
+                    }
+                };
+                let recorded = candidates
+                    .excluded
+                    .iter()
+                    .map(|path| {
+                        let resolved = index
+                            .slot_paths_of(path)
+                            .is_some_and(|slots| slots.iter().skip(1).all(Option::is_some));
+                        let stamps = index.stamps_of(path).map(<[_]>::to_vec).unwrap_or_default();
+                        (resolved, stamps)
+                    })
+                    .collect::<Vec<_>>();
+                TargetView {
+                    candidates,
+                    recorded,
+                    coverage: index.coverage(),
+                    scopes: membership.scopes.clone(),
+                    complete: membership.complete,
+                    limit: membership.limit.clone(),
+                    packages: membership.packages,
+                }
+            });
+            let Some(view) = view else {
+                // The store kept no index (no room for the membership): read
+                // every member as today's walk would, within the bound.
+                let membership = self.index_membership(key, cancel)?;
+                memory = true;
+                let mut skipped = 0usize;
+                let mut searched = 0usize;
+                for path in membership.paths {
+                    if deleted(&path) || !taken.insert(path_key(&path)) {
+                        continue;
+                    }
+                    if unverified_left == 0 {
+                        skipped += 1;
+                        continue;
+                    }
+                    unverified_left -= 1;
+                    searched += 1;
+                    result.sources.push((path, key.clone()));
+                }
+                if skipped > 0 {
+                    result.gaps.push(format!(
+                        "{skipped} units of {display} are not indexed yet; {searched} were searched directly"
+                    ));
+                }
+                self.project_cache.request_index(anchor.clone());
+                continue;
+            };
+            let TargetView {
+                candidates:
+                    Candidates {
+                        selected,
+                        mut unverified,
+                        refused: refused_members,
+                        excluded,
+                    },
+                recorded,
+                coverage,
+                scopes,
+                complete,
+                limit,
+                packages,
+            } = view;
+
+            for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
+                check_workspace_cancel(Some(cancel))?;
+                let proven = resolved
+                    && recorded.first().is_some_and(|first| first.path == path)
+                    && recorded.iter().all(|member| {
+                        let now = stamps
+                            .entry(path_key(&member.path))
+                            .or_insert_with(|| path_stamp(&member.path));
+                        matches!((&member.stamp, &*now), (Some(old), Some(now)) if old.proves_unchanged(now))
+                    });
+                if proven {
+                    result.baseline.extend(
+                        recorded
+                            .into_iter()
+                            .map(|member| (member.path, member.stamp)),
+                    );
+                } else {
+                    if resolved {
+                        self.project_cache.mark_index_stale(key, &path);
+                    }
+                    unverified.push(path);
+                }
+            }
+            unverified.sort_by_cached_key(|path| path_key(path));
+
+            for path in selected {
+                if !deleted(&path) && taken.insert(path_key(&path)) {
+                    result.sources.push((path, key.clone()));
+                }
+            }
+            let mut skipped = 0usize;
+            let mut searched = 0usize;
+            for path in unverified {
+                let path_key = path_key(&path);
+                if deleted(&path) || taken.contains(&path_key) {
+                    continue;
+                }
+                // Open buffers are always read (A4); they do not use the bound.
+                if !open.contains(&path_key) {
+                    if unverified_left == 0 {
+                        skipped += 1;
+                        continue;
+                    }
+                    unverified_left -= 1;
+                    searched += 1;
+                }
+                taken.insert(path_key);
+                result.sources.push((path, key.clone()));
+            }
+            if skipped > 0 {
+                result.gaps.push(format!(
+                    "{skipped} units of {display} are not indexed yet; {searched} were searched directly"
+                ));
+            }
+            refused += refused_members.len();
+            if first_refusal.is_none() {
+                first_refusal = refused_members.into_iter().next().map(|(_, reason)| reason);
+            }
+
+            for (scope, _) in &scopes {
+                if let Some(shared) = self.project_cache.catalogue(scope) {
+                    result
+                        .baseline
+                        .extend(shared.catalogue.directories().iter().cloned());
+                }
+            }
+            match limit.as_deref() {
+                Some(limit) if limit.starts_with("more than ") => {
+                    result.gaps.push(format!(
+                        "{display} has more than {} units; the rest were not searched",
+                        coverage.members
+                    ));
+                }
+                Some(_) => memory = true,
+                None => {}
+            }
+            memory |= self.project_cache.index_memory_exhausted(key);
+            if packages {
+                result.gaps.push(format!(
+                    "units provided through runtime packages of {display} were not searched"
+                ));
+            }
+            if coverage.pending > 0 || !complete {
+                self.project_cache.request_index(anchor.clone());
+            }
+        }
+
+        for uri in must_include {
+            let Ok(path) = uri.to_file_path().map(absolute_path) else {
+                continue;
+            };
+            let path_key = path_key(&path);
+            if deleted(&path) || taken.contains(&path_key) {
+                continue;
+            }
+            let owner = targets
+                .contexts
+                .iter()
+                .map(|(key, _)| key)
+                .find(|key| {
+                    self.project_cache
+                        .read_index(key, |index, _| index.state_of(&path).is_some())
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .or_else(|| {
+                    let known = input
+                        .document_owners
+                        .get(uri)
+                        .or_else(|| input.document_owners.get(&super::canonical_file_uri(uri)))?;
+                    result
+                        .contexts
+                        .entry(known.key.clone())
+                        .or_insert_with(|| super::ContextState::clone(&known.state));
+                    Some(known.key.clone())
+                });
+            // Without a known owner the snapshot's own overlay step reads it.
+            if let Some(owner) = owner {
+                taken.insert(path_key);
+                result.sources.push((path, owner));
+            }
+        }
+
+        if refused > 0 {
+            result.gaps.push(format!(
+                "{refused} units could not be indexed: {}",
+                first_refusal.as_deref().unwrap_or("unknown reason")
+            ));
+        }
+        if memory {
+            result
+                .gaps
+                .push("the workspace index memory share is exhausted".to_owned());
+        }
+        Ok(result)
+    }
+
     /// The configured project file; a relative one is looked up under the
     /// workspace roots.
     fn configured_project_path(&self) -> Option<PathBuf> {
@@ -1027,6 +1316,33 @@ impl Workspace {
             .iter()
             .map(|root| root.path.join(project))
             .find(|candidate| candidate.is_file())
+    }
+}
+
+/// What one target's index says, copied out under the index lock.
+struct TargetView {
+    candidates: Candidates,
+    /// Per excluded member: whether every include slot resolved, and the
+    /// stamps it was indexed under.
+    recorded: Vec<(bool, Vec<MemberStamp>)>,
+    coverage: IndexCoverage,
+    scopes: Vec<(CatalogueKey, u64)>,
+    complete: bool,
+    limit: Option<String>,
+    packages: bool,
+}
+
+/// How coverage notes name a context: its project file, or the document
+/// that anchors a projectless one.
+fn anchor_display(anchor: &IndexAnchor) -> String {
+    match anchor {
+        IndexAnchor::Project(path) => path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        IndexAnchor::Document(uri) => uri
+            .to_file_path()
+            .map_or_else(|()| uri.to_string(), |path| path.display().to_string()),
     }
 }
 
@@ -1999,6 +2315,7 @@ mod tests {
                     small_sources: None,
                     small_projects: None,
                     max_targets: None,
+                    unverified: None,
                 })
             });
         }
@@ -2271,5 +2588,315 @@ mod tests {
         let found = targets(&mut workspace, None, TargetPurpose::References);
         assert_eq!(keys(&found), [p2, p1.clone()]);
         assert_eq!(workspace.project_cache.owner_of(&root.join("P1")), Some(p1));
+    }
+
+    const SHARED: &str =
+        "unit Shared;\ninterface\nconst\n  SharedValue = 1;\nimplementation\nend.\n";
+    const USER: &str = "unit User;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  WriteLn(SharedValue);\nend;\nend.\n";
+    const OTHER: &str = "unit Other;\ninterface\nimplementation\nprocedure Run;\nvar\n  SharedValue: Integer;\nbegin\n  SharedValue := 1;\nend;\nend.\n";
+    const PLAIN: &str = "unit Plain;\ninterface\nimplementation\nend.\n";
+
+    /// App.dpr and lib/{Shared,User,Other,Plain}.pas, fully indexed: User
+    /// imports Shared and names SharedValue, Other only names it.
+    fn shared_project(
+        root: &Path,
+        options: WorkspaceOptions,
+    ) -> (Workspace, ContextKey, IndexAnchor) {
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        write(&root.join("lib/Other.pas"), OTHER);
+        write(&root.join("lib/Plain.pas"), PLAIN);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            "",
+            options,
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        (workspace, key, anchor)
+    }
+
+    fn one_target(key: &ContextKey, anchor: &IndexAnchor) -> Targets {
+        Targets {
+            contexts: vec![(key.clone(), anchor.clone())],
+            ..Targets::default()
+        }
+    }
+
+    fn shared_query(units: Option<&[&str]>) -> CandidateQuery {
+        CandidateQuery {
+            names: vec!["SharedValue".to_owned()],
+            top_level_units: units
+                .map(|units| units.iter().map(|unit| (*unit).to_owned()).collect()),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn indexed(
+        workspace: &mut Workspace,
+        input: &WorkspaceInput,
+        targets: &Targets,
+        query: Option<&CandidateQuery>,
+        must_include: &[Url],
+    ) -> IndexedSources {
+        workspace
+            .indexed_sources(input, targets, query, must_include, &AtomicBool::new(false))
+            .expect("indexed sources")
+    }
+
+    fn source_names(sources: &IndexedSources) -> Vec<String> {
+        let mut names = sources
+            .sources
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn indexed_sources_hold_importers_with_the_name_and_the_declaring_unit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(found.sources.iter().all(|(_, owner)| *owner == key));
+        assert!(found.contexts.contains_key(&key));
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+        for excluded in ["App.dpr", "lib/Other.pas", "lib/Plain.pas"] {
+            let path = root.join(excluded);
+            assert!(
+                found
+                    .baseline
+                    .iter()
+                    .any(|(baseline, stamp)| *baseline == path && stamp.is_some()),
+                "{excluded} is in the baseline"
+            );
+        }
+        assert!(
+            found
+                .baseline
+                .iter()
+                .any(|(path, _)| *path == root.join("lib")),
+            "the membership directories are in the baseline"
+        );
+        assert!(workspace.project_cache.take_index_requests().is_empty());
+    }
+
+    #[test]
+    fn an_excluded_member_changed_since_indexing_becomes_a_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        write(&plain, USER.replace("unit User", "unit Plain").as_str());
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Plain.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(!found.baseline.iter().any(|(path, _)| *path == plain));
+        assert_eq!(state(&workspace, &key, &plain), Some(MemberState::Stale));
+    }
+
+    #[test]
+    fn an_unresolved_include_makes_a_member_unverified_every_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(
+            &root.join("lib/Inc.pas"),
+            "unit Inc;\ninterface\n{$I missing.inc}\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let member = root.join("lib/Inc.pas");
+        assert_eq!(state(&workspace, &key, &member), Some(MemberState::Fresh));
+        let query = shared_query(Some(&["shared"]));
+        for _ in 0..2 {
+            let input = workspace.analysis_input();
+            let found = indexed(
+                &mut workspace,
+                &input,
+                &one_target(&key, &anchor),
+                Some(&query),
+                &[],
+            );
+            assert_eq!(source_names(&found), ["Inc.pas", "Shared.pas", "User.pas"]);
+        }
+        assert_eq!(state(&workspace, &key, &member), Some(MemberState::Fresh));
+    }
+
+    #[test]
+    fn unverified_members_are_bounded_and_the_rest_are_a_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
+        let _caps = override_caps(|caps| caps.unverified = Some(3));
+        let input = workspace.analysis_input();
+        let query = CandidateQuery {
+            names: vec!["P0".to_owned()],
+            top_level_units: None,
+            aliases: Vec::new(),
+        };
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["App.dpr", "U0.pas", "U1.pas"]);
+        assert_eq!(
+            found.gaps,
+            ["2 units of App.dproj are not indexed yet; 3 were searched directly"]
+        );
+        assert_eq!(workspace.project_cache.take_index_requests(), [anchor]);
+    }
+
+    #[test]
+    fn refused_members_are_a_gap_not_a_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let big = root.join("lib/Big.pas");
+        write(
+            &big,
+            &format!(
+                "unit Big;\n{}\ninterface implementation end.\n",
+                "{ SharedValue }\n".repeat(60)
+            ),
+        );
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (mut workspace, key, anchor) = shared_project(root, options);
+        assert!(matches!(
+            state(&workspace, &key, &big),
+            Some(MemberState::Refused(_))
+        ));
+        let input = workspace.analysis_input();
+        let query = shared_query(None);
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert!(!source_names(&found).contains(&"Big.pas".to_owned()));
+        assert_eq!(found.gaps.len(), 1, "{:?}", found.gaps);
+        assert!(
+            found.gaps[0].starts_with("1 units could not be indexed: ")
+                && found.gaps[0].contains("per-file limit"),
+            "{}",
+            found.gaps[0]
+        );
+    }
+
+    #[test]
+    fn an_open_buffer_is_a_candidate_even_when_its_disk_facts_exclude_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = Url::from_file_path(root.join("lib/Plain.pas")).unwrap();
+        workspace
+            .open_document(plain.clone(), USER.replace("unit User", "unit Plain"), 1)
+            .unwrap();
+        let input = workspace.analysis_input();
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            std::slice::from_ref(&plain),
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Plain.pas", "Shared.pas", "User.pas"]
+        );
+        let owner = found
+            .sources
+            .iter()
+            .find(|(path, _)| path.ends_with("Plain.pas"))
+            .map(|(_, owner)| owner);
+        assert_eq!(owner, Some(&key));
+    }
+
+    #[test]
+    fn client_deleted_files_are_never_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let user = root.join("lib/User.pas");
+        let mut input = workspace.analysis_input();
+        input.deleted_overrides.insert(
+            Url::from_file_path(&user).unwrap(),
+            super::super::disk_stamp(&user),
+        );
+        let query = shared_query(Some(&["shared"]));
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[Url::from_file_path(&user).unwrap()],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas"]);
+    }
+
+    #[test]
+    fn phase_one_failure_falls_back_to_the_member_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let query = shared_query(None);
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&query),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Other.pas", "Shared.pas", "User.pas"]
+        );
+    }
+
+    #[test]
+    fn a_symbols_request_reads_only_unverified_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        workspace
+            .project_cache
+            .mark_index_stale(&key, &root.join("lib/Plain.pas"));
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            None,
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Plain.pas"]);
+        assert_eq!(workspace.project_cache.take_index_requests(), [anchor]);
     }
 }

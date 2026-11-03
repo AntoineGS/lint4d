@@ -1842,6 +1842,9 @@ fn read_only_reference_coverage(
     // candidate whose include audit failed is withheld. A gap naming no
     // unit withholds every unit with an include directive.
     // Its importers are withheld too: what it declares may shadow theirs.
+    // One level is enough: a Pascal unit sees only the interface of the
+    // units it uses itself, never what those use in turn, so a failed
+    // unit's declarations reach no unit beyond its direct importers.
     let dependency_gaps = &snapshot.dependency_coverage;
     let mut unattributed = dependency_gaps.omitted > 0;
     let mut failed = HashSet::new();
@@ -4173,6 +4176,77 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(rename.value.is_err(), "{:?}", rename.value);
+    }
+
+    /// l4d-jeh4 fix round 1: without the index, references answer from the
+    /// best-effort local snapshot; a provider whose analysis failed there
+    /// is a dependency gap that withholds the requesting document too.
+    #[test]
+    fn the_index_unavailable_fallback_withholds_the_importers_of_a_dependency_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            root.join("Failing.pas"),
+            "unit Failing;\ninterface\n{$I Missing.inc}\nimplementation\nend.\n",
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_target_error(false);
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_target_error(true);
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(0));
+        let computed = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == super::INDEX_UNAVAILABLE_GAP),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            !located(&partial.value)
+                .iter()
+                .any(|(uri, _, _)| *uri == source_uri(&downstream)),
+            "{:?}",
+            partial.value
+        );
     }
 
     /// l4d-jeh4 fix round 1: a provider of the requesting document whose

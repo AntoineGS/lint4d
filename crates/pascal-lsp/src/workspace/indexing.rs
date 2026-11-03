@@ -3122,6 +3122,93 @@ mod tests {
         assert_eq!(state(&workspace, &key, &open), Some(MemberState::Unindexed));
     }
 
+    const EDITED: &str = "unit U0;\ninterface\nprocedure Edited;\nimplementation\nprocedure Edited; begin end;\nend.\n";
+
+    /// D37: nothing of the editor reaches the producer view.
+    #[test]
+    fn a_baseline_view_holds_no_editor_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut workspace, key, anchor) =
+            indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let open = Url::from_file_path(temp.path().join("lib/U0.pas")).unwrap();
+        workspace
+            .open_document(open.clone(), EDITED.to_owned(), 1)
+            .unwrap();
+        workspace.remember_deleted(&Url::from_file_path(temp.path().join("lib/U1.pas")).unwrap());
+        let session_input = workspace.analysis_input();
+        assert!(!session_input.baseline && !session_input.overlays.is_empty());
+        let input = session_input.disk_baseline();
+        assert!(input.baseline && input.overlays.is_empty() && input.cached_documents.is_empty());
+        assert!(input.rejected_documents.is_empty() && input.rejection_reasons.is_empty());
+        assert!(input.deleted_overrides.is_empty() && input.document_versions.is_empty());
+        assert_eq!(input.roots, vec![temp.path().to_path_buf()]);
+        let mut view = Workspace::from_analysis_input(&input);
+        assert!(view.is_baseline() && !workspace.is_baseline());
+        assert!(!view.root_is_session_private(&open));
+        assert!(view.open_documents.is_empty() && view.deleted_overrides.is_empty());
+        assert_eq!(
+            view.index_context_for(&anchor, &AtomicBool::new(false))
+                .unwrap(),
+            key,
+            "same context key"
+        );
+    }
+
+    /// D32: an open, edited member is indexed from its saved file.
+    #[test]
+    fn an_open_edited_member_is_indexed_and_persisted_from_disk() {
+        use super::super::eligible::{RecordInputs, Unindexed};
+        let temp = tempfile::tempdir().unwrap();
+        let (mut workspace, key, anchor) =
+            indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let path = temp.path().join("lib/U0.pas");
+        let open = Url::from_file_path(&path).unwrap();
+        workspace
+            .open_document(open.clone(), EDITED.to_owned(), 1)
+            .unwrap();
+        let session = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(session.skipped_open, 1);
+        assert_eq!(state(&workspace, &key, &path), Some(MemberState::Unindexed));
+
+        let mut view = Workspace::from_analysis_input(&workspace.analysis_input().disk_baseline());
+        let progress = advance(&mut view, &anchor, IndexBound::all());
+        assert_eq!(progress.skipped_open, 0);
+        assert!(progress.complete);
+        assert_eq!(state(&view, &key, &path), Some(MemberState::Fresh));
+        assert_eq!(selected(&view, &key, "P0"), vec![path.clone()]);
+        assert!(selected(&view, &key, "Edited").is_empty());
+        let record = view
+            .eligible_indexed_member(
+                &key,
+                &RecordInputs {
+                    path: &path,
+                    facts: None,
+                    artifact: None,
+                    member_evidence: None,
+                    origin: pascal_project::SourceOrigin::ProjectCompiled,
+                    unindexed: Some(Unindexed::NotRecorded),
+                },
+            )
+            .expect("eligible in the baseline view");
+        assert_eq!(record.value().header.source.canonical, path);
+        assert!(
+            workspace
+                .eligible_indexed_member(
+                    &key,
+                    &RecordInputs {
+                        path: &path,
+                        facts: None,
+                        artifact: None,
+                        member_evidence: None,
+                        origin: pascal_project::SourceOrigin::ProjectCompiled,
+                        unindexed: Some(Unindexed::NotRecorded),
+                    },
+                )
+                .is_err(),
+            "the session view refuses its open member"
+        );
+    }
+
     #[test]
     fn a_rejected_open_document_is_skipped_too() {
         let temp = tempfile::tempdir().unwrap();

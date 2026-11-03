@@ -306,6 +306,35 @@ pub(crate) struct WorkspaceInput {
     pub(crate) source_generation: u64,
     pub(crate) request_generation: u64,
     pub(crate) configuration_generation: u64,
+    /// The disk-only producer view (`disk_baseline`).
+    pub(crate) baseline: bool,
+}
+
+impl WorkspaceInput {
+    /// The same project with none of the session's editor state: no
+    /// overlays, reusable parses, rejected documents, versions or deletion
+    /// overrides, so everything analysed from it reads saved files only
+    /// (spec §4.4, D37). Roots, options, selections, owners, caches and
+    /// generations are kept.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
+        )
+    )]
+    pub(crate) fn disk_baseline(&self) -> WorkspaceInput {
+        WorkspaceInput {
+            overlays: HashMap::new(),
+            cached_documents: HashMap::new(),
+            rejected_documents: HashSet::new(),
+            rejection_reasons: HashMap::new(),
+            document_versions: HashMap::new(),
+            deleted_overrides: HashMap::new(),
+            baseline: true,
+            ..self.clone()
+        }
+    }
 }
 
 /// The small portion of a workspace snapshot needed to revalidate a retained
@@ -1632,6 +1661,7 @@ impl Workspace {
             source_generation: self.source_generation,
             request_generation: self.request_generation,
             configuration_generation: self.configuration_generation,
+            baseline: false,
         }
     }
 

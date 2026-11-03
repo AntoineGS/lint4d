@@ -3087,6 +3087,15 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
+    /// The disk-only producer view: no editor state (`WorkspaceInput::disk_baseline`).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
+        )
+    )]
+    baseline: bool,
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
@@ -3688,8 +3697,20 @@ impl Workspace {
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
+            baseline: input.baseline,
             ..Self::default()
         }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the persistence producers (l4d-zf1b.8) are its first callers"
+        )
+    )]
+    pub(crate) fn is_baseline(&self) -> bool {
+        self.baseline
     }
 
     pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
@@ -25032,6 +25053,7 @@ BDS = '/fake/37'
             source_generation: 0,
             request_generation: 0,
             configuration_generation: 0,
+            baseline: false,
         };
         let entry = ProjectPathEntry {
             path: root.clone(),

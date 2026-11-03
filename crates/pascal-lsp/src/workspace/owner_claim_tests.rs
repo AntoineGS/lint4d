@@ -242,3 +242,21 @@ fn the_index_targets_the_selected_project_for_the_unit() {
         .expect("membership");
     assert!(membership.paths.contains(&fixture.users));
 }
+
+#[test]
+fn selecting_the_project_after_opening_the_unit_moves_it_to_the_selected_context() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    select(&mut workspace, &fixture.app, &fixture.app_project);
+
+    assert_eq!(
+        project_of(&mut workspace, &fixture.users),
+        Some(uri(&fixture.app_project))
+    );
+    assert_eq!(
+        key_of(&workspace, &fixture.users),
+        key_of(&workspace, &fixture.app),
+        "the unit must follow the selection, not keep the automatic context"
+    );
+    assert!(key_of(&workspace, &fixture.users).selection_project.is_some());
+}

@@ -5658,8 +5658,26 @@ impl<S: SourceStore> UnitResolver<S> {
                 })
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
         );
-        // Typed lookups deliberately reread; do not replace freshness checks by
-        // a same-root map hit. Neither this request nor callbacks hold the lock.
+        // Reuse this session's listing only while the directory is proven
+        // unchanged: its listing stamp was settled and equals a stamp taken
+        // now (`ProjectReadStamp::proves_unchanged`). A changed, unsettled or
+        // incomplete directory is listed again. The reused listing was
+        // charged, and counted against the entry limit, when it was read.
+        if let Some(listing) = self.reusable_directory(&key, &canonical, &mut budget)? {
+            self.record_observation_build(
+                report_path_payload(&canonical, Some(entry)),
+                cancel,
+                || ResolutionObservation::Directory {
+                    path: (*canonical).clone(),
+                    entry: entry.clone(),
+                    stamp: listing.stamp.clone(),
+                    complete: true,
+                    listed: true,
+                },
+            )?;
+            return Ok(DirectoryAccess::Admitted(listing));
+        }
+        // Neither this request nor callbacks hold the lock.
         let result = self.store.list_directory_admitted(
             DirectoryRequest {
                 directory: &canonical,
@@ -5724,20 +5742,66 @@ impl<S: SourceStore> UnitResolver<S> {
         let caller = listing
             .into_shared(&mut budget)
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-        if cacheable {
-            let cached = caller
-                .try_clone(&mut budget)
-                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-            let root = self
-                .compile_time_store
-                .as_ref()
-                .expect("typed directory call");
-            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .value_mut()
-                .insert_directory(key, cached, &mut budget)?;
+        if cacheable && complete {
+            // The cache is an optimization: when its retained bytes are not
+            // admitted, the listing is simply not kept.
+            if let Ok(cached) = caller.try_clone(&mut budget) {
+                let root = self
+                    .compile_time_store
+                    .as_ref()
+                    .expect("typed directory call");
+                let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                match cache.value_mut().insert_directory(key, cached, &mut budget) {
+                    Ok(()) => {}
+                    Err(ResolverError::LimitExceeded {
+                        limit: "max_retained_bytes",
+                        ..
+                    }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(DirectoryAccess::Admitted(caller))
+    }
+
+    /// This session's listing of `canonical`, if its directory is proven
+    /// unchanged since it was listed.
+    fn reusable_directory(
+        &self,
+        key: &OwnedDirectoryKey,
+        canonical: &Path,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Option<AdmittedShared<DirectoryListing>>, ResolverError> {
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        let cached = {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            match cache.directories.get(&*key.0) {
+                Some(listing) if listing.complete && listing.is_admitted_by(budget) => {
+                    let Some(stamp) = listing.stamp.clone() else {
+                        return Ok(None);
+                    };
+                    if !stamp.settled {
+                        return Ok(None);
+                    }
+                    match listing.try_clone(budget) {
+                        Ok(listing) => (listing, stamp),
+                        Err(_) => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        };
+        // One stat of the directory instead of a listing of its entries.
+        budget
+            .charge(1, canonical.as_os_str().len(), 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let current = path_stamp_result(canonical).ok().flatten();
+        Ok(current
+            .is_some_and(|current| cached.1.proves_unchanged(&current))
+            .then_some(cached.0))
     }
 
     fn load_candidate(
@@ -18400,6 +18464,22 @@ mod tests {
                 Ok(caller) => {
                     callers.push(caller);
                     let mut cache = root_cache.view.lock().unwrap();
+                    if cache.directories.len() == 3 {
+                        // l4d-4nbs R13: a refused map growth only stops
+                        // caching; the lookup itself succeeds and the old
+                        // backing and entries are preserved.
+                        assert_eq!(cache.directories.capacity(), old_capacity);
+                        assert!(cache.directory_capacity.is_some());
+                        for caller in &callers[..3] {
+                            assert!(
+                                cache
+                                    .directories
+                                    .values()
+                                    .any(|v| v.files.as_ptr() == caller.files.as_ptr())
+                            );
+                        }
+                        continue;
+                    }
                     assert_eq!(cache.directories.len(), 4);
                     assert_eq!(cache.directories.capacity(), 7);
                     for caller in &callers {

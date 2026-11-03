@@ -4082,6 +4082,58 @@ mod tests {
         assert_eq!(bound_documents(), expected);
     }
 
+    /// l4d-vbeh soundness: a unit whose own text never spells the name but
+    /// whose include does is still walked, and the skip changes nothing.
+    #[test]
+    fn an_occurrence_only_through_an_include_survives_the_occurrence_prefilter() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("main");
+        let include = root.join("Body.inc");
+        fs::write(&include, "  Log(SHAREDVALUE);\n").expect("include");
+        fs::write(
+            root.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Main;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n",
+        )
+        .expect("consumer");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::navigation::test_set_occurrence_prefilter(true);
+            }
+        }
+        let _reset = Reset;
+        let mut results = Vec::new();
+        for prefilter in [true, false] {
+            crate::navigation::test_set_occurrence_prefilter(prefilter);
+            crate::navigation::test_reset_bound_documents();
+            let computed = references_from_input(
+                input.clone(),
+                &source_uri(&main),
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            );
+            let partial = computed.value.expect("references");
+            assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+            results.push((located(&partial.value), bound_documents()));
+        }
+        assert_eq!(results[0].0, results[1].0);
+        assert_eq!(
+            results[0].0,
+            vec![(source_uri(&include), 0, 6), (source_uri(&main), 2, 6)]
+        );
+        let consumer = source_uri(&root.join("Consumer.pas"));
+        assert!(results[0].1.contains(&consumer), "{:?}", results[0].1);
+    }
+
     #[test]
     fn an_include_document_keeps_the_old_path() {
         let temp = tempfile::tempdir().expect("temporary workspace");

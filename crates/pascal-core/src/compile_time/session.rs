@@ -452,6 +452,12 @@ struct ProviderSession {
     credits: AdmittedOwned<Vec<AdmittedOwned<ScanCredit>>>,
     active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     identities: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
+    /// Compiled interface graph of each provider identity (by occurrence).
+    /// A provider imported by several units of one session is analysed
+    /// once: later imports prepare their names on a copy of this graph. A
+    /// repeated analysis would be real work with no grant, since the session
+    /// credits each source byte once.
+    graphs: AdmittedOwned<Vec<AdmittedOwned<(OccurrenceId, AdmittedInterfaceGraph)>>>,
     queries: usize,
     next_occurrence: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
@@ -566,10 +572,14 @@ impl ProviderSession {
         let credits = budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?;
+        let graphs = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
         Ok(Self {
             credits,
             active,
             identities,
+            graphs,
             declarations,
             queries: 0,
             next_occurrence: 1,
@@ -2070,6 +2080,24 @@ impl ProviderEngine<'_, '_> {
                 && key.qualifiers == provider.authorized_qualifiers
         });
         let new_identity = previous.is_none();
+        if let Some(key) = previous {
+            let occurrence = key.occurrence;
+            self.budget
+                .charge(self.providers.graphs.len() + 1, 0, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if let Some(graph) = self
+                .providers
+                .graphs
+                .iter()
+                .find(|entry| entry.0 == occurrence)
+                .map(|entry| entry.1.clone())
+            {
+                drop(provider);
+                return self
+                    .replace_interface_graph(&graph, name, pointers, depth + 1)
+                    .map(Fact::Known);
+            }
+        }
         let occurrence = if let Some(key) = previous {
             key.occurrence
         } else {
@@ -2198,6 +2226,11 @@ impl ProviderEngine<'_, '_> {
             .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
         drop(analysis);
+        let entry = self
+            .budget
+            .admit_owned(1, 0, 0, || (occurrence, graph.clone()))
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.graphs, entry, self.budget)?;
         Ok(Fact::Known(graph))
     }
 }

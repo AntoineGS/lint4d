@@ -1691,3 +1691,64 @@ fn by_value_provider_cycle_has_explicit_provenance_and_does_not_poison_pointer()
         "{fact:?}"
     );
 }
+
+/// l4d-4nbs R9: a provider imported by two units of one session (guiutils
+/// pulls Windows.pas through RzCommon and again through Classes) is analysed
+/// once; later imports prepare their names on a copy of the session's
+/// interface graph. Re-analysing it (1.3 MB) had no matching grant, since
+/// the session credits each byte once, and exceeded `max_byte_work`.
+fn big_provider() -> String {
+    let comment = "documentation of a provider constant ".repeat(6);
+    let mut big = String::from("unit W; interface type TW = Int64;\nconst\n");
+    let mut n = 0;
+    while big.len() < 2_000_000 {
+        big.push_str(&format!("  C{n} = {n}; {{ {comment} }}\n"));
+        n += 1;
+    }
+    big.push_str("implementation end.");
+    big
+}
+
+fn provider_fixture(root: &str, units: &[(&str, &str)]) -> Fixture {
+    let mut f = Fixture::new(root, context(LayoutPlatform::Win32));
+    for (name, text) in units {
+        f.unit(name, text, context(LayoutPlatform::Win32));
+    }
+    f.unit("W", &big_provider(), context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f
+}
+
+#[test]
+fn a_provider_imported_twice_in_one_session_is_analysed_once() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let alone = alone.analyze().unwrap();
+    assert_eq!(activity(&alone, "DEFINE HW"), Truth::True);
+    let one_analysis = alone.budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    // One scan of W plus copies of its graph, not a second scan.
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}

@@ -610,6 +610,16 @@ pub(super) fn build_project_context(
             provenance,
         );
     }
+    let mut project_unit_directories = paths_from_entries(&search_path_entries);
+    if let Some(directory) = main_source_entry
+        .as_ref()
+        .and_then(|entry| entry.path.parent())
+        && !project_unit_directories
+            .iter()
+            .any(|existing| project_paths_equal(existing, directory))
+    {
+        project_unit_directories.push(directory.to_path_buf());
+    }
     for item in &options.source_paths {
         check_project_scan_cancel(cancel)?;
         add_resolved_search_path_entry(
@@ -982,6 +992,7 @@ pub(super) fn build_project_context(
             installation_evidence: installation_evidence.clone(),
             installation_selection,
             project_source_roots,
+            project_unit_directories,
             search_path_entries,
             browsing_path_entries: ide_paths.browsing,
             debug_dcu_path_entries: ide_paths.debug_dcu,
@@ -1116,6 +1127,7 @@ fn build_standalone_context(
             installation_evidence: InstallationEvidence::default(),
             installation_selection: None,
             project_source_roots,
+            project_unit_directories: Vec::new(),
             search_path_entries,
             browsing_path_entries: Vec::new(),
             debug_dcu_path_entries: Vec::new(),

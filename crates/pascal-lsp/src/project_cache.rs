@@ -4344,6 +4344,9 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.project_source_roots() != right.project_source_roots() {
         fields.push("project_source_roots".to_string());
     }
+    if left.project_unit_directories() != right.project_unit_directories() {
+        fields.push("project_unit_directories".to_string());
+    }
     if left.config() != right.config() {
         fields.push("config".to_string());
     }

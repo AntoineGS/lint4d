@@ -133,6 +133,8 @@ pub(crate) mod indexing;
 mod isolation;
 #[cfg(test)]
 mod navigation_walk_tests;
+#[cfg(test)]
+mod owner_claim_tests;
 pub(crate) mod persist;
 pub mod project_catalogue;
 pub mod projects;
@@ -10172,6 +10174,17 @@ impl Workspace {
             budget,
             defer_context_pruning,
         )? {
+            let projectless = self.contexts.get(&key).is_some_and(|state| {
+                state.context.project_file().is_none() && state.context.discovery_complete()
+            });
+            if projectless
+                && key.selection_scope.is_none()
+                && project_options.project_file.is_none()
+                && let Some(claimed) =
+                    self.claim_projectless_unit(uri, &path, cancel, budget, defer_context_pruning)?
+            {
+                return Ok(claimed);
+            }
             return Ok(key);
         }
         let discovered =
@@ -10197,6 +10210,15 @@ impl Workspace {
                 ));
             }
         };
+        if discovery.context.project_file().is_none()
+            && discovery.context.discovery_complete()
+            && discovery.project_selection.is_none()
+            && project_options.project_file.is_none()
+            && let Some(claimed) =
+                self.claim_projectless_unit(uri, &path, cancel, budget, defer_context_pruning)?
+        {
+            return Ok(claimed);
+        }
         let ProjectDiscovery {
             context,
             context_observations,
@@ -10285,6 +10307,89 @@ impl Workspace {
         format!("{deleted_paths:?}").hash(&mut hasher);
         self.project_cache.invalidation_epoch().hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// D43: a unit no project of its ancestor directories names keeps the
+    /// context of a selected project, else of an open document's project,
+    /// whose unit search path resolves it, instead of a projectless one.
+    /// Selected projects come first, then open documents' projects, each in
+    /// project path order; the first fresh one is shared, never duplicated.
+    fn claim_projectless_unit(
+        &mut self,
+        uri: &Url,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
+    ) -> Result<Option<ContextKey>, String> {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
+        {
+            return Ok(None);
+        }
+        let selected = self
+            .contexts
+            .iter()
+            .filter(|(key, _)| {
+                key.selection_scope
+                    .as_deref()
+                    .zip(key.selection_project.as_deref())
+                    .is_some_and(|(scope, project)| {
+                        self.project_selections
+                            .get(scope)
+                            .is_some_and(|current| paths_equal_ci(current, project))
+                    })
+            })
+            .map(|(key, _)| key.clone());
+        let open = self
+            .open_document_contexts
+            .iter()
+            .filter(|(document, _)| *document != uri)
+            .map(|(_, key)| key.clone());
+        let mut claimants = Vec::<(bool, ContextKey)>::new();
+        for (is_selected, key) in selected
+            .map(|key| (true, key))
+            .chain(open.map(|key| (false, key)))
+        {
+            if claimants.iter().any(|(_, existing)| *existing == key) {
+                continue;
+            }
+            let claims = self
+                .contexts
+                .get(&key)
+                .is_some_and(|state| state.context.resolves_unit_source(path));
+            if claims {
+                claimants.push((is_selected, key));
+            }
+        }
+        claimants.sort_by(|(left_selected, left), (right_selected, right)| {
+            right_selected
+                .cmp(left_selected)
+                .then_with(|| left.project_file.cmp(&right.project_file))
+                .then_with(|| left.selection_scope.cmp(&right.selection_scope))
+        });
+        for (_, key) in claimants {
+            if !self.context_is_fresh_with_cancel(&key, cancel, budget)? {
+                continue;
+            }
+            crate::trace::trace!(
+                "  owner: {} keeps the context of {:?} (D43)",
+                path.display(),
+                key.project_file
+            );
+            self.extend_context_watch_paths(&key, path, cancel, budget)?;
+            self.select_document_context_with_pruning(
+                uri,
+                &key,
+                OwnerOrigin::Automatic,
+                cancel,
+                budget,
+                !defer_context_pruning,
+            )?;
+            return Ok(Some(key));
+        }
+        Ok(None)
     }
 
     /// Adopt the context another workspace sharing this one's discoveries
@@ -19899,7 +20004,7 @@ mod tests {
         let main = root.join("Main.dpr");
         fs::write(
             &project,
-            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource><DCC_UnitSearchPath>Units0;Units1;Units2;Units3</DCC_UnitSearchPath></PropertyGroup></Project>",
         )
         .unwrap();
         fs::write(&main, "program Main; begin end.").unwrap();
@@ -22517,9 +22622,11 @@ BDS = '/fake/37'
         let other_source = other_scope.join("Other.pas");
         let other_project = other_scope.join("Other.dproj");
         fs::write(&source, "unit Shared; interface implementation end.").unwrap();
+        // The ancestor names `nested` as a unit directory, so it owns
+        // `nested/Shared.pas` (D43).
         fs::write(
             &ancestor_project,
-            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource><DCC_UnitSearchPath>nested</DCC_UnitSearchPath></PropertyGroup></Project>",
         )
         .unwrap();
         fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
@@ -22626,7 +22733,7 @@ BDS = '/fake/37'
         fs::write(&sibling, "unit Other; interface implementation end.").unwrap();
         fs::write(
             &ancestor_project,
-            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource><DCC_UnitSearchPath>nested;other</DCC_UnitSearchPath></PropertyGroup></Project>",
         )
         .unwrap();
         fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();

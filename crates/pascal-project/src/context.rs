@@ -140,6 +140,10 @@ pub struct ProjectContext {
     /// project directory, unit search paths, caller source paths, and IDE
     /// library-path entries outside the selected installation's directories.
     pub(crate) project_source_roots: Vec<PathBuf>,
+    /// The project directory, its `DCC_UnitSearchPath` directories and its
+    /// main source's directory, without caller source paths or IDE library
+    /// paths: the directories whose units the project names as its own (D43).
+    pub(crate) project_unit_directories: Vec<PathBuf>,
     pub(crate) config: Option<String>,
     pub(crate) platform: Option<String>,
     /// The selected build configuration and the `.dproj` configuration choices.
@@ -175,6 +179,10 @@ impl ProjectContext {
 
     pub fn project_file(&self) -> Option<&Path> {
         self.project_file.as_deref()
+    }
+
+    pub fn project_unit_directories(&self) -> &[PathBuf] {
+        &self.project_unit_directories
     }
 
     pub fn installation_evidence(&self) -> &InstallationEvidence {
@@ -300,6 +308,53 @@ impl ProjectContext {
             .collect()
     }
 
+    /// Whether the project names `path` as one of its own units (D43): its
+    /// main source, an explicit reference (`DCCReference` or `uses ... in`),
+    /// or a unit of the project directory, a `DCC_UnitSearchPath` directory
+    /// or the main source's directory. Caller source paths and IDE library paths do not count, and
+    /// an explicit reference to another file of the same unit name shadows
+    /// the directories.
+    pub fn owns_unit_source(&self, path: &Path) -> bool {
+        self.names_unit_source(path, &self.project_unit_directories)
+    }
+
+    /// Whether the project resolves `path`'s unit name to `path`: its own
+    /// units and the units of every unit search path, library paths included.
+    pub fn resolves_unit_source(&self, path: &Path) -> bool {
+        self.names_unit_source(path, &paths_from_entries(&self.search_path_entries))
+    }
+
+    fn names_unit_source(&self, path: &Path, directories: &[PathBuf]) -> bool {
+        if self.project_file.is_none() {
+            return false;
+        }
+        let path = lexical_normalize(path);
+        if self
+            .main_source_entry
+            .iter()
+            .chain(self.explicit_unit_entries.values().flatten())
+            .any(|entry| project_paths_equal(&lexical_normalize(&entry.path), &path))
+        {
+            return true;
+        }
+        let Some(name) = path.file_stem().map(|stem| stem.to_string_lossy()) else {
+            return false;
+        };
+        if self
+            .explicit_unit_entries
+            .keys()
+            .any(|unit| unit.eq_ignore_ascii_case(&name))
+        {
+            return false;
+        }
+        let Some(directory) = path.parent() else {
+            return false;
+        };
+        directories
+            .iter()
+            .any(|candidate| project_paths_equal(&lexical_normalize(candidate), directory))
+    }
+
     pub fn main_source(&self) -> Option<&Path> {
         self.main_source_entry
             .as_ref()
@@ -355,7 +410,11 @@ impl ProjectContext {
             }
             Some(InstallationSelection::Legacy) | None => {}
         }
-        for path in &self.project_source_roots {
+        for path in self
+            .project_source_roots
+            .iter()
+            .chain(&self.project_unit_directories)
+        {
             visit(path.as_os_str().len())?;
         }
         for entry in &self.search_path_entries {
@@ -663,6 +722,7 @@ pub struct ProjectContextParts {
     pub conditional_closure: ConditionalClosure,
     pub library_conditional_context: ConditionalContext,
     pub project_source_roots: Vec<PathBuf>,
+    pub project_unit_directories: Vec<PathBuf>,
     pub config: Option<String>,
     pub platform: Option<String>,
     pub config_selection: BuildSelection,
@@ -696,6 +756,7 @@ impl ProjectContext {
             conditional_closure,
             library_conditional_context,
             project_source_roots,
+            project_unit_directories,
             config,
             platform,
             config_selection,
@@ -725,6 +786,7 @@ impl ProjectContext {
             conditional_closure,
             library_conditional_context,
             project_source_roots,
+            project_unit_directories,
             config,
             platform,
             config_selection,
@@ -757,6 +819,7 @@ impl ProjectContext {
             conditional_closure,
             library_conditional_context,
             project_source_roots,
+            project_unit_directories,
             config,
             platform,
             config_selection,
@@ -786,6 +849,7 @@ impl ProjectContext {
             conditional_closure,
             library_conditional_context,
             project_source_roots,
+            project_unit_directories,
             config,
             platform,
             config_selection,

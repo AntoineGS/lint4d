@@ -4010,7 +4010,8 @@ mod tests {
 
     /// `app/` with two project candidates, `B.dproj` selected for the open
     /// `app/Main.pas`, and an open `lib/Other.pas` from the projects' search
-    /// path outside their directory.
+    /// path outside their directory, which keeps the selected project's
+    /// context (D43).
     fn selected_project(root: &Path) -> (Workspace, PathBuf, Url, Url) {
         let app = root.join("app");
         for name in ["A", "B"] {
@@ -4079,11 +4080,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(projects, std::slice::from_ref(&resolved));
         assert_eq!(found.requesting.as_ref(), Some(&resolved));
+        assert_eq!(
+            input.document_owners[&other].key, input.document_owners[&main].key,
+            "the search-path unit keeps the selected project's context (D43)"
+        );
         assert!(
             found
                 .contexts
                 .iter()
-                .any(|(key, _)| *key == input.document_owners[&other].key)
+                .all(|(key, _)| *key != input.document_owners[&other].key),
+            "the older resolution must not be a second target"
         );
         let query = shared_query(Some(&["shared"]));
         let sources = request

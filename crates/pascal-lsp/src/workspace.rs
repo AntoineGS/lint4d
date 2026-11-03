@@ -9,6 +9,7 @@ use crate::navigation::compiled_dcu::{
     AuthorizedCompiledUnit, discover_compiled_units, virtual_unit_identity,
 };
 use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
+use crate::persistent_cache::CacheExclusion;
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::GlobSetBuilder;
 use lsp_types::{
@@ -2749,6 +2750,12 @@ struct ExcludeMatcher {
     root: PathBuf,
     config_root: PathBuf,
     patterns: Option<Arc<ExcludeGlobs>>,
+    /// The persistent-cache store directory, in the forms the workspace
+    /// sees it (l4d-vrw0).
+    cache: Option<CacheExclusion>,
+    /// Only `cache` is excluded: a walk outside every workspace root, whose
+    /// key stays `Exclusions::Nothing` unless the store is under it.
+    cache_only: bool,
 }
 
 impl ExcludeMatcher {
@@ -2757,11 +2764,39 @@ impl ExcludeMatcher {
             root: root.to_path_buf(),
             config_root: config_root.to_path_buf(),
             patterns: compile_exclude_patterns(patterns),
+            cache: None,
+            cache_only: false,
+        }
+    }
+
+    /// The default matcher of a mapped or package walk, leaving out the
+    /// store directory like every root does.
+    fn with_cache(mut self, cache: Option<&CacheExclusion>) -> Self {
+        self.cache = cache.cloned();
+        self
+    }
+
+    /// A walk outside every workspace root: nothing but the store directory
+    /// is excluded.
+    fn cache_only(root: &Path, cache: &CacheExclusion) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            config_root: root.to_path_buf(),
+            patterns: None,
+            cache: Some(cache.clone()),
+            cache_only: true,
         }
     }
 
     fn is_excluded(&self, path: &Path, source_root: &Path) -> bool {
-        if has_default_excluded_component_under(path, source_root) {
+        if !self.cache_only && has_default_excluded_component_under(path, source_root) {
+            return true;
+        }
+        if self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.contains(path))
+        {
             return true;
         }
 
@@ -2774,15 +2809,32 @@ impl ExcludeMatcher {
             .any(|relative| matches_exclude_patterns(patterns, path, &relative))
     }
 
-    /// The identity of what this matcher excludes, for catalogue keys.
-    fn exclusions(&self) -> crate::catalogue::Exclusions {
-        match &self.patterns {
-            None => crate::catalogue::Exclusions::Defaults,
-            Some(globs) => crate::catalogue::Exclusions::Globs {
+    /// The identity of what this matcher excludes from a walk of `root`,
+    /// for catalogue keys. The store directory is part of it only when the
+    /// walk can meet it (it lies under `root`, or `root` lies in it), so
+    /// other catalogues are shared as before.
+    fn exclusions(&self, root: &Path) -> crate::catalogue::Exclusions {
+        let exclusions = match (&self.patterns, self.cache_only) {
+            (_, true) => crate::catalogue::Exclusions::Nothing,
+            (None, false) => crate::catalogue::Exclusions::Defaults,
+            (Some(globs), false) => crate::catalogue::Exclusions::Globs {
                 root: self.root.clone(),
                 config_root: self.config_root.clone(),
                 patterns: Arc::clone(&globs.text),
             },
+        };
+        let cache: Vec<PathBuf> = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.met_by_walk_of(root))
+            .unwrap_or_default();
+        if cache.is_empty() {
+            exclusions
+        } else {
+            crate::catalogue::Exclusions::WithCache {
+                exclusions: Box::new(exclusions),
+                cache: cache.into(),
+            }
         }
     }
 }
@@ -2978,8 +3030,15 @@ impl WorkspaceRoot {
                 root: path.clone(),
                 config_root,
                 patterns,
+                cache: None,
+                cache_only: false,
             },
         }
+    }
+
+    /// Leave the store directory out of this root (l4d-vrw0).
+    fn set_cache_exclusion(&mut self, cache: Option<&CacheExclusion>) {
+        self.excludes.cache = cache.cloned();
     }
 
     fn accepts(&self, path: &Path) -> bool {
@@ -3087,6 +3146,13 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
+    /// The store directory as `persistent_cache` gives it (l4d-vrw0).
+    cache_base: Option<CacheExclusion>,
+    /// `cache_base` in every form a walk of the roots can reach it through
+    /// (`CacheExclusion::seen_from`), computed once by the main workspace
+    /// and carried to request views: what every walk, catalogue,
+    /// membership check and file event leaves out.
+    cache_exclusion: Option<CacheExclusion>,
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
@@ -3583,6 +3649,7 @@ impl Workspace {
             self.persistent_cache.readmit();
         }
         self.roots = prepared.roots;
+        self.see_cache_exclusion();
 
         self.bump_source_generation();
         self.bump_configuration_generation();
@@ -3630,7 +3697,11 @@ impl Workspace {
             .roots
             .iter()
             .cloned()
-            .map(|root| WorkspaceRoot::new(root, &input.options))
+            .map(|root| {
+                let mut root = WorkspaceRoot::new(root, &input.options);
+                root.set_cache_exclusion(input.cache_exclusion.as_ref());
+                root
+            })
             .collect();
         let open_documents = input
             .overlays
@@ -3679,6 +3750,7 @@ impl Workspace {
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
             persistent_cache: input.persistent_cache.clone(),
+            cache_exclusion: input.cache_exclusion.clone(),
             shared_discoveries: input.shared_discoveries.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
@@ -4819,6 +4891,15 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
+        if self.is_cache_path(uri)
+            && !uri
+                .to_file_path()
+                .is_ok_and(|path| crate::catalogue::is_retained_file(&path))
+        {
+            // The store's own files are not workspace files (l4d-vrw0); a
+            // source there is never dropped (the server refuses the store).
+            return Ok(Vec::new());
+        }
         if let Some(budget) = budget {
             let package_descriptor_event = uri
                 .to_file_path()
@@ -5892,6 +5973,7 @@ impl Workspace {
                     self.warn(error);
                 }
                 self.roots.push(root);
+                self.see_cache_exclusion();
             }
         }
         self.contexts.clear();
@@ -12773,7 +12855,7 @@ impl Workspace {
         let root = absolute_path(root.to_path_buf());
         let scope = match self.context_root_excludes(context_key) {
             Some(matcher) => CatalogueScope::recursive(&root, Some(matcher)),
-            None => CatalogueScope::recursive(&root, Some(&ExcludeMatcher::new(&root, &root, &[]))),
+            None => CatalogueScope::recursive(&root, Some(&self.default_excludes(&root))),
         };
         let mut before_io = || -> Result<(), String> {
             check_workspace_cancel(cancel)?;
@@ -13085,7 +13167,8 @@ impl Workspace {
             .roots
             .iter()
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
-            .map(|workspace_root| workspace_root.excludes.clone());
+            .map(|workspace_root| workspace_root.excludes.clone())
+            .or_else(|| self.cache_only_excludes(&root));
         let scope = CatalogueScope::recursive(&root, matcher.as_ref());
         #[cfg(feature = "test-support")]
         let mut steps = 0usize;
@@ -13505,6 +13588,75 @@ impl Workspace {
 
     pub(crate) fn set_persistent_cache(&mut self, cache: crate::persistent_cache::PersistentCache) {
         self.persistent_cache = cache;
+        self.refresh_cache_exclusion();
+    }
+
+    /// Take the store directory to leave out from the persistent cache
+    /// again, after its options changed. A change rebuilds the roots'
+    /// matchers; catalogues follow through their keys.
+    pub(crate) fn refresh_cache_exclusion(&mut self) {
+        let base = self.persistent_cache.exclusion();
+        if base == self.cache_base {
+            return;
+        }
+        self.cache_base = base;
+        self.cache_exclusion = None;
+        self.see_cache_exclusion();
+        self.attach_cache_exclusion();
+        self.bump_source_generation();
+        self.mark_global_change();
+    }
+
+    /// Resolve `cache_base` through the current roots and source roots
+    /// (symlinks), once, and attach the result.
+    fn see_cache_exclusion(&mut self) {
+        if let Some(base) = &self.cache_base {
+            let bases = self.roots.iter().flat_map(|root| {
+                std::iter::once(root.path.as_path())
+                    .chain(root.source_roots.iter().map(PathBuf::as_path))
+            });
+            self.cache_exclusion = Some(base.seen_from(bases));
+        }
+        self.attach_cache_exclusion();
+    }
+
+    /// A view of a request's roots that leaves out the same store directory
+    /// (already resolved by the main workspace).
+    pub(crate) fn with_cache_exclusion(mut self, exclusion: Option<CacheExclusion>) -> Self {
+        self.cache_exclusion = exclusion;
+        self.attach_cache_exclusion();
+        self
+    }
+
+    fn attach_cache_exclusion(&mut self) {
+        for root in &mut self.roots {
+            root.set_cache_exclusion(self.cache_exclusion.as_ref());
+        }
+    }
+
+    pub(crate) fn cache_exclusion(&self) -> Option<&CacheExclusion> {
+        self.cache_exclusion.as_ref()
+    }
+
+    /// Whether `uri` names the store directory or a path under it.
+    pub(crate) fn is_cache_path(&self, uri: &Url) -> bool {
+        self.cache_exclusion.as_ref().is_some_and(|cache| {
+            uri.to_file_path()
+                .is_ok_and(|path| cache.contains(&absolute_path(path)))
+        })
+    }
+
+    /// The matcher of a walk with no root exclusions of its own.
+    fn default_excludes(&self, root: &Path) -> ExcludeMatcher {
+        ExcludeMatcher::new(root, root, &[]).with_cache(self.cache_exclusion.as_ref())
+    }
+
+    /// The matcher of a walk outside every workspace root: the store
+    /// directory alone, `None` without one.
+    fn cache_only_excludes(&self, root: &Path) -> Option<ExcludeMatcher> {
+        self.cache_exclusion
+            .as_ref()
+            .map(|cache| ExcludeMatcher::cache_only(root, cache))
     }
 
     pub(crate) fn configured_project_file(&self) -> Option<&Path> {
@@ -17026,6 +17178,8 @@ mod tests {
             root: root.clone(),
             config_root: root.clone(),
             patterns: Some(Arc::clone(&patterns)),
+            cache: None,
+            cache_only: false,
         };
 
         assert!(matcher.is_excluded(&root.join(".git/config.pas"), &root));
@@ -17053,6 +17207,8 @@ mod tests {
             root: root.clone(),
             config_root: root.clone(),
             patterns: Some(Arc::clone(&patterns)),
+            cache: None,
+            cache_only: false,
         };
 
         assert_eq!(patterns.test_build_counts(), (1, 0));
@@ -25022,6 +25178,7 @@ BDS = '/fake/37'
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
             persistent_cache: Default::default(),
+            cache_exclusion: None,
             shared_discoveries: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),

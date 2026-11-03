@@ -34,6 +34,14 @@ pub(crate) const MAX_REQUEST_OWNER_DISCOVERY: usize = 256;
 #[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) const MAX_TARGET_CONTEXTS: usize = 16;
 
+/// What one request has spent on owner discovery: the directories it
+/// discovered, and which owner contexts it already found fresh or stale.
+#[derive(Default)]
+struct OwnerDiscovery {
+    discovered: usize,
+    fresh: HashMap<ContextKey, bool>,
+}
+
 /// A workspace with at most this many Pascal sources and descriptors under
 /// its roots still answers `workspace/symbol` the old way (A16).
 #[allow(dead_code)] // read by the query tasks of l4d-33
@@ -85,6 +93,16 @@ thread_local! {
             max_targets: None,
         })
     };
+}
+
+#[cfg(test)]
+thread_local! {
+    static DESCRIPTOR_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn descriptor_attempts() -> usize {
+    DESCRIPTOR_ATTEMPTS.with(std::cell::Cell::get)
 }
 
 fn owner_discovery_cap() -> usize {
@@ -686,7 +704,7 @@ impl Workspace {
         let mut seen = HashSet::new();
         let mut before_io = || check_workspace_cancel(Some(cancel));
         let mut owned = HashMap::<PathBuf, Option<bool>>::new();
-        let mut discovered = 0usize;
+        let mut discovery = OwnerDiscovery::default();
         for scope in scopes {
             if !seen.insert(scope.key().clone()) {
                 continue;
@@ -704,7 +722,7 @@ impl Workspace {
                 };
                 if !owned.contains_key(directory) {
                     let verdict =
-                        self.directory_owned_by(key, directory, file, cancel, &mut discovered)?;
+                        self.directory_owned_by(key, directory, file, cancel, &mut discovery)?;
                     if verdict.is_none() {
                         membership.owner_pending += 1;
                         membership.complete = false;
@@ -727,29 +745,60 @@ impl Workspace {
         directory: &Path,
         sample: &Path,
         cancel: &AtomicBool,
-        discovered: &mut usize,
+        discovery: &mut OwnerDiscovery,
     ) -> Result<Option<bool>, String> {
         Ok(self
-            .discover_directory_owner(directory, sample, cancel, discovered)?
+            .discover_directory_owner(directory, sample, cancel, discovery)?
             .map(|owner| &owner == key))
     }
 
-    /// The owner of `directory` from the owner map, else discovered through
-    /// `sample` and remembered, while `discovered` is under the per-call cap.
+    /// The remembered owner of `directory`, only while its context is still
+    /// retained and fresh and still the one selected for `sample`, as the
+    /// sibling reuse of `discover_enumerated_contexts` requires.
+    fn fresh_owner_of(
+        &self,
+        directory: &Path,
+        sample: &Path,
+        cancel: &AtomicBool,
+        discovery: &mut OwnerDiscovery,
+    ) -> Result<Option<ContextKey>, String> {
+        let Some(owner) = self.project_cache.owner_of(directory) else {
+            return Ok(None);
+        };
+        let fresh = match discovery.fresh.get(&owner) {
+            Some(fresh) => *fresh,
+            None => {
+                let fresh = self.context_is_fresh_with_cancel(&owner, Some(cancel), None)?
+                    && self.context_matches_current_selection_with_cancel_and_budget(
+                        sample,
+                        &owner,
+                        Some(cancel),
+                        None,
+                    )?;
+                discovery.fresh.insert(owner.clone(), fresh);
+                fresh
+            }
+        };
+        Ok(fresh.then_some(owner))
+    }
+
+    /// The owner of `directory` from the owner map while fresh, else
+    /// discovered through `sample` and remembered, while the request is under
+    /// the discovery cap.
     fn discover_directory_owner(
         &mut self,
         directory: &Path,
         sample: &Path,
         cancel: &AtomicBool,
-        discovered: &mut usize,
+        discovery: &mut OwnerDiscovery,
     ) -> Result<Option<ContextKey>, String> {
-        if let Some(owner) = self.project_cache.owner_of(directory) {
+        if let Some(owner) = self.fresh_owner_of(directory, sample, cancel, discovery)? {
             return Ok(Some(owner));
         }
-        if *discovered >= owner_discovery_cap() {
+        if discovery.discovered >= owner_discovery_cap() {
             return Ok(None);
         }
-        *discovered += 1;
+        discovery.discovered += 1;
         let Ok(uri) = Url::from_file_path(sample) else {
             return Ok(None);
         };
@@ -757,6 +806,7 @@ impl Workspace {
             Ok(owner) => {
                 self.project_cache
                     .remember_owner(directory.to_path_buf(), owner.clone());
+                discovery.fresh.insert(owner.clone(), true);
                 Ok(Some(owner))
             }
             Err(_) => {
@@ -803,7 +853,9 @@ impl Workspace {
                         push(&mut targets, key, owner_anchor(project.as_deref(), uri));
                     }
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                    Err(_) => {}
+                    Err(error) => {
+                        crate::trace::trace!("  index target: {uri} did not resolve: {error}");
+                    }
                 }
             }
         }
@@ -826,7 +878,11 @@ impl Workspace {
             match self.index_context_for(&IndexAnchor::Project(project.clone()), cancel) {
                 Ok(key) => push(&mut targets, key, IndexAnchor::Project(project)),
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(_) => {}
+                Err(error) => {
+                    crate::trace::trace!(
+                        "  index target: configured project did not resolve: {error}"
+                    );
+                }
             }
         }
         targets.from_open_or_configured = targets.contexts.len();
@@ -838,23 +894,23 @@ impl Workspace {
             .collect::<Vec<_>>();
         let mut before_io = || check_workspace_cancel(Some(cancel));
         let mut complete = true;
-        let mut sources = Vec::<PathBuf>::new();
-        let mut descriptors = Vec::<PathBuf>::new();
+        let mut sources = Vec::<(String, PathBuf)>::new();
+        let mut descriptors = Vec::<(String, PathBuf)>::new();
         for scope in &scopes {
             let catalogue = self.shared_catalogue(scope, MAX_CATALOGUE_ENTRIES, &mut before_io)?;
             complete &= catalogue.is_complete() && catalogue.limit().is_none();
-            sources.extend(catalogue.pascal_files().map(Path::to_path_buf));
+            sources.extend(catalogue.pascal_files().map(keyed));
             descriptors.extend(
                 catalogue
                     .files()
                     .iter()
                     .filter(|path| is_descriptor(path))
-                    .cloned(),
+                    .map(|path| keyed(path)),
             );
         }
         for list in [&mut sources, &mut descriptors] {
-            list.sort_by_cached_key(|path| path_key(path));
-            list.dedup_by(|left, right| path_key(left) == path_key(right));
+            list.sort_by(|left, right| left.0.cmp(&right.0));
+            list.dedup_by(|left, right| left.0 == right.0);
         }
         targets.small_workspace = complete
             && sources.len() <= small_workspace_sources()
@@ -863,17 +919,36 @@ impl Workspace {
         if purpose == TargetPurpose::WorkspaceSymbols {
             let roots = self.workspace_root_paths();
             let mut options = self.project_options();
-            for descriptor in &descriptors {
-                if targets.contexts.len() >= maximum {
+            let projects = descriptors
+                .iter()
+                .filter(|(_, path)| is_project_file(path))
+                .filter_map(|(_, path)| sibling_stem(path))
+                .collect::<HashSet<_>>();
+            let mut attempts = 0usize;
+            for (_, descriptor) in &descriptors {
+                if targets.contexts.len() >= maximum || attempts >= 2 * maximum {
                     break;
                 }
+                if !is_project_file(descriptor)
+                    && sibling_stem(descriptor).is_some_and(|stem| projects.contains(&stem))
+                {
+                    continue;
+                }
                 check_workspace_cancel(Some(cancel))?;
+                attempts += 1;
+                #[cfg(test)]
+                DESCRIPTOR_ATTEMPTS.with(|count| count.set(count.get() + 1));
                 match project_metadata_context(self, descriptor, &roots, &mut options, cancel) {
                     Ok((key, _)) => {
                         push(&mut targets, key, IndexAnchor::Project(descriptor.clone()));
                     }
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                    Err(_) => {}
+                    Err(error) => {
+                        crate::trace::trace!(
+                            "  index target: {} did not resolve: {error}",
+                            descriptor.display()
+                        );
+                    }
                 }
             }
         }
@@ -885,10 +960,10 @@ impl Workspace {
             });
         }
         let mut owners = HashMap::<PathBuf, Option<ContextKey>>::new();
-        let mut discovered = 0usize;
+        let mut discovery = OwnerDiscovery::default();
         let mut outside = 0usize;
-        for file in sources.iter().filter(|path| is_unit_source(path)) {
-            if held.contains(&path_key(file)) {
+        for (file_key, file) in sources.iter().filter(|(_, path)| is_unit_source(path)) {
+            if held.contains(file_key) {
                 continue;
             }
             let Some(directory) = file.parent() else {
@@ -897,13 +972,18 @@ impl Workspace {
             let owner = match owners.get(directory) {
                 Some(owner) => owner.clone(),
                 None => {
-                    let owner = match self.project_cache.owner_of(directory) {
-                        Some(owner) => Some(owner),
-                        None if targets.contexts.len() < maximum => {
-                            self.discover_directory_owner(directory, file, cancel, &mut discovered)?
-                        }
-                        None => None,
-                    };
+                    let owner =
+                        match self.fresh_owner_of(directory, file, cancel, &mut discovery)? {
+                            Some(owner) => Some(owner),
+                            None if targets.contexts.len() < maximum => self
+                                .discover_directory_owner(
+                                    directory,
+                                    file,
+                                    cancel,
+                                    &mut discovery,
+                                )?,
+                            None => None,
+                        };
                     owners.insert(directory.to_path_buf(), owner.clone());
                     owner
                 }
@@ -955,6 +1035,23 @@ fn owner_anchor(project: Option<&Path>, uri: &Url) -> IndexAnchor {
         Some(project) => IndexAnchor::Project(project.to_path_buf()),
         None => IndexAnchor::Document(uri.clone()),
     }
+}
+
+fn keyed(path: &Path) -> (String, PathBuf) {
+    (path_key(path), path.to_path_buf())
+}
+
+fn is_project_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
+}
+
+/// The directory and lowercase stem a `.dpr`/`.dpk` shares with its `.dproj`.
+fn sibling_stem(path: &Path) -> Option<(PathBuf, String)> {
+    Some((
+        path.parent()?.to_path_buf(),
+        path.file_stem()?.to_string_lossy().to_lowercase(),
+    ))
 }
 
 fn is_descriptor(path: &Path) -> bool {
@@ -2022,9 +2119,7 @@ mod tests {
         let b = context(&mut workspace, IndexAnchor::Project(second));
         let symbols = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
         let found = keys(&symbols);
-        // Each descriptor, a `.dpr` as well as a `.dproj`, is a context, as
-        // in the rename snapshot.
-        assert_eq!(found.len(), 4);
+        assert_eq!(found.len(), 2);
         assert!(found.contains(&a) && found.contains(&b));
         assert_eq!(symbols.from_open_or_configured, 0);
         let references = targets(&mut workspace, None, TargetPurpose::References);
@@ -2111,5 +2206,70 @@ mod tests {
         }
         let _caps = override_caps(|caps| caps.small_projects = Some(3));
         assert!(!targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols).small_workspace);
+    }
+
+    #[test]
+    fn a_standalone_dpr_is_still_a_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("S/S.dpr"), "program S; begin end.\n");
+        named_project(root, "A", false);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let found = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
+        assert_eq!(found.contexts.len(), 2);
+        assert!(found.contexts.iter().any(|(_, anchor)| {
+            matches!(anchor, IndexAnchor::Project(path) if path.ends_with("S/S.dpr"))
+        }));
+        assert!(found.contexts.iter().any(|(_, anchor)| {
+            matches!(anchor, IndexAnchor::Project(path) if path.ends_with("A/A.dproj"))
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_attempts_are_capped_at_twice_the_target_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..6 {
+            let descriptor = root.join(format!("P{index}/P{index}.dproj"));
+            write(&descriptor, "<Project/>");
+        }
+        pascal_project::backdate_tree_for_test(root);
+        for index in 0..6 {
+            let descriptor = root.join(format!("P{index}/P{index}.dproj"));
+            let mut permissions = fs::metadata(&descriptor).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
+            fs::set_permissions(&descriptor, permissions).unwrap();
+        }
+        let _caps = override_caps(|caps| caps.max_targets = Some(1));
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let before = descriptor_attempts();
+        let _ = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
+        assert_eq!(descriptor_attempts() - before, 2);
+    }
+
+    #[test]
+    fn a_stale_owner_map_entry_is_rediscovered_not_trusted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        named_project(root, "P1", true);
+        named_project(root, "P2", true);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let uri = open(&mut workspace, &root.join("P2/U.pas"), 1);
+        let p2 = context(&mut workspace, IndexAnchor::Document(uri));
+        let p1 = context(
+            &mut workspace,
+            IndexAnchor::Document(Url::from_file_path(root.join("P1/U.pas")).unwrap()),
+        );
+        let mut stale = p1.clone();
+        stale.config = Some("not retained".to_owned());
+        workspace
+            .project_cache
+            .remember_owner(root.join("P1"), stale.clone());
+        let found = targets(&mut workspace, None, TargetPurpose::References);
+        assert_eq!(keys(&found), [p2, p1.clone()]);
+        assert_eq!(workspace.project_cache.owner_of(&root.join("P1")), Some(p1));
     }
 }

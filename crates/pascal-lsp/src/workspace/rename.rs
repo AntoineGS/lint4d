@@ -43,8 +43,9 @@ use pascal_core::resolver::{
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
     BuildChoice, ConditionalContext, MetadataObservation, ProjectCandidateMembership,
-    ProjectContext, ProjectDiscoveryCacheScope, ProjectObservations, ProjectPathEntry,
-    ProjectPathProvenance, ProjectSelections, ReadPolicy, has_invalid_project_selection,
+    ProjectContext, ProjectDiscoveryCacheScope, ProjectObservations, ProjectOptions,
+    ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    has_invalid_project_selection,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -5504,33 +5505,45 @@ fn discover_project_metadata_contexts(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        let uri = Url::from_file_path(&descriptor)
-            .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
-        options.project_file = Some(descriptor.clone());
-        let (key, project) =
-            loader.readonly_context_for_uri(&uri, &descriptor, &roots, &options)?;
-        for warning in project.observations.warnings.iter().cloned() {
-            loader.warn(warning);
-        }
-        loader.install_context(
-            key.clone(),
-            project.context,
-            project.observations,
-            Vec::new(),
-            HashMap::new(),
-            &descriptor,
-            Some(cancel),
-            None,
-        )?;
-        let Some(state) = loader.contexts.get(&key).cloned() else {
-            return Err(format!(
-                "project context was not retained for {descriptor:?}"
-            ));
-        };
+        let (key, state) =
+            project_metadata_context(loader, &descriptor, &roots, &mut options, cancel)?;
         enumeration.retain_context(key.clone(), &state);
         contexts.insert(key);
     }
     Ok(contexts)
+}
+
+/// The context of one project descriptor, installed and retained.
+pub(super) fn project_metadata_context(
+    loader: &mut Workspace,
+    descriptor: &Path,
+    roots: &[PathBuf],
+    options: &mut ProjectOptions,
+    cancel: &AtomicBool,
+) -> Result<(ContextKey, ContextState), String> {
+    let uri = Url::from_file_path(descriptor)
+        .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
+    options.project_file = Some(descriptor.to_path_buf());
+    let (key, project) = loader.readonly_context_for_uri(&uri, descriptor, roots, options)?;
+    for warning in project.observations.warnings.iter().cloned() {
+        loader.warn(warning);
+    }
+    loader.install_context(
+        key.clone(),
+        project.context,
+        project.observations,
+        Vec::new(),
+        HashMap::new(),
+        descriptor,
+        Some(cancel),
+        None,
+    )?;
+    let Some(state) = loader.contexts.get(&key).cloned() else {
+        return Err(format!(
+            "project context was not retained for {descriptor:?}"
+        ));
+    };
+    Ok((key, state))
 }
 
 fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {

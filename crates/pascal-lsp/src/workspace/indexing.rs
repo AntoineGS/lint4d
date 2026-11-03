@@ -15,7 +15,8 @@ use pascal_project::ProjectContext;
 
 use super::catalogues::CatalogueScope;
 use super::rename::{
-    CANCELLATION_MESSAGE, is_safe_source_path, path_key, snapshot_context_for_uri,
+    CANCELLATION_MESSAGE, WorkspaceInput, is_safe_source_path, path_key, project_metadata_context,
+    snapshot_context_for_uri,
 };
 use super::{
     ContextKey, PathStamp, Workspace, absolute_path, check_workspace_cancel, path_stamp,
@@ -28,6 +29,95 @@ use crate::workspace_index::{MemberFacts, MemberStamp, MemberState};
 /// Directories whose owner one call may discover; the rest stay pending and
 /// the membership says so.
 pub(crate) const MAX_REQUEST_OWNER_DISCOVERY: usize = 256;
+
+/// At most this many contexts are searched by one indexed request.
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) const MAX_TARGET_CONTEXTS: usize = 16;
+
+/// A workspace with at most this many Pascal sources and descriptors under
+/// its roots still answers `workspace/symbol` the old way (A16).
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) const SMALL_WORKSPACE_SOURCES: usize = 2_048;
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) const SMALL_WORKSPACE_PROJECTS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) enum TargetPurpose {
+    References,
+    WorkspaceSymbols,
+}
+
+/// The contexts one indexed request searches, in priority order.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // read by the query tasks of l4d-33
+pub(crate) struct Targets {
+    pub(crate) contexts: Vec<(ContextKey, IndexAnchor)>,
+    pub(crate) gaps: Vec<String>,
+    /// Targets that came from the requesting document, open documents or the
+    /// configured project (A8 items 1-3).
+    pub(crate) from_open_or_configured: usize,
+    pub(crate) small_workspace: bool,
+}
+
+impl Targets {
+    fn holds(&self, key: &ContextKey) -> bool {
+        self.contexts.iter().any(|(held, _)| held == key)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct CapOverrides {
+    owner_discovery: Option<usize>,
+    small_sources: Option<usize>,
+    small_projects: Option<usize>,
+    max_targets: Option<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAP_OVERRIDES: std::cell::Cell<CapOverrides> = const {
+        std::cell::Cell::new(CapOverrides {
+            owner_discovery: None,
+            small_sources: None,
+            small_projects: None,
+            max_targets: None,
+        })
+    };
+}
+
+fn owner_discovery_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().owner_discovery) {
+        return cap;
+    }
+    MAX_REQUEST_OWNER_DISCOVERY
+}
+
+fn small_workspace_sources() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().small_sources) {
+        return cap;
+    }
+    SMALL_WORKSPACE_SOURCES
+}
+
+fn small_workspace_projects() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().small_projects) {
+        return cap;
+    }
+    SMALL_WORKSPACE_PROJECTS
+}
+
+fn max_target_contexts() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().max_targets) {
+        return cap;
+    }
+    MAX_TARGET_CONTEXTS
+}
 
 /// How many pending members one `advance_workspace_index` call takes.
 #[derive(Debug, Clone, Copy)]
@@ -639,10 +729,24 @@ impl Workspace {
         cancel: &AtomicBool,
         discovered: &mut usize,
     ) -> Result<Option<bool>, String> {
+        Ok(self
+            .discover_directory_owner(directory, sample, cancel, discovered)?
+            .map(|owner| &owner == key))
+    }
+
+    /// The owner of `directory` from the owner map, else discovered through
+    /// `sample` and remembered, while `discovered` is under the per-call cap.
+    fn discover_directory_owner(
+        &mut self,
+        directory: &Path,
+        sample: &Path,
+        cancel: &AtomicBool,
+        discovered: &mut usize,
+    ) -> Result<Option<ContextKey>, String> {
         if let Some(owner) = self.project_cache.owner_of(directory) {
-            return Ok(Some(&owner == key));
+            return Ok(Some(owner));
         }
-        if *discovered >= MAX_REQUEST_OWNER_DISCOVERY {
+        if *discovered >= owner_discovery_cap() {
             return Ok(None);
         }
         *discovered += 1;
@@ -653,7 +757,7 @@ impl Workspace {
             Ok(owner) => {
                 self.project_cache
                     .remember_owner(directory.to_path_buf(), owner.clone());
-                Ok(Some(&owner == key))
+                Ok(Some(owner))
             }
             Err(_) => {
                 check_workspace_cancel(Some(cancel))?;
@@ -661,6 +765,204 @@ impl Workspace {
             }
         }
     }
+
+    /// The contexts an indexed request searches (A8): the requesting owner,
+    /// the owners of open documents (newest first), the configured project,
+    /// then, to fill the slots left, project descriptors (symbols only) and
+    /// the owners of sources no target holds.
+    pub(crate) fn index_targets(
+        &mut self,
+        input: &WorkspaceInput,
+        requesting: Option<&Url>,
+        purpose: TargetPurpose,
+        cancel: &AtomicBool,
+    ) -> Result<Targets, String> {
+        let maximum = max_target_contexts();
+        let mut targets = Targets::default();
+        let push = |targets: &mut Targets, key: ContextKey, anchor: IndexAnchor| {
+            if targets.contexts.len() < maximum && !targets.holds(&key) {
+                targets.contexts.push((key, anchor));
+            }
+        };
+
+        if let Some(uri) = requesting {
+            let known = input
+                .document_owners
+                .get(uri)
+                .or_else(|| input.document_owners.get(&super::canonical_file_uri(uri)));
+            if let Some(owner) = known {
+                let anchor = owner_anchor(owner.state.context.project_file(), uri);
+                push(&mut targets, owner.key.clone(), anchor);
+            } else {
+                match self.index_context_for(&IndexAnchor::Document(uri.clone()), cancel) {
+                    Ok(key) => {
+                        let project = self
+                            .contexts
+                            .get(&key)
+                            .and_then(|state| state.context.project_file().map(Path::to_path_buf));
+                        push(&mut targets, key, owner_anchor(project.as_deref(), uri));
+                    }
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let mut open = input.document_versions.iter().collect::<Vec<_>>();
+        open.sort_by(|left, right| {
+            right
+                .1
+                .cmp(left.1)
+                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+        });
+        for (uri, _) in open {
+            if let Some(owner) = input.document_owners.get(uri) {
+                let anchor = owner_anchor(owner.state.context.project_file(), uri);
+                push(&mut targets, owner.key.clone(), anchor);
+            }
+        }
+
+        if let Some(project) = self.configured_project_path() {
+            match self.index_context_for(&IndexAnchor::Project(project.clone()), cancel) {
+                Ok(key) => push(&mut targets, key, IndexAnchor::Project(project)),
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => {}
+            }
+        }
+        targets.from_open_or_configured = targets.contexts.len();
+
+        let scopes = self
+            .roots
+            .iter()
+            .map(|root| CatalogueScope::recursive(&root.path, Some(&root.excludes)))
+            .collect::<Vec<_>>();
+        let mut before_io = || check_workspace_cancel(Some(cancel));
+        let mut complete = true;
+        let mut sources = Vec::<PathBuf>::new();
+        let mut descriptors = Vec::<PathBuf>::new();
+        for scope in &scopes {
+            let catalogue = self.shared_catalogue(scope, MAX_CATALOGUE_ENTRIES, &mut before_io)?;
+            complete &= catalogue.is_complete() && catalogue.limit().is_none();
+            sources.extend(catalogue.pascal_files().map(Path::to_path_buf));
+            descriptors.extend(
+                catalogue
+                    .files()
+                    .iter()
+                    .filter(|path| is_descriptor(path))
+                    .cloned(),
+            );
+        }
+        for list in [&mut sources, &mut descriptors] {
+            list.sort_by_cached_key(|path| path_key(path));
+            list.dedup_by(|left, right| path_key(left) == path_key(right));
+        }
+        targets.small_workspace = complete
+            && sources.len() <= small_workspace_sources()
+            && descriptors.len() <= small_workspace_projects();
+
+        if purpose == TargetPurpose::WorkspaceSymbols {
+            let roots = self.workspace_root_paths();
+            let mut options = self.project_options();
+            for descriptor in &descriptors {
+                if targets.contexts.len() >= maximum {
+                    break;
+                }
+                check_workspace_cancel(Some(cancel))?;
+                match project_metadata_context(self, descriptor, &roots, &mut options, cancel) {
+                    Ok((key, _)) => {
+                        push(&mut targets, key, IndexAnchor::Project(descriptor.clone()));
+                    }
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let mut held = HashSet::<String>::new();
+        for (key, _) in &targets.contexts {
+            self.project_cache.read_index(key, |_, membership| {
+                held.extend(membership.paths.iter().map(|path| path_key(path)));
+            });
+        }
+        let mut owners = HashMap::<PathBuf, Option<ContextKey>>::new();
+        let mut discovered = 0usize;
+        let mut outside = 0usize;
+        for file in sources.iter().filter(|path| is_unit_source(path)) {
+            if held.contains(&path_key(file)) {
+                continue;
+            }
+            let Some(directory) = file.parent() else {
+                continue;
+            };
+            let owner = match owners.get(directory) {
+                Some(owner) => owner.clone(),
+                None => {
+                    let owner = match self.project_cache.owner_of(directory) {
+                        Some(owner) => Some(owner),
+                        None if targets.contexts.len() < maximum => {
+                            self.discover_directory_owner(directory, file, cancel, &mut discovered)?
+                        }
+                        None => None,
+                    };
+                    owners.insert(directory.to_path_buf(), owner.clone());
+                    owner
+                }
+            };
+            match owner {
+                Some(owner) if targets.holds(&owner) => {}
+                Some(owner) if targets.contexts.len() < maximum => {
+                    let project = self
+                        .contexts
+                        .get(&owner)
+                        .and_then(|state| state.context.project_file().map(Path::to_path_buf));
+                    let anchor = match (project, Url::from_file_path(file)) {
+                        (Some(project), _) => IndexAnchor::Project(project),
+                        (None, Ok(uri)) => IndexAnchor::Document(uri),
+                        (None, Err(())) => {
+                            outside += 1;
+                            continue;
+                        }
+                    };
+                    push(&mut targets, owner, anchor);
+                }
+                _ => outside += 1,
+            }
+        }
+        if outside > 0 {
+            targets.gaps.push(format!(
+                "{outside} sources under the workspace roots belong to contexts that were not searched"
+            ));
+        }
+        Ok(targets)
+    }
+
+    /// The configured project file; a relative one is looked up under the
+    /// workspace roots.
+    fn configured_project_path(&self) -> Option<PathBuf> {
+        let project = self.configured_project_file()?;
+        if project.is_absolute() {
+            return Some(project.to_path_buf());
+        }
+        self.roots
+            .iter()
+            .map(|root| root.path.join(project))
+            .find(|candidate| candidate.is_file())
+    }
+}
+
+fn owner_anchor(project: Option<&Path>, uri: &Url) -> IndexAnchor {
+    match project {
+        Some(project) => IndexAnchor::Project(project.to_path_buf()),
+        None => IndexAnchor::Document(uri.clone()),
+    }
+}
+
+fn is_descriptor(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["dproj", "dpr", "dpk"]
+            .iter()
+            .any(|descriptor| extension.eq_ignore_ascii_case(descriptor))
+    })
 }
 
 #[cfg(test)]
@@ -1588,5 +1890,226 @@ mod tests {
         let found = membership(&mut workspace, &key);
         assert!(found.paths.contains(&sdk.join("Lib.pas")), "{found:?}");
         assert!(found.paths.contains(&root.join("App.dpr")));
+    }
+
+    struct CapGuard;
+
+    impl Drop for CapGuard {
+        fn drop(&mut self) {
+            CAP_OVERRIDES.with(|caps| {
+                caps.set(CapOverrides {
+                    owner_discovery: None,
+                    small_sources: None,
+                    small_projects: None,
+                    max_targets: None,
+                })
+            });
+        }
+    }
+
+    fn override_caps(change: impl FnOnce(&mut CapOverrides)) -> CapGuard {
+        CAP_OVERRIDES.with(|caps| {
+            let mut value = caps.get();
+            change(&mut value);
+            caps.set(value);
+        });
+        CapGuard
+    }
+
+    fn named_project(root: &Path, name: &str, with_unit: bool) -> PathBuf {
+        let descriptor = root.join(name).join(format!("{name}.dproj"));
+        write(
+            &descriptor,
+            &format!(
+                "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
+            ),
+        );
+        write(
+            &root.join(name).join(format!("{name}.dpr")),
+            &format!("program {name}; begin end.\n"),
+        );
+        if with_unit {
+            unit(&root.join(name).join("U.pas"));
+        }
+        descriptor
+    }
+
+    fn targets(
+        workspace: &mut Workspace,
+        requesting: Option<&Url>,
+        purpose: TargetPurpose,
+    ) -> Targets {
+        let input = workspace.analysis_input();
+        workspace
+            .index_targets(&input, requesting, purpose, &AtomicBool::new(false))
+            .expect("targets")
+    }
+
+    fn open(workspace: &mut Workspace, path: &Path, version: i32) -> Url {
+        let uri = Url::from_file_path(path).unwrap();
+        workspace
+            .open_document(
+                uri.clone(),
+                "unit U; interface implementation end.\n".to_owned(),
+                version,
+            )
+            .unwrap();
+        uri
+    }
+
+    fn keys(targets: &Targets) -> Vec<ContextKey> {
+        targets
+            .contexts
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn targets_follow_the_documented_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for name in ["A", "B", "C"] {
+            named_project(root, name, true);
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        open(&mut workspace, &root.join("B/U.pas"), 1);
+        open(&mut workspace, &root.join("A/U.pas"), 2);
+        let requesting = Url::from_file_path(root.join("C/U.pas")).unwrap();
+        let a = context(
+            &mut workspace,
+            IndexAnchor::Document(Url::from_file_path(root.join("A/U.pas")).unwrap()),
+        );
+        let b = context(
+            &mut workspace,
+            IndexAnchor::Document(Url::from_file_path(root.join("B/U.pas")).unwrap()),
+        );
+        let c = context(&mut workspace, IndexAnchor::Document(requesting.clone()));
+        let found = targets(&mut workspace, Some(&requesting), TargetPurpose::References);
+        assert_eq!(keys(&found), [c, a, b]);
+        assert_eq!(found.from_open_or_configured, 3);
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    }
+
+    #[test]
+    fn the_configured_project_is_a_target_and_never_a_duplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let descriptor = named_project(root, "D", true);
+        pascal_project::backdate_tree_for_test(root);
+        let options = WorkspaceOptions {
+            project_file: Some(PathBuf::from("D/D.dproj")),
+            ..WorkspaceOptions::default()
+        };
+        let mut workspace = workspace(root, options);
+        let configured = context(&mut workspace, IndexAnchor::Project(descriptor.clone()));
+        let uri = open(&mut workspace, &root.join("D/U.pas"), 1);
+        let found = targets(&mut workspace, Some(&uri), TargetPurpose::References);
+        assert_eq!(keys(&found), [configured]);
+        assert_eq!(found.from_open_or_configured, 1);
+    }
+
+    #[test]
+    fn workspace_symbols_add_project_descriptor_contexts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = named_project(root, "A", false);
+        let second = named_project(root, "B", false);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let a = context(&mut workspace, IndexAnchor::Project(first));
+        let b = context(&mut workspace, IndexAnchor::Project(second));
+        let symbols = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
+        let found = keys(&symbols);
+        // Each descriptor, a `.dpr` as well as a `.dproj`, is a context, as
+        // in the rename snapshot.
+        assert_eq!(found.len(), 4);
+        assert!(found.contains(&a) && found.contains(&b));
+        assert_eq!(symbols.from_open_or_configured, 0);
+        let references = targets(&mut workspace, None, TargetPurpose::References);
+        assert!(references.contexts.is_empty());
+    }
+
+    #[test]
+    fn outside_sources_get_their_owners_discovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        named_project(root, "P1", true);
+        named_project(root, "P2", true);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let uri = open(&mut workspace, &root.join("P2/U.pas"), 1);
+        let p2 = context(&mut workspace, IndexAnchor::Document(uri));
+        let p1 = context(
+            &mut workspace,
+            IndexAnchor::Document(Url::from_file_path(root.join("P1/U.pas")).unwrap()),
+        );
+        let found = targets(&mut workspace, None, TargetPurpose::References);
+        assert_eq!(keys(&found), [p2, p1]);
+        assert_eq!(found.from_open_or_configured, 1);
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+        assert!(workspace.project_cache.owner_of(&root.join("P1")).is_some());
+    }
+
+    #[test]
+    fn outside_sources_beyond_the_discovery_cap_are_one_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..5 {
+            unit(&root.join(format!("d{index}/U.pas")));
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let _caps = override_caps(|caps| caps.owner_discovery = Some(2));
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let found = targets(&mut workspace, None, TargetPurpose::References);
+        assert_eq!(
+            found.gaps,
+            ["3 sources under the workspace roots belong to contexts that were not searched"]
+        );
+        let remembered = (0..5)
+            .filter(|index| {
+                workspace
+                    .project_cache
+                    .owner_of(&root.join(format!("d{index}")))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(remembered, 2);
+    }
+
+    #[test]
+    fn targets_are_capped_at_sixteen() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..20 {
+            named_project(root, &format!("P{index:02}"), true);
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        let found = targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols);
+        assert_eq!(found.contexts.len(), MAX_TARGET_CONTEXTS);
+        let distinct = keys(&found).into_iter().collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), MAX_TARGET_CONTEXTS);
+        assert!(!found.gaps.is_empty());
+    }
+
+    #[test]
+    fn a_small_workspace_is_detected_from_the_root_catalogues() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        named_project(root, "A", true);
+        named_project(root, "B", true);
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = workspace(root, WorkspaceOptions::default());
+        assert!(targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols).small_workspace);
+        {
+            let _caps = override_caps(|caps| caps.small_sources = Some(1));
+            assert!(
+                !targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols).small_workspace
+            );
+        }
+        let _caps = override_caps(|caps| caps.small_projects = Some(3));
+        assert!(!targets(&mut workspace, None, TargetPurpose::WorkspaceSymbols).small_workspace);
     }
 }

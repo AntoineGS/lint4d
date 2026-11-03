@@ -83,6 +83,18 @@ fn is_terminal(catalogue: &Catalogue) -> bool {
 }
 
 impl Workspace {
+    /// The complete (up to the scope cap) catalogue a workspace snapshot
+    /// enumerates, cancellable between filesystem operations.
+    pub(super) fn snapshot_catalogue(
+        &mut self,
+        scope: &CatalogueScope,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Arc<Catalogue>, String> {
+        self.shared_catalogue(scope, crate::catalogue::MAX_CATALOGUE_ENTRIES, &mut || {
+            super::check_workspace_cancel(Some(cancel))
+        })
+    }
+
     /// The shared catalogue of `scope`, extended until it is complete or
     /// counts `need` entries. `before_io` runs before every filesystem
     /// operation (cancellation, budgets, test barriers); its error publishes

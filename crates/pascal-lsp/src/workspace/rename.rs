@@ -6,15 +6,18 @@
 //! index for each expensive request and never mutates the live navigation
 //! cache or the filesystem.
 
+use super::catalogues::CatalogueScope;
 use super::resolver as shared_resolver;
 use super::{
-    ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
-    WorkspaceOptions, absolute_path, canonical_file_uri, conditional_context_for_path,
-    conditional_context_for_uri, disk_stamp, is_analyzable_source_path, is_configuration_file,
-    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
-    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
+    ContextKey, ContextState, DiskStamp, ExcludeMatcher, KnownDocumentOwner, OpenDocument,
+    PathStamp, Workspace, WorkspaceOptions, absolute_path, canonical_file_uri,
+    conditional_context_for_path, conditional_context_for_uri, disk_stamp,
+    is_analyzable_source_path, is_configuration_file, is_pascal_path, path_stamp,
+    path_stamp_result, path_starts_with_ci, path_starts_with_native, paths_equal_ci,
+    read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
+use crate::catalogue::{Catalogue, Limit, MAX_CATALOGUE_ENTRIES, RootKind};
 use crate::coverage::Coverage;
 use crate::include_expansion::{
     self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
@@ -56,7 +59,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use walkdir::WalkDir;
 
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, Sender};
@@ -5586,7 +5588,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
 }
 
 fn enumerate_mapped_sources(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     context_states: &HashMap<ContextKey, ContextState>,
     contexts: &HashSet<ContextKey>,
     enumeration: &mut Enumeration,
@@ -5666,57 +5668,38 @@ fn enumerate_mapped_sources(
                 continue;
             }
 
-            let walker = WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    entry.depth() == 0
-                        || !workspace.mapped_path_is_excluded(entry.path(), &root, &context_key)
-                });
-            for entry in walker {
+            let scope = match workspace.context_root_excludes(&context_key) {
+                Some(matcher) => CatalogueScope::recursive(&root, Some(matcher)),
+                None => {
+                    CatalogueScope::recursive(&root, Some(&ExcludeMatcher::new(&root, &root, &[])))
+                }
+            };
+            let catalogue = workspace.snapshot_catalogue(&scope, cancel)?;
+            enumeration.visited_entries = enumeration
+                .visited_entries
+                .saturating_add(catalogue.visits());
+            if let Some(reason) = snapshot_catalogue_gap(&catalogue, entry_limit, "mapped root ") {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert(reason);
+            }
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
+            for path in catalogue.files() {
                 if is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
-                enumeration.visited_entries = enumeration.visited_entries.saturating_add(1);
-                if enumeration.visited_entries > entry_limit {
-                    enumeration.complete = false;
-                    enumeration.reason.get_or_insert_with(|| {
-                        format!("source traversal entry limit ({entry_limit}) reached")
-                    });
-                    stop = true;
-                    break;
-                }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        enumeration.complete = false;
-                        enumeration.reason.get_or_insert_with(|| {
-                            format!(
-                                "source traversal error under mapped root {}: {error}",
-                                root.display()
-                            )
-                        });
-                        continue;
-                    }
-                };
-                let path = absolute_path(entry.path().to_path_buf());
-                let file_type = entry.file_type();
-                if file_type.is_symlink() {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    #[cfg(test)]
-                    crate::catalogue::test_record_listing(&path);
-                    add_baseline_path(&mut enumeration.baseline, path);
-                    continue;
-                }
-                if file_type.is_file()
-                    && is_pascal_path(&path)
-                    && workspace.mapped_path_is_readable_under_root(&path, &root, &context_key)
+                if is_pascal_path(path)
+                    && workspace.mapped_path_is_readable_under_root(path, &root, &context_key)
                 {
                     add_baseline_path(&mut enumeration.baseline, path.clone());
-                    enumeration.add_path(path, Some(context_key.clone()));
+                    enumeration.add_path(path.clone(), Some(context_key.clone()));
                 }
+            }
+            if enumeration.visited_entries > entry_limit {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert_with(|| {
+                    format!("source traversal entry limit ({entry_limit}) reached")
+                });
+                stop = true;
             }
             if stop {
                 break;
@@ -6095,7 +6078,7 @@ fn build_snapshot_with_policy(
         };
         let context_states = enumeration.contexts.clone();
         enumerate_mapped_sources(
-            &loader,
+            &mut loader,
             &context_states,
             &mapped_contexts,
             &mut enumeration,
@@ -7568,75 +7551,45 @@ fn enumerate_sources(
         return Ok(result);
     }
     let entry_limit = MAX_RENAME_TRAVERSAL_ENTRIES;
-    let mut stop = false;
-    for root in &workspace.roots {
-        for source_root in &root.source_roots {
+    'roots: for root_index in 0..workspace.roots.len() {
+        for source_index in 0..workspace.roots[root_index].source_roots.len() {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let source_root = absolute_path(source_root.clone());
-            let walker = WalkDir::new(&source_root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    entry.depth() == 0 || !root.excludes.is_excluded(entry.path(), &source_root)
-                });
-            for entry in walker {
+            let root = &workspace.roots[root_index];
+            let source_root = absolute_path(root.source_roots[source_index].clone());
+            let scope = CatalogueScope::recursive(&source_root, Some(&root.excludes));
+            let catalogue = workspace.snapshot_catalogue(&scope, cancel)?;
+            let root = &workspace.roots[root_index];
+            result.visited_entries = result.visited_entries.saturating_add(catalogue.visits());
+            if let Some(reason) = snapshot_catalogue_gap(&catalogue, entry_limit, "") {
+                result.complete = false;
+                result.reason.get_or_insert(reason);
+            }
+            add_catalogue_directories(&mut result.baseline, &catalogue);
+            for path in catalogue.files() {
                 if is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
-                result.visited_entries = result.visited_entries.saturating_add(1);
-                if result.visited_entries > entry_limit {
-                    result.complete = false;
-                    result.reason.get_or_insert_with(|| {
-                        format!("source traversal entry limit ({entry_limit}) reached")
-                    });
-                    stop = true;
-                    break;
-                }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        result.complete = false;
-                        result.reason.get_or_insert_with(|| {
-                            format!(
-                                "source traversal error under {}: {error}",
-                                source_root.display()
-                            )
-                        });
-                        continue;
-                    }
-                };
-                let path = absolute_path(entry.path().to_path_buf());
-                let file_type = entry.file_type();
-                if file_type.is_symlink() {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    #[cfg(test)]
-                    crate::catalogue::test_record_listing(&path);
-                    add_baseline_path(&mut result.baseline, path);
-                    continue;
-                }
-                if file_type.is_file()
-                    && root.accepts(&path)
-                    && is_project_metadata_path(&path)
-                    && !is_configuration_file(&path)
+                if root.accepts(path)
+                    && is_project_metadata_path(path)
+                    && !is_configuration_file(path)
                 {
                     add_baseline_path(&mut result.baseline, path.clone());
                 }
-                if !file_type.is_file() || !is_pascal_path(&path) || !root.accepts(&path) {
+                if !is_pascal_path(path) || !root.accepts(path) {
                     continue;
                 }
                 add_baseline_path(&mut result.baseline, path.clone());
-                result.add_path(path, None);
+                result.add_path(path.clone(), None);
             }
-            if stop {
-                break;
+            if result.visited_entries > entry_limit {
+                result.complete = false;
+                result.reason.get_or_insert_with(|| {
+                    format!("source traversal entry limit ({entry_limit}) reached")
+                });
+                break 'roots;
             }
-        }
-        if stop {
-            break;
         }
     }
 
@@ -7822,11 +7775,35 @@ fn add_baseline_path_with_stamp(
     baseline.add_path(path, stamp);
 }
 
+/// Why a snapshot walk of `catalogue` is incomplete, in the old walk's words.
+fn snapshot_catalogue_gap(
+    catalogue: &Catalogue,
+    entry_limit: usize,
+    under: &str,
+) -> Option<String> {
+    if !catalogue.is_complete() {
+        let limit = match catalogue.limit() {
+            Some(Limit::Visits) => entry_limit,
+            Some(Limit::Entries) | None => MAX_CATALOGUE_ENTRIES,
+        };
+        return Some(format!("source traversal entry limit ({limit}) reached"));
+    }
+    if catalogue.root_kind() == RootKind::Missing {
+        return Some(format!(
+            "source traversal error under {under}{}: the directory does not exist",
+            catalogue.root().display()
+        ));
+    }
+    catalogue.unreadable().first().map(|(path, error)| {
+        format!(
+            "source traversal error under {under}{}: {error}",
+            path.display()
+        )
+    })
+}
+
 /// Every directory `catalogue` listed, with the stamp taken before listing it.
-fn add_catalogue_directories(
-    baseline: &mut BaselineAccumulator,
-    catalogue: &crate::catalogue::Catalogue,
-) {
+fn add_catalogue_directories(baseline: &mut BaselineAccumulator, catalogue: &Catalogue) {
     for (directory, stamp) in catalogue.directories() {
         add_baseline_path_with_stamp(baseline, directory.clone(), stamp.clone());
     }

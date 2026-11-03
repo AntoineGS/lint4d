@@ -3900,27 +3900,91 @@ mod tests {
         );
     }
 
-    /// l4d-20 characterization: every references request walks the workspace
-    /// again (Task 6 turns this into the acceptance test).
+    /// l4d-20 AC#1: a second references request on the same workspace performs
+    /// no directory walk (Task 1 recorded that it did).
     #[test]
-    fn references_requests_list_the_workspace_root_each_time() {
+    fn a_second_references_request_lists_no_directory() {
         let fixture = query_fixture();
         let cancel = AtomicBool::new(false);
-        for request in ["first", "second"] {
-            crate::catalogue::test_reset_listings();
-            let computed = references_from_input(
+        let references = || {
+            references_from_input(
                 fixture.input.clone(),
                 &source_uri(&fixture.provider),
                 shared_value_position(),
                 true,
                 &cancel,
+            )
+        };
+        let first = references();
+        assert!(first.value.is_ok(), "first references: {first:?}");
+        crate::catalogue::test_reset_listings();
+        let second = references();
+        assert!(second.value.is_ok(), "second references: {second:?}");
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "the second request listed {:?}",
+            crate::catalogue::test_listings()
+        );
+        assert_eq!(
+            first.value.unwrap().value,
+            second.value.unwrap().value,
+            "both requests find the same references"
+        );
+    }
+
+    #[test]
+    fn a_narrower_exclusion_set_never_enumerates_what_a_wider_one_catalogued() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        fs::create_dir_all(root.join("vendor")).expect("vendor");
+        fs::write(
+            root.join("vendor/VendorConsumer.pas"),
+            "unit VendorConsumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("vendor consumer");
+        let wide = test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let mut narrow = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                exclude: vec!["vendor".to_string()],
+                ..WorkspaceOptions::default()
+            },
+        )
+        .analysis_input();
+        narrow.project_cache = wide.project_cache.clone();
+        let cancel = AtomicBool::new(false);
+        let found = |input: &WorkspaceInput| {
+            let computed = references_from_input(
+                input.clone(),
+                &source_uri(&provider),
+                shared_value_position(),
+                false,
+                &cancel,
             );
-            assert!(computed.value.is_ok(), "{request} references: {computed:?}");
-            assert!(
-                !crate::catalogue::test_listings().is_empty(),
-                "today the {request} references request walks the workspace"
-            );
-        }
+            computed
+                .value
+                .expect("references")
+                .value
+                .into_iter()
+                .map(|location| location.uri.path().rsplit('/').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found(&wide), ["VendorConsumer.pas"]);
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view must not see vendor/"
+        );
+        assert_eq!(
+            found(&wide),
+            ["VendorConsumer.pas"],
+            "the wider view still does"
+        );
     }
 
     #[test]

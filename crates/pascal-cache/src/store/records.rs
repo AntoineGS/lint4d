@@ -11,6 +11,7 @@ use super::limits::{
 use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::reader::ScratchLease;
+use super::sequence::next_publication_seq;
 use super::sqlite::{begin, classify, classify_read};
 use super::stream::{Expected, ManifestReader, RowError, RowSource};
 use crate::evidence::path_key;
@@ -228,6 +229,7 @@ fn insert_record(
     scope: Scope,
     encoded: &EncodedRecord,
     expected: &StoredRecord,
+    sequence: i64,
 ) -> Result<(), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let namespace = scope.namespace.as_bytes().as_slice();
@@ -236,8 +238,8 @@ fn insert_record(
     transaction
         .execute(
             "INSERT INTO member_records (namespace_id, reset_epoch, record_id, lifecycle, header, \
-             source_key, artifact_id, member_evidence, binding_count, content_bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             source_key, artifact_id, member_evidence, binding_count, content_bytes, \
+             publication_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 namespace,
                 reset_epoch,
@@ -248,7 +250,8 @@ fn insert_record(
                 expected.artifact_id,
                 expected.member_evidence,
                 expected.binding_count,
-                expected.content_bytes
+                expected.content_bytes,
+                sequence
             ],
         )
         .map_err(fail)?;
@@ -358,15 +361,30 @@ impl Store {
                 )?;
             }
         }
+        let sequence = next_publication_seq(&transaction)?;
         let published = match read_record_row(&transaction, self.scope, encoded.id).map_err(fail)? {
             Some(stored) if stored.lifecycle != LIVE => return Err(Bypass::Retiring),
             // Only the record row is compared: the ID is the digest of the
             // header and every binding, so the same ID means the same
             // bindings, and stored rows that disagree fail every read.
-            Some(stored) if stored == expected => Published::AlreadyPresent,
+            Some(stored) if stored == expected => {
+                transaction
+                    .execute(
+                        "UPDATE member_records SET publication_seq = ?4 \
+                         WHERE namespace_id = ?1 AND reset_epoch = ?2 AND record_id = ?3",
+                        params![
+                            self.scope.namespace.as_bytes().as_slice(),
+                            epoch(self.scope),
+                            encoded.id.as_bytes().as_slice(),
+                            sequence
+                        ],
+                    )
+                    .map_err(fail)?;
+                Published::AlreadyPresent
+            }
             Some(_) => return Err(Bypass::Integrity(Integrity::ConflictingRecord)),
             None => {
-                insert_record(&transaction, self.scope, &encoded, &expected)?;
+                insert_record(&transaction, self.scope, &encoded, &expected, sequence)?;
                 Published::Inserted
             }
         };

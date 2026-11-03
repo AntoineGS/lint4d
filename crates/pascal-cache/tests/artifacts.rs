@@ -535,3 +535,28 @@ fn republishing_over_a_conflicting_root_manifest_is_an_integrity_failure() {
         Err(Bypass::Integrity(Integrity::ConflictingManifest))
     );
 }
+
+#[test]
+fn an_identical_republish_takes_the_next_sequence() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let key = key("unit A;");
+    assert_eq!(
+        store.publish_artifact(&write(&key, &ROWS)),
+        Ok(Published::Inserted)
+    );
+    let sequence = || -> i64 {
+        raw(root.path())
+            .query_row("SELECT publication_seq FROM artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let first = sequence();
+    assert!(first >= 1);
+    assert_eq!(
+        store.publish_artifact(&write(&key, &ROWS)),
+        Ok(Published::AlreadyPresent)
+    );
+    assert!(sequence() > first, "the republish committed its recency");
+}

@@ -8,6 +8,7 @@ use super::limits::{
 };
 use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
+use super::sequence::next_publication_seq;
 use super::sqlite::{begin, classify, classify_read};
 use crate::{Digest, Encoder, KeyKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -280,10 +281,23 @@ pub(crate) fn insert_prepared(
     if let Some(root) = write.key.root() {
         put_manifest(transaction, scope, root)?;
     }
+    let sequence = next_publication_seq(transaction)?;
     if let Some(stored) = read_header(transaction, scope, *artifact_id).map_err(fail)? {
         return if stored.lifecycle != LIVE {
             Err(Bypass::Retiring)
         } else if stored == *expected {
+            transaction
+                .execute(
+                    "UPDATE artifacts SET publication_seq = ?4 \
+                     WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3",
+                    params![
+                        scope.namespace.as_bytes().as_slice(),
+                        epoch(scope),
+                        artifact_id.as_bytes().as_slice(),
+                        sequence
+                    ],
+                )
+                .map_err(fail)?;
             Ok(Published::AlreadyPresent)
         } else {
             Err(Bypass::Integrity(Integrity::ConflictingArtifact))
@@ -294,8 +308,8 @@ pub(crate) fn insert_prepared(
     transaction
         .execute(
             "INSERT INTO artifacts (namespace_id, reset_epoch, artifact_id, kind, root_key, \
-             lifecycle, row_count, content_bytes, fact_checksum, supplemental) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             lifecycle, row_count, content_bytes, fact_checksum, supplemental, publication_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 namespace,
                 reset_epoch,
@@ -306,7 +320,8 @@ pub(crate) fn insert_prepared(
                 expected.row_count,
                 expected.content_bytes,
                 expected.fact_checksum,
-                expected.supplemental
+                expected.supplemental,
+                sequence
             ],
         )
         .map_err(fail)?;
@@ -371,15 +386,16 @@ fn admit_header(
 impl Store {
     /// Publish an immutable artifact: key manifests, header and rows in one
     /// transaction. Hashing happens before the transaction starts.
+    ///
+    /// An identical republish commits: it takes a new publication sequence so
+    /// the artifact counts as recently used (and, once write admission exists,
+    /// it passes admission like any other write).
     pub fn publish_artifact(&self, write: &ArtifactWrite<'_>) -> Result<Published, Bypass> {
         let prepared = prepare_artifact(write)?;
         let mut writer = self.writer()?;
         let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
         ensure_live(&transaction, self.scope)?;
         let published = insert_prepared(&transaction, self.scope, write, &prepared)?;
-        if published == Published::AlreadyPresent {
-            return Ok(published);
-        }
         self.before_commit();
         transaction.commit().map_err(|error| classify(&error))?;
         Ok(published)

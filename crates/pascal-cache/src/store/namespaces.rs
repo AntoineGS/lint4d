@@ -17,7 +17,9 @@ const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 9] = [
+const RECLAIM_TABLES: [&str; 11] = [
+    "lease_holds",
+    "process_leases",
     "snapshot_members",
     "snapshots",
     "member_bindings",

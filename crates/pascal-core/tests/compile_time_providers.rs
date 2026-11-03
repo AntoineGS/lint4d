@@ -2222,3 +2222,54 @@ fn names_prepared_on_a_shared_interface_are_shared() {
         "{one:?} then {two:?}"
     );
 }
+
+fn provider_chain(levels: usize) -> Fixture {
+    let mut f = Fixture::new(
+        "unit Main; interface uses U0; {$IF SizeOf(U0.T0)=8}{$DEFINE DEEP}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    for n in 0..levels {
+        let text = if n + 1 == levels {
+            format!("unit U{n}; interface type T{n} = Int64; implementation end.")
+        } else {
+            let m = n + 1;
+            format!("unit U{n}; interface uses U{m}; type T{n} = U{m}.T{m}; implementation end.")
+        };
+        f.unit(&format!("U{n}"), &text, context(LayoutPlatform::Win32));
+    }
+    f.limits.max_retained_bytes = 512 * 1024 * 1024;
+    f
+}
+
+/// l4d-4nbs D29: each nested provider interface costs about 50 KiB of stack
+/// in a debug build (11 KiB in release), so a deep interface `uses` chain
+/// overflowed a default 2 MiB thread at about 40 levels and aborted the
+/// process. The nesting now stops at a stack budget and reports the limit.
+#[test]
+fn a_deep_interface_uses_chain_reports_the_stack_limit() {
+    let analysis = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut f = provider_chain(300);
+            f.analyze()
+        })
+        .unwrap()
+        .join()
+        .expect("no overflow");
+    let limited = match &analysis {
+        Ok(analysis) => analysis.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                pascal_core::compile_time::IncompleteReason::Limit {
+                    name: "max_provider_stack_bytes",
+                    ..
+                }
+            )
+        }),
+        Err(pascal_core::ResolverError::LimitExceeded { limit, .. }) => {
+            *limit == "max_provider_stack_bytes"
+        }
+        Err(_) => false,
+    };
+    assert!(limited, "{:?}", analysis.as_ref().map(|a| &a.reasons));
+}

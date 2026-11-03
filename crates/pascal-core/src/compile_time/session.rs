@@ -613,6 +613,15 @@ struct SharedOrigin {
     warnings: Arc<Vec<String>>,
 }
 
+/// An address in the caller's stack frame: the stack grows down on every
+/// supported target, so the distance from an earlier position is what the
+/// frames in between use.
+#[inline(never)]
+fn stack_position() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
 fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
     if more.is_empty() {
         return base.clone();
@@ -686,6 +695,8 @@ struct ProviderSession {
     collecting: Vec<Vec<ProviderDependency>>,
     queries: usize,
     next_occurrence: u64,
+    /// Where the stack was when the session started (l4d-4nbs D29).
+    stack_base: usize,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
 }
 
@@ -811,6 +822,7 @@ impl ProviderSession {
             declarations,
             queries: 0,
             next_occurrence: 1,
+            stack_base: stack_position(),
         })
     }
 
@@ -2352,6 +2364,15 @@ impl ProviderEngine<'_, '_> {
             "max_type_depth",
         )
         .map_err(|r| resolver_error(r, self.budget))?;
+        let stack = self.providers.stack_base.saturating_sub(stack_position());
+        let maximum = self.budget.limits().max_provider_stack_bytes;
+        if stack > maximum {
+            return Err(ResolverError::LimitExceeded {
+                limit: "max_provider_stack_bytes",
+                observed: stack,
+                maximum,
+            });
+        }
         let metadata = provider_owned_payload(&provider)?;
         // Separately compiled unit roots have one nominal identity per proven
         // source/revision/context/qualifier capability in this session. Repeating

@@ -51,6 +51,12 @@ pub struct CompileTimeLimits {
     pub max_array_dimensions: usize,
     pub max_branch_states: usize,
     pub max_provider_queries: usize,
+    /// Stack bytes nested provider interface compilations may use below the
+    /// session's entry (l4d-4nbs D29). Each level costs about 50 KiB in a
+    /// debug build and 11 KiB in release; the default keeps a 2 MiB thread
+    /// clear of overflow with half of it left for the caller and the
+    /// innermost level.
+    pub max_provider_stack_bytes: usize,
     pub max_work: usize,
     /// Steps each source byte entering the session adds to `max_work`.
     pub work_per_source_byte: usize,
@@ -80,6 +86,7 @@ impl Default for CompileTimeLimits {
             // RTL, VCL, DB, IBX and business objects; Log.pas needed 237). A
             // count fuse only: work, byte work and retention bound the cost.
             max_provider_queries: 4_096,
+            max_provider_stack_bytes: 1024 * 1024,
             // Finite normal-body work headroom. Header selection/reproof
             // inherit this operation policy, with their distinct state fuse.
             max_work: 2_000_000,

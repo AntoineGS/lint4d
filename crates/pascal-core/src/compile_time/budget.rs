@@ -67,7 +67,11 @@ impl Default for CompileTimeLimits {
             max_type_depth: 256,
             max_array_dimensions: 256,
             max_branch_states: 64,
-            max_provider_queries: 256,
+            // Unit lookups by import site in one session. A unit's closure
+            // can exceed 256 import sites (SFClient2's BOSFBase units import
+            // RTL, VCL, DB, IBX and business objects; Log.pas needed 237). A
+            // count fuse only: work, byte work and retention bound the cost.
+            max_provider_queries: 4_096,
             // Finite normal-body work headroom. Header selection/reproof
             // inherit this operation policy, with their distinct state fuse.
             max_work: 2_000_000,

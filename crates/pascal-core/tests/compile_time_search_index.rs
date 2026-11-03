@@ -239,3 +239,54 @@ fn a_lookup_skips_directories_that_cannot_hold_the_unit() {
         "{per_lookup_directory} byte work per lookup and skipped directory ({few} -> {many})"
     );
 }
+
+/// A unit closure of `units` units each importing `uses` others, in the
+/// last of `dirs` search directories, below a root that imports them all
+/// and asks a name only the closure could declare.
+fn closure(units: usize, uses: usize, dirs: usize) -> (
+    pascal_core::compile_time::CompileTimeAnalysis,
+    pascal_core::compile_time::BudgetSnapshot,
+) {
+    let project = project(dirs, 10);
+    let last = project.search.last().unwrap().clone();
+    for u in 0..units {
+        // Interface uses are acyclic, as Delphi requires.
+        let deps = (u + 1..units.min(u + 1 + uses))
+            .map(|k| format!("U{k}"))
+            .collect::<Vec<_>>();
+        let uses_clause = if deps.is_empty() {
+            String::new()
+        } else {
+            format!("uses {};", deps.join(", "))
+        };
+        let mut text = format!("unit U{u}; interface {uses_clause}\ntype\n");
+        for n in 0..300 {
+            text.push_str(&format!(
+                "  TC{u}_{n} = class(TObject) procedure P; function F(X: Integer): Integer; end;\n"
+            ));
+        }
+        text.push_str("implementation end.");
+        std::fs::write(last.join(format!("U{u}.pas")), text).unwrap();
+    }
+    let all = (0..units)
+        .map(|u| format!("U{u}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    analyze(
+        &project,
+        &format!(
+            "unit T; interface uses {all}; implementation {{$IF CompilerVersion > 21.0}}{{$DEFINE HIT}}{{$IFEND}} end."
+        ),
+        &[],
+        &[],
+    )
+}
+
+/// The provider query fuse bounds one session's unit lookups by import
+/// site. SFClient2's BOSFBase units import a closure (RTL, VCL, DB, IBX,
+/// business objects) of more than 256 import sites; Log.pas needed 237.
+#[test]
+fn a_closure_of_three_hundred_import_sites_is_resolved() {
+    let (analysis, usage) = closure(40, 9, 20);
+    assert!(analysis.root.complete, "{:?} {usage:?}", analysis.reasons);
+}

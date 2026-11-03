@@ -1807,16 +1807,36 @@ fn read_only_reference_coverage(
     // An indexed snapshot audits its candidates relaxed (l4d-jeh4): a
     // candidate whose include audit failed is withheld. A gap naming no
     // unit withholds every unit with an include directive.
+    // Its importers are withheld too: what it declares may shadow theirs.
     let dependency_gaps = &snapshot.dependency_coverage;
     let mut unattributed = dependency_gaps.omitted > 0;
+    let mut failed = HashSet::new();
     for gap in &dependency_gaps.gaps {
         coverage.note(gap.uri.as_ref(), gap.reason.as_str());
         match &gap.uri {
             Some(owner) => {
-                withheld.insert(owner.clone());
+                failed.insert(owner.clone());
             }
             None => unattributed = true,
         }
+    }
+    if !failed.is_empty() {
+        for importer in snapshot.sources.keys() {
+            let imports_failed = snapshot.index.imports(importer).iter().any(|import| {
+                snapshot
+                    .index
+                    .import_provider_uri(importer, &import.name)
+                    .is_some_and(|provider| failed.contains(provider))
+            });
+            if imports_failed && !failed.contains(importer) {
+                coverage.note(
+                    Some(importer),
+                    "a unit it uses could not be analyzed, so its bindings are unproven",
+                );
+                withheld.insert(importer.clone());
+            }
+        }
+        withheld.extend(failed);
     }
     if unattributed {
         withheld.extend(
@@ -4051,6 +4071,12 @@ mod tests {
             "unit Other;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
         )
         .expect("other");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
         let input =
             test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
         struct Reset;
@@ -4081,10 +4107,29 @@ mod tests {
             "{:?}",
             partial.coverage
         );
+        // Failing.pas may declare what Downstream.pas binds.
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))),
+            "{:?}",
+            partial.coverage
+        );
         assert_eq!(
             located(&partial.value),
             vec![(source_uri(&other), 6, 6), (source_uri(&shared), 2, 6)]
         );
+        // A provider of the requesting document keeps the strict proof.
+        let refused = references_from_input(
+            input.clone(),
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(refused.value.is_err(), "{:?}", refused.value);
         let rename = crate::workspace::rename::rename_from_input(
             input,
             &source_uri(&shared),

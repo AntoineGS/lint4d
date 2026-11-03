@@ -7244,6 +7244,24 @@ fn build_snapshot_with_policy(
                 requested.extend(parents.iter().cloned());
             }
         }
+        if indexed && !best_effort {
+            // A provider of the requesting document can shadow the binding
+            // the references prove, so its failure still refuses them.
+            let providers = requested
+                .iter()
+                .flat_map(|uri| {
+                    loader
+                        .index
+                        .imports(uri)
+                        .into_iter()
+                        .filter_map(|import| {
+                            loader.index.import_provider_uri(uri, &import.name).cloned()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            requested.extend(providers);
+        }
         let include_audit = audit_includes(IncludeAuditor {
             requested: &requested,
             // Only read-only references build an indexed snapshot here: a

@@ -820,6 +820,13 @@ impl ConditionalEnvironment {
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.values.keys()
     }
+    /// Bytes of the DEFINE/option/constant facts, which the legacy
+    /// `MAX_ENVIRONMENT_BYTES` cap bounds. The typed declaration state grows
+    /// with the unit and is admitted by the compile-time budget instead.
+    fn scalar_bytes(&self) -> usize {
+        self.bytes
+    }
+
     fn bytes(&self) -> usize {
         let mut bytes = self.bytes;
         if let Some(state) = &self.typed_state {
@@ -2482,14 +2489,15 @@ fn apply_fact(
         if !budget.charge_bytes(symbol.len()) {
             return false;
         }
-        if !environment.contains_key(&symbol) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
+        if !environment.contains_key(&symbol) && environment.scalar_len() >= MAX_ENVIRONMENT_ENTRIES
+        {
             budget.exhausted = true;
             return false;
         }
         if !environment.contains_key(&symbol)
             && !budget.check_environment_bytes(
                 environment
-                    .bytes()
+                    .scalar_bytes()
                     .saturating_add(symbol.len().saturating_add(size_of::<Truth>())),
             )
         {
@@ -2523,12 +2531,14 @@ fn apply_option_fact(
     if !budget.charge_bytes(key.len()) {
         return false;
     }
-    if !environment.options.contains_key(&key) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
+    if !environment.options.contains_key(&key)
+        && environment.scalar_len() >= MAX_ENVIRONMENT_ENTRIES
+    {
         budget.exhausted = true;
         return false;
     }
     let bytes = environment
-        .bytes()
+        .scalar_bytes()
         .saturating_add(key.len().saturating_add(size_of::<Truth>()));
     if !environment.options.contains_key(&key) && !budget.check_environment_bytes(bytes) {
         return false;
@@ -3371,7 +3381,9 @@ fn merge_environment(
             return false;
         }
     }
-    if current.len() > MAX_ENVIRONMENT_ENTRIES || current.bytes() > MAX_ENVIRONMENT_BYTES {
+    if current.scalar_len() > MAX_ENVIRONMENT_ENTRIES
+        || current.scalar_bytes() > MAX_ENVIRONMENT_BYTES
+    {
         budget.exhausted = true;
         return false;
     }

@@ -475,3 +475,22 @@ fn repeated_includes_through_a_default_hook_adapter_credit_once_per_session() {
             .map(|analysis| (&analysis.reasons, analysis.budget.budget_snapshot()))
     );
 }
+
+/// l4d-4nbs R1: the legacy 1 MiB cap on the conditional environment bounds
+/// its DEFINE/option facts only. The typed declaration state is admitted by
+/// the compile-time budget, so a unit with more than 1 MiB of declarations
+/// still applies later switches, DEFINEs and includes (SynCommons failed at
+/// `{$M+}` with 1.3 MB of typed state and 2,877 scalar entries).
+#[test]
+fn directives_after_a_megabyte_of_declarations_are_applied() {
+    let mut text = String::from("unit T;\ninterface\nconst\n");
+    let value = "x".repeat(100);
+    for n in 0..12_000 {
+        text.push_str(&format!("  C{n} = '{value}';\n"));
+    }
+    text.push_str(
+        "{$M+}\n{$DEFINE LATE}\n{$IFDEF LATE}\nconst Late = 1;\n{$ENDIF}\n{$I late.inc}\n{$IF Late = 1}{$DEFINE AFTER}{$IFEND}\nimplementation\nend.\n",
+    );
+    let (result, usage) = analyze_with(&text, &[("late.inc", "const FromInclude = 2;\n")]);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+}

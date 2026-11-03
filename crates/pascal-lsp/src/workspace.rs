@@ -418,8 +418,6 @@ const MAX_SOURCE_CHANGE_OBSERVATIONS: usize = 4_096;
 // counted without following links. Keep a fixed margin for normal growth, but
 // retain a hard stop so a pathological workspace cannot turn package lookup
 // into an unbounded traversal.
-const MAX_PACKAGE_CATALOGUE_ENTRIES: usize = 524_288;
-const MAX_PACKAGE_CATALOGUES: usize = 64;
 const MAX_PACKAGE_LOOKUPS: usize = 256;
 const MAX_PACKAGE_METADATA_CACHE: usize = 512;
 const MAX_PACKAGE_UNIT_CANDIDATES: usize = 1_024;
@@ -2104,36 +2102,6 @@ impl DiskStamp {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct PackageCatalogue {
-    entries: HashMap<String, Vec<PathBuf>>,
-    requested_names: HashSet<String>,
-    complete: bool,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    validated_epoch: u64,
-    last_used: u64,
-}
-
-#[derive(Debug)]
-struct PackageDescriptorMatch {
-    path: PathBuf,
-    names: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-struct PackageDescriptorFiles {
-    has_dpk: bool,
-    dpk: Vec<PackageDescriptorMatch>,
-    dproj: Vec<PackageDescriptorMatch>,
-}
-
-#[derive(Debug, Default)]
-struct PackageCatalogueScan {
-    entries: HashMap<String, Vec<PathBuf>>,
-    directories: Vec<(PathBuf, Option<PathStamp>)>,
-    complete: bool,
-}
-
 #[derive(Debug, Clone)]
 struct CachedPackageMetadata {
     metadata_stamps: Vec<(PathBuf, Option<PathStamp>)>,
@@ -2190,12 +2158,6 @@ fn selected_installation_id(context: &ProjectContext) -> Option<String> {
         Some(pascal_project::InstallationSelection::Selected { id, .. }) => Some(id.clone()),
         _ => None,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PackageCatalogueKey {
-    context: ContextKey,
-    root: PathBuf,
 }
 
 impl ContextKey {
@@ -2445,7 +2407,6 @@ struct DiscardedRecoveryState {
     document_contexts: HashMap<Url, ContextKey>,
     open_document_contexts: HashMap<Url, ContextKey>,
     cached_documents: HashMap<Url, rename::CachedDocument>,
-    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
     package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     source_change_generations: HashMap<Url, u64>,
     source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
@@ -2938,8 +2899,6 @@ pub struct Workspace {
     project_selections: ProjectSelections,
     installation_selections: HashMap<PathBuf, String>,
     build_selections: HashMap<PathBuf, BuildChoice>,
-    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
-    package_catalogue_epoch: u64,
     package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
     catalogue_validations: catalogues::CatalogueValidations,
     warnings: Vec<String>,
@@ -3447,7 +3406,6 @@ impl Workspace {
             owner.legacy_route = None;
         }
         self.cached_documents.clear();
-        self.package_catalogues.clear();
         self.package_metadata_cache.clear();
         self.source_change_generations.clear();
         self.configuration_change_generations.clear();
@@ -4832,7 +4790,6 @@ impl Workspace {
             document_contexts: std::mem::take(&mut self.document_contexts),
             open_document_contexts: std::mem::take(&mut self.open_document_contexts),
             cached_documents: std::mem::take(&mut self.cached_documents),
-            package_catalogues: std::mem::take(&mut self.package_catalogues),
             package_metadata_cache: std::mem::take(&mut self.package_metadata_cache),
             source_change_generations: std::mem::take(&mut self.source_change_generations),
             source_change_observations: std::mem::take(&mut self.source_change_observations),
@@ -4998,7 +4955,6 @@ impl Workspace {
             count_recovery_entries!(self.document_contexts.len());
             count_recovery_entries!(self.open_document_contexts.len());
             count_recovery_entries!(self.cached_documents.len());
-            count_recovery_entries!(self.package_catalogues.len());
             count_recovery_entries!(self.package_metadata_cache.len());
             count_recovery_entries!(self.source_change_generations.len());
             count_recovery_entries!(self.source_change_observations.len());
@@ -5096,23 +5052,6 @@ impl Workspace {
                 }
                 for observation in &cached.observations {
                     observation.visit_recovery_payload(&mut charge_retained_payload)?;
-                }
-            }
-            for (key, catalogue) in &self.package_catalogues {
-                key.context
-                    .visit_recovery_payload(&mut charge_retained_payload)?;
-                charge_retained_payload(key.root.as_os_str().len())?;
-                for (name, paths) in &catalogue.entries {
-                    charge_retained_payload(name.len())?;
-                    for path in paths {
-                        charge_retained_payload(path.as_os_str().len())?;
-                    }
-                }
-                for name in &catalogue.requested_names {
-                    charge_retained_payload(name.len())?;
-                }
-                for (path, _) in &catalogue.directories {
-                    charge_retained_payload(path.as_os_str().len())?;
                 }
             }
             for (owner_uri, owner) in &self.document_owners {
@@ -5302,7 +5241,6 @@ impl Workspace {
         clear_recovery_map!(self.document_contexts);
         clear_recovery_map!(self.open_document_contexts);
         clear_recovery_map!(self.cached_documents);
-        clear_recovery_map!(self.package_catalogues);
         clear_recovery_map!(self.package_metadata_cache);
         clear_recovery_map!(self.source_change_generations);
         clear_recovery_map!(self.source_change_observations);
@@ -5762,7 +5700,6 @@ impl Workspace {
         self.document_contexts.clear();
         self.open_document_contexts.clear();
         self.deleted_overrides.clear();
-        self.package_catalogues.clear();
         self.package_metadata_cache.clear();
         self.expansions.clear();
         self.include_parents.clear();
@@ -11671,24 +11608,27 @@ impl Workspace {
             && safe_path_under_root(path, root)
     }
 
+    /// The workspace root's exclusions a package or mapped walk applies for
+    /// `context_key`; `None` means the default components alone. Borrowed, so
+    /// per-path callers do not clone a matcher.
+    fn context_root_excludes(&self, context_key: &ContextKey) -> Option<&ExcludeMatcher> {
+        let selected = context_key.workspace_root.as_deref()?;
+        self.roots
+            .iter()
+            .find(|root| native_paths_equal(&root.path, selected))
+            .map(|root| &root.excludes)
+    }
+
     fn mapped_path_is_excluded(
         &self,
         path: &Path,
         mapped_root: &Path,
         context_key: &ContextKey,
     ) -> bool {
-        if has_default_excluded_component_under(path, mapped_root) {
-            return true;
-        }
-        context_key
-            .workspace_root
-            .as_deref()
-            .and_then(|workspace_root| {
-                self.roots
-                    .iter()
-                    .find(|root| native_paths_equal(&root.path, workspace_root))
-            })
-            .is_some_and(|workspace_root| workspace_root.excludes.is_excluded(path, mapped_root))
+        has_default_excluded_component_under(path, mapped_root)
+            || self
+                .context_root_excludes(context_key)
+                .is_some_and(|excludes| excludes.is_excluded(path, mapped_root))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11967,14 +11907,8 @@ impl Workspace {
             if let Some(budget) = budget {
                 budget.charge_package_path_visits(1)?;
             }
-            let (descriptors, catalogue_complete) = self.package_descriptors(
-                &package_names,
-                package_name,
-                context,
-                context_key,
-                cancel,
-                budget,
-            )?;
+            let (descriptors, catalogue_complete) =
+                self.package_descriptors(package_name, context, context_key, cancel, budget)?;
             if !catalogue_complete {
                 lookup.complete = false;
                 lookup.warnings.push(format!(
@@ -12081,7 +12015,6 @@ impl Workspace {
 
     fn package_descriptors(
         &mut self,
-        requested_names: &[String],
         package_name: &str,
         context: &ProjectContext,
         context_key: &ContextKey,
@@ -12089,65 +12022,33 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(Vec<PathBuf>, bool), String> {
         check_workspace_cancel(cancel)?;
-        let requested_names: HashSet<String> = requested_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
         let key = package_name.to_ascii_lowercase();
         let roots = self.package_catalogue_roots(context, context_key, cancel, budget)?;
-
-        for root in &roots {
-            self.package_catalogue(context_key, root, &requested_names, cancel, budget)?;
-        }
-        check_workspace_cancel(cancel)?;
-        let (mut descriptors, complete) =
-            self.catalogued_package_descriptors(context_key, &roots, &key, cancel, budget)?;
-
-        descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        descriptors.dedup_by(|left, right| package_paths_equal(left, right));
-        Ok((descriptors, complete))
-    }
-
-    fn catalogued_package_descriptors(
-        &self,
-        context_key: &ContextKey,
-        roots: &[PathBuf],
-        package_name: &str,
-        cancel: Option<&AtomicBool>,
-        budget: Option<&ReconciliationBudget>,
-    ) -> Result<(Vec<PathBuf>, bool), String> {
         let mut descriptors: Vec<PathBuf> = Vec::new();
         let mut complete = true;
-        for root in roots {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            let root = absolute_path(root.clone());
-            let key = PackageCatalogueKey {
-                context: context_key.clone(),
-                root,
-            };
-            let Some(catalogue) = self.package_catalogues.get(&key) else {
-                complete = false;
-                continue;
-            };
-            complete &= catalogue.complete;
-            if let Some(paths) = catalogue.entries.get(package_name) {
-                for path in paths {
-                    check_workspace_cancel(cancel)?;
-                    if let Some(budget) = budget {
-                        budget.charge_path_visits(1)?;
-                    }
-                    if !descriptors
-                        .iter()
-                        .any(|existing| package_paths_equal(existing, path))
-                    {
-                        descriptors.push(path.clone());
-                    }
+        for root in &roots {
+            let catalogue = self.package_catalogue(context_key, root, cancel, budget)?;
+            // A symlinked or missing root, an unreadable directory or a limit
+            // leaves package absence unproven, as the old scan did.
+            complete &= catalogue.is_complete()
+                && catalogue.unreadable_count() == 0
+                && catalogue.root_kind() == crate::catalogue::RootKind::Directory;
+            for path in catalogue.package_descriptors(&key) {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if !descriptors
+                    .iter()
+                    .any(|existing| package_paths_equal(existing, path))
+                {
+                    descriptors.push(path.to_path_buf());
                 }
             }
         }
+        check_workspace_cancel(cancel)?;
+        descriptors.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        descriptors.dedup_by(|left, right| package_paths_equal(left, right));
         Ok((descriptors, complete))
     }
 
@@ -12460,250 +12361,30 @@ impl Workspace {
         Ok(())
     }
 
+    /// The recursive catalogue of `root` under the context's workspace-root
+    /// exclusions, complete up to the scope cap. Every `.dpk`/`.dproj` stem
+    /// is indexed, so no requested-name set is part of it.
     fn package_catalogue(
         &mut self,
         context_key: &ContextKey,
         root: &Path,
-        requested_names: &HashSet<String>,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
-    ) -> Result<PackageCatalogue, String> {
+    ) -> Result<Arc<Catalogue>, String> {
         check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
-        let key = PackageCatalogueKey {
-            context: context_key.clone(),
-            root: root.clone(),
+        let scope = match self.context_root_excludes(context_key) {
+            Some(matcher) => CatalogueScope::recursive(&root, Some(matcher)),
+            None => CatalogueScope::recursive(&root, Some(&ExcludeMatcher::new(&root, &root, &[]))),
         };
-        let requested_names: HashSet<String> = requested_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        let mut fresh = false;
-        if let Some(catalogue) = self.package_catalogues.get(&key) {
-            fresh = catalogue.complete
-                && requested_names.is_subset(&catalogue.requested_names)
-                && package_catalogue_directories_are_readable(
-                    &catalogue.directories,
-                    cancel,
-                    budget,
-                )?;
-            if fresh && catalogue.validated_epoch != self.package_catalogue_epoch {
-                for (path, stamp) in &catalogue.directories {
-                    check_workspace_cancel(cancel)?;
-                    if let Some(budget) = budget {
-                        budget.charge_package_path_visits(1)?;
-                    }
-                    if path_stamp(path) != *stamp {
-                        fresh = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if fresh {
-            self.use_clock = self.use_clock.saturating_add(1);
-            if let Some(catalogue) = self.package_catalogues.get_mut(&key) {
-                catalogue.validated_epoch = self.package_catalogue_epoch;
-                catalogue.last_used = self.use_clock;
-                return Ok(catalogue.clone());
-            }
-        }
-
-        let mut scan_names = requested_names.clone();
-        if let Some(catalogue) = self.package_catalogues.get(&key) {
-            scan_names.extend(catalogue.requested_names.iter().cloned());
-        }
-        let scan = self.scan_package_catalogue(context_key, &root, &scan_names, cancel, budget)?;
-
-        self.use_clock = self.use_clock.saturating_add(1);
-        let catalogue = PackageCatalogue {
-            entries: scan.entries,
-            requested_names: scan_names,
-            complete: scan.complete,
-            directories: scan.directories,
-            validated_epoch: self.package_catalogue_epoch,
-            last_used: self.use_clock,
-        };
-        self.package_catalogues.insert(key, catalogue.clone());
-        self.trim_package_catalogues();
-        Ok(catalogue)
-    }
-
-    fn scan_package_catalogue(
-        &mut self,
-        context_key: &ContextKey,
-        root: &Path,
-        requested_names: &HashSet<String>,
-        cancel: Option<&AtomicBool>,
-        budget: Option<&ReconciliationBudget>,
-    ) -> Result<PackageCatalogueScan, String> {
-        check_workspace_cancel(cancel)?;
-        let root = absolute_path(root.to_path_buf());
-        let excludes = self
-            .roots
-            .iter()
-            .find(|workspace_root| {
-                context_key
-                    .workspace_root
-                    .as_deref()
-                    .is_some_and(|selected| native_paths_equal(selected, &workspace_root.path))
-            })
-            .map(|workspace_root| workspace_root.excludes.clone())
-            .unwrap_or_else(|| ExcludeMatcher::new(&root, &root, &[]));
-        let mut scan = PackageCatalogueScan {
-            complete: true,
-            ..PackageCatalogueScan::default()
-        };
-        check_workspace_cancel(cancel)?;
-        if let Some(budget) = budget {
-            budget.charge_package_path_visits(1)?;
-        }
-        scan.directories.push((root.clone(), path_stamp(&root)));
-        check_workspace_cancel(cancel)?;
-        if let Some(budget) = budget {
-            budget.charge_path_visits(1)?;
-        }
-        if fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-            scan.complete = false;
-            return Ok(scan);
-        }
-        let mut pending = VecDeque::from([root.clone()]);
-        let mut visited = 1usize;
-
-        'directories: while let Some(directory) = pending.pop_front() {
+        let mut before_io = || -> Result<(), String> {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
                 budget.charge_package_path_visits(1)?;
             }
-            #[cfg(test)]
-            crate::catalogue::test_record_listing(&directory);
-            let read_dir = match fs::read_dir(&directory) {
-                Ok(read_dir) => read_dir,
-                Err(_) => {
-                    scan.complete = false;
-                    break;
-                }
-            };
-            let mut children = Vec::new();
-            let mut read_dir = read_dir;
-            loop {
-                check_workspace_cancel(cancel)?;
-                if let Some(budget) = budget {
-                    budget.charge_package_path_visits(1)?;
-                }
-                let Some(result) = read_dir.next() else {
-                    break;
-                };
-                if visited >= MAX_PACKAGE_CATALOGUE_ENTRIES {
-                    scan.complete = false;
-                    break 'directories;
-                }
-                let Ok(entry) = result else {
-                    scan.complete = false;
-                    break 'directories;
-                };
-                visited += 1;
-                children.push(entry);
-            }
-            children.sort_by(|left, right| {
-                left.path()
-                    .to_string_lossy()
-                    .cmp(&right.path().to_string_lossy())
-            });
-
-            let mut descriptors_by_stem: HashMap<String, PackageDescriptorFiles> = HashMap::new();
-            for entry in children {
-                check_workspace_cancel(cancel)?;
-                if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
-                }
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    scan.complete = false;
-                    continue;
-                };
-                let excluded = excludes.is_excluded(&path, &root);
-                if file_type.is_dir() {
-                    if let Some(budget) = budget {
-                        budget.charge_path_visits(1)?;
-                    }
-                    scan.directories.push((path.clone(), path_stamp(&path)));
-                    if !file_type.is_symlink() && !excluded {
-                        pending.push_back(path);
-                    }
-                    continue;
-                }
-                if file_type.is_symlink()
-                    || excluded
-                    || !file_type.is_file()
-                    || !(extension_is(&path, "dpk") || extension_is(&path, "dproj"))
-                {
-                    continue;
-                }
-                let Some(stem) = path.file_stem() else {
-                    continue;
-                };
-                let stem = stem.to_string_lossy().to_ascii_lowercase();
-                let mut matched_names = Vec::new();
-                if requested_names.contains(&stem) {
-                    matched_names.push(stem.clone());
-                }
-
-                let files = descriptors_by_stem.entry(stem).or_default();
-                if extension_is(&path, "dpk") {
-                    files.has_dpk = true;
-                    if !matched_names.is_empty() {
-                        files.dpk.push(PackageDescriptorMatch {
-                            path,
-                            names: matched_names,
-                        });
-                    }
-                } else if !matched_names.is_empty() {
-                    files.dproj.push(PackageDescriptorMatch {
-                        path,
-                        names: matched_names,
-                    });
-                }
-            }
-
-            for files in descriptors_by_stem.into_values() {
-                check_workspace_cancel(cancel)?;
-                let selected = if files.has_dpk {
-                    files.dpk
-                } else {
-                    files.dproj
-                };
-                for descriptor in selected {
-                    for name in descriptor.names {
-                        scan.entries
-                            .entry(name)
-                            .or_default()
-                            .push(descriptor.path.clone());
-                    }
-                }
-            }
-        }
-
-        for paths in scan.entries.values_mut() {
-            check_workspace_cancel(cancel)?;
-            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-            paths.dedup_by(|left, right| package_paths_equal(left, right));
-        }
-        Ok(scan)
-    }
-
-    fn trim_package_catalogues(&mut self) {
-        while self.package_catalogues.len() > MAX_PACKAGE_CATALOGUES {
-            let Some(victim) = self
-                .package_catalogues
-                .iter()
-                .min_by_key(|(_, catalogue)| catalogue.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.package_catalogues.remove(&victim);
-        }
+            Ok(())
+        };
+        self.shared_catalogue(&scope, MAX_CATALOGUE_ENTRIES, &mut before_io)
     }
 
     fn filename_candidates_for_names(
@@ -15848,28 +15529,6 @@ fn context_uses_mapped_root(
         })
 }
 
-fn package_catalogue_directories_are_readable(
-    directories: &[(PathBuf, Option<PathStamp>)],
-    cancel: Option<&AtomicBool>,
-    budget: Option<&ReconciliationBudget>,
-) -> Result<bool, String> {
-    for (path, stamp) in directories {
-        check_workspace_cancel(cancel)?;
-        if stamp
-            .as_ref()
-            .is_some_and(|stamp| stamp.is_dir && !stamp.is_symlink)
-        {
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            if fs::read_dir(path).is_err() {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
 fn relative_path(base: &Path, path: &Path) -> Option<PathBuf> {
     let case_insensitive = pascal_project::path_identity::is_case_insensitive(base);
     let base_components = base.components().collect::<Vec<_>>();
@@ -17447,37 +17106,6 @@ mod tests {
             assert_eq!(metrics["recovery_visits"], 0);
             assert_eq!(metrics["recovery_visit_reserve"], 0);
         }
-    }
-
-    #[test]
-    fn refused_recovery_discards_nested_catalogue_payload() {
-        let temp = tempfile::tempdir().expect("workspace root");
-        let mut workspace =
-            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
-        let catalogue_root = temp.path().join("catalogue");
-        let key = super::PackageCatalogueKey {
-            context: budget_test_context_key(0),
-            root: catalogue_root.clone(),
-        };
-        let mut catalogue = super::PackageCatalogue::default();
-        catalogue.entries.insert(
-            "many-children".into(),
-            (0..=65_536)
-                .map(|entry| catalogue_root.join(format!("child-{entry:05}.pas")))
-                .collect(),
-        );
-        workspace.package_catalogues.insert(key, catalogue);
-        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
-        budget
-            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
-            .expect("force notification recovery");
-        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
-
-        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
-        assert!(!workspace.analysis_admission_fenced());
-        assert!(workspace.package_catalogues.is_empty());
-        #[cfg(feature = "test-support")]
-        assert!(budget.metrics(true)["recovery_refused"].as_bool().unwrap());
     }
 
     #[test]
@@ -22706,6 +22334,40 @@ BDS = '/fake/37'
     }
 
     #[test]
+    fn package_catalogues_are_shared_by_every_context_of_a_workspace_root() {
+        let temp = tempfile::tempdir().expect("package root");
+        let root = temp.path().to_path_buf();
+        fs::write(root.join("Pkg.dpk"), "package Pkg; end.").expect("descriptor");
+        let main = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let debug = ContextKey {
+            workspace_root: Some(root.clone()),
+            config: Some("Debug".to_string()),
+            ..budget_test_context_key(0)
+        };
+        let release = ContextKey {
+            config: Some("Release".to_string()),
+            ..debug.clone()
+        };
+        let input = main.analysis_input();
+        let first = Workspace::from_analysis_input(&input)
+            .package_catalogue(&debug, &root, None, None)
+            .expect("debug catalogue");
+        crate::catalogue::test_reset_listings();
+        let second = Workspace::from_analysis_input(&input)
+            .package_catalogue(&release, &root, None, None)
+            .expect("release catalogue");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the context is not part of the key"
+        );
+        assert!(crate::catalogue::test_listings().is_empty());
+        assert_eq!(
+            second.package_descriptors("pkg").collect::<Vec<_>>(),
+            [super::absolute_path(root.join("Pkg.dpk")).as_path()]
+        );
+    }
+
+    #[test]
     fn package_catalogue_scan_charges_directory_and_candidate_enumeration() {
         let temp = tempfile::tempdir().expect("package root");
         for index in 0..5 {
@@ -22735,7 +22397,7 @@ BDS = '/fake/37'
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
 
         workspace
-            .scan_package_catalogue(&context, temp.path(), &HashSet::new(), None, Some(&budget))
+            .package_catalogue(&context, temp.path(), None, Some(&budget))
             .expect("bounded package catalogue scan");
 
         assert!(

@@ -491,6 +491,9 @@ pub(crate) struct SharedCatalogue {
 pub(crate) struct Removed {
     pub(crate) bytes: usize,
     pub(crate) watch_directories: Vec<PathBuf>,
+    /// The cache's watch-count epoch when the watches were acquired; under a
+    /// later one they were already drained and must not be released.
+    pub(crate) watch_count_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -500,6 +503,7 @@ struct Stored {
     last_used: u64,
     bytes: usize,
     watch_directories: Vec<PathBuf>,
+    watch_count_epoch: u64,
     watch_epoch: Option<u64>,
     watched: bool,
 }
@@ -512,7 +516,10 @@ pub(crate) struct CatalogueStore {
     by_directory: HashMap<PathBuf, HashSet<CatalogueKey>>,
     clock: u64,
     generation: u64,
+    /// Watches held by catalogues acquired under `watch_count_epoch`; older
+    /// ones were drained by poison recovery and hold nothing.
     watched_directories: usize,
+    watch_count_epoch: u64,
     /// `None` is `MAX_CATALOGUE_WATCH_DIRECTORIES`.
     watch_budget: Option<usize>,
 }
@@ -555,14 +562,17 @@ impl CatalogueStore {
         catalogue: Arc<Catalogue>,
         bytes: usize,
         watch_directories: Vec<PathBuf>,
+        watch_count_epoch: u64,
     ) -> Result<(u64, Vec<Removed>), Removed> {
         let current = self.entries.get(&key).map(|stored| stored.generation);
         if current != base {
             return Err(Removed {
                 bytes,
                 watch_directories,
+                watch_count_epoch,
             });
         }
+        self.advance_watch_count_epoch(watch_count_epoch);
         let mut removed = self.take(&key).into_iter().collect::<Vec<_>>();
         self.generation += 1;
         self.clock += 1;
@@ -572,7 +582,9 @@ impl CatalogueStore {
                 .or_default()
                 .insert(key.clone());
         }
-        self.watched_directories += watch_directories.len();
+        if watch_count_epoch == self.watch_count_epoch {
+            self.watched_directories += watch_directories.len();
+        }
         self.entries.insert(
             key,
             Stored {
@@ -581,6 +593,7 @@ impl CatalogueStore {
                 last_used: self.clock,
                 bytes,
                 watch_directories,
+                watch_count_epoch,
                 watch_epoch: None,
                 watched: false,
             },
@@ -599,8 +612,11 @@ impl CatalogueStore {
         Ok((self.generation, removed))
     }
 
-    /// Whether `directories` more native watches fit the catalogues' budget.
-    pub(crate) fn can_watch(&self, directories: usize) -> bool {
+    /// Whether `directories` more native watches fit the catalogues' budget,
+    /// counting only those acquired under `watch_count_epoch` (the cache's
+    /// current one).
+    pub(crate) fn can_watch(&mut self, directories: usize, watch_count_epoch: u64) -> bool {
+        self.advance_watch_count_epoch(watch_count_epoch);
         let budget = self.watch_budget.unwrap_or(MAX_CATALOGUE_WATCH_DIRECTORIES);
         self.watched_directories
             .checked_add(directories)
@@ -672,8 +688,24 @@ impl CatalogueStore {
             .map(|(_, stored)| Removed {
                 bytes: stored.bytes,
                 watch_directories: stored.watch_directories,
+                watch_count_epoch: stored.watch_count_epoch,
             })
             .collect()
+    }
+
+    /// Stops counting the watches of catalogues acquired before
+    /// `watch_count_epoch`: poison recovery drained them.
+    fn advance_watch_count_epoch(&mut self, watch_count_epoch: u64) {
+        if watch_count_epoch <= self.watch_count_epoch {
+            return;
+        }
+        self.watch_count_epoch = watch_count_epoch;
+        self.watched_directories = self
+            .entries
+            .values()
+            .filter(|stored| stored.watch_count_epoch == watch_count_epoch)
+            .map(|stored| stored.watch_directories.len())
+            .sum();
     }
 
     fn take(&mut self, key: &CatalogueKey) -> Option<Removed> {
@@ -686,12 +718,15 @@ impl CatalogueStore {
                 }
             }
         }
-        self.watched_directories = self
-            .watched_directories
-            .saturating_sub(stored.watch_directories.len());
+        if stored.watch_count_epoch == self.watch_count_epoch {
+            self.watched_directories = self
+                .watched_directories
+                .saturating_sub(stored.watch_directories.len());
+        }
         Some(Removed {
             bytes: stored.bytes,
             watch_directories: stored.watch_directories,
+            watch_count_epoch: stored.watch_count_epoch,
         })
     }
 }

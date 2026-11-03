@@ -1619,6 +1619,39 @@ mod cache_tests {
     }
 
     #[test]
+    fn poison_recovery_forgets_the_catalogue_watches_it_drained() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared_directory = temp.path().join("sub");
+        std::fs::create_dir_all(&shared_directory).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        cache.set_catalogue_watch_budget_for_test(2);
+        let (old_key, old) = super::listed_catalogue(temp.path());
+        let old_generation = cache.publish_catalogue(old_key.clone(), None, old).unwrap();
+        cache.poison_state();
+        let (new_key, new) = super::listed_catalogue(&shared_directory);
+        let new_generation = cache.publish_catalogue(new_key.clone(), None, new).unwrap();
+        assert!(
+            cache.catalogue(&new_key).unwrap().watch_registered,
+            "drained watches no longer count against the budget"
+        );
+        cache.confirm_catalogue_watched(&new_key, new_generation);
+        assert!(cache.catalogue(&new_key).unwrap().watched);
+        let before_drop = calls.lock().unwrap().len();
+        cache.drop_catalogue(&old_key, old_generation);
+        assert_eq!(
+            calls.lock().unwrap()[before_drop..],
+            [],
+            "the older catalogue's release must not unwatch what the newer one holds"
+        );
+        cache.drop_catalogue(&new_key, new_generation);
+        assert_eq!(
+            calls.lock().unwrap()[before_drop..],
+            [("unwatch", shared_directory, true)]
+        );
+    }
+
+    #[test]
     fn a_failed_watch_leaves_the_catalogue_unregistered() {
         struct Refuse;
         impl DirectoryWatch for Refuse {
@@ -2548,6 +2581,9 @@ struct State {
     /// them: their holders release them on drop.
     reserved: [usize; ReservationKind::COUNT],
     watch_counts: HashMap<PathBuf, usize>,
+    /// Advances when poison recovery drains `watch_counts`: a catalogue's
+    /// watches acquired under an older one were drained and are not released.
+    watch_count_epoch: u64,
     /// Directories whose watch count reached or left zero. `sync_watches`
     /// applies them to the watcher once the state lock is released.
     watch_changes: Vec<PathBuf>,
@@ -2581,6 +2617,7 @@ impl Default for State {
             outstanding_bytes: 0,
             reserved: [0; ReservationKind::COUNT],
             watch_counts: HashMap::new(),
+            watch_count_epoch: 0,
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
@@ -2905,6 +2942,7 @@ fn recover_poisoned_state<'a>(
     let watched_directories = watched_directories.collect::<Vec<_>>();
     state.watch_changes.extend(watched_directories);
     // The drained counts held the catalogue watches too.
+    state.watch_count_epoch += 1;
     inner.watch_epoch.fetch_add(1, Ordering::SeqCst);
     inner.state.clear_poison();
     state
@@ -4485,9 +4523,16 @@ impl ProjectCache {
             .map(|(directory, _)| directory.clone())
             .collect::<Vec<_>>();
         let epoch = self.inner.watch_epoch.load(Ordering::SeqCst);
-        let watch = self.has_watcher() && self.catalogues().can_watch(directories.len());
+        let state = lock(&self.inner);
+        let mut count_epoch = state.watch_count_epoch;
+        self.release(state);
+        let watch =
+            self.has_watcher() && self.catalogues().can_watch(directories.len(), count_epoch);
         if watch {
+            // Read under the lock that acquires: `lock` may have just
+            // recovered from poison and advanced it.
             let mut state = lock(&self.inner);
+            count_epoch = state.watch_count_epoch;
             for directory in &directories {
                 acquire_watch(&mut state, directory);
             }
@@ -4498,9 +4543,9 @@ impl ProjectCache {
         } else {
             Vec::new()
         };
-        let outcome = self
-            .catalogues()
-            .publish(key.clone(), base, catalogue, bytes, held);
+        let outcome =
+            self.catalogues()
+                .publish(key.clone(), base, catalogue, bytes, held, count_epoch);
         match outcome {
             Ok((generation, removed)) => {
                 self.release_catalogues(removed);
@@ -4602,6 +4647,11 @@ impl ProjectCache {
         let index = ReservationKind::Catalogues.index();
         for removed in &removed {
             state.reserved[index] = state.reserved[index].saturating_sub(removed.bytes);
+            // Watches acquired before a poison recovery were drained with
+            // the counts; releasing them would release a newer holder's.
+            if removed.watch_count_epoch != state.watch_count_epoch {
+                continue;
+            }
             for directory in &removed.watch_directories {
                 release_watch(&mut state, directory);
             }

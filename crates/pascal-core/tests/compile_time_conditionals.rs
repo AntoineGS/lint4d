@@ -492,6 +492,7 @@ fn bulk_plain_trivia_keeps_directives_coordinates_and_default_work_bounds() {
         ));
         fixture.limits.max_byte_work = CompileTimeLimits::default().max_byte_work;
         fixture.limits.max_work = 16;
+        fixture.limits.work_per_source_byte = 0;
         assert!(matches!(
             fixture.analyze(),
             Err(pascal_core::ResolverError::LimitExceeded {

@@ -770,6 +770,8 @@ fn analyze_source_with_providers_inner(
     prepared_coordinate: Option<Arc<str>>,
 ) -> Result<SessionOutput, ResolverError> {
     let limits = budget.limits();
+    // Scanning this source costs steps in proportion to its bytes.
+    budget.grant_source_bytes(root.bytes.len());
     let metadata = crate::resolver::loaded_source_metadata_retained(root);
     if !metadata_admitted {
         budget
@@ -2223,6 +2225,10 @@ impl RootSession<'_, '_> {
             }
             .into();
         }
+        if let Resolution::Found(child) = result.result() {
+            // The child's text is scanned in this session.
+            self.budget.grant_source_bytes(child.bytes.len());
+        }
         let index = self.includes.len();
         self.budget
             .charge(mapping.fragments.len(), 0, 0)
@@ -3454,6 +3460,8 @@ mod tests {
             &mut NoGraphCallbacks,
             CompileTimeLimits {
                 max_work: 1_000_000,
+                // The old fixed profile: no steps granted per source byte.
+                work_per_source_byte: 0,
                 max_byte_work: 16 * 1024 * 1024,
                 ..limits
             },
@@ -3472,23 +3480,22 @@ mod tests {
             "unit Dense; interface {} implementation end.",
             "{$DEFINE LOCAL}\n".repeat(16_000)
         ));
-        let refusal = analyze_source(
+        let dense = analyze_source(
             &extreme,
             &ConditionalContext::default(),
             &mut NoGraphCallbacks,
             limits,
             &NoCancellation,
         );
+        // Dense directives cost a linear number of steps beyond the fixed
+        // 2M profile; the steps granted per scanned source byte admit them
+        // (superlinear work still trips: tests/compile_time_work_scaling.rs).
+        let output = dense.expect("dense directives fit the per-byte grant");
+        assert!(output.root.complete);
+        assert!(output.budget.budget_snapshot().work > 2_000_000);
         assert!(
-            matches!(
-                refusal,
-                Err(ResolverError::LimitExceeded {
-                    limit: "max_work",
-                    observed: 2_000_001,
-                    maximum: 2_000_000
-                })
-            ),
-            "genuine dense processing must retain 2M fuse: {refusal:?}"
+            output.budget.budget_snapshot().work
+                < 2_000_000 + extreme.bytes.len() * limits.work_per_source_byte
         );
         struct CancelAfter(std::cell::Cell<usize>);
         impl CancellationToken for CancelAfter {

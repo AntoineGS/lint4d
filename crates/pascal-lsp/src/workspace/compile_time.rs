@@ -471,6 +471,7 @@ pub(super) fn selected_import_header(
     }
     let conditional_context = context.conditional_context_for(&root.path);
     let used = resolver.compile_time_usage();
+    let granted = resolver.compile_time_work_allowance();
     let mut adapter = HeaderResolver {
         inner: &mut resolver,
         captures: None,
@@ -481,7 +482,10 @@ pub(super) fn selected_import_header(
         &mut adapter,
         CompileTimeLimits {
             max_branch_states: HEADER_MAX_BRANCH_STATES,
-            max_work: limits.max_compile_time_work.saturating_sub(used.work),
+            max_work: limits
+                .max_compile_time_work
+                .saturating_add(granted)
+                .saturating_sub(used.work),
             max_byte_work: limits
                 .max_compile_time_byte_work
                 .saturating_sub(used.byte_work),

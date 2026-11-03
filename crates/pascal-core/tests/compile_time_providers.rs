@@ -1803,3 +1803,95 @@ fn a_provider_found_through_different_entries_is_funded_once_per_revision() {
         "{analysis:?}"
     );
 }
+
+/// l4d-4nbs R13: a later import of a provider whose session graph already
+/// prepared the same name shares that graph instead of copying it. Each
+/// copy of Windows.pas's graph cost 12.5M of byte work (75M per Log.pas
+/// session).
+#[test]
+fn a_provider_graph_prepared_for_the_same_name_is_shared_not_copied() {
+    let query = "{$IF Declared(Missing)}{$DEFINE HIT}{$ENDIF}";
+    let mut one = provider_fixture(
+        &format!("unit Main; interface uses A; {query} implementation end."),
+        &[("A", "unit A; interface uses W; implementation end.")],
+    );
+    let one = one.analyze().unwrap().budget.budget_snapshot().byte_work;
+    let units = ["A", "B", "C", "D"];
+    let texts = units
+        .iter()
+        .map(|u| format!("unit {u}; interface uses W; implementation end."))
+        .collect::<Vec<_>>();
+    let mut four = provider_fixture(
+        &format!("unit Main; interface uses A, B, C, D; {query} implementation end."),
+        &units
+            .iter()
+            .zip(&texts)
+            .map(|(u, t)| (*u, t.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let analysis = four.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    let four = analysis.budget.budget_snapshot().byte_work;
+    assert!(
+        four < one + one / 4,
+        "{four} byte work for four importers of W, {one} for one"
+    );
+}
+
+/// l4d-4nbs R13: one file state reached through different search entries
+/// (Windows.pas was analysed three times in one Log.pas session and its
+/// declarations exceeded `max_definitions`) is one provider identity.
+#[test]
+fn a_disk_provider_reached_through_different_entries_is_one_identity() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let one_analysis = alone.analyze().unwrap().budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    twice.importer_entries = true;
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}
+
+/// l4d-4nbs R13: SysUtils' 25 `{$IF CompilerVersion …}` each copied the
+/// Windows.pas graph to prepare the same name again (65M of byte work).
+/// A graph already prepared for a name is shared.
+#[test]
+fn repeated_queries_of_one_name_do_not_copy_provider_graphs() {
+    let usage = |queries: usize| {
+        let text = (0..queries)
+            .map(|n| format!("{{$IF CompilerVersion > {n}}}{{$DEFINE Q{n}}}{{$IFEND}}\n"))
+            .collect::<String>();
+        let mut f = provider_fixture(
+            &format!("unit Main; interface uses W; {text} implementation end."),
+            &[],
+        );
+        let analysis = f.analyze().unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        analysis.budget.budget_snapshot().byte_work
+    };
+    let (one, many) = (usage(1), usage(25));
+    assert!(
+        many < one + one / 4,
+        "{many} byte work for 25 queries, {one} for one"
+    );
+}

@@ -128,6 +128,10 @@ pub struct CompileTimeState {
     pub(super) provider_sources: Vec<LoadedSource>,
     pub(super) provider_backings: Vec<super::session::AdmittedSourceBacking>,
     in_interface: bool,
+    /// Names (and pointer mode) already prepared in this state as a provider
+    /// interface graph. Preparing one again changes nothing, so the graph is
+    /// shared instead of copied (l4d-4nbs R13).
+    pub(super) prepared: Vec<(String, bool)>,
 }
 
 pub(super) fn limit(
@@ -270,6 +274,7 @@ impl CompileTimeState {
             provider_sources: Vec::new(),
             provider_backings: Vec::new(),
             in_interface: false,
+            prepared: Vec::new(),
         })
     }
 
@@ -1678,6 +1683,9 @@ impl CompileTimeState {
         for s in &self.spans {
             visit(size_of::<Span>())?;
             visit(s.anchor.source.as_str().len())?;
+        }
+        for (name, _) in &self.prepared {
+            visit(size_of::<(String, bool)>() + name.len())?;
         }
         for d in &self.declarations {
             visit(size_of::<Declaration>())?;

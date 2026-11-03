@@ -67,6 +67,9 @@ pub struct Fixture {
     /// Serve each unit with a revision that depends on its importer, as a
     /// file found through different search entries is (same content).
     pub importer_revisions: bool,
+    /// Serve each unit read from disk through an entry that depends on its
+    /// importer: the same file state, a different authorization route.
+    pub importer_entries: bool,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -88,6 +91,7 @@ impl Fixture {
             include_warnings: vec![],
             unit_requests: vec![],
             importer_revisions: false,
+            importer_entries: false,
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -281,6 +285,20 @@ impl CompileTimeResolver for Fixture {
                     ) as i32,
                     content_hash: pascal_project::content_hash_bytes(&provider.unit.source.bytes),
                 };
+            }
+            if self.importer_entries {
+                let mut revision = disk_revision(&provider.unit.source.bytes);
+                if let SourceRevision::Disk { path_entry, .. } = &mut revision {
+                    *path_entry = pascal_project::ProjectPathEntry::configured(
+                        request
+                            .importer_path
+                            .parent()
+                            .unwrap()
+                            .join("entry")
+                            .join(request.importer_path.file_name().unwrap()),
+                    );
+                }
+                provider.unit.source.revision = revision;
             }
             let provider = &provider;
             let reusable = self.cached_unit.as_ref().is_some_and(|s| {

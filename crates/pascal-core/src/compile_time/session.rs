@@ -442,6 +442,61 @@ struct ScanCredit {
     validated: bool,
 }
 
+/// Whether two revisions are one state of one file: equal, or disk reads of
+/// the same stamp and content through different search entries or read
+/// policies. One file state is one provider identity, however a session's
+/// importers reached it (l4d-4nbs R13); an overlay version stays distinct.
+fn same_file_state(left: &crate::SourceRevision, right: &crate::SourceRevision) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (
+                crate::SourceRevision::Disk {
+                    stamp: left_stamp,
+                    content_hash: left_hash,
+                    ..
+                },
+                crate::SourceRevision::Disk {
+                    stamp: right_stamp,
+                    content_hash: right_hash,
+                    ..
+                },
+            ) if left_stamp == right_stamp && left_hash == right_hash
+        )
+}
+
+/// A provider identity's compiled interface graph, with the most names
+/// prepared so far.
+struct ProviderGraph {
+    occurrence: OccurrenceId,
+    graph: AdmittedInterfaceGraph,
+}
+
+/// Whether `name` (in `pointers` mode) is prepared in a provider graph:
+/// preparing it again changes nothing, so the graph is shared, not copied.
+fn is_prepared(prepared: &[(String, bool)], name: &str, pointers: bool) -> bool {
+    prepared
+        .iter()
+        .any(|(prepared, p)| *p == pointers && prepared.eq_ignore_ascii_case(name))
+}
+
+/// Record that `name` is prepared in `state`, admitting the entry.
+fn mark_prepared(
+    state: &mut CompileTimeState,
+    name: &str,
+    pointers: bool,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    if is_prepared(&state.prepared, name, pointers) {
+        return Ok(());
+    }
+    budget
+        .charge(1, name.len(), name.len() + size_of::<(String, bool)>())
+        .map_err(|r| resolver_error(r, budget))?;
+    state.prepared.push((name.to_owned(), pointers));
+    Ok(())
+}
+
 struct ProviderSession {
     /// Per-source session credits; shared by the root and nested provider
     /// sessions of one compilation.
@@ -453,7 +508,7 @@ struct ProviderSession {
     /// once: later imports prepare their names on a copy of this graph. A
     /// repeated analysis would be real work with no grant, since the session
     /// credits each source byte once.
-    graphs: AdmittedOwned<Vec<AdmittedOwned<(OccurrenceId, AdmittedInterfaceGraph)>>>,
+    graphs: AdmittedOwned<Vec<AdmittedOwned<ProviderGraph>>>,
     queries: usize,
     next_occurrence: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
@@ -1829,6 +1884,13 @@ impl ProviderEngine<'_, '_> {
         pointers: bool,
         depth: usize,
     ) -> Result<AdmittedInterfaceGraph, ResolverError> {
+        // A name this graph already prepared needs nothing more: share it.
+        self.budget
+            .charge(graph.prepared.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        if is_prepared(&graph.prepared, suffix, pointers) {
+            return Ok(graph.clone());
+        }
         // An independent mutable copy is required; attach its construction
         // credits before traversing/copying, not after preparation completes.
         let mut copy = self.budget.admit_compilation(0, |budget| {
@@ -1846,7 +1908,8 @@ impl ProviderEngine<'_, '_> {
                 observations: self.observations,
                 warnings: self.warnings,
             };
-            engine.prepare_name(copy, &captured, suffix, pointers, depth)
+            engine.prepare_name(copy, &captured, suffix, pointers, depth)?;
+            mark_prepared(copy, suffix, pointers, budget)
         })
         .map_err(|r| resolver_error(r, self.budget))??;
         // Move the now-prepared graph AND its existing credits into shared
@@ -2053,7 +2116,7 @@ impl ProviderEngine<'_, '_> {
         }
         if self.providers.active.iter().any(|key| {
             key.source == provider.unit.source.id
-                && key.revision == provider.unit.source.revision
+                && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
                 && key.qualifiers == provider.authorized_qualifiers
         }) {
@@ -2073,7 +2136,7 @@ impl ProviderEngine<'_, '_> {
         // fragments still receive their own physical occurrences normally.
         let previous = self.providers.identities.iter().find(|key| {
             key.source == provider.unit.source.id
-                && key.revision == provider.unit.source.revision
+                && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
                 && key.qualifiers == provider.authorized_qualifiers
         });
@@ -2083,17 +2146,18 @@ impl ProviderEngine<'_, '_> {
             self.budget
                 .charge(self.providers.graphs.len() + 1, 0, 0)
                 .map_err(|r| resolver_error(r, self.budget))?;
-            if let Some(graph) = self
+            if let Some(index) = self
                 .providers
                 .graphs
                 .iter()
-                .find(|entry| entry.0 == occurrence)
-                .map(|entry| entry.1.clone())
+                .position(|entry| entry.occurrence == occurrence)
             {
                 drop(provider);
-                return self
-                    .replace_interface_graph(&graph, name, pointers, depth + 1)
-                    .map(Fact::Known);
+                let graph = self.providers.graphs[index].graph.clone();
+                let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1)?;
+                // Keep the graph with the most names prepared.
+                self.providers.graphs.value_mut()[index].value_mut().graph = prepared.clone();
+                return Ok(Fact::Known(prepared));
             }
         }
         let occurrence = if let Some(key) = previous {
@@ -2150,7 +2214,8 @@ impl ProviderEngine<'_, '_> {
                         observations: self.observations,
                         warnings: self.warnings,
                     };
-                    engine.prepare_name(facts, &site, name, pointers, depth + 1)
+                    engine.prepare_name(facts, &site, name, pointers, depth + 1)?;
+                    mark_prepared(facts, name, pointers, budget)
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             result?;
@@ -2226,7 +2291,10 @@ impl ProviderEngine<'_, '_> {
         drop(analysis);
         let entry = self
             .budget
-            .admit_owned(1, 0, 0, || (occurrence, graph.clone()))
+            .admit_owned(1, 0, 0, || ProviderGraph {
+                occurrence,
+                graph: graph.clone(),
+            })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
         Ok(Fact::Known(graph))
@@ -5653,7 +5721,8 @@ mod tests {
         // This is the actual replacement boundary, not a primitive stand-in:
         // one mutable independent graph copy is required; sharing it performs
         // no second payload traversal/copy or payload-byte-work admission.
-        assert_eq!(after.byte_work - before.byte_work, payload);
+        // The copy records the prepared name (l4d-4nbs R13).
+        assert_eq!(after.byte_work - before.byte_work, payload + "R".len());
         assert!(!Arc::ptr_eq(&old, &replacement));
         assert_eq!(old.fingerprint(), replacement.fingerprint());
         assert!(

@@ -22335,6 +22335,7 @@ BDS = '/fake/37'
         let temp = tempfile::tempdir().expect("package root");
         let root = temp.path().to_path_buf();
         fs::write(root.join("Pkg.dpk"), "package Pkg; end.").expect("descriptor");
+        pascal_project::backdate_tree_for_test(&root);
         let main = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let debug = ContextKey {
             workspace_root: Some(root.clone()),

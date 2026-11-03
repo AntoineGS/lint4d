@@ -174,7 +174,8 @@ impl Workspace {
 
     /// The stored catalogue of `scope` if it still holds: watched, already
     /// validated by this view this request, or every listed directory's
-    /// stamp unchanged (a changed one drops it).
+    /// settled stamp unchanged (a changed or unsettled one drops it, so a
+    /// catalogue is confirmed watched only after its stamps proved it).
     fn validated_catalogue(
         &mut self,
         scope: &CatalogueScope,
@@ -190,7 +191,14 @@ impl Workspace {
         crate::catalogue::test_record_stamp_check();
         for (directory, stamp) in shared.catalogue.directories() {
             before_io()?;
-            if path_stamp(directory) != *stamp {
+            // A recorded stamp that was not settled proves nothing (l4d-122):
+            // drop the catalogue so the rebuild records fresh stamps.
+            let unchanged = match (stamp, path_stamp(directory)) {
+                (Some(recorded), Some(current)) => recorded.proves_unchanged(&current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged {
                 self.project_cache
                     .drop_catalogue(&scope.key, shared.generation);
                 return Ok(None);
@@ -278,6 +286,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         write(&root.join("A.pas"));
+        pascal_project::backdate_tree_for_test(&root);
         let main = workspace(&root);
         main.project_cache().set_watcher(Box::new(AcceptAll));
         let input = main.analysis_input();
@@ -286,6 +295,44 @@ mod tests {
         Workspace::from_analysis_input(&input).filename_catalogue(&root);
         Workspace::from_analysis_input(&input).filename_catalogue(&root);
         assert_eq!(test_stamp_checks(), 1, "one confirming check, then none");
+    }
+
+    #[test]
+    fn an_unsettled_catalogue_is_listed_again_and_never_confirmed_watched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("A.pas"));
+        write(&root.join("sub/B.pas"));
+        let main = workspace(&root);
+        main.project_cache().set_watcher(Box::new(AcceptAll));
+        let scope = CatalogueScope::recursive(&root, None);
+        let input = main.analysis_input();
+        let serve = || {
+            Workspace::from_analysis_input(&input)
+                .shared_catalogue(&scope, MAX_CATALOGUE_ENTRIES, &mut no_io())
+                .unwrap()
+        };
+        serve();
+        for _ in 0..2 {
+            test_reset_listings();
+            serve();
+            assert!(
+                test_listings().contains(&root),
+                "an unsettled stamp proves nothing: {:?}",
+                test_listings()
+            );
+            let stored = main.project_cache().catalogue(scope.key()).unwrap();
+            assert!(
+                !stored.watched,
+                "an unsettled catalogue was confirmed watched"
+            );
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        serve();
+        test_reset_listings();
+        serve();
+        assert!(test_listings().is_empty(), "{:?}", test_listings());
+        assert!(main.project_cache().catalogue(scope.key()).unwrap().watched);
     }
 
     #[test]
@@ -366,6 +413,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         write(&root.join("A.pas"));
+        pascal_project::backdate_tree_for_test(&root);
         let input = workspace(&root).analysis_input();
         let first = Workspace::from_analysis_input(&input).filename_catalogue(&root);
         test_reset_listings();
@@ -504,6 +552,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         write(&root.join("A.pas"));
         write(&root.join("sub/B.pas"));
+        pascal_project::backdate_tree_for_test(&root);
         let mut view = workspace(&root);
         let scope = CatalogueScope::recursive(&root, None);
         let mut stopped =

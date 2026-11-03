@@ -3999,6 +3999,17 @@ mod tests {
     #[test]
     fn a_second_references_request_lists_no_directory() {
         let fixture = query_fixture();
+        let root =
+            crate::workspace::absolute_path(fixture.provider.parent().unwrap().to_path_buf());
+        let nested = root.join("sub").join("Nested.pas");
+        fs::create_dir_all(nested.parent().unwrap()).expect("nested directory");
+        fs::write(
+            &nested,
+            "unit Nested;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("nested consumer");
+        // Settled stamps, so the shared catalogue outlives the first request.
+        pascal_project::backdate_tree_for_test(&root);
         let cancel = AtomicBool::new(false);
         let references = || {
             references_from_input(
@@ -4009,8 +4020,14 @@ mod tests {
                 &cancel,
             )
         };
+        crate::catalogue::test_reset_listings();
         let first = references();
         assert!(first.value.is_ok(), "first references: {first:?}");
+        let listed = crate::catalogue::test_listings();
+        assert!(
+            listed.contains(&root) && listed.contains(&root.join("sub")),
+            "the first request walks the root and its subdirectory: {listed:?}"
+        );
         crate::catalogue::test_reset_listings();
         let second = references();
         assert!(second.value.is_ok(), "second references: {second:?}");
@@ -4019,15 +4036,29 @@ mod tests {
             "the second request listed {:?}",
             crate::catalogue::test_listings()
         );
+        let first = first.value.unwrap().value;
+        assert!(
+            first
+                .iter()
+                .any(|location| location.uri == source_uri(&nested)),
+            "the nested consumer is found: {first:?}"
+        );
         assert_eq!(
-            first.value.unwrap().value,
+            first,
             second.value.unwrap().value,
             "both requests find the same references"
         );
     }
 
-    #[test]
-    fn a_narrower_exclusion_set_never_enumerates_what_a_wider_one_catalogued() {
+    /// Two views of one root sharing one cache, the narrower excluding
+    /// `vendor/`, and a references query naming the files each finds. The
+    /// tree is settled so catalogues outlive a request.
+    fn exclusion_views() -> (
+        TempDir,
+        WorkspaceInput,
+        WorkspaceInput,
+        impl Fn(&WorkspaceInput) -> Vec<String>,
+    ) {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().to_path_buf();
         let provider = root.join("Provider.pas");
@@ -4042,6 +4073,7 @@ mod tests {
             "unit VendorConsumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
         )
         .expect("vendor consumer");
+        pascal_project::backdate_tree_for_test(&root);
         let wide = test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
         let mut narrow = test_workspace(
             vec![root.clone()],
@@ -4052,14 +4084,13 @@ mod tests {
         )
         .analysis_input();
         narrow.project_cache = wide.project_cache.clone();
-        let cancel = AtomicBool::new(false);
-        let found = |input: &WorkspaceInput| {
+        let found = move |input: &WorkspaceInput| {
             let computed = references_from_input(
                 input.clone(),
                 &source_uri(&provider),
                 shared_value_position(),
                 false,
-                &cancel,
+                &AtomicBool::new(false),
             );
             computed
                 .value
@@ -4069,6 +4100,12 @@ mod tests {
                 .map(|location| location.uri.path().rsplit('/').next().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
+        (temp, wide, narrow, found)
+    }
+
+    #[test]
+    fn a_narrower_exclusion_set_never_enumerates_what_a_wider_one_catalogued() {
+        let (_temp, wide, narrow, found) = exclusion_views();
         assert_eq!(found(&wide), ["VendorConsumer.pas"]);
         assert!(
             found(&narrow).is_empty(),
@@ -4078,6 +4115,24 @@ mod tests {
             found(&wide),
             ["VendorConsumer.pas"],
             "the wider view still does"
+        );
+    }
+
+    #[test]
+    fn a_wider_exclusion_set_still_finds_what_a_narrower_one_catalogued_first() {
+        let (_temp, wide, narrow, found) = exclusion_views();
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view must not see vendor/"
+        );
+        assert_eq!(
+            found(&wide),
+            ["VendorConsumer.pas"],
+            "the wider view is not served the narrower catalogue"
+        );
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view still does not"
         );
     }
 

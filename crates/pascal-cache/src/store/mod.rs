@@ -37,6 +37,7 @@ mod sqlite;
 mod stream;
 #[cfg(feature = "test-support")]
 mod testing;
+mod wal;
 
 pub use artifacts::{
     ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
@@ -88,6 +89,7 @@ pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
 #[cfg(feature = "test-support")]
 pub use testing::{HeldConnection, ScratchHold};
+pub use wal::Checkpointed;
 
 use crate::Namespace;
 use namespaces::NamespaceLock;

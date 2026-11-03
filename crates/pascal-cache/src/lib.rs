@@ -60,7 +60,7 @@ pub use namespace::{BUILD_FINGERPRINT, Namespace};
 pub use store::{
     APPLICATION_ID, Access, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow,
     ArtifactWrite, BindingBatch, Bypass, CONNECTION_OVERHEAD_BYTES, CONTAINER_VERSION,
-    DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite,
+    Checkpointed, DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite,
     FACT_CHECKSUM_CONTEXT, Hint, HintStats, ImporterHit, ImporterPage, IndexHit, IndexPage,
     Integrity, JOURNAL_SIZE_LIMIT_BYTES, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES,
     LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS,

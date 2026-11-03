@@ -171,10 +171,14 @@ pub enum FaultPoint {
     GcRetireBeforeCommit,
     /// Inside a `reclaim` deletion batch, before commit.
     GcDeleteBeforeCommit,
+    /// After a maintenance checkpoint; no connection is held.
+    CheckpointCompleted,
+    /// Inside an incremental vacuum batch, before commit.
+    VacuumBeforeCommit,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -186,10 +190,17 @@ impl FaultPoint {
         Self::LeaseRenewDecided,
         Self::GcRetireBeforeCommit,
         Self::GcDeleteBeforeCommit,
+        Self::CheckpointCompleted,
+        Self::VacuumBeforeCommit,
     ];
 
     /// The points inside maintenance batches.
-    pub const MAINTENANCE: [Self; 2] = [Self::GcRetireBeforeCommit, Self::GcDeleteBeforeCommit];
+    pub const MAINTENANCE: [Self; 4] = [
+        Self::GcRetireBeforeCommit,
+        Self::GcDeleteBeforeCommit,
+        Self::CheckpointCompleted,
+        Self::VacuumBeforeCommit,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -204,6 +215,8 @@ impl FaultPoint {
             Self::LeaseRenewDecided => "LeaseRenewDecided",
             Self::GcRetireBeforeCommit => "GcRetireBeforeCommit",
             Self::GcDeleteBeforeCommit => "GcDeleteBeforeCommit",
+            Self::CheckpointCompleted => "CheckpointCompleted",
+            Self::VacuumBeforeCommit => "VacuumBeforeCommit",
         }
     }
 

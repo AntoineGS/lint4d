@@ -243,12 +243,7 @@ fn the_wal_threshold_stops_writes_until_a_checkpoint_makes_room() {
         Err(Bypass::WalPressure)
     );
     assert_eq!(store.pressure(), Ok(Pressure::WalPressure));
-    // Task 8 replaces this with a maintenance checkpoint.
-    let _: (i64, i64, i64) = common::records::raw(root.path())
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .unwrap();
+    assert!(store.checkpoint().unwrap().truncated);
     assert_eq!(
         publish_bulk(&store, "unit B;", 1, 10),
         Ok(Published::Inserted)
@@ -1101,4 +1096,151 @@ fn a_fenced_handle_still_reclaims_whole_retired_scopes() {
     while !store.reclaim(256).unwrap().complete {}
     assert_eq!(table_rows(root.path()), 0);
     assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
+}
+
+#[test]
+fn an_idle_store_checkpoints_and_truncates_its_wal() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    let checkpoint = store.checkpoint().unwrap();
+    assert!(
+        checkpoint.complete() && checkpoint.wal_frames > 0,
+        "{checkpoint:?}"
+    );
+    assert!(checkpoint.truncated);
+    assert_eq!(file_len(root.path(), "-wal"), 0);
+    assert!(
+        file_len(root.path(), "") > 8 << 20,
+        "the pages are in the database"
+    );
+}
+
+#[test]
+fn a_held_reader_keeps_the_checkpoint_partial_and_writes_stop_at_the_threshold() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    let reader = raw(root.path());
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .unwrap();
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    let checkpoint = store.checkpoint().unwrap();
+    assert!(
+        !checkpoint.complete() && !checkpoint.truncated,
+        "{checkpoint:?}"
+    );
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Err(Bypass::WalPressure)
+    );
+    reader.execute_batch("COMMIT").unwrap();
+    assert!(store.checkpoint().unwrap().truncated);
+    assert_eq!(
+        publish_bulk(&store, "unit B;", 1, 10),
+        Ok(Published::Inserted)
+    );
+}
+
+#[test]
+fn incremental_vacuum_returns_free_pages_in_bounded_batches() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    while !store.reclaim(256).unwrap().complete {}
+    store.checkpoint().unwrap();
+    let free = || store.usage().unwrap().free_pages;
+    let start = free();
+    assert!(start > 256, "{start} free pages");
+    let limits = MaintenanceLimits {
+        vacuum_free_bytes: 0,
+        ..EAGER
+    };
+    let first = store.vacuum_step(&limits).unwrap();
+    assert!((1..=256).contains(&first));
+    while store.vacuum_step(&limits).unwrap() > 0 {}
+    assert_eq!(free(), 0);
+    assert_eq!(
+        store.vacuum_step(&MaintenanceLimits::default()),
+        Ok(0),
+        "below the threshold"
+    );
+    store.checkpoint().unwrap();
+    assert!(file_len(root.path(), "") < 2 << 20, "the file shrank");
+}
+
+#[test]
+fn vacuum_validates_its_limits_and_writes_nothing_at_the_wal_threshold() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let bad = MaintenanceLimits {
+        vacuum_pages: 257,
+        ..EAGER
+    };
+    assert_eq!(
+        store.vacuum_step(&bad),
+        Err(Bypass::InvalidMaintenanceLimits)
+    );
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    let reader = raw(root.path());
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .unwrap();
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    let eager = MaintenanceLimits {
+        vacuum_free_bytes: 0,
+        ..EAGER
+    };
+    assert_eq!(store.vacuum_step(&eager), Err(Bypass::WalPressure));
+    assert!(store.checkpoint().is_ok(), "checkpoints are always allowed");
+}
+
+#[test]
+fn a_vacuum_batch_passes_its_fault_point_before_commit() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    while !store.reclaim(256).unwrap().complete {}
+    store.checkpoint().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    store.set_fault_for_test(FaultPoint::VacuumBeforeCommit, move || {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let limits = MaintenanceLimits {
+        vacuum_free_bytes: 0,
+        ..EAGER
+    };
+    assert!(store.vacuum_step(&limits).unwrap() > 0);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = completed.clone();
+    store.set_fault_for_test(FaultPoint::CheckpointCompleted, move || {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    store.checkpoint().unwrap();
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

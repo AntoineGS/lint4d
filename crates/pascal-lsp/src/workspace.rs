@@ -10180,8 +10180,14 @@ impl Workspace {
             if projectless
                 && key.selection_scope.is_none()
                 && project_options.project_file.is_none()
-                && let Some(claimed) =
-                    self.claim_projectless_unit(uri, &path, cancel, budget, defer_context_pruning)?
+                && let Some(claimed) = self.claim_projectless_unit(
+                    uri,
+                    &path,
+                    discovery_inputs,
+                    cancel,
+                    budget,
+                    defer_context_pruning,
+                )?
             {
                 return Ok(claimed);
             }
@@ -10214,8 +10220,14 @@ impl Workspace {
             && discovery.context.discovery_complete()
             && discovery.project_selection.is_none()
             && project_options.project_file.is_none()
-            && let Some(claimed) =
-                self.claim_projectless_unit(uri, &path, cancel, budget, defer_context_pruning)?
+            && let Some(claimed) = self.claim_projectless_unit(
+                uri,
+                &path,
+                discovery_inputs,
+                cancel,
+                budget,
+                defer_context_pruning,
+            )?
         {
             return Ok(claimed);
         }
@@ -10318,6 +10330,7 @@ impl Workspace {
         &mut self,
         uri: &Url,
         path: &Path,
+        discovery_inputs: u64,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
         defer_context_pruning: bool,
@@ -10328,49 +10341,71 @@ impl Workspace {
         {
             return Ok(None);
         }
-        let selected = self
-            .contexts
-            .iter()
-            .filter(|(key, _)| {
-                key.selection_scope
-                    .as_deref()
-                    .zip(key.selection_project.as_deref())
-                    .is_some_and(|(scope, project)| {
-                        self.project_selections
-                            .get(scope)
-                            .is_some_and(|current| paths_equal_ci(current, project))
-                    })
-            })
-            .map(|(key, _)| key.clone());
+        let is_selected = |key: &ContextKey| {
+            key.selection_scope
+                .as_deref()
+                .zip(key.selection_project.as_deref())
+                .is_some_and(|(scope, project)| {
+                    self.project_selections
+                        .get(scope)
+                        .is_some_and(|current| paths_equal_ci(current, project))
+                })
+        };
+        // A request workspace starts from the document owners alone, so the
+        // open documents' contexts come from their owners when not installed.
+        let mut claimants = Vec::<(bool, ContextKey, Option<Arc<ContextState>>)>::new();
         let open = self
-            .open_document_contexts
-            .iter()
-            .filter(|(document, _)| *document != uri)
-            .map(|(_, key)| key.clone());
-        let mut claimants = Vec::<(bool, ContextKey)>::new();
-        for (is_selected, key) in selected
-            .map(|key| (true, key))
-            .chain(open.map(|key| (false, key)))
-        {
-            if claimants.iter().any(|(_, existing)| *existing == key) {
+            .open_documents
+            .keys()
+            .filter(|document| *document != uri)
+            .filter_map(|document| {
+                let owner = self.document_owners.get(document);
+                let key = self
+                    .open_document_contexts
+                    .get(document)
+                    .or(owner.map(|owner| &owner.key))?;
+                let state = owner
+                    .filter(|owner| owner.key == *key)
+                    .map(|owner| owner.state.clone());
+                Some((key, state))
+            });
+        let installed_selected = self
+            .contexts
+            .keys()
+            .filter(|key| is_selected(key))
+            .map(|key| (key, None));
+        for (key, state) in installed_selected.chain(open) {
+            if claimants.iter().any(|(_, existing, _)| existing == key) {
                 continue;
             }
             let claims = self
                 .contexts
-                .get(&key)
+                .get(key)
+                .or(state.as_deref())
                 .is_some_and(|state| state.context.resolves_unit_source(path));
             if claims {
-                claimants.push((is_selected, key));
+                claimants.push((is_selected(key), key.clone(), state));
             }
         }
-        claimants.sort_by(|(left_selected, left), (right_selected, right)| {
+        claimants.sort_by(|(left_selected, left, _), (right_selected, right, _)| {
             right_selected
                 .cmp(left_selected)
                 .then_with(|| left.project_file.cmp(&right.project_file))
                 .then_with(|| left.selection_scope.cmp(&right.selection_scope))
         });
-        for (_, key) in claimants {
+        for (_, key, state) in claimants {
+            let installed = !self.contexts.contains_key(&key);
+            if installed {
+                let Some(state) = state else {
+                    continue;
+                };
+                self.contexts
+                    .insert(key.clone(), ContextState::clone(&state));
+            }
             if !self.context_is_fresh_with_cancel(&key, cancel, budget)? {
+                if installed {
+                    self.contexts.remove(&key);
+                }
                 continue;
             }
             crate::trace::trace!(
@@ -10387,6 +10422,18 @@ impl Workspace {
                 budget,
                 !defer_context_pruning,
             )?;
+            if let Some(state) = self.contexts.get(&key) {
+                self.shared_discoveries.insert(
+                    self.configuration_generation,
+                    uri.clone(),
+                    discovery_inputs,
+                    SharedDiscovery {
+                        key: key.clone(),
+                        state: state.clone(),
+                        warnings: Vec::new(),
+                    },
+                );
+            }
             return Ok(Some(key));
         }
         Ok(None)

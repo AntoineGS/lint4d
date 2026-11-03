@@ -258,5 +258,52 @@ fn selecting_the_project_after_opening_the_unit_moves_it_to_the_selected_context
         key_of(&workspace, &fixture.app),
         "the unit must follow the selection, not keep the automatic context"
     );
-    assert!(key_of(&workspace, &fixture.users).selection_project.is_some());
+    assert!(
+        key_of(&workspace, &fixture.users)
+            .selection_project
+            .is_some()
+    );
+}
+
+/// The server answers from a workspace rebuilt from its analysis input; the
+/// unit's imports must resolve in the selected project there too, not in a
+/// projectless context where `Base` is ambiguous.
+#[test]
+fn a_request_from_the_analysis_input_resolves_the_unit_in_the_selected_project() {
+    let fixture = fixture("");
+    let users_source = "unit Users;\ninterface\nuses Base;\ntype\n  TUser = class(TBase)\n  end;\nimplementation\nend.\n";
+    write(&fixture.users, users_source);
+    let base = fixture.root.join("Common").join("Base").join("Base.pas");
+    let base_source =
+        "unit Base;\ninterface\ntype\n  TBase = class\n  end;\nimplementation\nend.\n";
+    write(&base, base_source);
+    write(
+        &fixture.root.join("Projects").join("Other").join("Base.pas"),
+        base_source,
+    );
+    write(
+        &fixture.app_project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>..\\..\\Common\\Rules;..\\..\\Common\\Base</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    pascal_project::backdate_tree_for_test(&fixture.root);
+    let workspace = app_with_users_open(&fixture, true);
+
+    let result = super::queries::navigation_from_input(
+        workspace.analysis_input(),
+        &uri(&fixture.users),
+        Position::new(4, 18),
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("navigation");
+
+    assert_eq!(
+        result
+            .locations
+            .iter()
+            .map(|location| location.uri.clone())
+            .collect::<Vec<_>>(),
+        vec![uri(&base)]
+    );
 }

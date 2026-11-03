@@ -144,4 +144,56 @@ mod tests {
         assert_eq!(snapshot.misses[MissCause::Freshness as usize], 1);
         assert_eq!(snapshot.bypasses[names::bypass_index(&Bypass::Busy)], 2);
     }
+
+    #[test]
+    fn record_reuse_counts_hits_misses_and_bypasses() {
+        use crate::project_cache::{ProjectCache, ReservationKind};
+        use crate::workspace::persist::{AdmittedFacts, ReuseMiss, ReuseVia};
+        use pascal_core::facts::ArtifactFacts;
+        let cache = ProjectCache::new(1 << 20);
+        let charge = cache.reserve(ReservationKind::Facts, 64).unwrap();
+        let counters = Counters::default();
+        counters.record_reuse(&Ok(Reuse::Hit {
+            facts: AdmittedFacts {
+                facts: std::sync::Arc::new(ArtifactFacts::default()),
+                charge,
+            },
+            via: ReuseVia::Local,
+            reads: 0,
+        }));
+        counters.record_reuse(&Ok(Reuse::Miss(ReuseMiss::Open)));
+        counters.record_reuse(&Err(PersistError::Cancelled));
+        counters.record_reuse(&Err(PersistError::Store(Bypass::Busy)));
+        let snapshot = counters.snapshot();
+        assert_eq!((snapshot.hits, snapshot.decoded_bytes), (1, 64));
+        assert_eq!(snapshot.misses[MissCause::Input as usize], 1);
+        assert_eq!(snapshot.misses[MissCause::Budget as usize], 1);
+        assert_eq!(snapshot.bypasses[names::bypass_index(&Bypass::Busy)], 1);
+    }
+
+    #[test]
+    fn record_step_accumulates() {
+        use pascal_cache::{Phase, Pressure};
+        let counters = Counters::default();
+        let report = |cycle_complete, skipped, rows| StepReport {
+            skipped,
+            cancelled: false,
+            phase: Phase::Hints,
+            rows,
+            cycle_complete,
+            pressure: Pressure::None,
+        };
+        counters.record_step(&report(true, false, 5));
+        counters.record_step(&report(false, true, 2));
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            (
+                snapshot.steps,
+                snapshot.cycles,
+                snapshot.rows,
+                snapshot.skipped
+            ),
+            (2, 1, 7, 1)
+        );
+    }
 }

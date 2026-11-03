@@ -82,15 +82,27 @@ pub(crate) struct CacheStatus {
     pub(crate) counters: CounterSnapshot,
 }
 
-fn truncate(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
+/// Bytes `c` takes inside a JSON string (`serde_json`: quotes and
+/// backslashes double, control characters take two or six bytes).
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if c < ' ' => 6,
+        c => c.len_utf8(),
     }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+}
+
+/// The longest prefix of `text` whose JSON-escaped form is at most
+/// `max_escaped_bytes`, cut at a char boundary.
+fn truncate(text: &str, max_escaped_bytes: usize) -> &str {
+    let mut used = 0;
+    for (index, c) in text.char_indices() {
+        used += escaped_len(c);
+        if used > max_escaped_bytes {
+            return &text[..index];
+        }
     }
-    &text[..end]
+    text
 }
 
 fn cause_json(cause: &StatusCause) -> Value {
@@ -212,9 +224,9 @@ mod tests {
             generation: u64::MAX,
             enabled: true,
             cause: Some(StatusCause::Configuration(
-                "x".repeat(MAX_CAUSE_MESSAGE_BYTES * 2),
+                "\u{1}".repeat(MAX_CAUSE_MESSAGE_BYTES * 2),
             )),
-            directory: Some(PathBuf::from(format!("/{}", "d".repeat(4095)))),
+            directory: Some(PathBuf::from(format!("/{}", "\"\\".repeat(4095)))),
             limits: StoreLimits::default(),
             reset_epoch: Some(u64::MAX),
             reserved: Reserved {
@@ -242,6 +254,18 @@ mod tests {
 
     /// Only the cache directory is a path; a bypass carries names, never
     /// source paths (spec §11.2: no source text or project membership).
+    #[test]
+    fn truncation_counts_escaped_bytes() {
+        let text = "a\"\\\u{1}\u{e9}";
+        for max in 0..16 {
+            let cut = truncate(text, max);
+            let escaped = serde_json::to_string(cut).unwrap().len() - 2;
+            assert!(escaped <= max, "{max}: {escaped}");
+        }
+        assert_eq!(truncate(text, 3), "a\"");
+        assert_eq!(truncate(text, 100), text);
+    }
+
     #[test]
     fn status_names_no_source_path() {
         let status = CacheStatus {

@@ -3583,6 +3583,7 @@ impl Workspace {
         workspace
             .project_cache
             .set_max_bytes(workspace.options.limits.max_cache_bytes);
+        workspace.sync_artifact_roots();
         if let Err(error) = workspace.overrides.effective_for(None, None) {
             workspace.warn(error);
         }
@@ -3649,6 +3650,7 @@ impl Workspace {
             self.persistent_cache.readmit();
         }
         self.roots = prepared.roots;
+        self.sync_artifact_roots();
         self.see_cache_exclusion();
 
         self.bump_source_generation();
@@ -5976,6 +5978,7 @@ impl Workspace {
                 self.see_cache_exclusion();
             }
         }
+        self.sync_artifact_roots();
         self.contexts.clear();
         self.document_contexts.clear();
         self.open_document_contexts.clear();
@@ -13607,6 +13610,19 @@ impl Workspace {
         self.mark_global_change();
     }
 
+    /// Tells the cache which directories are workspace roots, so it can tell
+    /// tool state below them from sources.
+    fn sync_artifact_roots(&self) {
+        self.project_cache.set_artifact_roots(
+            self.roots
+                .iter()
+                .flat_map(|root| {
+                    std::iter::once(root.path.clone()).chain(root.source_roots.iter().cloned())
+                })
+                .collect(),
+        );
+    }
+
     /// Resolve `cache_base` through the current roots and source roots
     /// (symlinks), once, and attach the result.
     fn see_cache_exclusion(&mut self) {
@@ -19289,6 +19305,34 @@ mod tests {
         assert!(
             cache.take_closure_crawl_requests().is_empty(),
             "the warm closure must survive opening an unchanged unit"
+        );
+    }
+
+    #[test]
+    fn a_folder_added_later_registers_its_tool_state_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let added = temp.path().join("added");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(added.join(".opencode/db")).unwrap();
+        let mut workspace = test_workspace(vec![first], Default::default());
+        let cache = workspace.project_cache().clone();
+
+        workspace.update_workspace_folders([added.clone()], []);
+        let epoch = cache.invalidation_epoch();
+        cache.invalidate_file_contents(&added.join(".opencode/db/x.sqlite"));
+        assert_eq!(cache.invalidation_epoch(), epoch);
+
+        cache.invalidate_file_contents(&added.join("New.pas"));
+        assert_ne!(cache.invalidation_epoch(), epoch);
+
+        workspace.update_workspace_folders([], [added.clone()]);
+        let epoch = cache.invalidation_epoch();
+        cache.invalidate_file_contents(&added.join(".opencode/db/x.sqlite"));
+        assert_ne!(
+            cache.invalidation_epoch(),
+            epoch,
+            "a removed root no longer counts"
         );
     }
 

@@ -73,9 +73,10 @@ const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
 // One additional slot is reserved for interactive work. Bulk analysis and
 // diagnostics must never occupy all workers while a navigation request waits.
 const MAX_ANALYSIS_JOBS: usize = MAX_GENERAL_ANALYSIS_JOBS + 1;
-/// How long an interactive worker waits for a cache slot that a bulk job or
-/// the warmer is computing before it computes the slot itself, uncached.
-const INTERACTIVE_CLAIM_WAIT: Duration = Duration::from_millis(50);
+/// How long an interactive worker waits for an import slot that a bulk job
+/// or diagnostics is computing before it computes the slot itself, uncached.
+/// It waits for unit slots as long as their claims are held.
+const INTERACTIVE_IMPORT_CLAIM_WAIT: Duration = Duration::from_millis(50);
 /// Maximum number of accepted analysis requests waiting for a worker.
 ///
 /// Queued requests retain only their parsed request parameters, never a
@@ -5569,11 +5570,16 @@ impl AnalysisJobs {
                         crate::trace::short(format!("{request:?}"), 240)
                     )
                 });
-                if priority == AnalysisPriority::Interactive {
-                    crate::project_cache::limit_claim_waits_on_this_thread(Some(
-                        INTERACTIVE_CLAIM_WAIT,
-                    ));
-                }
+                crate::project_cache::set_claim_role_on_this_thread(
+                    if priority == AnalysisPriority::Interactive {
+                        crate::project_cache::ClaimRole::interactive(
+                            Arc::clone(&worker_cancellation),
+                            INTERACTIVE_IMPORT_CLAIM_WAIT,
+                        )
+                    } else {
+                        crate::project_cache::ClaimRole::job(Arc::clone(&worker_cancellation))
+                    },
+                );
                 let validation_input = input.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {

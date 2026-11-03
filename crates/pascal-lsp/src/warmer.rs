@@ -703,6 +703,9 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     if !gate.wait_idle(&job.cancel) {
         return end(None, Vec::new());
     }
+    crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::yielding(
+        job.cancel.clone(),
+    ));
     let _span = crate::trace::Span::new(|| format!("warm crawl {}", job.uri));
     let mut workspace = Workspace::from_analysis_input(&job.input);
     let hook_events = events.clone();

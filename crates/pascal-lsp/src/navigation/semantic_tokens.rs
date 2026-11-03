@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AssistanceBudget, BudgetedLookup, Document, GenericParameterContext, NavigationIndex, Origin,
     OwnerTypeContext, SemanticTokenResolutionMode, Span, Symbol, SymbolKind, TypeKind,
@@ -518,7 +519,7 @@ fn symbol_classification(symbol: &Symbol) -> Option<(u32, u32)> {
 }
 
 fn is_generic_parameter_declaration(identifier: Node<'_>) -> bool {
-    let Some(parent) = identifier.parent() else {
+    let Some(parent) = identifier.tree_parent() else {
         return false;
     };
     parent.kind() == "genericArg"
@@ -691,7 +692,7 @@ fn is_right_hand_qualified_identifier_with_budget(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<bool>, String> {
     let target = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         if !budget.take_work(1, cancel)? {
             return Ok(None);
@@ -703,7 +704,7 @@ fn is_right_hand_qualified_identifier_with_budget(
         {
             return Ok(Some(true));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(Some(false))
 }

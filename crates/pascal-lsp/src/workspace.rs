@@ -7247,7 +7247,7 @@ impl Workspace {
                 crate::project_cache::Lookup::Compute(claim) => {
                     #[cfg(feature = "test-support")]
                     if !claim.is_detached()
-                        && !crate::project_cache::claim_waits_are_limited_on_this_thread()
+                        && !crate::project_cache::claims_are_interactive_on_this_thread()
                     {
                         wait_at_import_claim_test_barrier();
                     }

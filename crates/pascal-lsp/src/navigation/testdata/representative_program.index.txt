@@ -1,0 +1,120 @@
+## unit_name
+"characterized"
+## unit_display_name
+"Characterized"
+## interface_range
+None
+## implementation_range
+None
+## verified_header
+None
+## has_initialization
+false
+## has_finalization
+false
+## parser_recovery_spans
+## uses_clauses
+0: UsesClauseMetadata { span: SourceSpan { start: 44, end: 114 }, interface: false }
+## interface_uses
+## implementation_uses
+0: "sysutils"
+1: "characterized.sample"
+## imports
+0: ImportMetadata { name: "sysutils", span: SourceSpan { start: 51, end: 59 }, section: Module }
+1: ImportMetadata { name: "characterized.sample", span: SourceSpan { start: 63, end: 83 }, section: Module }
+## unknown_imports
+## interface_routine_keys
+## scopes
+0: Scope { start: 0, end: 410, parent: None, owner_type: None }
+1: Scope { start: 209, end: 381, parent: Some(0), owner_type: None }
+2: Scope { start: 248, end: 330, parent: Some(1), owner_type: None }
+3: Scope { start: 292, end: 329, parent: Some(2), owner_type: None }
+4: Scope { start: 332, end: 380, parent: Some(1), owner_type: None }
+5: Scope { start: 383, end: 408, parent: Some(0), owner_type: None }
+## with_contexts
+## cache_unsafe_scopes
+0: "0"
+## owner_type_contexts
+0: OwnerTypeContext { span: Span { start: 138, end: 177 }, owner_type: "tlocalrecord" }
+## symbols
+0: Symbol { span: Span { start: 8, end: 21 }, declaration_span: Span { start: 0, end: 410 }, selection_span: Span { start: 8, end: 21 }, name: "Characterized", key: "characterized", kind: Unit, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 0, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: false, generic_parameters: [], generic_parameter: None, type_name: None, type_ref: None, type_shape: None, result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: None, body_scope: None, unresolved_abbreviated: false, accessor: None }
+1: Symbol { span: Span { start: 123, end: 135 }, declaration_span: Span { start: 123, end: 178 }, selection_span: Span { start: 123, end: 135 }, name: "TLocalRecord", key: "tlocalrecord", kind: Type, type_kind: Record, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 0, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: false, generic_parameters: [], generic_parameter: None, type_name: None, type_ref: None, type_shape: Some(Unknown), result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: Some(156), body_scope: None, unresolved_abbreviated: false, accessor: None }
+2: Symbol { span: Span { start: 156, end: 161 }, declaration_span: Span { start: 156, end: 171 }, selection_span: Span { start: 156, end: 161 }, name: "Value", key: "value", kind: Field, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 0, owner_type: Some("tlocalrecord"), owner_type_name: Some("TLocalRecord"), visibility: Public, declaration_ordered: false, generic_parameters: [], generic_parameter: None, type_name: Some("integer"), type_ref: Some(TypeRef { path: ["integer"], args: [], span: Span { start: 163, end: 170 } }), type_shape: Some(Named(TypeRef { path: ["integer"], args: [], span: Span { start: 163, end: 170 } })), result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: None, body_scope: None, unresolved_abbreviated: false, accessor: None }
+3: Symbol { span: Span { start: 186, end: 192 }, declaration_span: Span { start: 186, end: 207 }, selection_span: Span { start: 186, end: 192 }, name: "GValue", key: "gvalue", kind: Variable, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 0, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: false, generic_parameters: [], generic_parameter: None, type_name: Some("tlocalrecord"), type_ref: Some(TypeRef { path: ["tlocalrecord"], args: [], span: Span { start: 194, end: 206 } }), type_shape: Some(Named(TypeRef { path: ["tlocalrecord"], args: [], span: Span { start: 194, end: 206 } })), result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: None, body_scope: None, unresolved_abbreviated: false, accessor: None }
+4: Symbol { span: Span { start: 219, end: 222 }, declaration_span: Span { start: 209, end: 381 }, selection_span: Span { start: 219, end: 222 }, name: "Run", key: "run", kind: Routine, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 0, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: true, generic_parameters: [], generic_parameter: None, type_name: None, type_ref: None, type_shape: None, result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Definition, is_static: false, local_only: false, routine_key: Some("::run<0>(const string)@0"), routine_signature: Some("const string"), routine_header_span: Some(Span { start: 209, end: 244 }), routine_parameter_spans: [Span { start: 229, end: 234 }], routine_parameters: [RoutineParameter { span: Span { start: 229, end: 234 }, type_span: Some(Span { start: 236, end: 242 }), type_name: Some("string"), type_ref: Some(TypeRef { path: ["string"], args: [], span: Span { start: 236, end: 242 } }), type_shape: Some(Named(TypeRef { path: ["string"], args: [], span: Span { start: 236, end: 242 } })), mode: Const, has_default: false }], type_excerpt_end: None, body_scope: Some(1), unresolved_abbreviated: false, accessor: None }
+5: Symbol { span: Span { start: 229, end: 234 }, declaration_span: Span { start: 223, end: 242 }, selection_span: Span { start: 229, end: 234 }, name: "AText", key: "atext", kind: Parameter, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: Some(Const), scope: 1, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: true, generic_parameters: [], generic_parameter: None, type_name: Some("string"), type_ref: Some(TypeRef { path: ["string"], args: [], span: Span { start: 236, end: 242 } }), type_shape: Some(Named(TypeRef { path: ["string"], args: [], span: Span { start: 236, end: 242 } })), result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: None, body_scope: None, unresolved_abbreviated: false, accessor: None }
+6: Symbol { span: Span { start: 257, end: 262 }, declaration_span: Span { start: 248, end: 330 }, selection_span: Span { start: 257, end: 262 }, name: "Inner", key: "inner", kind: Routine, type_kind: Other, routine_kind: Function, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: None, scope: 1, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: true, generic_parameters: [], generic_parameter: None, type_name: None, type_ref: None, type_shape: None, result_type_name: Some("integer"), result_type_ref: Some(TypeRef { path: ["integer"], args: [], span: Span { start: 281, end: 288 } }), result_type_span: Some(Span { start: 281, end: 288 }), region: Other, origin: Definition, is_static: false, local_only: false, routine_key: Some("::inner<0>(integer)@1"), routine_signature: Some("integer"), routine_header_span: Some(Span { start: 248, end: 289 }), routine_parameter_spans: [Span { start: 263, end: 269 }], routine_parameters: [RoutineParameter { span: Span { start: 263, end: 269 }, type_span: Some(Span { start: 271, end: 278 }), type_name: Some("integer"), type_ref: Some(TypeRef { path: ["integer"], args: [], span: Span { start: 271, end: 278 } }), type_shape: Some(Named(TypeRef { path: ["integer"], args: [], span: Span { start: 271, end: 278 } })), mode: Value, has_default: false }], type_excerpt_end: None, body_scope: Some(2), unresolved_abbreviated: false, accessor: None }
+7: Symbol { span: Span { start: 263, end: 269 }, declaration_span: Span { start: 263, end: 278 }, selection_span: Span { start: 263, end: 269 }, name: "AValue", key: "avalue", kind: Parameter, type_kind: Other, routine_kind: Procedure, routine_directives: RoutineDirectives { overload: false, virtual_: false, dynamic: false, override_: false, reintroduce: false, forward: false, abstract_: false, calling_convention: None, calling_convention_unknown: false }, parameter_mode: Some(Value), scope: 2, owner_type: None, owner_type_name: None, visibility: Public, declaration_ordered: true, generic_parameters: [], generic_parameter: None, type_name: Some("integer"), type_ref: Some(TypeRef { path: ["integer"], args: [], span: Span { start: 271, end: 278 } }), type_shape: Some(Named(TypeRef { path: ["integer"], args: [], span: Span { start: 271, end: 278 } })), result_type_name: None, result_type_ref: None, result_type_span: None, region: Other, origin: Declaration, is_static: false, local_only: false, routine_key: None, routine_signature: None, routine_header_span: None, routine_parameter_spans: [], routine_parameters: [], type_excerpt_end: None, body_scope: None, unresolved_abbreviated: false, accessor: None }
+## opaque_ranges
+## conditional_unknown_symbols
+0: false
+1: false
+2: false
+3: false
+4: false
+5: false
+6: false
+7: false
+## unknown_class_owners
+## known_non_class_owners
+0: "\"tlocalrecord\""
+## symbol_indices_by_scope_key
+0: "((0, \"characterized\"), [0])"
+1: "((0, \"gvalue\"), [3])"
+2: "((0, \"run\"), [4])"
+3: "((0, \"tlocalrecord\"), [1])"
+4: "((0, \"value\"), [2])"
+5: "((1, \"atext\"), [5])"
+6: "((1, \"inner\"), [6])"
+7: "((2, \"avalue\"), [7])"
+## scope_symbol_indices
+0: "(0, [0, 1, 2, 3, 4])"
+1: "(1, [5, 6])"
+2: "(2, [7])"
+## member_symbol_indices
+0: "((\"tlocalrecord\", \"value\"), [2])"
+## member_binding_keys_by_owner
+0: ("\"tlocalrecord\"", ["\"value\""])
+## scope_binding_keys
+0: []
+1: ["\"atext\"", "\"inner\""]
+2: ["\"atext\"", "\"avalue\"", "\"inner\""]
+3: ["\"atext\"", "\"avalue\"", "\"inner\""]
+4: ["\"atext\"", "\"inner\""]
+5: []
+## member_symbol_indices_by_owner
+0: "(\"tlocalrecord\", [2])"
+## type_ancestry
+0: "(\"tlocalrecord\", [TypeAncestry { kind: Record, name_span: Span { start: 123, end: 135 }, parent_declared: false, abstract_: false, parents: [] }])"
+## type_symbol_indices
+0: "(\"tlocalrecord\", [1])"
+## direct_symbol_indices
+0: "(Span { start: 123, end: 135 }, [1])"
+1: "(Span { start: 156, end: 161 }, [2])"
+2: "(Span { start: 186, end: 192 }, [3])"
+3: "(Span { start: 219, end: 222 }, [4])"
+4: "(Span { start: 229, end: 234 }, [5])"
+5: "(Span { start: 257, end: 262 }, [6])"
+6: "(Span { start: 263, end: 269 }, [7])"
+7: "(Span { start: 8, end: 21 }, [0])"
+## routine_symbol_indices
+0: "(\"::inner<0>(integer)@1\", [6])"
+1: "(\"::run<0>(const string)@0\", [4])"
+## routine_symbol_indices_by_body_scope
+0: "(1, [4])"
+1: "(2, [6])"
+## exported_symbol_indices
+## interface_member_routine_keys
+## method_resolutions
+## interface_delegations
+## generic_parameter_contexts
+## helpers
+## documentation
+0: None
+1: None
+2: None
+3: None
+4: None
+5: None
+6: None
+7: None

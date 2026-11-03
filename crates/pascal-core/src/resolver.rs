@@ -2514,12 +2514,21 @@ impl<S: SourceStore> UnitResolver<S> {
         let previous = std::mem::replace(&mut self.compile_time_route, route);
         let defaults = crate::compile_time::CompileTimeLimits::default();
         let aggregate = self.compile_time_usage();
+        // The session grants only bytes beyond the request's credit floor; a
+        // shape probe may already have credited the request for the bytes
+        // below it. Give the session that grant back so it is funded as a
+        // fresh session would be, still within the request remainder.
+        let floor = self.compile_time_credit_floor(root);
         let limits = crate::compile_time::CompileTimeLimits {
             max_work: defaults
                 .max_work
+                .saturating_add(floor.saturating_mul(self.limits.compile_time_work_per_source_byte))
                 .min(self.remaining_compile_time_work(aggregate)),
             max_byte_work: defaults
                 .max_byte_work
+                .saturating_add(
+                    floor.saturating_mul(self.limits.compile_time_byte_work_per_source_byte),
+                )
                 .min(self.remaining_compile_time_byte_work(aggregate)),
             // An explicit resolver retention selection must reach this session.
             // Default resolver construction still selects the core 1 MiB cap.

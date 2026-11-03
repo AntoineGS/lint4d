@@ -494,3 +494,43 @@ fn directives_after_a_megabyte_of_declarations_are_applied() {
     let (result, usage) = analyze_with(&text, &[("late.inc", "const FromInclude = 2;\n")]);
     assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
 }
+
+/// l4d-4nbs R2: the shape probe credits the request for the importer's
+/// bytes, so the session that follows earns no per-byte grant of its own.
+/// It must still get what a fresh session over the same text would get
+/// (Windows.pas, 1.3 MB with includes, failed at `max_work 2000001 >
+/// 2000000` while the request still had 10.5M steps of earned allowance).
+#[test]
+fn the_session_after_a_probe_keeps_the_grant_of_the_probed_bytes() {
+    let mut text = String::from("unit T;\ninterface\nuses U;\n{$I small.inc}\nimplementation\n");
+    let mut n = 0;
+    while text.len() < 1_300_000 {
+        text.push_str(&format!(
+            "procedure P{n}(var V: Integer);\nbegin\n  case V mod 4 of\n    0: V := V + {n};\n    1: V := V - 1;\n  else\n    V := 0;\n  end;\nend;\n"
+        ));
+        n += 1;
+    }
+    text.push_str("end.\n");
+    let (_dir, path, mut resolver) = resolver_with(
+        &text,
+        &[
+            ("U.pas", "unit U; interface implementation end."),
+            ("small.inc", "const Small = 1;"),
+        ],
+    );
+    let mut source = support::loaded("T.pas", &text);
+    source.path = path;
+    let importer = pascal_core::ResolvedUnit {
+        requested_name: "T".into(),
+        declared_name: "T".into(),
+        source,
+    };
+    let imports = resolver.resolve_imports_with_text(&importer, &[], &text, &NoCancellation);
+    let report = resolver.report();
+    assert!(
+        imports.as_ref().is_ok_and(|imports| imports.complete),
+        "{imports:?} {:?} {:?}",
+        report.incomplete_reasons,
+        resolver.compile_time_usage()
+    );
+}

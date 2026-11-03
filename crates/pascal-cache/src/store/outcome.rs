@@ -21,8 +21,20 @@ pub enum Bypass {
     /// The store's scope was reset or retired after it was opened.
     Fenced,
     Busy,
+    /// Another connection is recovering the WAL after a crash; try later.
+    Recovering,
     ReadOnly,
     Full,
+    /// The WAL is at the policy threshold; writes wait for a checkpoint.
+    WalPressure,
+    /// The write would leave the store without its maintenance headroom.
+    OverBudget,
+    /// The cache directory's filesystem is low on free space.
+    LowDiskSpace,
+    /// A lease holds MAX_LEASE_HOLDS sealed snapshots already.
+    TooManyHolds,
+    /// The maintenance limits raise a bound above its default.
+    InvalidMaintenanceLimits,
     Corrupt,
     OutOfMemory,
     ScratchExhausted,

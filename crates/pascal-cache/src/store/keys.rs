@@ -1,4 +1,6 @@
 use super::Store;
+use super::budget::WriteEstimate;
+use super::health::Access;
 use super::limits::MAX_MANIFEST_BYTES;
 use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Miss, Published, TooLarge};
@@ -186,22 +188,35 @@ pub(crate) fn admit_manifest_by_digest(
 }
 
 impl Store {
-    /// Retain `key`'s manifest, for example a context key's.
+    /// Retain `key`'s manifest, for example a context key's. A manifest no
+    /// artifact, evidence set or snapshot references is deleted by
+    /// maintenance; publish it again before relying on it.
     pub fn publish_key(&self, key: &CanonicalKey) -> Result<Published, Bypass> {
-        check_manifest_size(key)?;
-        let mut writer = self.writer()?;
-        let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
-        ensure_live(&transaction, self.scope)?;
-        let published = put_manifest(&transaction, self.scope, key)?;
-        self.before_commit();
-        transaction.commit().map_err(|error| classify(&error))?;
-        Ok(published)
+        self.guarded(Access::Write, || {
+            check_manifest_size(key)?;
+            let mut writer = self.writer()?;
+            let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: key.manifest().len() as u64,
+                    rows: 1,
+                },
+            )?;
+            let published = put_manifest(&transaction, self.scope, key)?;
+            self.before_commit();
+            transaction.commit().map_err(|error| classify(&error))?;
+            Ok(published)
+        })
     }
 
     pub fn admit_key(&self, key: &CanonicalKey) -> Result<Lookup<()>, Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        admit_manifest(&transaction, &self.namespace, self.scope, key)
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            admit_manifest(&transaction, &self.namespace, self.scope, key)
+        })
     }
 }

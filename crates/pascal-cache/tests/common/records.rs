@@ -1,11 +1,12 @@
 //! Member record and snapshot fixtures shared by the store's tests.
 
 use pascal_cache::{
-    ArtifactKeyRef, Binding, BindingKind, BindingOutcome, ContextKey, CoverageStatus,
-    DATABASE_FILE, Digest, EvidenceTarget, EvidenceWrite, LocalArtifactKey, Lookup, LookupInputs,
-    LookupKey, LookupKind, MemberCoverage, MemberHeader, MemberRecord, Miss, Namespace,
-    Observation, SnapshotHeader, SnapshotMember, SnapshotSeal, SourceContent, SourceIdentity,
-    Store, StoreLimits,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Binding, BindingKind, BindingOutcome, Bypass,
+    ContextKey, CoverageStatus, DATABASE_FILE, Digest, EvidenceTarget, EvidenceWrite,
+    LocalArtifactKey, Lookup, LookupInputs, LookupKey, LookupKind, MaintenanceLimits,
+    MemberCoverage, MemberHeader, MemberRecord, Miss, Namespace, Observation, Published,
+    SnapshotHeader, SnapshotMember, SnapshotSeal, SourceContent, SourceIdentity, Store,
+    StoreLimits,
 };
 use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, ProjectContext, SourceOrigin};
@@ -178,6 +179,117 @@ pub fn sealed(store: &Store, records: &[Digest]) -> SnapshotHeader {
         store.add_members(&mut builder, batch).unwrap();
     }
     store.seal_snapshot(builder, &SEAL).unwrap()
+}
+
+/// Publish the local artifact for `text` with `rows` rows of `row_bytes`
+/// bytes each.
+pub fn publish_bulk(
+    store: &Store,
+    text: &str,
+    rows: usize,
+    row_bytes: usize,
+) -> Result<Published, Bypass> {
+    let key = LocalArtifactKey::new(
+        &SourceContent::from_bytes(text.as_bytes()),
+        &ConditionalContext::default(),
+        SourceOrigin::ProjectCompiled,
+    );
+    let payload = vec![7u8; row_bytes];
+    let rows: Vec<ArtifactRow<'_>> = (0..rows)
+        .map(|_| ArtifactRow {
+            row_kind: 1,
+            index_key: None,
+            payload: &payload,
+        })
+        .collect();
+    store.publish_artifact(&ArtifactWrite {
+        key: ArtifactKeyRef::local(&key),
+        supplemental: b"",
+        rows: &rows,
+    })
+}
+
+/// Retirement without the recency window, so tests need not publish 65,536
+/// rows to age one.
+pub const EAGER: MaintenanceLimits = MaintenanceLimits {
+    recency_window: 0,
+    ..MaintenanceLimits::DEFAULT
+};
+
+/// Rows that break the reachability invariant (phase 6 Decision 11): a
+/// live record over a retired or missing artifact or evidence set, a
+/// building or sealed snapshot over a retired or missing record or
+/// discovery evidence, live artifact evidence over a retired or missing
+/// artifact. Must always be 0.
+pub fn check_invariant(directory: &Path) -> i64 {
+    const LIVE_ARTIFACT: &str = "EXISTS (SELECT 1 FROM artifacts a WHERE a.namespace_id = r.namespace_id \
+        AND a.reset_epoch = r.reset_epoch AND a.artifact_id = r.artifact_id AND a.lifecycle = 1)";
+    let live_evidence = |column: &str, alias: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM evidence_sets e WHERE e.namespace_id = {alias}.namespace_id \
+             AND e.reset_epoch = {alias}.reset_epoch AND e.evidence_id = {alias}.{column} AND e.lifecycle = 1)"
+        )
+    };
+    let queries = [
+        format!(
+            "SELECT count(*) FROM member_records r WHERE r.lifecycle = 1 AND \
+             ((r.artifact_id IS NOT NULL AND NOT {LIVE_ARTIFACT}) \
+              OR (r.member_evidence IS NOT NULL AND NOT {}))",
+            live_evidence("member_evidence", "r")
+        ),
+        format!(
+            "SELECT count(*) FROM member_bindings b JOIN member_records r \
+             ON r.namespace_id = b.namespace_id AND r.reset_epoch = b.reset_epoch AND r.record_id = b.record_id \
+             WHERE r.lifecycle = 1 AND b.evidence_id IS NOT NULL AND NOT {}",
+            live_evidence("evidence_id", "b")
+        ),
+        "SELECT count(*) FROM snapshot_members m JOIN snapshots s \
+         ON s.namespace_id = m.namespace_id AND s.reset_epoch = m.reset_epoch AND s.snapshot_id = m.snapshot_id \
+         WHERE s.state IN (1, 2) AND NOT EXISTS (SELECT 1 FROM member_records r \
+         WHERE r.namespace_id = m.namespace_id AND r.reset_epoch = m.reset_epoch \
+         AND r.record_id = m.record_id AND r.lifecycle = 1)"
+            .to_string(),
+        format!(
+            "SELECT count(*) FROM snapshots s WHERE s.state = 2 AND s.discovery_evidence IS NOT NULL AND NOT {}",
+            live_evidence("discovery_evidence", "s")
+        ),
+        "SELECT count(*) FROM evidence_sets e WHERE e.lifecycle = 1 AND e.artifact_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.namespace_id = e.namespace_id \
+         AND a.reset_epoch = e.reset_epoch AND a.artifact_id = e.artifact_id AND a.lifecycle = 1)"
+            .to_string(),
+    ];
+    let connection = raw(directory);
+    queries
+        .iter()
+        .map(|sql| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        })
+        .sum()
+}
+
+/// Two lease renewals a renewal interval apart (each one due): everything
+/// published before now is behind every floor of this process's lease.
+pub fn age_past_grace(store: &Store) {
+    for _ in 0..2 {
+        store.advance_clock_for_test(pascal_cache::LEASE_RENEWAL);
+        store.renew_lease().unwrap();
+    }
+}
+
+/// A member at `path` over the local artifact for `text`, importing
+/// `target` under `evidence`.
+pub fn local_member(
+    store: &Store,
+    path: &str,
+    text: &str,
+    target: &str,
+    evidence: Digest,
+) -> MemberRecord {
+    let mut record = member(path, &[target], evidence);
+    record.header.artifact = Some(artifact(store, text));
+    record
 }
 
 /// Every member, read and verified, or the miss that ended the read.

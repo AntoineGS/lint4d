@@ -165,7 +165,7 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO artifacts VALUES (?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'')",
+                "INSERT INTO artifacts VALUES (?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'', 1)",
                 params![
                     ns.as_bytes().as_slice(),
                     id.as_slice(),

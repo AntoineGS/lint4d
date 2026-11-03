@@ -1,3 +1,4 @@
+use super::gc;
 use super::location::StoreLocation;
 use super::outcome::{Bypass, Integrity};
 use super::pool::Deadline;
@@ -17,7 +18,9 @@ const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 9] = [
+const RECLAIM_TABLES: [&str; 11] = [
+    "lease_holds",
+    "process_leases",
     "snapshot_members",
     "snapshots",
     "member_bindings",
@@ -46,7 +49,10 @@ pub struct RetireReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Reclaimed {
     pub rows: usize,
-    /// No retired scope remains.
+    /// No retired scope remains, and nothing in the live scope is left to
+    /// delete: no retired row that nothing references, no orphan key
+    /// manifest. `reclaim(0)` does not examine the live scope, so its
+    /// `complete` speaks for the retired scopes only.
     pub complete: bool,
 }
 
@@ -67,7 +73,7 @@ pub(crate) struct NamespaceLock {
     path: PathBuf,
 }
 
-fn open_lock_file(path: &Path) -> Result<File, Bypass> {
+pub(crate) fn open_lock_file(path: &Path) -> Result<File, Bypass> {
     StoreLocation::check_file(path)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -203,6 +209,30 @@ pub(crate) fn ensure_live(connection: &Connection, scope: Scope) -> Result<(), B
     live.map(|_| ()).ok_or(Bypass::Fenced)
 }
 
+/// Retire `scope` and move its namespace to the next epoch in one
+/// transaction (spec §11.2): every handle of `scope` is fenced from its
+/// next transaction; its rows are reclaimed in batches like any retired
+/// scope. `store_state.reset_epoch` is not used.
+pub(crate) fn reset(transaction: &Connection, scope: Scope) -> Result<(), Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    ensure_live(transaction, scope)?;
+    let id = scope.namespace.as_bytes().as_slice();
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
+            params![id, epoch(scope)],
+        )
+        .map_err(fail)?;
+    transaction
+        .execute(
+            "UPDATE namespaces SET reset_epoch = reset_epoch + 1 \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?3",
+            params![id, epoch(scope), LIVE],
+        )
+        .map_err(fail)?;
+    Ok(())
+}
+
 /// Retire every other live namespace no process holds, one short
 /// transaction each.
 pub(crate) fn retire_obsolete(
@@ -268,15 +298,17 @@ pub(crate) fn retire_obsolete(
     Ok(report)
 }
 
-/// Delete at most `max_rows` rows of retired scopes in one short write
-/// transaction (spec §10: no unbounded cascades).
+/// Delete at most `max_rows` rows in the caller's write transaction (spec
+/// §10: no unbounded cascades): rows of whole retired scopes first, then,
+/// with what is left, retired rows and orphan key manifests of `live`. The
+/// second part is skipped when `live` is no longer live (a fenced handle
+/// still reclaims retired scopes, its own included).
 pub(crate) fn reclaim(
-    connection: &mut Connection,
+    transaction: &Connection,
     max_rows: usize,
-    deadline: Deadline,
+    live: Scope,
 ) -> Result<Reclaimed, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
     let scopes: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
             .prepare(
@@ -322,21 +354,33 @@ pub(crate) fn reclaim(
             )
             .map_err(fail)?;
     }
+    // With no rows left to spend, the live scope is not examined:
+    // `complete` then speaks for the retired scopes only.
+    let drained = match ensure_live(transaction, live) {
+        Ok(()) if budget == 0 => true,
+        Ok(()) => {
+            let (deleted, drained) = gc::delete_retired(transaction, live, budget)?;
+            rows += deleted;
+            drained
+        }
+        Err(Bypass::Fenced) => true,
+        Err(error) => return Err(error),
+    };
     transaction
         .execute(
             "DELETE FROM namespaces WHERE state = ?1 \
              AND NOT EXISTS (SELECT 1 FROM retired_scopes r WHERE r.namespace_id = namespaces.namespace_id) \
-             AND NOT EXISTS (SELECT 1 FROM key_manifests k WHERE k.namespace_id = namespaces.namespace_id)",
+             AND NOT EXISTS (SELECT 1 FROM key_manifests k WHERE k.namespace_id = namespaces.namespace_id) \
+             AND NOT EXISTS (SELECT 1 FROM process_leases l WHERE l.namespace_id = namespaces.namespace_id)",
             [RETIRED],
         )
         .map_err(fail)?;
     let remaining: i64 = transaction
         .query_row("SELECT count(*) FROM retired_scopes", [], |row| row.get(0))
         .map_err(fail)?;
-    transaction.commit().map_err(fail)?;
     Ok(Reclaimed {
         rows,
-        complete: remaining == 0,
+        complete: remaining == 0 && drained,
     })
 }
 

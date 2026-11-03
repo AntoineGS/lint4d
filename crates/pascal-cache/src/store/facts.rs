@@ -1,4 +1,5 @@
 use super::Store;
+use super::health::Access;
 use super::keys::ArtifactKeyRef;
 use super::outcome::{Bypass, Lookup, Malformed, Miss, Published};
 use crate::facts::{FactDecodeError, FactDecoder, encode_facts, encoded_content_bytes};
@@ -14,16 +15,18 @@ impl Store {
         key: ArtifactKeyRef<'_>,
         facts: &ArtifactFacts,
     ) -> Result<Published, Bypass> {
-        let bytes = encoded_content_bytes(facts).map_err(Bypass::TooLarge)?;
-        let Some(_scratch) = self.scratch.reserve(bytes as u64) else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let encoded = encode_facts(facts).map_err(Bypass::TooLarge)?;
-        let rows = encoded.rows();
-        self.publish_artifact(&ArtifactWrite {
-            key,
-            supplemental: &encoded.supplemental,
-            rows: &rows,
+        self.guarded(Access::Write, || {
+            let bytes = encoded_content_bytes(facts).map_err(Bypass::TooLarge)?;
+            let Some(_scratch) = self.scratch.reserve(bytes as u64) else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let encoded = encode_facts(facts).map_err(Bypass::TooLarge)?;
+            let rows = encoded.rows();
+            self.publish_artifact(&ArtifactWrite {
+                key,
+                supplemental: &encoded.supplemental,
+                rows: &rows,
+            })
         })
     }
 
@@ -36,10 +39,10 @@ impl Store {
         key: ArtifactKeyRef<'_>,
         budget: &mut FactBudget,
     ) -> Result<Lookup<ArtifactFacts>, Bypass> {
-        match self.open_artifact(key)? {
+        self.guarded(Access::Read, || match self.open_artifact(key)? {
             Lookup::Hit(header) => self.load_facts_from(&header, budget),
             Lookup::Miss(miss) => Ok(Lookup::Miss(miss)),
-        }
+        })
     }
 
     /// `load_facts` for the artifact validated evidence concluded.
@@ -48,10 +51,10 @@ impl Store {
         id: Digest,
         budget: &mut FactBudget,
     ) -> Result<Lookup<ArtifactFacts>, Bypass> {
-        match self.open_artifact_by_id(id)? {
+        self.guarded(Access::Read, || match self.open_artifact_by_id(id)? {
             Lookup::Hit(header) => self.load_facts_from(&header, budget),
             Lookup::Miss(miss) => Ok(Lookup::Miss(miss)),
-        }
+        })
     }
 
     fn load_facts_from(

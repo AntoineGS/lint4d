@@ -6,6 +6,8 @@
 
 use super::Store;
 use super::artifacts::{ArtifactWrite, insert_prepared, prepare_artifact};
+use super::budget::WriteEstimate;
+use super::health::Access;
 use super::keys::{
     ArtifactKeyRef, admit_manifest, admit_manifest_by_digest, check_manifest_size, put_manifest,
 };
@@ -368,46 +370,56 @@ impl Store {
         facts: &ArtifactFacts,
         evidence: &EvidenceWrite<'_>,
     ) -> Result<PublishedEvidence, Bypass> {
-        let Some(root) = key.root() else {
-            return Err(Bypass::EvidenceForLocalArtifact);
-        };
-        check_manifest_size(evidence.context.key())?;
-        let fact_bytes = encoded_content_bytes(facts).map_err(Bypass::TooLarge)?;
-        check_observation_count(evidence.observations)?;
-        // The facts' size is exact; the evidence is bounded from its inputs.
-        // Both are charged before anything is encoded (spec §10).
-        let Some(mut scratch) = self.scratch.reserve(
-            (fact_bytes as u64).saturating_add(observations_bound(evidence.observations) as u64),
-        ) else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let subject = EvidenceSubject {
-            purpose: EvidencePurpose::Artifact,
-            context: evidence.context.digest(),
-            subject: root.digest(),
-        };
-        let prepared = prepare_evidence(subject, Some(key.digest()), evidence.observations)?;
-        scratch.shrink_to(fact_bytes as u64 + prepared.bytes);
-        let encoded = encode_facts(facts).map_err(Bypass::TooLarge)?;
-        let rows = encoded.rows();
-        let write = ArtifactWrite {
-            key,
-            supplemental: &encoded.supplemental,
-            rows: &rows,
-        };
-        let artifact_prepared = prepare_artifact(&write)?;
-        let mut writer = self.writer()?;
-        let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
-        ensure_live(&transaction, self.scope)?;
-        let artifact = insert_prepared(&transaction, self.scope, &write, &artifact_prepared)?;
-        put_manifest(&transaction, self.scope, evidence.context.key())?;
-        let published = insert_evidence(&transaction, self.scope, &prepared)?;
-        fault_point!(self, EvidenceBeforeCommit);
-        self.before_commit();
-        transaction.commit().map_err(|error| classify(&error))?;
-        Ok(PublishedEvidence {
-            artifact,
-            evidence: published,
+        self.guarded(Access::Write, || {
+            let Some(root) = key.root() else {
+                return Err(Bypass::EvidenceForLocalArtifact);
+            };
+            check_manifest_size(evidence.context.key())?;
+            let fact_bytes = encoded_content_bytes(facts).map_err(Bypass::TooLarge)?;
+            check_observation_count(evidence.observations)?;
+            // The facts' size is exact; the evidence is bounded from its inputs.
+            // Both are charged before anything is encoded (spec §10).
+            let Some(mut scratch) = self.scratch.reserve(
+                (fact_bytes as u64)
+                    .saturating_add(observations_bound(evidence.observations) as u64),
+            ) else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let subject = EvidenceSubject {
+                purpose: EvidencePurpose::Artifact,
+                context: evidence.context.digest(),
+                subject: root.digest(),
+            };
+            let prepared = prepare_evidence(subject, Some(key.digest()), evidence.observations)?;
+            scratch.shrink_to(fact_bytes as u64 + prepared.bytes);
+            let encoded = encode_facts(facts).map_err(Bypass::TooLarge)?;
+            let rows = encoded.rows();
+            let write = ArtifactWrite {
+                key,
+                supplemental: &encoded.supplemental,
+                rows: &rows,
+            };
+            let artifact_prepared = prepare_artifact(&write)?;
+            let mut writer = self.writer()?;
+            let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                artifact_prepared.estimate(&write).plus(WriteEstimate {
+                    bytes: prepared.bytes,
+                    rows: (evidence.observations.len() as u64).saturating_add(2),
+                }),
+            )?;
+            let artifact = insert_prepared(&transaction, self.scope, &write, &artifact_prepared)?;
+            put_manifest(&transaction, self.scope, evidence.context.key())?;
+            let published = insert_evidence(&transaction, self.scope, &prepared)?;
+            fault_point!(self, EvidenceBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(|error| classify(&error))?;
+            Ok(PublishedEvidence {
+                artifact,
+                evidence: published,
+            })
         })
     }
 
@@ -419,34 +431,46 @@ impl Store {
         target: EvidenceTarget<'_>,
         evidence: &EvidenceWrite<'_>,
     ) -> Result<PublishedSet, Bypass> {
-        check_manifest_size(evidence.context.key())?;
-        check_manifest_size(target.key())?;
-        check_observation_count(evidence.observations)?;
-        let Some(mut scratch) = self
-            .scratch
-            .reserve(observations_bound(evidence.observations) as u64)
-        else {
-            return Err(Bypass::ScratchExhausted);
-        };
-        let subject = EvidenceSubject {
-            purpose: target.purpose(),
-            context: evidence.context.digest(),
-            subject: target.key().digest(),
-        };
-        let prepared = prepare_evidence(subject, None, evidence.observations)?;
-        scratch.shrink_to(prepared.bytes);
-        let mut writer = self.writer()?;
-        let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
-        ensure_live(&transaction, self.scope)?;
-        put_manifest(&transaction, self.scope, evidence.context.key())?;
-        put_manifest(&transaction, self.scope, target.key())?;
-        let published = insert_evidence(&transaction, self.scope, &prepared)?;
-        fault_point!(self, EvidenceBeforeCommit);
-        self.before_commit();
-        transaction.commit().map_err(|error| classify(&error))?;
-        Ok(PublishedSet {
-            evidence_id: prepared.id,
-            published,
+        self.guarded(Access::Write, || {
+            check_manifest_size(evidence.context.key())?;
+            check_manifest_size(target.key())?;
+            check_observation_count(evidence.observations)?;
+            let Some(mut scratch) = self
+                .scratch
+                .reserve(observations_bound(evidence.observations) as u64)
+            else {
+                return Err(Bypass::ScratchExhausted);
+            };
+            let subject = EvidenceSubject {
+                purpose: target.purpose(),
+                context: evidence.context.digest(),
+                subject: target.key().digest(),
+            };
+            let prepared = prepare_evidence(subject, None, evidence.observations)?;
+            scratch.shrink_to(prepared.bytes);
+            let mut writer = self.writer()?;
+            let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
+            ensure_live(&transaction, self.scope)?;
+            self.admit_write(
+                &transaction,
+                WriteEstimate {
+                    bytes: prepared.bytes.saturating_add(
+                        (evidence.context.key().manifest().len() + target.key().manifest().len())
+                            as u64,
+                    ),
+                    rows: (evidence.observations.len() as u64).saturating_add(3),
+                },
+            )?;
+            put_manifest(&transaction, self.scope, evidence.context.key())?;
+            put_manifest(&transaction, self.scope, target.key())?;
+            let published = insert_evidence(&transaction, self.scope, &prepared)?;
+            fault_point!(self, EvidenceBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(|error| classify(&error))?;
+            Ok(PublishedSet {
+                evidence_id: prepared.id,
+                published,
+            })
         })
     }
 
@@ -458,7 +482,9 @@ impl Store {
         context: &ContextKey,
         root: &LocalArtifactKey,
     ) -> Result<Lookup<Vec<EvidenceHeader>>, Bypass> {
-        self.find_subject(context, EvidencePurpose::Artifact, root.key())
+        self.guarded(Access::Read, || {
+            self.find_subject(context, EvidencePurpose::Artifact, root.key())
+        })
     }
 
     /// The live binding or discovery evidence of `target` under `context`,
@@ -469,7 +495,9 @@ impl Store {
         context: &ContextKey,
         target: EvidenceTarget<'_>,
     ) -> Result<Lookup<Vec<EvidenceHeader>>, Bypass> {
-        self.find_subject(context, target.purpose(), target.key())
+        self.guarded(Access::Read, || {
+            self.find_subject(context, target.purpose(), target.key())
+        })
     }
 
     fn find_subject(
@@ -535,56 +563,58 @@ impl Store {
     /// it. Its context and subject manifests must hash to the stored
     /// digests (`admit_manifest_by_digest`); observations are unverified.
     pub fn open_evidence(&self, id: Digest) -> Result<Lookup<EvidenceHeader>, Bypass> {
-        let mut reader = self.reader()?;
-        let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
-        ensure_live(&transaction, self.scope)?;
-        let (stored, sequence) = match read_evidence_row(&transaction, self.scope, id) {
-            Ok(Some(row)) => row,
-            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-            Err(error) => return classify_read(&error).map(Lookup::Miss),
-        };
-        if stored.lifecycle != LIVE {
-            return Ok(Lookup::Miss(Miss::Retired));
-        }
-        let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Evidence)));
-        let Some(purpose) = u8::try_from(stored.purpose)
-            .ok()
-            .and_then(EvidencePurpose::from_tag)
-        else {
-            return malformed;
-        };
-        let (Ok(context), Ok(subject)) = (
-            <[u8; 32]>::try_from(stored.context_key.as_slice()),
-            <[u8; 32]>::try_from(stored.subject_key.as_slice()),
-        ) else {
-            return malformed;
-        };
-        let subject = EvidenceSubject {
-            purpose,
-            context: Digest::from_bytes(context),
-            subject: Digest::from_bytes(subject),
-        };
-        for (digest, kind) in [
-            (subject.context, KeyKind::Context),
-            (subject.subject, purpose.subject_kind()),
-        ] {
-            if let Lookup::Miss(miss) =
-                admit_manifest_by_digest(&transaction, self.scope, digest, kind)?
-            {
-                return Ok(Lookup::Miss(miss));
+        self.guarded(Access::Read, || {
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            let (stored, sequence) = match read_evidence_row(&transaction, self.scope, id) {
+                Ok(Some(row)) => row,
+                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+                Err(error) => return classify_read(&error).map(Lookup::Miss),
+            };
+            if stored.lifecycle != LIVE {
+                return Ok(Lookup::Miss(Miss::Retired));
             }
-        }
-        let row = (
-            id.as_bytes().to_vec(),
-            stored.artifact_id,
-            stored.observation_count,
-            stored.content_bytes,
-            sequence,
-        );
-        match header_from(self.scope, subject, row) {
-            Some(header) => Ok(Lookup::Hit(header)),
-            None => malformed,
-        }
+            let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Evidence)));
+            let Some(purpose) = u8::try_from(stored.purpose)
+                .ok()
+                .and_then(EvidencePurpose::from_tag)
+            else {
+                return malformed;
+            };
+            let (Ok(context), Ok(subject)) = (
+                <[u8; 32]>::try_from(stored.context_key.as_slice()),
+                <[u8; 32]>::try_from(stored.subject_key.as_slice()),
+            ) else {
+                return malformed;
+            };
+            let subject = EvidenceSubject {
+                purpose,
+                context: Digest::from_bytes(context),
+                subject: Digest::from_bytes(subject),
+            };
+            for (digest, kind) in [
+                (subject.context, KeyKind::Context),
+                (subject.subject, purpose.subject_kind()),
+            ] {
+                if let Lookup::Miss(miss) =
+                    admit_manifest_by_digest(&transaction, self.scope, digest, kind)?
+                {
+                    return Ok(Lookup::Miss(miss));
+                }
+            }
+            let row = (
+                id.as_bytes().to_vec(),
+                stored.artifact_id,
+                stored.observation_count,
+                stored.content_bytes,
+                sequence,
+            );
+            match header_from(self.scope, subject, row) {
+                Some(header) => Ok(Lookup::Hit(header)),
+                None => malformed,
+            }
+        })
     }
 
     pub fn read_evidence(&self, header: &EvidenceHeader) -> EvidenceReader<'_> {

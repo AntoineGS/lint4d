@@ -6,6 +6,7 @@
 //! verified.
 
 use super::Store;
+use super::health::Access;
 use super::limits::{MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS};
 use super::namespaces::{Scope, ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
@@ -144,6 +145,11 @@ impl<'a, S: RowSource> ManifestReader<'a, S> {
     /// witness verified. Items are unverified until then. A header from
     /// another scope is fenced before any SQL.
     pub(crate) fn next_batch(&mut self) -> Result<Lookup<Option<Batch<S::Item>>>, Bypass> {
+        let store = self.store;
+        store.guarded(Access::Read, || self.next_batch_unguarded())
+    }
+
+    fn next_batch_unguarded(&mut self) -> Result<Lookup<Option<Batch<S::Item>>>, Bypass> {
         if self.expected.scope != self.store.scope() {
             return Err(Bypass::Fenced);
         }

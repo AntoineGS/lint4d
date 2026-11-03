@@ -5,16 +5,18 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 3;
+pub const CONTAINER_VERSION: i64 = 4;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 3. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 4. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
 /// Spec §6.1 (amended 2026-10-27) adds evidence purposes and the publication sequence.
+/// Spec §6.1 (amended 2026-11-03) adds sequences on artifacts and records, leases and
+/// reference indexes.
 const SCHEMA: &str = "
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -61,6 +63,7 @@ CREATE TABLE artifacts (
     content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
     fact_checksum BLOB NOT NULL CHECK (length(fact_checksum) = 32),
     supplemental BLOB NOT NULL CHECK (length(supplemental) <= 1048576),
+    publication_seq INTEGER NOT NULL CHECK (publication_seq >= 1),
     PRIMARY KEY (namespace_id, reset_epoch, artifact_id),
     FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
         REFERENCES key_manifests (namespace_id, reset_epoch, digest),
@@ -86,6 +89,12 @@ CREATE TABLE artifact_rows (
 CREATE INDEX artifact_rows_by_index_key
     ON artifact_rows (namespace_id, reset_epoch, row_kind, index_key, artifact_id, ordinal)
     WHERE index_key IS NOT NULL;
+
+CREATE INDEX artifacts_by_root
+    ON artifacts (namespace_id, reset_epoch, root_key) WHERE root_key IS NOT NULL;
+
+CREATE INDEX artifacts_by_lifecycle
+    ON artifacts (namespace_id, reset_epoch, lifecycle, publication_seq);
 
 CREATE TABLE evidence_sets (
     namespace_id BLOB NOT NULL,
@@ -117,6 +126,13 @@ CREATE INDEX evidence_by_artifact
     ON evidence_sets (namespace_id, reset_epoch, artifact_id)
     WHERE artifact_id IS NOT NULL;
 
+CREATE INDEX evidence_by_context ON evidence_sets (namespace_id, reset_epoch, context_key);
+
+CREATE INDEX evidence_by_subject_key ON evidence_sets (namespace_id, reset_epoch, subject_key);
+
+CREATE INDEX evidence_by_lifecycle
+    ON evidence_sets (namespace_id, reset_epoch, lifecycle, publication_seq);
+
 CREATE TABLE observations (
     namespace_id BLOB NOT NULL,
     reset_epoch INTEGER NOT NULL,
@@ -144,6 +160,7 @@ CREATE TABLE member_records (
     member_evidence BLOB CHECK (member_evidence IS NULL OR length(member_evidence) = 32),
     binding_count INTEGER NOT NULL CHECK (binding_count BETWEEN 0 AND 65536),
     content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
+    publication_seq INTEGER NOT NULL CHECK (publication_seq >= 1),
     PRIMARY KEY (namespace_id, reset_epoch, record_id),
     FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
         REFERENCES artifacts (namespace_id, reset_epoch, artifact_id),
@@ -159,6 +176,9 @@ CREATE INDEX member_records_by_artifact
 CREATE INDEX member_records_by_evidence
     ON member_records (namespace_id, reset_epoch, member_evidence)
     WHERE member_evidence IS NOT NULL;
+
+CREATE INDEX member_records_by_lifecycle
+    ON member_records (namespace_id, reset_epoch, lifecycle, publication_seq);
 
 CREATE TABLE member_bindings (
     namespace_id BLOB NOT NULL,
@@ -214,6 +234,12 @@ CREATE TABLE snapshots (
 CREATE INDEX snapshots_by_context
     ON snapshots (namespace_id, reset_epoch, context_key, state, publication_seq);
 
+CREATE INDEX snapshots_by_discovery
+    ON snapshots (namespace_id, reset_epoch, discovery_evidence)
+    WHERE discovery_evidence IS NOT NULL;
+
+CREATE INDEX snapshots_by_state ON snapshots (namespace_id, reset_epoch, state);
+
 CREATE TABLE snapshot_members (
     namespace_id BLOB NOT NULL,
     reset_epoch INTEGER NOT NULL,
@@ -231,10 +257,35 @@ CREATE TABLE snapshot_members (
 
 CREATE INDEX snapshot_members_by_record
     ON snapshot_members (namespace_id, reset_epoch, record_id, snapshot_id);
+
+CREATE TABLE process_leases (
+    namespace_id BLOB NOT NULL REFERENCES namespaces (namespace_id),
+    reset_epoch INTEGER NOT NULL CHECK (reset_epoch >= 0),
+    lease_id BLOB NOT NULL CHECK (length(lease_id) = 16),
+    renewed_unix_seconds INTEGER NOT NULL CHECK (renewed_unix_seconds >= 0),
+    renewal_seq INTEGER NOT NULL CHECK (renewal_seq >= 0),
+    floor_seq INTEGER NOT NULL CHECK (floor_seq BETWEEN 0 AND renewal_seq),
+    PRIMARY KEY (namespace_id, reset_epoch, lease_id)
+) STRICT;
+
+CREATE TABLE lease_holds (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    lease_id BLOB NOT NULL,
+    snapshot_id BLOB NOT NULL,
+    PRIMARY KEY (namespace_id, reset_epoch, lease_id, snapshot_id),
+    FOREIGN KEY (namespace_id, reset_epoch, lease_id)
+        REFERENCES process_leases (namespace_id, reset_epoch, lease_id),
+    FOREIGN KEY (namespace_id, reset_epoch, snapshot_id)
+        REFERENCES snapshots (namespace_id, reset_epoch, snapshot_id)
+) STRICT;
+
+CREATE INDEX lease_holds_by_snapshot
+    ON lease_holds (namespace_id, reset_epoch, snapshot_id, lease_id);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Container {
+pub(crate) enum Container {
     Fresh,
     Current,
 }
@@ -291,7 +342,7 @@ fn run_hook(point: HookPoint) {
 /// Read-only inspection: nothing is written to a file that is not ours.
 /// The header and schema are read in one statement, so one snapshot: read
 /// separately, a creation committed between them looks foreign.
-fn inspect(connection: &Connection) -> Result<Container, Bypass> {
+pub(crate) fn inspect(connection: &Connection) -> Result<Container, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let (application_id, user_version, tables): (i64, i64, i64) = connection
         .query_row(
@@ -454,10 +505,12 @@ mod tests {
                 "artifacts",
                 "evidence_sets",
                 "key_manifests",
+                "lease_holds",
                 "member_bindings",
                 "member_records",
                 "namespaces",
                 "observations",
+                "process_leases",
                 "retired_scopes",
                 "snapshot_members",
                 "snapshots",
@@ -482,6 +535,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, (CONTAINER_VERSION, 0, 0, 8 << 30, 256 << 20, 0));
+    }
+
+    /// Every reference a per-row deletion checks is served by an index
+    /// whose leading columns are the scope and the referencing columns,
+    /// so deleting a parent never scans its children (spec §6.1, 2026-11-03).
+    #[test]
+    fn every_reference_is_indexed_by_its_scope_and_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = connect(&root.path().join("a.sqlite3"));
+        prepare_container(&mut connection, deadline()).unwrap();
+        let names = |sql: &str| -> Vec<String> {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let tables = names("SELECT name FROM sqlite_schema WHERE type = 'table'");
+        for table in &tables {
+            let mut references: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT id, \"from\", \"table\" FROM pragma_foreign_key_list('{table}') ORDER BY id, seq"
+                ))
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap();
+            for row in rows {
+                let (id, from, parent) = row.unwrap();
+                if parent != "namespaces" {
+                    references.entry(id).or_default().push(from);
+                }
+            }
+            let indexes = names(&format!("SELECT name FROM pragma_index_list('{table}')"));
+            for columns in references.values() {
+                let covered = indexes.iter().any(|index| {
+                    let leading = names(&format!(
+                        "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
+                    ));
+                    leading.len() >= columns.len() && leading[..columns.len()] == columns[..]
+                });
+                assert!(covered, "{table} ({columns:?}) has no index");
+            }
+        }
     }
 
     #[test]
@@ -520,7 +626,7 @@ mod tests {
 
     #[test]
     fn older_containers_are_bypassed_not_migrated() {
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("a.sqlite3");
             {
@@ -718,14 +824,14 @@ mod tests {
                 "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
                  INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
                  INSERT INTO artifacts VALUES
-                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');
+                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);
                  INSERT INTO key_manifests VALUES
                      (zeroblob(32), 0, CAST(zeroblob(31) || x'01' AS BLOB), 4, zeroblob(9));
                  INSERT INTO evidence_sets VALUES
                      (zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
                       zeroblob(32), zeroblob(32), 1, 0, 0, 1);
                  INSERT INTO member_records VALUES
-                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0);
+                     (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0, 1);
                  INSERT INTO snapshots VALUES
                      (zeroblob(32), 0, zeroblob(16), CAST(zeroblob(31) || x'01' AS BLOB), 1,
                       zeroblob(16), 0, 0, NULL, NULL, NULL, NULL);",
@@ -844,7 +950,7 @@ mod tests {
                 "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
                  INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
                  INSERT INTO artifacts VALUES
-                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'');",
+                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);",
             )
             .unwrap();
         for (purpose, artifact) in [(1, "NULL"), (2, "zeroblob(32)"), (3, "zeroblob(32)")] {

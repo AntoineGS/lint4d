@@ -14,6 +14,9 @@ pub(crate) struct Hooks {
     before_commit: Mutex<Option<Hook>>,
     row_fault: Mutex<Option<usize>>,
     faults: Mutex<HashMap<FaultPoint, Hook>>,
+    injected: Mutex<Option<Bypass>>,
+    pretend_usage: std::sync::atomic::AtomicU64,
+    pretend_free_space: Mutex<Option<u64>>,
 }
 
 impl Hooks {
@@ -27,9 +30,57 @@ impl Hooks {
             hook();
         }
     }
+
+    pub(crate) fn pretend_usage(&self) -> u64 {
+        self.pretend_usage
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pretend_free_space(&self) -> Option<u64> {
+        *self
+            .pretend_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn take_injected(&self) -> Option<Bypass> {
+        self.injected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl Store {
+    pub fn advance_clock_for_test(&self, by: std::time::Duration) {
+        self.clock.advance(by);
+    }
+
+    /// Count `extra_bytes` more as the store's physical size.
+    pub fn pretend_usage_for_test(&self, extra_bytes: u64) {
+        self.hooks
+            .pretend_usage
+            .store(extra_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace the filesystem's free space; `None` restores the real value.
+    pub fn pretend_free_space_for_test(&self, free: Option<u64>) {
+        *self
+            .hooks
+            .pretend_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = free;
+    }
+
+    /// The next guarded operation returns `bypass` without running.
+    pub fn fail_next_for_test(&self, bypass: Bypass) {
+        *self
+            .hooks
+            .injected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(bypass);
+    }
+
     /// Take the one-shot row fault: the number of rows to read before the
     /// next `next_batch` call fails with a SQLite I/O error.
     pub(crate) fn take_row_fault(&self) -> Option<usize> {
@@ -113,10 +164,23 @@ pub enum FaultPoint {
     SealCommitted,
     /// Inside a snapshot retirement, before commit.
     RetireBeforeCommit,
+    /// In `renew_lease`, after it found the lease due and before it takes
+    /// the writer.
+    LeaseRenewDecided,
+    /// Inside a maintenance retirement batch, before commit.
+    GcRetireBeforeCommit,
+    /// Inside a `reclaim` deletion batch, before commit.
+    GcDeleteBeforeCommit,
+    /// After a maintenance checkpoint; no connection is held.
+    CheckpointCompleted,
+    /// Inside an incremental vacuum batch, before commit.
+    VacuumBeforeCommit,
+    /// Inside a namespace reset, before commit.
+    ResetBeforeCommit,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 14] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -125,6 +189,21 @@ impl FaultPoint {
         Self::SealBeforeCommit,
         Self::SealCommitted,
         Self::RetireBeforeCommit,
+        Self::LeaseRenewDecided,
+        Self::GcRetireBeforeCommit,
+        Self::GcDeleteBeforeCommit,
+        Self::CheckpointCompleted,
+        Self::VacuumBeforeCommit,
+        Self::ResetBeforeCommit,
+    ];
+
+    /// The points inside maintenance batches.
+    pub const MAINTENANCE: [Self; 5] = [
+        Self::GcRetireBeforeCommit,
+        Self::GcDeleteBeforeCommit,
+        Self::CheckpointCompleted,
+        Self::VacuumBeforeCommit,
+        Self::ResetBeforeCommit,
     ];
 
     pub fn name(self) -> &'static str {
@@ -137,6 +216,12 @@ impl FaultPoint {
             Self::SealBeforeCommit => "SealBeforeCommit",
             Self::SealCommitted => "SealCommitted",
             Self::RetireBeforeCommit => "RetireBeforeCommit",
+            Self::LeaseRenewDecided => "LeaseRenewDecided",
+            Self::GcRetireBeforeCommit => "GcRetireBeforeCommit",
+            Self::GcDeleteBeforeCommit => "GcDeleteBeforeCommit",
+            Self::CheckpointCompleted => "CheckpointCompleted",
+            Self::VacuumBeforeCommit => "VacuumBeforeCommit",
+            Self::ResetBeforeCommit => "ResetBeforeCommit",
         }
     }
 
@@ -175,6 +260,19 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&point);
+    }
+}
+
+/// `maintenance.lock` held by a test until dropped.
+pub struct MaintenanceLockHold(#[allow(dead_code)] super::maintenance::MaintenanceLock);
+
+impl Store {
+    /// Take `maintenance.lock` as another maintainer would; `Busy` when
+    /// someone holds it.
+    pub fn hold_maintenance_lock_for_test(&self) -> Result<MaintenanceLockHold, Bypass> {
+        super::maintenance::MaintenanceLock::try_take(&self.location)?
+            .map(MaintenanceLockHold)
+            .ok_or(Bypass::Busy)
     }
 }
 

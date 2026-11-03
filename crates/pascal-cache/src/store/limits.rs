@@ -8,6 +8,9 @@ pub const MAX_SCRATCH_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_WAIT: Duration = Duration::from_millis(25);
 /// Wait allowance when opening the store, which is off interactive paths.
 pub const MAX_OPEN_WAIT: Duration = Duration::from_secs(2);
+/// The WAL file length SQLite truncates to when it resets the WAL
+/// (spec §10 amendment 2026-11-03, D13).
+pub const JOURNAL_SIZE_LIMIT_BYTES: i64 = 4 << 20;
 pub const MAX_READERS: usize = 2;
 pub const MIN_CONNECTION_PAGE_CACHE_BYTES: u64 = 256 * 1024;
 /// Heap one SQLite connection may use beyond its page cache: schema,

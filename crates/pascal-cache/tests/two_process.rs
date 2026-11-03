@@ -1,15 +1,23 @@
 #![cfg(unix)]
 
+mod common;
+
+use common::records::publish_bulk;
+use pascal_cache::admin;
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Digest, LocalArtifactKey, Lookup, Miss, Namespace,
-    Published, RetireReport, SourceContent, Store, StoreLimits,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, LocalArtifactKey,
+    Lookup, Maintenance, MaintenanceLimits, Miss, Namespace, Pressure, Published, RetireReport,
+    SourceContent, StepBudget, Store, StoreLimits, StorePolicy,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use rusqlite::Connection;
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 const ROLE: &str = "PASCAL_CACHE_CHILD_ROLE";
 const DIRECTORY: &str = "PASCAL_CACHE_CHILD_DIRECTORY";
@@ -83,6 +91,19 @@ fn child_process_entry() {
     };
     let directory = std::env::var_os(DIRECTORY).expect("directory");
     let artifact = std::env::var(ARTIFACT).unwrap_or_default();
+    if role == "hold-reader" {
+        // A read transaction outside any store, open until stdin closes.
+        let connection = Connection::open(Path::new(&directory).join(DATABASE_FILE)).unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        let _: i64 = connection
+            .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        println!("ready");
+        let mut line = String::new();
+        while std::io::stdin().read_line(&mut line).unwrap() != 0 {}
+        connection.execute_batch("COMMIT").unwrap();
+        return;
+    }
     let byte = if role == "hold" {
         HOLD_NAMESPACE
     } else {
@@ -104,6 +125,11 @@ fn child_process_entry() {
             store.set_before_commit_for_test(|| std::process::abort());
             publish(&store, &artifact);
             unreachable!("the hook aborts the process");
+        }
+        "publish-abort-after-commit" => {
+            publish(&store, &artifact);
+            // No checkpoint, no close: the commit is only in the WAL.
+            std::process::abort();
         }
         "hold" => {
             println!("ready");
@@ -151,6 +177,39 @@ fn result(role: &str, directory: &Path, artifact: &str) -> String {
 fn private_directory(root: &Path) -> std::path::PathBuf {
     root.join("cache")
 }
+
+/// Spawn `command` and wait until it prints "ready"; the child's stdout
+/// stays open with it.
+fn spawn_ready(mut command: Command) -> (Child, BufReader<ChildStdout>) {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("ready") {
+        line.clear();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "child exited early"
+        );
+    }
+    (child, stdout)
+}
+
+fn inode(directory: &Path, suffix: &str) -> u64 {
+    std::fs::metadata(directory.join(format!("{DATABASE_FILE}{suffix}")))
+        .unwrap()
+        .ino()
+}
+
+const ROOMY: StepBudget = StepBudget {
+    time: Duration::from_secs(60),
+    rows: 1000,
+};
 
 #[test]
 fn two_processes_share_published_records() {
@@ -260,4 +319,157 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
         })
     );
     assert!(!lock.exists());
+}
+
+#[test]
+fn ac3_a_reader_held_in_another_process_stops_writes_at_the_wal_threshold() {
+    let root = common::private_tempdir();
+    let directory = private_directory(root.path());
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 << 20,
+                wal_threshold_bytes: 8 << 20,
+            },
+        )
+        .unwrap();
+    let (mut holder, _stdout) = spawn_ready(child("hold-reader", &directory, ""));
+    assert_eq!(
+        publish_bulk(&store, "unit Bulk;", 9, 1_000_000),
+        Ok(Published::Inserted)
+    );
+    let checkpoint = store.checkpoint().unwrap();
+    assert!(
+        !checkpoint.complete() && !checkpoint.truncated,
+        "{checkpoint:?}"
+    );
+    assert_eq!(
+        publish_bulk(&store, "unit Next;", 1, 10),
+        Err(Bypass::WalPressure)
+    );
+    let report = Maintenance::new(MaintenanceLimits::default())
+        .unwrap()
+        .step(
+            &store,
+            StepBudget {
+                time: Duration::from_secs(60),
+                rows: 100,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!((report.pressure, report.rows), (Pressure::WalPressure, 0));
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+    assert!(store.checkpoint().unwrap().truncated);
+    assert_eq!(
+        publish_bulk(&store, "unit Next;", 1, 10),
+        Ok(Published::Inserted)
+    );
+}
+
+#[test]
+fn ac3_a_commit_survives_death_before_any_checkpoint() {
+    let root = common::private_tempdir();
+    let directory = private_directory(root.path());
+    drop(
+        Store::open(
+            &directory,
+            &namespace(SHARED_NAMESPACE),
+            StoreLimits::default(),
+        )
+        .unwrap(),
+    );
+    let status = child("publish-abort-after-commit", &directory, "Delta")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
+    let wal = std::fs::metadata(directory.join(format!("{DATABASE_FILE}-wal")))
+        .unwrap()
+        .len();
+    assert!(wal > 0, "the commit is only in the WAL");
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(read(&store, "Delta"), Some(payloads("Delta")));
+}
+
+/// Spec §12.1: a reset or prune while another process holds a reader.
+#[test]
+fn a_reset_and_a_prune_neither_wait_on_nor_invalidate_a_reader_in_another_process() {
+    let root = common::private_tempdir();
+    let directory = private_directory(root.path());
+    let other = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(publish(&other, "Alpha"), Published::Inserted);
+    let (mut holder, _stdout) = spawn_ready(child("hold-reader", &directory, ""));
+    let files = (inode(&directory, ""), inode(&directory, "-wal"));
+
+    assert_eq!(
+        admin::reset(
+            &directory,
+            &namespace(SHARED_NAMESPACE),
+            StoreLimits::default()
+        ),
+        Ok(true)
+    );
+    assert_eq!(other.check_scope(), Err(Bypass::Fenced), "reset fences");
+    let pruned = admin::prune(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+        ROOMY,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(pruned.cycle_complete && !pruned.skipped, "{pruned:?}");
+    let store = Store::open(
+        &directory,
+        &namespace(SHARED_NAMESPACE),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(store.scope().reset_epoch, 1);
+    assert_eq!(read(&store, "Alpha"), None, "the reset namespace is empty");
+    let checkpoint = store.checkpoint().unwrap();
+    // (`truncated` only says the WAL is under the journal limit, which
+    // this small WAL always is.)
+    assert!(
+        !checkpoint.complete(),
+        "the reader holds the checkpoint back: {checkpoint:?}"
+    );
+    assert_eq!(
+        (inode(&directory, ""), inode(&directory, "-wal")),
+        files,
+        "nothing unlinked or renamed"
+    );
+
+    drop(holder.stdin.take());
+    assert!(
+        holder.wait().unwrap().success(),
+        "the reader's transaction commits"
+    );
+    let report = Maintenance::new(MaintenanceLimits::default())
+        .unwrap()
+        .step(&store, ROOMY, &AtomicBool::new(false))
+        .unwrap();
+    assert!(report.cycle_complete, "{report:?}");
+    assert!(store.checkpoint().unwrap().complete());
+    assert_eq!((inode(&directory, ""), inode(&directory, "-wal")), files);
 }

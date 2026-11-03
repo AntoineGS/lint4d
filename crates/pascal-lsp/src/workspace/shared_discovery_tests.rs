@@ -30,11 +30,13 @@ fn settle(root: &Path) {
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
     for entry in fs::read_dir(root).expect("fixture directory") {
         let path = entry.expect("fixture entry").path();
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .and_then(|file| file.set_modified(past))
-            .expect("age fixture file");
+        let file = if path.is_dir() {
+            fs::File::open(&path)
+        } else {
+            fs::File::options().write(true).open(&path)
+        };
+        file.and_then(|file| file.set_modified(past))
+            .expect("age fixture entry");
     }
     fs::File::open(root)
         .and_then(|directory| directory.set_modified(past))
@@ -172,4 +174,41 @@ fn a_project_warning_is_logged_once_across_requests() {
         .filter(|warning| warning.contains("ignored Target body"))
         .count();
     assert_eq!(targets, 1, "{logged:#?}");
+}
+
+/// A request that already installed the project context for one document
+/// and adopts the shared discovery of another records that document's
+/// directories, so a new project candidate there stales the context.
+#[test]
+fn adopting_a_shared_discovery_into_an_installed_context_records_its_directories() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    fixture(root);
+    fs::create_dir_all(root.join("b")).expect("second source directory");
+    fs::write(
+        root.join("b/Other.pas"),
+        "unit Other;\ninterface\nimplementation\nend.\n",
+    )
+    .expect("second source");
+    settle(&root.join("b"));
+    settle(root);
+    let main_workspace = workspace(root);
+    let main = Url::from_file_path(root.join("Main.pas")).expect("main URI");
+    let other = Url::from_file_path(root.join("b/Other.pas")).expect("other URI");
+    {
+        let mut first = Workspace::from_analysis_input(&main_workspace.analysis_input());
+        first.context_for_uri(&other).expect("context of Other");
+    }
+
+    let mut second = Workspace::from_analysis_input(&main_workspace.analysis_input());
+    let main_key = second.context_for_uri(&main).expect("context of Main");
+    let other_key = second.context_for_uri(&other).expect("context of Other");
+    assert_eq!(main_key, other_key, "one project owns both documents");
+
+    let memberships = &second.contexts[&other_key].project_candidate_memberships;
+    assert!(
+        memberships.keys().any(|directory| directory.ends_with("b")),
+        "{:?}",
+        memberships.keys().collect::<Vec<_>>()
+    );
 }

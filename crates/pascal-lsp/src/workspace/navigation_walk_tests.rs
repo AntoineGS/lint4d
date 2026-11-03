@@ -13,6 +13,12 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 fn workspace(root: &Path) -> Workspace {
+    let mut workspace = strict_workspace(root);
+    workspace.set_best_effort_navigation(true);
+    workspace
+}
+
+fn strict_workspace(root: &Path) -> Workspace {
     Workspace::with_override_session(
         vec![root.to_path_buf()],
         WorkspaceOptions::default(),
@@ -206,4 +212,98 @@ fn a_definition_within_the_walk_limits_still_binds() {
 
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert!(!walk_stopped(&workspace), "{:?}", workspace.warnings);
+}
+
+#[test]
+fn strict_navigation_does_not_skip_a_failed_dependency() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    inherited_member_fixture(root);
+    let mut workspace = strict_workspace(root);
+    let _fail = FailImports::of("/Bad.pas");
+
+    let result = workspace.navigate_with_cancel(
+        &uri(&root.join("Main.pas")),
+        Position::new(7, 5),
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    );
+
+    assert!(
+        result.is_err(),
+        "the implementation lens stays strict: {result:?}"
+    );
+}
+
+#[test]
+fn a_skipped_dependency_is_logged_once_per_configuration_generation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    inherited_member_fixture(root);
+    let main_workspace = strict_workspace(root);
+    let main = uri(&root.join("Main.pas"));
+    let _fail = FailImports::of("/Bad.pas");
+    super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().clear());
+
+    for _ in 0..2 {
+        let locations = super::queries::navigation_from_input(
+            main_workspace.analysis_input(),
+            &main,
+            Position::new(7, 5),
+            NavigationTarget::Definition,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("definition")
+        .locations;
+        assert_eq!(locations.len(), 1, "{locations:?}");
+    }
+
+    let logged = super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow().clone());
+    let skipped = logged
+        .iter()
+        .filter(|warning| warning.contains("navigation skipped the imports of"))
+        .count();
+    assert_eq!(skipped, 1, "{logged:#?}");
+}
+
+#[test]
+fn a_relaxed_global_binding_is_logged_by_definition() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    fs::write(
+        root.join("Dep.pas"),
+        "unit Dep;\ninterface\nprocedure DepValue;\nimplementation\nprocedure DepValue; begin end;\nend.\n",
+    )
+    .expect("dependency");
+    fs::write(
+        root.join("Main.pas"),
+        concat!(
+            "unit Main;\ninterface\nuses Dep;\ntype\n  TThing = class(TBase)\n    procedure Run;\n  end;\n",
+            "implementation\nprocedure TThing.Run;\nbegin\n  DepValue;\nend;\nend.\n",
+        ),
+    )
+    .expect("main");
+    let main_workspace = strict_workspace(root);
+    super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().clear());
+
+    let locations = super::queries::navigation_from_input(
+        main_workspace.analysis_input(),
+        &uri(&root.join("Main.pas")),
+        Position::new(10, 4),
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("definition")
+    .locations;
+
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    let logged = super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow().clone());
+    assert!(
+        logged
+            .iter()
+            .any(|warning| warning.contains("Members inherited by TThing are unknown")),
+        "{logged:#?}"
+    );
 }

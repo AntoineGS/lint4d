@@ -364,8 +364,17 @@ fn an_imported_global_called_from_a_method_binds_for_read_only_features() {
         &cancel,
     )
     .value
-    .expect("hover answers");
-    assert!(hover.is_some(), "hover must bind DepValue");
+    .expect("hover answers")
+    .expect("hover must bind DepValue");
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("unexpected hover contents: {:?}", hover.contents);
+    };
+    assert!(
+        markup
+            .value
+            .contains("Members inherited by TThing are unknown; the result may be shadowed."),
+        "the relaxed binding must say it may be shadowed: {markup:?}"
+    );
     let definition = super::navigation_from_input(
         fixture.input.clone(),
         &fixture.main,
@@ -389,5 +398,149 @@ fn an_imported_global_called_from_a_method_binds_for_read_only_features() {
         rename.value.is_err(),
         "rename keeps the conservative inherited-member model: {:?}",
         rename.value
+    );
+}
+
+#[test]
+fn prepare_call_hierarchy_answers_best_effort_over_an_unproven_dependency() {
+    let main = concat!(
+        "unit Main;\ninterface\nuses Dep, Broken;\nprocedure Run;\nimplementation\n",
+        "procedure Run;\nbegin\n  DepValue;\nend;\nend.\n",
+    );
+    let fixture = fixture(main, &dep_source(""), &stopped_before_include(), "");
+    let items = super::prepare_call_hierarchy_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        Position::new(3, 11),
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("prepare call hierarchy answers best effort");
+    assert!(
+        items.is_some_and(|items| items.iter().any(|item| item.name == "Run")),
+        "the routine under the cursor is prepared"
+    );
+}
+
+#[test]
+fn semantic_tokens_resolve_best_effort_over_an_unproven_dependency() {
+    let fixture = broken_fixture(&stopped_before_include());
+    let tokens = super::semantic_tokens_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        None,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("semantic tokens answer best effort");
+    // `DepValue` (line 6) is classified from its binding, as a function.
+    let mut line = 0;
+    let mut bound = false;
+    for token in &tokens.data {
+        line += token.delta_line;
+        if line == 6 && token.length == 8 {
+            bound = token.token_type != 0 || token.token_modifiers_bitset != 0;
+        }
+    }
+    assert!(
+        bound,
+        "DepValue must be resolved, not lexical only: {tokens:?}"
+    );
+}
+
+#[test]
+fn a_dependency_without_a_project_context_is_a_coverage_gap() {
+    let fixture = broken_fixture("");
+    let _fail = FailContext::of("/Broken.pas");
+    let hover = hover_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        VALUE,
+        MarkupKind::PlainText,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("hover answers best effort")
+    .expect("hover binds DepValue");
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("unexpected hover contents: {:?}", hover.contents);
+    };
+    assert!(
+        markup
+            .value
+            .contains("Analysis of Broken.pas is incomplete"),
+        "{markup:?}"
+    );
+}
+
+struct FailContext;
+
+impl FailContext {
+    fn of(file_name: &str) -> Self {
+        crate::workspace::rename::TEST_FAIL_INCLUDE_AUDIT_CONTEXT
+            .with(|name| *name.borrow_mut() = Some(file_name.to_string()));
+        Self
+    }
+}
+
+impl Drop for FailContext {
+    fn drop(&mut self) {
+        crate::workspace::rename::TEST_FAIL_INCLUDE_AUDIT_CONTEXT
+            .with(|name| *name.borrow_mut() = None);
+    }
+}
+
+#[test]
+fn the_hover_note_counts_gaps_past_the_retention_limit() {
+    let mut coverage = crate::coverage::Coverage::default();
+    for index in 0..40 {
+        let unit = Url::parse(&format!("file:///workspace/Unit{index:02}.pas")).expect("URI");
+        coverage.note(Some(&unit), "conditional analysis is incomplete");
+    }
+    let note = super::coverage_note(&coverage).expect("note");
+    assert!(
+        note.contains("Unit00.pas, Unit01.pas, Unit02.pas and 37 more"),
+        "{note}"
+    );
+}
+
+#[test]
+fn an_unsupported_directive_in_the_document_blocks_after_error_recording_stopped() {
+    let uri = Url::parse("file:///workspace/Main.pas").expect("URI");
+    let snapshot = crate::workspace::rename::RenameSnapshot::with_include_errors_for_test(
+        vec![
+            "rename cannot prove completeness because include error limit (256) was reached".into(),
+        ],
+        Vec::new(),
+        vec![uri.clone()],
+    );
+    assert!(
+        super::blocking_include_error(&snapshot, &uri).is_some(),
+        "the document's own unsupported directive still blocks"
+    );
+}
+
+/// Completion inside a method whose owner's member list ran out of budget
+/// cannot know which inherited member shadows a global, so it offers none.
+#[test]
+fn completion_withholds_globals_when_the_owner_member_lookup_runs_out() {
+    let main = concat!(
+        "unit Main;\ninterface\nuses Dep;\ntype\n  TThing = class\n    procedure Run;\n  end;\n",
+        "implementation\nprocedure TThing.Run;\nbegin\n  DepValue;\nend;\nend.\n",
+    );
+    let fixture = fixture(main, &dep_source(""), "", "");
+    let _exhaust = crate::navigation::test_exhaust_completion_member_lookup();
+    let completion = completion_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        Position::new(10, 5),
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("completion answers");
+    assert!(completion.is_incomplete, "{completion:?}");
+    assert!(
+        completion.items.iter().all(|item| item.label != "DepValue"),
+        "{completion:?}"
     );
 }

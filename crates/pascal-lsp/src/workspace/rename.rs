@@ -97,6 +97,10 @@ type EnumeratedContextHook = Box<dyn FnMut(usize, &Path, &ProjectContext)>;
 
 #[cfg(test)]
 thread_local! {
+    /// The include audit cannot find a project context for an owner whose
+    /// path ends with this.
+    pub(crate) static TEST_FAIL_INCLUDE_AUDIT_CONTEXT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
     static TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
     static TEST_ENUMERATED_CONTEXT_HOOK: std::cell::RefCell<Option<EnumeratedContextHook>> =
@@ -579,6 +583,37 @@ pub(crate) struct RenameSnapshot {
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
     _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
+}
+
+#[cfg(test)]
+impl RenameSnapshot {
+    pub(crate) fn with_include_errors_for_test(
+        include_errors: Vec<String>,
+        include_error_owners: Vec<(Url, String)>,
+        unsupported_directive_owners: Vec<Url>,
+    ) -> Self {
+        Self {
+            index: NavigationIndex::new(),
+            sources: HashMap::new(),
+            records: HashMap::new(),
+            expansions: HashMap::new(),
+            readable: HashSet::new(),
+            editable: HashSet::new(),
+            complete: true,
+            incomplete_reason: None,
+            other_include_errors: false,
+            include_errors,
+            unsupported_directive_owners,
+            include_error_owners,
+            best_effort: true,
+            dependency_coverage: Coverage::default(),
+            incomplete_context_sources: Vec::new(),
+            declaration_providers: HashSet::new(),
+            baseline_records: Vec::new(),
+            mode: SnapshotMode::Assistance,
+            _cache_leases: HashMap::new(),
+        }
+    }
 }
 
 fn cached_position_index<'a>(
@@ -8437,7 +8472,14 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         auditor.current_owner = Some(uri.clone());
-        let context = auditor.context_for_source(&uri)?;
+        let context = match auditor.context_for_source(&uri) {
+            Ok(context) => context,
+            Err(error) if error != CANCELLATION_MESSAGE && auditor.dependency_relaxed() => {
+                auditor.note_gap(format!("include analysis is incomplete: {error}"));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let Some(mut source) = auditor.sources.get(&uri).cloned() else {
             continue;
         };
@@ -8659,6 +8701,14 @@ impl IncludeAuditor<'_> {
         &mut self,
         uri: &Url,
     ) -> Result<Option<(ContextKey, Arc<ProjectContext>, ProjectObservations)>, String> {
+        #[cfg(test)]
+        if TEST_FAIL_INCLUDE_AUDIT_CONTEXT.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("could not discover project context for {uri}"));
+        }
         let context_key = if let Some(context_key) = self.contexts.get(uri).cloned() {
             Some(context_key)
         } else if let Some(context_key) = self.loader.document_contexts.get(uri).cloned() {

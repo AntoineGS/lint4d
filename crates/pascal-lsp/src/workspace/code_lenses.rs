@@ -316,7 +316,9 @@ pub(crate) fn resolve(
             (value, result.records, "references")
         }
         LensKind::Implementation => {
-            let result = queries::navigation_from_input(
+            // Strict, like the references lens: a count has no room to say
+            // the answer is best effort.
+            let result = queries::strict_navigation_from_input(
                 input.clone(),
                 &data.uri,
                 data.range.start,

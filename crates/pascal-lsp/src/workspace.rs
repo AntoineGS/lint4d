@@ -3037,6 +3037,9 @@ pub struct Workspace {
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
+    /// Navigation answers best effort (D16): a dependency whose imports fail
+    /// to load is skipped. The implementation code lens stays strict.
+    best_effort_navigation: bool,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3619,6 +3622,11 @@ impl Workspace {
             request_generation: input.request_generation,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
+        self.best_effort_navigation = best_effort;
+        self.index.set_best_effort_bindings(best_effort);
     }
 
     pub(crate) fn navigation_state(&self) -> NavigationState {
@@ -7128,8 +7136,9 @@ impl Workspace {
                     }
                     // D16: a dependency that cannot be loaded only hides what
                     // binds through it; navigation returns what still binds.
-                    Err(error) if &current != uri => {
-                        self.warn(format!(
+                    // Each request rebuilds the walk, so log it once.
+                    Err(error) if self.best_effort_navigation && &current != uri => {
+                        self.warn_project(format!(
                             "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
                         ));
                         continue;
@@ -10124,7 +10133,18 @@ impl Workspace {
         if installed {
             self.contexts
                 .insert(discovery.key.clone(), discovery.state.clone());
+        } else if let Some(state) = self.contexts.get_mut(&discovery.key) {
+            // The installed state was discovered for another document; record
+            // the candidate memberships of this one's directories, as
+            // `install_context` would.
+            for (directory, membership) in &discovery.state.project_candidate_memberships {
+                state
+                    .project_candidate_memberships
+                    .entry(directory.clone())
+                    .or_insert_with(|| membership.clone());
+            }
         }
+        self.extend_context_watch_paths(&discovery.key, path, cancel, budget)?;
         if !(self.context_is_fresh_with_cancel(&discovery.key, cancel, budget)?
             && self.context_matches_current_selection_with_cancel_and_budget(
                 path,

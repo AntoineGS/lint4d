@@ -2257,6 +2257,15 @@ impl NavigationIndex {
         let Some(current_document) = self.documents.get(current_uri) else {
             return Ok((false, false));
         };
+        #[cfg(test)]
+        if super::rename::TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(Cell::get) {
+            let error = accumulator
+                .budget
+                .require_bytes(usize::MAX, cancel)
+                .expect_err("an unbounded charge exhausts the budget");
+            accumulator.stop_if_exhausted(error, cancel)?;
+            return Ok((false, false));
+        }
         let lookup = match self.member_candidates_for_completion_with_budget(
             current_uri,
             current_document,
@@ -2272,8 +2281,9 @@ impl NavigationIndex {
         ) {
             Ok(lookup) => lookup,
             Err(error) => {
+                // The inherited members are unknown: conservative status.
                 accumulator.stop_if_exhausted(error, cancel)?;
-                return Ok((true, false));
+                return Ok((false, false));
             }
         };
         let status = (lookup.ancestry_known, !lookup.ambiguous_names.is_empty());

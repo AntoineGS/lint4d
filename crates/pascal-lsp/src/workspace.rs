@@ -2939,7 +2939,8 @@ pub struct Workspace {
     pub(crate) index_build: bool,
     /// The context an index build is working in: no prune drops it.
     pinned_context: Option<ContextKey>,
-    /// The read error of the last closed-source load that skipped its file.
+    /// Why the last load that returned `Ok(false)` skipped its file: a read
+    /// error, a cache limit or a failed expansion.
     load_refusal: Option<String>,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
@@ -8154,6 +8155,11 @@ impl Workspace {
                     uri
                 ));
             }
+            self.load_refusal = Some(format!(
+                "source cache limit: {} files, {} bytes retained",
+                self.indexed_files.len(),
+                self.indexed_bytes
+            ));
             return Ok(false);
         }
         let context = self
@@ -8208,6 +8214,7 @@ impl Workspace {
                         self.warn(format!(
                             "include expansion failed for {uri}; navigation is incomplete: {error}"
                         ));
+                        self.load_refusal = Some(format!("include expansion failed: {error}"));
                         return Ok(false);
                     }
                 };
@@ -8267,6 +8274,7 @@ impl Workspace {
             }
             self.remove_indexed_with_control(uri, cancel, budget, true)?;
             self.warn(format!("cannot index {uri}: {error}"));
+            self.load_refusal = Some(format!("the parse failed: {error}"));
             return Ok(false);
         }
         // The index now holds this source's new parse; an older lease is stale.

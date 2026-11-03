@@ -274,6 +274,9 @@ struct Member {
     tail_ids: Vec<NameId>,
     unit_ids: Vec<NameId>,
     charged: usize,
+    /// When its last load was deferred (a reason that may pass), in the
+    /// context's deferral order; 0 when it was not.
+    deferred: u64,
 }
 
 impl Member {
@@ -334,6 +337,10 @@ pub(crate) struct ContextIndex {
     /// The names the interner and the inverted-list keys hold, charged once
     /// per context and kept until compaction.
     name_bytes: usize,
+    deferrals: u64,
+    /// The reason of the latest deferral, reported while members are
+    /// deferred.
+    last_deferral: Option<Box<str>>,
 }
 
 pub(crate) struct CandidateQuery {
@@ -398,6 +405,9 @@ pub(crate) struct IndexCoverage {
     pub(crate) pending: usize,
     pub(crate) refused: usize,
     pub(crate) first_refusal: Option<Box<str>>,
+    /// Pending members whose last load failed for a reason that may pass.
+    pub(crate) deferred: usize,
+    pub(crate) first_deferral: Option<Box<str>>,
 }
 
 impl ContextIndex {
@@ -511,6 +521,7 @@ impl ContextIndex {
             self.units = HashMap::new();
             self.include_dependents = HashMap::new();
             self.member_bytes = 0;
+            self.last_deferral = None;
             removed_bytes += std::mem::take(&mut self.name_bytes);
         }
         if !changed.is_empty() {
@@ -530,6 +541,7 @@ impl ContextIndex {
         let facts = member.facts.take();
         let charged = std::mem::take(&mut member.charged);
         member.stamps = Vec::new();
+        member.deferred = 0;
         for name in posting_ids {
             list_remove(&mut self.postings, name, id);
         }
@@ -559,15 +571,63 @@ impl ContextIndex {
         charged
     }
 
-    /// Unindexed | Stale, path order.
-    pub(crate) fn pending(&self, limit: usize) -> Vec<PathBuf> {
+    fn pending_members(&self) -> impl Iterator<Item = &Member> {
         self.by_path
             .values()
             .map(|id| &self.members[id.0 as usize])
             .filter(|member| matches!(member.state(), MemberState::Unindexed | MemberState::Stale))
+    }
+
+    /// Unindexed | Stale: the members no load deferred in path order, then
+    /// the deferred ones, longest deferred first, so a run of failing
+    /// members never holds the others back.
+    pub(crate) fn pending(&self, limit: usize) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .pending_members()
+            .filter(|member| member.deferred == 0)
             .take(limit)
             .map(|member| member.path.clone())
+            .collect();
+        if paths.len() < limit {
+            let mut deferred: Vec<&Member> = self
+                .pending_members()
+                .filter(|member| member.deferred != 0)
+                .collect();
+            deferred.sort_by_key(|member| member.deferred);
+            paths.extend(
+                deferred
+                    .into_iter()
+                    .take(limit - paths.len())
+                    .map(|member| member.path.clone()),
+            );
+        }
+        paths
+    }
+
+    /// Pending members no load has deferred since they were last indexed.
+    pub(crate) fn untried(&self) -> Vec<PathBuf> {
+        self.pending_members()
+            .filter(|member| member.deferred == 0)
+            .map(|member| member.path.clone())
             .collect()
+    }
+
+    /// A pending member's load failed for a reason that may pass: it goes
+    /// behind every other pending member. The facts do not change, so this
+    /// neither bumps the generation nor logs a change.
+    pub(crate) fn defer(&mut self, path: &Path, reason: &str) {
+        let Some(id) = self.id_of(path) else {
+            return;
+        };
+        let member = &mut self.members[id.0 as usize];
+        if !matches!(member.state(), MemberState::Unindexed | MemberState::Stale) {
+            return;
+        }
+        self.deferrals += 1;
+        member.deferred = self.deferrals;
+        if self.last_deferral.as_deref() != Some(reason) {
+            self.last_deferral = Some(reason.into());
+        }
     }
 
     /// The bytes `insert` will store for this member, computable before
@@ -741,6 +801,7 @@ impl ContextIndex {
         }
         member.stamps = stamps;
         member.state = Some(MemberState::Fresh);
+        member.deferred = 0;
         true
     }
 
@@ -1022,17 +1083,25 @@ impl ContextIndex {
             pending: 0,
             refused: 0,
             first_refusal: None,
+            deferred: 0,
+            first_deferral: None,
         };
         for (_, member) in self.live_members_with_ids() {
             match member.state() {
                 MemberState::Fresh => coverage.fresh += 1,
-                MemberState::Unindexed | MemberState::Stale => coverage.pending += 1,
+                MemberState::Unindexed | MemberState::Stale => {
+                    coverage.pending += 1;
+                    coverage.deferred += usize::from(member.deferred != 0);
+                }
                 MemberState::Limited => {}
                 MemberState::Refused(reason) => {
                     coverage.refused += 1;
                     coverage.first_refusal.get_or_insert_with(|| reason.clone());
                 }
             }
+        }
+        if coverage.deferred > 0 {
+            coverage.first_deferral = self.last_deferral.clone();
         }
         coverage
     }

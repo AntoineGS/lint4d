@@ -285,16 +285,34 @@ pub(crate) struct IndexProgress {
     /// Members whose facts were limited: unverified candidates of every
     /// request until they change.
     pub(crate) limited: usize,
+    /// Pending closed members no batch has deferred yet.
+    pub(crate) untried: usize,
+}
+
+impl IndexProgress {
+    /// Another batch can gain something: this one settled a member, or
+    /// members no batch has tried yet are still pending. A batch that only
+    /// deferred members already deferred is not requeued (no livelock); a
+    /// request or invalidation asks for the anchor again.
+    pub(crate) fn worth_requeue(&self) -> bool {
+        !self.complete
+            && !self.memory
+            && (self.indexed + self.refreshed + self.refused + self.limited > 0
+                || (self.deferred > 0 && self.untried > 0))
+    }
 }
 
 /// A read failure that repeats for the same bytes or path (A6): a file over
 /// `maxFileBytes`, an unreadable or irregular file, a symlink or path outside
-/// the roots. Cancellation, budgets and internal errors are transient.
+/// the roots, an include expansion over a compile-time limit (a request
+/// reading it directly fails the same way). Cancellation, budgets and
+/// internal errors are transient.
 pub(crate) fn is_stable_load_refusal(message: &str) -> bool {
     if message == CANCELLATION_MESSAGE || message.to_ascii_lowercase().contains("budget") {
         return false;
     }
     message.starts_with("cannot read ")
+        || (message.starts_with("include expansion failed: ") && message.contains("limit"))
         || message.starts_with("cannot inspect ")
         || message.starts_with("source path is outside the effective project read roots")
         || message.contains("the configured per-file limit")
@@ -323,14 +341,19 @@ fn set_after_load_hook(hook: Option<LoadHook>) {
 
 #[cfg(test)]
 thread_local! {
-    /// A member whose indexing fails with an error that is no cancellation.
-    static MEMBER_ERROR: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
+    /// Members whose indexing fails with an error that is no cancellation.
+    static MEMBER_ERROR: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 fn set_member_error(path: Option<PathBuf>) {
-    MEMBER_ERROR.with(|slot| *slot.borrow_mut() = path);
+    set_member_errors(path.into_iter().collect());
+}
+
+#[cfg(test)]
+fn set_member_errors(paths: Vec<PathBuf>) {
+    MEMBER_ERROR.with(|slot| *slot.borrow_mut() = paths);
 }
 
 #[cfg(test)]
@@ -354,7 +377,7 @@ enum MemberOutcome {
     /// The facts were limited: an unverified candidate until it changes.
     Limited,
     /// The load failed for a reason that may pass: still pending.
-    Deferred,
+    Deferred(String),
     Refused,
     /// Not a member any more, or an unsaved buffer: nothing to publish.
     Skipped,
@@ -425,6 +448,7 @@ impl Workspace {
             deferred: 0,
             memory: false,
             limited: 0,
+            untried: 0,
         };
         // Open members are skipped, so ask for enough to fill the bound.
         let wanted = bound.units.saturating_add(self.open_documents.len());
@@ -458,17 +482,18 @@ impl Workspace {
             let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
                 Ok(outcome) => outcome,
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(error) => {
-                    crate::trace::trace!("  index member {} deferred: {error}", path.display());
-                    MemberOutcome::Deferred
-                }
+                Err(error) => MemberOutcome::Deferred(error),
             };
             match outcome {
                 MemberOutcome::Published => progress.indexed += 1,
                 MemberOutcome::Refused => progress.refused += 1,
                 MemberOutcome::Limited => progress.limited += 1,
                 MemberOutcome::Skipped => {}
-                MemberOutcome::Deferred => progress.deferred += 1,
+                MemberOutcome::Deferred(reason) => {
+                    crate::trace::trace!("  index member {} deferred: {reason}", path.display());
+                    self.project_cache.defer_index_member(&key, &path, &reason);
+                    progress.deferred += 1;
+                }
                 MemberOutcome::Memory => {
                     progress.memory = true;
                     break;
@@ -476,15 +501,23 @@ impl Workspace {
             }
         }
         self.ensure_index_membership(&key, anchor, cancel)?;
-        let (all_pending, generation) = self
+        let (all_pending, untried, generation) = self
             .project_cache
             .read_index(&key, |index, _| {
-                (index.pending(usize::MAX), index.generation())
+                (
+                    index.pending(usize::MAX),
+                    index.untried(),
+                    index.generation(),
+                )
             })
             .unwrap_or_default();
         let open = all_pending
             .iter()
             .filter(|path| self.is_open_member(path))
+            .count();
+        progress.untried = untried
+            .iter()
+            .filter(|path| !self.is_open_member(path))
             .count();
         progress.pending = all_pending.len() - open;
         progress.skipped_open = open;
@@ -612,7 +645,7 @@ impl Workspace {
             return Ok(self.refuse_member(key, path, "the path has no file URI".to_owned()));
         };
         #[cfg(test)]
-        if MEMBER_ERROR.with(|slot| slot.borrow().as_deref() == Some(path)) {
+        if MEMBER_ERROR.with(|slot| slot.borrow().iter().any(|failing| failing == path)) {
             return Err("an injected member error".to_owned());
         }
         let held = self.index.contains(&uri);
@@ -638,7 +671,11 @@ impl Workspace {
                     self.project_cache.invalidate_path(path);
                     Ok(MemberOutcome::Skipped)
                 }
-                _ => Ok(MemberOutcome::Deferred),
+                reason => {
+                    Ok(MemberOutcome::Deferred(reason.unwrap_or_else(|| {
+                        "the source could not be loaded".to_owned()
+                    })))
+                }
             },
             Ok(true) => self.publish_member(key, path, &uri, own_stamp, cancel),
         };
@@ -1696,6 +1733,12 @@ impl Workspace {
             if skipped > 0 {
                 result.gaps.push(format!(
                     "{skipped} units of {display} are not indexed yet; {read} were searched directly"
+                ));
+            }
+            if searched && let Some(reason) = coverage.first_deferral.as_deref() {
+                result.gaps.push(format!(
+                    "{} units of {display} failed to load for the index and are retried later: {reason}",
+                    coverage.deferred
                 ));
             }
             refused += refused_members.len();
@@ -2880,6 +2923,107 @@ mod tests {
         assert_eq!(state(&workspace, &key, &limited), Some(MemberState::Stale));
     }
 
+    /// A unit whose include expansion exceeds a compile-time limit fails the
+    /// same way for the same bytes, in a batch as in a request (A6).
+    #[test]
+    fn a_member_over_a_compile_time_limit_is_refused_with_its_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 3, WorkspaceOptions::default());
+        let heavy = root.join("lib/U0.pas");
+        write(
+            &root.join("lib/big.inc"),
+            &format!("{}\n", "{ padding }\n".repeat(4_000)),
+        );
+        write(
+            &heavy,
+            "unit U0;\ninterface\n{$I big.inc}\nprocedure P0;\nimplementation\nprocedure P0;\nbegin\nend;\nend.\n",
+        );
+        let _cap = super::super::resolver::test_byte_work_cap(4_096);
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (progress.indexed, progress.refused, progress.deferred),
+            (2, 1, 0),
+            "{progress:?}"
+        );
+        assert!(progress.complete, "{progress:?}");
+        match state(&workspace, &key, &heavy) {
+            Some(MemberState::Refused(reason)) => {
+                assert!(reason.contains("limit"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Deferred members go behind the members never tried, so a run of
+    /// failures at the head of the path order cannot stall the index; once
+    /// the condition clears they are indexed too.
+    #[test]
+    fn deferred_members_go_behind_untried_ones_and_are_retried_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 7, WorkspaceOptions::default());
+        // App.dpr and U0, U1 head the path order and keep failing.
+        let failing = vec![
+            root.join("App.dpr"),
+            root.join("lib/U0.pas"),
+            root.join("lib/U1.pas"),
+        ];
+        set_member_errors(failing.clone());
+        let first = advance(&mut workspace, &anchor, IndexBound::units(3));
+        assert_eq!((first.indexed, first.deferred), (0, 3), "{first:?}");
+        assert!(first.untried > 0 && first.worth_requeue(), "{first:?}");
+        let second = advance(&mut workspace, &anchor, IndexBound::units(3));
+        assert_eq!((second.indexed, second.deferred), (3, 0), "{second:?}");
+        let third = advance(&mut workspace, &anchor, IndexBound::units(3));
+        assert_eq!((third.indexed, third.deferred), (1, 2), "{third:?}");
+        assert!(third.worth_requeue(), "{third:?}");
+        // Only the deferred are left: the batch retries them, fails again
+        // and stops, telling why.
+        let stalled = advance(&mut workspace, &anchor, IndexBound::units(3));
+        assert_eq!(
+            (stalled.indexed, stalled.deferred, stalled.untried),
+            (0, 3, 0)
+        );
+        assert!(!stalled.worth_requeue(), "{stalled:?}");
+        let coverage = workspace
+            .project_cache
+            .read_index(&key, |index, _| index.coverage())
+            .expect("an index");
+        assert_eq!(coverage.deferred, 3);
+        assert_eq!(
+            coverage.first_deferral.as_deref(),
+            Some("an injected member error")
+        );
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            None,
+            &[],
+        );
+        assert!(
+            found
+                .gaps
+                .contains(&"3 units of App.dproj failed to load for the index and are retried later: an injected member error".to_owned()),
+            "{:?}",
+            found.gaps
+        );
+        set_member_errors(Vec::new());
+        let cleared = advance(&mut workspace, &anchor, IndexBound::units(3));
+        assert_eq!((cleared.indexed, cleared.pending), (3, 0), "{cleared:?}");
+        assert!(cleared.complete);
+        let coverage = workspace
+            .project_cache
+            .read_index(&key, |index, _| index.coverage())
+            .expect("an index");
+        assert_eq!((coverage.deferred, coverage.first_deferral), (0, None));
+        for path in failing {
+            assert_eq!(state(&workspace, &key, &path), Some(MemberState::Fresh));
+        }
+    }
+
     #[test]
     fn a_member_error_is_deferred_and_the_batch_continues() {
         let temp = tempfile::tempdir().unwrap();
@@ -2987,6 +3131,8 @@ mod tests {
             "/w/A.pas is a symlink and not an authorized workspace source",
             "/w/A.pas is not a regular file",
             "source path is outside the effective project read roots: /w/A.pas",
+            "include expansion failed: resolver limit max_work exceeded: 9354837 > 1999998",
+            "include expansion failed: mapped expansion work limit reached",
         ] {
             assert!(is_stable_load_refusal(stable), "{stable}");
         }
@@ -2995,6 +3141,8 @@ mod tests {
             "reconciliation budget exhausted",
             "cannot read /w/A.pas: the request budget was exceeded",
             "project context was not retained for file:///w/A.pas",
+            "source cache limit: 3 files, 10 bytes retained",
+            "include expansion failed: request cancelled",
             "",
         ] {
             assert!(!is_stable_load_refusal(transient), "{transient}");

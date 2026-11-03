@@ -557,9 +557,18 @@ the snapshot reads and filters them as before, in path order, at most
 `MAX_UNVERIFIED_SYMBOL_CANDIDATES = 256` per `workspace/symbol` request (an
 interactive bound: on multidev 2,050 direct reads took about 65 s, 258 about
 10 s). Members refused for a stable reason (over the size limit,
-unreadable) are reported, not searched. Transient failures leave a member
-pending, and one member's failure never stops a batch: it is counted as
-deferred and the batch goes on. A member whose session was limited (a
+unreadable, an include expansion over a compile-time limit, which a direct
+read in a request fails the same way) are reported, not searched. Transient
+failures leave a member pending, and one member's failure never stops a batch:
+it is counted as deferred, goes behind every pending member no batch has
+deferred (longest deferred first), and the batch goes on. The context keeps
+the latest deferral reason for the coverage. On multidev (wave 3) the
+expansion limit failures were classed as transient: 36 Woll2Woll and RTL
+sources over `max_byte_work`, then the `Common/BOBase` units over `max_work`,
+sat at the head of the path order, every batch retried them first, and after
+about 700 members a batch of 64 deferrals stopped the index at 6,087 pending.
+With them refused, the context (about 6,800 members) completes in about
+330 s. A member whose session was limited (a
 compile-time limit or an incomplete include lookup, `NotPersistable::Transient`)
 is `Limited`: it keeps no facts, is an unverified candidate of every request
 and is not indexed again until it changes. Members of other targets outside
@@ -620,9 +629,13 @@ The warmer builds indexes in batches of 64 units (`INDEX_BATCH_UNITS`) only when
 its open-file queue is empty, project anchors before document anchors, at most
 16 queued anchors. A batch yields before every unit through the interactive
 gate, and also when a new crawl is pending (a crawl flag checked between
-units); a paused batch is requeued. A batch is requeued when it made progress
-(indexed, refreshed, refused or limited something), is not complete and did not
-hit the memory limit, which avoids livelock. Warm `End` of an open file requests its
+units); a paused batch is requeued. A batch is requeued when it is not
+complete, did not hit the memory limit, and made progress (indexed, refreshed,
+refused or limited something) or left pending members no batch has deferred
+yet; a batch that only deferred members already deferred is not, which avoids
+livelock. Such an anchor is asked for again by the next request that finds
+its index incomplete and by the warm end of its open file (an edit or
+invalidation), and then retries the longest deferred members first. Warm `End` of an open file requests its
 context. Requests that find an incomplete index of a searched target request
 its anchor too; descriptor and outside-source targets are never requested. Each
 batch stamps a member before its read, one `before_io` call per member.
@@ -641,6 +654,7 @@ Each gap is one coverage note (at most 32 are kept). The wordings emitted:
 - `<context> membership is incomplete; some units were not searched`
 - `units provided through runtime packages of <context> were not searched`
 - `<n> units could not be indexed: <first reason>`
+- `<n> units of <context> failed to load for the index and are retried later: <latest reason>`
 - `the workspace index memory share is exhausted`
 - `no project context is open; open a source or select a project`
 - `<context> changed while the request ran; it was not searched`

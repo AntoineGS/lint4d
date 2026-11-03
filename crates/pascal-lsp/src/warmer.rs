@@ -726,13 +726,10 @@ impl Warmer {
                 if *generation != self.generation {
                     return false;
                 }
-                // A batch that published nothing (deferred or open-only
-                // members) or hit the memory limit cannot gain from a retry.
-                if !progress.complete
-                    && !progress.memory
-                    && progress.indexed + progress.refreshed + progress.refused + progress.limited
-                        > 0
-                {
+                // A batch that settled nothing and left no untried member
+                // (deferred or open-only members), or hit the memory limit,
+                // cannot gain from a retry.
+                if progress.worth_requeue() {
                     self.request_index(anchor.clone());
                 }
                 true

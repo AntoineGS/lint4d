@@ -5078,6 +5078,12 @@ impl ProjectCache {
         }
     }
 
+    pub(crate) fn defer_index_member(&self, key: &ContextKey, path: &Path, reason: &str) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.defer(path, reason);
+        }
+    }
+
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_stale(path);

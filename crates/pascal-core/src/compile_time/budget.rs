@@ -134,7 +134,7 @@ impl<'a> CompileTimeBudget<'a> {
             return Err(IncompleteReason::Cancelled);
         }
         self.counters.with_snapshot_mut(|current, allowance| {
-            let next = admit_snapshot(*current, self.limits, allowance, work, byte_work, retained)
+            let next = admit_snapshot(*current, self.limits, *allowance, work, byte_work, retained)
                 .map_err(|(reason, failure)| {
                     self.last_failed_charge = Some(failure);
                     reason
@@ -206,21 +206,74 @@ impl<'a> CompileTimeBudget<'a> {
         self.allowance().byte_work
     }
 
-    /// `bytes` of source text enter the session: grant the steps and byte
-    /// work scanning them legitimately costs (`work_per_source_byte` and
-    /// `byte_work_per_source_byte` each). Nothing is charged; the scanning
-    /// sites charge what they do against the raised limits.
-    pub(crate) fn grant_source_bytes(&mut self, bytes: usize) {
-        let work = bytes.saturating_mul(self.limits.work_per_source_byte);
-        let byte_work = bytes.saturating_mul(self.limits.byte_work_per_source_byte);
-        let grant = |allowance: &mut Allowance| {
-            allowance.work = allowance.work.saturating_add(work);
-            allowance.byte_work = allowance.byte_work.saturating_add(byte_work);
+    /// The directive scanner is about to read `scanned` more source bytes:
+    /// grant the steps and byte work that processing them legitimately costs
+    /// (`work_per_source_byte` and `byte_work_per_source_byte` each), then
+    /// charge this read. The grant follows the text actually consumed, so a
+    /// header-only or interface-only scan is granted only its prefix. A
+    /// refused read grants nothing.
+    pub(crate) fn charge_scanned(
+        &mut self,
+        scanned: usize,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: scanned.saturating_mul(self.limits.work_per_source_byte),
+            byte_work: scanned.saturating_mul(self.limits.byte_work_per_source_byte),
         };
-        match &mut self.counters {
-            Counters::Inline(_, allowance) => grant(allowance),
-            Counters::Shared(ledger) => grant(&mut ledger.lock().allowance),
+        self.charge_granted(grant, work, byte_work)
+    }
+
+    /// Charge work that is itself proportional to input the session must
+    /// consume whole (UTF-8 validation of a raw source), granting exactly
+    /// that charge: it does not consume the fixed budget and leaves nothing
+    /// for other work to spend. Limits without per-byte grants (factor 0)
+    /// fund nothing, so a fixed cap still bounds it.
+    pub(crate) fn charge_funded(
+        &mut self,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: if self.limits.work_per_source_byte > 0 {
+                work
+            } else {
+                0
+            },
+            byte_work: if self.limits.byte_work_per_source_byte > 0 {
+                byte_work
+            } else {
+                0
+            },
+        };
+        self.charge_granted(grant, work, byte_work)
+    }
+
+    fn charge_granted(
+        &mut self,
+        grant: Allowance,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        if self.cancel.is_cancelled() {
+            return Err(IncompleteReason::Cancelled);
         }
+        self.counters.with_snapshot_mut(|current, allowance| {
+            let granted = Allowance {
+                work: allowance.work.saturating_add(grant.work),
+                byte_work: allowance.byte_work.saturating_add(grant.byte_work),
+            };
+            let next = admit_snapshot(*current, self.limits, granted, work, byte_work, 0).map_err(
+                |(reason, failure)| {
+                    self.last_failed_charge = Some(failure);
+                    reason
+                },
+            )?;
+            *current = next;
+            *allowance = granted;
+            Ok(())
+        })
     }
 
     /// Scratch marks exclude independently owned/cache/shared reservations.
@@ -469,13 +522,15 @@ enum Counters {
 }
 
 impl Counters {
-    fn with_snapshot_mut<T>(&mut self, f: impl FnOnce(&mut BudgetSnapshot, Allowance) -> T) -> T {
+    fn with_snapshot_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut BudgetSnapshot, &mut Allowance) -> T,
+    ) -> T {
         match self {
-            Self::Inline(current, allowance) => f(current, *allowance),
+            Self::Inline(current, allowance) => f(current, allowance),
             Self::Shared(ledger) => {
-                let mut state = ledger.lock();
-                let allowance = state.allowance;
-                f(&mut state.usage, allowance)
+                let state = &mut *ledger.lock();
+                f(&mut state.usage, &mut state.allowance)
             }
         }
     }

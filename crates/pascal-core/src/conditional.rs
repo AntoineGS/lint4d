@@ -1363,6 +1363,9 @@ pub(crate) fn analyze_with_source_order(
 /// suspended at each directive and at child EOF rather than finalizing a root.
 pub(crate) struct DirectiveScanner {
     stop_at_semicolon: bool,
+    /// Return after about this many bytes at a Normal-mode boundary, so the
+    /// caller can stop before reading text it no longer needs.
+    chunk: Option<usize>,
     mode: DirectiveLex,
     pending: AdmittedOwned<String>,
     fragments: AdmittedOwned<Vec<SourceAnchor>>,
@@ -1467,6 +1470,7 @@ impl DirectiveScanner {
         let fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
         Ok(Self {
             stop_at_semicolon: false,
+            chunk: None,
             mode: DirectiveLex::default(),
             pending,
             fragments,
@@ -1481,6 +1485,10 @@ impl DirectiveScanner {
             self.mode,
             DirectiveLex::Normal | DirectiveLex::Slash | DirectiveLex::Line | DirectiveLex::Quote
         )
+    }
+    /// Suspend each scan after about `bytes` bytes at a Normal-mode boundary.
+    pub(crate) fn set_chunk(&mut self, bytes: usize) {
+        self.chunk = Some(bytes);
     }
     pub(crate) fn prefix(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
         let mut scanner = Self::new(budget)?;
@@ -1506,6 +1514,17 @@ impl DirectiveScanner {
             if cancel.is_cancelled() {
                 return Err(IncompleteReason::Cancelled);
             }
+            if self
+                .chunk
+                .is_some_and(|chunk| i - cursor >= chunk && matches!(self.mode, Normal))
+                && self.pending.is_empty()
+            {
+                return Ok(ScannerStep {
+                    text_end: i,
+                    directive: None,
+                    deferred,
+                });
+            }
             let delimiter = match self.mode {
                 Brace => Some('}'),
                 Line => Some('\n'),
@@ -1513,13 +1532,15 @@ impl DirectiveScanner {
                 _ => None,
             };
             if let Some(delimiter) = delimiter {
-                let skip = bounded_trivia_run(source, i, delimiter, budget)?;
+                let skip = bounded_trivia_run(source, i, delimiter, true, budget)?;
                 if skip > 0 {
                     i += skip;
                     continue;
                 }
             }
-            budget.charge(1, 1, 0)?;
+            // The scanner reads each source byte once: this read grants the
+            // session's per-byte allowance (see CompileTimeBudget::charge_scanned).
+            budget.charge_scanned(1, 1, 1)?;
             let b = bytes[i];
             if matches!(self.mode, Normal)
                 && let Some(probe) = &mut self.shape_probe
@@ -1931,19 +1952,24 @@ impl DirectiveScanner {
 /// One bounded standard-library delimiter search over at most 4 KiB, never
 /// crossing a UTF-8 boundary. Admit a search step and a visited-byte upper
 /// bound before each piece; the delimiter itself remains for the normal
-/// lexical machine.
+/// lexical machine. Pieces start at 8 bytes and double up to 512, so a short
+/// comment is charged about what it reads. When `scanned` (the directive
+/// scanner's own read), the consumed bytes grant the per-byte allowance.
 pub(crate) fn bounded_trivia_run(
     source: &str,
     start: usize,
     delimiter: char,
+    scanned: bool,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<usize, IncompleteReason> {
     const RUN: usize = 4096;
-    const PIECE: usize = 512;
+    const FIRST_PIECE: usize = 8;
+    const MAX_PIECE: usize = 512;
     let limit = source.len().min(start.saturating_add(RUN));
     let mut from = start;
-    loop {
-        let mut end = limit.min(from.saturating_add(PIECE));
+    let mut piece_len = FIRST_PIECE;
+    let consumed = loop {
+        let mut end = limit.min(from.saturating_add(piece_len));
         while !source.is_char_boundary(end) {
             end -= 1;
         }
@@ -1951,7 +1977,7 @@ pub(crate) fn bounded_trivia_run(
             if from == start {
                 budget.charge(1, 0, 0)?;
             }
-            return Ok(from - start);
+            break from - start;
         }
         let piece = &source[from..end];
         // Admit the visited-byte upper bound of this piece BEFORE searching
@@ -1959,10 +1985,15 @@ pub(crate) fn bounded_trivia_run(
         // evaluator step per byte.
         budget.charge(1, piece.len(), 0)?;
         if let Some(found) = piece.find(delimiter) {
-            return Ok(from + found - start);
+            break from + found - start;
         }
         from = end;
+        piece_len = (piece_len * 2).min(MAX_PIECE);
+    };
+    if scanned && consumed > 0 {
+        budget.charge_scanned(consumed, 0, 0)?;
     }
+    Ok(consumed)
 }
 
 /// Scanner-only vector growth. Payload invoices attach before cloning identity
@@ -5439,7 +5470,7 @@ mod tests {
         let charged = |start: usize| {
             let mut budget =
                 CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
-            let skip = super::bounded_trivia_run(&source, start, '}', &mut budget).unwrap();
+            let skip = super::bounded_trivia_run(&source, start, '}', false, &mut budget).unwrap();
             (skip, budget.snapshot().byte_work)
         };
         let (skip, bytes) = charged(0);
@@ -5618,6 +5649,9 @@ mod tests {
         let mut budget = CompileTimeBudget::new(
             CompileTimeLimits {
                 max_work: source.len() + 64,
+                // A fixed cap: the scanner grants nothing (l4d-9bxx).
+                work_per_source_byte: 0,
+                byte_work_per_source_byte: 0,
                 ..Default::default()
             },
             &crate::NoCancellation,

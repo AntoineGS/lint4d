@@ -770,8 +770,6 @@ fn analyze_source_with_providers_inner(
     prepared_coordinate: Option<Arc<str>>,
 ) -> Result<SessionOutput, ResolverError> {
     let limits = budget.limits();
-    // Scanning this source costs steps in proportion to its bytes.
-    budget.grant_source_bytes(root.bytes.len());
     let metadata = crate::resolver::loaded_source_metadata_retained(root);
     if !metadata_admitted {
         budget
@@ -877,6 +875,7 @@ fn analyze_source_with_providers_inner(
         .map_err(|r| resolver_error(r, budget))?;
     let mut session = RootSession {
         header_only,
+        chunked: interface_only && !header_only,
         header_proof,
         prefix_end: 0,
         coordinate: coordinate.clone(),
@@ -926,6 +925,9 @@ fn analyze_source_with_providers_inner(
         providers,
         physical_paths: vec![(root_occurrence, root.path.clone())],
     };
+    if session.chunked {
+        session.scanner.set_chunk(PROVIDER_SCAN_CHUNK);
+    }
     let result = conditional::analyze_with_source_order(text, context, cancel, &mut session);
     let mut analysis = result.map_err(|()| {
         session.resource_error.take().unwrap_or_else(|| {
@@ -1328,9 +1330,16 @@ pub(crate) fn resolver_error(
     }
 }
 
+/// Bytes an interface-only provider scan reads between checks of whether
+/// every path has finished its interface.
+const PROVIDER_SCAN_CHUNK: usize = 16 * 1024;
+
 struct RootSession<'a, 'b> {
     coordinate: Arc<str>,
     header_only: bool,
+    /// An interface-only provider scans in chunks and stops reading once
+    /// every path has finished its interface.
+    chunked: bool,
     header_proof: AdmittedOwned<super::header::HeaderProof>,
     prefix_end: usize,
     root: LoadedSource,
@@ -2225,10 +2234,6 @@ impl RootSession<'_, '_> {
             }
             .into();
         }
-        if let Resolution::Found(child) = result.result() {
-            // The child's text is scanned in this session.
-            self.budget.grant_source_bytes(child.bytes.len());
-        }
         let index = self.includes.len();
         self.budget
             .charge(mapping.fragments.len(), 0, 0)
@@ -2743,7 +2748,7 @@ impl SourceOrder for RootSession<'_, '_> {
         self.header_only && self.header_proof.done()
     }
     fn continue_source(&self, end: usize, length: usize) -> bool {
-        self.header_only && !self.header_proof.done() && end < length
+        (self.header_only && !self.header_proof.done() || self.chunked) && end < length
     }
     fn projection_end(&self, length: usize) -> usize {
         if self.header_only {
@@ -3604,9 +3609,9 @@ mod tests {
             limits,
             &NoCancellation,
         );
-        // 64 MiB plus the byte work granted by the scanned source bytes:
-        // forked declaration snapshots cost more than that grant.
-        let maximum = 67_108_864 + extreme.bytes.len() * limits.byte_work_per_source_byte;
+        // 64 MiB plus the byte work granted by the source bytes scanned so
+        // far: forked declaration snapshots cost more than that grant.
+        let ceiling = 67_108_864 + extreme.bytes.len() * limits.byte_work_per_source_byte;
         assert!(
             matches!(
                 refusal,
@@ -3614,7 +3619,7 @@ mod tests {
                     limit: "max_byte_work",
                     maximum: refused,
                     ..
-                }) if refused == maximum
+                }) if refused > 67_108_864 && refused <= ceiling
             ),
             "actual declaration snapshots must retain the 64MiB fuse: {refusal:?}"
         );

@@ -420,6 +420,9 @@ fn firedac_prefix_proof_obeys_resolver_work_limit() {
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_compile_time_work: 32,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..ResolverLimits::default()
         },
     );
@@ -461,6 +464,9 @@ fn fixround1_ordinary_header_search_work_is_cumulative_and_blocks_later_reads() 
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_compile_time_work: 10_000,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..ResolverLimits::default()
         },
     );

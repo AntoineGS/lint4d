@@ -45,8 +45,11 @@ pub(crate) fn text(
             if cancel.is_cancelled() {
                 return Err(ResolverError::Cancelled);
             }
+            // Validation and copy are proportional to the raw source, which
+            // must be consumed whole: they are funded, not paid from the
+            // fixed budget (CompileTimeBudget::charge_funded).
             budget
-                .charge(end - cursor, end - cursor, 0)
+                .charge_funded(end - cursor, end - cursor)
                 .map_err(|r| super::session::resolver_error(r, budget))?;
             match validate(&bytes[cursor..end]) {
                 Ok(chunk) => break chunk,
@@ -64,10 +67,11 @@ pub(crate) fn text(
                 }
             }
         };
-        text.grow(budget, chunk.len(), chunk.len(), 0, |text| {
-            text.push_str(chunk)
-        })
-        .map_err(|r| super::session::resolver_error(r, budget))?;
+        budget
+            .charge_funded(chunk.len(), chunk.len())
+            .map_err(|r| super::session::resolver_error(r, budget))?;
+        text.grow(budget, 0, 0, 0, |text| text.push_str(chunk))
+            .map_err(|r| super::session::resolver_error(r, budget))?;
         cursor = end;
     }
     let arc_bytes = bytes
@@ -77,7 +81,10 @@ pub(crate) fn text(
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
     }
-    text.grow(budget, bytes.len(), bytes.len(), arc_bytes, |_| ())
+    budget
+        .charge_funded(bytes.len(), bytes.len())
+        .map_err(|r| super::session::resolver_error(r, budget))?;
+    text.grow(budget, 0, 0, arc_bytes, |_| ())
         .map_err(|r| super::session::resolver_error(r, budget))?;
     let mut text = text
         .map_value(budget, Arc::<str>::from)
@@ -229,6 +236,9 @@ mod tests {
         let mut budget = CompileTimeBudget::new(
             CompileTimeLimits {
                 max_byte_work: 128,
+                // A fixed cap: validation is not funded (l4d-9bxx).
+                work_per_source_byte: 0,
+                byte_work_per_source_byte: 0,
                 ..CompileTimeLimits::default()
             },
             &NoCancellation,

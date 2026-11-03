@@ -60,6 +60,11 @@ pub struct ResolverLimits {
     pub max_compile_time_retained_bytes: usize,
     pub max_compile_time_work: usize,
     pub max_compile_time_byte_work: usize,
+    /// Steps and byte work each source byte the directive scanner reads adds
+    /// to the session and aggregate limits. Zero selects fixed limits: no
+    /// per-byte grant and no funded whole-input charges.
+    pub compile_time_work_per_source_byte: usize,
+    pub compile_time_byte_work_per_source_byte: usize,
 }
 
 impl Default for ResolverLimits {
@@ -82,6 +87,8 @@ impl Default for ResolverLimits {
             max_compile_time_retained_bytes: 1_048_576,
             max_compile_time_work: work.max_work,
             max_compile_time_byte_work: work.max_byte_work,
+            compile_time_work_per_source_byte: work.work_per_source_byte,
+            compile_time_byte_work_per_source_byte: work.byte_work_per_source_byte,
         }
     }
 }
@@ -2153,12 +2160,10 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         Ok(())
     }
-    /// Cumulative admitted work and live scratch/published-output reservations.
-    /// Temporary projections refund storage, never work or byte work. The
-    /// resolver cannot observe callers dropping outputs, so their reservations
-    /// conservatively last for this resolver's request-local lifetime.
-    /// Steps granted on top of `max_compile_time_work` by the source bytes
-    /// finished sessions scanned (`compile_time::WORK_PER_SOURCE_BYTE`).
+    /// Steps granted on top of `max_compile_time_work`: the per-byte grant of
+    /// source text that finished sessions and probes actually scanned
+    /// (`CompileTimeLimits::work_per_source_byte`), plus funded whole-input
+    /// charges.
     pub fn compile_time_work_allowance(&self) -> usize {
         self.compile_time_work_allowance
     }
@@ -2193,6 +2198,10 @@ impl<S: SourceStore> UnitResolver<S> {
             .saturating_sub(used.byte_work)
     }
 
+    /// Cumulative admitted work and live scratch/published-output reservations.
+    /// Temporary projections refund storage, never work or byte work. The
+    /// resolver cannot observe callers dropping outputs, so their reservations
+    /// conservatively last for this resolver's request-local lifetime.
     pub fn compile_time_usage(&self) -> crate::compile_time::BudgetSnapshot {
         let mut usage = self.compile_time_accounting;
         for root in &self.compile_time_caches {
@@ -2395,6 +2404,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 .limits
                 .max_compile_time_retained_bytes
                 .saturating_sub(aggregate.retained_bytes),
+            work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+            byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
             ..defaults
         };
         let mut budget = crate::compile_time::CompileTimeBudget::new(limits, cancel);
@@ -2478,6 +2489,8 @@ impl<S: SourceStore> UnitResolver<S> {
                         .limits
                         .max_compile_time_retained_bytes
                         .saturating_sub(used.retained_bytes),
+                    work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+                    byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
                     ..defaults
                 },
                 cancel,
@@ -2489,6 +2502,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
             );
             let scanned = probe_budget.snapshot();
+            // The probe's scanner read the text: its per-byte grant raises the
+            // aggregate exactly as a session's does, for what it consumed.
+            self.compile_time_work_allowance += probe_budget.work_allowance();
+            self.compile_time_byte_work_allowance += probe_budget.byte_work_allowance();
             // Transfer monotonic probe work to the same resolver aggregate on
             // success AND refusal. Only ephemeral scanner scratch has died.
             self.charge_compile_time(scanned.work, scanned.byte_work, 0, cancel)?;
@@ -2501,7 +2518,19 @@ impl<S: SourceStore> UnitResolver<S> {
                 // The legacy scalar analyzer still uses its conservative
                 // whole-source estimate; shared dispatch below charges actual
                 // scanner/evaluator steps and must not inherit that estimate.
-                self.charge_compile_time(text.len().saturating_mul(8), text.len(), 0, cancel)?;
+                //
+                // That estimate is proportional to the whole text the lexical
+                // pass reads, so it is funded (granted exactly what it charges),
+                // as raw UTF-8 validation is: it neither consumes the fixed
+                // budget nor leaves anything for other work.
+                let estimate = text.len().saturating_mul(8);
+                if self.limits.compile_time_work_per_source_byte > 0 {
+                    self.compile_time_work_allowance += estimate;
+                }
+                if self.limits.compile_time_byte_work_per_source_byte > 0 {
+                    self.compile_time_byte_work_allowance += text.len();
+                }
+                self.charge_compile_time(estimate, text.len(), 0, cancel)?;
                 let context = self.context.conditional_context_for(&source.path);
                 let mut context_bytes = 0usize;
                 context
@@ -4682,6 +4711,8 @@ impl<S: SourceStore> UnitResolver<S> {
                         .limits
                         .max_compile_time_retained_bytes
                         .saturating_sub(used.retained_bytes),
+                    work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+                    byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
                     ..crate::compile_time::CompileTimeLimits::default()
                 },
                 cancel,
@@ -9373,7 +9404,14 @@ fn case_match_sizing(
     budget
         .charge(count, 0, 0)
         .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-    let wanted = wanted.to_string_lossy();
+    // A non-UTF-8 component is decoded into an owned copy (at most 3 bytes
+    // per input byte): admit it before allocating. UTF-8 names borrow.
+    let lossy = wanted.len().saturating_mul(3);
+    let wanted = budget
+        .admit_owned(1, wanted.len(), lossy, || {
+            wanted.to_string_lossy().into_owned()
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
     let mut matching = 0usize;
     let mut bytes = 0usize;
     let mut largest = 0usize;
@@ -9388,9 +9426,14 @@ fn case_match_sizing(
             .and_then(|n| n.checked_add(32))
             .ok_or_else(overflow)?;
         largest = largest.max(bound);
+        // Same predicate as the matching pass. A UTF-8 name is compared in
+        // place; only a non-UTF-8 name is decoded, bounded by its length.
         if candidate
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&wanted))
+            .is_some_and(|name| match name.to_str() {
+                Some(name) => name.eq_ignore_ascii_case(&wanted),
+                None => name.to_string_lossy().eq_ignore_ascii_case(&wanted),
+            })
         {
             matching += 1;
             bytes = bytes.checked_add(bound).ok_or_else(overflow)?;
@@ -9835,6 +9878,9 @@ mod tests {
         }];
         let mut r = admission_resolver(ResolverLimits {
             max_compile_time_work: 50,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..Default::default()
         });
         assert!(matches!(
@@ -17139,6 +17185,70 @@ mod tests {
         );
         assert!(!listing.files.is_empty());
         assert!(!call.report.observations.is_empty());
+    }
+
+    /// l4d-9bxx: the name pass is linear, but entries whose name matches pay
+    /// the pairwise dedup/sort term; many case variants are charged for it.
+    #[test]
+    fn many_matching_entries_pay_the_pairwise_candidate_term() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        if path_identity::is_case_insensitive(dir.path()) {
+            return;
+        }
+        // All 16 case spellings of "many.pas" match "Many.pas".
+        let mut variants = Vec::new();
+        for mask in 0..16u32 {
+            let name: String = "many"
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if mask & (1 << i) != 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            variants.push(format!("{name}.pas"));
+        }
+        for name in &variants {
+            fs::write(dir.path().join(name), "unit Many;").unwrap();
+        }
+        fs::write(dir.path().join("Single.pas"), "unit Single;").unwrap();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let mut spent = |name: &str| {
+            let before = budget.snapshot();
+            let paths = call
+                .paths_for_names(
+                    dir.path(),
+                    &entry,
+                    &[name.into()],
+                    &listing,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let after = budget.snapshot();
+            (
+                paths.len(),
+                after.work - before.work,
+                after.byte_work - before.byte_work,
+            )
+        };
+        let (single, single_work, single_bytes) = spent("Single.pas");
+        let (many, many_work, many_bytes) = spent("Many.pas");
+        assert_eq!(single, 1);
+        assert_eq!(many, 16);
+        assert!(
+            many_work >= single_work + 16 * 16,
+            "16 candidates: {many_work} steps, 1 candidate: {single_work}"
+        );
+        assert!(many_bytes > single_bytes);
     }
 
     #[test]

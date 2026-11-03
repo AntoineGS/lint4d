@@ -115,6 +115,33 @@ pub enum Origin {
     Definition,
 }
 
+/// What `lsp_kind` and `workspace_eligible` read from a symbol
+/// (`pascal-lsp navigation/symbols.rs`), without lsp_types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclarationShape {
+    Unit,
+    Class,
+    Record,
+    Interface,
+    Enum,
+    Array,
+    Pointer,
+    Callable,
+    String,
+    File,
+    OtherType,
+    Constructor,
+    Function,
+    Operator,
+    Method,
+    Procedure,
+    Variable,
+    Constant,
+    Field,
+    Property,
+    EnumValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationFact {
     /// Position among the artifact's declarations.
@@ -133,6 +160,13 @@ pub struct DeclarationFact {
     /// The declared name.
     pub location: FactLocation,
     pub certainty: Certainty,
+    /// The whole declaration (`Symbol::declaration_span`), for symbol ranges.
+    pub extent: FactLocation,
+    pub shape: DeclarationShape,
+    /// Declared at unit scope (`scope == ROOT_SCOPE`).
+    pub unit_scope: bool,
+    /// The owning type's display name (`Symbol::owner_type_name`).
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

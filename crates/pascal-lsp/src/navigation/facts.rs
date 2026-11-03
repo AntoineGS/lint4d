@@ -6,17 +6,17 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::{
-    Origin as SymbolOrigin, ParsedDocument, ROOT_SCOPE, Region as SymbolRegion, Span, Symbol,
-    SymbolKind, Visibility as SymbolVisibility, canonical_path,
+    Origin as SymbolOrigin, ParsedDocument, ROOT_SCOPE, Region as SymbolRegion, RoutineKind, Span,
+    Symbol, SymbolKind, TypeKind, Visibility as SymbolVisibility, canonical_path,
 };
 use crate::include_expansion::{ExpandedSource, SegmentSource};
 use pascal_core::compile_time::CompileTimeOutput;
 use pascal_core::facts::{
     Activity, ArtifactFacts, Certainty, CoverageReason, DeclarationFact, DeclarationKind,
-    FactBudget, FactError, FactLocation, ImportFact, IncludeExpansion, IncludeFact, IncludeSlot,
-    IncludeSlotOutcome, NotPersistable, Origin, PostingActivity, PostingFact, PostingOccurrence,
-    Region, SegmentFact, SegmentTarget, TextRange, Visibility, decoded_text, identifier_runs,
-    include_slots, session_persistability,
+    DeclarationShape, FactBudget, FactError, FactLocation, ImportFact, IncludeExpansion,
+    IncludeFact, IncludeSlot, IncludeSlotOutcome, NotPersistable, Origin, PostingActivity,
+    PostingFact, PostingOccurrence, Region, SegmentFact, SegmentTarget, TextRange, Visibility,
+    decoded_text, identifier_runs, include_slots, session_persistability,
 };
 use pascal_project::ConditionalContext;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -221,6 +221,13 @@ impl SlotMap {
         })
     }
 
+    /// A declaration's extent: in one slot when one physical segment holds
+    /// it, otherwise expanded. Unlike a fact's own location it never counts
+    /// toward coverage.
+    fn locate_extent(&self, span: Range<usize>) -> Result<FactLocation, FactError> {
+        self.locate(span)
+    }
+
     /// Where a run of slot `slot`'s text was analysed, if it was.
     fn analysed(&self, slot: usize, run: &Range<usize>) -> Option<Range<usize>> {
         if self.segments.is_empty() {
@@ -258,6 +265,39 @@ fn declared(symbol: &Symbol) -> Option<DeclarationKind> {
         SymbolKind::EnumValue => DeclarationKind::EnumValue,
         SymbolKind::Parameter | SymbolKind::Label => return None,
     })
+}
+
+/// Mirrors `lsp_kind` (`navigation/symbols.rs`) arm by arm.
+fn shape(symbol: &Symbol) -> DeclarationShape {
+    match symbol.kind {
+        SymbolKind::Unit => DeclarationShape::Unit,
+        SymbolKind::Type => match symbol.type_kind {
+            TypeKind::Class => DeclarationShape::Class,
+            TypeKind::Record => DeclarationShape::Record,
+            TypeKind::Interface => DeclarationShape::Interface,
+            TypeKind::Enum => DeclarationShape::Enum,
+            TypeKind::Array | TypeKind::DynamicArray => DeclarationShape::Array,
+            TypeKind::Pointer => DeclarationShape::Pointer,
+            TypeKind::Callable => DeclarationShape::Callable,
+            TypeKind::String => DeclarationShape::String,
+            TypeKind::File => DeclarationShape::File,
+            TypeKind::Other => DeclarationShape::OtherType,
+        },
+        SymbolKind::Routine => match symbol.routine_kind {
+            RoutineKind::Constructor => DeclarationShape::Constructor,
+            RoutineKind::Function if symbol.owner_type_name.is_none() => DeclarationShape::Function,
+            RoutineKind::Operator => DeclarationShape::Operator,
+            _ if symbol.owner_type_name.is_some() => DeclarationShape::Method,
+            _ => DeclarationShape::Procedure,
+        },
+        SymbolKind::Variable => DeclarationShape::Variable,
+        SymbolKind::Constant => DeclarationShape::Constant,
+        SymbolKind::Field => DeclarationShape::Field,
+        SymbolKind::Property => DeclarationShape::Property,
+        SymbolKind::EnumValue => DeclarationShape::EnumValue,
+        // `declared` never admits these.
+        SymbolKind::Parameter | SymbolKind::Label => DeclarationShape::Variable,
+    }
 }
 
 /// The unit key the analyser builds from a header's written dotted name.
@@ -326,7 +366,12 @@ fn declarations(
         let Some(kind) = declared(symbol) else {
             continue;
         };
-        budget.charge(size_of::<DeclarationFact>() + symbol.key.len() + symbol.name.len())?;
+        budget.charge(
+            size_of::<DeclarationFact>()
+                + symbol.key.len()
+                + symbol.name.len()
+                + symbol.owner_type_name.as_ref().map_or(0, String::len),
+        )?;
         let id = length(facts.declarations.len())?;
         ids.insert(index, id);
         let unknown = parsed
@@ -346,6 +391,11 @@ fn declarations(
             parent: None,
             location: map.locate(symbol.selection_span.start..symbol.selection_span.end)?,
             certainty: certainty(unknown, &parsed.parser_recovery_spans, symbol.span),
+            extent: map
+                .locate_extent(symbol.declaration_span.start..symbol.declaration_span.end)?,
+            shape: shape(symbol),
+            unit_scope: symbol.scope == ROOT_SCOPE,
+            owner: symbol.owner_type_name.clone(),
         });
     }
     // A parent must be an earlier declaration, so a member declared before
@@ -743,6 +793,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn declaration_shapes_follow_lsp_kinds() {
+        use DeclarationShape::*;
+        let source = "unit Shapes;\ninterface\ntype\n  TFoo = class\n    FValue: Integer;\n    constructor Create;\n    procedure Run;\n    function Get: Integer;\n    property Value: Integer read FValue;\n  end;\n  TRec = record\n    class operator Add(A, B: TRec): TRec;\n  end;\n  IThing = interface\n  end;\n  TColor = (Red, Green);\nfunction Helper: Integer;\nprocedure Hello;\nconst Limit = 1;\nvar Counter: Integer;\nimplementation\nend.\n";
+        let facts = extract(&parse(source, &ConditionalContext::default()));
+        let find = |name: &str| {
+            facts
+                .declarations
+                .iter()
+                .find(|d| d.name == name && d.origin == Origin::Declaration)
+                .unwrap_or_else(|| panic!("no declaration {name}"))
+        };
+        let summary: Vec<_> = [
+            "shapes", "tfoo", "fvalue", "create", "run", "get", "value", "trec", "add", "ithing",
+            "tcolor", "red", "helper", "hello", "limit", "counter",
+        ]
+        .iter()
+        .map(|name| {
+            let d = find(name);
+            (*name, d.shape, d.unit_scope, d.owner.as_deref())
+        })
+        .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("shapes", Unit, true, None),
+                ("tfoo", Class, true, None),
+                ("fvalue", Field, true, Some("TFoo")),
+                ("create", Constructor, true, Some("TFoo")),
+                ("run", Method, true, Some("TFoo")),
+                ("get", Method, true, Some("TFoo")),
+                ("value", Property, true, Some("TFoo")),
+                ("trec", Record, true, None),
+                ("add", Operator, true, Some("TRec")),
+                ("ithing", Interface, true, None),
+                ("tcolor", Enum, true, None),
+                ("red", EnumValue, true, Some("TColor")),
+                ("helper", Function, true, None),
+                ("hello", Procedure, true, None),
+                ("limit", Constant, true, None),
+                ("counter", Variable, true, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_extent_covers_the_whole_declaration() {
+        let source = "unit Shapes;\ninterface\ntype\n  TFoo = class\n    procedure Run;\n  end;\nimplementation\nend.\n";
+        let facts = extract(&parse(source, &ConditionalContext::default()));
+        let foo = facts
+            .declarations
+            .iter()
+            .find(|d| d.name == "tfoo")
+            .expect("the class is declared");
+        let FactLocation::Source { slot: 0, range } = foo.extent else {
+            panic!("{:?}", foo.extent)
+        };
+        let text = &source[range.to_range()];
+        assert!(
+            text.starts_with("TFoo = class") && text.trim_end_matches(';').ends_with("end"),
+            "{text:?}"
+        );
+        assert_eq!(root_text(source, foo.location), "TFoo");
     }
 
     #[test]

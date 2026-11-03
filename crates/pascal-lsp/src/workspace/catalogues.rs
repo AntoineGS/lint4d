@@ -95,6 +95,15 @@ impl Workspace {
         })
     }
 
+    /// The files directly in `directory`, cancellable.
+    pub(super) fn listing_catalogue_with_cancel(
+        &mut self,
+        directory: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Arc<Catalogue>, String> {
+        self.snapshot_catalogue(&CatalogueScope::listing(directory), cancel)
+    }
+
     /// The shared catalogue of `scope`, extended until it is complete or
     /// counts `need` entries. `before_io` runs before every filesystem
     /// operation (cancellation, budgets, test barriers); its error publishes

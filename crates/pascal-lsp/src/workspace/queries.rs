@@ -3222,6 +3222,100 @@ mod tests {
         }
     }
 
+    /// l4d-20 Decision 5: Delphi's unit search path is not recursive, so
+    /// completion never lists a search directory's subdirectories.
+    #[test]
+    fn completion_providers_come_from_search_directories_without_recursion() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("lib/nested")).expect("library directories");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project");
+        let consumer_source = "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nvar Value: TDi;\nbegin Value := nil; end;\nend.\n";
+        let consumer = root.join("Consumer.pas");
+        fs::write(&consumer, consumer_source).expect("consumer");
+        fs::write(
+            root.join("lib/Direct.pas"),
+            "unit Direct;\ninterface\ntype TDirectType = class end;\nimplementation\nend.\n",
+        )
+        .expect("direct provider");
+        fs::write(
+            root.join("lib/nested/Deep.pas"),
+            "unit Deep;\ninterface\ntype TDiscardedType = class end;\nimplementation\nend.\n",
+        )
+        .expect("nested provider");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let cancel = AtomicBool::new(false);
+        crate::catalogue::test_reset_listings();
+        let completion = completion_from_input(
+            input,
+            &source_uri(&consumer),
+            position_after(consumer_source, "TDi"),
+            &cancel,
+        );
+        let labels = completion
+            .value
+            .expect("completion")
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(
+            labels.iter().any(|label| label == "TDirectType"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().all(|label| label != "TDiscardedType"),
+            "{labels:?}"
+        );
+        let nested = root.join("lib/nested");
+        assert!(
+            crate::catalogue::test_listings()
+                .iter()
+                .all(|listed| !listed.starts_with(&nested)),
+            "lib/nested was listed: {:?}",
+            crate::catalogue::test_listings()
+        );
+    }
+
+    /// Projectless contexts keep the shared resolver's recursive workspace-root
+    /// tier (guard: green before and after).
+    #[test]
+    fn projectless_completion_still_offers_providers_in_subdirectories() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("sub")).expect("sub");
+        let consumer_source = "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nvar Value: TPro;\nbegin Value := nil; end;\nend.\n";
+        let consumer = root.join("Consumer.pas");
+        fs::write(&consumer, consumer_source).expect("consumer");
+        fs::write(
+            root.join("sub/Provider.pas"),
+            "unit Provider;\ninterface\ntype TProviderType = class end;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input(
+            input,
+            &source_uri(&consumer),
+            position_after(consumer_source, "TPro"),
+            &cancel,
+        );
+        assert!(
+            completion
+                .value
+                .expect("completion")
+                .items
+                .iter()
+                .any(|item| item.label == "TProviderType")
+        );
+    }
+
     fn position_after(source: &str, needle: &str) -> Position {
         let offset = source
             .find(needle)

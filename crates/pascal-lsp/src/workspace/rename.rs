@@ -7639,6 +7639,70 @@ fn enumerate_sources(
     Ok(result)
 }
 
+/// Where the requesting context's resolver finds a unit (shared-resolver
+/// tiers): explicit `in` files; the importer's directory, the main-source
+/// directory and each search directory, listed without recursion because
+/// Delphi's unit search path is not recursive; and, for a projectless context
+/// only, the workspace roots recursively.
+#[derive(Debug, Default)]
+struct ProviderScopes {
+    files: Vec<PathBuf>,
+    listed: Vec<PathBuf>,
+    recursive: Vec<PathBuf>,
+}
+
+fn assistance_provider_scopes(
+    workspace: &Workspace,
+    context: &ProjectContext,
+    importers: &[PathBuf],
+) -> ProviderScopes {
+    let mut scopes = ProviderScopes {
+        files: context
+            .explicit_unit_entries()
+            .values()
+            .flatten()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        ..ProviderScopes::default()
+    };
+    scopes.listed.extend(
+        importers
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf)),
+    );
+    scopes.listed.extend(
+        context
+            .main_source_entry()
+            .iter()
+            .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+    );
+    scopes.listed.extend(context.search_paths());
+    if context.project_file().is_none() {
+        scopes.recursive.extend(
+            workspace
+                .roots
+                .iter()
+                .flat_map(|root| root.source_roots.iter().cloned()),
+        );
+    }
+    for paths in [&mut scopes.files, &mut scopes.listed, &mut scopes.recursive] {
+        for path in paths.iter_mut() {
+            *path = absolute_path(std::mem::take(path));
+        }
+        paths.sort_by_key(|path| path_key(path));
+        paths.dedup_by(|left, right| paths_equal_ci(left, right));
+    }
+    // The recursive tier already covers these directories, under its own
+    // bound and completeness.
+    scopes.listed.retain(|directory| {
+        !scopes
+            .recursive
+            .iter()
+            .any(|root| path_starts_with_native(directory, root))
+    });
+    scopes
+}
+
 fn enumerate_assistance_provider_sources(
     workspace: &mut Workspace,
     input: &WorkspaceInput,
@@ -7659,104 +7723,101 @@ fn enumerate_assistance_provider_sources(
             enumeration.auto_import_complete = false;
             continue;
         };
-        let mut context_roots = context.search_paths();
-        context_roots.extend(
-            context
-                .main_source_entry()
-                .iter()
-                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
-        );
-        context_roots.extend(
-            context
-                .explicit_unit_entries()
-                .values()
-                .flatten()
-                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
-        );
-        context_roots.extend(mapped_source_roots(&context));
-        if context_roots.is_empty() {
-            context_roots.extend(
-                workspace
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.source_roots.iter().cloned()),
-            );
-        }
-        context_roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        context_roots.dedup_by(|left, right| paths_equal_ci(left, right));
-
-        for root in context_roots {
+        let importers = priority_contexts
+            .iter()
+            .filter(|(_, key)| **key == context_key)
+            .filter_map(|(uri, _)| uri.to_file_path().ok().map(absolute_path))
+            .collect::<Vec<_>>();
+        let scopes = assistance_provider_scopes(workspace, &context, &importers);
+        let mut candidates = scopes
+            .files
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned()
+            .collect::<Vec<_>>();
+        for directory in &scopes.listed {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let root = absolute_path(root);
-            let catalogue = workspace.filename_catalogue_with_cancel(&root, Some(cancel))?;
+            let catalogue = workspace.listing_catalogue_with_cancel(directory, cancel)?;
             if !catalogue.is_complete() {
                 enumeration.auto_import_complete = false;
             }
             add_catalogue_directories(&mut enumeration.baseline, &catalogue);
-            let mut provider_paths = catalogue
-                .pascal_files()
-                .map(|path| absolute_path(path.to_path_buf()))
-                .collect::<Vec<_>>();
-            provider_paths.sort_by_key(|left| path_key(left));
-            provider_paths.dedup_by(|left, right| paths_equal_ci(left, right));
-            for path in provider_paths {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
-                    enumeration.auto_import_complete = false;
-                    return Ok(());
-                }
-                if !is_pascal_path(&path)
-                    || !workspace.ensure_supported_project_context(
-                        &path,
-                        &context,
-                        Some(&context_key),
-                    )
-                {
-                    continue;
-                }
-                enumeration.add_path(path, Some(context_key.clone()));
+            candidates.extend(catalogue.pascal_files().map(Path::to_path_buf));
+        }
+        for root in &scopes.recursive {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
             }
+            let catalogue = workspace.filename_catalogue_with_cancel(root, Some(cancel))?;
+            if !catalogue.is_complete() {
+                enumeration.auto_import_complete = false;
+            }
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
+            candidates.extend(catalogue.pascal_files().map(Path::to_path_buf));
+        }
+        candidates.sort_by_key(|path| path_key(path));
+        candidates.dedup_by(|left, right| paths_equal_ci(left, right));
+        for path in candidates {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                enumeration.auto_import_complete = false;
+                return Ok(());
+            }
+            if !is_pascal_path(&path)
+                || !workspace.ensure_supported_project_context(&path, &context, Some(&context_key))
+            {
+                continue;
+            }
+            enumeration.add_path(path, Some(context_key.clone()));
+        }
 
-            let mut overlay_paths = Vec::new();
-            for (uri, overlay) in &input.overlays {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                let Some(path) = uri.to_file_path().ok() else {
-                    continue;
-                };
-                overlay_paths.push((absolute_path(path), overlay.text.len()));
+        let mut overlay_paths = Vec::new();
+        for (uri, overlay) in &input.overlays {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
             }
-            overlay_paths.sort_by_key(|left| path_key(&left.0));
-            overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
-            for (path, overlay_bytes) in overlay_paths {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                if !is_pascal_path(&path)
-                    || !path_starts_with_native(&path, &root)
-                    || !workspace.ensure_supported_project_context(
-                        &path,
-                        &context,
-                        Some(&context_key),
-                    )
-                {
-                    continue;
-                }
-                if overlay_bytes > input.options.limits.max_file_bytes {
-                    enumeration.auto_import_complete = false;
-                    continue;
-                }
-                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
-                    enumeration.auto_import_complete = false;
-                    return Ok(());
-                }
-                enumeration.add_path(path, Some(context_key.clone()));
+            let Some(path) = uri.to_file_path().ok().map(absolute_path) else {
+                continue;
+            };
+            let in_scope = scopes.files.iter().any(|file| paths_equal_ci(file, &path))
+                || path.parent().is_some_and(|parent| {
+                    scopes
+                        .listed
+                        .iter()
+                        .any(|directory| paths_equal_ci(directory, parent))
+                })
+                || scopes
+                    .recursive
+                    .iter()
+                    .any(|root| path_starts_with_native(&path, root));
+            if in_scope {
+                overlay_paths.push((path, overlay.text.len()));
             }
+        }
+        overlay_paths.sort_by_key(|left| path_key(&left.0));
+        overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
+        for (path, overlay_bytes) in overlay_paths {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if !is_pascal_path(&path)
+                || !workspace.ensure_supported_project_context(&path, &context, Some(&context_key))
+            {
+                continue;
+            }
+            if overlay_bytes > input.options.limits.max_file_bytes {
+                enumeration.auto_import_complete = false;
+                continue;
+            }
+            if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                enumeration.auto_import_complete = false;
+                return Ok(());
+            }
+            enumeration.add_path(path, Some(context_key.clone()));
         }
     }
     Ok(())
@@ -10965,6 +11026,113 @@ mod tests {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("changed"))
+        );
+    }
+
+    /// l4d-20 Decision 6: a catalogue holds facts, not authorization. Two
+    /// contexts that differ only in read policy share one listing of a search
+    /// directory, and each keeps only the providers its policy may read.
+    #[test]
+    fn contexts_that_differ_only_in_read_policy_share_one_listing_and_each_sees_only_what_it_may_read()
+     {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = temp.path().join("ws");
+        let ext = temp.path().join("ext");
+        fs::create_dir_all(&ws).expect("workspace root");
+        fs::create_dir_all(&ext).expect("external search directory");
+        let consumer = ws.join("Consumer.pas");
+        let provider = ext.join("Provider.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("consumer");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\ntype TProviderType = class end;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let mut workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let context = |readable: &[PathBuf]| ContextState {
+            context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                project_file: Some(ws.join("App.dproj")),
+                search_path_entries: vec![ProjectPathEntry::configured(ext.clone())],
+                read_policy: ReadPolicy::new(readable, &[], &[], &EffectiveOverrides::default()),
+                ..pascal_project::ProjectContextParts::default()
+            })
+            .into(),
+            ..ContextState::default()
+        };
+        let key = |config: &str| ContextKey {
+            installation_id: None,
+            project_file: Some(ws.join("App.dproj")),
+            workspace_root: Some(ws.clone()),
+            project_scope: Some(ws.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: Some(config.to_owned()),
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: Default::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let allowed = key("Allowed");
+        let denied = key("Denied");
+        workspace
+            .contexts
+            .insert(allowed.clone(), context(&[ws.clone(), ext.clone()]));
+        workspace
+            .contexts
+            .insert(denied.clone(), context(std::slice::from_ref(&ws)));
+        let input = workspace.analysis_input();
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let cancel = AtomicBool::new(false);
+        let enumerate = |workspace: &mut Workspace, key: &ContextKey| {
+            let mut enumeration = Enumeration {
+                complete: true,
+                auto_import_complete: true,
+                ..Enumeration::default()
+            };
+            super::enumerate_assistance_provider_sources(
+                workspace,
+                &input,
+                &HashMap::from([(consumer_uri.clone(), key.clone())]),
+                &mut enumeration,
+                &cancel,
+            )
+            .expect("provider enumeration");
+            enumeration
+                .paths
+                .iter()
+                .any(|source| path_key(&source.path) == path_key(&provider))
+        };
+
+        assert!(
+            enumerate(&mut workspace, &allowed),
+            "the allowed context must see the provider"
+        );
+        crate::catalogue::test_reset_listings();
+        assert!(
+            !enumerate(&mut workspace, &denied),
+            "the denied context must not see the provider"
+        );
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "the denied context rebuilt a shared listing: {:?}",
+            crate::catalogue::test_listings()
+        );
+        let stored = workspace
+            .project_cache()
+            .catalogue(super::CatalogueScope::listing(&ext).key())
+            .expect("the search directory's listing is shared");
+        assert!(
+            stored
+                .catalogue
+                .pascal_files()
+                .any(|path| path_key(path) == path_key(&provider)),
+            "the shared listing lost the provider"
         );
     }
 

@@ -6,15 +6,18 @@
 //! index for each expensive request and never mutates the live navigation
 //! cache or the filesystem.
 
+use super::catalogues::CatalogueScope;
 use super::resolver as shared_resolver;
 use super::{
-    ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
-    WorkspaceOptions, absolute_path, canonical_file_uri, conditional_context_for_path,
-    conditional_context_for_uri, disk_stamp, is_analyzable_source_path, is_configuration_file,
-    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
-    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
+    ContextKey, ContextState, DiskStamp, ExcludeMatcher, KnownDocumentOwner, OpenDocument,
+    PathStamp, Workspace, WorkspaceOptions, absolute_path, canonical_file_uri,
+    conditional_context_for_path, conditional_context_for_uri, disk_stamp,
+    is_analyzable_source_path, is_configuration_file, is_pascal_path, path_stamp,
+    path_stamp_result, path_starts_with_ci, path_starts_with_native, paths_equal_ci,
+    read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
+use crate::catalogue::{Catalogue, Limit, MAX_CATALOGUE_ENTRIES, RootKind};
 use crate::coverage::Coverage;
 use crate::include_expansion::{
     self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
@@ -56,7 +59,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use walkdir::WalkDir;
 
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, Sender};
@@ -5586,7 +5588,7 @@ fn mapped_source_roots(context: &ProjectContext) -> Vec<PathBuf> {
 }
 
 fn enumerate_mapped_sources(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     context_states: &HashMap<ContextKey, ContextState>,
     contexts: &HashSet<ContextKey>,
     enumeration: &mut Enumeration,
@@ -5666,55 +5668,38 @@ fn enumerate_mapped_sources(
                 continue;
             }
 
-            let walker = WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    entry.depth() == 0
-                        || !workspace.mapped_path_is_excluded(entry.path(), &root, &context_key)
-                });
-            for entry in walker {
+            let scope = match workspace.context_root_excludes(&context_key) {
+                Some(matcher) => CatalogueScope::recursive(&root, Some(matcher)),
+                None => {
+                    CatalogueScope::recursive(&root, Some(&ExcludeMatcher::new(&root, &root, &[])))
+                }
+            };
+            let catalogue = workspace.snapshot_catalogue(&scope, cancel)?;
+            enumeration.visited_entries = enumeration
+                .visited_entries
+                .saturating_add(catalogue.visits());
+            if let Some(reason) = snapshot_catalogue_gap(&catalogue, entry_limit, "mapped root ") {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert(reason);
+            }
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
+            for path in catalogue.files() {
                 if is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
-                enumeration.visited_entries = enumeration.visited_entries.saturating_add(1);
-                if enumeration.visited_entries > entry_limit {
-                    enumeration.complete = false;
-                    enumeration.reason.get_or_insert_with(|| {
-                        format!("source traversal entry limit ({entry_limit}) reached")
-                    });
-                    stop = true;
-                    break;
-                }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        enumeration.complete = false;
-                        enumeration.reason.get_or_insert_with(|| {
-                            format!(
-                                "source traversal error under mapped root {}: {error}",
-                                root.display()
-                            )
-                        });
-                        continue;
-                    }
-                };
-                let path = absolute_path(entry.path().to_path_buf());
-                let file_type = entry.file_type();
-                if file_type.is_symlink() {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    add_baseline_path(&mut enumeration.baseline, path);
-                    continue;
-                }
-                if file_type.is_file()
-                    && is_pascal_path(&path)
-                    && workspace.mapped_path_is_readable_under_root(&path, &root, &context_key)
+                if is_pascal_path(path)
+                    && workspace.mapped_path_is_readable_under_root(path, &root, &context_key)
                 {
                     add_baseline_path(&mut enumeration.baseline, path.clone());
-                    enumeration.add_path(path, Some(context_key.clone()));
+                    enumeration.add_path(path.clone(), Some(context_key.clone()));
                 }
+            }
+            if enumeration.visited_entries > entry_limit {
+                enumeration.complete = false;
+                enumeration.reason.get_or_insert_with(|| {
+                    format!("source traversal entry limit ({entry_limit}) reached")
+                });
+                stop = true;
             }
             if stop {
                 break;
@@ -6093,7 +6078,7 @@ fn build_snapshot_with_policy(
         };
         let context_states = enumeration.contexts.clone();
         enumerate_mapped_sources(
-            &loader,
+            &mut loader,
             &context_states,
             &mapped_contexts,
             &mut enumeration,
@@ -7512,7 +7497,7 @@ fn enumerate_sources(
                 }
                 let catalogue =
                     workspace.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
-                if !catalogue.complete {
+                if !catalogue.is_complete() {
                     result.complete = false;
                     result.reason.get_or_insert_with(|| {
                         format!(
@@ -7521,14 +7506,10 @@ fn enumerate_sources(
                         )
                     });
                 }
-                for (directory, stamp) in catalogue.directories {
-                    add_baseline_path_with_stamp(&mut result.baseline, directory, stamp);
-                }
+                add_catalogue_directories(&mut result.baseline, &catalogue);
                 let mut owner_paths = catalogue
-                    .entries
-                    .into_values()
-                    .flatten()
-                    .map(absolute_path)
+                    .pascal_files()
+                    .map(|path| absolute_path(path.to_path_buf()))
                     .collect::<Vec<_>>();
                 owner_paths.sort_by_key(|path| path_key(path));
                 owner_paths.dedup_by(|left, right| paths_equal_ci(left, right));
@@ -7570,73 +7551,45 @@ fn enumerate_sources(
         return Ok(result);
     }
     let entry_limit = MAX_RENAME_TRAVERSAL_ENTRIES;
-    let mut stop = false;
-    for root in &workspace.roots {
-        for source_root in &root.source_roots {
+    'roots: for root_index in 0..workspace.roots.len() {
+        for source_index in 0..workspace.roots[root_index].source_roots.len() {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let source_root = absolute_path(source_root.clone());
-            let walker = WalkDir::new(&source_root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    entry.depth() == 0 || !root.excludes.is_excluded(entry.path(), &source_root)
-                });
-            for entry in walker {
+            let root = &workspace.roots[root_index];
+            let source_root = absolute_path(root.source_roots[source_index].clone());
+            let scope = CatalogueScope::recursive(&source_root, Some(&root.excludes));
+            let catalogue = workspace.snapshot_catalogue(&scope, cancel)?;
+            let root = &workspace.roots[root_index];
+            result.visited_entries = result.visited_entries.saturating_add(catalogue.visits());
+            if let Some(reason) = snapshot_catalogue_gap(&catalogue, entry_limit, "") {
+                result.complete = false;
+                result.reason.get_or_insert(reason);
+            }
+            add_catalogue_directories(&mut result.baseline, &catalogue);
+            for path in catalogue.files() {
                 if is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
-                result.visited_entries = result.visited_entries.saturating_add(1);
-                if result.visited_entries > entry_limit {
-                    result.complete = false;
-                    result.reason.get_or_insert_with(|| {
-                        format!("source traversal entry limit ({entry_limit}) reached")
-                    });
-                    stop = true;
-                    break;
-                }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        result.complete = false;
-                        result.reason.get_or_insert_with(|| {
-                            format!(
-                                "source traversal error under {}: {error}",
-                                source_root.display()
-                            )
-                        });
-                        continue;
-                    }
-                };
-                let path = absolute_path(entry.path().to_path_buf());
-                let file_type = entry.file_type();
-                if file_type.is_symlink() {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    add_baseline_path(&mut result.baseline, path);
-                    continue;
-                }
-                if file_type.is_file()
-                    && root.accepts(&path)
-                    && is_project_metadata_path(&path)
-                    && !is_configuration_file(&path)
+                if root.accepts(path)
+                    && is_project_metadata_path(path)
+                    && !is_configuration_file(path)
                 {
                     add_baseline_path(&mut result.baseline, path.clone());
                 }
-                if !file_type.is_file() || !is_pascal_path(&path) || !root.accepts(&path) {
+                if !is_pascal_path(path) || !root.accepts(path) {
                     continue;
                 }
                 add_baseline_path(&mut result.baseline, path.clone());
-                result.add_path(path, None);
+                result.add_path(path.clone(), None);
             }
-            if stop {
-                break;
+            if result.visited_entries > entry_limit {
+                result.complete = false;
+                result.reason.get_or_insert_with(|| {
+                    format!("source traversal entry limit ({entry_limit}) reached")
+                });
+                break 'roots;
             }
-        }
-        if stop {
-            break;
         }
     }
 
@@ -7686,6 +7639,70 @@ fn enumerate_sources(
     Ok(result)
 }
 
+/// Where the requesting context's resolver finds a unit (shared-resolver
+/// tiers): explicit `in` files; the importer's directory, the main-source
+/// directory and each search directory, listed without recursion because
+/// Delphi's unit search path is not recursive; and, for a projectless context
+/// only, the workspace roots recursively.
+#[derive(Debug, Default)]
+struct ProviderScopes {
+    files: Vec<PathBuf>,
+    listed: Vec<PathBuf>,
+    recursive: Vec<PathBuf>,
+}
+
+fn assistance_provider_scopes(
+    workspace: &Workspace,
+    context: &ProjectContext,
+    importers: &[PathBuf],
+) -> ProviderScopes {
+    let mut scopes = ProviderScopes {
+        files: context
+            .explicit_unit_entries()
+            .values()
+            .flatten()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        ..ProviderScopes::default()
+    };
+    scopes.listed.extend(
+        importers
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf)),
+    );
+    scopes.listed.extend(
+        context
+            .main_source_entry()
+            .iter()
+            .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
+    );
+    scopes.listed.extend(context.search_paths());
+    if context.project_file().is_none() {
+        scopes.recursive.extend(
+            workspace
+                .roots
+                .iter()
+                .flat_map(|root| root.source_roots.iter().cloned()),
+        );
+    }
+    for paths in [&mut scopes.files, &mut scopes.listed, &mut scopes.recursive] {
+        for path in paths.iter_mut() {
+            *path = absolute_path(std::mem::take(path));
+        }
+        paths.sort_by_key(|path| path_key(path));
+        paths.dedup_by(|left, right| paths_equal_ci(left, right));
+    }
+    // The recursive tier already covers these directories, under its own
+    // bound and completeness.
+    scopes.listed.retain(|directory| {
+        !scopes
+            .recursive
+            .iter()
+            .any(|root| path_starts_with_native(directory, root))
+    });
+    scopes
+}
+
 fn enumerate_assistance_provider_sources(
     workspace: &mut Workspace,
     input: &WorkspaceInput,
@@ -7706,108 +7723,106 @@ fn enumerate_assistance_provider_sources(
             enumeration.auto_import_complete = false;
             continue;
         };
-        let mut context_roots = context.search_paths();
-        context_roots.extend(
-            context
-                .main_source_entry()
-                .iter()
-                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
-        );
-        context_roots.extend(
-            context
-                .explicit_unit_entries()
-                .values()
-                .flatten()
-                .filter_map(|entry| entry.path.parent().map(Path::to_path_buf)),
-        );
-        context_roots.extend(mapped_source_roots(&context));
-        if context_roots.is_empty() {
-            context_roots.extend(
-                workspace
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.source_roots.iter().cloned()),
-            );
-        }
-        context_roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        context_roots.dedup_by(|left, right| paths_equal_ci(left, right));
-
-        for root in context_roots {
+        let importers = priority_contexts
+            .iter()
+            .filter(|(_, key)| **key == context_key)
+            .filter_map(|(uri, _)| uri.to_file_path().ok().map(absolute_path))
+            .collect::<Vec<_>>();
+        let scopes = assistance_provider_scopes(workspace, &context, &importers);
+        let mut candidates = Vec::new();
+        for path in &scopes.files {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let root = absolute_path(root);
-            let catalogue = workspace.filename_catalogue_with_cancel(&root, Some(cancel))?;
-            if !catalogue.complete {
+            // Recorded present or absent: creating a missing one stales the result.
+            add_baseline_path(&mut enumeration.baseline, path.clone());
+            if path.is_file() {
+                candidates.push(path.clone());
+            }
+        }
+        for directory in &scopes.listed {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let catalogue = workspace.listing_catalogue_with_cancel(directory, cancel)?;
+            if !catalogue.is_complete() {
                 enumeration.auto_import_complete = false;
             }
-            for (directory, stamp) in catalogue.directories {
-                add_baseline_path_with_stamp(&mut enumeration.baseline, directory, stamp);
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
+            candidates.extend(catalogue.pascal_files().map(Path::to_path_buf));
+        }
+        for root in &scopes.recursive {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
             }
-            let mut provider_paths = catalogue
-                .entries
-                .into_values()
-                .flatten()
-                .map(absolute_path)
-                .collect::<Vec<_>>();
-            provider_paths.sort_by_key(|left| path_key(left));
-            provider_paths.dedup_by(|left, right| paths_equal_ci(left, right));
-            for path in provider_paths {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
-                    enumeration.auto_import_complete = false;
-                    return Ok(());
-                }
-                if !is_pascal_path(&path)
-                    || !workspace.ensure_supported_project_context(
-                        &path,
-                        &context,
-                        Some(&context_key),
-                    )
-                {
-                    continue;
-                }
-                enumeration.add_path(path, Some(context_key.clone()));
+            let catalogue = workspace.filename_catalogue_with_cancel(root, Some(cancel))?;
+            if !catalogue.is_complete() {
+                enumeration.auto_import_complete = false;
             }
+            add_catalogue_directories(&mut enumeration.baseline, &catalogue);
+            candidates.extend(catalogue.pascal_files().map(Path::to_path_buf));
+        }
+        candidates.sort_by_key(|path| path_key(path));
+        candidates.dedup_by(|left, right| paths_equal_ci(left, right));
+        for path in candidates {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                enumeration.auto_import_complete = false;
+                return Ok(());
+            }
+            if !is_pascal_path(&path)
+                || !workspace.ensure_supported_project_context(&path, &context, Some(&context_key))
+            {
+                continue;
+            }
+            enumeration.add_path(path, Some(context_key.clone()));
+        }
 
-            let mut overlay_paths = Vec::new();
-            for (uri, overlay) in &input.overlays {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                let Some(path) = uri.to_file_path().ok() else {
-                    continue;
-                };
-                overlay_paths.push((absolute_path(path), overlay.text.len()));
+        let mut overlay_paths = Vec::new();
+        for (uri, overlay) in &input.overlays {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
             }
-            overlay_paths.sort_by_key(|left| path_key(&left.0));
-            overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
-            for (path, overlay_bytes) in overlay_paths {
-                if is_cancelled(cancel) {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
-                if !is_pascal_path(&path)
-                    || !path_starts_with_native(&path, &root)
-                    || !workspace.ensure_supported_project_context(
-                        &path,
-                        &context,
-                        Some(&context_key),
-                    )
-                {
-                    continue;
-                }
-                if overlay_bytes > input.options.limits.max_file_bytes {
-                    enumeration.auto_import_complete = false;
-                    continue;
-                }
-                if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
-                    enumeration.auto_import_complete = false;
-                    return Ok(());
-                }
-                enumeration.add_path(path, Some(context_key.clone()));
+            let Some(path) = uri.to_file_path().ok().map(absolute_path) else {
+                continue;
+            };
+            let in_scope = scopes.files.iter().any(|file| paths_equal_ci(file, &path))
+                || path.parent().is_some_and(|parent| {
+                    scopes
+                        .listed
+                        .iter()
+                        .any(|directory| paths_equal_ci(directory, parent))
+                })
+                || scopes
+                    .recursive
+                    .iter()
+                    .any(|root| path_starts_with_native(&path, root));
+            if in_scope {
+                overlay_paths.push((path, overlay.text.len()));
             }
+        }
+        overlay_paths.sort_by_key(|left| path_key(&left.0));
+        overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
+        for (path, overlay_bytes) in overlay_paths {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if !is_pascal_path(&path)
+                || !workspace.ensure_supported_project_context(&path, &context, Some(&context_key))
+            {
+                continue;
+            }
+            if overlay_bytes > input.options.limits.max_file_bytes {
+                enumeration.auto_import_complete = false;
+                continue;
+            }
+            if enumeration.paths.len() >= MAX_AUTO_IMPORT_PROVIDER_SOURCES {
+                enumeration.auto_import_complete = false;
+                return Ok(());
+            }
+            enumeration.add_path(path, Some(context_key.clone()));
         }
     }
     Ok(())
@@ -7824,6 +7839,40 @@ fn add_baseline_path_with_stamp(
     stamp: Option<PathStamp>,
 ) {
     baseline.add_path(path, stamp);
+}
+
+/// Why a snapshot walk of `catalogue` is incomplete, in the old walk's words.
+fn snapshot_catalogue_gap(
+    catalogue: &Catalogue,
+    entry_limit: usize,
+    under: &str,
+) -> Option<String> {
+    if !catalogue.is_complete() {
+        let limit = match catalogue.limit() {
+            Some(Limit::Visits) => entry_limit,
+            Some(Limit::Entries) | None => MAX_CATALOGUE_ENTRIES,
+        };
+        return Some(format!("source traversal entry limit ({limit}) reached"));
+    }
+    if catalogue.root_kind() == RootKind::Missing {
+        return Some(format!(
+            "source traversal error under {under}{}: the directory does not exist",
+            catalogue.root().display()
+        ));
+    }
+    catalogue.unreadable().first().map(|(path, error)| {
+        format!(
+            "source traversal error under {under}{}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Every directory `catalogue` listed, with the stamp taken before listing it.
+fn add_catalogue_directories(baseline: &mut BaselineAccumulator, catalogue: &Catalogue) {
+    for (directory, stamp) in catalogue.directories() {
+        add_baseline_path_with_stamp(baseline, directory.clone(), stamp.clone());
+    }
 }
 
 fn add_baseline_candidate_membership(
@@ -8026,7 +8075,7 @@ fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(path)
 }
 
-fn is_project_metadata_path(path: &Path) -> bool {
+pub(crate) fn is_project_metadata_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         matches!(
             extension.to_string_lossy().to_ascii_lowercase().as_str(),
@@ -11005,6 +11054,234 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("changed"))
         );
+    }
+
+    /// l4d-20 Decision 6: a catalogue holds facts, not authorization. Two
+    /// contexts that differ only in read policy share one listing of a search
+    /// directory, and each keeps only the providers its policy may read.
+    #[test]
+    fn contexts_that_differ_only_in_read_policy_share_one_listing_and_each_sees_only_what_it_may_read()
+     {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = temp.path().join("ws");
+        let ext = temp.path().join("ext");
+        fs::create_dir_all(&ws).expect("workspace root");
+        fs::create_dir_all(&ext).expect("external search directory");
+        let consumer = ws.join("Consumer.pas");
+        let provider = ext.join("Provider.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("consumer");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\ntype TProviderType = class end;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let mut workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let context = |readable: &[PathBuf]| ContextState {
+            context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                project_file: Some(ws.join("App.dproj")),
+                search_path_entries: vec![ProjectPathEntry::configured(ext.clone())],
+                read_policy: ReadPolicy::new(readable, &[], &[], &EffectiveOverrides::default()),
+                ..pascal_project::ProjectContextParts::default()
+            })
+            .into(),
+            ..ContextState::default()
+        };
+        let key = |config: &str| ContextKey {
+            installation_id: None,
+            project_file: Some(ws.join("App.dproj")),
+            workspace_root: Some(ws.clone()),
+            project_scope: Some(ws.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: Some(config.to_owned()),
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: Default::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let allowed = key("Allowed");
+        let denied = key("Denied");
+        workspace
+            .contexts
+            .insert(allowed.clone(), context(&[ws.clone(), ext.clone()]));
+        workspace
+            .contexts
+            .insert(denied.clone(), context(std::slice::from_ref(&ws)));
+        let input = workspace.analysis_input();
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let cancel = AtomicBool::new(false);
+        let enumerate = |workspace: &mut Workspace, key: &ContextKey| {
+            let mut enumeration = Enumeration {
+                complete: true,
+                auto_import_complete: true,
+                ..Enumeration::default()
+            };
+            super::enumerate_assistance_provider_sources(
+                workspace,
+                &input,
+                &HashMap::from([(consumer_uri.clone(), key.clone())]),
+                &mut enumeration,
+                &cancel,
+            )
+            .expect("provider enumeration");
+            enumeration
+                .paths
+                .iter()
+                .any(|source| path_key(&source.path) == path_key(&provider))
+        };
+
+        assert!(
+            enumerate(&mut workspace, &allowed),
+            "the allowed context must see the provider"
+        );
+        crate::catalogue::test_reset_listings();
+        assert!(
+            !enumerate(&mut workspace, &denied),
+            "the denied context must not see the provider"
+        );
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "the denied context rebuilt a shared listing: {:?}",
+            crate::catalogue::test_listings()
+        );
+        let stored = workspace
+            .project_cache()
+            .catalogue(super::CatalogueScope::listing(&ext).key())
+            .expect("the search directory's listing is shared");
+        assert!(
+            stored
+                .catalogue
+                .pascal_files()
+                .any(|path| path_key(path) == path_key(&provider)),
+            "the shared listing lost the provider"
+        );
+    }
+
+    /// l4d-20 F4: a projectless context's recursive workspace-root tier covers
+    /// the directories under it, so they are not listed again; a context with
+    /// a project has no recursive tier and keeps every listed directory.
+    #[test]
+    fn listed_directories_under_a_recursive_root_are_dropped_only_when_that_tier_exists() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = super::absolute_path(temp.path().to_path_buf());
+        let sub = ws.join("sub");
+        fs::create_dir_all(&sub).expect("importer directory");
+        let workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let importers = [sub.join("Consumer.pas")];
+        let context = |project_file: Option<PathBuf>| {
+            ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                project_file,
+                ..pascal_project::ProjectContextParts::default()
+            })
+        };
+
+        let projectless = super::assistance_provider_scopes(&workspace, &context(None), &importers);
+        assert!(projectless.listed.is_empty(), "{:?}", projectless.listed);
+        assert!(
+            projectless
+                .recursive
+                .iter()
+                .any(|root| path_key(root) == path_key(&ws)),
+            "{:?}",
+            projectless.recursive
+        );
+
+        let with_project = super::assistance_provider_scopes(
+            &workspace,
+            &context(Some(ws.join("App.dproj"))),
+            &importers,
+        );
+        assert!(with_project.recursive.is_empty());
+        assert!(
+            with_project
+                .listed
+                .iter()
+                .any(|directory| path_key(directory) == path_key(&sub)),
+            "{:?}",
+            with_project.listed
+        );
+    }
+
+    /// A missing explicit `in` file is part of the completion's inputs: its
+    /// absence is recorded, so creating it stales the delivered result.
+    #[test]
+    fn a_missing_explicit_unit_file_is_recorded_in_the_completion_baseline() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ws = temp.path().to_path_buf();
+        let consumer = ws.join("Consumer.pas");
+        let generated = ws.join("gen").join("Gen.pas");
+        fs::create_dir_all(generated.parent().unwrap()).expect("generated directory");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nimplementation\nend.\n",
+        )
+        .expect("consumer");
+        let mut workspace = test_workspace(vec![ws.clone()], WorkspaceOptions::default());
+        let key = ContextKey {
+            installation_id: None,
+            project_file: Some(ws.join("App.dpr")),
+            workspace_root: Some(ws.clone()),
+            project_scope: Some(ws.clone()),
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: Default::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context: ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                    discovery_complete: true,
+                    project_file: Some(ws.join("App.dpr")),
+                    explicit_unit_entries: HashMap::from([(
+                        "gen".to_string(),
+                        vec![ProjectPathEntry::configured(generated.clone())],
+                    )]),
+                    read_policy: ReadPolicy::new(
+                        std::slice::from_ref(&ws),
+                        &[],
+                        &[],
+                        &EffectiveOverrides::default(),
+                    ),
+                    ..pascal_project::ProjectContextParts::default()
+                })
+                .into(),
+                ..ContextState::default()
+            },
+        );
+        let input = workspace.analysis_input();
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
+        let mut enumeration = Enumeration {
+            complete: true,
+            auto_import_complete: true,
+            ..Enumeration::default()
+        };
+        super::enumerate_assistance_provider_sources(
+            &mut workspace,
+            &input,
+            &HashMap::from([(consumer_uri, key)]),
+            &mut enumeration,
+            &AtomicBool::new(false),
+        )
+        .expect("provider enumeration");
+        let recorded = enumeration
+            .baseline
+            .paths
+            .iter()
+            .find(|baseline| path_key(&baseline.path) == path_key(&generated))
+            .expect("the missing explicit file is in the baseline");
+        assert!(recorded.stamp.is_none(), "recorded as absent: {recorded:?}");
     }
 
     #[test]

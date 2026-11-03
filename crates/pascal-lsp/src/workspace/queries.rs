@@ -3222,6 +3222,100 @@ mod tests {
         }
     }
 
+    /// l4d-20 Decision 5: Delphi's unit search path is not recursive, so
+    /// completion never lists a search directory's subdirectories.
+    #[test]
+    fn completion_providers_come_from_search_directories_without_recursion() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("lib/nested")).expect("library directories");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project");
+        let consumer_source = "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nvar Value: TDi;\nbegin Value := nil; end;\nend.\n";
+        let consumer = root.join("Consumer.pas");
+        fs::write(&consumer, consumer_source).expect("consumer");
+        fs::write(
+            root.join("lib/Direct.pas"),
+            "unit Direct;\ninterface\ntype TDirectType = class end;\nimplementation\nend.\n",
+        )
+        .expect("direct provider");
+        fs::write(
+            root.join("lib/nested/Deep.pas"),
+            "unit Deep;\ninterface\ntype TDiscardedType = class end;\nimplementation\nend.\n",
+        )
+        .expect("nested provider");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let cancel = AtomicBool::new(false);
+        crate::catalogue::test_reset_listings();
+        let completion = completion_from_input(
+            input,
+            &source_uri(&consumer),
+            position_after(consumer_source, "TDi"),
+            &cancel,
+        );
+        let labels = completion
+            .value
+            .expect("completion")
+            .items
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(
+            labels.iter().any(|label| label == "TDirectType"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().all(|label| label != "TDiscardedType"),
+            "{labels:?}"
+        );
+        let nested = root.join("lib/nested");
+        assert!(
+            crate::catalogue::test_listings()
+                .iter()
+                .all(|listed| !listed.starts_with(&nested)),
+            "lib/nested was listed: {:?}",
+            crate::catalogue::test_listings()
+        );
+    }
+
+    /// Projectless contexts keep the shared resolver's recursive workspace-root
+    /// tier (guard: green before and after).
+    #[test]
+    fn projectless_completion_still_offers_providers_in_subdirectories() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("sub")).expect("sub");
+        let consumer_source = "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nvar Value: TPro;\nbegin Value := nil; end;\nend.\n";
+        let consumer = root.join("Consumer.pas");
+        fs::write(&consumer, consumer_source).expect("consumer");
+        fs::write(
+            root.join("sub/Provider.pas"),
+            "unit Provider;\ninterface\ntype TProviderType = class end;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let cancel = AtomicBool::new(false);
+        let completion = completion_from_input(
+            input,
+            &source_uri(&consumer),
+            position_after(consumer_source, "TPro"),
+            &cancel,
+        );
+        assert!(
+            completion
+                .value
+                .expect("completion")
+                .items
+                .iter()
+                .any(|item| item.label == "TProviderType")
+        );
+    }
+
     fn position_after(source: &str, needle: &str) -> Position {
         let offset = source
             .find(needle)
@@ -3897,6 +3991,148 @@ mod tests {
         assert!(
             error.contains("membership") || error.contains("changed"),
             "unexpected new-consumer revalidation error: {error}"
+        );
+    }
+
+    /// l4d-20 AC#1: a second references request on the same workspace performs
+    /// no directory walk (Task 1 recorded that it did).
+    #[test]
+    fn a_second_references_request_lists_no_directory() {
+        let fixture = query_fixture();
+        let root =
+            crate::workspace::absolute_path(fixture.provider.parent().unwrap().to_path_buf());
+        let nested = root.join("sub").join("Nested.pas");
+        fs::create_dir_all(nested.parent().unwrap()).expect("nested directory");
+        fs::write(
+            &nested,
+            "unit Nested;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("nested consumer");
+        // Settled stamps, so the shared catalogue outlives the first request.
+        pascal_project::backdate_tree_for_test(&root);
+        let cancel = AtomicBool::new(false);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.provider),
+                shared_value_position(),
+                true,
+                &cancel,
+            )
+        };
+        crate::catalogue::test_reset_listings();
+        let first = references();
+        assert!(first.value.is_ok(), "first references: {first:?}");
+        let listed = crate::catalogue::test_listings();
+        assert!(
+            listed.contains(&root) && listed.contains(&root.join("sub")),
+            "the first request walks the root and its subdirectory: {listed:?}"
+        );
+        crate::catalogue::test_reset_listings();
+        let second = references();
+        assert!(second.value.is_ok(), "second references: {second:?}");
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "the second request listed {:?}",
+            crate::catalogue::test_listings()
+        );
+        let first = first.value.unwrap().value;
+        assert!(
+            first
+                .iter()
+                .any(|location| location.uri == source_uri(&nested)),
+            "the nested consumer is found: {first:?}"
+        );
+        assert_eq!(
+            first,
+            second.value.unwrap().value,
+            "both requests find the same references"
+        );
+    }
+
+    /// Two views of one root sharing one cache, the narrower excluding
+    /// `vendor/`, and a references query naming the files each finds. The
+    /// tree is settled so catalogues outlive a request.
+    fn exclusion_views() -> (
+        TempDir,
+        WorkspaceInput,
+        WorkspaceInput,
+        impl Fn(&WorkspaceInput) -> Vec<String>,
+    ) {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        fs::create_dir_all(root.join("vendor")).expect("vendor");
+        fs::write(
+            root.join("vendor/VendorConsumer.pas"),
+            "unit VendorConsumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("vendor consumer");
+        pascal_project::backdate_tree_for_test(&root);
+        let wide = test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let mut narrow = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                exclude: vec!["vendor".to_string()],
+                ..WorkspaceOptions::default()
+            },
+        )
+        .analysis_input();
+        narrow.project_cache = wide.project_cache.clone();
+        let found = move |input: &WorkspaceInput| {
+            let computed = references_from_input(
+                input.clone(),
+                &source_uri(&provider),
+                shared_value_position(),
+                false,
+                &AtomicBool::new(false),
+            );
+            computed
+                .value
+                .expect("references")
+                .value
+                .into_iter()
+                .map(|location| location.uri.path().rsplit('/').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        (temp, wide, narrow, found)
+    }
+
+    #[test]
+    fn a_narrower_exclusion_set_never_enumerates_what_a_wider_one_catalogued() {
+        let (_temp, wide, narrow, found) = exclusion_views();
+        assert_eq!(found(&wide), ["VendorConsumer.pas"]);
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view must not see vendor/"
+        );
+        assert_eq!(
+            found(&wide),
+            ["VendorConsumer.pas"],
+            "the wider view still does"
+        );
+    }
+
+    #[test]
+    fn a_wider_exclusion_set_still_finds_what_a_narrower_one_catalogued_first() {
+        let (_temp, wide, narrow, found) = exclusion_views();
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view must not see vendor/"
+        );
+        assert_eq!(
+            found(&wide),
+            ["VendorConsumer.pas"],
+            "the wider view is not served the narrower catalogue"
+        );
+        assert!(
+            found(&narrow).is_empty(),
+            "the narrower view still does not"
         );
     }
 

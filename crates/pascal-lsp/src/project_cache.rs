@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
 use std::time::Duration;
 
 use lsp_types::Url;
 use pascal_project::{ProjectContext, ProjectReadStamp};
 
+use crate::catalogue::{Catalogue, CatalogueKey, CatalogueStore, Removed, SharedCatalogue};
 use crate::file_watch::DirectoryWatch;
 use crate::include_expansion::ExpansionResult;
 use crate::navigation::ParsedDocument;
@@ -22,6 +23,11 @@ pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// `measure_retained_bytes_per_source_byte` on RAD Studio 7.0 RTL/VCL units.
 #[allow(dead_code)]
 pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09-29: 46, 45, 45 on RAD Studio 7.0 RTL/VCL
+
+/// Shared directory catalogues (l4d-20) may hold at most this fraction of
+/// `maxCacheBytes`. Like a reservation, they may evict unpinned entries to
+/// make room, but never past that eighth of the budget.
+const CATALOGUE_BUDGET_SHARE: usize = 8;
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1553,6 +1559,119 @@ mod cache_tests {
         );
     }
 
+    #[test]
+    fn a_published_catalogue_watches_its_directories_with_the_cache_unlocked() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        let root = temp.path().to_path_buf();
+        let sub = root.join("sub");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", root.clone(), true), ("watch", sub.clone(), true)]
+        );
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(shared.watch_registered);
+        assert!(!shared.watched, "watched only after a later stamp check");
+        cache.confirm_catalogue_watched(&key, shared.generation);
+        assert!(cache.catalogue(&key).unwrap().watched);
+        cache.drop_catalogue(&key, shared.generation);
+        assert_eq!(
+            calls.lock().unwrap()[2..],
+            [("unwatch", root, true), ("unwatch", sub, true)]
+        );
+    }
+
+    #[test]
+    fn a_catalogue_beyond_the_watch_budget_is_not_watched() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        cache.set_catalogue_watch_budget_for_test(1);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!cache.catalogue(&key).unwrap().watch_registered);
+    }
+
+    #[test]
+    fn replacing_the_watcher_forgets_every_watched_catalogue() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        recording_watcher(&cache);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        let generation = cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.confirm_catalogue_watched(&key, generation);
+        assert!(cache.catalogue(&key).unwrap().watched);
+        recording_watcher(&cache);
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(!shared.watched && !shared.watch_registered);
+    }
+
+    #[test]
+    fn poison_recovery_forgets_the_catalogue_watches_it_drained() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared_directory = temp.path().join("sub");
+        std::fs::create_dir_all(&shared_directory).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        cache.set_catalogue_watch_budget_for_test(2);
+        let (old_key, old) = super::listed_catalogue(temp.path());
+        let old_generation = cache.publish_catalogue(old_key.clone(), None, old).unwrap();
+        cache.poison_state();
+        let (new_key, new) = super::listed_catalogue(&shared_directory);
+        let new_generation = cache.publish_catalogue(new_key.clone(), None, new).unwrap();
+        assert!(
+            cache.catalogue(&new_key).unwrap().watch_registered,
+            "drained watches no longer count against the budget"
+        );
+        cache.confirm_catalogue_watched(&new_key, new_generation);
+        assert!(cache.catalogue(&new_key).unwrap().watched);
+        let before_drop = calls.lock().unwrap().len();
+        cache.drop_catalogue(&old_key, old_generation);
+        assert_eq!(
+            calls.lock().unwrap()[before_drop..],
+            [],
+            "the older catalogue's release must not unwatch what the newer one holds"
+        );
+        cache.drop_catalogue(&new_key, new_generation);
+        assert_eq!(
+            calls.lock().unwrap()[before_drop..],
+            [("unwatch", shared_directory, true)]
+        );
+    }
+
+    #[test]
+    fn a_failed_watch_leaves_the_catalogue_unregistered() {
+        struct Refuse;
+        impl DirectoryWatch for Refuse {
+            fn watch(&mut self, _: &Path) -> bool {
+                false
+            }
+            fn unwatch(&mut self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        cache.set_watcher(Box::new(Refuse));
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        let generation = cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.confirm_catalogue_watched(&key, generation);
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(!shared.watch_registered && !shared.watched);
+    }
+
     fn long_probe(name: &str) -> Probe {
         Probe::Stamp {
             path: PathBuf::from(format!("/ws/{}/{name}", "deep".repeat(64))),
@@ -2462,6 +2581,9 @@ struct State {
     /// them: their holders release them on drop.
     reserved: [usize; ReservationKind::COUNT],
     watch_counts: HashMap<PathBuf, usize>,
+    /// Advances when poison recovery drains `watch_counts`: a catalogue's
+    /// watches acquired under an older one were drained and are not released.
+    watch_count_epoch: u64,
     /// Directories whose watch count reached or left zero. `sync_watches`
     /// applies them to the watcher once the state lock is released.
     watch_changes: Vec<PathBuf>,
@@ -2495,6 +2617,7 @@ impl Default for State {
             outstanding_bytes: 0,
             reserved: [0; ReservationKind::COUNT],
             watch_counts: HashMap::new(),
+            watch_count_epoch: 0,
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
@@ -2520,7 +2643,8 @@ struct WatcherState {
 /// `watcher`, never calls the watcher and never touches the filesystem; it
 /// queues watch-count changes in `State::watch_changes`, and `sync_watches`
 /// applies them after `state` is released. `witnesses` is never held together
-/// with either lock.
+/// with either lock. `catalogues` is never held together with any other lock:
+/// what it drops is released (charge, watches) after it is unlocked.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
@@ -2528,6 +2652,11 @@ struct Inner {
     watcher: Mutex<WatcherState>,
     /// Never held together with `state` or `watcher`.
     witnesses: Mutex<HashMap<PathBuf, Witness>>,
+    /// Never held together with `state`, `watcher` or `witnesses`.
+    catalogues: Mutex<CatalogueStore>,
+    /// Advances whenever the watcher's registrations are lost (a new watcher,
+    /// poisoned-state recovery): catalogue watches of an older epoch are gone.
+    watch_epoch: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -2662,6 +2791,7 @@ pub(crate) struct CacheStats {
     pub reserved_facts_bytes: usize,
     pub reserved_scratch_bytes: usize,
     pub reserved_pages_bytes: usize,
+    pub reserved_catalogue_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2670,6 +2800,7 @@ impl CacheStats {
         self.reserved_facts_bytes
             .saturating_add(self.reserved_scratch_bytes)
             .saturating_add(self.reserved_pages_bytes)
+            .saturating_add(self.reserved_catalogue_bytes)
     }
 }
 
@@ -2684,16 +2815,21 @@ pub(crate) enum ReservationKind {
     Scratch,
     /// The persistent store's SQLite page caches and connection overhead.
     Pages,
+    /// Shared directory catalogues (l4d-20). The catalogue store holds these
+    /// bytes itself, not through a `Reservation`: a stored `Reservation`
+    /// would keep `Inner` alive through its own `Arc`.
+    Catalogues,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 3;
+    const COUNT: usize = 4;
 
     fn index(self) -> usize {
         match self {
             Self::Facts => 0,
             Self::Scratch => 1,
             Self::Pages => 2,
+            Self::Catalogues => 3,
         }
     }
 }
@@ -2765,6 +2901,24 @@ fn fits(state: &State, retained: usize, request: usize) -> bool {
         .is_some_and(|total| total <= state.max_bytes)
 }
 
+/// Evicts unpinned entries, least recently used first, until `request` more
+/// bytes fit. False when they cannot: pinned, outstanding and reserved bytes
+/// alone leave no room, or nothing is left to evict.
+fn make_room(state: &mut State, request: usize) -> bool {
+    if !fits(state, state.pinned_bytes, request) {
+        return false;
+    }
+    while !fits(state, state.bytes, request) {
+        let Some((_, key)) = state.lru.pop_first() else {
+            return false;
+        };
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
+    }
+    true
+}
+
 fn recover_poisoned_state<'a>(
     inner: &'a Inner,
     mut state: MutexGuard<'a, State>,
@@ -2787,6 +2941,9 @@ fn recover_poisoned_state<'a>(
     let watched_directories = state.watch_counts.drain().map(|(directory, _)| directory);
     let watched_directories = watched_directories.collect::<Vec<_>>();
     state.watch_changes.extend(watched_directories);
+    // The drained counts held the catalogue watches too.
+    state.watch_count_epoch += 1;
+    inner.watch_epoch.fetch_add(1, Ordering::SeqCst);
     inner.state.clear_poison();
     state
 }
@@ -2881,18 +3038,9 @@ impl ProjectCache {
             .try_fold(0usize, |total, (_, bytes)| total.checked_add(*bytes))?;
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        if !fits(&state, state.pinned_bytes, total) {
+        if !make_room(&mut state, total) {
             self.release(state);
             return None;
-        }
-        while !fits(&state, state.bytes, total) {
-            let Some((_, key)) = state.lru.pop_first() else {
-                self.release(state);
-                return None;
-            };
-            #[cfg(test)]
-            note_examined(&state);
-            remove_ready(&mut state, &key);
         }
         for &(kind, bytes) in requests {
             state.reserved[kind.index()] += bytes;
@@ -3984,14 +4132,18 @@ fn release_watches(state: &mut State, entry: &Entry) {
         return;
     };
     for directory in &imports.watch_dirs {
-        let Some(count) = state.watch_counts.get_mut(directory) else {
-            continue;
-        };
-        *count -= 1;
-        if *count == 0 {
-            state.watch_counts.remove(directory);
-            state.watch_changes.push(directory.clone());
-        }
+        release_watch(state, directory);
+    }
+}
+
+fn release_watch(state: &mut State, directory: &Path) {
+    let Some(count) = state.watch_counts.get_mut(directory) else {
+        return;
+    };
+    *count -= 1;
+    if *count == 0 {
+        state.watch_counts.remove(directory);
+        state.watch_changes.push(directory.to_path_buf());
     }
 }
 
@@ -4185,6 +4337,8 @@ impl ProjectCache {
         }
         self.release(state);
         self.drop_witnesses(path, include_parent);
+        let removed = self.catalogues().invalidate(path, include_parent);
+        self.release_catalogues(removed);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
         }
@@ -4218,6 +4372,9 @@ impl ProjectCache {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Overflow lost which directories changed: no catalogue survives it.
+        let removed = self.catalogues().clear();
+        self.release_catalogues(removed);
     }
 
     /// Remember that `path`, while it has `stamp`, holds what `proven` says.
@@ -4321,6 +4478,7 @@ impl ProjectCache {
             reserved_facts_bytes: state.reserved[ReservationKind::Facts.index()],
             reserved_scratch_bytes: state.reserved[ReservationKind::Scratch.index()],
             reserved_pages_bytes: state.reserved[ReservationKind::Pages.index()],
+            reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
         }
     }
 
@@ -4333,6 +4491,174 @@ impl ProjectCache {
             .unwrap_or_else(PoisonError::into_inner);
         state.watcher = Some(watcher);
         state.registered.clear();
+        self.inner.watch_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Shared directory catalogues (l4d-20).
+impl ProjectCache {
+    pub(crate) fn catalogue(&self, key: &CatalogueKey) -> Option<SharedCatalogue> {
+        let epoch = self.inner.watch_epoch.load(Ordering::SeqCst);
+        self.catalogues().get(key, epoch)
+    }
+
+    /// Keeps `catalogue` for every view of this cache, charged to the
+    /// `Catalogues` share of `maxCacheBytes`, when `base` is the generation
+    /// stored now. Returns the new generation, or `None` when it was not kept
+    /// (no room, or another view published or invalidated first); the caller
+    /// may still use it for its own request.
+    pub(crate) fn publish_catalogue(
+        &self,
+        key: CatalogueKey,
+        base: Option<u64>,
+        catalogue: Arc<Catalogue>,
+    ) -> Option<u64> {
+        let bytes = catalogue.retained_bytes();
+        if !self.charge_catalogue(bytes) {
+            return None;
+        }
+        let directories = catalogue
+            .directories()
+            .iter()
+            .map(|(directory, _)| directory.clone())
+            .collect::<Vec<_>>();
+        let epoch = self.inner.watch_epoch.load(Ordering::SeqCst);
+        let state = lock(&self.inner);
+        let mut count_epoch = state.watch_count_epoch;
+        self.release(state);
+        let watch =
+            self.has_watcher() && self.catalogues().can_watch(directories.len(), count_epoch);
+        if watch {
+            // Read under the lock that acquires: `lock` may have just
+            // recovered from poison and advanced it.
+            let mut state = lock(&self.inner);
+            count_epoch = state.watch_count_epoch;
+            for directory in &directories {
+                acquire_watch(&mut state, directory);
+            }
+            self.release(state);
+        }
+        let held = if watch {
+            directories.clone()
+        } else {
+            Vec::new()
+        };
+        let outcome =
+            self.catalogues()
+                .publish(key.clone(), base, catalogue, bytes, held, count_epoch);
+        match outcome {
+            Ok((generation, removed)) => {
+                self.release_catalogues(removed);
+                if watch && self.all_watched(&directories) {
+                    self.catalogues()
+                        .mark_watch_registered(&key, generation, epoch);
+                }
+                Some(generation)
+            }
+            Err(rejected) => {
+                self.release_catalogues(vec![rejected]);
+                None
+            }
+        }
+    }
+
+    /// Drops the catalogue of `key` if it is still the one published under
+    /// `generation` (a stamp check found it stale).
+    pub(crate) fn drop_catalogue(&self, key: &CatalogueKey, generation: u64) {
+        let removed = self.catalogues().remove(key, generation);
+        self.release_catalogues(removed.into_iter().collect());
+    }
+
+    /// Advances on every catalogue publication and invalidation (for the
+    /// l4d-33 index and l4d-zf1b.8 coverage).
+    #[cfg_attr(not(test), allow(dead_code))] // read by l4d-33 and l4d-zf1b.8
+    pub(crate) fn catalogue_generation(&self) -> u64 {
+        self.catalogues().generation()
+    }
+
+    /// A stamp check of the catalogue published under `generation`, begun
+    /// after its watches were registered, passed.
+    pub(crate) fn confirm_catalogue_watched(&self, key: &CatalogueKey, generation: u64) {
+        self.catalogues().confirm_watched(key, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_catalogue_watch_budget_for_test(&self, directories: usize) {
+        self.catalogues().set_watch_budget_for_test(directories);
+    }
+
+    fn has_watcher(&self) -> bool {
+        self.inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watcher
+            .is_some()
+    }
+
+    fn all_watched(&self, directories: &[PathBuf]) -> bool {
+        let watcher = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        watcher.watcher.is_some()
+            && directories
+                .iter()
+                .all(|directory| watcher.registered.contains(directory))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalogue_count(&self) -> usize {
+        self.catalogues().len()
+    }
+
+    /// A panic under the store lock leaves reverse-map keys whose catalogue
+    /// is gone, which lookups ignore; a panic in `publish` or `invalidate`
+    /// after `take` also leaks the charge and watch counts of the entries it
+    /// took, since their `Removed` never reaches `release_catalogues`. Poison
+    /// is cleared, not recovered from.
+    fn catalogues(&self) -> MutexGuard<'_, CatalogueStore> {
+        self.inner.catalogues.lock().unwrap_or_else(|poisoned| {
+            self.inner.catalogues.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
+    fn charge_catalogue(&self, bytes: usize) -> bool {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let index = ReservationKind::Catalogues.index();
+        let share = state.max_bytes / CATALOGUE_BUDGET_SHARE;
+        let admitted = state.reserved[index]
+            .checked_add(bytes)
+            .is_some_and(|total| total <= share)
+            && make_room(&mut state, bytes);
+        if admitted {
+            state.reserved[index] += bytes;
+        }
+        self.release(state);
+        admitted
+    }
+
+    fn release_catalogues(&self, removed: Vec<Removed>) {
+        if removed.is_empty() {
+            return;
+        }
+        let mut state = lock(&self.inner);
+        let index = ReservationKind::Catalogues.index();
+        for removed in &removed {
+            state.reserved[index] = state.reserved[index].saturating_sub(removed.bytes);
+            // Watches acquired before a poison recovery were drained with
+            // the counts; releasing them would release a newer holder's.
+            if removed.watch_count_epoch != state.watch_count_epoch {
+                continue;
+            }
+            for directory in &removed.watch_directories {
+                release_watch(&mut state, directory);
+            }
+        }
+        self.release(state);
     }
 }
 
@@ -4427,5 +4753,222 @@ mod witness_tests {
             None,
             "past the bound nothing is recorded"
         );
+    }
+}
+
+#[cfg(test)]
+fn listed_catalogue(
+    directory: &Path,
+) -> (
+    crate::catalogue::CatalogueKey,
+    Arc<crate::catalogue::Catalogue>,
+) {
+    use crate::catalogue::{
+        Bound, Catalogue, CatalogueKey, Depth, Exclusions, MAX_CATALOGUE_ENTRIES,
+    };
+    let mut io = || -> Result<(), String> { Ok(()) };
+    let mut catalogue = Catalogue::new(directory, Depth::Recursive, &mut io).unwrap();
+    catalogue
+        .advance(Bound::entries(MAX_CATALOGUE_ENTRIES), &|_| false, &mut io)
+        .unwrap();
+    let key = CatalogueKey {
+        root: directory.to_path_buf(),
+        depth: Depth::Recursive,
+        exclusions: Exclusions::Nothing,
+    };
+    (key, Arc::new(catalogue))
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+    use crate::catalogue::MAX_SHARED_CATALOGUES;
+
+    fn tree() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        std::fs::write(temp.path().join("A.pas"), b"").unwrap();
+        std::fs::write(temp.path().join("sub/B.pas"), b"").unwrap();
+        temp
+    }
+
+    #[test]
+    fn a_published_catalogue_is_shared_by_every_clone_of_the_cache() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let generation = cache
+            .publish_catalogue(key.clone(), None, Arc::clone(&catalogue))
+            .expect("retained");
+        let shared = cache.clone().catalogue(&key).expect("shared");
+        assert!(Arc::ptr_eq(&shared.catalogue, &catalogue));
+        assert_eq!(shared.generation, generation);
+    }
+
+    #[test]
+    fn a_catalogue_is_charged_until_it_is_removed() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let bytes = catalogue.retained_bytes();
+        let generation = cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        assert_eq!(cache.stats().reserved_catalogue_bytes, bytes);
+        assert_eq!(cache.stats().reserved_bytes(), bytes);
+        cache.drop_catalogue(&key, generation.wrapping_add(1));
+        assert!(
+            cache.catalogue(&key).is_some(),
+            "a stale generation drops nothing"
+        );
+        cache.drop_catalogue(&key, generation);
+        assert!(cache.catalogue(&key).is_none());
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+    }
+
+    #[test]
+    fn a_catalogue_over_its_share_of_the_budget_is_not_retained() {
+        let temp = tree();
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let bytes = catalogue.retained_bytes();
+        let cache = ProjectCache::new(bytes * CATALOGUE_BUDGET_SHARE - CATALOGUE_BUDGET_SHARE);
+        assert_eq!(cache.publish_catalogue(key.clone(), None, catalogue), None);
+        assert!(cache.catalogue(&key).is_none());
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+    }
+
+    #[test]
+    fn a_stale_base_never_replaces_the_stored_catalogue() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let first = cache
+            .publish_catalogue(key.clone(), None, Arc::clone(&catalogue))
+            .unwrap();
+        assert_eq!(
+            cache.publish_catalogue(key.clone(), None, Arc::clone(&catalogue)),
+            None,
+            "a new build never replaces a stored one"
+        );
+        let second = cache
+            .publish_catalogue(key.clone(), Some(first), Arc::clone(&catalogue))
+            .expect("an extension of the stored catalogue replaces it");
+        assert_eq!(
+            cache.publish_catalogue(key.clone(), Some(first), Arc::clone(&catalogue)),
+            None
+        );
+        cache.drop_catalogue(&key, second);
+        assert_eq!(
+            cache.publish_catalogue(key.clone(), Some(second), catalogue),
+            None,
+            "an extension of an invalidated catalogue is not stored"
+        );
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+    }
+
+    #[test]
+    fn the_store_keeps_the_most_recently_used_catalogues() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 40);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let keyed = |index: usize| crate::catalogue::CatalogueKey {
+            root: key.root.join(format!("view{index}")),
+            ..key.clone()
+        };
+        for index in 0..=MAX_SHARED_CATALOGUES {
+            cache
+                .publish_catalogue(keyed(index), None, Arc::clone(&catalogue))
+                .unwrap();
+        }
+        assert_eq!(cache.catalogue_count(), MAX_SHARED_CATALOGUES);
+        assert!(cache.catalogue(&keyed(0)).is_none());
+        assert!(cache.catalogue(&keyed(MAX_SHARED_CATALOGUES)).is_some());
+        assert_eq!(
+            cache.stats().reserved_catalogue_bytes,
+            MAX_SHARED_CATALOGUES * catalogue.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn a_listing_change_drops_the_catalogues_that_listed_the_parent() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let before = cache.catalogue_generation();
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_path(&temp.path().join("sub/New.pas"));
+        assert!(cache.catalogue(&key).is_none());
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+        assert!(cache.catalogue_generation() > before + 1);
+    }
+
+    #[test]
+    fn a_content_change_keeps_catalogues_unless_it_names_a_listed_directory() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_file_contents(&temp.path().join("A.pas"));
+        assert!(
+            cache.catalogue(&key).is_some(),
+            "a file's bytes are not membership"
+        );
+        cache.invalidate_file_contents(&temp.path().join("sub"));
+        assert!(
+            cache.catalogue(&key).is_none(),
+            "a listed directory's metadata changed"
+        );
+    }
+
+    #[test]
+    fn a_change_inside_an_excluded_directory_keeps_the_catalogue() {
+        use crate::catalogue::{Bound, Catalogue, Depth, MAX_CATALOGUE_ENTRIES};
+        let temp = tree();
+        std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        let mut io = || -> Result<(), String> { Ok(()) };
+        let mut catalogue = Catalogue::new(temp.path(), Depth::Recursive, &mut io).unwrap();
+        catalogue
+            .advance(
+                Bound::entries(MAX_CATALOGUE_ENTRIES),
+                &|path: &Path| path.ends_with("node_modules"),
+                &mut io,
+            )
+            .unwrap();
+        let (key, _) = listed_catalogue(temp.path());
+        let cache = ProjectCache::new(1 << 30);
+        cache
+            .publish_catalogue(key.clone(), None, Arc::new(catalogue))
+            .unwrap();
+        cache.invalidate_path(&temp.path().join("node_modules/pkg/index.js"));
+        assert!(cache.catalogue(&key).is_some());
+        cache.invalidate_path(&temp.path().join("node_modules"));
+        assert!(
+            cache.catalogue(&key).is_none(),
+            "the root's own listing changed"
+        );
+    }
+
+    #[test]
+    fn overflow_drops_every_catalogue_and_releases_its_charge() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let other = crate::catalogue::CatalogueKey {
+            root: key.root.join("other"),
+            ..key.clone()
+        };
+        cache
+            .publish_catalogue(key.clone(), None, Arc::clone(&catalogue))
+            .unwrap();
+        cache
+            .publish_catalogue(other.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_after_overflow();
+        assert_eq!(cache.catalogue_count(), 0);
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
     }
 }

@@ -45,15 +45,10 @@ struct EncodedRecord {
     content_bytes: u64,
 }
 
-/// Encode, admit and hash a validated record before any transaction
-/// (spec §9, §10).
+/// Encode, admit and hash a validated record, its binding count already
+/// admitted, before any transaction (spec §9, §10).
 fn encode_record(record: &MemberRecord) -> Result<EncodedRecord, Bypass> {
     let too_large = |limit| Err(Bypass::TooLarge(limit));
-    if record.bindings.len() > MAX_MEMBER_BINDINGS {
-        return too_large(TooLarge::Bindings {
-            count: record.bindings.len(),
-        });
-    }
     let header = record.header.encoded();
     if header.len() > MAX_MANIFEST_BYTES {
         return too_large(TooLarge::Manifest {
@@ -316,13 +311,20 @@ impl Store {
     /// record under the same ID is an integrity failure.
     pub fn publish_member_record(&self, record: &MemberRecord) -> Result<PublishedRecord, Bypass> {
         record.validate().map_err(Bypass::InvalidRecord)?;
-        let encoded = encode_record(record)?;
-        let Some(_scratch) = self
-            .scratch
-            .reserve(encoded.header.len() as u64 + encoded.content_bytes)
-        else {
+        if record.bindings.len() > MAX_MEMBER_BINDINGS {
+            return Err(Bypass::TooLarge(TooLarge::Bindings {
+                count: record.bindings.len(),
+            }));
+        }
+        // Charged from input sizes before anything is encoded (spec §10),
+        // then kept at what the encoding takes.
+        let Some(mut scratch) = self.scratch.reserve(record.encoded_bytes_bound() as u64) else {
             return Err(Bypass::ScratchExhausted);
         };
+        let encoded = encode_record(record)?;
+        scratch.shrink_to(
+            (encoded.header.len() + encoded.source_key.len()) as u64 + encoded.content_bytes,
+        );
         let expected = expected_row(record, &encoded);
         let fail = |error: rusqlite::Error| classify(&error);
         let mut writer = self.writer()?;

@@ -10,6 +10,14 @@ pub const MAX_WAIT: Duration = Duration::from_millis(25);
 pub const MAX_OPEN_WAIT: Duration = Duration::from_secs(2);
 pub const MAX_READERS: usize = 2;
 pub const MIN_CONNECTION_PAGE_CACHE_BYTES: u64 = 256 * 1024;
+/// Heap one SQLite connection may use beyond its page cache: schema,
+/// lookaside, the prepared-statement cache and parser state (spec §10: "A
+/// connection is not opened when its overhead cannot be admitted").
+/// `tests/sqlite_heap.rs` checks it against SQLite's own heap count, measured
+/// with the statements a fresh store runs (each connection's statement cache
+/// can hold more); statement heap beyond it (large sorts, unusual plans) is
+/// not accounted.
+pub const CONNECTION_OVERHEAD_BYTES: u64 = 1024 * 1024;
 pub const MAX_ROW_BATCH_ROWS: usize = 256;
 pub const MAX_ROW_BATCH_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -100,11 +108,60 @@ impl StoreLimits {
     pub fn connection_page_cache_bytes(&self) -> u64 {
         self.page_cache_bytes / self.connections() as u64
     }
+
+    /// What the store's connections are admitted for: the aggregate page
+    /// cache plus each connection's overhead allowance.
+    pub fn page_admission_bytes(&self) -> u64 {
+        self.page_cache_bytes
+            .saturating_add(CONNECTION_OVERHEAD_BYTES.saturating_mul(self.connections() as u64))
+    }
+
+    /// Everything an open store is admitted for: its connections and its
+    /// scratch.
+    pub fn admission_bytes(&self) -> u64 {
+        self.page_admission_bytes()
+            .saturating_add(self.scratch_bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_covers_pages_connections_and_scratch() {
+        let limits = StoreLimits::default();
+        assert_eq!(CONNECTION_OVERHEAD_BYTES, 1024 * 1024);
+        assert_eq!(
+            limits.page_admission_bytes(),
+            16 * 1024 * 1024 + 3 * 1024 * 1024
+        );
+        assert_eq!(
+            limits.admission_bytes(),
+            16 * 1024 * 1024 + 3 * 1024 * 1024 + 16 * 1024 * 1024
+        );
+        let small = StoreLimits {
+            readers: 1,
+            page_cache_bytes: 2 * MIN_CONNECTION_PAGE_CACHE_BYTES,
+            scratch_bytes: MAX_ROW_BATCH_BYTES as u64,
+            ..limits
+        };
+        assert_eq!(
+            small.page_admission_bytes(),
+            2 * MIN_CONNECTION_PAGE_CACHE_BYTES + 2 * CONNECTION_OVERHEAD_BYTES
+        );
+        assert_eq!(
+            small.admission_bytes(),
+            small.page_admission_bytes() + MAX_ROW_BATCH_BYTES as u64
+        );
+        let unvalidated = StoreLimits {
+            readers: usize::MAX - 1,
+            page_cache_bytes: u64::MAX,
+            ..limits
+        };
+        assert_eq!(unvalidated.page_admission_bytes(), u64::MAX);
+        assert_eq!(unvalidated.admission_bytes(), u64::MAX);
+    }
 
     #[test]
     fn defaults_are_the_spec_ceilings() {

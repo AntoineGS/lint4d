@@ -63,17 +63,17 @@ pub use testing::FaultPoint;
 
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use limits::{
-    LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
-    MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
-    MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES,
-    MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS,
-    MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT,
-    StoreLimits,
+    CONNECTION_OVERHEAD_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS,
+    MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE,
+    MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
+    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES,
+    MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    SQLITE_LENGTH_LIMIT, StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
 #[cfg(feature = "test-support")]
-pub use testing::HeldConnection;
+pub use testing::{HeldConnection, ScratchHold};
 
 use crate::Namespace;
 use namespaces::NamespaceLock;
@@ -84,8 +84,11 @@ use std::path::Path;
 /// While it exists the namespace is held live (spec §10).
 ///
 /// The scratch budget, the page cache and the 2+1 connection pool belong to
-/// each `Store`, while the spec states them per process. One store per
-/// process is expected: every additional `Store` adds its own budgets.
+/// each `Store`, while the spec states them per process. One admitted store
+/// per process is expected (the LSP opens it through
+/// `workspace::admitted::AdmittedStore`, which charges
+/// `StoreLimits::admission_bytes` to `maxCacheBytes` first): every
+/// additional `Store` adds its own budgets.
 pub struct Store {
     location: StoreLocation,
     limits: StoreLimits,

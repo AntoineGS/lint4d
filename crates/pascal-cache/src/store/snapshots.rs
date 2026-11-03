@@ -668,11 +668,19 @@ impl Store {
 
     /// At most `MAX_SNAPSHOT_CANDIDATES` sealed snapshots of `context`,
     /// newest publication first. Hints only: a session validates each
-    /// candidate's members and evidence before using any (spec §9).
+    /// candidate's members and evidence before using any (spec §9). The
+    /// candidates are charged to the scratch while they are built.
     pub fn find_snapshots(
         &self,
         context: &ContextKey,
     ) -> Result<Lookup<Vec<SnapshotHeader>>, Bypass> {
+        // The candidates, charged before they are allocated (spec §10).
+        let Some(_scratch) = self
+            .scratch
+            .reserve((MAX_SNAPSHOT_CANDIDATES * std::mem::size_of::<SnapshotHeader>()) as u64)
+        else {
+            return Err(Bypass::ScratchExhausted);
+        };
         let mut reader = self.reader()?;
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, self.scope)?;

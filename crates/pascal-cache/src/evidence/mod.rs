@@ -6,8 +6,9 @@ mod decode;
 pub use decode::{ObservationError, decode_observation};
 
 use crate::manifest::manifest_encoder;
+use crate::path::path_bound;
 use crate::{CanonicalEncode, Digest, Encoder, KeyKind, MANIFEST_DIGEST_CONTEXT, SourceContent};
-use pascal_project::ProjectPathEntry;
+use pascal_project::{ProjectPathEntry, ProjectPathProvenance};
 use std::path::{Path, PathBuf};
 
 /// Domain of directory-listing digests.
@@ -68,6 +69,36 @@ impl Observation {
         encoder.encode(self);
         encoder.into_bytes()
     }
+
+    /// An upper bound of what `Store` encodes and charges for this
+    /// observation (its payload and its path key), without encoding it
+    /// (spec §10).
+    pub(crate) fn encoded_bytes_bound(&self) -> usize {
+        // Variant, field tags, option tags, provenance tag and content.
+        const FIXED: usize = 128;
+        fn entry_bound(entry: &ProjectPathEntry) -> usize {
+            path_bound(&entry.path).saturating_add(match &entry.provenance {
+                ProjectPathProvenance::Mapped { root } => path_bound(root),
+                ProjectPathProvenance::LegacyNative | ProjectPathProvenance::Configured => 0,
+            })
+        }
+        let entry = match self {
+            Self::Payload { entry, .. } | Self::Listing { entry, .. } => entry_bound(entry),
+            Self::Presence { entry, .. } => entry.as_ref().map_or(0, entry_bound),
+        };
+        // The path is encoded twice: in the payload and as the row's key.
+        FIXED
+            .saturating_add(path_bound(self.path()).saturating_mul(2))
+            .saturating_add(entry)
+    }
+}
+
+/// `Observation::encoded_bytes_bound` over a whole evidence set.
+pub(crate) fn observations_bound(observations: &[Observation]) -> usize {
+    observations
+        .iter()
+        .map(Observation::encoded_bytes_bound)
+        .fold(0, usize::saturating_add)
 }
 
 impl CanonicalEncode for Observation {
@@ -250,6 +281,54 @@ pub fn evidence_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_observation_bound_never_undercounts() {
+        let root = PathBuf::from("/w/include");
+        let mapped = ProjectPathEntry {
+            path: root.join("a.inc"),
+            provenance: ProjectPathProvenance::Mapped {
+                root: PathBuf::from("/mapped/root"),
+            },
+        };
+        let observations = [
+            Observation::Payload {
+                path: root.join("a.inc"),
+                entry: mapped,
+                content: SourceContent::from_bytes(b"const A = 1;"),
+            },
+            Observation::Presence {
+                path: root.join("b.inc"),
+                entry: None,
+                present: false,
+            },
+            Observation::Presence {
+                path: root.join("c.inc"),
+                entry: Some(ProjectPathEntry::legacy(root.join("c.inc"))),
+                present: true,
+            },
+            Observation::Listing {
+                path: root.clone(),
+                entry: ProjectPathEntry::configured(root.clone()),
+                listing: listing_digest(&[root.join("a.inc")], &[]),
+            },
+        ];
+        for observation in &observations {
+            // What `Store` charges per observation: its payload and path key.
+            let encoded = observation.encoded().len() + path_key(observation.path()).len();
+            assert!(
+                observation.encoded_bytes_bound() >= encoded,
+                "{observation:?}"
+            );
+        }
+        assert_eq!(
+            observations_bound(&observations),
+            observations
+                .iter()
+                .map(Observation::encoded_bytes_bound)
+                .sum::<usize>()
+        );
+    }
 
     #[test]
     fn the_streamed_id_is_the_digest_of_the_whole_manifest() {

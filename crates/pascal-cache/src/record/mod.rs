@@ -10,6 +10,7 @@ pub use decode::{
 };
 
 use crate::manifest::manifest_encoder;
+use crate::path::path_bound;
 use crate::{CanonicalEncode, Digest, Encoder, KeyKind, MANIFEST_DIGEST_CONTEXT, SourceIdentity};
 use pascal_project::SourceOrigin;
 
@@ -357,6 +358,38 @@ impl MemberRecord {
         }
         Ok(hasher.finish())
     }
+
+    /// An upper bound of what `Store::publish_member_record` encodes and
+    /// charges (the header, the source key, every binding payload and every
+    /// precise target key), from input sizes alone, so the scratch is reserved before any
+    /// encoding (spec §10).
+    pub(crate) fn encoded_bytes_bound(&self) -> usize {
+        // Tags, digests, options, coverage and the ambiguous count: under
+        // 128 bytes for a header and for a binding.
+        const FIXED: usize = 128;
+        let header = FIXED
+            .saturating_add(self.header.source.encoded_bytes_bound())
+            .saturating_add(path_bound(&self.header.source.canonical))
+            .saturating_add(
+                self.header
+                    .fallback_unit_name
+                    .as_ref()
+                    .map_or(0, |name| 8 + name.len()),
+            );
+        self.bindings.iter().fold(header, |total, binding| {
+            let identities = match &binding.outcome {
+                BindingOutcome::Precise { target } => target
+                    .encoded_bytes_bound()
+                    .saturating_add(path_bound(&target.canonical)),
+                BindingOutcome::Ambiguous { candidates, .. } => candidates
+                    .iter()
+                    .map(SourceIdentity::encoded_bytes_bound)
+                    .fold(0, usize::saturating_add),
+                BindingOutcome::Unavailable | BindingOutcome::Incomplete(_) => 0,
+            };
+            total.saturating_add(FIXED).saturating_add(identities)
+        })
+    }
 }
 
 /// The record ID, streamed so the bindings never exist in one buffer.
@@ -382,5 +415,120 @@ impl RecordHasher {
 
     pub(crate) fn finish(&self) -> Digest {
         Digest::from_bytes(*self.0.finalize().as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use crate::evidence::path_key;
+
+    fn identity(path: &str, spelling: Option<&str>, uri: Option<&str>) -> SourceIdentity {
+        SourceIdentity {
+            canonical: path.into(),
+            logical: format!("{path}.logical").into(),
+            spelling: spelling.map(str::to_owned),
+            uri: uri.map(str::to_owned),
+        }
+    }
+
+    /// What `Store::publish_member_record` charges: the encoded header, the
+    /// source key, each binding payload and each precise target's path key.
+    fn encoded_bytes(record: &MemberRecord) -> usize {
+        record.header.encoded().len()
+            + path_key(&record.header.source.canonical).len()
+            + record
+                .bindings
+                .iter()
+                .map(|binding| {
+                    binding.encoded().len()
+                        + binding
+                            .outcome
+                            .target()
+                            .map_or(0, |target| path_key(&target.canonical).len())
+                })
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn the_record_bound_never_undercounts() {
+        let evidence = Some(Digest::from_bytes([3; 32]));
+        let header = |source, artifact: Option<Digest>, fallback: Option<&str>| MemberHeader {
+            source,
+            artifact,
+            member_evidence: artifact.map(|_| Digest::from_bytes([4; 32])),
+            origin: SourceOrigin::Library,
+            fallback_unit_name: fallback.map(str::to_owned),
+            coverage: MemberCoverage {
+                extraction: CoverageStatus::Incomplete(IncompleteReason::Unsupported),
+                resolution: CoverageStatus::Complete,
+            },
+        };
+        let candidates = (0..MAX_AMBIGUOUS_CANDIDATES)
+            .map(|index| {
+                identity(
+                    &format!("/w/C{index}.pas"),
+                    Some("C"),
+                    Some("file:///w/C.pas"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bindings = vec![
+            Binding {
+                kind: BindingKind::Import,
+                occurrence: 0,
+                outcome: BindingOutcome::Precise {
+                    target: identity("/w/A.pas", Some("A"), None),
+                },
+                evidence,
+            },
+            Binding {
+                kind: BindingKind::Import,
+                occurrence: 1,
+                outcome: BindingOutcome::Ambiguous {
+                    candidates,
+                    overflow: true,
+                },
+                evidence,
+            },
+            Binding {
+                kind: BindingKind::Include,
+                occurrence: 2,
+                outcome: BindingOutcome::Unavailable,
+                evidence,
+            },
+            Binding {
+                kind: BindingKind::Include,
+                occurrence: 3,
+                outcome: BindingOutcome::Incomplete(IncompleteReason::OverSizeLimit),
+                evidence: None,
+            },
+        ];
+        for record in [
+            MemberRecord {
+                header: header(identity("/w/M.pas", None, None), None, None),
+                bindings: Vec::new(),
+            },
+            MemberRecord {
+                header: header(
+                    identity("/w/M.pas", Some("M"), Some("file:///w/M.pas")),
+                    Some(Digest::from_bytes([5; 32])),
+                    Some("M"),
+                ),
+                bindings,
+            },
+            MemberRecord {
+                header: header(
+                    identity(&format!("/w/{}.pas", "M".repeat(2048)), None, None),
+                    None,
+                    None,
+                ),
+                bindings: Vec::new(),
+            },
+        ] {
+            let bound = record.encoded_bytes_bound();
+            let encoded = encoded_bytes(&record);
+            assert!(bound >= encoded, "{bound} < {encoded}");
+        }
     }
 }

@@ -12,7 +12,8 @@ use crate::workspace::rename::OverlayInput;
 use crate::workspace::resolver::{deletion_applies, path_equivalent};
 use lsp_types::Url;
 use pascal_cache::{
-    Bypass, EvidenceHeader, Lookup, Miss, Observation, SourceContent, Store, listing_digest,
+    Bypass, ContextKey as CacheContextKey, EvidenceHeader, Lookup, Miss, Observation,
+    SourceContent, Store, listing_digest,
 };
 use pascal_core::resolver::{
     DirectoryRequest, FilesystemSourceStore, SourceStore, SourceStoreError,
@@ -26,6 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the current session sees, which evidence is checked against.
 pub(crate) struct CurrentInputs<'a> {
+    /// The requester's own cache context, derived by the caller from its
+    /// context, never taken from the evidence: evidence proves its inputs
+    /// only under the context that recorded it.
+    pub(crate) context: &'a CacheContextKey,
     pub(crate) read_policy: &'a ReadPolicy,
     pub(crate) overlays: &'a HashMap<Url, OverlayInput>,
     /// The editor's deletions (`resolver::deletion_overrides_by_path`).
@@ -54,12 +59,18 @@ pub(crate) enum Stale {
     Unauthorized(PathBuf),
     /// An editor buffer changes what this session sees there (spec §4.4).
     Overlay(PathBuf),
+    /// The evidence was recorded under another cache context, whose search
+    /// paths, roots and read policy it proves inputs under.
+    Context,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unproven {
     Cancelled,
     Budget,
+    /// The RAM or decode budget refused the facts (spec §10 amendment
+    /// 2026-11-02). Retryable once memory is released.
+    Memory,
 }
 
 pub(crate) struct Validator<'a> {
@@ -322,12 +333,16 @@ pub(crate) enum EvidenceCheck {
 /// discovery; spec §6.1 amendment 2026-10-27) against current inputs. It
 /// holds only once every observation held and the reader verified the set:
 /// a committed record is history, and only this check makes it current
-/// for this session (spec §7, §9).
+/// for this session (spec §7, §9). Evidence recorded under another context
+/// is stale before any observation is read.
 pub(crate) fn validate_evidence(
     store: &Store,
     header: &EvidenceHeader,
     validator: &mut Validator<'_>,
 ) -> Result<EvidenceCheck, Bypass> {
+    if header.subject().context != validator.inputs.context.digest() {
+        return Ok(EvidenceCheck::Stale(Stale::Context));
+    }
     let mut reader = store.read_evidence(header);
     loop {
         match reader.next_batch()? {
@@ -368,6 +383,8 @@ mod tests {
         cache: ProjectCache,
         overlays: HashMap<Url, OverlayInput>,
         deleted: HashMap<PathBuf, Option<DiskStamp>>,
+        /// The requester's context: the one `stored_evidence` publishes under.
+        context: pascal_cache::ContextKey,
     }
 
     fn fixture() -> Fixture {
@@ -390,6 +407,7 @@ mod tests {
             cache: ProjectCache::default(),
             overlays: HashMap::new(),
             deleted: HashMap::new(),
+            context: pascal_cache::ContextKey::new(&pascal_project::ProjectContext::default()),
         }
     }
 
@@ -444,6 +462,7 @@ mod tests {
             let budget = ReconciliationBudget::new(Arc::clone(&cancel));
             let mut validator = Validator::new(
                 CurrentInputs {
+                    context: &self.context,
                     read_policy: policy,
                     overlays: &self.overlays,
                     deleted: &self.deleted,
@@ -746,6 +765,7 @@ mod tests {
         let budget = ReconciliationBudget::new(Arc::clone(&cancel));
         let mut validator = Validator::new(
             CurrentInputs {
+                context: &fixture.context,
                 read_policy: &fixture.policy,
                 overlays: &fixture.overlays,
                 deleted: &fixture.deleted,
@@ -766,6 +786,7 @@ mod tests {
             .charge_path_visits(crate::workspace::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS + 1);
         let mut validator = Validator::new(
             CurrentInputs {
+                context: &fixture.context,
                 read_policy: &fixture.policy,
                 overlays: &fixture.overlays,
                 deleted: &fixture.deleted,
@@ -827,6 +848,7 @@ mod tests {
         let budget = ReconciliationBudget::new(Arc::clone(&cancel));
         let mut validator = Validator::new(
             CurrentInputs {
+                context: &fixture.context,
                 read_policy: &fixture.policy,
                 overlays: &fixture.overlays,
                 deleted: &fixture.deleted,
@@ -879,6 +901,36 @@ mod tests {
         assert_eq!(
             validate_with(&fixture, &collected, &header, false),
             EvidenceCheck::Store(Miss::Vanished)
+        );
+    }
+
+    /// Evidence recorded under one context proves nothing under another:
+    /// its search paths, roots and read policy are that context's.
+    #[cfg(unix)]
+    #[test]
+    fn evidence_holds_only_under_the_context_that_recorded_it() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        use pascal_project::ProjectContextParts;
+        let mut fixture = fixture();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let header = stored_evidence(&store, &[fixture.payload()]);
+        assert_eq!(
+            validate_with(&fixture, &store, &header, false),
+            EvidenceCheck::Holds,
+            "the recording context"
+        );
+        let other = pascal_project::ProjectContext::from_parts(ProjectContextParts {
+            discovery_complete: true,
+            search_path_entries: vec![ProjectPathEntry::configured(fixture.root.join("include"))],
+            read_policy: fixture.policy.clone(),
+            ..Default::default()
+        });
+        fixture.context = pascal_cache::ContextKey::new(&other);
+        assert_ne!(fixture.context.digest(), header.subject().context);
+        assert_eq!(
+            validate_with(&fixture, &store, &header, false),
+            EvidenceCheck::Stale(Stale::Context)
         );
     }
 
@@ -1001,6 +1053,7 @@ mod tests {
             let budget = ReconciliationBudget::new(Arc::clone(&cancel));
             let mut validator = Validator::new(
                 CurrentInputs {
+                    context: &fixture.context,
                     read_policy: &fixture.policy,
                     overlays: &fixture.overlays,
                     deleted: &fixture.deleted,

@@ -7,15 +7,17 @@ use super::evidence::EvidenceGap;
 use super::validate::{
     CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
 };
+use crate::project_cache::{Reservation, ReservationKind};
 use lsp_types::Url;
 use pascal_cache::{
-    ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, EvidenceWrite, ExpandedArtifactKey,
-    KeyError, LocalArtifactKey, Lookup, Malformed, Miss, Published, PublishedEvidence,
-    SessionDependence, SourceContent, Store, observations_digest,
+    ArtifactKeyRef, Bypass, ContextKey as CacheContextKey, Digest, EvidencePurpose,
+    EvidenceSubject, EvidenceWrite, ExpandedArtifactKey, KeyError, LocalArtifactKey, Lookup,
+    Malformed, Miss, Observation, Published, PublishedEvidence, SessionDependence, SourceContent,
+    Store, evidence_id, observations_digest,
 };
 use pascal_core::facts::{ArtifactFacts, FactBudget, FactError, NotPersistable, include_slots};
 use pascal_core::resolver::ResolverLimits;
-use pascal_project::{ProjectContext, ProjectPathProvenance, ProjectWorkBudget};
+use pascal_project::{ProjectContext, ProjectPathProvenance, ProjectWorkBudget, SourceOrigin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,6 +25,72 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) enum Persisted {
     Local(Published),
     Expanded(PublishedEvidence),
+}
+
+/// What `persist_source` publishes, prepared without the store: the facts,
+/// their key and, for an expanded artifact, the evidence that proves it.
+/// `workspace::eligible` derives a member record's header from it.
+pub(crate) struct PreparedArtifact {
+    pub(crate) facts: ArtifactFacts,
+    pub(crate) origin: SourceOrigin,
+    local: LocalArtifactKey,
+    expanded: Option<ExpandedArtifact>,
+}
+
+struct ExpandedArtifact {
+    key: ExpandedArtifactKey,
+    context: CacheContextKey,
+    observations: Vec<Observation>,
+}
+
+impl PreparedArtifact {
+    pub(crate) fn key(&self) -> ArtifactKeyRef<'_> {
+        match &self.expanded {
+            None => ArtifactKeyRef::local(&self.local),
+            Some(expanded) => ArtifactKeyRef::expanded(&expanded.key, &self.local)
+                .expect("an expanded key built from this root names it"),
+        }
+    }
+
+    pub(crate) fn artifact_id(&self) -> Digest {
+        self.key().digest()
+    }
+
+    /// The ID `Store::publish_facts_with_evidence` gives this artifact's
+    /// evidence; `None` for a local artifact, which is its own proof.
+    pub(crate) fn member_evidence_id(&self) -> Option<Digest> {
+        let expanded = self.expanded.as_ref()?;
+        Some(evidence_id(
+            &EvidenceSubject {
+                purpose: EvidencePurpose::Artifact,
+                context: expanded.context.digest(),
+                subject: self.local.digest(),
+            },
+            Some(self.artifact_id()),
+            &expanded.observations,
+        ))
+    }
+
+    /// Publish under the local key, or the expanded key with its evidence
+    /// in one transaction (spec §6.2).
+    pub(crate) fn publish(&self, store: &Store) -> Result<Persisted, PersistError> {
+        let published = match &self.expanded {
+            None => store
+                .publish_facts(self.key(), &self.facts)
+                .map(Persisted::Local),
+            Some(expanded) => store
+                .publish_facts_with_evidence(
+                    self.key(),
+                    &self.facts,
+                    &EvidenceWrite {
+                        context: &expanded.context,
+                        observations: &expanded.observations,
+                    },
+                )
+                .map(Persisted::Expanded),
+        };
+        published.map_err(PersistError::Store)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,16 +110,66 @@ pub(crate) enum PersistError {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reuse {
     Hit {
-        facts: ArtifactFacts,
+        facts: AdmittedFacts,
         via: ReuseVia,
-        /// Payloads and listings validation read rather than witnessed,
-        /// including those read for candidates it rejected first.
+        /// Payloads and listings this call read rather than witnessed,
+        /// summed over every evidence candidate it validated, including
+        /// candidates rejected before the hit. A cost measure, not a
+        /// property of the facts returned.
         reads: usize,
     },
     Miss(ReuseMiss),
+}
+
+/// Decoded persisted facts and their charge to `maxCacheBytes` (spec §10
+/// amendment 2026-11-02). The charge lives exactly as long as this value,
+/// however long a worker snapshot keeps it; eviction never releases it.
+pub(crate) struct AdmittedFacts {
+    pub(crate) facts: Arc<ArtifactFacts>,
+    pub(crate) charge: Reservation,
+}
+
+impl std::fmt::Debug for AdmittedFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedFacts")
+            .field("facts", &self.facts)
+            .field("charged", &self.charge.bytes())
+            .finish()
+    }
+}
+
+/// The charge is accounting, not content.
+impl PartialEq for AdmittedFacts {
+    fn eq(&self, other: &Self) -> bool {
+        self.facts == other.facts
+    }
+}
+
+impl Eq for AdmittedFacts {}
+
+/// Keep `charge` at what decoding `facts` used.
+fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) -> AdmittedFacts {
+    charge.shrink_to(budget.used());
+    AdmittedFacts {
+        facts: Arc::new(facts),
+        charge,
+    }
+}
+
+/// A decoder refusal for size is a memory miss; any other bypass stays an
+/// error.
+fn decoded(
+    result: Result<Lookup<ArtifactFacts>, Bypass>,
+) -> Result<Result<Lookup<ArtifactFacts>, ReuseMiss>, PersistError> {
+    match result {
+        Ok(lookup) => Ok(Ok(lookup)),
+        Err(Bypass::FactBudget) => Ok(Err(ReuseMiss::Unproven(Unproven::Memory))),
+        Err(bypass) => Err(PersistError::Store(bypass)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +221,16 @@ impl Workspace {
         budget: &mut FactBudget,
         cancel: &AtomicBool,
     ) -> Result<Persisted, PersistError> {
+        self.prepare_artifact(uri, budget, cancel)?.publish(store)
+    }
+
+    /// Everything `persist_source` checks and builds before it publishes.
+    pub(crate) fn prepare_artifact(
+        &self,
+        uri: &Url,
+        budget: &mut FactBudget,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedArtifact, PersistError> {
         // The document's context labels the facts and the evidence, which
         // describe the context that produced the session.
         if self
@@ -148,10 +276,12 @@ impl Workspace {
             return Err(PersistError::Cancelled);
         }
         if slots.is_empty() && !source.extracted.provider_dependent {
-            return store
-                .publish_facts(ArtifactKeyRef::local(&local), &source.extracted.facts)
-                .map(Persisted::Local)
-                .map_err(PersistError::Store);
+            return Ok(PreparedArtifact {
+                facts: source.extracted.facts,
+                origin: source.origin,
+                local,
+                expanded: None,
+            });
         }
         // The evidence must be the parse's own session's, as extraction
         // checks for the source map.
@@ -186,48 +316,67 @@ impl Workspace {
             ExpandedArtifactKey::from_slots(&local, conditional, &slots)
         }
         .map_err(PersistError::Key)?;
-        let key = ArtifactKeyRef::expanded(&expanded, &local)
-            .expect("an expanded key built from this root names it");
         if cancel.load(Ordering::Relaxed) {
             return Err(PersistError::Cancelled);
         }
-        store
-            .publish_facts_with_evidence(
-                key,
-                &source.extracted.facts,
-                &EvidenceWrite {
-                    context: &context,
-                    observations: &observations,
-                },
-            )
-            .map(Persisted::Expanded)
-            .map_err(PersistError::Store)
+        Ok(PreparedArtifact {
+            facts: source.extracted.facts,
+            origin: source.origin,
+            local,
+            expanded: Some(ExpandedArtifact {
+                key: expanded,
+                context,
+                observations,
+            }),
+        })
+    }
+
+    /// Whether `uri` is open, overlaid or deleted in this session's editor:
+    /// its view is session-private (spec §4.4).
+    pub(super) fn root_is_session_private(&self, uri: &Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
+        self.is_open(uri)
+            || self
+                .overlay_inputs()
+                .contains_key(&super::canonical_file_uri(uri))
+            || super::resolver::deletion_applies(&deleted, &super::absolute_path(path))
     }
 
     /// `uri`'s persisted facts, only if current inputs prove them (spec §7):
     /// the current context and root bytes select the keys, and evidence
     /// must validate under the current read policy and editor state.
     /// Nothing is indexed or parsed.
+    ///
+    /// `decode_limit` bytes are reserved from `maxCacheBytes` before the
+    /// first decode and held until this returns; a hit keeps only what
+    /// decoding used, for as long as its facts live (spec §10 amendment
+    /// 2026-11-02). A refused reservation, or facts over the limit, is
+    /// `Unproven::Memory`; cancellation, including during context
+    /// discovery, is `Unproven::Cancelled` (l4d-ne50). Both are retryable.
     pub(crate) fn reuse_persisted_facts(
         &mut self,
         uri: &Url,
         store: &Store,
         work: &dyn ProjectWorkBudget,
-        budget: &mut FactBudget,
+        decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
         let overlays = self.overlay_inputs();
         let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
-        if self.is_open(uri)
-            || overlays.contains_key(&super::canonical_file_uri(uri))
-            || super::resolver::deletion_applies(&deleted, &super::absolute_path(path.clone()))
-        {
+        if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
-        let key = self
-            .context_for_uri_with_cancel(uri, Some(cancel))
-            .map_err(PersistError::Context)?;
+        let key = match self.context_for_uri_with_cancel(uri, Some(cancel)) {
+            Ok(key) => key,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Cancelled)));
+            }
+            Err(message) => return Err(PersistError::Context(message)),
+        };
         let context = Arc::clone(
             &self
                 .contexts
@@ -241,18 +390,27 @@ impl Workspace {
             &super::conditional_context_for_uri(&context, uri),
             context.source_origin(&path),
         );
-        if let Lookup::Hit(facts) = store
-            .load_facts(ArtifactKeyRef::local(&local), budget)
-            .map_err(PersistError::Store)?
-        {
-            return Ok(Reuse::Hit {
-                facts,
-                via: ReuseVia::Local,
-                reads: 0,
-            });
+        let Some(charge) = self
+            .project_cache
+            .reserve(ReservationKind::Facts, decode_limit)
+        else {
+            return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)));
+        };
+        let mut budget = FactBudget::new(decode_limit);
+        match decoded(store.load_facts(ArtifactKeyRef::local(&local), &mut budget))? {
+            Ok(Lookup::Hit(facts)) => {
+                return Ok(Reuse::Hit {
+                    facts: admitted(facts, &budget, charge),
+                    via: ReuseVia::Local,
+                    reads: 0,
+                });
+            }
+            Ok(Lookup::Miss(_)) => {}
+            Err(miss) => return Ok(Reuse::Miss(miss)),
         }
+        let context_key = CacheContextKey::new(&context);
         let headers = match store
-            .find_evidence(&CacheContextKey::new(&context), &local)
+            .find_evidence(&context_key, &local)
             .map_err(PersistError::Store)?
         {
             Lookup::Hit(headers) => headers,
@@ -260,6 +418,7 @@ impl Workspace {
         };
         let mut validator = Validator::new(
             CurrentInputs {
+                context: &context_key,
                 read_policy: context.read_policy(),
                 overlays: &overlays,
                 deleted: &deleted,
@@ -291,16 +450,14 @@ impl Workspace {
                 }
             }
             return Ok(
-                match store
-                    .load_facts_by_id(artifact, budget)
-                    .map_err(PersistError::Store)?
-                {
-                    Lookup::Hit(facts) => Reuse::Hit {
-                        facts,
+                match decoded(store.load_facts_by_id(artifact, &mut budget))? {
+                    Ok(Lookup::Hit(facts)) => Reuse::Hit {
+                        facts: admitted(facts, &budget, charge),
                         via: ReuseVia::Evidence,
                         reads: validator.reads(),
                     },
-                    Lookup::Miss(miss) => Reuse::Miss(ReuseMiss::Store(miss)),
+                    Ok(Lookup::Miss(miss)) => Reuse::Miss(ReuseMiss::Store(miss)),
+                    Err(miss) => Reuse::Miss(miss),
                 },
             );
         }
@@ -379,6 +536,8 @@ pub(in crate::workspace) mod tests {
         Workspace::from_analysis_input(&main.analysis_input())
     }
 
+    pub(in crate::workspace) const DECODE_LIMIT: usize = 1 << 26;
+
     pub(in crate::workspace) fn reuse(
         workspace: &mut Workspace,
         uri: &Url,
@@ -386,7 +545,7 @@ pub(in crate::workspace) mod tests {
     ) -> Result<Reuse, PersistError> {
         let cancel = Arc::new(AtomicBool::new(false));
         let work = ReconciliationBudget::new(Arc::clone(&cancel));
-        workspace.reuse_persisted_facts(uri, store, &work, &mut FactBudget::new(1 << 26), &cancel)
+        workspace.reuse_persisted_facts(uri, store, &work, DECODE_LIMIT, &cancel)
     }
 
     pub(in crate::workspace) fn persist(indexed: &Indexed, name: &str, store: &Store) -> Persisted {
@@ -440,7 +599,7 @@ pub(in crate::workspace) mod tests {
             match reuse(&mut restarted, &indexed.uri(name), &store).unwrap() {
                 Reuse::Hit { facts, via, .. } => {
                     assert_eq!(via, expected_via, "{name}");
-                    assert_eq!(facts, expected, "{name}");
+                    assert_eq!(*facts.facts, expected, "{name}");
                 }
                 miss => panic!("{name}: {miss:?}"),
             }
@@ -603,6 +762,142 @@ pub(in crate::workspace) mod tests {
             reuse(&mut restarted, &saved.uri("Cond.pas"), &store).unwrap(),
             Reuse::Miss(ReuseMiss::Open)
         ));
+    }
+
+    type Fixture = (&'static [(&'static str, &'static [u8])], &'static str);
+
+    /// A source that persists under its local key, and one that only
+    /// persists under evidence (a provider-dependent source).
+    const FIXTURES: [Fixture; 2] = [
+        (&[("Cond.pas", CONDITIONAL)], "Cond.pas"),
+        (
+            &[("Main.pas", PROVIDER_MAIN), ("Shapes.pas", SHAPES)],
+            "Main.pas",
+        ),
+    ];
+
+    /// What decoding `name`'s stored artifact uses, loaded straight from the
+    /// store under its local key, else through its evidence.
+    fn decode_use(indexed: &Indexed, name: &str, store: &Store) -> usize {
+        let source = indexed.facts(name);
+        let bytes = std::fs::read(indexed.root.join(name)).unwrap();
+        let local = LocalArtifactKey::new(
+            &SourceContent::from_bytes(&bytes),
+            &source.extracted.conditional_context,
+            source.origin,
+        );
+        let mut budget = FactBudget::new(DECODE_LIMIT);
+        if let Lookup::Hit(_) = store
+            .load_facts(ArtifactKeyRef::local(&local), &mut budget)
+            .unwrap()
+        {
+            return budget.used();
+        }
+        let context = &indexed.workspace.contexts
+            [&indexed.workspace.document_contexts[&indexed.uri(name)]]
+            .context;
+        let Lookup::Hit(headers) = store
+            .find_evidence(&CacheContextKey::new(context), &local)
+            .unwrap()
+        else {
+            panic!("{name}: neither a local artifact nor evidence")
+        };
+        let artifact = headers[0].artifact_id().unwrap();
+        let Lookup::Hit(_) = store.load_facts_by_id(artifact, &mut budget).unwrap() else {
+            panic!("{name}: the evidence names a stored artifact")
+        };
+        budget.used()
+    }
+
+    #[test]
+    fn a_hit_is_charged_to_the_cache_until_its_facts_drop() {
+        for (files, name) in FIXTURES {
+            let indexed = index(files, &[name]);
+            let directory = private_dir();
+            let store = open_store(directory.path());
+            persist(&indexed, name, &store);
+            let mut restarted = restart(&indexed);
+            let cache = restarted.project_cache.clone();
+            let Reuse::Hit { facts, .. } =
+                reuse(&mut restarted, &indexed.uri(name), &store).unwrap()
+            else {
+                panic!("{name}: the persisted facts are reused")
+            };
+            let charged = facts.charge.bytes();
+            assert!(charged > 0, "{name}");
+            assert_eq!(
+                charged,
+                decode_use(&indexed, name, &store),
+                "{name}: shrunk to what decoding used"
+            );
+            assert_eq!(cache.stats().reserved_facts_bytes, charged, "{name}");
+            cache.set_max_bytes(1);
+            assert_eq!(
+                cache.stats().reserved_facts_bytes,
+                charged,
+                "{name}: eviction never releases facts a caller keeps"
+            );
+            drop(facts);
+            assert_eq!(cache.stats().reserved_bytes(), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_refused_reservation_is_a_retryable_memory_miss() {
+        let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        persist(&indexed, "Cond.pas", &store);
+        let mut restarted = restart(&indexed);
+        restarted.project_cache.set_max_bytes(DECODE_LIMIT - 1);
+        assert_eq!(
+            reuse(&mut restarted, &indexed.uri("Cond.pas"), &store).unwrap(),
+            Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory))
+        );
+        restarted
+            .project_cache
+            .set_max_bytes(crate::project_cache::DEFAULT_MAX_CACHE_BYTES);
+        assert!(matches!(
+            reuse(&mut restarted, &indexed.uri("Cond.pas"), &store).unwrap(),
+            Reuse::Hit { .. }
+        ));
+    }
+
+    #[test]
+    fn facts_over_the_decode_limit_are_a_memory_miss() {
+        for (files, name) in FIXTURES {
+            let indexed = index(files, &[name]);
+            let directory = private_dir();
+            let store = open_store(directory.path());
+            persist(&indexed, name, &store);
+            let mut restarted = restart(&indexed);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let work = ReconciliationBudget::new(Arc::clone(&cancel));
+            assert_eq!(
+                restarted.reuse_persisted_facts(&indexed.uri(name), &store, &work, 16, &cancel),
+                Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory))),
+                "{name}"
+            );
+            assert_eq!(
+                restarted.project_cache.stats().reserved_bytes(),
+                0,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_discovery_failure_is_still_an_error() {
+        let indexed = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        std::fs::write(indexed.root.join("Notes.txt"), b"notes").unwrap();
+        let mut restarted = restart(&indexed);
+        let result = reuse(&mut restarted, &indexed.uri("Notes.txt"), &store);
+        assert!(
+            matches!(&result, Err(PersistError::Context(message)) if message.contains("unsupported Pascal document path")),
+            "{result:?}"
+        );
     }
 }
 
@@ -956,7 +1251,29 @@ mod acceptance {
             &indexed.uri("Main.pas"),
             &store,
             &CancelOnFirstVisit(&cancel),
-            &mut FactBudget::new(1 << 26),
+            DECODE_LIMIT,
+            &cancel,
+        );
+        assert_eq!(
+            result,
+            Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Cancelled)))
+        );
+    }
+
+    /// l4d-ne50: cancellation during context discovery is a retryable miss,
+    /// never a hard failure a caller would report.
+    #[test]
+    fn cancellation_during_context_discovery_is_a_cancelled_miss() {
+        let (indexed, directory) = persisted(&providers());
+        let store = open_store(directory.path());
+        let mut restarted = restart(&indexed);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let work = crate::workspace::ReconciliationBudget::new(Arc::clone(&cancel));
+        let result = restarted.reuse_persisted_facts(
+            &indexed.uri("Main.pas"),
+            &store,
+            &work,
+            DECODE_LIMIT,
             &cancel,
         );
         assert_eq!(

@@ -23,8 +23,17 @@ impl CanonicalEncode for Path {
     }
 }
 
+/// An upper bound of a path's canonical encoding, without encoding it: the
+/// tag, the `u64` length, then the bytes on Unix, or two bytes per UTF-16
+/// unit on Windows (a path never has more units than WTF-8 bytes).
+pub(crate) fn path_bound(path: &Path) -> usize {
+    let bytes = path.as_os_str().len();
+    1 + 8 + if cfg!(windows) { 2 * bytes } else { bytes }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::path_bound;
     use crate::Encoder;
     use std::path::Path;
 
@@ -32,6 +41,16 @@ mod tests {
         let mut encoder = Encoder::new();
         encoder.encode(path);
         encoder.into_bytes()
+    }
+
+    #[test]
+    fn the_path_bound_is_the_encoded_length_on_unix_and_an_upper_bound_everywhere() {
+        for path in ["", "/", "/w/Main.pas", "/w/caf\u{e9}.pas"] {
+            let path = Path::new(path);
+            assert!(path_bound(path) >= encoded(path).len(), "{path:?}");
+            #[cfg(unix)]
+            assert_eq!(path_bound(path), encoded(path).len(), "{path:?}");
+        }
     }
 
     #[cfg(unix)]

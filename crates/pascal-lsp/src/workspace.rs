@@ -113,14 +113,19 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
+mod admitted;
+mod authorize;
 pub(crate) mod capture;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
+mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+#[cfg(all(test, unix))]
+mod isolation;
 mod persist;
 pub mod project_catalogue;
 pub mod projects;
@@ -8409,13 +8414,18 @@ impl Workspace {
                 disk,
             };
             let bytes = value.retained_bytes();
-            let parsed = value.parsed.clone();
-            self.project_cache
-                .store_unit(claim, value, bytes, cancel.unwrap_or(&lookup_cancel));
-            if self.cache_epoch.is_some()
-                && let Some(lease) = self.project_cache.lease_stored_parse(&parsed, bytes)
-            {
-                self.cache_leases.insert(uri.clone(), lease);
+            let cancel = cancel.unwrap_or(&lookup_cancel);
+            if self.cache_epoch.is_some() {
+                // A request keeps the parse in its index: lease it under the
+                // store's own lock (l4d-10).
+                if let Some(lease) = self
+                    .project_cache
+                    .store_unit_leased(claim, value, bytes, cancel)
+                {
+                    self.cache_leases.insert(uri.clone(), lease);
+                }
+            } else {
+                self.project_cache.store_unit(claim, value, bytes, cancel);
             }
         }
         Ok(true)
@@ -18765,6 +18775,42 @@ mod tests {
             cache.stats().outstanding_bytes
                 >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
             "the worker still holds the parses it stored"
+        );
+        drop(worker);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    /// l4d-10 review minor 2: between `store_unit` and `lease_stored_parse`
+    /// an eviction could leave a stored parse unleased and uncharged while
+    /// the request kept it. A 1-byte budget makes every store evict itself
+    /// at once, which is the same window closed deterministically.
+    #[test]
+    fn a_parse_evicted_as_it_is_stored_stays_charged_while_the_request_keeps_it() {
+        let fixture = inherited_fixture("Base");
+        let cache = fixture.workspace.project_cache().clone();
+        cache.set_max_bytes(1);
+        let mut worker = worker_view(&fixture.workspace);
+        worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("cold warm");
+        assert!(
+            cache.ready_layers(&fixture.derived).is_empty(),
+            "every store evicts itself under a 1-byte budget"
+        );
+        assert!(worker.index.parsed_document(&fixture.derived).is_some());
+        assert!(
+            worker.cache_leases.contains_key(&fixture.derived),
+            "the request leases the parse it stored"
+        );
+        // A lower bound, not equality: outstanding also holds every other
+        // parse the warm stored and leased (Main, Derived), and each charge
+        // adds the value's own size, its expansion and its probes
+        // (`UnitValue::retained_bytes`), which the test cannot recompute
+        // without rebuilding them.
+        assert!(
+            cache.stats().outstanding_bytes
+                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            "so its charge stays outstanding"
         );
         drop(worker);
         assert_eq!(cache.stats().outstanding_bytes, 0);

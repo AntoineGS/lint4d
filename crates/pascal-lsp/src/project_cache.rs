@@ -2454,16 +2454,14 @@ mod cache_tests {
     fn build_product_events_do_not_stale_the_cache() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
+        for name in ["Unit1.o", "build.lock", "settings.ini"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
         let cache = ProjectCache::new(1 << 20);
         store_directory_observer(&cache, &dir);
         let epoch = cache.invalidation_epoch();
 
-        for name in [
-            "Unit1.o",
-            "build.lock",
-            "settings.ini",
-            ".opencode/db/x.sqlite",
-        ] {
+        for name in ["Unit1.o", "build.lock", "settings.ini"] {
             assert!(cache.invalidate_file_contents(&dir.join(name)).is_empty());
             // A create or delete in the observed directory changes its
             // listing, but not for a file no analysis reads.
@@ -2481,6 +2479,93 @@ mod cache_tests {
             ),
             Lookup::Hit(_)
         ));
+    }
+
+    #[test]
+    fn sources_under_an_opencode_ancestor_of_the_root_still_stale_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".opencode/work/ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        cache.set_artifact_roots(vec![root.clone()]);
+        store_directory_observer(&cache, &root);
+
+        for name in ["New.pas", "App.dpr", "App.dproj", "inc/x.inc"] {
+            let epoch = cache.invalidation_epoch();
+            cache.invalidate_path(&root.join(name));
+            assert_ne!(cache.invalidation_epoch(), epoch, "{name}");
+        }
+        // Even a non-source file bumps: the ancestor is not tool state.
+        let epoch = cache.invalidation_epoch();
+        cache.invalidate_file_contents(&root.join("notes.txt"));
+        assert_ne!(cache.invalidation_epoch(), epoch);
+    }
+
+    #[test]
+    fn opencode_state_below_a_root_does_not_stale_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        std::fs::create_dir_all(root.join(".opencode/db")).unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        cache.set_artifact_roots(vec![root.clone()]);
+        let epoch = cache.invalidation_epoch();
+
+        cache.invalidate_file_contents(&root.join(".opencode/db/x.sqlite"));
+        cache.invalidate_path(&root.join(".opencode/db/y.bin"));
+        assert_eq!(cache.invalidation_epoch(), epoch);
+
+        // A source is never tool state, wherever it sits.
+        cache.invalidate_path(&root.join(".opencode/db/Z.pas"));
+        assert_ne!(cache.invalidation_epoch(), epoch);
+    }
+
+    #[test]
+    fn a_crowded_invalidation_counts_as_touching_every_unit() {
+        let cache = ProjectCache::new(1 << 30);
+        let shared = PathBuf::from("/w/Shared.inc");
+        let ctx = context("A.dproj");
+        for index in 0..(MAX_AFFECTED_PER_RECORD + 5) {
+            let main = uri(&format!("U{index}.pas"));
+            let Lookup::Compute(claim) =
+                cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+            else {
+                panic!()
+            };
+            cache.store_imports(
+                claim,
+                import_value(vec![Probe::Stamp {
+                    path: shared.clone(),
+                    expected: None,
+                }]),
+                1,
+                &no_cancel(),
+            );
+        }
+        let before = cache.invalidation_epoch();
+        let affected = cache.invalidate_file_contents(&shared);
+        assert!(affected.len() > MAX_AFFECTED_PER_RECORD);
+
+        let unrelated = HashSet::from([uri("Unrelated.pas")]);
+        assert!(cache.units_invalidated_since(before, &unrelated));
+        assert!(
+            lock(&cache.inner)
+                .invalidation_log
+                .iter()
+                .all(|record| record.affected.len() <= MAX_AFFECTED_PER_RECORD)
+        );
+    }
+
+    #[test]
+    fn a_dispatch_at_the_dropped_epoch_is_still_covered_by_the_log() {
+        let cache = ProjectCache::new(1 << 20);
+        let units = HashSet::from([uri("Sync.pas")]);
+        for index in 0..=MAX_INVALIDATION_LOG {
+            cache.invalidate_file_contents(Path::new(&format!("/w/Other{index}.pas")));
+        }
+        // Epoch 1's record was dropped. A dispatch at epoch 1 already saw it,
+        // while one at epoch 0 may have missed it.
+        assert!(!cache.units_invalidated_since(1, &units));
+        assert!(cache.units_invalidated_since(0, &units));
     }
 
     #[test]
@@ -2886,6 +2971,7 @@ const WAIT_SLICE: Duration = Duration::from_millis(20);
 const MAX_CLOSURE_CRAWL_REQUESTS: usize = 1024;
 const MAX_CLOSURE_MISS_ROOTS: usize = 1024;
 const MAX_INVALIDATION_LOG: usize = 1024;
+const MAX_AFFECTED_PER_RECORD: usize = 64;
 
 /// Extensions of build products and tool state that no analysis reads. A
 /// create or delete of such a file never changes what a directory listing
@@ -2897,18 +2983,30 @@ const ARTIFACT_EXTENSIONS: &[&str] = &[
 struct InvalidationRecord {
     epoch: u64,
     path: PathBuf,
+    /// Empty with `crowded` set when more entries were evicted than the log\n    /// keeps.
     affected: Vec<Url>,
+    crowded: bool,
 }
 
-fn is_artifact_path(path: &Path) -> bool {
+/// Whether `path` is a build product or tool state file. A source or project
+/// metadata file never is. `.opencode` counts only as a component below one
+/// of the workspace `roots`, never in the roots' own ancestry.
+fn is_artifact_path(path: &Path, roots: &[PathBuf]) -> bool {
+    if crate::catalogue::is_retained_file(path) {
+        return false;
+    }
     path.extension().is_some_and(|extension| {
         let extension = extension.to_string_lossy();
         ARTIFACT_EXTENSIONS
             .iter()
             .any(|artifact| extension.eq_ignore_ascii_case(artifact))
-    }) || path
-        .components()
-        .any(|component| component.as_os_str() == ".opencode")
+    }) || roots.iter().any(|root| {
+        path.strip_prefix(root).is_ok_and(|below| {
+            below
+                .components()
+                .any(|component| component.as_os_str() == ".opencode")
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3210,6 +3308,8 @@ struct State {
     invalidation_log: std::collections::VecDeque<InvalidationRecord>,
     /// Epochs below this have no complete record in `invalidation_log`.
     invalidation_log_floor: u64,
+    /// Workspace roots, for recognizing tool state below them.
+    artifact_roots: Vec<PathBuf>,
     /// The slot each thread waits for, to find waits that would close a
     /// cycle.
     waiting: HashMap<std::thread::ThreadId, Key>,
@@ -3246,6 +3346,7 @@ impl Default for State {
             closure_misses: HashMap::new(),
             invalidation_log: std::collections::VecDeque::new(),
             invalidation_log_floor: 0,
+            artifact_roots: Vec::new(),
             waiting: HashMap::new(),
             #[cfg(test)]
             examined: std::cell::Cell::new(0),
@@ -5010,6 +5111,10 @@ impl ProjectCache {
     /// file, or an entry of its URI. An epoch the log no longer covers counts
     /// as invalidated.
     pub(crate) fn units_invalidated_since(&self, epoch: u64, units: &HashSet<Url>) -> bool {
+        let unit_paths = units
+            .iter()
+            .filter_map(|unit| unit.to_file_path().ok())
+            .collect::<HashSet<_>>();
         let state = lock(&self.inner);
         if epoch == state.invalidation_epoch {
             return false;
@@ -5022,11 +5127,14 @@ impl ProjectCache {
             .iter()
             .filter(|record| record.epoch > epoch)
             .any(|record| {
-                record.affected.iter().any(|uri| units.contains(uri))
-                    || units
-                        .iter()
-                        .any(|unit| unit.to_file_path().is_ok_and(|path| path == record.path))
+                record.crowded
+                    || unit_paths.contains(&record.path)
+                    || record.affected.iter().any(|uri| units.contains(uri))
             })
+    }
+
+    pub(crate) fn set_artifact_roots(&self, roots: Vec<PathBuf>) {
+        lock(&self.inner).artifact_roots = roots;
     }
 
     pub(crate) fn take_closure_crawl_requests(&self) -> Vec<Url> {
@@ -5083,18 +5191,17 @@ impl ProjectCache {
 
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
-        let parent = path
-            .parent()
-            .filter(|_| include_parent && !is_artifact_path(path));
+        let artifact = is_artifact_path(path, &state.artifact_roots);
+        let parent = path.parent().filter(|_| include_parent && !artifact);
         // Only a build product or tool state file that no entry observes can
-        // be skipped: it is never read, so neither a stored entry nor a
-        // computation in flight can depend on it, and creating or removing it
-        // does not change what an observed listing means. Any other path
-        // stales the epoch, since a computation in flight may read it before
-        // it registers the dependency.
-        let relevant = !is_artifact_path(path)
-            || state.exact.contains_key(path)
-            || state.observed.contains_key(path);
+        // be skipped. No analysis reads such a file as a source (an include
+        // named like one is a probe, and so observed, once an entry has it),
+        // and creating or removing it does not change what an observed
+        // listing means. Any other path stales the epoch, since a
+        // computation in flight may read it before it registers the
+        // dependency.
+        let relevant =
+            !artifact || state.exact.contains_key(path) || state.observed.contains_key(path);
         if relevant {
             state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         }
@@ -5123,15 +5230,21 @@ impl ProjectCache {
         }
         if relevant {
             let epoch = state.invalidation_epoch;
+            let crowded = affected.len() > MAX_AFFECTED_PER_RECORD;
             state.invalidation_log.push_back(InvalidationRecord {
                 epoch,
                 path: path.to_path_buf(),
-                affected: affected.clone(),
+                affected: if crowded {
+                    Vec::new()
+                } else {
+                    affected.clone()
+                },
+                crowded,
             });
             if state.invalidation_log.len() > MAX_INVALIDATION_LOG
                 && let Some(dropped) = state.invalidation_log.pop_front()
             {
-                state.invalidation_log_floor = dropped.epoch.wrapping_add(1);
+                state.invalidation_log_floor = dropped.epoch;
             }
         }
         self.release(state);

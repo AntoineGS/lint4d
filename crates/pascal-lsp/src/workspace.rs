@@ -3583,6 +3583,7 @@ impl Workspace {
         workspace
             .project_cache
             .set_max_bytes(workspace.options.limits.max_cache_bytes);
+        workspace.sync_artifact_roots();
         if let Err(error) = workspace.overrides.effective_for(None, None) {
             workspace.warn(error);
         }
@@ -3649,6 +3650,7 @@ impl Workspace {
             self.persistent_cache.readmit();
         }
         self.roots = prepared.roots;
+        self.sync_artifact_roots();
         self.see_cache_exclusion();
 
         self.bump_source_generation();
@@ -13609,6 +13611,17 @@ impl Workspace {
 
     /// Resolve `cache_base` through the current roots and source roots
     /// (symlinks), once, and attach the result.
+    fn sync_artifact_roots(&self) {
+        self.project_cache.set_artifact_roots(
+            self.roots
+                .iter()
+                .flat_map(|root| {
+                    std::iter::once(root.path.clone()).chain(root.source_roots.iter().cloned())
+                })
+                .collect(),
+        );
+    }
+
     fn see_cache_exclusion(&mut self) {
         if let Some(base) = &self.cache_base {
             let bases = self.roots.iter().flat_map(|root| {

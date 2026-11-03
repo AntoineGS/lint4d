@@ -234,6 +234,7 @@ fn parse_dproj_package_metadata(
         ));
     }
 
+    let undefined_is_empty = builder.undefined_is_empty();
     let mut metadata = PackageMetadata {
         warnings: builder.warnings,
         incomplete: builder.incomplete,
@@ -269,6 +270,7 @@ fn parse_dproj_package_metadata(
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
             &builder.unknown_properties,
+            undefined_is_empty,
             &mut metadata.warnings,
             &reference.source_file,
             &reference.source_provenance,

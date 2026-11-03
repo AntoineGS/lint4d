@@ -681,10 +681,12 @@ pub(super) fn build_project_context(
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
             &builder.unknown_properties,
+            builder.undefined_is_empty(),
             &mut builder.warnings,
             &reference.source_file,
             &reference.source_provenance,
         );
+        builder.incomplete |= expanded.undefined_property_unknown;
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             continue;
         }
@@ -1148,7 +1150,6 @@ fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> b
     warnings.iter().any(|warning| {
         let warning = warning.to_ascii_lowercase();
         (!explicit && warning.contains("no resolvable"))
-            || warning.contains("unresolved property")
             || warning.contains("path does not exist and was omitted")
             || warning.contains("could not read optset")
             || warning.contains("could not read main source")
@@ -1180,7 +1181,6 @@ fn binding_metadata_warnings_incomplete(warnings: &[String], explicit: bool) -> 
 
 fn warning_incomplete(warning: &str, explicit: bool) -> bool {
     (!explicit && warning.contains("no resolvable"))
-        || warning.contains("unresolved property")
         || warning.contains("path does not exist and was omitted")
         || warning.contains("could not read optset")
         || warning.contains("could not read main source")
@@ -1622,6 +1622,7 @@ fn parse_project_bootstrap(
                         properties: &properties,
                         unknown_properties: &unknown_properties,
                         unknown_import_taint,
+                        undefined_is_empty: false,
                         overrides,
                         read_policy,
                     },
@@ -1651,6 +1652,9 @@ fn parse_project_bootstrap(
                 properties: &properties,
                 unknown_properties: &unknown_properties,
                 unknown_import_taint,
+                // Only Config and Platform are tracked here, so any other
+                // undefined property may have been set earlier.
+                undefined_is_empty: false,
                 overrides,
                 read_policy,
             },
@@ -1673,6 +1677,7 @@ fn parse_project_bootstrap(
                     properties: &properties,
                     unknown_properties: &unknown_properties,
                     unknown_import_taint,
+                    undefined_is_empty: false,
                     overrides,
                     read_policy,
                 },

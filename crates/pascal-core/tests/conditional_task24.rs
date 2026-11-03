@@ -297,6 +297,84 @@ fn binding_neutral_interop_and_linker_directives_are_harmless() {
 }
 
 #[test]
+fn binding_neutral_compiler_switches_are_harmless() {
+    for directive in [
+        "{$OPENSTRINGS ON}",
+        "{$TYPEINFO ON}",
+        "{$WEAKLINKRTTI ON}",
+        "{$CODEPAGE UTF8}",
+        "{$PACKSET 1}",
+        "{$PACKRECORDS C}",
+        "{$PACKENUM 1}",
+        "{$SetPEFlags IMAGE_FILE_RELOCS_STRIPPED or IMAGE_FILE_LARGE_ADDRESS_AWARE}",
+        "{$SETPEFLAGS $20}",
+        "{$SetPEOptFlags $40}",
+        "{$SETPEOSVERSION 6.0}",
+        "{$SETPESUBSYSVERSION 6.0}",
+        "{$SETPEUSERVERSION 1.0}",
+        "{$LEGACYIFEND ON}",
+        "{$DEBUGINFO ON}",
+        "{$LOCALSYMBOLS ON}",
+        "{$REFERENCEINFO ON}",
+        "{$DEFINITIONINFO ON}",
+        "{$YD}",
+        "{$IOCHECKS OFF}",
+        "{$SAFEDIVIDE OFF}",
+        "{$VARSTRINGCHECKS ON}",
+        "{$IMPORTEDDATA ON}",
+        "{$HIGHCHARUNICODE ON}",
+        "{$INLINE AUTO}",
+        "{$ZEROBASEDSTRINGS OFF}",
+        "{$EXTENSION cpl}",
+        "{$E cpl}",
+        "{$LIBPREFIX 'lib'}",
+        "{$LIBSUFFIX '250'}",
+        "{$LIBVERSION '1.0'}",
+        "{$MINSTACKSIZE $4000}",
+        "{$MAXSTACKSIZE $100000}",
+        "{$DESCRIPTION 'Package'}",
+        "{$DESIGNONLY}",
+        "{$RUNONLY}",
+        "{$IMPLICITBUILD OFF}",
+    ] {
+        let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());
+        assert!(analysis.complete, "directive {directive:?}");
+        assert_ne!(
+            analysis.directives[0].kind,
+            conditional::DirectiveKind::Other,
+            "directive {directive:?}"
+        );
+    }
+}
+
+/// `LEGACYIFEND ON` only forbids `$ENDIF` from closing `$IF`. The evaluator
+/// closes any conditional with either `$IFEND` or `$ENDIF`, so source that
+/// compiles under either setting has the same conditional structure.
+#[test]
+fn legacy_ifend_keeps_the_conditional_structure() {
+    let context = ConditionalContext::default();
+    for source in [
+        "{$DEFINE X}{$LEGACYIFEND ON}{$IF Defined(X)}{$DEFINE A}{$IFEND}{$IFDEF A}{$DEFINE B}{$ENDIF}",
+        "{$DEFINE X}{$LEGACYIFEND OFF}{$IF Defined(X)}{$DEFINE A}{$ENDIF}{$IFDEF A}{$DEFINE B}{$ENDIF}",
+    ] {
+        let analysis = conditional::analyze_with_context(source, &context);
+        assert!(analysis.complete, "{source}");
+        assert!(
+            analysis
+                .directives
+                .iter()
+                .all(|directive| directive.kind != conditional::DirectiveKind::Other),
+            "{source}"
+        );
+        assert_eq!(
+            directive_activity(source, "DEFINE B", &context),
+            Truth::True,
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn binding_sensitive_directives_remain_unsupported() {
     for directive in ["{$SCOPEDENUMS ON}", "{$POINTERMATH ON}"] {
         let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());

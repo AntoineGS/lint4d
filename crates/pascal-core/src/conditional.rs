@@ -5387,6 +5387,60 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "z1"
             | "z2"
             | "z4"
+            // Parameter passing and RTTI generation: `string` var parameters
+            // become open strings, `TYPEINFO` is the long form of `$M`.
+            | "openstrings"
+            | "typeinfo"
+            | "weaklinkrtti"
+            // String literal code page, like the `-codepage` compiler option.
+            // Safe only because `$IF` evaluation of `Length` and `Ord`
+            // refuses non-ASCII strings (and `Low`/`High` are not evaluated),
+            // so no evaluated fact depends on how literals are decoded.
+            | "codepage"
+            // FPC-only layout switches. DCC does not model or apply them: it
+            // reports an unknown directive (W1030) and ignores it.
+            | "packset"
+            | "packrecords"
+            | "packenum"
+            // PE header fields of the linked image.
+            | "setpeflags"
+            | "setpeoptflags"
+            | "setpeosversion"
+            | "setpesubsysversion"
+            | "setpeuserversion"
+            // Only forbids `$ENDIF` from closing `$IF`; the evaluator closes
+            // any conditional with either `$IFEND` or `$ENDIF`.
+            | "legacyifend"
+            // Debug and browsing information.
+            | "debuginfo"
+            | "localsymbols"
+            | "referenceinfo"
+            | "definitioninfo"
+            | "yd"
+            // Run-time checks and code generation.
+            | "iochecks"
+            | "safedivide"
+            | "varstringchecks"
+            | "importeddata"
+            | "inline"
+            // Values of character and string expressions, not their names.
+            // Safe for the same reason as `CODEPAGE`: the `$IF` evaluator
+            // refuses non-ASCII `Length`/`Ord` and does not evaluate `Low`
+            // or `High` of strings, so these switches cannot change a fact.
+            | "highcharunicode"
+            | "zerobasedstrings"
+            // Output file naming, stack sizes and package options.
+            | "e"
+            | "extension"
+            | "libprefix"
+            | "libsuffix"
+            | "libversion"
+            | "minstacksize"
+            | "maxstacksize"
+            | "description"
+            | "designonly"
+            | "runonly"
+            | "implicitbuild"
     )
 }
 

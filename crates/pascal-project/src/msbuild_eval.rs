@@ -19,6 +19,10 @@ pub(super) struct ProjectBuilder {
     pub(super) overrides: EffectiveOverrides,
     pub(super) unknown_properties: HashSet<String>,
     pub(super) unknown_import_taint: bool,
+    /// An import that is not evaluated (a `.targets` file) may define any
+    /// property, so a property still undefined after it is unknown rather
+    /// than empty. Values established before it stay known.
+    pub(super) opaque_import: bool,
     installation_data_mode: bool,
     pub(super) references: Vec<DccReference>,
     pub(super) path_issues: Vec<ProjectPathIssue>,
@@ -141,6 +145,7 @@ impl ProjectBuilder {
             overrides: overrides.clone(),
             unknown_properties: HashSet::new(),
             unknown_import_taint: false,
+            opaque_import: false,
             installation_data_mode: false,
             references: Vec::new(),
             path_issues: Vec::new(),
@@ -327,6 +332,9 @@ impl ProjectBuilder {
                             properties: &self.properties,
                             unknown_properties: &self.unknown_properties,
                             unknown_import_taint: self.unknown_import_taint,
+                            // Items are evaluated after every property in
+                            // MSBuild; this pass sees only earlier ones.
+                            undefined_is_empty: false,
                             overrides: &self.overrides,
                             read_policy: &self.read_policy,
                         },
@@ -368,6 +376,7 @@ impl ProjectBuilder {
                 properties: &self.properties,
                 unknown_properties: &self.unknown_properties,
                 unknown_import_taint: self.unknown_import_taint,
+                undefined_is_empty: self.undefined_is_empty(),
                 overrides: &self.overrides,
                 read_policy: &self.read_policy,
             },
@@ -394,6 +403,7 @@ impl ProjectBuilder {
                     properties: &self.properties,
                     unknown_properties: &self.unknown_properties,
                     unknown_import_taint: self.unknown_import_taint,
+                    undefined_is_empty: self.undefined_is_empty(),
                     overrides: &self.overrides,
                     read_policy: &self.read_policy,
                 },
@@ -425,10 +435,12 @@ impl ProjectBuilder {
                 &self.property_provenance_ranges,
                 &self.property_default_provenances,
                 &self.unknown_properties,
+                self.undefined_is_empty(),
                 &mut self.warnings,
                 source_file,
                 source_provenance,
             );
+            self.incomplete |= value.undefined_property_unknown;
             let trimmed = value.value.trim();
             let trim_start = value.value.len() - value.value.trim_start().len();
             let configured_ranges =
@@ -503,6 +515,12 @@ impl ProjectBuilder {
         self.property_default_provenances
             .insert(key.clone(), source_provenance.clone());
         self.properties.insert(key, value);
+    }
+
+    /// Whether an undefined property takes the MSBuild empty default: no
+    /// import that was not evaluated could have defined it.
+    pub(super) fn undefined_is_empty(&self) -> bool {
+        !self.unknown_import_taint && !self.opaque_import
     }
 
     fn taint_unknown_import(&mut self) {
@@ -588,6 +606,7 @@ impl ProjectBuilder {
                 properties: &self.properties,
                 unknown_properties: &self.unknown_properties,
                 unknown_import_taint: self.unknown_import_taint,
+                undefined_is_empty: self.undefined_is_empty(),
                 overrides: &self.overrides,
                 read_policy: &self.read_policy,
             },
@@ -627,6 +646,7 @@ impl ProjectBuilder {
                 source_file.display(),
                 import.project
             ));
+            self.opaque_import |= !is_standard_embarcadero_import(&import.project);
             return Ok(());
         }
         let expanded = expand_value(
@@ -638,6 +658,7 @@ impl ProjectBuilder {
             &self.property_provenance_ranges,
             &self.property_default_provenances,
             &self.unknown_properties,
+            self.undefined_is_empty(),
             &mut self.warnings,
             source_file,
             source_provenance,
@@ -669,6 +690,7 @@ impl ProjectBuilder {
                 source_file.display(),
                 import.project
             ));
+            self.opaque_import |= !is_standard_embarcadero_import(&import.project);
             return Ok(());
         }
         let path_status = resolve_existing_path_status_with_provenance(
@@ -1164,6 +1186,11 @@ pub(super) struct ExpandedValue {
     pub(super) explicit_dependency: bool,
     pub(super) configured_ranges: Vec<Range<usize>>,
     pub(super) provenance_ranges: Vec<ProvenanceRange>,
+    /// An undefined property could not take the MSBuild empty default (see
+    /// [`is_environment_provided_property`] and
+    /// [`ProjectBuilder::undefined_is_empty`]), so the value is unknowable
+    /// and the project context is incomplete.
+    pub(super) undefined_property_unknown: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1176,12 +1203,14 @@ pub(super) fn expand_value(
     property_provenance_ranges: &HashMap<String, Vec<ProvenanceRange>>,
     property_default_provenances: &HashMap<String, ProjectPathProvenance>,
     unknown_properties: &HashSet<String>,
+    undefined_is_empty: bool,
     warnings: &mut Vec<String>,
     source_file: &Path,
     source_provenance: &ProjectPathProvenance,
 ) -> ExpandedValue {
     let mut expanded = String::new();
     let mut unknown = false;
+    let mut undefined_property_unknown = false;
     let mut explicit_dependency = false;
     let mut configured_ranges = Vec::new();
     let mut provenance_ranges = Vec::new();
@@ -1202,6 +1231,7 @@ pub(super) fn expand_value(
                 explicit_dependency,
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
+                undefined_property_unknown,
             };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
@@ -1215,6 +1245,7 @@ pub(super) fn expand_value(
                 explicit_dependency,
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
+                undefined_property_unknown,
             };
         };
         let end = start + 2 + relative_end;
@@ -1243,6 +1274,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    undefined_property_unknown,
                 };
             }
         } else if let Some(replacement) = properties.get(&key) {
@@ -1254,6 +1286,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    undefined_property_unknown,
                 };
             }
             let replacement_end = expanded.len();
@@ -1300,12 +1333,16 @@ pub(super) fn expand_value(
             // Delphi project files commonly terminate list properties with
             // their own unset value. This is an intentional empty default.
             unknown |= unknown_properties.contains(&key);
+        } else if undefined_is_empty && !is_environment_provided_property(name) {
+            // MSBuild expands an undefined property to the empty string.
+            push_undefined_property_warning(warnings, name, source_file);
         } else {
             warnings.push(format!(
                 "unresolved property path $({name}) in {}",
                 source_file.display()
             ));
             unknown = true;
+            undefined_property_unknown = true;
             if !append_expansion(
                 &mut expanded,
                 &UNRESOLVED_MARKER.to_string(),
@@ -1318,6 +1355,7 @@ pub(super) fn expand_value(
                     explicit_dependency,
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
+                    undefined_property_unknown,
                 };
             }
         }
@@ -1337,6 +1375,7 @@ pub(super) fn expand_value(
             explicit_dependency,
             configured_ranges: Vec::new(),
             provenance_ranges: Vec::new(),
+            undefined_property_unknown,
         };
     }
     ExpandedValue {
@@ -1345,7 +1384,111 @@ pub(super) fn expand_value(
         explicit_dependency,
         configured_ranges,
         provenance_ranges,
+        undefined_property_unknown,
     }
+}
+
+fn push_undefined_property_warning(warnings: &mut Vec<String>, name: &str, source_file: &Path) {
+    let warning = format!(
+        "undefined property $({name}) in {} was taken as empty (MSBuild default); \
+         set it under [properties] in the delphi-tools configuration if the build defines it",
+        source_file.display()
+    );
+    if !warnings
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&warning))
+    {
+        warnings.push(warning);
+    }
+}
+
+/// Imports of the standard Embarcadero build files. They add build steps and
+/// the IDE's own properties (`BDS`, `Platform`, output paths, ...), never a
+/// project's user properties, so ignoring them does not make later undefined
+/// properties unknown. `UserTools.proj` holds the IDE's Tools-menu build
+/// events.
+fn is_standard_embarcadero_import(project: &str) -> bool {
+    let normalized = project.trim().replace('\\', "/").to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or_default();
+    (normalized.starts_with("$(bds)/bin/") && name.ends_with(".targets"))
+        || matches!(
+            name,
+            "codegear.delphi.targets" | "codegear.common.targets" | "usertools.proj"
+        )
+}
+
+/// Properties that MSBuild, the Delphi targets, the IDE or Windows always
+/// define in a real build. An undefined one here means the build environment
+/// was not captured (configure it under `[properties]`), not that it is
+/// empty, so it stays unknown instead of taking the MSBuild empty default.
+pub(super) fn is_environment_provided_property(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    // MSBuild reserved and well-known properties.
+    if name.starts_with("msbuild") {
+        return true;
+    }
+    matches!(
+        name.as_str(),
+        // IDE and rsvars.bat environment of a Delphi installation.
+        "bds"
+            | "bdsbin"
+            | "bdsinclude"
+            | "bdslib"
+            | "bdscommondir"
+            | "bdsuserdir"
+            | "bdsappdatabasedir"
+            | "bdsplatformsdksdir"
+            | "bdsprojectsdir"
+            | "bdscatalogrepository"
+            | "bdscatalogrepositoryallusers"
+            | "appdata"
+            | "delphi"
+            | "productversion"
+            | "ibredistdir"
+            | "frameworkdir"
+            | "frameworkversion"
+            | "frameworksdkdir"
+            // Defined by the MSBuild common and Delphi targets.
+            | "targetname"
+            | "targetext"
+            | "targetfilename"
+            | "targetpath"
+            | "targetdir"
+            | "outdir"
+            | "outputpath"
+            | "projectdir"
+            | "projectname"
+            | "projectpath"
+            | "projectfilename"
+            | "projectext"
+            // Always set in a Windows process environment.
+            | "allusersprofile"
+            | "commonprogramfiles"
+            | "commonprogramfiles(x86)"
+            | "commonprogramw6432"
+            | "computername"
+            | "homedrive"
+            | "homepath"
+            | "localappdata"
+            | "number_of_processors"
+            | "os"
+            | "path"
+            | "pathext"
+            | "processor_architecture"
+            | "programdata"
+            | "programfiles"
+            | "programfiles(x86)"
+            | "programw6432"
+            | "public"
+            | "systemdrive"
+            | "systemroot"
+            | "temp"
+            | "tmp"
+            | "userdomain"
+            | "username"
+            | "userprofile"
+            | "windir"
+    )
 }
 
 fn append_expansion(
@@ -1401,6 +1544,10 @@ pub(super) struct ConditionEnvironment<'a> {
     pub(super) properties: &'a HashMap<String, String>,
     pub(super) unknown_properties: &'a HashSet<String>,
     pub(super) unknown_import_taint: bool,
+    /// Whether `properties` holds every property defined so far, so an
+    /// undefined one takes the MSBuild empty default. A partial map (the
+    /// project bootstrap, item conditions) leaves it unknown.
+    pub(super) undefined_is_empty: bool,
     pub(super) overrides: &'a EffectiveOverrides,
     pub(super) read_policy: &'a ReadPolicy,
 }
@@ -1410,6 +1557,7 @@ fn expand_condition_value(
     properties: &HashMap<String, String>,
     unknown_properties: &HashSet<String>,
     unknown_import_taint: bool,
+    undefined_is_empty: bool,
     source_file: &Path,
     warnings: &mut Vec<String>,
 ) -> ConditionValue {
@@ -1456,7 +1604,15 @@ fn expand_condition_value(
             }
             missing |= replacement.contains(UNRESOLVED_MARKER)
                 || unknown_properties.contains(&name.to_ascii_lowercase());
-        } else if unknown_import_taint || !is_known_project_local_configuration_property(name) {
+        } else if !unknown_import_taint && is_known_project_local_configuration_property(name) {
+            // Configuration keys are only ever defined by the project itself.
+        } else if !unknown_import_taint
+            && undefined_is_empty
+            && !is_environment_provided_property(name)
+        {
+            // MSBuild compares an undefined property as the empty string.
+            push_undefined_property_warning(warnings, name, source_file);
+        } else {
             missing = true;
             if !append_expansion(
                 &mut expanded,
@@ -1523,6 +1679,7 @@ pub(super) fn condition_matches(
         properties: environment.properties,
         unknown_properties: environment.unknown_properties,
         unknown_import_taint: environment.unknown_import_taint,
+        undefined_is_empty: environment.undefined_is_empty,
         overrides: environment.overrides,
         read_policy: environment.read_policy,
         base,
@@ -1694,6 +1851,7 @@ struct ConditionParser<'a> {
     properties: &'a HashMap<String, String>,
     unknown_properties: &'a HashSet<String>,
     unknown_import_taint: bool,
+    undefined_is_empty: bool,
     overrides: &'a EffectiveOverrides,
     read_policy: &'a ReadPolicy,
     base: &'a Path,
@@ -1834,6 +1992,7 @@ impl ConditionParser<'_> {
                     self.properties,
                     self.unknown_properties,
                     self.unknown_import_taint,
+                    self.undefined_is_empty,
                     self.source_file,
                     self.warnings,
                 );

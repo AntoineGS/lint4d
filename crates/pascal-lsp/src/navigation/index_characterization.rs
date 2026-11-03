@@ -714,3 +714,60 @@ fn indexing_parent_lookups_grow_linearly_with_flat_declarations() {
         "parent lookups grew from {small_steps} to {large_steps} steps when the declarations doubled"
     );
 }
+
+/// The owner lookup the index used before it carried ancestors: the nearest
+/// type declaration whose type contains the node decides, and a declaration
+/// without a name identifier makes the node top-level.
+fn reference_enclosing_type(node: Node<'_>, source: &str) -> Option<String> {
+    let node_span = Span::from_node(node);
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "declType"
+            && let Some(type_node) = parent.child_by_field_name("type")
+            && Span::from_node(type_node).contains(node_span)
+        {
+            return declaration_name_identifiers(parent)
+                .last()
+                .map(|identifier| canonical_name(&node_text(*identifier, source)));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// Error-recovery trees (including type declarations that lost their name)
+/// give every declaration the owner the previous lookup gave it, and top-level
+/// types are classified the same way.
+#[test]
+fn recovered_trees_keep_the_owner_lookup() {
+    let bodies = [
+        "type\n  = class\n    FField: Integer;\n  end;\n  TAfter = class end;\n",
+        "type\n  TA = class end;\n  = record\n    FField: Integer;\n  end;\n  TB = class end;\n",
+        "type\n  TA = class\n  FField: Integer;\n  end;\n  : class\n    FField: Integer;\n  end;\n",
+        "type\n  <T> = class\n    FField: Integer;\n  end;\n  TB = class end;\n",
+        "type\n  TA = class\n    type = class end;\n    FField: Integer;\n  end;\n",
+    ];
+    let checked_total = std::cell::RefCell::new(0);
+    for body in bodies {
+        let source = format!("unit U;\ninterface\n{body}implementation\nend.\n");
+        let document = parse_source("Recovered.pas", source.clone());
+        let parsed = &document.parsed;
+        collect_nodes_with_ancestors(parsed.tree.root_node(), &mut |node, ancestors| {
+            if !matches!(
+                node.kind(),
+                "declType" | "declProc" | "declProp" | "declField"
+            ) {
+                return;
+            }
+            assert_eq!(
+                enclosing_type_among(node, nearest_first(ancestors), &source),
+                reference_enclosing_type(node, &source),
+                "{} at {:?} in {body:?}",
+                node.kind(),
+                Span::from_node(node)
+            );
+            *checked_total.borrow_mut() += 1;
+        });
+    }
+    assert!(*checked_total.borrow() > 8);
+}

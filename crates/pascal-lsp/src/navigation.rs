@@ -18184,7 +18184,7 @@ fn helper_parent_node<'a>(node: Node<'a>, for_start: usize, source: &str) -> Opt
 fn collect_helpers(root: Node<'_>, source: &str) -> Vec<HelperDefinition> {
     let mut helpers = Vec::new();
     for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declType") {
-        if enclosing_type_declaration(declaration, nearest_first(&ancestors)).is_some() {
+        if enclosing_type_among(declaration, nearest_first(&ancestors), source).is_some() {
             continue;
         }
         let Some(type_node) = declaration.child_by_field_name("type") else {
@@ -18387,7 +18387,7 @@ fn collect_type_ancestry(
     let mut ancestry = HashMap::new();
     let mut forward_spans = HashSet::new();
     for (declaration, ancestors) in collect_nodes_matching_with_ancestors(root, "declType") {
-        if enclosing_type_declaration(declaration, nearest_first(&ancestors)).is_some() {
+        if enclosing_type_among(declaration, nearest_first(&ancestors), source).is_some() {
             continue;
         }
         let Some(name) = declaration_name_identifiers(declaration).last().copied() else {

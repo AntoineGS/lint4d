@@ -1444,6 +1444,28 @@ mod cache_tests {
     }
 
     #[test]
+    fn interactive_unit_waits_on_a_roleless_owner_are_bounded() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(&cache, &main, &ctx, ClaimRole::default());
+        let interactive = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::from_millis(50)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lookup = interactive.recv_timeout(Duration::from_secs(5));
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let Ok(Lookup::Compute(claim)) = lookup else {
+            panic!("a wait on a roleless owner gives up")
+        };
+        assert!(claim.is_detached());
+    }
+
+    #[test]
     fn interactive_import_waits_are_bounded_and_leave_the_claim() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
@@ -3125,6 +3147,9 @@ pub(crate) enum Lookup<V> {
 
 /// Exclusive right to compute one slot. Dropping it without storing frees the
 /// slot and wakes waiters so one of them can take over.
+///
+/// A claim must stay on the thread that obtained it: cycle detection between
+/// waiters identifies a claim's owner by that thread.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Claim {
     inner: Arc<Inner>,
@@ -3970,9 +3995,12 @@ impl ProjectCache {
                         taking_over = true;
                         break;
                     }
+                    // Claims of threads without a role (the main thread, which
+                    // parses opened documents) cannot be cancelled or taken
+                    // over, so they are bounded like import claims.
                     let import_wait = role
                         .import_claim_wait
-                        .filter(|_| layer == Layer::Import)
+                        .filter(|_| layer == Layer::Import || owner.role.cancel.is_none())
                         .map(|limit| limit.saturating_sub(waiting_since.elapsed()));
                     // The claim computes another revision of the input, this
                     // thread may not wait longer for an import slot, or

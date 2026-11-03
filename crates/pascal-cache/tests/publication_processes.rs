@@ -9,17 +9,21 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    SEAL, binding_evidence, context, member, open, raw, read_members, read_record, unit_lookup,
+    EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context, member,
+    open, publish_bulk, raw, read_members, read_record, records, sealed, unit_lookup,
 };
 use pascal_cache::{
-    Digest, EvidencePurpose, EvidenceSubject, EvidenceTarget, FaultPoint, Lookup, Observation,
-    SnapshotHeader, Store, evidence_id,
+    Bypass, DATABASE_FILE, Digest, EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite,
+    FaultPoint, LEASE_EXPIRY, Lookup, Maintenance, MaintenanceLimits, Observation, RetireStep,
+    SnapshotHeader, StepBudget, Store, evidence_id,
 };
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 const ROLE: &str = "PASCAL_CACHE_PUBLISHER_ROLE";
 const DIRECTORY: &str = "PASCAL_CACHE_PUBLISHER_DIRECTORY";
@@ -36,16 +40,33 @@ fn target(variant: &str) -> String {
 /// One whole publication: binding evidence for `provider`, the record of
 /// `/w/Main.pas` importing it, and a sealed snapshot of that record.
 fn build(store: &Store, variant: &str, pause: &dyn Fn(&str)) -> SnapshotHeader {
+    try_build(store, variant, pause).unwrap()
+}
+
+/// [`build`], returning the first store call's bypass.
+fn try_build(store: &Store, variant: &str, pause: &dyn Fn(&str)) -> Result<SnapshotHeader, Bypass> {
     let target = target(variant);
-    let evidence = binding_evidence(store, "provider", &target);
+    let observations = [Observation::Presence {
+        path: PathBuf::from(&target),
+        entry: None,
+        present: true,
+    }];
+    let evidence = store
+        .publish_evidence(
+            EvidenceTarget::Binding(&unit_lookup("provider")),
+            &EvidenceWrite {
+                context: &context(),
+                observations: &observations,
+            },
+        )?
+        .evidence_id;
     let record = store
-        .publish_member_record(&member("/w/Main.pas", &[target.as_str()], evidence))
-        .unwrap()
+        .publish_member_record(&member("/w/Main.pas", &[target.as_str()], evidence))?
         .record_id;
-    let mut builder = store.begin_snapshot(&context()).unwrap();
+    let mut builder = store.begin_snapshot(&context())?;
     pause("begun");
-    store.add_members(&mut builder, &[record]).unwrap();
-    store.seal_snapshot(builder, &SEAL).unwrap()
+    store.add_members(&mut builder, &[record])?;
+    store.seal_snapshot(builder, &SEAL)
 }
 
 /// The record `build(…, variant, …)` publishes, computed without a store.
@@ -91,16 +112,60 @@ fn publisher_child_entry() {
         store.set_fault_for_test(point, || std::process::abort());
     }
     if let Some(point) = FaultPoint::from_name(&pause) {
-        store.set_fault_for_test(point, move || wait_for_parent(point.name()));
+        // One-shot: a maintenance cycle reaches its points once per batch,
+        // and the parent sends one line.
+        let waited = AtomicBool::new(false);
+        store.set_fault_for_test(point, move || {
+            if !waited.swap(true, Ordering::SeqCst) {
+                wait_for_parent(point.name());
+            }
+        });
     }
+    let pause_at = |step: &str| {
+        if step == pause {
+            wait_for_parent(step);
+        }
+    };
     match role.to_str().unwrap() {
         "build" => {
-            let header = build(&store, &variant, &|step| {
-                if step == pause {
-                    wait_for_parent(step);
-                }
-            });
+            let header = build(&store, &variant, &pause_at);
             println!("result sealed {}", header.publication_seq());
+        }
+        "build-tolerant" => match try_build(&store, &variant, &pause_at) {
+            Ok(header) => println!("result sealed {}", header.publication_seq()),
+            Err(bypass) => println!("result bypass {bypass:?}"),
+        },
+        "maintain" => {
+            if variant == "expire" {
+                // Every other process's lease looks expired from here.
+                store.advance_clock_for_test(LEASE_EXPIRY);
+            }
+            age_past_grace(&store);
+            let mut maintenance = Maintenance::new(MaintenanceLimits {
+                recency_window: 0,
+                vacuum_free_bytes: 0,
+                ..MaintenanceLimits::DEFAULT
+            })
+            .unwrap();
+            let never = AtomicBool::new(false);
+            let budget = StepBudget {
+                time: Duration::from_secs(60),
+                rows: 100_000,
+            };
+            let mut rows = 0;
+            loop {
+                let report = maintenance.step(&store, budget, &never).unwrap();
+                assert!(!report.skipped, "{report:?}");
+                rows += report.rows;
+                if report.cycle_complete {
+                    break;
+                }
+            }
+            println!("result maintained {rows}");
+        }
+        "reset" => {
+            store.reset_namespace().unwrap();
+            println!("result reset");
         }
         "retire" => {
             let Lookup::Hit(headers) = store.find_snapshots(&context()).unwrap() else {
@@ -432,4 +497,201 @@ fn ac4_duplicate_publishers_in_two_processes_converge_and_keep_history() {
     };
     assert_eq!(count("member_records"), 1, "identical records converge");
     assert_eq!(count("evidence_sets"), 1, "identical evidence converges");
+}
+
+/// Six sealed snapshots of two records each (two beyond `keep_snapshots`),
+/// four stray artifacts and evidence sets, and one stray artifact large
+/// enough that deleting it frees whole pages for the vacuum.
+fn prepare(store: &Store) {
+    for index in 0..6 {
+        sealed(store, &records(store, &format!("S{index}"), 2));
+    }
+    for index in 0..4 {
+        artifact(store, &format!("unit Stray{index};"));
+        binding_evidence(store, &format!("stray{index}"), "/w/Stray.pas");
+    }
+    publish_bulk(store, "unit Big;", 9, 100_000).unwrap();
+}
+
+/// Every sealed snapshot still found reads back complete and verified.
+fn sealed_read_verified(store: &Store) -> usize {
+    let found = sealed_snapshots(store);
+    for header in &found {
+        read_members(store, header).expect("a retained snapshot reads back verified");
+    }
+    found.len()
+}
+
+fn first_word(result: &str) -> Option<&str> {
+    result.split_whitespace().next()
+}
+
+#[test]
+fn ac3_death_at_each_maintenance_boundary_keeps_the_invariant() {
+    for point in FaultPoint::MAINTENANCE {
+        let root = private_tempdir();
+        let directory = root.path();
+        let store = open(directory);
+        prepare(&store);
+        age_past_grace(&store);
+        let role = if point == FaultPoint::ResetBeforeCommit {
+            "reset"
+        } else {
+            "maintain"
+        };
+        abort_at(child(role, directory, ""), point);
+        let after = open(directory);
+        assert_eq!(
+            after.scope().reset_epoch,
+            0,
+            "{point:?}: an aborted reset changed nothing"
+        );
+        assert_eq!(check_invariant(directory), 0, "{point:?}");
+        assert!(
+            sealed_read_verified(&after) >= 4,
+            "{point:?}: the newest snapshots survive"
+        );
+        // The next pass resumes from the database and finishes.
+        age_past_grace(&after);
+        assert_eq!(
+            first_word(&run(child("maintain", directory, ""))),
+            Some("maintained")
+        );
+        assert_eq!(check_invariant(directory), 0, "{point:?}");
+        assert_eq!(sealed_read_verified(&after), 4, "{point:?}");
+        drop(store);
+    }
+}
+
+#[test]
+fn ac1_gc_racing_a_paused_publisher_preserves_what_it_references() {
+    // A live builder's lease protects its build and records.
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    let paused = Paused::spawn(child("build", directory, "New"), "begun");
+    age_past_grace(&store);
+    assert_eq!(
+        first_word(&run(child("maintain", directory, ""))),
+        Some("maintained")
+    );
+    assert!(paused.resume().starts_with("sealed"));
+    assert_eq!(check_invariant(directory), 0);
+    let headers = sealed_snapshots(&store);
+    assert_eq!(
+        targets_of(&store, &headers[0]),
+        [PathBuf::from(target("New"))]
+    );
+
+    // A publisher inside its write transaction makes GC wait, not
+    // interleave. The clock moves first: renewing while the child holds
+    // the write lock would be refused.
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    age_past_grace(&store);
+    store.advance_clock_for_test(LEASE_EXPIRY);
+    let paused = Paused::spawn(
+        child("build", directory, "New"),
+        FaultPoint::RecordBeforeCommit.name(),
+    );
+    assert_eq!(
+        store.retire_step(RetireStep::Evidence, &EAGER),
+        Err(Bypass::Busy)
+    );
+    assert!(paused.resume().starts_with("sealed"));
+    assert_eq!(check_invariant(directory), 0);
+
+    // A builder whose lease expired is fenced and rebuilds; nothing partial
+    // seals.
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    let paused = Paused::spawn(child("build-tolerant", directory, "New"), "begun");
+    age_past_grace(&store);
+    assert_eq!(
+        first_word(&run(child("maintain", directory, "expire"))),
+        Some("maintained")
+    );
+    assert_eq!(paused.resume(), "bypass BuilderFenced");
+    assert_eq!(sealed_snapshots(&store).len(), 0);
+    assert_eq!(check_invariant(directory), 0);
+    let header = build(&store, "New", &|_| {});
+    assert_eq!(
+        targets_of(&store, &header),
+        [PathBuf::from(target("New"))],
+        "the retry succeeds"
+    );
+}
+
+#[test]
+fn ac1_a_reader_keeps_its_snapshot_while_another_process_deletes() {
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    prepare(&store);
+    let newest = sealed_snapshots(&store)[0].clone();
+    age_past_grace(&store);
+    let paused = Paused::spawn(
+        child("maintain", directory, ""),
+        FaultPoint::GcDeleteBeforeCommit.name(),
+    );
+    // The other process holds the write lock mid-deletion: live reads go on.
+    assert_eq!(read_members(&store, &newest).map(|m| m.len()), Ok(2));
+    assert!(paused.resume().starts_with("maintained"));
+    assert_eq!(read_members(&store, &newest).map(|m| m.len()), Ok(2));
+    assert_eq!(check_invariant(directory), 0);
+}
+
+#[test]
+fn ac4_maintenance_in_two_processes_is_coordinated() {
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    prepare(&store);
+    age_past_grace(&store);
+    let paused = Paused::spawn(
+        child("maintain", directory, ""),
+        FaultPoint::GcRetireBeforeCommit.name(),
+    );
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let report = maintenance
+        .step(
+            &store,
+            StepBudget {
+                time: Duration::from_secs(60),
+                rows: 1000,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(report.skipped && report.rows == 0, "{report:?}");
+    assert!(paused.resume().starts_with("maintained"));
+    assert_eq!(check_invariant(directory), 0);
+}
+
+#[test]
+fn ac4_a_reset_in_one_process_fences_the_other_without_touching_files() {
+    use std::os::unix::fs::MetadataExt;
+    let root = private_tempdir();
+    let directory = root.path();
+    let store = open(directory);
+    let header = sealed(&store, &records(&store, "M", 300));
+    let mut reader = store.read_snapshot(&header);
+    assert!(matches!(reader.next_batch(), Ok(Lookup::Hit(Some(_)))));
+    let inode = std::fs::metadata(directory.join(DATABASE_FILE))
+        .unwrap()
+        .ino();
+    assert_eq!(run(child("reset", directory, "")), "reset");
+    assert_eq!(reader.next_batch().err(), Some(Bypass::Fenced));
+    assert!(!reader.is_verified());
+    assert_eq!(store.check_scope(), Err(Bypass::Fenced));
+    assert_eq!(
+        std::fs::metadata(directory.join(DATABASE_FILE))
+            .unwrap()
+            .ino(),
+        inode
+    );
+    drop(store);
+    assert_eq!(open(directory).scope().reset_epoch, 1);
 }

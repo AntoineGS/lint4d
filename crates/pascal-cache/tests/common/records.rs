@@ -1,11 +1,12 @@
 //! Member record and snapshot fixtures shared by the store's tests.
 
 use pascal_cache::{
-    ArtifactKeyRef, Binding, BindingKind, BindingOutcome, ContextKey, CoverageStatus,
-    DATABASE_FILE, Digest, EvidenceTarget, EvidenceWrite, LocalArtifactKey, Lookup, LookupInputs,
-    LookupKey, LookupKind, MaintenanceLimits, MemberCoverage, MemberHeader, MemberRecord, Miss,
-    Namespace, Observation, SnapshotHeader, SnapshotMember, SnapshotSeal, SourceContent,
-    SourceIdentity, Store, StoreLimits,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Binding, BindingKind, BindingOutcome, Bypass,
+    ContextKey, CoverageStatus, DATABASE_FILE, Digest, EvidenceTarget, EvidenceWrite,
+    LocalArtifactKey, Lookup, LookupInputs, LookupKey, LookupKind, MaintenanceLimits,
+    MemberCoverage, MemberHeader, MemberRecord, Miss, Namespace, Observation, Published,
+    SnapshotHeader, SnapshotMember, SnapshotSeal, SourceContent, SourceIdentity, Store,
+    StoreLimits,
 };
 use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, ProjectContext, SourceOrigin};
@@ -178,6 +179,34 @@ pub fn sealed(store: &Store, records: &[Digest]) -> SnapshotHeader {
         store.add_members(&mut builder, batch).unwrap();
     }
     store.seal_snapshot(builder, &SEAL).unwrap()
+}
+
+/// Publish the local artifact for `text` with `rows` rows of `row_bytes`
+/// bytes each.
+pub fn publish_bulk(
+    store: &Store,
+    text: &str,
+    rows: usize,
+    row_bytes: usize,
+) -> Result<Published, Bypass> {
+    let key = LocalArtifactKey::new(
+        &SourceContent::from_bytes(text.as_bytes()),
+        &ConditionalContext::default(),
+        SourceOrigin::ProjectCompiled,
+    );
+    let payload = vec![7u8; row_bytes];
+    let rows: Vec<ArtifactRow<'_>> = (0..rows)
+        .map(|_| ArtifactRow {
+            row_kind: 1,
+            index_key: None,
+            payload: &payload,
+        })
+        .collect();
+    store.publish_artifact(&ArtifactWrite {
+        key: ArtifactKeyRef::local(&key),
+        supplemental: b"",
+        rows: &rows,
+    })
 }
 
 /// Retirement without the recency window, so tests need not publish 65,536

@@ -6,17 +6,16 @@ mod common;
 use common::private_tempdir;
 use common::records::{
     EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
-    local_member, member, open, raw, read_members, read_record, records, sealed,
+    local_member, member, open, publish_bulk, raw, read_members, read_record, records, sealed,
 };
 use pascal_cache::admin::{self, RecoveryAdvice, StoreStatus};
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, DiscoveryInputs,
-    DiscoveryScope, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint,
-    HintStats, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup,
-    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Maintenance, MaintenanceLimits,
-    MaintenanceLimitsError, Miss, Observation, Phase, PolicyError, PolicyState, Pressure,
-    Published, Reclaimed, RetireStep, ScannedDirectory, SnapshotSeal, SourceContent, StepBudget,
-    Store, StorePolicy, Unhealthy,
+    ArtifactKeyRef, Bypass, DATABASE_FILE, Digest, DiscoveryInputs, DiscoveryScope, EvidenceTarget,
+    EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint, HintStats, JOURNAL_SIZE_LIMIT_BYTES,
+    LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup, MAX_LEASE_HOLDS,
+    MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Maintenance, MaintenanceLimits, MaintenanceLimitsError,
+    Miss, Observation, Phase, PolicyError, PolicyState, Pressure, Published, Reclaimed, RetireStep,
+    ScannedDirectory, SnapshotSeal, SourceContent, StepBudget, Store, StorePolicy, Unhealthy,
 };
 use pascal_cache::{Namespace, StoreLimits};
 use pascal_core::facts::ArtifactFacts;
@@ -30,29 +29,6 @@ fn key(text: &str) -> LocalArtifactKey {
         &ConditionalContext::default(),
         SourceOrigin::ProjectCompiled,
     )
-}
-
-/// Publish an artifact of `rows` rows of `row_bytes` bytes each.
-fn publish_bulk(
-    store: &Store,
-    name: &str,
-    rows: usize,
-    row_bytes: usize,
-) -> Result<pascal_cache::Published, pascal_cache::Bypass> {
-    let key = key(name);
-    let payload = vec![7u8; row_bytes];
-    let rows: Vec<ArtifactRow<'_>> = (0..rows)
-        .map(|_| ArtifactRow {
-            row_kind: 1,
-            index_key: None,
-            payload: &payload,
-        })
-        .collect();
-    store.publish_artifact(&ArtifactWrite {
-        key: ArtifactKeyRef::local(&key),
-        supplemental: b"",
-        rows: &rows,
-    })
 }
 
 const MIB: u64 = 1 << 20;
@@ -1186,6 +1162,24 @@ fn incremental_vacuum_returns_free_pages_in_bounded_batches() {
 }
 
 #[test]
+fn a_vacuum_batch_releases_its_whole_page_budget() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    publish_bulk(&store, "unit A;", 9, 1_000_000).unwrap();
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    while !store.reclaim(256).unwrap().complete {}
+    let start = store.usage().unwrap().free_pages;
+    assert!(start > 256, "{start} free pages");
+    let limits = MaintenanceLimits {
+        vacuum_free_bytes: 0,
+        ..EAGER
+    };
+    assert_eq!(store.vacuum_step(&limits), Ok(256));
+    assert_eq!(store.usage().unwrap().free_pages, start - 256);
+}
+
+#[test]
 fn vacuum_validates_its_limits_and_writes_nothing_at_the_wal_threshold() {
     let root = private_tempdir();
     let store = open(root.path());
@@ -1804,4 +1798,69 @@ fn a_read_only_directory_is_bypassed_and_left_alone() {
     assert_eq!(bypass, Bypass::ReadOnly, "observed");
     assert_eq!(advice, RecoveryAdvice::FreshDirectory);
     assert_eq!(snapshot(root.path()), before);
+}
+
+#[test]
+fn ac2_a_low_budget_bounds_writes_and_maintenance_reclaims_obsolete_versions() {
+    let root = private_tempdir();
+    let obsolete = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([2; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    publish_bulk(&obsolete, "unit Old;", 9, 1_000_000).unwrap();
+    drop(obsolete);
+    let store = open(root.path()); // retires namespace 2 at open
+    store.checkpoint().unwrap();
+    let full = store.usage().unwrap();
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 32 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    store.pretend_usage_for_test(20 * MIB);
+    assert_eq!(
+        publish_bulk(&store, "unit New;", 1, 10),
+        Err(Bypass::OverBudget)
+    );
+    assert_eq!(store.pressure(), Ok(Pressure::OverHeadroom));
+    let mut maintenance = Maintenance::new(MaintenanceLimits::default()).unwrap();
+    let never = AtomicBool::new(false);
+    while !maintenance
+        .step(&store, ROOMY, &never)
+        .unwrap()
+        .cycle_complete
+    {}
+    // A second cycle vacuums what the first one's deletion freed.
+    while !maintenance
+        .step(&store, ROOMY, &never)
+        .unwrap()
+        .cycle_complete
+    {}
+    store.checkpoint().unwrap();
+    store.pretend_usage_for_test(0);
+    let after = store.usage().unwrap();
+    let live =
+        |usage: &pascal_cache::Usage| (usage.page_count - usage.free_pages) * usage.page_size;
+    assert!(
+        live(&after) < live(&full) / 4,
+        "obsolete rows reclaimed: {full:?} -> {after:?}"
+    );
+    assert!(
+        after.database_bytes < full.database_bytes / 4,
+        "free pages returned: {full:?} -> {after:?}"
+    );
+    assert!(
+        after.wal_bytes <= JOURNAL_SIZE_LIMIT_BYTES as u64,
+        "the WAL is bounded: {after:?}"
+    );
+    assert_eq!(
+        publish_bulk(&store, "unit New;", 1, 10),
+        Ok(Published::Inserted)
+    );
 }

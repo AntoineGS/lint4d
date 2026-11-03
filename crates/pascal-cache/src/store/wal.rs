@@ -106,12 +106,18 @@ impl Store {
             if before.free_pages == 0 {
                 return Ok(0);
             }
-            transaction
-                .execute_batch(&format!(
+            // The pragma frees one page per step; `execute_batch` would
+            // step it once.
+            let mut vacuum = transaction
+                .prepare(&format!(
                     "PRAGMA incremental_vacuum({})",
                     limits.vacuum_pages
                 ))
                 .map_err(fail)?;
+            let mut steps = vacuum.raw_query();
+            while steps.next().map_err(fail)?.is_some() {}
+            drop(steps);
+            drop(vacuum);
             let after = read_usage(self, &transaction)?;
             fault_point!(self, VacuumBeforeCommit);
             self.before_commit();

@@ -2983,7 +2983,8 @@ const ARTIFACT_EXTENSIONS: &[&str] = &[
 struct InvalidationRecord {
     epoch: u64,
     path: PathBuf,
-    /// Empty with `crowded` set when more entries were evicted than the log\n    /// keeps.
+    /// Empty with `crowded` set when more entries were evicted than the log
+    /// keeps.
     affected: Vec<Url>,
     crowded: bool,
 }

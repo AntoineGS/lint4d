@@ -1198,9 +1198,9 @@ mod cache_tests {
         );
     }
 
-    fn import_slot(cache: &ProjectCache, main: &Url, ctx: &ProjectContext) -> Option<u64> {
+    fn claimed_unit(cache: &ProjectCache, main: &Url, ctx: &ProjectContext) -> Option<u64> {
         match lock(&cache.inner).slots.get(&Key {
-            layer: Layer::Import,
+            layer: Layer::Unit,
             uri: main.clone(),
             fingerprint: project_context_fingerprint(ctx),
         }) {
@@ -1209,7 +1209,16 @@ mod cache_tests {
         }
     }
 
-    /// Looks the imports of `main` up on a new thread with `role`, and
+    fn main_unit_value() -> UnitValue {
+        UnitValue {
+            parsed: parsed_unit("Main.pas"),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        }
+    }
+
+    /// Looks the unit `main` up on a new thread with `role`, and
     /// reports the outcome: `Hit`, `Cancelled`, or the claim to compute.
     fn spawn_lookup(
         cache: &ProjectCache,
@@ -1217,20 +1226,20 @@ mod cache_tests {
         ctx: &ProjectContext,
         role: ClaimRole,
         cancel: Arc<AtomicBool>,
-    ) -> std::sync::mpsc::Receiver<Lookup<ImportValue>> {
+    ) -> std::sync::mpsc::Receiver<Lookup<UnitValue>> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let cache = cache.clone();
         let ctx = ctx.clone();
         let main = main.clone();
         std::thread::spawn(move || {
             set_claim_role_on_this_thread(role);
-            let lookup = cache.imports(&main, &ctx, 1, &HashMap::new(), &cancel);
+            let lookup = cache.unit(&main, &ctx, 1, &HashMap::new(), &cancel);
             result_tx.send(lookup).unwrap();
         });
         result_rx
     }
 
-    /// Claims the imports of `main` on a new thread with `role`, then holds
+    /// Claims the unit `main` on a new thread with `role`, then holds
     /// the claim until told to store (`true`) or drop (`false`) it.
     fn spawn_owner(
         cache: &ProjectCache,
@@ -1245,15 +1254,14 @@ mod cache_tests {
         let main = main.clone();
         let owner = std::thread::spawn(move || {
             set_claim_role_on_this_thread(role);
-            let Lookup::Compute(claim) =
-                cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+            let Lookup::Compute(claim) = cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel())
             else {
                 panic!("the owner claims the slot")
             };
             assert!(!claim.is_detached());
             claimed_tx.send(()).unwrap();
             if finish_rx.recv().unwrap() {
-                cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+                cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
             }
         });
         claimed_rx
@@ -1263,7 +1271,7 @@ mod cache_tests {
     }
 
     #[test]
-    fn interactive_lookup_waits_for_a_claim_instead_of_computing_it_again() {
+    fn interactive_lookup_waits_for_a_unit_claim_instead_of_parsing_it_again() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
@@ -1275,7 +1283,7 @@ mod cache_tests {
             &cache,
             &main,
             &ctx,
-            ClaimRole::interactive(Arc::new(AtomicBool::new(false))),
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
             Arc::new(AtomicBool::new(false)),
         );
         // Each wait lasts one slice at most; outlast any bounded wait the
@@ -1315,7 +1323,7 @@ mod cache_tests {
             &cache,
             &main,
             &ctx,
-            ClaimRole::interactive(cancel.clone()),
+            ClaimRole::interactive(cancel.clone(), Duration::ZERO),
             cancel.clone(),
         );
         waiting_rx
@@ -1324,7 +1332,7 @@ mod cache_tests {
         cancel.store(true, Ordering::Relaxed);
         cache.inner.changed.notify_all();
         let lookup = interactive.recv_timeout(Duration::from_secs(5));
-        let still_claimed = import_slot(&cache, &main, &ctx).is_some();
+        let still_claimed = claimed_unit(&cache, &main, &ctx).is_some();
         finish.send(true).unwrap();
         owner.join().unwrap();
         assert!(
@@ -1351,7 +1359,7 @@ mod cache_tests {
             &cache,
             &main,
             &ctx,
-            ClaimRole::interactive(Arc::new(AtomicBool::new(false))),
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
             Arc::new(AtomicBool::new(false)),
         );
         waiting_rx
@@ -1363,9 +1371,9 @@ mod cache_tests {
             panic!("the waiter computes once the owner drops its claim")
         };
         assert!(!claim.is_detached(), "the waiter claims the freed slot");
-        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
         assert!(matches!(
-            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Hit(_)
         ));
     }
@@ -1378,28 +1386,28 @@ mod cache_tests {
         let owner_cancel = Arc::new(AtomicBool::new(false));
         let (finish, owner) =
             spawn_owner(&cache, &main, &ctx, ClaimRole::job(owner_cancel.clone()));
-        let owner_claim = import_slot(&cache, &main, &ctx).expect("owner claim");
+        let owner_claim = claimed_unit(&cache, &main, &ctx).expect("owner claim");
         owner_cancel.store(true, Ordering::Relaxed);
         let interactive = spawn_lookup(
             &cache,
             &main,
             &ctx,
-            ClaimRole::interactive(Arc::new(AtomicBool::new(false))),
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
             Arc::new(AtomicBool::new(false)),
         );
         let Ok(Lookup::Compute(claim)) = interactive.recv_timeout(Duration::from_secs(5)) else {
             panic!("the waiter takes over a cancelled owner's claim")
         };
         assert!(!claim.is_detached(), "the take-over claims the slot");
-        let taken = import_slot(&cache, &main, &ctx).expect("taken-over claim");
+        let taken = claimed_unit(&cache, &main, &ctx).expect("taken-over claim");
         assert_ne!(taken, owner_claim);
         // The cancelled owner finishing late neither stores nor frees the slot.
         finish.send(true).unwrap();
         owner.join().unwrap();
-        assert_eq!(import_slot(&cache, &main, &ctx), Some(taken));
-        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        assert_eq!(claimed_unit(&cache, &main, &ctx), Some(taken));
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
         assert!(matches!(
-            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Hit(_)
         ));
     }
@@ -1419,16 +1427,64 @@ mod cache_tests {
             &cache,
             &main,
             &ctx,
-            ClaimRole::interactive(Arc::new(AtomicBool::new(false))),
+            ClaimRole::interactive(Arc::new(AtomicBool::new(false)), Duration::ZERO),
             Arc::new(AtomicBool::new(false)),
         );
         let Ok(Lookup::Compute(claim)) = interactive.recv_timeout(Duration::from_secs(5)) else {
             panic!("interactive work takes the warmer's claim over")
         };
         assert!(!claim.is_detached());
-        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
         finish.send(true).unwrap();
         owner.join().unwrap();
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn interactive_import_waits_are_bounded_and_leave_the_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected initial miss")
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let interactive = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                set_claim_role_on_this_thread(ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::from_millis(50),
+                ));
+                let Lookup::Compute(local) =
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("a bounded import wait computes locally")
+                };
+                assert!(local.is_detached());
+                cache.store_imports(local, import_value(vec![]), 1, &no_cancel());
+                result_tx.send(()).unwrap();
+            })
+        };
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        let still_claimed = matches!(
+            lock(&cache.inner).slots.get(&Key {
+                layer: Layer::Import,
+                uri: main.clone(),
+                fingerprint: project_context_fingerprint(&ctx),
+            }),
+            Some(Slot::Computing { .. })
+        );
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        interactive.join().unwrap();
+        result.expect("a bounded import wait must give up on the claim");
+        assert!(still_claimed, "the local computation must leave the claim");
         assert!(matches!(
             cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Hit(_)
@@ -2814,14 +2870,20 @@ pub(crate) struct ClaimRole {
     /// Interactive work takes this work's claims over instead of waiting:
     /// the warmer pauses for interactive requests and runs at low priority.
     yields_to_interactive: bool,
+    /// How long the work waits for an import slot another thread computes
+    /// before computing it without caching. An import claim covers the
+    /// owner's own walk of the importer's closure, which can take much
+    /// longer than the walk the waiter needs; a unit claim is one parse.
+    import_claim_wait: Option<Duration>,
 }
 
 impl ClaimRole {
-    pub(crate) fn interactive(cancel: Arc<AtomicBool>) -> Self {
+    pub(crate) fn interactive(cancel: Arc<AtomicBool>, import_claim_wait: Duration) -> Self {
         Self {
             interactive: true,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            import_claim_wait: Some(import_claim_wait),
         }
     }
 
@@ -2830,6 +2892,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            import_claim_wait: None,
         }
     }
 
@@ -2838,6 +2901,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: true,
+            import_claim_wait: None,
         }
     }
 
@@ -3289,7 +3353,7 @@ thread_local! {
 /// cancellation is clear. It takes the claim over instead once the owner's
 /// work is cancelled, or when it is interactive and the owner yields to
 /// interactive work. It computes without caching when waiting would close a
-/// cycle of waits.
+/// cycle of waits, or when an import slot outlasts the role's import wait.
 pub(crate) fn set_claim_role_on_this_thread(role: ClaimRole) {
     CLAIM_ROLE.with(|cell| *cell.borrow_mut() = role);
 }
@@ -3320,13 +3384,6 @@ fn wait_closes_cycle(
         current = owner.thread;
     }
     false
-}
-
-fn wait_timeout_recovering_poison<'a>(
-    inner: &'a Inner,
-    state: MutexGuard<'a, State>,
-) -> (MutexGuard<'a, State>, WaitTimeoutResult) {
-    wait_timeout_recovering_poison_for(inner, state, WAIT_SLICE)
 }
 
 fn wait_timeout_recovering_poison_for<'a>(
@@ -3899,7 +3956,7 @@ impl ProjectCache {
                     owner,
                     ..
                 }) => {
-                    wait_started.get_or_insert_with(std::time::Instant::now);
+                    let waiting_since = *wait_started.get_or_insert_with(std::time::Instant::now);
                     if cancel.load(Ordering::Relaxed) {
                         return Lookup::Cancelled;
                     }
@@ -3913,10 +3970,16 @@ impl ProjectCache {
                         taking_over = true;
                         break;
                     }
-                    // The claim computes another revision of the input, or
-                    // waiting for it would close a cycle of waits: compute
-                    // without caching instead of waiting on it.
+                    let import_wait = role
+                        .import_claim_wait
+                        .filter(|_| layer == Layer::Import)
+                        .map(|limit| limit.saturating_sub(waiting_since.elapsed()));
+                    // The claim computes another revision of the input, this
+                    // thread may not wait longer for an import slot, or
+                    // waiting would close a cycle of waits: compute without
+                    // caching instead of waiting on it.
                     if *claimed_input != input_hash
+                        || import_wait.is_some_and(|remaining| remaining.is_zero())
                         || wait_closes_cycle(&state, thread, owner.thread)
                     {
                         let generation = *generation;
@@ -3940,7 +4003,9 @@ impl ProjectCache {
                     state.waiting.insert(thread, key.clone());
                     #[cfg(test)]
                     self.signal_waiter_hook();
-                    state = wait_timeout_recovering_poison(&self.inner, state).0;
+                    let slice =
+                        import_wait.map_or(WAIT_SLICE, |remaining| remaining.min(WAIT_SLICE));
+                    state = wait_timeout_recovering_poison_for(&self.inner, state, slice).0;
                     state.waiting.remove(&thread);
                 }
                 Some(Slot::Ready(entry))

@@ -5,12 +5,14 @@
 //! package/index lookup, and the stateful include/rename resolver.
 
 pub mod analysis_metrics;
+pub mod cache_admin;
 mod catalogue;
 pub(crate) mod configuration;
 pub(crate) mod coverage;
 pub(crate) mod file_watch;
 pub(crate) mod include_expansion;
 pub mod navigation;
+pub(crate) mod persistent_cache;
 mod project_cache;
 pub mod server;
 pub mod text;

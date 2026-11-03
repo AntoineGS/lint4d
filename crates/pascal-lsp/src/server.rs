@@ -14,6 +14,10 @@ use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FOLDING_KIND_COMMENT,
     FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions, InlayHintOptions,
 };
+use crate::persistent_cache::{
+    CacheOptions, CacheOptionsOverride, CacheOptionsUpdate, PersistentCache,
+    parse_runtime_cache_options,
+};
 use crate::workspace::code_lenses;
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
@@ -3423,6 +3427,12 @@ struct ConfigurationCoordinator {
     pending: Option<PendingConfigurationRequest>,
     retired: VecDeque<RequestId>,
     preparation: ConfigurationPreparationJobs,
+    /// Persistent-cache options apply to `persistent` directly, apart from
+    /// the workspace rebuild, and are not rolled back with
+    /// `runtime_options` when scheduling that rebuild fails.
+    cache_base: CacheOptions,
+    cache_override: CacheOptionsOverride,
+    persistent: PersistentCache,
 }
 
 impl ConfigurationCoordinator {
@@ -3448,7 +3458,15 @@ impl ConfigurationCoordinator {
             pending: None,
             retired: VecDeque::new(),
             preparation: ConfigurationPreparationJobs::new(),
+            cache_base: CacheOptions::default(),
+            cache_override: CacheOptionsOverride::default(),
+            persistent: PersistentCache::default(),
         }
+    }
+
+    fn set_persistent_cache(&mut self, persistent: PersistentCache, base: CacheOptions) {
+        self.persistent = persistent;
+        self.cache_base = base;
     }
 
     fn update_scope(
@@ -3642,6 +3660,20 @@ impl ConfigurationCoordinator {
         for warning in warnings {
             eprintln!("pascal-lsp: warning: {warning}");
         }
+        let cache_before = self.cache_override.effective(&self.cache_base);
+        let cache_warnings = match value {
+            Some(Value::Object(object)) => self
+                .cache_override
+                .apply(parse_runtime_cache_options(object)),
+            _ => self.cache_override.apply(CacheOptionsUpdate::reset()),
+        };
+        for warning in cache_warnings {
+            eprintln!("pascal-lsp: warning: {warning}");
+        }
+        let cache_after = self.cache_override.effective(&self.cache_base);
+        if cache_after != cache_before {
+            self.persistent.reconfigure(cache_after);
+        }
         let after = self.runtime_options.effective(&self.base_options);
         self.accepted_scope = Some(scope);
         if before != after {
@@ -3762,6 +3794,12 @@ fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
         "maxFileBytes",
         "maxTotalBytes",
         "maxCacheBytes",
+        "maxWorkspaceUnits",
+        "persistentCacheEnabled",
+        "persistentCacheDirectory",
+        "persistentCachePageBytes",
+        "persistentCacheScratchBytes",
+        "persistentCacheWaitMs",
     ]
     .iter()
     .any(|key| object.contains_key(*key))
@@ -10482,6 +10520,9 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
 
 #[cfg(feature = "test-support")]
 const TEST_ANALYSIS_METRICS_METHOD: &str = "pascal/testAnalysisMetrics";
+const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
+#[cfg(feature = "test-support")]
+const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
 
 fn run_connection(
     connection: &ProtocolConnection,
@@ -10512,6 +10553,14 @@ fn run_connection(
         };
         break (initialize_id, initialize, options, initialize_value);
     };
+    let (cache_options, cache_warnings) =
+        CacheOptions::parse_initialization(initialize.initialization_options.as_ref());
+    for warning in cache_warnings {
+        eprintln!("pascal-lsp: warning: {warning}");
+    }
+    if let Some(invalid) = &cache_options.invalid {
+        eprintln!("pascal-lsp: warning: {invalid}");
+    }
     let roots = workspace_roots(&initialize);
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
     let configuration_pull_supported = supports_configuration(&initialize.capabilities);
@@ -10566,6 +10615,14 @@ fn run_connection(
     }
     let jobs =
         AnalysisJobs::with_test_barriers_and_progress(test_barriers, work_done_progress_supported);
+    let persistent = PersistentCache::start(
+        cache_options.clone(),
+        workspace.project_cache().clone(),
+        jobs.interactive_gate.clone(),
+    );
+    let _close = persistent.close_on_drop();
+    workspace.set_persistent_cache(persistent.clone());
+    configuration.set_persistent_cache(persistent.clone(), cache_options);
 
     event_loop(
         connection,
@@ -10581,6 +10638,7 @@ fn run_connection(
         watch_events,
         work_done_progress_supported,
         jobs,
+        &persistent,
         #[cfg(feature = "test-support")]
         analysis_metrics_endpoint,
     )
@@ -10943,6 +11001,7 @@ fn event_loop(
     watch_events: crate::file_watch::WatchEvents,
     work_done_progress_supported: bool,
     mut jobs: AnalysisJobs,
+    persistent: &PersistentCache,
     #[cfg(feature = "test-support")] analysis_metrics_endpoint: bool,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
@@ -11012,6 +11071,7 @@ fn event_loop(
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         warmer.shutdown();
                         jobs.shutdown_with_connection(connection)?;
+                        persistent.shutdown();
                         return Ok(true);
                     }
                     if deadline_expired {
@@ -11135,6 +11195,7 @@ fn event_loop(
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     warmer.shutdown();
                     jobs.shutdown_with_connection(connection)?;
+                    persistent.shutdown();
                     return Ok(true);
                 }
                 Err(TryRecvError::Empty) => {
@@ -11340,6 +11401,7 @@ fn event_loop(
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         warmer.shutdown();
                         jobs.shutdown();
+                        persistent.shutdown();
                         configuration.shutdown();
                         diagnostic_refresh.shutdown();
                         semantic_tokens_refresh.shutdown();
@@ -11385,6 +11447,7 @@ fn event_loop(
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     warmer.shutdown();
                     jobs.shutdown();
+                    persistent.shutdown();
                     configuration.shutdown();
                     diagnostic_refresh.shutdown();
                     semantic_tokens_refresh.shutdown();
@@ -11404,6 +11467,7 @@ fn event_loop(
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
+                persistent.shutdown();
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
                 semantic_tokens_refresh.shutdown();
@@ -11438,6 +11502,13 @@ fn event_loop(
                 deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
+            }
+            // Unordered: the handle needs no workspace, so it is answered
+            // ahead of deferred workspace and configuration work.
+            Message::Request(request)
+                if request.method == CACHE_STATUS_METHOD && !shutdown_received =>
+            {
+                send_ok(connection, request.id, persistent.status().to_json())?;
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
@@ -11474,6 +11545,32 @@ fn event_loop(
                     deferred_workspace_message_bytes,
                     deferred_workspace_overflow.as_ref(),
                 );
+            }
+            // In message order: behind pending file work (the arm above) and
+            // a configuration being prepared (the generic arm defers it).
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if request.method == TEST_CACHE_SETTLE_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let stepped = request
+                    .params
+                    .get("step")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    .then(|| persistent.step_now().map(|result| result.is_ok()))
+                    .flatten();
+                persistent.settle(Duration::from_secs(5));
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({
+                        "status": persistent.status().to_json(),
+                        "operations": pascal_cache::store_operations_for_test(),
+                        "stepped": stepped,
+                    }),
+                )?;
             }
             Message::Request(request) => {
                 if shutdown_received {
@@ -11592,6 +11689,7 @@ fn event_loop(
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
+                persistent.shutdown();
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
                 semantic_tokens_refresh.shutdown();
@@ -12194,6 +12292,10 @@ fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToke
 }
 
 fn request_requires_configuration(method: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    if method == TEST_CACHE_SETTLE_METHOD {
+        return true;
+    }
     matches!(
         method,
         "workspace/diagnostic"
@@ -15565,6 +15667,25 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn bare_persistent_cache_settings_are_a_runtime_section() {
+        for key in [
+            "persistentCacheEnabled",
+            "persistentCacheDirectory",
+            "persistentCachePageBytes",
+            "persistentCacheScratchBytes",
+            "persistentCacheWaitMs",
+            "maxWorkspaceUnits",
+        ] {
+            let settings = serde_json::json!({ key: null });
+            assert_eq!(
+                super::runtime_settings_section(&settings),
+                Ok(Some(settings.clone())),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn workspace_notification_deadline_log_distinguishes_trigger_from_elapsed_time() {
         assert_eq!(
             super::workspace_notification_deadline_log_message(true, false),
@@ -16641,6 +16762,7 @@ mod tests {
             crate::file_watch::WatchEvents::channel().1,
             false,
             AnalysisJobs::new(),
+            &super::PersistentCache::default(),
             #[cfg(feature = "test-support")]
             false,
         )

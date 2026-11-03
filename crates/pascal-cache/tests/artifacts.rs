@@ -536,6 +536,54 @@ fn republishing_over_a_conflicting_root_manifest_is_an_integrity_failure() {
     );
 }
 
+/// D28: a write that waits for the pool's writer, then for SQLite's write
+/// lock, is counted; both time out as `Busy`.
+#[test]
+fn waits_for_the_pool_and_the_write_lock_are_counted() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let before = pascal_cache::lock_waits();
+    {
+        let _held = store.hold_writer_for_test().unwrap();
+        assert_eq!(
+            store.publish_artifact(&write(&key("unit A;"), &ROWS)),
+            Err(Bypass::Busy)
+        );
+    }
+    let pooled = pascal_cache::lock_waits();
+    assert!(pooled.pool_waits > before.pool_waits, "{pooled:?}");
+    assert!(pooled.pool_wait_micros > before.pool_wait_micros);
+    assert!(pooled.busy > before.busy);
+    let other = raw(root.path());
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        store.publish_artifact(&write(&key("unit B;"), &ROWS)),
+        Err(Bypass::Busy)
+    );
+    other.execute_batch("ROLLBACK").unwrap();
+    let locked = pascal_cache::lock_waits();
+    assert!(locked.lock_waits > pooled.lock_waits, "{locked:?}");
+    assert!(locked.lock_wait_micros >= pooled.lock_wait_micros + 1_000);
+    assert!(locked.busy > pooled.busy);
+}
+
+/// The zero-IO tests of `pascal-lsp` read this counter (spec §12.1
+/// amendment 2026-11-03): opening, any connection lease and the
+/// administration functions count.
+#[test]
+fn every_store_access_counts_an_operation() {
+    let root = private_tempdir();
+    let start = pascal_cache::store_operations_for_test();
+    let store = open(root.path());
+    let opened = pascal_cache::store_operations_for_test();
+    assert!(opened > start);
+    store.check_scope().unwrap();
+    assert!(pascal_cache::store_operations_for_test() > opened);
+    let read = pascal_cache::store_operations_for_test();
+    let _ = pascal_cache::admin::status(root.path());
+    assert!(pascal_cache::store_operations_for_test() > read);
+}
+
 #[test]
 fn an_identical_republish_takes_the_next_sequence() {
     let root = private_tempdir();

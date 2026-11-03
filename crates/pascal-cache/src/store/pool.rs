@@ -77,6 +77,24 @@ impl Pool {
     }
 
     pub(crate) fn acquire(&self, role: Role, deadline: Deadline) -> Result<Lease<'_>, Bypass> {
+        super::count_operation();
+        let mut waited = None;
+        let result = self.acquire_waiting(role, deadline, &mut waited);
+        if let Some(started) = waited {
+            super::waits::record_pool_wait(started.elapsed());
+        }
+        if matches!(result, Err(Bypass::Busy)) {
+            super::waits::record_busy();
+        }
+        result
+    }
+
+    fn acquire_waiting(
+        &self,
+        role: Role,
+        deadline: Deadline,
+        waited: &mut Option<std::time::Instant>,
+    ) -> Result<Lease<'_>, Bypass> {
         let mut state = self.lock();
         loop {
             match role {
@@ -107,6 +125,7 @@ impl Pool {
             if remaining.is_zero() {
                 return Err(Bypass::Busy);
             }
+            waited.get_or_insert_with(std::time::Instant::now);
             state = self
                 .returned
                 .wait_timeout(state, remaining)

@@ -115,7 +115,7 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
-mod admitted;
+pub(crate) mod admitted;
 mod authorize;
 pub(crate) mod capture;
 mod catalogues;
@@ -129,7 +129,7 @@ pub(crate) mod extract;
 mod facts;
 #[cfg(all(test, unix))]
 mod isolation;
-mod persist;
+pub(crate) mod persist;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;
@@ -492,12 +492,19 @@ fn filename_catalogue_entry_limit() -> usize {
     MAX_FILENAME_CATALOGUE_ENTRIES
 }
 
+/// Compact catalogue members per project/configuration (spec §8);
+/// `l4d-zf1b.8` is its first consumer.
+pub(crate) const DEFAULT_MAX_WORKSPACE_UNITS: usize = pascal_cache::MAX_SNAPSHOT_MEMBERS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
     pub max_cache_bytes: usize,
+    /// Compact catalogue members per project/configuration (spec §8);
+    /// `l4d-zf1b.8` is its first consumer.
+    pub max_workspace_units: usize,
 }
 
 impl Default for ResourceLimits {
@@ -507,6 +514,7 @@ impl Default for ResourceLimits {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+            max_workspace_units: DEFAULT_MAX_WORKSPACE_UNITS,
         }
     }
 }
@@ -545,6 +553,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
     pub(crate) max_cache_bytes: RuntimeOption<usize>,
+    pub(crate) max_workspace_units: RuntimeOption<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -559,6 +568,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -672,6 +682,7 @@ impl RuntimeOptionsUpdate {
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
             max_cache_bytes: RuntimeOption::Reset,
+            max_workspace_units: RuntimeOption::Reset,
         }
     }
 }
@@ -707,6 +718,9 @@ impl RuntimeOptionsOverride {
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
                 max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
                 max_cache_bytes: self.max_cache_bytes.unwrap_or(base.limits.max_cache_bytes),
+                max_workspace_units: self
+                    .max_workspace_units
+                    .unwrap_or(base.limits.max_workspace_units),
             },
         }
     }
@@ -764,11 +778,17 @@ impl RuntimeOptionsOverride {
             "maxCacheBytes",
             &mut warnings,
         );
+        apply_runtime_field(
+            &mut self.max_workspace_units,
+            update.max_workspace_units,
+            "maxWorkspaceUnits",
+            &mut warnings,
+        );
         warnings
     }
 }
 
-fn apply_runtime_field<T: Clone>(
+pub(crate) fn apply_runtime_field<T: Clone>(
     target: &mut Option<T>,
     value: RuntimeOption<T>,
     name: &str,
@@ -835,6 +855,11 @@ pub(crate) fn parse_runtime_options(
             object,
             "maxCacheBytes",
             crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+        ),
+        max_workspace_units: parse_runtime_limit(
+            object,
+            "maxWorkspaceUnits",
+            DEFAULT_MAX_WORKSPACE_UNITS,
         ),
     })
 }
@@ -1113,6 +1138,7 @@ struct RawWorkspaceOptions {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 fn parse_conditional_context_values(
@@ -1300,6 +1326,10 @@ impl WorkspaceOptions {
                 crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
                 "maxCacheBytes",
             )?;
+        }
+        if let Some(value) = raw.max_workspace_units {
+            limits.max_workspace_units =
+                bounded_limit(value, 1, DEFAULT_MAX_WORKSPACE_UNITS, "maxWorkspaceUnits")?;
         }
         Ok(Self {
             source_paths: raw.source_paths,
@@ -2919,6 +2949,8 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    /// The process's persistent-cache handle; inert by default.
+    persistent_cache: crate::persistent_cache::PersistentCache,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3391,9 +3423,15 @@ impl Workspace {
         }
 
         let project_file_changed = self.options.project_file != prepared.options.project_file;
+        let budget_changed =
+            self.options.limits.max_cache_bytes != prepared.options.limits.max_cache_bytes;
         self.options = prepared.options;
         self.project_cache
             .set_max_bytes(self.options.limits.max_cache_bytes);
+        if budget_changed {
+            // Re-admit the store against the new budget (spec §11.1 amendment).
+            self.persistent_cache.readmit();
+        }
         self.roots = prepared.roots;
 
         self.bump_source_generation();
@@ -3490,6 +3528,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
+            persistent_cache: input.persistent_cache.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
@@ -13098,6 +13137,15 @@ impl Workspace {
 
     pub(crate) fn project_cache(&self) -> &crate::project_cache::ProjectCache {
         &self.project_cache
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
+    pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
+        &self.persistent_cache
+    }
+
+    pub(crate) fn set_persistent_cache(&mut self, cache: crate::persistent_cache::PersistentCache) {
+        self.persistent_cache = cache;
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {
@@ -23867,6 +23915,40 @@ BDS = '/fake/37'
     }
 
     #[test]
+    fn max_workspace_units_defaults_to_one_hundred_thousand() {
+        let options = WorkspaceOptions::parse(None).unwrap();
+        assert_eq!(options.limits.max_workspace_units, 100_000);
+    }
+
+    #[test]
+    fn max_workspace_units_is_configurable_downward_and_clamped() {
+        let parse = |value| WorkspaceOptions::parse(Some(&json!({"maxWorkspaceUnits": value})));
+        assert_eq!(parse(500).unwrap().limits.max_workspace_units, 500);
+        assert_eq!(parse(250_000).unwrap().limits.max_workspace_units, 100_000);
+        assert_eq!(
+            parse(0).unwrap_err(),
+            "initializationOptions.maxWorkspaceUnits must be at least 1"
+        );
+    }
+
+    #[test]
+    fn max_workspace_units_runtime_option_applies_keeps_and_resets() {
+        let base = WorkspaceOptions::default();
+        let mut runtime = super::RuntimeOptionsOverride::default();
+        runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 42})).unwrap());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        let warnings =
+            runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 0})).unwrap());
+        assert_eq!(
+            warnings,
+            ["ignoring runtime maxWorkspaceUnits: must be at least 1"]
+        );
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        runtime.apply(super::RuntimeOptionsUpdate::reset());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 100_000);
+    }
+
+    #[test]
     fn max_cache_bytes_initialization_option_sets_cache_budget() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let options = WorkspaceOptions::parse(Some(&json!({"maxCacheBytes": 1_048_576})))
@@ -23968,6 +24050,47 @@ BDS = '/fake/37'
 
         assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
         assert!(!workspace.project_cache.has_room());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_cache_budget_change_readmits_the_persistent_store() {
+        use crate::persistent_cache::{CacheOptions, CacheState, PersistentCache, StatusCause};
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let store = super::persist::tests::private_dir();
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let cache = PersistentCache::start_unscheduled_for_test(
+            CacheOptions {
+                directory: Some(store.path().to_path_buf()),
+                ..CacheOptions::default()
+            },
+            workspace.project_cache.clone(),
+            Arc::default(),
+            pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([0x5d; 32])),
+        );
+        let settle = std::time::Duration::from_secs(10);
+        assert_eq!(cache.settle(settle), CacheState::Enabled);
+        workspace.set_persistent_cache(cache.clone());
+        let update = super::parse_runtime_options(&json!({"maxCacheBytes": 1_048_576}))
+            .expect("runtime cache budget option");
+        let mut overrides = RuntimeOptionsOverride::default();
+        assert!(overrides.apply(update).is_empty());
+        let prepared = Workspace::prepare_runtime_options_for_roots(
+            workspace.configuration_root_paths(),
+            overrides.effective(&workspace.options),
+            &AtomicBool::new(false),
+        )
+        .expect("prepared runtime options");
+
+        assert!(workspace.apply_prepared_runtime_options(prepared));
+
+        assert_eq!(
+            cache.settle(settle),
+            CacheState::Bypassed(StatusCause::Memory)
+        );
+        assert_eq!(workspace.project_cache.stats().reserved_bytes(), 0);
+        cache.shutdown();
     }
 
     #[test]
@@ -24235,6 +24358,7 @@ BDS = '/fake/37'
             overlays,
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
+            persistent_cache: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
@@ -25198,6 +25322,7 @@ BDS = '/fake/37'
                 max_file_bytes: source.len() + 3,
                 max_total_bytes: source.len() * 3,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };
@@ -25263,6 +25388,7 @@ BDS = '/fake/37'
                 max_file_bytes: 1024,
                 max_total_bytes: first_source.len() * 2 + second_source.len() * 2,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };
@@ -26308,6 +26434,26 @@ BDS = '/fake/37'
 
         assert!(workspace.contexts.contains_key(&live));
         assert!(!workspace.contexts.contains_key(&orphan));
+    }
+
+    #[test]
+    fn request_workspaces_carry_the_persistent_cache_handle() {
+        let mut workspace = Workspace::default();
+        let inert = format!("{:?}", workspace.persistent_cache());
+        assert!(inert.contains("inert: true"), "{inert}");
+        // Disabled: no worker, no store, no IO.
+        let options = crate::persistent_cache::CacheOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        workspace.set_persistent_cache(crate::persistent_cache::PersistentCache::start(
+            options,
+            workspace.project_cache().clone(),
+            Arc::default(),
+        ));
+        let request = Workspace::from_analysis_input(&workspace.analysis_input());
+        let carried = format!("{:?}", request.persistent_cache());
+        assert!(carried.contains("inert: false"), "{carried}");
     }
 
     #[test]

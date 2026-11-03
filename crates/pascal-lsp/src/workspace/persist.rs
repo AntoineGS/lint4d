@@ -7,6 +7,7 @@ use super::evidence::EvidenceGap;
 use super::validate::{
     CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
 };
+use crate::persistent_cache::counters::MissCause;
 use crate::project_cache::{Reservation, ReservationKind};
 use lsp_types::Url;
 use pascal_cache::{
@@ -188,6 +189,41 @@ pub(crate) enum ReuseMiss {
     Stale(Stale),
     Unproven(Unproven),
     Store(Miss),
+}
+
+impl ReuseMiss {
+    /// The diagnostic cause (spec §11.2 amendment 2026-11-03, D27).
+    pub(crate) fn cause(&self) -> MissCause {
+        use MissCause::*;
+        match self {
+            Self::Open | Self::Store(Miss::Absent) | Self::Stale(Stale::Context) => Input,
+            Self::Store(Miss::KeyMismatch(_)) => Version,
+            Self::Stale(Stale::Unauthorized(_)) => Authorization,
+            Self::Stale(_) | Self::Store(Miss::Retired | Miss::Vanished) => Freshness,
+            Self::Unproven(_) | Self::Store(Miss::Oversized) => Budget,
+            Self::Store(Miss::Malformed(_) | Miss::ChecksumMismatch) => Integrity,
+        }
+    }
+}
+
+impl PersistError {
+    /// A store bypass is counted as a bypass, everything else as a miss.
+    pub(crate) fn cause(&self) -> Result<MissCause, &Bypass> {
+        use MissCause::*;
+        match self {
+            Self::Store(bypass) => Err(bypass),
+            Self::Unauthorized => Ok(Authorization),
+            Self::RootChanged => Ok(Freshness),
+            Self::Cancelled => Ok(Budget),
+            Self::NotPersistable(_)
+            | Self::Fact(_)
+            | Self::Evidence(_)
+            | Self::Key(_)
+            | Self::Unreadable(_)
+            | Self::Context(_)
+            | Self::NotIndexed => Ok(Input),
+        }
+    }
 }
 
 impl Workspace {
@@ -466,7 +502,7 @@ impl Workspace {
 }
 
 #[cfg(all(test, unix))]
-pub(in crate::workspace) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workspace::ReconciliationBudget;
     use crate::workspace::facts::tests::{
@@ -482,7 +518,7 @@ pub(in crate::workspace) mod tests {
     pub(in crate::workspace) const SHAPES: &[u8] =
         b"unit Shapes;\ninterface\ntype TPair = record A, B: Integer; end;\nimplementation\nend.\n";
 
-    pub(in crate::workspace) fn private_dir() -> tempfile::TempDir {
+    pub(crate) fn private_dir() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), PermissionsExt::from_mode(0o700)).unwrap();
         directory
@@ -558,6 +594,44 @@ pub(in crate::workspace) mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn reuse_misses_map_to_their_diagnostic_causes() {
+        use crate::persistent_cache::counters::MissCause::*;
+        use pascal_cache::{Malformed, Mismatch, Miss};
+        let path = std::path::PathBuf::from("/p/A.pas");
+        for (miss, cause) in [
+            (ReuseMiss::Open, Input),
+            (ReuseMiss::Store(Miss::Absent), Input),
+            (ReuseMiss::Stale(Stale::Context), Input),
+            (
+                ReuseMiss::Store(Miss::KeyMismatch(Mismatch::DigestDiffers)),
+                Version,
+            ),
+            (ReuseMiss::Store(Miss::Retired), Freshness),
+            (ReuseMiss::Store(Miss::Vanished), Freshness),
+            (ReuseMiss::Stale(Stale::Content(path.clone())), Freshness),
+            (ReuseMiss::Stale(Stale::Overlay(path.clone())), Freshness),
+            (
+                ReuseMiss::Stale(Stale::Unauthorized(path.clone())),
+                Authorization,
+            ),
+            (ReuseMiss::Unproven(Unproven::Memory), Budget),
+            (ReuseMiss::Unproven(Unproven::Cancelled), Budget),
+            (ReuseMiss::Store(Miss::Oversized), Budget),
+            (ReuseMiss::Store(Miss::Malformed(Malformed::Row)), Integrity),
+            (ReuseMiss::Store(Miss::ChecksumMismatch), Integrity),
+        ] {
+            assert_eq!(miss.cause(), cause, "{miss:?}");
+        }
+        assert_eq!(PersistError::Unauthorized.cause(), Ok(Authorization));
+        assert_eq!(PersistError::RootChanged.cause(), Ok(Freshness));
+        assert_eq!(PersistError::Cancelled.cause(), Ok(Budget));
+        assert_eq!(
+            PersistError::Store(Bypass::Busy).cause(),
+            Err(&Bypass::Busy)
+        );
     }
 
     #[test]

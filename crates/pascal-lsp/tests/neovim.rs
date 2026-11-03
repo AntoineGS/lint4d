@@ -747,7 +747,9 @@ fn neovim_standard_assistance_requests_use_overlays_without_saving() {
     fs::write(directory.path().join("Main.pas"), main_source).unwrap();
 
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new("nvim")
+    let environment = tempfile::tempdir().unwrap();
+    let mut command = Command::new("nvim");
+    command
         .args(["--headless", "-u", "NONE", "-l"])
         .arg(manifest.join("tests/neovim_assistance_smoke.lua"))
         .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
@@ -755,9 +757,9 @@ fn neovim_standard_assistance_requests_use_overlays_without_saving() {
         .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if child.try_wait().unwrap().is_some() {

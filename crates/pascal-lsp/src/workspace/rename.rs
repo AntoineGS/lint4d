@@ -243,6 +243,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
     pub(crate) project_cache: crate::project_cache::ProjectCache,
+    pub(crate) persistent_cache: crate::persistent_cache::PersistentCache,
     pub(crate) cache_epoch: u64,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
@@ -1476,6 +1477,7 @@ impl Workspace {
             overlays,
             cached_documents,
             project_cache: self.project_cache.clone(),
+            persistent_cache: self.persistent_cache.clone(),
             cache_epoch: self
                 .cache_epoch
                 .unwrap_or_else(|| self.project_cache.invalidation_epoch()),

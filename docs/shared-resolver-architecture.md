@@ -406,6 +406,211 @@ because include ... could not be read: ...`) instead of assuming the include is
 empty. Semantic-token requests may retain lexical tokens while suppressing
 semantic classifications when include resolution is uncertain.
 
+## Workspace index (l4d-33)
+
+Non-local `textDocument/references` and `workspace/symbol` used to build a
+whole-workspace snapshot per request: walk every source root, resolve an owner
+context per file, read and filter every file. The workspace index
+(`workspace_index.rs`, `workspace/indexing.rs`) replaces that walk with
+per-context facts that survive the request, so both answer from candidates and
+report what they could not search.
+
+### What it holds
+
+The index is built from compact per-document facts
+(`pascal_core::facts::ArtifactFacts`), never from retained syntax trees. A
+document's facts enter through one function, `MemberFacts::from_facts`: unit
+names (declared unit and file stem, canonical), imports by name, identifier
+postings of every activity, declarations (kind, shape, unit scope, owner,
+location as include slot plus range) and the include slot paths. The
+declaration facts carry `extent`, `shape`, `unit_scope` and `owner`, so symbols
+can be served without a parse. Fresh extraction is the only caller today;
+persisted reuse (`l4d-zf1b.8`) will call the same function.
+
+One `ContextIndex` exists per `ContextKey` (at most 8, least recently used
+evicted, `MAX_INDEXED_CONTEXTS`). It keeps the members, an interner of names,
+inverted lists (postings, importers, declared units), the include-dependents
+map, the membership scopes with their catalogue generations, a generation
+counter and the last 4,096 `(generation, path)` changes. Disk facts only:
+open documents are never indexed and edits never mutate the index. An open
+document is always a candidate and is answered from its live parse.
+
+### Membership
+
+Membership is computed per context from `l4d-20` directory catalogues, not from
+a walk.
+
+- **Project contexts**: the main source, every explicit unit and the `.pas`
+  files of the `Listing` catalogues of the main-source directory, each
+  search-path directory and each explicit-unit directory. A path is accepted
+  when `(accepts_path && is_safe_source_path) || mapped_path_is_readable`, so
+  mapped library sources stay in or out exactly as today's mapped roots do.
+  Units provided only through runtime packages are not members.
+- **Projectless contexts**: the `.pas` files of the recursive workspace-root and
+  search-path catalogues whose discovered owner is that context. A file owned by
+  a project is a member of that project only.
+- **Cap**: `MAX_WORKSPACE_UNITS = 100,000` members per context, truncated in
+  path order.
+
+Owner discovery reuses a sibling directory's owner only when its context is
+retained and fresh, memoized per key per request, and discovers at most 256
+directories per call (`MAX_REQUEST_OWNER_DISCOVERY`); the rest stay pending and
+the membership is marked incomplete. A `.dpr`/`.dpk` descriptor with a
+same-stem `.dproj` in its directory is skipped as a symbol target, since the
+`.dproj` is its project.
+
+Targets of one request, in order and without duplicates: the requesting
+document's owner, the owners of open documents (most recent first), the
+configured project, for symbols the contexts of project descriptors under the
+workspace roots, then the owners of workspace sources no target holds. At most
+16 targets (`MAX_TARGET_CONTEXTS`); descriptor resolution attempts are capped at
+twice that. Indexed requests do not walk mapped roots: units reachable only
+through runtime-package mappings are a coverage gap, not searched.
+
+### Candidate rules and soundness
+
+References resolve the binding first through the bounded `LocalWithImports`
+snapshot and read its members. If every member is top-level (unit scope, no
+owner type, not an enum value, field or property), the top-level rule applies,
+otherwise the member rule:
+
+- **Top-level**: the declaring unit plus every member that imports it and has an
+  identifier posting for one of the binding's names.
+- **Member**: every member of every target context with a posting for the name.
+- Postings are matched on the last dotted segment of each name after
+  `canonical_name`. A non-ASCII name, or an empty one (or one ending in `.`),
+  proves nothing and skips the filter.
+
+A member is an importer of unit `D` when an import name, or an alias target,
+matches `import_names_for(D)` exactly, or when its last dotted segment equals
+the last segment of a name in that set. The widening follows the resolver's
+short-name tier, which binds `uses Vendor.Foo` to `Foo.pas`. Every member
+imports the implicit units `system` and `sysinit`. Ambiguous or same-named
+imports still make a member a candidate, so ambiguity is conservative without
+resolving anything.
+
+Soundness argument. Naming a unit-scope identifier of `D` from unit `U`
+requires `D` in `U`'s scope: `U` is `D`, or `U` imports a name that resolves to
+`D`. Pascal has no re-export, so direct importers suffice. Every spelling the
+resolver can map to `D` (exact, namespace-prefixed, aliased, short-name) is
+covered by the widened name set, and the reference text contains the binding
+name's last segment as an identifier run, which is a posting when the name is
+ASCII. Conditional references are postings of another activity, and every
+activity counts. A type member can be reached through inheritance, `with`,
+helpers or another unit's declarations without importing the declaring unit, so
+the member rule uses postings alone. Nothing is pruned without proof: anything
+the rules cannot decide is a candidate, anything outside the searched contexts
+is reported.
+
+Today's binding finds no member reference from a unit that does not import the
+declaring unit; the member rule is therefore a superset of what binding can
+return. Cross-unit member resolution through types reached via non-imported
+units is not implemented in either path.
+
+### Freshness
+
+Facts are trusted only for members whose stamps still prove them unchanged. A
+member has one stamp for its own path and one per expanded include slot, taken
+before the bytes were read; include stamps come from the load's own read
+observations. Every request stats the excluded members' stamps (and the
+contributing members' for symbols); a mismatch makes the member unverified for
+this request and marks it stale for the warmer. A member with an unresolved
+include slot but unchanged stamps is unverified on every request without being
+marked stale, so a created include file is noticed. The excluded members'
+paths and stamps, and the membership catalogue directories (from the catalogue
+generation the membership recorded), join the snapshot baseline, so a result is
+rejected when one of them changed.
+
+Unindexed, stale and unverified members are candidates: the snapshot reads and
+filters them as before, at most `MAX_UNVERIFIED_CANDIDATES = 2,048` per request
+in path order. Members refused for a stable reason (over the size limit,
+unreadable) are reported, not searched. Transient failures leave a member
+pending. Members of other targets outside the workspace roots that the indexed
+enumeration may not bind are filtered before that bound and reported.
+
+Invalidation: a changed member path goes `Stale`; a changed include marks its
+dependents `Stale`; a listing change dirties the membership scopes that listed
+the directory and the next batch or query reconciles them; overflow stales
+every member, dirties every membership and clears the owner map.
+
+### Memory
+
+Index bytes are charged to `maxCacheBytes` through a
+`ReservationKind::WorkspaceIndex` bucket held by the store (no `Reservation`
+value, to avoid a cycle with the cache), capped at a quarter of
+`maxCacheBytes` and reported as `reserved_index_bytes`. A member's charge is
+computed before it is inserted (`ContextIndex::charge_for`) and deliberately
+overcounts: every distinct name is charged as new to the interner, each list
+entry is counted twice (the inverted list and the per-member list kept for
+removal) and include keys are included. `ContextIndex::bytes()` is the sum of
+member charges, so interner compaction would need no release. The membership
+charge per path is `3 × len + size_of::<Member>() + 64`. When a charge fails
+the least recently used other index is evicted once; if it still fails the
+member stays unindexed and the coverage says so. Two contexts sharing a
+document each charge their own copy: an overcount, never an undercount.
+
+The test `index_bytes_per_member_stay_within_the_estimate` builds 1,000 members
+with 300 distinct postings, 20 imports and 40 declarations each and asserts at
+most 64 KiB per member; it measured 27,326 bytes per member.
+
+An index build does not publish parses (`Workspace::index_build`): the batch
+view drops its `ProjectCache` claim after extracting facts, so a build does not
+evict interactive parses.
+
+### Scheduling
+
+The warmer builds indexes in batches of 64 units (`INDEX_BATCH_UNITS`) only when
+its open-file queue is empty, project anchors before document anchors, at most
+16 queued anchors. A batch yields before every unit through the interactive
+gate, and also when a new crawl is pending (a crawl flag checked between
+units); a paused batch is requeued. A batch is requeued when it made progress
+(indexed, refreshed or refused something), is not complete and did not hit the
+memory limit, which avoids livelock. Warm `End` of an open file requests its
+context. Requests that find an incomplete index request its anchor too. Each
+batch stamps a member before its read, one `before_io` call per member.
+Configuration changes produce new `ContextKey`s and so new indexes. Rename,
+code actions and references on `.inc` documents keep the whole-workspace walk.
+
+### Coverage messages
+
+Each gap is one coverage note (at most 32 are kept). The wordings emitted:
+
+- `<n> units of <context> are not indexed yet; <m> were searched directly`
+- `<n> sources under the workspace roots belong to contexts that were not searched`
+- `<n> requested sources belong to no searched context and were not searched`
+- `<n> units of <context> outside the workspace roots were not searched`
+- `<context> has more than <MAX_WORKSPACE_UNITS> units; the rest were not searched`
+- `<context> membership is incomplete; some units were not searched`
+- `units provided through runtime packages of <context> were not searched`
+- `<n> units could not be indexed: <first reason>`
+- `the workspace index memory share is exhausted`
+- `no project context is open; open a source or select a project`
+
+`workspace/symbol` answers from the Fresh members' declarations of the target
+contexts, merged with unverified members and open documents, deduplicated on
+`(uri, range, name)`, ordered by URI then start. The 10,000-result error fires
+early, on deduplicated facts. A workspace with no target from the first three
+target kinds keeps today's snapshot path only when it is small (at most 2,048
+sources and 64 descriptors); otherwise the last message above applies. A
+declaration in an include slot is reported at the include file; nested routines
+and routine-local types are not facts and appear only for open documents.
+
+### Not yet built
+
+- The `maxWorkspaceUnits` client option (the cap is a constant; tests lower it
+  through the store).
+- Hash-consing members shared by several contexts.
+- Compaction of the per-context interner (names of removed members stay until
+  the context empties; they are not charged).
+- A native-watch fast path for verifying excluded members (`l4d-20`
+  `SharedCatalogue::watched`); each request stats them today.
+- `.inc` references on `ContextIndex::include_dependents` (`l4d-35`).
+- Population from persisted facts (`l4d-zf1b.8`).
+- Relative `projectFile` anchors.
+- Cross-unit member resolution through types reached via non-imported units.
+- References on very large workspaces remain subject to the Workspace-mode
+  completeness precheck (`l4d-xsvq`).
+
 ## Dependency identity
 
 cfg-core and cfg-pascal are workspace crates (`crates/cfg-core`,

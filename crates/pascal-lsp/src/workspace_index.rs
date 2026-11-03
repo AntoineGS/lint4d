@@ -1556,4 +1556,53 @@ mod tests {
         );
         assert_eq!(index.candidates(&member_rule(&[""])).selected.len(), 1);
     }
+
+    #[test]
+    fn index_bytes_per_member_stay_within_the_estimate() {
+        const MEMBERS: usize = 1_000;
+        let mut index = ContextIndex::new();
+        let member_paths: Vec<PathBuf> = (0..MEMBERS)
+            .map(|id| PathBuf::from(format!("/workspace/src/module{id:04}/Unit{id:04}.pas")))
+            .collect();
+        index.set_members(member_paths.clone());
+        for (id, path) in member_paths.iter().enumerate() {
+            let imports: Vec<String> = (0..20).map(|n| format!("vendor.core.unit{n}")).collect();
+            let imports: Vec<&str> = imports.iter().map(String::as_str).collect();
+            let postings: Vec<String> = (0..300)
+                .map(|n| format!("identifier{id:04}x{n:03}"))
+                .collect();
+            let postings: Vec<&str> = postings.iter().map(String::as_str).collect();
+            let declarations: Vec<(String, DeclarationKind, DeclarationShape, bool)> = (0..40)
+                .map(|n| {
+                    (
+                        format!("TDeclaration{id:04}x{n:02}"),
+                        DeclarationKind::Type,
+                        DeclarationShape::Class,
+                        true,
+                    )
+                })
+                .collect();
+            let declarations: Vec<(&str, DeclarationKind, DeclarationShape, bool)> = declarations
+                .iter()
+                .map(|(name, kind, shape, scope)| (name.as_str(), *kind, *shape, *scope))
+                .collect();
+            let unit = format!("unit{id:04}");
+            let facts = MemberFacts::from_facts(
+                path,
+                &facts(&unit, &imports, &postings, &declarations),
+                vec![],
+            );
+            let stamps = vec![MemberStamp {
+                path: path.clone(),
+                stamp: None,
+            }];
+            assert!(index.insert(path, facts, stamps, 1).is_some());
+        }
+        let per_member = index.bytes() / MEMBERS;
+        println!("workspace index bytes per member: {per_member}");
+        assert!(
+            per_member <= 64 * 1024,
+            "{per_member} bytes per member exceeds the 64 KiB estimate"
+        );
+    }
 }

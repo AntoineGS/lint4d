@@ -1024,6 +1024,13 @@ struct WorkerAdmission {
 /// client requests (never to another diagnostics job, which would pause in
 /// turn). Lent jobs do not count against the reserved interactive slot, so
 /// it stays available after the diagnostics they borrowed from resume.
+///
+/// Bound: diagnostics only start in free general slots, so at most
+/// `MAX_GENERAL_ANALYSIS_JOBS` of them run, and each lends at most one slot
+/// while paused. Running workers therefore never exceed
+/// `MAX_ANALYSIS_JOBS + MAX_GENERAL_ANALYSIS_JOBS` (5): the usual three plus
+/// one lent job per diagnostic that paused, which keep running after it
+/// resumes.
 fn worker_admission(
     interactive: usize,
     general: usize,
@@ -1039,7 +1046,13 @@ fn worker_admission(
             lent: false,
         });
     }
-    if paused > 0 && general - paused < MAX_GENERAL_ANALYSIS_JOBS {
+    // Lent work may be interactive, so the lend also counts interactive jobs
+    // against the slots the paused jobs leave: without it, every queued
+    // interactive request would start at once.
+    if paused > 0
+        && general - paused < MAX_GENERAL_ANALYSIS_JOBS
+        && interactive + (general - paused) < MAX_ANALYSIS_JOBS
+    {
         return Some(WorkerAdmission {
             interactive_only: false,
             diagnostics: false,
@@ -19102,6 +19115,65 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_diagnostic_lends_one_slot_not_the_whole_interactive_backlog() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        workspace
+            .open_document(
+                uri.clone(),
+                "unit Main; interface implementation end.\n".into(),
+                1,
+            )
+            .expect("open");
+        let mut jobs = AnalysisJobs::new();
+        let held = hold_pull_diagnostics(&mut jobs);
+        jobs.interactive_gate.set_paused_background_for_tests(1);
+        let hovers = [1, 2, 3, 4];
+        for id in hovers {
+            queue_test_client(
+                &mut jobs,
+                id,
+                AnalysisRequest::Hover {
+                    uri: uri.clone(),
+                    position: Position::new(0, id as u32),
+                    format: MarkupKind::PlainText,
+                },
+            );
+        }
+        let running = |jobs: &AnalysisJobs| {
+            jobs.pending
+                .values()
+                .filter(|job| job.priority == AnalysisPriority::Interactive)
+                .count()
+        };
+        let _ = jobs.pump(&workspace, None);
+        // One diagnostic runs and one is paused: the reserved slot and the
+        // lent one take interactive work, and nothing else starts.
+        assert_eq!(running(&jobs), 2, "the paused slot is lent once");
+        assert_eq!(jobs.queue.len(), 2, "the rest of the backlog waits");
+
+        let (server, client) = Connection::memory();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hovers.iter().any(|id| {
+            running_client(&jobs, *id)
+                || jobs.queue.iter().any(|queued| {
+                    matches!(queued, super::QueuedAnalysis::Client(job)
+                        if job.id == AnalysisComputationId(*id))
+                })
+        }) {
+            assert!(Instant::now() < deadline, "the backlog completes");
+            jobs.poll(&server, &mut workspace).expect("poll");
+            assert!(running(&jobs) <= 2, "never more than the bounded number");
+            while client.receiver.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(held);
+        jobs.shutdown();
+    }
+
+    #[test]
     fn queued_pull_diagnostics_do_not_pause_running_diagnostics() {
         let mut jobs = AnalysisJobs::new();
         let uri = Url::parse("file:///Main.pas").unwrap();
@@ -19167,6 +19239,11 @@ mod tests {
         assert_eq!(super::worker_admission(0, 3, 1, 1), interactive);
         assert_eq!(super::worker_admission(0, 4, 2, 0), interactive);
         assert_eq!(super::worker_admission(1, 3, 1, 1), None);
+        // A paused diagnostic's slot is lent once, not to every queued
+        // interactive request.
+        assert_eq!(super::worker_admission(2, 2, 0, 1), None);
+        assert_eq!(super::worker_admission(3, 2, 0, 2), None);
+        assert_eq!(super::worker_admission(2, 2, 0, 2), lend);
 
         let mut queue = PriorityQueue::new();
         queue.push(AnalysisPriority::Diagnostics, "diagnostic");

@@ -14,7 +14,8 @@ use crate::workspace::rename::WorkspaceInput;
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
     idle: Condvar,
-    /// Queued client requests of any priority, which wait for a worker.
+    /// Queued Interactive and Bulk client requests, which wait for a worker
+    /// and could take a lent slot (queued pull diagnostics are not counted).
     waiting_clients: std::sync::atomic::AtomicUsize,
     /// Background jobs paused in `yield_to_interactive_work`. Their workers
     /// use no CPU meanwhile, so the dispatcher lends their slots to client

@@ -285,7 +285,7 @@ CREATE INDEX lease_holds_by_snapshot
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Container {
+pub(crate) enum Container {
     Fresh,
     Current,
 }
@@ -342,7 +342,7 @@ fn run_hook(point: HookPoint) {
 /// Read-only inspection: nothing is written to a file that is not ours.
 /// The header and schema are read in one statement, so one snapshot: read
 /// separately, a creation committed between them looks foreign.
-fn inspect(connection: &Connection) -> Result<Container, Bypass> {
+pub(crate) fn inspect(connection: &Connection) -> Result<Container, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let (application_id, user_version, tables): (i64, i64, i64) = connection
         .query_row(

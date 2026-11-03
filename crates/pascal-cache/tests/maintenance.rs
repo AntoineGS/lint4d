@@ -8,6 +8,7 @@ use common::records::{
     EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
     local_member, member, open, raw, read_members, read_record, records, sealed,
 };
+use pascal_cache::admin::{self, RecoveryAdvice, StoreStatus};
 use pascal_cache::{
     ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, DiscoveryInputs,
     DiscoveryScope, EvidenceTarget, EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint,
@@ -17,6 +18,7 @@ use pascal_cache::{
     Published, Reclaimed, RetireStep, ScannedDirectory, SnapshotSeal, SourceContent, StepBudget,
     Store, StorePolicy, Unhealthy,
 };
+use pascal_cache::{Namespace, StoreLimits};
 use pascal_core::facts::ArtifactFacts;
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
@@ -1568,4 +1570,238 @@ fn a_cycle_completes_only_once_every_retired_scope_is_gone() {
     let report = maintenance.step(&store, budget, &never).unwrap();
     assert!(report.cycle_complete, "{report:?}");
     assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
+}
+
+fn namespace() -> Namespace {
+    Namespace::new(Digest::from_bytes([common::records::NAMESPACE; 32]))
+}
+
+#[test]
+fn status_of_an_absent_store_creates_nothing() {
+    let root = private_tempdir();
+    let directory = root.path().join("cache");
+    assert_eq!(admin::status(&directory), StoreStatus::Absent);
+    assert!(!directory.exists());
+    assert_eq!(
+        admin::prune(&directory, &namespace(), StoreLimits::default(), ROOMY),
+        Ok(None)
+    );
+    assert_eq!(
+        admin::reset(&directory, &namespace(), StoreLimits::default()),
+        Ok(false)
+    );
+    assert!(!directory.exists());
+}
+
+#[test]
+fn status_reports_usage_policy_and_counts_without_registering() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let StoreStatus::Present(report) = admin::status(root.path()) else {
+        panic!()
+    };
+    assert_eq!(report.policy.policy, StorePolicy::default());
+    assert_eq!(
+        (
+            report.live_namespaces,
+            report.live_leases,
+            report.retired_scopes
+        ),
+        (1, 1, 0)
+    );
+    assert!(report.usage.physical_bytes() > 0);
+    assert_eq!(
+        (report.container.version, report.container.compatible),
+        (pascal_cache::CONTAINER_VERSION, true)
+    );
+    assert_eq!(report.advice, RecoveryAdvice::None);
+    drop(store);
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM process_leases"),
+        0,
+        "status took no lease"
+    );
+    assert_eq!(count(root.path(), "SELECT count(*) FROM namespaces"), 1);
+}
+
+#[test]
+fn a_corrupt_container_is_left_in_place_with_fresh_directory_advice() {
+    let root = private_tempdir();
+    let path = root.path().join(DATABASE_FILE);
+    std::fs::write(&path, vec![0x5a; 8192]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        admin::status(root.path()),
+        StoreStatus::Unreadable {
+            bypass: Bypass::Corrupt,
+            advice: RecoveryAdvice::FreshDirectory
+        }
+    );
+    assert_eq!(
+        admin::prune(root.path(), &namespace(), StoreLimits::default(), ROOMY),
+        Err(Bypass::Corrupt)
+    );
+    assert_eq!(
+        admin::reset(root.path(), &namespace(), StoreLimits::default()),
+        Err(Bypass::Corrupt)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "never rewritten");
+    let names: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        names.contains(&DATABASE_FILE.into()),
+        "never renamed or removed"
+    );
+}
+
+#[test]
+fn an_unsupported_container_is_reported_and_never_reclaimed() {
+    let root = private_tempdir();
+    drop(open(root.path()));
+    raw(root.path())
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+    let before = std::fs::read(root.path().join(DATABASE_FILE)).unwrap();
+    assert_eq!(
+        admin::status(root.path()),
+        StoreStatus::Unreadable {
+            bypass: Bypass::UnsupportedContainer { version: 99 },
+            advice: RecoveryAdvice::FreshDirectory
+        }
+    );
+    assert!(admin::prune(root.path(), &namespace(), StoreLimits::default(), ROOMY).is_err());
+    assert_eq!(
+        std::fs::read(root.path().join(DATABASE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_read_only_database_is_bypassed_and_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = private_tempdir();
+    drop(open(root.path()));
+    let path = root.path().join(DATABASE_FILE);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        admin::status(root.path()),
+        StoreStatus::Unreadable {
+            bypass: Bypass::ReadOnly,
+            ..
+        }
+    ));
+    assert_eq!(
+        admin::prune(root.path(), &namespace(), StoreLimits::default(), ROOMY),
+        Err(Bypass::ReadOnly)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_reset_fences_every_handle_and_reclaims_the_old_epoch() {
+    let root = private_tempdir();
+    let first = open(root.path());
+    let second = open(root.path());
+    sealed(&first, &records(&first, "M", 3));
+    first.reset_namespace().unwrap();
+    assert_eq!(first.check_scope(), Err(Bypass::Fenced));
+    assert_eq!(
+        second.find_snapshots(&context()).err(),
+        Some(Bypass::Fenced)
+    );
+    drop((first, second));
+    let again = open(root.path());
+    assert_eq!(again.scope().reset_epoch, 1);
+    assert_eq!(
+        again.find_snapshots(&context()),
+        Ok(Lookup::Miss(Miss::Absent))
+    );
+    while !again.reclaim(256).unwrap().complete {}
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM member_records WHERE reset_epoch = 0"
+        ),
+        0
+    );
+    assert_eq!(count(root.path(), "SELECT count(*) FROM namespaces"), 1);
+}
+
+#[test]
+fn admin_reset_fences_and_reclaims_a_present_store() {
+    let root = private_tempdir();
+    let holder = open(root.path());
+    sealed(&holder, &records(&holder, "M", 3));
+    assert!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM member_records WHERE reset_epoch = 0"
+        ) > 0
+    );
+    assert_eq!(
+        admin::reset(root.path(), &namespace(), StoreLimits::default()),
+        Ok(true)
+    );
+    assert_eq!(holder.check_scope(), Err(Bypass::Fenced));
+    assert_eq!(
+        count(
+            root.path(),
+            "SELECT count(*) FROM member_records WHERE reset_epoch = 0"
+        ),
+        0,
+        "the bounded reclamation ran"
+    );
+    drop(holder);
+    assert_eq!(open(root.path()).scope().reset_epoch, 1);
+}
+
+#[test]
+fn a_read_only_directory_is_bypassed_and_left_alone() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = private_tempdir();
+    drop(open(root.path()));
+    let snapshot = |directory: &Path| {
+        let mut entries: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = snapshot(root.path());
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let status = admin::status(root.path());
+    let pruned = admin::prune(root.path(), &namespace(), StoreLimits::default(), ROOMY);
+    let opened = Store::open(root.path(), &namespace(), StoreLimits::default());
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let StoreStatus::Unreadable { bypass, advice } = status else {
+        panic!("{status:?}")
+    };
+    assert_eq!(advice, pascal_cache::admin::advice(&bypass));
+    assert_eq!(pruned.err(), Some(bypass.clone()));
+    assert_eq!(opened.err(), Some(bypass.clone()));
+    assert_eq!(bypass, Bypass::ReadOnly, "observed");
+    assert_eq!(advice, RecoveryAdvice::FreshDirectory);
+    assert_eq!(snapshot(root.path()), before);
 }

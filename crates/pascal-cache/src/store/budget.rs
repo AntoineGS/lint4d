@@ -224,20 +224,8 @@ fn filesystem_free_bytes(_directory: &std::path::Path) -> Option<u64> {
 }
 
 pub(crate) fn read_usage(store: &Store, connection: &Connection) -> Result<Usage, Bypass> {
-    let [database, wal, shm] = store
-        .location
-        .database_files()
-        .map(|file| std::fs::metadata(file).map_or(0, |metadata| metadata.len()));
     #[allow(unused_mut)]
-    let mut usage = Usage {
-        database_bytes: database,
-        wal_bytes: wal,
-        shm_bytes: shm,
-        page_size: pragma(connection, "page_size")?,
-        page_count: pragma(connection, "page_count")?,
-        free_pages: pragma(connection, "freelist_count")?,
-        filesystem_free_bytes: filesystem_free_bytes(store.location.directory()),
-    };
+    let mut usage = read_usage_at(&store.location, connection)?;
     #[cfg(feature = "test-support")]
     {
         usage.database_bytes = usage
@@ -248,6 +236,25 @@ pub(crate) fn read_usage(store: &Store, connection: &Connection) -> Result<Usage
         }
     }
     Ok(usage)
+}
+
+/// The sizes of `location`'s files and the pages of `connection`'s database.
+pub(crate) fn read_usage_at(
+    location: &super::StoreLocation,
+    connection: &Connection,
+) -> Result<Usage, Bypass> {
+    let [database, wal, shm] = location
+        .database_files()
+        .map(|file| std::fs::metadata(file).map_or(0, |metadata| metadata.len()));
+    Ok(Usage {
+        database_bytes: database,
+        wal_bytes: wal,
+        shm_bytes: shm,
+        page_size: pragma(connection, "page_size")?,
+        page_count: pragma(connection, "page_count")?,
+        free_pages: pragma(connection, "freelist_count")?,
+        filesystem_free_bytes: filesystem_free_bytes(location.directory()),
+    })
 }
 
 impl Store {

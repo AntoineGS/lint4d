@@ -209,6 +209,30 @@ pub(crate) fn ensure_live(connection: &Connection, scope: Scope) -> Result<(), B
     live.map(|_| ()).ok_or(Bypass::Fenced)
 }
 
+/// Retire `scope` and move its namespace to the next epoch in one
+/// transaction (spec §11.2): every handle of `scope` is fenced from its
+/// next transaction; its rows are reclaimed in batches like any retired
+/// scope. `store_state.reset_epoch` is not used.
+pub(crate) fn reset(transaction: &Connection, scope: Scope) -> Result<(), Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    ensure_live(transaction, scope)?;
+    let id = scope.namespace.as_bytes().as_slice();
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
+            params![id, epoch(scope)],
+        )
+        .map_err(fail)?;
+    transaction
+        .execute(
+            "UPDATE namespaces SET reset_epoch = reset_epoch + 1 \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?3",
+            params![id, epoch(scope), LIVE],
+        )
+        .map_err(fail)?;
+    Ok(())
+}
+
 /// Retire every other live namespace no process holds, one short
 /// transaction each.
 pub(crate) fn retire_obsolete(

@@ -175,10 +175,12 @@ pub enum FaultPoint {
     CheckpointCompleted,
     /// Inside an incremental vacuum batch, before commit.
     VacuumBeforeCommit,
+    /// Inside a namespace reset, before commit.
+    ResetBeforeCommit,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -192,14 +194,16 @@ impl FaultPoint {
         Self::GcDeleteBeforeCommit,
         Self::CheckpointCompleted,
         Self::VacuumBeforeCommit,
+        Self::ResetBeforeCommit,
     ];
 
     /// The points inside maintenance batches.
-    pub const MAINTENANCE: [Self; 4] = [
+    pub const MAINTENANCE: [Self; 5] = [
         Self::GcRetireBeforeCommit,
         Self::GcDeleteBeforeCommit,
         Self::CheckpointCompleted,
         Self::VacuumBeforeCommit,
+        Self::ResetBeforeCommit,
     ];
 
     pub fn name(self) -> &'static str {
@@ -217,6 +221,7 @@ impl FaultPoint {
             Self::GcDeleteBeforeCommit => "GcDeleteBeforeCommit",
             Self::CheckpointCompleted => "CheckpointCompleted",
             Self::VacuumBeforeCommit => "VacuumBeforeCommit",
+            Self::ResetBeforeCommit => "ResetBeforeCommit",
         }
     }
 

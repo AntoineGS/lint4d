@@ -57,6 +57,7 @@ pub use manifest::{
     ManifestHeader, Mismatch,
 };
 pub use namespace::{BUILD_FINGERPRINT, Namespace};
+pub use store::admin;
 pub use store::{
     APPLICATION_ID, Access, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow,
     ArtifactWrite, BindingBatch, Bypass, CONNECTION_OVERHEAD_BYTES, CONTAINER_VERSION,

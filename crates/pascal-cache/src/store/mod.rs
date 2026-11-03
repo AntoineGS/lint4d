@@ -11,6 +11,7 @@ macro_rules! fault_point {
     };
 }
 
+pub mod admin;
 mod artifacts;
 mod budget;
 mod clock;
@@ -243,6 +244,27 @@ impl Store {
             self.before_commit();
             transaction.commit().map_err(fail)?;
             Ok(reclaimed)
+        })
+    }
+
+    /// Retire this store's scope and move its namespace to the next epoch in
+    /// one transaction (spec §11.2). Every handle of the old scope, this one
+    /// included, is `Fenced` from its next transaction; reopen to use the new
+    /// epoch. The old rows are deleted in batches by [`Self::reclaim`].
+    pub fn reset_namespace(&self) -> Result<(), Bypass> {
+        self.guarded(Access::Maintenance, || {
+            let fail = |error: rusqlite::Error| sqlite::classify(&error);
+            let deadline = Deadline::after(self.limits.open_wait);
+            let mut writer = self.pool.acquire(Role::Writer, deadline)?;
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Immediate,
+                deadline,
+            )?;
+            namespaces::reset(&transaction, self.scope)?;
+            fault_point!(self, ResetBeforeCommit);
+            self.before_commit();
+            transaction.commit().map_err(fail)
         })
     }
 

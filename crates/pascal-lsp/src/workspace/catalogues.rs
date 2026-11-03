@@ -52,7 +52,7 @@ impl CatalogueScope {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn key(&self) -> &CatalogueKey {
         &self.key
     }
@@ -187,6 +187,12 @@ impl Workspace {
                 return Ok(None);
             }
         }
+        if shared.watch_registered {
+            // The watches existed before this check began, so the check
+            // closed the gap between listing and registering.
+            self.project_cache
+                .confirm_catalogue_watched(&scope.key, shared.generation);
+        }
         self.note_catalogue_validated(&scope.key);
         Ok(Some(shared))
     }
@@ -247,6 +253,77 @@ mod tests {
 
     fn no_io() -> impl FnMut() -> Result<(), String> {
         || Ok(())
+    }
+
+    struct AcceptAll;
+
+    impl crate::file_watch::DirectoryWatch for AcceptAll {
+        fn watch(&mut self, _: &Path) -> bool {
+            true
+        }
+        fn unwatch(&mut self, _: &Path) {}
+    }
+
+    #[test]
+    fn a_watched_catalogue_is_served_without_stamp_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("A.pas"));
+        let main = workspace(&root);
+        main.project_cache().set_watcher(Box::new(AcceptAll));
+        let input = main.analysis_input();
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        test_reset_stamp_checks();
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        assert_eq!(test_stamp_checks(), 1, "one confirming check, then none");
+    }
+
+    #[test]
+    fn a_change_before_publication_is_caught_by_the_confirming_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("A.pas"));
+        let view = workspace(&root);
+        view.project_cache().set_watcher(Box::new(AcceptAll));
+        let scope = CatalogueScope::recursive(&root, None);
+        let mut built = Catalogue::new(&root, Depth::Recursive, &mut no_io()).unwrap();
+        built
+            .advance(
+                Bound::entries(MAX_CATALOGUE_ENTRIES),
+                &|_| false,
+                &mut no_io(),
+            )
+            .unwrap();
+        // The event arrives while the catalogue is built: nothing is stored yet.
+        write(&root.join("New.pas"));
+        view.project_cache().invalidate_path(&root.join("New.pas"));
+        view.project_cache()
+            .publish_catalogue(scope.key().clone(), None, Arc::new(built))
+            .expect("published");
+        let stored = view.project_cache().catalogue(scope.key()).unwrap();
+        assert!(stored.watch_registered && !stored.watched);
+        let input = view.analysis_input();
+        let served = Workspace::from_analysis_input(&input)
+            .shared_catalogue(&scope, MAX_CATALOGUE_ENTRIES, &mut no_io())
+            .unwrap();
+        assert!(
+            served.pascal_files_named("new.pas").next().is_some(),
+            "the stamp check dropped the stale catalogue instead of confirming it"
+        );
+    }
+
+    #[test]
+    fn an_unwatched_catalogue_is_stamp_checked_by_every_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("A.pas"));
+        let input = workspace(&root).analysis_input();
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        test_reset_stamp_checks();
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        Workspace::from_analysis_input(&input).filename_catalogue(&root);
+        assert_eq!(test_stamp_checks(), 2);
     }
 
     #[test]

@@ -8,9 +8,6 @@
 //! one stopped (`l4d-zf1b.8` drives them from the warmer). A catalogue holds
 //! filesystem facts only; every consumer authorizes the paths it uses against
 //! its own project context.
-// Building blocks until Tasks 4-9 wire them; Task 8 narrows this to the
-// items that stay unused in production (the l4d-zf1b.8 batch API).
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -96,6 +93,7 @@ impl Bound {
     }
 
     /// At most `directories` listings (a background batch).
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 drives background batches
     pub(crate) const fn directories(directories: usize) -> Self {
         Self {
             counted_at_least: MAX_CATALOGUE_ENTRIES,
@@ -469,6 +467,8 @@ impl Catalogue {
 
 /// Catalogues one store keeps; the least recently used goes first.
 pub(crate) const MAX_SHARED_CATALOGUES: usize = 1_024;
+/// Native directory watches all catalogues together may hold.
+pub(crate) const MAX_CATALOGUE_WATCH_DIRECTORIES: usize = 16_384;
 
 /// A stored catalogue as a view sees it.
 #[derive(Debug, Clone)]
@@ -513,6 +513,8 @@ pub(crate) struct CatalogueStore {
     clock: u64,
     generation: u64,
     watched_directories: usize,
+    /// `None` is `MAX_CATALOGUE_WATCH_DIRECTORIES`.
+    watch_budget: Option<usize>,
 }
 
 impl CatalogueStore {
@@ -521,6 +523,7 @@ impl CatalogueStore {
         self.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -594,6 +597,45 @@ impl CatalogueStore {
             removed.extend(self.take(&victim));
         }
         Ok((self.generation, removed))
+    }
+
+    /// Whether `directories` more native watches fit the catalogues' budget.
+    pub(crate) fn can_watch(&self, directories: usize) -> bool {
+        let budget = self.watch_budget.unwrap_or(MAX_CATALOGUE_WATCH_DIRECTORIES);
+        self.watched_directories
+            .checked_add(directories)
+            .is_some_and(|total| total <= budget)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_watch_budget_for_test(&mut self, directories: usize) {
+        self.watch_budget = Some(directories);
+    }
+
+    /// Every listed directory of the catalogue published under `generation`
+    /// has a native watch of the watcher of `epoch`.
+    pub(crate) fn mark_watch_registered(
+        &mut self,
+        key: &CatalogueKey,
+        generation: u64,
+        epoch: u64,
+    ) {
+        if let Some(stored) = self.entries.get_mut(key)
+            && stored.generation == generation
+        {
+            stored.watch_epoch = Some(epoch);
+        }
+    }
+
+    /// A stamp check that began after the watches were registered passed:
+    /// every later change reaches `invalidate`.
+    pub(crate) fn confirm_watched(&mut self, key: &CatalogueKey, generation: u64) {
+        if let Some(stored) = self.entries.get_mut(key)
+            && stored.generation == generation
+            && stored.watch_epoch.is_some()
+        {
+            stored.watched = true;
+        }
     }
 
     pub(crate) fn remove(&mut self, key: &CatalogueKey, generation: u64) -> Option<Removed> {

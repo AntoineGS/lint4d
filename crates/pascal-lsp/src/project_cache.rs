@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
 use std::time::Duration;
 
@@ -1559,6 +1559,86 @@ mod cache_tests {
         );
     }
 
+    #[test]
+    fn a_published_catalogue_watches_its_directories_with_the_cache_unlocked() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        let root = temp.path().to_path_buf();
+        let sub = root.join("sub");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", root.clone(), true), ("watch", sub.clone(), true)]
+        );
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(shared.watch_registered);
+        assert!(!shared.watched, "watched only after a later stamp check");
+        cache.confirm_catalogue_watched(&key, shared.generation);
+        assert!(cache.catalogue(&key).unwrap().watched);
+        cache.drop_catalogue(&key, shared.generation);
+        assert_eq!(
+            calls.lock().unwrap()[2..],
+            [("unwatch", root, true), ("unwatch", sub, true)]
+        );
+    }
+
+    #[test]
+    fn a_catalogue_beyond_the_watch_budget_is_not_watched() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let calls = recording_watcher(&cache);
+        cache.set_catalogue_watch_budget_for_test(1);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!cache.catalogue(&key).unwrap().watch_registered);
+    }
+
+    #[test]
+    fn replacing_the_watcher_forgets_every_watched_catalogue() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        recording_watcher(&cache);
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        let generation = cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.confirm_catalogue_watched(&key, generation);
+        assert!(cache.catalogue(&key).unwrap().watched);
+        recording_watcher(&cache);
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(!shared.watched && !shared.watch_registered);
+    }
+
+    #[test]
+    fn a_failed_watch_leaves_the_catalogue_unregistered() {
+        struct Refuse;
+        impl DirectoryWatch for Refuse {
+            fn watch(&mut self, _: &Path) -> bool {
+                false
+            }
+            fn unwatch(&mut self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        cache.set_watcher(Box::new(Refuse));
+        let (key, catalogue) = super::listed_catalogue(temp.path());
+        let generation = cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.confirm_catalogue_watched(&key, generation);
+        let shared = cache.catalogue(&key).unwrap();
+        assert!(!shared.watch_registered && !shared.watched);
+    }
+
     fn long_probe(name: &str) -> Probe {
         Probe::Stamp {
             path: PathBuf::from(format!("/ws/{}/{name}", "deep".repeat(64))),
@@ -2537,6 +2617,9 @@ struct Inner {
     witnesses: Mutex<HashMap<PathBuf, Witness>>,
     /// Never held together with `state`, `watcher` or `witnesses`.
     catalogues: Mutex<CatalogueStore>,
+    /// Advances whenever the watcher's registrations are lost (a new watcher,
+    /// poisoned-state recovery): catalogue watches of an older epoch are gone.
+    watch_epoch: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -2821,6 +2904,8 @@ fn recover_poisoned_state<'a>(
     let watched_directories = state.watch_counts.drain().map(|(directory, _)| directory);
     let watched_directories = watched_directories.collect::<Vec<_>>();
     state.watch_changes.extend(watched_directories);
+    // The drained counts held the catalogue watches too.
+    inner.watch_epoch.fetch_add(1, Ordering::SeqCst);
     inner.state.clear_poison();
     state
 }
@@ -4368,14 +4453,15 @@ impl ProjectCache {
             .unwrap_or_else(PoisonError::into_inner);
         state.watcher = Some(watcher);
         state.registered.clear();
+        self.inner.watch_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 /// Shared directory catalogues (l4d-20).
-#[allow(dead_code)]
 impl ProjectCache {
     pub(crate) fn catalogue(&self, key: &CatalogueKey) -> Option<SharedCatalogue> {
-        self.catalogues().get(key, 0)
+        let epoch = self.inner.watch_epoch.load(Ordering::SeqCst);
+        self.catalogues().get(key, epoch)
     }
 
     /// Keeps `catalogue` for every view of this cache, charged to the
@@ -4393,12 +4479,35 @@ impl ProjectCache {
         if !self.charge_catalogue(bytes) {
             return None;
         }
+        let directories = catalogue
+            .directories()
+            .iter()
+            .map(|(directory, _)| directory.clone())
+            .collect::<Vec<_>>();
+        let epoch = self.inner.watch_epoch.load(Ordering::SeqCst);
+        let watch = self.has_watcher() && self.catalogues().can_watch(directories.len());
+        if watch {
+            let mut state = lock(&self.inner);
+            for directory in &directories {
+                acquire_watch(&mut state, directory);
+            }
+            self.release(state);
+        }
+        let held = if watch {
+            directories.clone()
+        } else {
+            Vec::new()
+        };
         let outcome = self
             .catalogues()
-            .publish(key, base, catalogue, bytes, Vec::new());
+            .publish(key.clone(), base, catalogue, bytes, held);
         match outcome {
             Ok((generation, removed)) => {
                 self.release_catalogues(removed);
+                if watch && self.all_watched(&directories) {
+                    self.catalogues()
+                        .mark_watch_registered(&key, generation, epoch);
+                }
                 Some(generation)
             }
             Err(rejected) => {
@@ -4417,8 +4526,41 @@ impl ProjectCache {
 
     /// Advances on every catalogue publication and invalidation (for the
     /// l4d-33 index and l4d-zf1b.8 coverage).
+    #[cfg_attr(not(test), allow(dead_code))] // read by l4d-33 and l4d-zf1b.8
     pub(crate) fn catalogue_generation(&self) -> u64 {
         self.catalogues().generation()
+    }
+
+    /// A stamp check of the catalogue published under `generation`, begun
+    /// after its watches were registered, passed.
+    pub(crate) fn confirm_catalogue_watched(&self, key: &CatalogueKey, generation: u64) {
+        self.catalogues().confirm_watched(key, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_catalogue_watch_budget_for_test(&self, directories: usize) {
+        self.catalogues().set_watch_budget_for_test(directories);
+    }
+
+    fn has_watcher(&self) -> bool {
+        self.inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watcher
+            .is_some()
+    }
+
+    fn all_watched(&self, directories: &[PathBuf]) -> bool {
+        let watcher = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        watcher.watcher.is_some()
+            && directories
+                .iter()
+                .all(|directory| watcher.registered.contains(directory))
     }
 
     #[cfg(test)]

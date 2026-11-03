@@ -4613,9 +4613,11 @@ impl ProjectCache {
         self.catalogues().len()
     }
 
-    /// A panic under the store lock leaves at worst reverse-map keys whose
-    /// catalogue is gone, which lookups ignore, so poison is cleared, not
-    /// recovered from.
+    /// A panic under the store lock leaves reverse-map keys whose catalogue
+    /// is gone, which lookups ignore; a panic in `publish` or `invalidate`
+    /// after `take` also leaks the charge and watch counts of the entries it
+    /// took, since their `Removed` never reaches `release_catalogues`. Poison
+    /// is cleared, not recovered from.
     fn catalogues(&self) -> MutexGuard<'_, CatalogueStore> {
         self.inner.catalogues.lock().unwrap_or_else(|poisoned| {
             self.inner.catalogues.clear_poison();

@@ -430,20 +430,16 @@ pub(crate) fn analyze_source_in_session(
 }
 
 /// What one session has credited for one distinct source (identity and
-/// content): every adapter credits each byte at most once per session and
-/// funds validation once, whatever its resolver hooks do.
+/// revision, as the request credits): every adapter credits each byte at most
+/// once per session and funds validation once, whatever its resolver hooks
+/// do. A revision found through another search entry (same content) is a
+/// distinct provider identity that is analysed again, so it is funded again;
+/// the number of such revisions is bounded by the search entries.
 struct ScanCredit {
     source: crate::SourceId,
-    content: u64,
+    revision: crate::SourceRevision,
     scanned: usize,
     validated: bool,
-}
-
-fn source_content(source: &LoadedSource) -> u64 {
-    match &source.revision {
-        crate::SourceRevision::Disk { content_hash, .. }
-        | crate::SourceRevision::Overlay { content_hash, .. } => *content_hash,
-    }
 }
 
 struct ProviderSession {
@@ -587,11 +583,10 @@ impl ProviderSession {
     }
 
     fn credit(&self, source: &LoadedSource) -> Option<&ScanCredit> {
-        let content = source_content(source);
         self.credits
             .iter()
             .map(|credit| &**credit)
-            .find(|credit| credit.content == content && credit.source == source.id)
+            .find(|credit| credit.source == source.id && credit.revision == source.revision)
     }
 
     /// Offset of `source` this session has already credited.
@@ -604,19 +599,22 @@ impl ProviderSession {
         source: &LoadedSource,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<&mut ScanCredit, ResolverError> {
-        let content = source_content(source);
         let index = match self
             .credits
             .iter()
-            .position(|credit| credit.content == content && credit.source == source.id)
+            .position(|credit| credit.source == source.id && credit.revision == source.revision)
         {
             Some(index) => index,
             None => {
-                let bytes = source.id.as_str().len();
+                // The source id, plus the authorization a disk revision
+                // carries (an overlay revision is inline).
+                let bytes = crate::resolver::loaded_source_metadata_retained(source)
+                    - size_of::<LoadedSource>()
+                    - source.path.as_os_str().len();
                 let credit = budget
                     .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
                         source: source.id.clone(),
-                        content,
+                        revision: source.revision.clone(),
                         scanned: 0,
                         validated: false,
                     })

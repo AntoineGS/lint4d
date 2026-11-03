@@ -1752,3 +1752,54 @@ fn a_provider_imported_twice_in_one_session_is_analysed_once() {
         "{work} steps; one analysis of W takes {one_analysis}"
     );
 }
+
+/// l4d-4nbs R9: in the LSP the same Windows.pas is found through different
+/// search entries by different importers: its revisions differ (a distinct
+/// provider identity) while its content does not. The session credited its
+/// bytes once per content, so the second analysis had no grant and Log.pas
+/// failed at `max_byte_work`; each distinct revision is funded once.
+#[test]
+fn a_provider_found_through_different_entries_is_funded_once_per_revision() {
+    let tight = |f: &mut Fixture| {
+        // Close to the scan's real cost, so an unfunded repeat cannot fit.
+        f.limits.max_byte_work = 4 * 1024 * 1024;
+        f.limits.byte_work_per_source_byte = 16;
+    };
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    tight(&mut alone);
+    let alone = alone.analyze().unwrap();
+    assert_eq!(
+        activity(&alone, "DEFINE HW"),
+        Truth::True,
+        "{:?}",
+        alone.reasons
+    );
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    tight(&mut twice);
+    twice.importer_revisions = true;
+    let analysis = twice.analyze();
+    let analysis = analysis
+        .as_ref()
+        .map(|a| (&a.reasons, a.budget.budget_snapshot()));
+    assert!(
+        analysis
+            .as_ref()
+            .is_ok_and(|(reasons, _)| reasons.is_empty()),
+        "{analysis:?}"
+    );
+}

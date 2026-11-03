@@ -224,6 +224,10 @@ pub fn classify_unit(
     config: &UsesConfig,
     external_units: &HashSet<String>,
 ) -> UnitSection {
+    // An explicit `in 'path'` does not change the unit's section.
+    let unit_name = unit_name
+        .split_once(" in '")
+        .map_or(unit_name, |(name, _)| name);
     // 1. Core: dotted prefix matches CORE_PREFIXES
     if let Some(dot_pos) = unit_name.find('.') {
         let prefix = &unit_name[..dot_pos];
@@ -447,6 +451,27 @@ fn unit_item(node: tree_sitter::Node, source: &[u8], comments: &CommentMap) -> O
     })
 }
 
+/// Append a uses entry's explicit `in 'path'` to the unit it follows, with
+/// the comments around it (Delphi's `{Form: TForm}` trails the path).
+fn append_explicit_path(
+    items: &mut [UsesItem],
+    node: tree_sitter::Node,
+    source: &[u8],
+    comments: &CommentMap,
+) {
+    let Some(UsesItem::Unit { name, trailing, .. }) = items.last_mut() else {
+        return;
+    };
+    if node.kind() == K::K_IN {
+        name.push_str(" in");
+    } else {
+        name.push(' ');
+        name.push_str(&node_text(node, source));
+    }
+    trailing.extend(leading_texts(node, comments));
+    trailing.extend(trailing_texts(node, comments));
+}
+
 /// Whether the branch `state` points at started with a `,`.
 fn branch_lead(block: &mut IfDefBlock, state: BranchState) -> &mut bool {
     match state {
@@ -516,6 +541,9 @@ fn parse_pp_uses_block(
                     items.push(item);
                     commas.pushed(items);
                 }
+            }
+            K::K_IN | K::LITERAL_STRING => {
+                append_explicit_path(branch_items(&mut block, state), child, source, comments);
             }
             K::PP_USES_BLOCK => {
                 let items = branch_items(&mut block, state);
@@ -617,6 +645,9 @@ pub(crate) fn extract_uses_items(
                     items.push(item);
                     commas.pushed(&items);
                 }
+            }
+            K::K_IN | K::LITERAL_STRING => {
+                append_explicit_path(&mut items, child, source, comments);
             }
             K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
                 items.extend(

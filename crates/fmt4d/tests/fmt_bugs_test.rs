@@ -4869,3 +4869,20 @@ fn comment_inside_code_keeps_the_space_after_it() {
         }
     }
 }
+
+// ── Bug l4d-zaf0: a uses entry's explicit `in 'path'` must survive ─
+
+#[test]
+fn uses_entry_explicit_path_is_preserved() {
+    let src = "program P;\n\nuses\n  Forms,\n  Environment in 'src\\Environment.pas' {frmEnvironment: TFrame},\n  B.C in '..\\B.C.pas';\n\nbegin\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        for needle in [
+            "Environment in 'src\\Environment.pas'",
+            "{frmEnvironment: TFrame}",
+            "B.C in '..\\B.C.pas'",
+            "Forms",
+        ] {
+            assert!(result.contains(needle), "{needle:?} missing in:\n{result}");
+        }
+    }
+}

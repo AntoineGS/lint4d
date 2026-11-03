@@ -1052,24 +1052,28 @@ module.exports = grammar({
 			$.ppUsesBlockWithSemi
 		)),
 
-		_usesClauseEntry: $ => choice($.moduleName, $.ppUsesBlock, ','),
+		_usesClauseEntry: $ => choice($._usesModule, $.ppUsesBlock, ','),
+
+		// Delphi programs, libraries and packages name a unit's file
+		// explicitly: `Unit in 'path\Unit.pas'`.
+		_usesModule: $ => seq($.moduleName, optional(seq($.kIn, $.literalString))),
 
 		ppUsesBlock: $ => seq(
 			alias(token(prec(5, ppIfToken)), $.ppIf),
-			repeat(choice($.moduleName, $.ppUsesBlock, ',')),
+			repeat(choice($._usesModule, $.ppUsesBlock, ',')),
 			repeat(seq(
 				alias(token(prec(5, ppElseToken)), $.ppElse),
-				repeat(choice($.moduleName, $.ppUsesBlock, ','))
+				repeat(choice($._usesModule, $.ppUsesBlock, ','))
 			)),
 			alias(token(prec(5, ppEndIfToken)), $.ppEndIf)
 		),
 
 		ppUsesBlockWithSemi: $ => seq(
 			alias(token(prec(5, ppIfToken)), $.ppIf),
-			repeat(choice($.moduleName, $.ppUsesBlock, ',')), ';',
+			repeat(choice($._usesModule, $.ppUsesBlock, ',')), ';',
 			repeat(seq(
 				alias(token(prec(5, ppElseToken)), $.ppElse),
-				repeat(choice($.moduleName, $.ppUsesBlock, ',')), ';'
+				repeat(choice($._usesModule, $.ppUsesBlock, ',')), ';'
 			)),
 			alias(token(prec(5, ppEndIfToken)), $.ppEndIf)
 		),

@@ -377,3 +377,78 @@ end.
     (kEnd)
     (kEndDot)))
 
+===
+Program uses with explicit unit paths
+===
+
+program a;
+
+uses
+  Forms,
+  Environment in 'src\Environment.pas' {frmEnvironment: TFrame},
+  b.c in '..\b.c.pas',
+  d;
+
+begin
+end.
+
+---
+
+(root
+  (program (kProgram) (moduleName (identifier))
+    (declUses (kUses)
+      (moduleName
+        (identifier))
+      (moduleName
+        (identifier))
+      (kIn)
+      (literalString)
+      (comment)
+      (moduleName
+        (identifier)
+        (kDot)
+        (identifier))
+      (kIn)
+      (literalString)
+      (moduleName
+        (identifier)))
+    (block
+      (kBegin)
+      (kEnd))
+    (kEndDot)))
+
+===
+Program uses with explicit unit paths in a conditional block
+===
+
+program a;
+
+uses
+  {$IFDEF X}
+  e in 'e.pas',
+  {$ENDIF}
+  f in 'f.pas';
+
+begin
+end.
+
+---
+
+(root
+  (program (kProgram) (moduleName (identifier))
+    (declUses (kUses)
+      (ppUsesBlock
+        (ppIf)
+        (moduleName
+          (identifier))
+        (kIn)
+        (literalString)
+        (ppEndIf))
+      (moduleName
+        (identifier))
+      (kIn)
+      (literalString))
+    (block
+      (kBegin)
+      (kEnd))
+    (kEndDot)))

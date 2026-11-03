@@ -9,6 +9,30 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub const HEADER_MAX_BYTE_WORK: usize = 64 * 1024 * 1024;
 pub const HEADER_MAX_BRANCH_STATES: usize = 256;
 
+/// Steps each source byte entering a session (root, include or provider)
+/// adds to `max_work`. Directive and declaration scanning cost a few steps
+/// per byte (measured: about 1 to 4, the high end on dense routine code,
+/// from per-byte scanning plus per-statement lookups), so the step budget
+/// follows the input with twice the densest measured cost.
+/// Work that grows faster than the input, such as re-processing it on every
+/// forked path, still exhausts the budget.
+pub const WORK_PER_SOURCE_BYTE: usize = 8;
+
+/// Byte work each source byte entering a session adds to `max_byte_work`,
+/// for the same reason: scanning, fragment, snapshot and mapping copies cost
+/// 12 to 15 bytes of byte work per source byte on synthetic library code
+/// (tests/compile_time_work_scaling.rs), and SysUtils.pas with its providers
+/// (about 2 MB) needs more than the fixed 64 MiB. The grant is about twice
+/// the synthetic cost.
+pub const BYTE_WORK_PER_SOURCE_BYTE: usize = 32;
+
+/// Work and byte work granted by source bytes entering a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Allowance {
+    work: usize,
+    byte_work: usize,
+}
+
 /// Request-wide limits, including dimensions enforced by later consumers.
 /// Pending fragments have their own admission limit in addition to total
 /// retained bytes; generic retained storage is not automatically pending text.
@@ -24,7 +48,11 @@ pub struct CompileTimeLimits {
     pub max_branch_states: usize,
     pub max_provider_queries: usize,
     pub max_work: usize,
+    /// Steps each source byte entering the session adds to `max_work`.
+    pub work_per_source_byte: usize,
     pub max_byte_work: usize,
+    /// Byte work each source byte entering the session adds to `max_byte_work`.
+    pub byte_work_per_source_byte: usize,
     pub max_retained_bytes: usize,
 }
 
@@ -43,7 +71,9 @@ impl Default for CompileTimeLimits {
             // Finite normal-body work headroom. Header selection/reproof
             // inherit this operation policy, with their distinct state fuse.
             max_work: 2_000_000,
+            work_per_source_byte: WORK_PER_SOURCE_BYTE,
             max_byte_work: 67_108_864,
+            byte_work_per_source_byte: BYTE_WORK_PER_SOURCE_BYTE,
             max_retained_bytes: 1_048_576,
         }
     }
@@ -84,7 +114,7 @@ impl<'a> CompileTimeBudget<'a> {
         Self {
             limits,
             cancel,
-            counters: Counters::Inline(BudgetSnapshot::default()),
+            counters: Counters::Inline(BudgetSnapshot::default(), Allowance::default()),
             layout_query_depth: 0,
             last_failed_charge: None,
             definitions: 0,
@@ -103,13 +133,12 @@ impl<'a> CompileTimeBudget<'a> {
         if self.cancel.is_cancelled() {
             return Err(IncompleteReason::Cancelled);
         }
-        self.counters.with_snapshot_mut(|current| {
-            let next = admit_snapshot(*current, self.limits, work, byte_work, retained).map_err(
-                |(reason, failure)| {
+        self.counters.with_snapshot_mut(|current, allowance| {
+            let next = admit_snapshot(*current, self.limits, *allowance, work, byte_work, retained)
+                .map_err(|(reason, failure)| {
                     self.last_failed_charge = Some(failure);
                     reason
-                },
-            )?;
+                })?;
             *current = next;
             Ok(())
         })?;
@@ -138,7 +167,7 @@ impl<'a> CompileTimeBudget<'a> {
             return;
         }
         match &mut self.counters {
-            Counters::Inline(current) => {
+            Counters::Inline(current, _) => {
                 current.retained_bytes = current.retained_bytes.saturating_sub(retained);
             }
             Counters::Shared(ledger) => {
@@ -154,9 +183,111 @@ impl<'a> CompileTimeBudget<'a> {
 
     pub fn snapshot(&self) -> BudgetSnapshot {
         match &self.counters {
-            Counters::Inline(current) => *current,
+            Counters::Inline(current, _) => *current,
             Counters::Shared(ledger) => ledger.lock().usage,
         }
+    }
+
+    fn allowance(&self) -> Allowance {
+        match &self.counters {
+            Counters::Inline(_, allowance) => *allowance,
+            Counters::Shared(ledger) => ledger.lock().allowance,
+        }
+    }
+
+    /// Work granted on top of `max_work` by source bytes entering the session.
+    pub fn work_allowance(&self) -> usize {
+        self.allowance().work
+    }
+
+    /// Byte work granted on top of `max_byte_work` by source bytes entering
+    /// the session.
+    pub fn byte_work_allowance(&self) -> usize {
+        self.allowance().byte_work
+    }
+
+    /// The directive scanner is about to read `scanned` more source bytes:
+    /// grant the steps and byte work that processing them legitimately costs
+    /// (`work_per_source_byte` and `byte_work_per_source_byte` each), then
+    /// charge this read. The grant follows the text actually consumed, so a
+    /// header-only or interface-only scan is granted only its prefix. A
+    /// refused read grants nothing.
+    pub(crate) fn charge_scanned(
+        &mut self,
+        scanned: usize,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: scanned.saturating_mul(self.limits.work_per_source_byte),
+            byte_work: scanned.saturating_mul(self.limits.byte_work_per_source_byte),
+        };
+        self.charge_granted(grant, work, byte_work)
+    }
+
+    /// Charge work that is itself proportional to input the session must
+    /// consume whole (UTF-8 validation of a raw source), granting exactly
+    /// that charge: it does not consume the fixed budget and leaves nothing
+    /// for other work to spend. Limits without per-byte grants (factor 0)
+    /// fund nothing, so a fixed cap still bounds it.
+    pub(crate) fn charge_funded(
+        &mut self,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: if self.limits.work_per_source_byte > 0 {
+                work
+            } else {
+                0
+            },
+            byte_work: if self.limits.byte_work_per_source_byte > 0 {
+                byte_work
+            } else {
+                0
+            },
+        };
+        self.charge_granted(grant, work, byte_work)
+    }
+
+    /// `charge_funded` when `funded`, otherwise a plain charge.
+    pub(crate) fn charge_funded_if(
+        &mut self,
+        funded: bool,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        if funded {
+            self.charge_funded(work, byte_work)
+        } else {
+            self.charge(work, byte_work, 0)
+        }
+    }
+
+    fn charge_granted(
+        &mut self,
+        grant: Allowance,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        if self.cancel.is_cancelled() {
+            return Err(IncompleteReason::Cancelled);
+        }
+        self.counters.with_snapshot_mut(|current, allowance| {
+            let granted = Allowance {
+                work: allowance.work.saturating_add(grant.work),
+                byte_work: allowance.byte_work.saturating_add(grant.byte_work),
+            };
+            let next = admit_snapshot(*current, self.limits, granted, work, byte_work, 0).map_err(
+                |(reason, failure)| {
+                    self.last_failed_charge = Some(failure);
+                    reason
+                },
+            )?;
+            *current = next;
+            *allowance = granted;
+            Ok(())
+        })
     }
 
     /// Scratch marks exclude independently owned/cache/shared reservations.
@@ -167,7 +298,7 @@ impl<'a> CompileTimeBudget<'a> {
             return owner.retained - owner.floor;
         }
         match &self.counters {
-            Counters::Inline(current) => current.retained_bytes,
+            Counters::Inline(current, _) => current.retained_bytes,
             Counters::Shared(ledger) => {
                 let state = ledger.lock();
                 state.usage.retained_bytes
@@ -287,7 +418,7 @@ impl<'a> CompileTimeBudget<'a> {
         retained: usize,
     ) -> Result<Retention, IncompleteReason> {
         let control_bytes = match self.counters {
-            Counters::Inline(_) => size_of::<Ledger>()
+            Counters::Inline(..) => size_of::<Ledger>()
                 .checked_add(arc_overhead::<Ledger>()?)
                 .ok_or(IncompleteReason::MalformedSource)?,
             Counters::Shared(_) => 0,
@@ -301,12 +432,13 @@ impl<'a> CompileTimeBudget<'a> {
                 .ok_or(IncompleteReason::MalformedSource)?,
         )?;
         drop(binding);
-        if let Counters::Inline(usage) = &self.counters {
+        if let Counters::Inline(usage, allowance) = &self.counters {
             // The ledger/control allocation occurs only AFTER its full credit
             // is admitted. Its storage lasts while the root or any receipt does.
             self.counters = Counters::Shared(Arc::new(Ledger {
                 state: Mutex::new(LedgerState {
                     usage: *usage,
+                    allowance: *allowance,
                     reserved: 0,
                     raw_report_floor: 0,
                 }),
@@ -398,15 +530,22 @@ impl<'a> CompileTimeBudget<'a> {
 }
 
 enum Counters {
-    Inline(BudgetSnapshot),
+    /// Usage and the granted allowance.
+    Inline(BudgetSnapshot, Allowance),
     Shared(Arc<Ledger>),
 }
 
 impl Counters {
-    fn with_snapshot_mut<T>(&mut self, f: impl FnOnce(&mut BudgetSnapshot) -> T) -> T {
+    fn with_snapshot_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut BudgetSnapshot, &mut Allowance) -> T,
+    ) -> T {
         match self {
-            Self::Inline(current) => f(current),
-            Self::Shared(ledger) => f(&mut ledger.lock().usage),
+            Self::Inline(current, allowance) => f(current, allowance),
+            Self::Shared(ledger) => {
+                let state = &mut *ledger.lock();
+                f(&mut state.usage, &mut state.allowance)
+            }
         }
     }
 }
@@ -420,6 +559,7 @@ struct Ledger {
 #[derive(Debug)]
 struct LedgerState {
     usage: BudgetSnapshot,
+    allowance: Allowance,
     reserved: usize,
     // R17 raw report handoff only; unrelated legacy scratch cannot release it.
     raw_report_floor: usize,
@@ -805,6 +945,7 @@ type ChargeFailure = (IncompleteReason, (&'static str, usize, usize));
 fn admit_snapshot(
     current: BudgetSnapshot,
     limits: CompileTimeLimits,
+    allowance: Allowance,
     work: usize,
     byte_work: usize,
     retained: usize,
@@ -814,11 +955,16 @@ fn admit_snapshot(
             .map_err(|reason| (reason, (name, current.saturating_add(added), maximum)))
     };
     Ok(BudgetSnapshot {
-        work: check(current.work, work, limits.max_work, "max_work")?,
+        work: check(
+            current.work,
+            work,
+            limits.max_work.saturating_add(allowance.work),
+            "max_work",
+        )?,
         byte_work: check(
             current.byte_work,
             byte_work,
-            limits.max_byte_work,
+            limits.max_byte_work.saturating_add(allowance.byte_work),
             "max_byte_work",
         )?,
         retained_bytes: check(

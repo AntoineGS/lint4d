@@ -14,10 +14,13 @@ fn validate(bytes: &[u8]) -> Result<&str, std::str::Utf8Error> {
     std::str::from_utf8(bytes)
 }
 
+/// `funded`: raw validation is granted what it charges (the request funds it
+/// once per distinct source); otherwise it is paid from the budget.
 pub(crate) fn text(
     source: &LoadedSource,
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
+    funded: bool,
 ) -> Result<AdmittedOwned<Arc<str>>, ResolverError> {
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
@@ -45,8 +48,11 @@ pub(crate) fn text(
             if cancel.is_cancelled() {
                 return Err(ResolverError::Cancelled);
             }
+            // Validation and copy are proportional to the raw source, which
+            // must be consumed whole: they are funded, not paid from the
+            // fixed budget (CompileTimeBudget::charge_funded).
             budget
-                .charge(end - cursor, end - cursor, 0)
+                .charge_funded_if(funded, end - cursor, end - cursor)
                 .map_err(|r| super::session::resolver_error(r, budget))?;
             match validate(&bytes[cursor..end]) {
                 Ok(chunk) => break chunk,
@@ -64,10 +70,11 @@ pub(crate) fn text(
                 }
             }
         };
-        text.grow(budget, chunk.len(), chunk.len(), 0, |text| {
-            text.push_str(chunk)
-        })
-        .map_err(|r| super::session::resolver_error(r, budget))?;
+        budget
+            .charge_funded_if(funded, chunk.len(), chunk.len())
+            .map_err(|r| super::session::resolver_error(r, budget))?;
+        text.grow(budget, 0, 0, 0, |text| text.push_str(chunk))
+            .map_err(|r| super::session::resolver_error(r, budget))?;
         cursor = end;
     }
     let arc_bytes = bytes
@@ -77,7 +84,10 @@ pub(crate) fn text(
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
     }
-    text.grow(budget, bytes.len(), bytes.len(), arc_bytes, |_| ())
+    budget
+        .charge_funded_if(funded, bytes.len(), bytes.len())
+        .map_err(|r| super::session::resolver_error(r, budget))?;
+    text.grow(budget, 0, 0, arc_bytes, |_| ())
         .map_err(|r| super::session::resolver_error(r, budget))?;
     let mut text = text
         .map_value(budget, Arc::<str>::from)
@@ -229,13 +239,16 @@ mod tests {
         let mut budget = CompileTimeBudget::new(
             CompileTimeLimits {
                 max_byte_work: 128,
+                // A fixed cap: validation is not funded (l4d-9bxx).
+                work_per_source_byte: 0,
+                byte_work_per_source_byte: 0,
                 ..CompileTimeLimits::default()
             },
             &NoCancellation,
         );
         let before = validation_bytes();
         assert!(matches!(
-            text(&root, &mut budget, &NoCancellation),
+            text(&root, &mut budget, &NoCancellation, true),
             Err(ResolverError::LimitExceeded { .. })
         ));
         assert_eq!(
@@ -261,7 +274,7 @@ mod tests {
         let baseline = budget.snapshot().retained_bytes;
         let before = validation_bytes();
         assert!(matches!(
-            text(&root, &mut budget, &Stop(0.into())),
+            text(&root, &mut budget, &Stop(0.into()), true),
             Err(ResolverError::Cancelled)
         ));
         assert_eq!(
@@ -280,7 +293,7 @@ mod tests {
         invalid.decoded_text = None;
         invalid.bytes = b"unit \xff;".as_slice().into();
         assert!(matches!(
-            text(&invalid, &mut budget, &NoCancellation),
+            text(&invalid, &mut budget, &NoCancellation, true),
             Err(ResolverError::InvalidRequest(_))
         ));
     }

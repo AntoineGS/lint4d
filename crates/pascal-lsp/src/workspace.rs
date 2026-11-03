@@ -398,7 +398,9 @@ pub(crate) const MAX_PENDING_DIAGNOSTIC_PUBLICATION_TARGETS: usize =
 pub(crate) const MAX_PENDING_DIAGNOSTIC_PUBLICATION_URI_BYTES: usize =
     MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES * 2;
 const MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS: usize = 20_000;
-const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// `maxFileBytes` may be raised above the default up to this ceiling.
+pub(crate) const MAX_FILE_BYTES_CEILING: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
 const MAX_PENDING_FILE_RENAMES: usize = 64;
@@ -825,7 +827,7 @@ pub(crate) fn parse_runtime_options(
             constants: parse_runtime_conditional_constants(object),
         },
         max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
-        max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
+        max_file_bytes: parse_runtime_limit(object, "maxFileBytes", MAX_FILE_BYTES_CEILING),
         max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
         max_cache_bytes: parse_runtime_limit(
             object,
@@ -1283,7 +1285,7 @@ impl WorkspaceOptions {
         }
         if let Some(value) = raw.max_file_bytes {
             limits.max_file_bytes =
-                bounded_limit(value, 1, DEFAULT_MAX_FILE_BYTES, "maxFileBytes")?;
+                bounded_limit(value, 1, MAX_FILE_BYTES_CEILING, "maxFileBytes")?;
         }
         if let Some(value) = raw.max_total_bytes {
             limits.max_total_bytes =
@@ -23874,6 +23876,54 @@ BDS = '/fake/37'
 
         assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
         assert!(!workspace.project_cache.has_room());
+    }
+
+    #[test]
+    fn max_file_bytes_defaults_to_four_mebibytes() {
+        let options = WorkspaceOptions::parse(None).expect("default initialization options");
+
+        assert_eq!(options.limits.max_file_bytes, 4 * 1024 * 1024);
+        assert_eq!(ResourceLimits::default().max_file_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_file_bytes_may_be_raised_up_to_the_sixteen_mebibyte_ceiling() {
+        let options = WorkspaceOptions::parse(Some(&json!({"maxFileBytes": 8 * 1024 * 1024})))
+            .expect("8 MiB maxFileBytes");
+        assert_eq!(options.limits.max_file_bytes, 8 * 1024 * 1024);
+
+        let options = WorkspaceOptions::parse(Some(&json!({"maxFileBytes": 32 * 1024 * 1024})))
+            .expect("oversized maxFileBytes clamps");
+        assert_eq!(options.limits.max_file_bytes, 16 * 1024 * 1024);
+
+        let error = WorkspaceOptions::parse(Some(&json!({"maxFileBytes": 0})))
+            .expect_err("zero maxFileBytes must be rejected");
+        assert_eq!(
+            error,
+            "initializationOptions.maxFileBytes must be at least 1"
+        );
+    }
+
+    #[test]
+    fn max_file_bytes_runtime_option_may_be_raised_up_to_the_ceiling() {
+        let update = super::parse_runtime_options(&json!({"maxFileBytes": 8 * 1024 * 1024}))
+            .expect("runtime settings");
+        assert!(matches!(
+            update.max_file_bytes,
+            super::RuntimeOption::Value(value) if value == 8 * 1024 * 1024
+        ));
+        let update = super::parse_runtime_options(&json!({"maxFileBytes": 32 * 1024 * 1024}))
+            .expect("runtime settings");
+        assert!(matches!(
+            update.max_file_bytes,
+            super::RuntimeOption::Value(value) if value == 16 * 1024 * 1024
+        ));
+        let update =
+            super::parse_runtime_options(&json!({"maxFileBytes": 0})).expect("runtime settings");
+        assert!(matches!(
+            update.max_file_bytes,
+            super::RuntimeOption::Invalid(_)
+        ));
     }
 
     #[test]

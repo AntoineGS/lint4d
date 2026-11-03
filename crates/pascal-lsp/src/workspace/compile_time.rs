@@ -245,6 +245,15 @@ struct HeaderResolver<'a> {
 }
 
 impl pascal_core::compile_time::CompileTimeResolver for HeaderResolver<'_> {
+    fn scan_credit_floor(&mut self, source: &LoadedSource) -> usize {
+        self.inner.scan_credit_floor(source)
+    }
+    fn note_scanned(&mut self, source: &LoadedSource, end: usize) {
+        self.inner.note_scanned(source, end);
+    }
+    fn fund_validation(&mut self, source: &LoadedSource) -> bool {
+        self.inner.fund_validation(source)
+    }
     fn include_capability(
         &mut self,
         request: pascal_core::IncludeResolveRequest<'_>,
@@ -471,6 +480,8 @@ pub(super) fn selected_import_header(
     }
     let conditional_context = context.conditional_context_for(&root.path);
     let used = resolver.compile_time_usage();
+    let granted = resolver.compile_time_work_allowance();
+    let granted_bytes = resolver.compile_time_byte_work_allowance();
     let mut adapter = HeaderResolver {
         inner: &mut resolver,
         captures: None,
@@ -481,9 +492,13 @@ pub(super) fn selected_import_header(
         &mut adapter,
         CompileTimeLimits {
             max_branch_states: HEADER_MAX_BRANCH_STATES,
-            max_work: limits.max_compile_time_work.saturating_sub(used.work),
+            max_work: limits
+                .max_compile_time_work
+                .saturating_add(granted)
+                .saturating_sub(used.work),
             max_byte_work: limits
                 .max_compile_time_byte_work
+                .saturating_add(granted_bytes)
                 .saturating_sub(used.byte_work),
             max_retained_bytes: limits
                 .max_compile_time_retained_bytes
@@ -703,7 +718,7 @@ pub(crate) fn lsp_compatibility_retention(
     let document = resources
         .max_file_bytes
         .min(source)
-        .min(super::DEFAULT_MAX_FILE_BYTES);
+        .min(super::MAX_FILE_BYTES_CEILING);
     let expanded = expansion
         .max_expanded_bytes
         .min(source)

@@ -445,6 +445,7 @@ fn star_comment_nonclosing_unicode_transition_keeps_bytework_and_cancellation_li
         fixture.include("later.inc", "const Later=1;");
         fixture.limits.max_retained_bytes = 8 * 1024 * 1024;
         fixture.limits.max_byte_work = 8192;
+        fixture.limits.byte_work_per_source_byte = 0;
         assert!(matches!(
             fixture.analyze(),
             Err(pascal_core::ResolverError::LimitExceeded {
@@ -483,6 +484,7 @@ fn bulk_plain_trivia_keeps_directives_coordinates_and_default_work_bounds() {
         assert!(analysis.budget.budget_snapshot().work < CompileTimeLimits::default().max_work);
         assert!(analysis.budget.budget_snapshot().byte_work >= source.len());
         fixture.limits.max_byte_work = 4096;
+        fixture.limits.byte_work_per_source_byte = 0;
         assert!(matches!(
             fixture.analyze(),
             Err(pascal_core::ResolverError::LimitExceeded {
@@ -492,6 +494,7 @@ fn bulk_plain_trivia_keeps_directives_coordinates_and_default_work_bounds() {
         ));
         fixture.limits.max_byte_work = CompileTimeLimits::default().max_byte_work;
         fixture.limits.max_work = 16;
+        fixture.limits.work_per_source_byte = 0;
         assert!(matches!(
             fixture.analyze(),
             Err(pascal_core::ResolverError::LimitExceeded {

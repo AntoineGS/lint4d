@@ -420,6 +420,9 @@ fn firedac_prefix_proof_obeys_resolver_work_limit() {
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_compile_time_work: 32,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..ResolverLimits::default()
         },
     );
@@ -461,6 +464,9 @@ fn fixround1_ordinary_header_search_work_is_cumulative_and_blocks_later_reads() 
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_compile_time_work: 10_000,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..ResolverLimits::default()
         },
     );
@@ -3738,4 +3744,104 @@ impl SourceStore for FailingDirectoryStore {
     ) -> Result<LoadedSource, SourceStoreError> {
         self.inner.load(request, cancel)
     }
+}
+
+/// l4d-9bxx round 3: per-byte grants and funded validation are credited to
+/// the request once per distinct source. Re-proving the same 3 KB header 60
+/// times earns no new credit, so the 10,000-step request cap refuses the
+/// repeated reads (it allowed 361,558 steps, 36x the cap, in round 2).
+#[test]
+fn rereading_one_source_earns_no_new_request_credit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut context = configured_disk_context(root);
+    let directory = root.join("0");
+    std::fs::create_dir(&directory).unwrap();
+    let text = format!("{}unit Wrong;", " ".repeat(3000));
+    std::fs::write(directory.join("Main.pas"), &text).unwrap();
+    edit_context(&mut context, |p| {
+        p.search_path_entries
+            .push(ProjectPathEntry::legacy(directory))
+    });
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_work: 10_000,
+            ..ResolverLimits::default()
+        },
+    );
+    let lookup = |resolver: &mut UnitResolver<FilesystemSourceStore>| {
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Main",
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+    lookup(&mut resolver);
+    let credited = resolver.compile_time_work_allowance();
+    // One read of the text: its per-byte grant plus funded validation.
+    let per_byte = ResolverLimits::default().compile_time_work_per_source_byte;
+    assert!(credited <= text.len() * (per_byte + 3), "{credited}");
+    for _ in 1..60 {
+        lookup(&mut resolver);
+    }
+    assert_eq!(resolver.compile_time_work_allowance(), credited);
+    let usage = resolver.compile_time_usage();
+    assert!(
+        usage.work <= 10_000 + credited,
+        "{usage:?} with {credited} credited"
+    );
+}
+
+/// Sixty distinct 3 KB candidates may each be credited once: the request is
+/// bounded by its cap plus the per-byte grant and funded validation of the
+/// distinct bytes it read.
+#[test]
+fn distinct_header_candidates_are_bounded_by_their_distinct_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut context = configured_disk_context(root);
+    let mut total = 0;
+    for index in 0..60 {
+        let directory = root.join(index.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        let name = if index == 59 { "Main" } else { "Wrong" };
+        let text = format!("{}unit {name};", " ".repeat(3000));
+        total += text.len();
+        std::fs::write(directory.join("Main.pas"), text).unwrap();
+        edit_context(&mut context, |p| {
+            p.search_path_entries
+                .push(ProjectPathEntry::legacy(directory))
+        });
+    }
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        ResolverLimits {
+            max_compile_time_work: 10_000,
+            ..ResolverLimits::default()
+        },
+    );
+    resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Main",
+            importer_path: &root.join("App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    let per_byte = ResolverLimits::default().compile_time_work_per_source_byte;
+    let credited = resolver.compile_time_work_allowance();
+    assert!(
+        credited <= total * (per_byte + 3),
+        "{credited} for {total} bytes"
+    );
+    let usage = resolver.compile_time_usage();
+    assert!(usage.work <= 10_000 + credited, "{usage:?}");
 }

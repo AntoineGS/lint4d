@@ -254,18 +254,24 @@ impl HeaderProof {
 /// No conditional evaluator is needed if the shared directive scanner reaches
 /// the first Pascal semicolon without finding a directive. Directive-bearing
 /// prefixes fall back to the source-order session, using the same root budget.
+///
+/// `grant_floor` is the offset already credited to the request for `root`;
+/// `read_to` receives the furthest offset read, even on refusal.
 pub(crate) fn plain_header_in_session(
     root: &LoadedSource,
     text: &str,
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
+    grant_floor: usize,
+    read_to: &mut usize,
 ) -> Result<Option<AdmittedOwned<Fact<VerifiedUnitHeader>>>, ResolverError> {
     let mut output = budget.admit_compilation(0, |budget| {
         let mut scanner = crate::conditional::DirectiveScanner::prefix(budget)
             .map_err(|r| super::session::resolver_error(r, budget))?;
-        let next = scanner
-            .next(text, 0, &root.id, OccurrenceId(0), budget, cancel)
-            .map_err(|r| super::session::resolver_error(r, budget))?;
+        scanner.set_grant_floor(grant_floor);
+        let next = scanner.next(text, 0, &root.id, OccurrenceId(0), budget, cancel);
+        *read_to = (*read_to).max(scanner.read_to());
+        let next = next.map_err(|r| super::session::resolver_error(r, budget))?;
         if next.directive.is_some() {
             return Ok(None);
         }

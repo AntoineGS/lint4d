@@ -40,6 +40,17 @@ impl CancellationToken for NoCancellation {
     }
 }
 
+/// What one request has credited for one distinct source (l4d-9bxx).
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceCredit {
+    /// Furthest byte offset whose per-byte grant was credited.
+    scanned: usize,
+    /// Raw UTF-8 validation was funded.
+    validation: bool,
+    /// The lexical-only import estimate was funded.
+    lexical: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverLimits {
     pub max_dependency_units: usize,
@@ -60,6 +71,11 @@ pub struct ResolverLimits {
     pub max_compile_time_retained_bytes: usize,
     pub max_compile_time_work: usize,
     pub max_compile_time_byte_work: usize,
+    /// Steps and byte work each source byte the directive scanner reads adds
+    /// to the session and aggregate limits. Zero selects fixed limits: no
+    /// per-byte grant and no funded whole-input charges.
+    pub compile_time_work_per_source_byte: usize,
+    pub compile_time_byte_work_per_source_byte: usize,
 }
 
 impl Default for ResolverLimits {
@@ -82,6 +98,8 @@ impl Default for ResolverLimits {
             max_compile_time_retained_bytes: 1_048_576,
             max_compile_time_work: work.max_work,
             max_compile_time_byte_work: work.max_byte_work,
+            compile_time_work_per_source_byte: work.work_per_source_byte,
+            compile_time_byte_work_per_source_byte: work.byte_work_per_source_byte,
         }
     }
 }
@@ -1483,6 +1501,14 @@ pub struct UnitResolver<S> {
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
+    /// Steps granted by source bytes scanned in finished sessions; they raise
+    /// `max_compile_time_work` as they raised each session's `max_work`.
+    compile_time_work_allowance: usize,
+    /// Byte work granted the same way; it raises `max_compile_time_byte_work`.
+    compile_time_byte_work_allowance: usize,
+    /// What the request has credited per distinct source (identity and
+    /// revision): grants are earned once per byte offset, funded charges once.
+    compile_time_credits: HashMap<SourceId, Vec<(SourceRevision, SourceCredit)>>,
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
     callback_reports: Option<CallbackReports>,
@@ -2148,6 +2174,153 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         Ok(())
     }
+    /// Steps granted on top of `max_compile_time_work`: the per-byte grant of
+    /// source text that finished sessions and probes actually scanned
+    /// (`CompileTimeLimits::work_per_source_byte`), plus funded whole-input
+    /// charges.
+    pub fn compile_time_work_allowance(&self) -> usize {
+        self.compile_time_work_allowance
+    }
+
+    /// Byte work granted on top of `max_compile_time_byte_work` the same way.
+    pub fn compile_time_byte_work_allowance(&self) -> usize {
+        self.compile_time_byte_work_allowance
+    }
+
+    fn compile_time_credit(&mut self, source: &LoadedSource) -> &mut SourceCredit {
+        let revisions = self
+            .compile_time_credits
+            .entry(source.id.clone())
+            .or_default();
+        let index = match revisions
+            .iter()
+            .position(|(revision, _)| *revision == source.revision)
+        {
+            Some(index) => index,
+            None => {
+                revisions.push((source.revision.clone(), SourceCredit::default()));
+                revisions.len() - 1
+            }
+        };
+        &mut revisions[index].1
+    }
+
+    /// Offset of `source` already credited to the request.
+    fn compile_time_credit_floor(&self, source: &LoadedSource) -> usize {
+        self.compile_time_credits
+            .get(&source.id)
+            .and_then(|revisions| {
+                revisions
+                    .iter()
+                    .find(|(revision, _)| *revision == source.revision)
+            })
+            .map_or(0, |(_, credit)| credit.scanned)
+    }
+
+    /// A scanner read `source` to offset `end`: credit the request the
+    /// per-byte grant of the bytes beyond its furthest credited offset.
+    fn credit_compile_time_scan(&mut self, source: &LoadedSource, end: usize) {
+        let (work, bytes) = (
+            self.limits.compile_time_work_per_source_byte,
+            self.limits.compile_time_byte_work_per_source_byte,
+        );
+        if work == 0 && bytes == 0 {
+            return;
+        }
+        let credit = self.compile_time_credit(source);
+        let new = end.saturating_sub(credit.scanned);
+        credit.scanned = credit.scanned.max(end);
+        self.compile_time_work_allowance = self
+            .compile_time_work_allowance
+            .saturating_add(new.saturating_mul(work));
+        self.compile_time_byte_work_allowance = self
+            .compile_time_byte_work_allowance
+            .saturating_add(new.saturating_mul(bytes));
+    }
+
+    /// Whether raw UTF-8 validation of `source` is funded: the first time per
+    /// distinct source in this request, crediting the request what it costs
+    /// (about 3 steps and 3 bytes per source byte: validation, copy and the
+    /// shared backing). Later validations are paid.
+    fn credit_compile_time_validation(&mut self, source: &LoadedSource) -> bool {
+        let (work, bytes) = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if !work && !bytes {
+            // Fixed limits: charge_funded funds nothing anyway.
+            return true;
+        }
+        if source.decoded_text.is_some() {
+            return true;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.validation {
+            return false;
+        }
+        credit.validation = true;
+        let cost = source.bytes.len().saturating_mul(3);
+        if work {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(cost);
+        }
+        if bytes {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(cost);
+        }
+        true
+    }
+
+    /// The lexical-only import pass's whole-source estimate is funded once
+    /// per distinct source in this request.
+    fn credit_compile_time_lexical(&mut self, source: &LoadedSource, work: usize, bytes: usize) {
+        let enabled = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if enabled == (false, false) {
+            return;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.lexical {
+            return;
+        }
+        credit.lexical = true;
+        if enabled.0 {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(work);
+        }
+        if enabled.1 {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(bytes);
+        }
+    }
+
+    fn max_compile_time_work(&self) -> usize {
+        self.limits
+            .max_compile_time_work
+            .saturating_add(self.compile_time_work_allowance)
+    }
+
+    fn max_compile_time_byte_work(&self) -> usize {
+        self.limits
+            .max_compile_time_byte_work
+            .saturating_add(self.compile_time_byte_work_allowance)
+    }
+
+    /// The part of `max_compile_time_work`, raised by granted steps, that
+    /// `used` has not consumed.
+    fn remaining_compile_time_work(&self, used: crate::compile_time::BudgetSnapshot) -> usize {
+        self.max_compile_time_work().saturating_sub(used.work)
+    }
+
+    /// The part of `max_compile_time_byte_work`, raised by granted byte work,
+    /// that `used` has not consumed.
+    fn remaining_compile_time_byte_work(&self, used: crate::compile_time::BudgetSnapshot) -> usize {
+        self.max_compile_time_byte_work()
+            .saturating_sub(used.byte_work)
+    }
+
     /// Cumulative admitted work and live scratch/published-output reservations.
     /// Temporary projections refund storage, never work or byte work. The
     /// resolver cannot observe callers dropping outputs, so their reservations
@@ -2231,13 +2404,13 @@ impl<S: SourceStore> UnitResolver<S> {
                 work: admit(
                     c.work,
                     work,
-                    self.limits.max_compile_time_work,
+                    self.max_compile_time_work(),
                     "max_compile_time_work",
                 )?,
                 byte_work: admit(
                     c.byte_work,
                     bytes,
-                    self.limits.max_compile_time_byte_work,
+                    self.max_compile_time_byte_work(),
                     "max_compile_time_byte_work",
                 )?,
                 retained_bytes: admit(
@@ -2342,22 +2515,20 @@ impl<S: SourceStore> UnitResolver<S> {
         let defaults = crate::compile_time::CompileTimeLimits::default();
         let aggregate = self.compile_time_usage();
         let limits = crate::compile_time::CompileTimeLimits {
-            max_work: defaults.max_work.min(
-                self.limits
-                    .max_compile_time_work
-                    .saturating_sub(aggregate.work),
-            ),
-            max_byte_work: defaults.max_byte_work.min(
-                self.limits
-                    .max_compile_time_byte_work
-                    .saturating_sub(aggregate.byte_work),
-            ),
+            max_work: defaults
+                .max_work
+                .min(self.remaining_compile_time_work(aggregate)),
+            max_byte_work: defaults
+                .max_byte_work
+                .min(self.remaining_compile_time_byte_work(aggregate)),
             // An explicit resolver retention selection must reach this session.
             // Default resolver construction still selects the core 1 MiB cap.
             max_retained_bytes: self
                 .limits
                 .max_compile_time_retained_bytes
                 .saturating_sub(aggregate.retained_bytes),
+            work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+            byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
             ..defaults
         };
         let mut budget = crate::compile_time::CompileTimeBudget::new(limits, cancel);
@@ -2396,6 +2567,8 @@ impl<S: SourceStore> UnitResolver<S> {
         // session. Failed-session storage has been dropped, never published.
         let usage = budget.snapshot();
         self.report_owners.record_work(&budget);
+        // The request was credited the distinct bytes the session read, as it
+        // read them (note_scanned); its own per-session grants are not added.
         self.compile_time_accounting.work += usage.work;
         self.compile_time_accounting.byte_work += usage.byte_work;
         if let Some(root) = self
@@ -2429,27 +2602,34 @@ impl<S: SourceStore> UnitResolver<S> {
                 crate::compile_time::CompileTimeLimits {
                     max_work: defaults
                         .max_work
-                        .min(self.limits.max_compile_time_work.saturating_sub(used.work)),
-                    max_byte_work: defaults.max_byte_work.min(
-                        self.limits
-                            .max_compile_time_byte_work
-                            .saturating_sub(used.byte_work),
-                    ),
+                        .min(self.remaining_compile_time_work(used)),
+                    max_byte_work: defaults
+                        .max_byte_work
+                        .min(self.remaining_compile_time_byte_work(used)),
                     max_retained_bytes: self
                         .limits
                         .max_compile_time_retained_bytes
                         .saturating_sub(used.retained_bytes),
+                    work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+                    byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
                     ..defaults
                 },
                 cancel,
             );
+            let floor = self.compile_time_credit_floor(source);
+            let mut read_to = 0;
             let shape = crate::conditional::source_directive_shape_in_session(
                 text,
                 &source.id,
                 &mut probe_budget,
                 cancel,
+                floor,
+                &mut read_to,
             );
             let scanned = probe_budget.snapshot();
+            // The probe read the text: the request is credited its distinct
+            // bytes once; a later session over the same source earns nothing.
+            self.credit_compile_time_scan(source, read_to);
             // Transfer monotonic probe work to the same resolver aggregate on
             // success AND refusal. Only ephemeral scanner scratch has died.
             self.charge_compile_time(scanned.work, scanned.byte_work, 0, cancel)?;
@@ -2462,7 +2642,14 @@ impl<S: SourceStore> UnitResolver<S> {
                 // The legacy scalar analyzer still uses its conservative
                 // whole-source estimate; shared dispatch below charges actual
                 // scanner/evaluator steps and must not inherit that estimate.
-                self.charge_compile_time(text.len().saturating_mul(8), text.len(), 0, cancel)?;
+                //
+                // That estimate is proportional to the whole text the lexical
+                // pass reads, so it is funded (granted exactly what it charges),
+                // as raw UTF-8 validation is: it neither consumes the fixed
+                // budget nor leaves anything for other work.
+                let estimate = text.len().saturating_mul(8);
+                self.credit_compile_time_lexical(source, estimate, text.len());
+                self.charge_compile_time(estimate, text.len(), 0, cancel)?;
                 let context = self.context.conditional_context_for(&source.path);
                 let mut context_bytes = 0usize;
                 context
@@ -2713,6 +2900,9 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
+            compile_time_work_allowance: 0,
+            compile_time_byte_work_allowance: 0,
+            compile_time_credits: HashMap::new(),
             compile_time_store: None,
             compile_time_caches: Vec::new(),
             callback_reports: None,
@@ -4632,32 +4822,38 @@ impl<S: SourceStore> UnitResolver<S> {
                 crate::compile_time::CompileTimeLimits {
                     max_branch_states: crate::compile_time::HEADER_MAX_BRANCH_STATES,
                     max_work: self
-                        .limits
-                        .max_compile_time_work
-                        .saturating_sub(used.work)
+                        .remaining_compile_time_work(used)
                         .min(crate::compile_time::CompileTimeLimits::default().max_work),
                     max_byte_work: self
-                        .limits
-                        .max_compile_time_byte_work
-                        .saturating_sub(used.byte_work)
+                        .remaining_compile_time_byte_work(used)
                         .min(crate::compile_time::HEADER_MAX_BYTE_WORK),
                     max_retained_bytes: self
                         .limits
                         .max_compile_time_retained_bytes
                         .saturating_sub(used.retained_bytes),
+                    work_per_source_byte: self.limits.compile_time_work_per_source_byte,
+                    byte_work_per_source_byte: self.limits.compile_time_byte_work_per_source_byte,
                     ..crate::compile_time::CompileTimeLimits::default()
                 },
                 cancel,
             )
         };
         let result = (|| {
-            let coordinate = crate::compile_time::coordinate_text(source, &mut budget, cancel)?;
-            if let Some(header) = crate::compile_time::plain_header_in_session(
+            let funded = self.credit_compile_time_validation(source);
+            let coordinate =
+                crate::compile_time::coordinate_text(source, &mut budget, cancel, funded)?;
+            let floor = self.compile_time_credit_floor(source);
+            let mut read_to = 0;
+            let header = crate::compile_time::plain_header_in_session(
                 source,
                 &coordinate,
                 &mut budget,
                 cancel,
-            )? {
+                floor,
+                &mut read_to,
+            );
+            self.credit_compile_time_scan(source, read_to);
+            if let Some(header) = header? {
                 return Ok(header);
             }
             let reserve = conditional_context_reserve_polled(&self.context, cancel)?;
@@ -5171,44 +5367,95 @@ impl<S: SourceStore> UnitResolver<S> {
                 .map_err(ResolverError::InvalidRequest)?;
             entry_bound = entry_bound.max(bytes);
         }
-        let backing = count
-            .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
-            .ok_or_else(overflow)?;
-        let mut payload = backing;
-        let mut key_bytes = 0usize;
-        for path in listing.files.iter().chain(overlays.iter()) {
-            let path_bytes = path.as_os_str().len();
-            let copies = path_bytes
+        let key_bound = |path: &Path| {
+            path.as_os_str()
+                .len()
                 .checked_mul(8)
-                .and_then(|n| n.checked_add(entry_bound.checked_mul(2)?))
                 .and_then(|n| n.checked_add(32))
+                .ok_or_else(overflow)
+        };
+        // The name test is one pass over the listing that reads each file
+        // name once per wanted name, one lossy name live at a time; overlays
+        // compare their whole path. Dedup, entry construction, copies and
+        // sorting only touch the candidates it keeps, so only they pay
+        // pairwise, sort-key or payload terms.
+        let mut read_bytes = 0usize;
+        let mut largest_key = 0usize;
+        for path in listing.files.iter() {
+            let name = path.file_name().map_or(0, |name| name.len());
+            read_bytes = read_bytes.checked_add(name).ok_or_else(overflow)?;
+            largest_key = largest_key.max(key_bound(path)?);
+        }
+        read_bytes = read_bytes
+            .checked_mul(names.len().max(1))
+            .ok_or_else(overflow)?;
+        for path in overlays.iter() {
+            read_bytes = read_bytes
+                .checked_add(path.as_os_str().len())
                 .ok_or_else(overflow)?;
-            payload = payload.checked_add(copies).ok_or_else(overflow)?;
-            key_bytes = key_bytes
-                .checked_add(
-                    path_bytes
-                        .checked_mul(8)
-                        .and_then(|n| n.checked_add(32))
-                        .ok_or_else(overflow)?,
-                )
+            largest_key = largest_key.max(key_bound(path)?);
+        }
+        let name_work = count
+            .checked_mul(names.len().checked_add(1).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        budget
+            .charge(name_work, read_bytes, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let mut candidates = 0usize;
+        let mut candidate_keys = 0usize;
+        for path in listing.files.iter().filter(|path| {
+            path.file_name().is_some_and(|name| {
+                names
+                    .iter()
+                    .any(|wanted| name.to_string_lossy().eq_ignore_ascii_case(wanted))
+            })
+        }) {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            candidates = candidates.checked_add(1).ok_or_else(overflow)?;
+            candidate_keys = candidate_keys
+                .checked_add(key_bound(path)?)
                 .ok_or_else(overflow)?;
         }
+        for path in overlays.iter() {
+            candidates = candidates.checked_add(1).ok_or_else(overflow)?;
+            candidate_keys = candidate_keys
+                .checked_add(key_bound(path)?)
+                .ok_or_else(overflow)?;
+        }
+        let copies = entry_bound
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(candidates))
+            .and_then(|n| n.checked_add(candidate_keys))
+            .ok_or_else(overflow)?;
+        let backing = candidates
+            .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
+            .ok_or_else(overflow)?;
+        let payload = backing.checked_add(copies).ok_or_else(overflow)?;
         // Comparisons, lossy name and sorting keys have a separate temporary
         // construction owner; they never travel with the returned path Vec.
-        let work = count
+        let work = candidates
             .checked_mul(
-                count
+                candidates
                     .checked_add(self.context.explicit_unit_entries().len())
-                    .and_then(|n| n.checked_add(names.len()))
                     .and_then(|n| n.checked_add(2))
                     .ok_or_else(overflow)?,
             )
+            .and_then(|n| n.checked_add(name_work))
+            .ok_or_else(overflow)?;
+        let byte_work = candidate_keys
+            .checked_mul(candidates.max(1))
+            .and_then(|n| n.checked_add(read_bytes))
             .ok_or_else(overflow)?;
         let _sorting = budget
             .admit_owned(
                 work,
-                key_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
-                key_bytes.checked_add(backing).ok_or_else(overflow)?,
+                byte_work,
+                candidate_keys
+                    .checked_add(largest_key)
+                    .and_then(|n| n.checked_add(backing))
+                    .ok_or_else(overflow)?,
                 || (),
             )
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
@@ -5218,7 +5465,7 @@ impl<S: SourceStore> UnitResolver<S> {
             payload,
             crate::compile_time::resolver_error,
             || {
-                let mut paths: Vec<(PathBuf, ProjectPathEntry)> = Vec::with_capacity(count);
+                let mut paths: Vec<(PathBuf, ProjectPathEntry)> = Vec::with_capacity(candidates);
                 for path in &listing.files {
                     if cancel.is_cancelled() {
                         return Err(ResolverError::Cancelled);
@@ -6819,16 +7066,26 @@ impl<S: SourceStore> UnitResolver<S> {
             sort_bytes = sort_bytes
                 .checked_add(index_bytes.checked_mul(2).ok_or_else(overflow)?)
                 .ok_or_else(overflow)?;
-            let work = count
-                .checked_mul(count.checked_add(1).ok_or_else(overflow)?)
+            // One pass over the listing; dedup and sorting only touch the
+            // entries whose name matches, so only they pay the pairwise term.
+            let (matching, matching_bytes, largest_key) =
+                case_match_sizing(&listing, wanted, &mut budget, cancel)?;
+            let work = matching
+                .checked_mul(matching.checked_add(1).ok_or_else(overflow)?)
+                .and_then(|n| n.checked_add(count))
+                .ok_or_else(overflow)?;
+            // The name pass runs twice: sizing the matches, then matching.
+            let byte_work = matching_bytes
+                .checked_mul(matching.max(1))
+                .and_then(|n| n.checked_add(sort_bytes.checked_mul(2)?))
+                .ok_or_else(overflow)?;
+            // One lossy name is live at a time; only matches keep sort keys.
+            let scratch = matching_bytes
+                .checked_add(largest_key)
+                .and_then(|n| n.checked_add(index_bytes.checked_mul(2)?))
                 .ok_or_else(overflow)?;
             let _sorting = budget
-                .admit_owned(
-                    work,
-                    sort_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
-                    sort_bytes,
-                    || (),
-                )
+                .admit_owned(work, byte_work, scratch, || ())
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
             let candidate_at = |index: usize| {
                 if index < listing.files.len() {
@@ -7630,6 +7887,15 @@ impl<S: SourceStore> UnitResolver<S> {
 }
 
 impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S> {
+    fn scan_credit_floor(&mut self, source: &LoadedSource) -> usize {
+        self.compile_time_credit_floor(source)
+    }
+    fn note_scanned(&mut self, source: &LoadedSource, end: usize) {
+        self.credit_compile_time_scan(source, end);
+    }
+    fn fund_validation(&mut self, source: &LoadedSource) -> bool {
+        self.credit_compile_time_validation(source)
+    }
     fn include_capability(
         &mut self,
         request: IncludeResolveRequest<'_>,
@@ -9226,6 +9492,8 @@ fn copy_case_path(
         .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
+/// Bytes the case-insensitive comparison pass reads: every entry's name and
+/// the wanted component, after charging one step per entry.
 fn case_sort_sizing(
     listing: &DirectoryListing,
     wanted: &std::ffi::OsStr,
@@ -9241,27 +9509,72 @@ fn case_sort_sizing(
     budget
         .charge(count, 0, 0)
         .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-    let mut bytes = wanted
-        .len()
-        .checked_mul(8)
-        .and_then(|n| n.checked_add(32))
-        .ok_or_else(overflow)?;
+    let mut bytes = wanted.len();
     for candidate in listing.files.iter().chain(listing.directories.iter()) {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
         bytes = bytes
-            .checked_add(
-                candidate
-                    .as_os_str()
-                    .len()
-                    .checked_mul(8)
-                    .and_then(|n| n.checked_add(32))
-                    .ok_or_else(overflow)?,
-            )
+            .checked_add(candidate.file_name().map_or(0, |name| name.len()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)
+}
+
+/// Counts the listing entries whose name matches `wanted` case-insensitively
+/// and their sort-key bytes, after charging the comparison pass. Also returns
+/// the largest single sort-key bound of the listing.
+fn case_match_sizing(
+    listing: &DirectoryListing,
+    wanted: &std::ffi::OsStr,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<(usize, usize, usize), ResolverError> {
+    let overflow = || ResolverError::InvalidRequest("case match sizing overflow".into());
+    let count = listing
+        .files
+        .len()
+        .checked_add(listing.directories.len())
+        .ok_or_else(overflow)?;
+    budget
+        .charge(count, 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    // A non-UTF-8 component is decoded into an owned copy (at most 3 bytes
+    // per input byte): admit it before allocating. UTF-8 names borrow.
+    let lossy = wanted.len().saturating_mul(3);
+    let wanted = budget
+        .admit_owned(1, wanted.len(), lossy, || {
+            wanted.to_string_lossy().into_owned()
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    let mut matching = 0usize;
+    let mut bytes = 0usize;
+    let mut largest = 0usize;
+    for candidate in listing.files.iter().chain(listing.directories.iter()) {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let bound = candidate
+            .as_os_str()
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(32))
+            .ok_or_else(overflow)?;
+        largest = largest.max(bound);
+        // Same predicate as the matching pass. A UTF-8 name is compared in
+        // place; only a non-UTF-8 name is decoded, bounded by its length.
+        if candidate
+            .file_name()
+            .is_some_and(|name| match name.to_str() {
+                Some(name) => name.eq_ignore_ascii_case(&wanted),
+                None => name.to_string_lossy().eq_ignore_ascii_case(&wanted),
+            })
+        {
+            matching += 1;
+            bytes = bytes.checked_add(bound).ok_or_else(overflow)?;
+        }
+    }
+    Ok((matching, bytes, largest))
 }
 
 fn case_result_payload_size(
@@ -9700,6 +10013,9 @@ mod tests {
         }];
         let mut r = admission_resolver(ResolverLimits {
             max_compile_time_work: 50,
+            // A fixed cap: no per-byte grant (l4d-9bxx).
+            compile_time_work_per_source_byte: 0,
+            compile_time_byte_work_per_source_byte: 0,
             ..Default::default()
         });
         assert!(matches!(
@@ -17006,6 +17322,70 @@ mod tests {
         assert!(!call.report.observations.is_empty());
     }
 
+    /// l4d-9bxx: the name pass is linear, but entries whose name matches pay
+    /// the pairwise dedup/sort term; many case variants are charged for it.
+    #[test]
+    fn many_matching_entries_pay_the_pairwise_candidate_term() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        if path_identity::is_case_insensitive(dir.path()) {
+            return;
+        }
+        // All 16 case spellings of "many.pas" match "Many.pas".
+        let mut variants = Vec::new();
+        for mask in 0..16u32 {
+            let name: String = "many"
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if mask & (1 << i) != 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            variants.push(format!("{name}.pas"));
+        }
+        for name in &variants {
+            fs::write(dir.path().join(name), "unit Many;").unwrap();
+        }
+        fs::write(dir.path().join("Single.pas"), "unit Single;").unwrap();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let mut spent = |name: &str| {
+            let before = budget.snapshot();
+            let paths = call
+                .paths_for_names(
+                    dir.path(),
+                    &entry,
+                    &[name.into()],
+                    &listing,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let after = budget.snapshot();
+            (
+                paths.len(),
+                after.work - before.work,
+                after.byte_work - before.byte_work,
+            )
+        };
+        let (single, single_work, single_bytes) = spent("Single.pas");
+        let (many, many_work, many_bytes) = spent("Many.pas");
+        assert_eq!(single, 1);
+        assert_eq!(many, 16);
+        assert!(
+            many_work >= single_work + 16 * 16,
+            "16 candidates: {many_work} steps, 1 candidate: {single_work}"
+        );
+        assert!(many_bytes > single_bytes);
+    }
+
     #[test]
     fn candidate_scratch_missing_overlay_dedup_and_case_variants_keep_real_capacity_owner() {
         use crate::compile_time::CompileTimeLimits;
@@ -17041,9 +17421,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(missing.is_empty());
-            assert!(
-                missing.capacity() >= listing.files.len(),
-                "empty result still owns allocated receiving capacity until drop"
+            assert_eq!(
+                missing.capacity(),
+                0,
+                "receiving capacity is sized by name-matching candidates, not the listing"
             );
             drop(missing);
             assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);

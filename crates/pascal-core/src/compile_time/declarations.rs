@@ -324,10 +324,13 @@ impl CompileTimeState {
                     _ => None,
                 };
                 if let Some(delimiter) = delimiter {
+                    // Per-path declaration feeds re-read text the directive
+                    // scanner already granted; they grant nothing.
                     let skip = crate::conditional::bounded_trivia_run(
                         fragment.text,
                         i,
                         delimiter,
+                        None,
                         budget,
                     )?;
                     if skip > 0 {

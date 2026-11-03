@@ -1111,7 +1111,7 @@ configuration schema:
     "conditionalUndefines": ["LEGACY"],
     "conditionalConstants": {"BuildNumber": 42},
     "maxFiles": 10000,
-    "maxFileBytes": 2097152,
+    "maxFileBytes": 4194304,
     "maxTotalBytes": 268435456
   }
 }
@@ -1926,8 +1926,8 @@ Documentation processing is bounded and cancellable:
 
 | Documentation limit | Value |
 | --- | ---: |
-| Source scan | 2 MiB |
-| Scanned comments | 8,192 |
+| Source scan | 16 MiB (the `maxFileBytes` ceiling) |
+| Scanned comments | 8,192, or one per 32 scanned bytes if more |
 | Individual comment body | 64 KiB |
 | Individual XML tag | 4 KiB |
 | XML nesting depth | 64 levels |
@@ -2073,8 +2073,15 @@ path also runs before provider body/closure indexing when the body would refuse
 its finite work budget. Candidate selection and request-local prefix reproof use
 a header-purpose ceiling of 64 MiB byte-work and 256 reachable states; tighter
 caller limits and cancellation still apply. Whole-body sessions use the measured
-finite 2,000,000-operation / 64 MiB profile and retain their separate 64-state
-ceiling. Header selection and reproof inherit the same operation policy while
+finite 2,000,000-operation / 64 MiB profile, raised by 8 operations and 32 bytes
+of byte-work for each source byte the directive scanner actually reads (in the
+root, providers and includes; a header-only or interface-only scan reads only a
+prefix, so it is granted only that prefix), and retain their separate 64-state
+ceiling. Raw UTF-8 validation and the lexical-only import pass, which read a
+whole source, are granted exactly what they charge. Request-wide limits gain these
+grants once per distinct source (path identity and revision), up to the furthest
+offset already credited: re-reading the same text, or validating it again, is
+paid from the fixed budget. Header selection and reproof inherit the same operation policy while
 keeping their 256-state purpose. Explicit smaller callers and shared remaining
 budgets are preserved. These are charged-work limits, not RSS or
 allocator measurements, and header availability does not certify body completion.
@@ -2283,10 +2290,12 @@ effective observations remain unchanged. Other clients receive an eager edit.
 | `sourcePaths` | Additional ordered unit search paths |
 | `exclude` | Additional source-discovery exclude globs |
 | `maxFiles` | 10,000 indexed files |
-| `maxFileBytes` | 2,097,152 bytes per document |
+| `maxFileBytes` | 4,194,304 bytes per document; may be raised to 16,777,216 |
 | `maxTotalBytes` | 268,435,456 source bytes per budget |
 
-Resource-limit options may lower limits, not raise the hard caps. Open buffers
+Resource-limit options may lower limits, not raise the hard caps, except
+`maxFileBytes`, which may be raised up to its 16 MiB ceiling. Larger values
+are clamped to the cap, as for the other limits. Open buffers
 take priority over closed parsed-cache entries, which can be evicted and loaded
 again on demand. Current-request dependencies are protected during resolution;
 if they cannot fit, navigation reports incomplete resolution rather than
@@ -2307,7 +2316,8 @@ partial proof. Includes used by rename are separately bounded by 4,096 files,
 Compile-time work, byte-work, declaration/field/provider counts, pending text,
 scope/type depth and branch alternatives are also bounded and cancellable.
 Checked layout arithmetic never wraps into a known size. Core defaults include
-2,000,000 work units, 64 MiB byte-work, 1 MiB retained storage, depth 256 and
+2,000,000 work units and 64 MiB byte-work, each raised by 8 units and 32 bytes
+per source byte the directive scanner reads, 1 MiB retained storage, depth 256 and
 64 branch states; other limits can refuse earlier. In particular, default
 include-depth 256 success has not been demonstrated: isolated depth probes
 refuse earlier at retention limits. The LSP preserves its existing **finite

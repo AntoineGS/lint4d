@@ -6,8 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const MAX_DOCUMENTATION_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+/// Sources reaching documentation already passed `maxFileBytes`, so the scan
+/// covers the largest document the workspace may index.
+const MAX_DOCUMENTATION_SOURCE_BYTES: usize = crate::workspace::MAX_FILE_BYTES_CEILING;
+/// Scanned comments: at least this many, and one per
+/// `DOCUMENTATION_BYTES_PER_COMMENT` scanned bytes in larger sources.
 const MAX_DOCUMENTATION_COMMENTS: usize = 8 * 1024;
+const DOCUMENTATION_BYTES_PER_COMMENT: usize = 32;
 const MAX_DOCUMENTATION_COMMENT_BYTES: usize = 64 * 1024;
 const MAX_DOCUMENTATION_TAG_BYTES: usize = 4096;
 const MAX_DOCUMENTATION_NESTING: usize = 64;
@@ -1084,6 +1089,7 @@ fn find_documentation(
 fn scan_comments(source: &str, cancel: &AtomicBool) -> Result<Vec<CommentAttachment>, String> {
     let bytes = source.as_bytes();
     let limit = source.len().min(MAX_DOCUMENTATION_SOURCE_BYTES);
+    let max_comments = MAX_DOCUMENTATION_COMMENTS.max(limit / DOCUMENTATION_BYTES_PER_COMMENT);
     let mut raw = Vec::new();
     let mut index = 0usize;
     while index < limit {
@@ -1148,7 +1154,7 @@ fn scan_comments(source: &str, cancel: &AtomicBool) -> Result<Vec<CommentAttachm
             }
             _ => index = index.saturating_add(1),
         }
-        if raw.len() >= MAX_DOCUMENTATION_COMMENTS {
+        if raw.len() >= max_comments {
             break;
         }
     }
@@ -1613,6 +1619,34 @@ mod tests {
         assert_eq!(
             render(&whitespace, MarkupKind::Markdown),
             Some("`   foo  bar baz   `".to_owned())
+        );
+    }
+
+    /// l4d-9bxx: a declaration late in a large, comment-dense unit (as in
+    /// SynCommons.pas, 2.2 MB) keeps its documentation.
+    #[test]
+    fn documentation_is_found_late_in_a_large_comment_dense_unit() {
+        let mut source = String::from("unit Big;\ninterface\n");
+        let mut n = 0;
+        while source.len() < 2_300_000 {
+            source.push_str(&format!(
+                "/// <summary>Routine {n} does its work.</summary>\nprocedure Routine{n}; // trailing note\n{{ ordinary comment {n} }}\n"
+            ));
+            n += 1;
+        }
+        source.push_str("/// <summary>The last routine.</summary>\nprocedure Last;\n");
+        let comments = scan_comments(&source, &not_cancelled()).expect("comments scan");
+        let documentation = find_documentation(
+            &source,
+            &comments,
+            source.find("procedure Last;").expect("last declaration"),
+            &not_cancelled(),
+        )
+        .expect("documentation lookup")
+        .expect("the last routine is documented");
+        assert_eq!(
+            render(&documentation, MarkupKind::PlainText),
+            Some("The last routine.".to_owned())
         );
     }
 

@@ -178,6 +178,20 @@ fn provider_owned_payload(provider: &ProviderSource) -> Result<usize, ResolverEr
 }
 
 pub trait CompileTimeResolver {
+    /// Offset of `source` already credited to the request-wide per-byte
+    /// allowance; the session's scanner grants nothing for bytes before it.
+    /// The default credits nothing request-wide, so every read is new.
+    fn scan_credit_floor(&mut self, _source: &LoadedSource) -> usize {
+        0
+    }
+    /// The session's scanner has read `source` up to offset `end`. A request
+    /// credits each distinct source's bytes once, up to the furthest offset.
+    fn note_scanned(&mut self, _source: &LoadedSource, _end: usize) {}
+    /// Whether raw UTF-8 validation of `source` is funded. A request funds
+    /// it once per distinct source; repeated validation is paid.
+    fn fund_validation(&mut self, _source: &LoadedSource) -> bool {
+        true
+    }
     /// Returned reports are an explicit owned capability. Defaults never call
     /// legacy callbacks; bounded adapters opt in with admitted constructors.
     fn unit_report_capability(
@@ -415,7 +429,27 @@ pub(crate) fn analyze_source_in_session(
     publish_analysis(analysis, budget)
 }
 
+/// What one session has credited for one distinct source (identity and
+/// content): every adapter credits each byte at most once per session and
+/// funds validation once, whatever its resolver hooks do.
+struct ScanCredit {
+    source: crate::SourceId,
+    content: u64,
+    scanned: usize,
+    validated: bool,
+}
+
+fn source_content(source: &LoadedSource) -> u64 {
+    match &source.revision {
+        crate::SourceRevision::Disk { content_hash, .. }
+        | crate::SourceRevision::Overlay { content_hash, .. } => *content_hash,
+    }
+}
+
 struct ProviderSession {
+    /// Per-source session credits; shared by the root and nested provider
+    /// sessions of one compilation.
+    credits: AdmittedOwned<Vec<AdmittedOwned<ScanCredit>>>,
     active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     identities: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     queries: usize,
@@ -469,9 +503,20 @@ pub(crate) fn header_owned_in_session(
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
 ) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
-    let coordinate = super::coordinates::text(root, budget, cancel)?;
-    if let Some(header) = super::header::plain_header_in_session(root, &coordinate, budget, cancel)?
-    {
+    let funded = resolver.fund_validation(root);
+    let coordinate = super::coordinates::text(root, budget, cancel, funded)?;
+    let floor = resolver.scan_credit_floor(root);
+    let mut read_to = 0;
+    let header = super::header::plain_header_in_session(
+        root,
+        &coordinate,
+        budget,
+        cancel,
+        floor,
+        &mut read_to,
+    );
+    resolver.note_scanned(root, read_to);
+    if let Some(header) = header? {
         return Ok(header);
     }
     header_with_coordinates_in_session(root, &coordinate, context, resolver, budget, cancel)
@@ -518,13 +563,88 @@ impl ProviderSession {
         let identities = budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?;
+        let credits = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
         Ok(Self {
+            credits,
             active,
             identities,
             declarations,
             queries: 0,
             next_occurrence: 1,
         })
+    }
+
+    fn credit(&self, source: &LoadedSource) -> Option<&ScanCredit> {
+        let content = source_content(source);
+        self.credits
+            .iter()
+            .map(|credit| &**credit)
+            .find(|credit| credit.content == content && credit.source == source.id)
+    }
+
+    /// Offset of `source` this session has already credited.
+    fn credit_floor(&self, source: &LoadedSource) -> usize {
+        self.credit(source).map_or(0, |credit| credit.scanned)
+    }
+
+    fn credit_mut(
+        &mut self,
+        source: &LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<&mut ScanCredit, ResolverError> {
+        let content = source_content(source);
+        let index = match self
+            .credits
+            .iter()
+            .position(|credit| credit.content == content && credit.source == source.id)
+        {
+            Some(index) => index,
+            None => {
+                let bytes = source.id.as_str().len();
+                let credit = budget
+                    .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
+                        source: source.id.clone(),
+                        content,
+                        scanned: 0,
+                        validated: false,
+                    })
+                    .map_err(|r| resolver_error(r, budget))?;
+                push_owner(&mut self.credits, credit, budget)?;
+                self.credits.len() - 1
+            }
+        };
+        Ok(self.credits.value_mut()[index].value_mut())
+    }
+
+    /// The session read `source` to `end`.
+    fn note_scanned(
+        &mut self,
+        source: &LoadedSource,
+        end: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if self.credit_floor(source) < end {
+            let credit = self.credit_mut(source, budget)?;
+            credit.scanned = end;
+        }
+        Ok(())
+    }
+
+    /// Whether raw validation of `source` is funded: once per session, and
+    /// only if the resolver funds it too.
+    fn fund_validation(
+        &mut self,
+        source: &LoadedSource,
+        resolver: &mut dyn CompileTimeResolver,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, ResolverError> {
+        if self.credit(source).is_some_and(|credit| credit.validated) {
+            return Ok(false);
+        }
+        self.credit_mut(source, budget)?.validated = true;
+        Ok(resolver.fund_validation(source))
     }
 }
 
@@ -784,7 +904,8 @@ fn analyze_source_with_providers_inner(
         .charge(1, root.id.as_str().len(), reserve)
         .map_err(|r| resolver_error(r, budget))?;
     let coordinate_owner = if prepared_coordinate.is_none() {
-        Some(super::coordinates::text(root, budget, cancel)?)
+        let funded = providers.fund_validation(root, resolver, budget)?;
+        Some(super::coordinates::text(root, budget, cancel, funded)?)
     } else {
         None
     };
@@ -875,6 +996,7 @@ fn analyze_source_with_providers_inner(
         .map_err(|r| resolver_error(r, budget))?;
     let mut session = RootSession {
         header_only,
+        chunked: interface_only && !header_only,
         header_proof,
         prefix_end: 0,
         coordinate: coordinate.clone(),
@@ -924,6 +1046,9 @@ fn analyze_source_with_providers_inner(
         providers,
         physical_paths: vec![(root_occurrence, root.path.clone())],
     };
+    if session.chunked {
+        session.scanner.set_chunk(PROVIDER_SCAN_CHUNK);
+    }
     let result = conditional::analyze_with_source_order(text, context, cancel, &mut session);
     let mut analysis = result.map_err(|()| {
         session.resource_error.take().unwrap_or_else(|| {
@@ -1325,9 +1450,16 @@ pub(crate) fn resolver_error(
     }
 }
 
+/// Bytes an interface-only provider scan reads between checks of whether
+/// every path has finished its interface.
+const PROVIDER_SCAN_CHUNK: usize = 16 * 1024;
+
 struct RootSession<'a, 'b> {
     coordinate: Arc<str>,
     header_only: bool,
+    /// An interface-only provider scans in chunks and stops reading once
+    /// every path has finished its interface.
+    chunked: bool,
     header_proof: AdmittedOwned<super::header::HeaderProof>,
     prefix_end: usize,
     root: LoadedSource,
@@ -2304,8 +2436,14 @@ impl RootSession<'_, '_> {
                         metadata + child.id.as_str().len() + size_of::<crate::SourceId>(),
                     )
                     .map_err(|r| resolver_error(r, self.budget))?;
-                let coordinate =
-                    super::coordinates::text(&output.source, self.budget, self.cancel)?;
+                let coordinate = {
+                    let funded = self.providers.fund_validation(
+                        &output.source,
+                        self.resolver,
+                        self.budget,
+                    )?;
+                    super::coordinates::text(&output.source, self.budget, self.cancel, funded)?
+                };
                 let text = coordinate.as_ref();
                 let child = child.clone();
                 let occurrence = OccurrenceId(self.providers.next_occurrence);
@@ -2736,7 +2874,7 @@ impl SourceOrder for RootSession<'_, '_> {
         self.header_only && self.header_proof.done()
     }
     fn continue_source(&self, end: usize, length: usize) -> bool {
-        self.header_only && !self.header_proof.done() && end < length
+        (self.header_only && !self.header_proof.done() || self.chunked) && end < length
     }
     fn projection_end(&self, length: usize) -> usize {
         if self.header_only {
@@ -2771,6 +2909,13 @@ impl SourceOrder for RootSession<'_, '_> {
                 directive: None,
             });
         }
+        // The session's own floor holds for every adapter; the resolver's
+        // adds what earlier sessions of the request already credited.
+        let floor = self
+            .resolver
+            .scan_credit_floor(&self.root)
+            .max(self.providers.credit_floor(&self.root));
+        self.scanner.set_grant_floor(floor);
         let scanned = self.scanner.next(
             source,
             cursor,
@@ -2779,6 +2924,15 @@ impl SourceOrder for RootSession<'_, '_> {
             self.budget,
             self.cancel,
         );
+        let read_to = self.scanner.read_to();
+        self.resolver.note_scanned(&self.root, read_to);
+        if let Err(error) = self
+            .providers
+            .note_scanned(&self.root, read_to, self.budget)
+        {
+            self.resource_error = Some(error);
+            return Err(());
+        }
         let next = match scanned {
             Ok(next) => next,
             Err(reason) => {
@@ -3155,11 +3309,16 @@ fn apply_path_directive(
 ) -> Result<(), IncompleteReason> {
     // Bound shared-decoder scratch and scan/copy work before parsing switch
     // lists or invoking the legacy scalar mutator's independent safety limits.
+    // The body is read by a bounded number of passes (key, value, option and
+    // switch-list decoding, member keys, this member count): byte work per
+    // pass. Steps are one per directive and one per list member.
+    const BODY_PASSES: usize = 8;
     let bytes = directive.body.len();
     let scratch = bytes.saturating_mul(2 * size_of::<&str>());
+    let members = directive.body.bytes().filter(|b| *b == b',').count() + 1;
     budget.charge(
-        bytes.saturating_mul(8).saturating_add(1),
-        bytes.saturating_mul(32),
+        members.saturating_add(1),
+        bytes.saturating_mul(BODY_PASSES),
         scratch,
     )?;
     let result = apply_path_directive_inner(path, directive, budget);
@@ -3236,8 +3395,12 @@ fn apply_path_directive_inner(
         }
     }
     conditional::apply_source_directive(&mut path.environment, directive, budget)?;
+    // Record a scalar snapshot (and advance the sequence) only when the
+    // directive may have changed a fact; an inert hint such as EXTERNALSYM
+    // leaves the latest snapshot exact.
     if matches!(directive.kind, DirectiveKind::Define | DirectiveKind::Undef)
-        || conditional::is_option_directive(&directive.body)
+        || (conditional::is_option_directive(&directive.body)
+            && conditional::option_directive_sets_facts(&directive.body))
     {
         let scalar = path.environment.snapshot_scalar(budget)?;
         budget.charge(
@@ -3444,50 +3607,52 @@ mod tests {
         assert!(output.root.complete);
         assert!(output.reasons.is_empty());
         assert_eq!(output.directive_fragments.len(), 8_000);
-        assert!(spent.work > 1_000_000);
+        assert!(spent.work > 100_000);
         assert!(spent.work < 2_000_000);
         assert!(spent.byte_work < 64 * 1024 * 1024);
-        let old = analyze_source(
+        // A fixed step cap one short of the actual processing refuses it.
+        let short = analyze_source(
             &root,
             &ConditionalContext::default(),
             &mut NoGraphCallbacks,
             CompileTimeLimits {
-                max_work: 1_000_000,
-                max_byte_work: 16 * 1024 * 1024,
+                max_work: spent.work - 1,
+                work_per_source_byte: 0,
                 ..limits
             },
             &NoCancellation,
         );
-        eprintln!("old work defaults on the same normal fixture: {old:?}");
-        assert!(matches!(
-            old,
-            Err(ResolverError::LimitExceeded {
-                limit: "max_work",
-                observed: 1_000_001,
-                maximum: 1_000_000
-            })
-        ));
+        assert!(
+            matches!(
+                short,
+                Err(ResolverError::LimitExceeded {
+                    limit: "max_work",
+                    observed,
+                    maximum,
+                }) if maximum == spent.work - 1 && observed == spent.work
+            ),
+            "{short:?}"
+        );
         let extreme = graph_source(&format!(
             "unit Dense; interface {} implementation end.",
             "{$DEFINE LOCAL}\n".repeat(16_000)
         ));
-        let refusal = analyze_source(
+        let dense = analyze_source(
             &extreme,
             &ConditionalContext::default(),
             &mut NoGraphCallbacks,
             limits,
             &NoCancellation,
         );
+        // Dense directives cost a linear number of steps; the steps granted
+        // per scanned source byte bound them (superlinear work still trips:
+        // tests/compile_time_work_scaling.rs).
+        let output = dense.expect("dense directives fit the per-byte grant");
+        assert!(output.root.complete);
+        assert!(output.budget.budget_snapshot().work > spent.work);
         assert!(
-            matches!(
-                refusal,
-                Err(ResolverError::LimitExceeded {
-                    limit: "max_work",
-                    observed: 2_000_001,
-                    maximum: 2_000_000
-                })
-            ),
-            "genuine dense processing must retain 2M fuse: {refusal:?}"
+            output.budget.budget_snapshot().work
+                < 2_000_000 + extreme.bytes.len() * limits.work_per_source_byte
         );
         struct CancelAfter(std::cell::Cell<usize>);
         impl CancellationToken for CancelAfter {
@@ -3586,16 +3751,19 @@ mod tests {
             limits,
             &NoCancellation,
         );
+        // 64 MiB plus the byte work granted by the source bytes scanned so
+        // far: forked declaration snapshots cost more than that grant.
+        let ceiling = 67_108_864 + extreme.bytes.len() * limits.byte_work_per_source_byte;
         assert!(
             matches!(
                 refusal,
                 Err(ResolverError::LimitExceeded {
                     limit: "max_byte_work",
-                    maximum: 67_108_864,
+                    maximum: refused,
                     ..
-                })
+                }) if refused > 67_108_864 && refused <= ceiling
             ),
-            "actual declaration snapshots must retain 64MiB fuse: {refusal:?}"
+            "actual declaration snapshots must retain the 64MiB fuse: {refusal:?}"
         );
     }
 
@@ -3870,6 +4038,7 @@ mod tests {
             },
             CompileTimeLimits {
                 max_work: 32,
+                work_per_source_byte: 0,
                 ..limits
             },
         ] {
@@ -4735,6 +4904,22 @@ mod tests {
             .unwrap();
         let baseline = observer.budget_snapshot().retained_bytes;
         let mut providers = ProviderSession::new(&mut budget).unwrap();
+        // The shared provider session keeps one live per-source scan credit
+        // (l4d-9bxx) from its first analysis; create it before measuring
+        // publication handoffs.
+        drop(
+            analyze_source_with_providers(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoGraphCallbacks,
+                &mut budget,
+                &NoCancellation,
+                &mut providers,
+                false,
+                OccurrenceId(0),
+            )
+            .unwrap(),
+        );
         let mut cancelled_count = 0;
         let mut completed_calls = None;
         for allowed in 0..64 {

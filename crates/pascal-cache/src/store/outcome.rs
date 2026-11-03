@@ -21,6 +21,8 @@ pub enum Bypass {
     /// The store's scope was reset or retired after it was opened.
     Fenced,
     Busy,
+    /// Another connection is recovering the WAL after a crash; try later.
+    Recovering,
     ReadOnly,
     Full,
     Corrupt,

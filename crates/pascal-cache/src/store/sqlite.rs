@@ -1,4 +1,4 @@
-use super::limits::SQLITE_LENGTH_LIMIT;
+use super::limits::{JOURNAL_SIZE_LIMIT_BYTES, SQLITE_LENGTH_LIMIT};
 use super::outcome::{Bypass, Malformed, Miss};
 use super::pool::Deadline;
 use rusqlite::config::DbConfig;
@@ -37,6 +37,11 @@ pub(crate) fn check_sqlite_version(version_number: i32) -> Result<(), Bypass> {
 pub(crate) fn classify(error: &rusqlite::Error) -> Bypass {
     match error {
         rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
+            ErrorCode::DatabaseBusy
+                if failure.extended_code == rusqlite::ffi::SQLITE_BUSY_RECOVERY =>
+            {
+                Bypass::Recovering
+            }
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Bypass::Busy,
             ErrorCode::ReadOnly => Bypass::ReadOnly,
             ErrorCode::DiskFull => Bypass::Full,
@@ -97,6 +102,13 @@ fn configure(connection: &Connection, page_cache_bytes: u64) -> Result<(), Bypas
         .map_err(fail)?;
     connection
         .pragma_update(None, "synchronous", "NORMAL")
+        .map_err(fail)?;
+    // Only maintenance checkpoints (spec §10 amendment 2026-11-03, D13).
+    connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .map_err(fail)?;
+    connection
+        .pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)
         .map_err(fail)?;
     connection
         .pragma_update(None, "mmap_size", 0)
@@ -176,6 +188,11 @@ mod tests {
     fn sqlite_failures_map_to_bypass_reasons() {
         assert_eq!(classify(&failure(ffi::SQLITE_BUSY)), Bypass::Busy);
         assert_eq!(classify(&failure(ffi::SQLITE_LOCKED)), Bypass::Busy);
+        assert_eq!(
+            classify(&failure(ffi::SQLITE_BUSY_RECOVERY)),
+            Bypass::Recovering
+        );
+        assert_eq!(classify(&failure(ffi::SQLITE_BUSY_SNAPSHOT)), Bypass::Busy);
         assert_eq!(classify(&failure(ffi::SQLITE_READONLY)), Bypass::ReadOnly);
         assert_eq!(classify(&failure(ffi::SQLITE_FULL)), Bypass::Full);
         assert_eq!(classify(&failure(ffi::SQLITE_CORRUPT)), Bypass::Corrupt);
@@ -227,6 +244,8 @@ mod tests {
         assert_eq!(pragma("cache_size"), -5461);
         assert_eq!(pragma("synchronous"), 1);
         assert_eq!(pragma("cell_size_check"), 1);
+        assert_eq!(pragma("wal_autocheckpoint"), 0);
+        assert_eq!(pragma("journal_size_limit"), 4 << 20);
         use rusqlite::limits::Limit;
         assert_eq!(
             connection.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(),

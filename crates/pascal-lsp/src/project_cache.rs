@@ -2431,6 +2431,125 @@ mod cache_tests {
         ));
     }
 
+    fn store_directory_observer(cache: &ProjectCache, dir: &Path) {
+        let ctx = context("A.dproj");
+        let Lookup::Compute(claim) =
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!()
+        };
+        let stamp = pascal_project::path_stamp_result(dir).ok().flatten();
+        cache.store_imports(
+            claim,
+            import_value(vec![Probe::Stamp {
+                path: dir.to_path_buf(),
+                expected: stamp,
+            }]),
+            1,
+            &no_cancel(),
+        );
+    }
+
+    #[test]
+    fn build_product_events_do_not_stale_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let cache = ProjectCache::new(1 << 20);
+        store_directory_observer(&cache, &dir);
+        let epoch = cache.invalidation_epoch();
+
+        for name in [
+            "Unit1.o",
+            "build.lock",
+            "settings.ini",
+            ".opencode/db/x.sqlite",
+        ] {
+            assert!(cache.invalidate_file_contents(&dir.join(name)).is_empty());
+            // A create or delete in the observed directory changes its
+            // listing, but not for a file no analysis reads.
+            assert!(cache.invalidate_path(&dir.join(name)).is_empty());
+        }
+
+        assert_eq!(cache.invalidation_epoch(), epoch);
+        assert!(matches!(
+            cache.imports(
+                &uri("Main.pas"),
+                &context("A.dproj"),
+                1,
+                &HashMap::new(),
+                &no_cancel()
+            ),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn a_source_created_in_an_observed_directory_still_stales_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let cache = ProjectCache::new(1 << 20);
+        store_directory_observer(&cache, &dir);
+        let epoch = cache.invalidation_epoch();
+
+        assert_eq!(
+            cache.invalidate_path(&dir.join("New.pas")),
+            vec![uri("Main.pas")]
+        );
+        assert_ne!(cache.invalidation_epoch(), epoch);
+    }
+
+    #[test]
+    fn compiled_unit_and_unknown_kinds_still_stale_the_cache() {
+        let cache = ProjectCache::new(1 << 20);
+        for name in [
+            "/w/Unit1.dcu",
+            "/w/Pack.dcp",
+            "/w/Pack.bpl",
+            "/w/a.optset",
+            "/w/x.txt",
+        ] {
+            let epoch = cache.invalidation_epoch();
+            cache.invalidate_file_contents(Path::new(name));
+            assert_ne!(cache.invalidation_epoch(), epoch, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_observed_build_product_still_stales_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp.path().join("Unit1.o");
+        std::fs::write(&object, "x").unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        store_directory_observer(&cache, &object);
+        let epoch = cache.invalidation_epoch();
+
+        assert_eq!(
+            cache.invalidate_file_contents(&object),
+            vec![uri("Main.pas")]
+        );
+        assert_ne!(cache.invalidation_epoch(), epoch);
+    }
+
+    #[test]
+    fn units_invalidated_since_sees_only_the_units_it_is_asked_about() {
+        let cache = ProjectCache::new(1 << 20);
+        let sync = uri("Sync.pas");
+        let units = HashSet::from([sync.clone()]);
+        let before = cache.invalidation_epoch();
+        assert!(!cache.units_invalidated_since(before, &units));
+
+        cache.invalidate_file_contents(Path::new("/w/Other.pas"));
+        assert!(!cache.units_invalidated_since(before, &units));
+
+        cache.invalidate_file_contents(&sync.to_file_path().unwrap());
+        assert!(cache.units_invalidated_since(before, &units));
+        assert!(!cache.units_invalidated_since(cache.invalidation_epoch(), &units));
+
+        let overflowed = cache.invalidation_epoch();
+        cache.invalidate_after_overflow();
+        assert!(cache.units_invalidated_since(overflowed - 1, &HashSet::new()));
+    }
+
     #[test]
     fn invalidation_after_claim_prevents_store() {
         let temp = tempfile::tempdir().unwrap();
@@ -2766,6 +2885,31 @@ mod cache_tests {
 const WAIT_SLICE: Duration = Duration::from_millis(20);
 const MAX_CLOSURE_CRAWL_REQUESTS: usize = 1024;
 const MAX_CLOSURE_MISS_ROOTS: usize = 1024;
+const MAX_INVALIDATION_LOG: usize = 1024;
+
+/// Extensions of build products and tool state that no analysis reads. A
+/// create or delete of such a file never changes what a directory listing
+/// means to a cache entry.
+const ARTIFACT_EXTENSIONS: &[&str] = &[
+    "o", "a", "obj", "ppu", "so", "lock", "ini", "log", "tmp", "bak", "swp", "map", "rsm",
+];
+
+struct InvalidationRecord {
+    epoch: u64,
+    path: PathBuf,
+    affected: Vec<Url>,
+}
+
+fn is_artifact_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        let extension = extension.to_string_lossy();
+        ARTIFACT_EXTENSIONS
+            .iter()
+            .any(|artifact| extension.eq_ignore_ascii_case(artifact))
+    }) || path
+        .components()
+        .any(|component| component.as_os_str() == ".opencode")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
@@ -3061,6 +3205,11 @@ struct State {
     closure_crawl_requests: Vec<Url>,
     /// Each root's uncached closure units at its last snapshot walk.
     closure_misses: HashMap<Url, HashSet<Url>>,
+    /// Epoch bumps from path invalidations, oldest first, for asking whether
+    /// given units were invalidated since an epoch.
+    invalidation_log: std::collections::VecDeque<InvalidationRecord>,
+    /// Epochs below this have no complete record in `invalidation_log`.
+    invalidation_log_floor: u64,
     /// The slot each thread waits for, to find waits that would close a
     /// cycle.
     waiting: HashMap<std::thread::ThreadId, Key>,
@@ -3095,6 +3244,8 @@ impl Default for State {
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
+            invalidation_log: std::collections::VecDeque::new(),
+            invalidation_log_floor: 0,
             waiting: HashMap::new(),
             #[cfg(test)]
             examined: std::cell::Cell::new(0),
@@ -4846,6 +4997,38 @@ impl ProjectCache {
         lock(&self.inner).closure_misses.remove(root);
     }
 
+    /// The uncached closure units the root's last walk reported.
+    pub(crate) fn closure_misses(&self, root: &Url) -> HashSet<Url> {
+        lock(&self.inner)
+            .closure_misses
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether anything invalidated since `epoch` touched one of `units`: its
+    /// file, or an entry of its URI. An epoch the log no longer covers counts
+    /// as invalidated.
+    pub(crate) fn units_invalidated_since(&self, epoch: u64, units: &HashSet<Url>) -> bool {
+        let state = lock(&self.inner);
+        if epoch == state.invalidation_epoch {
+            return false;
+        }
+        if epoch < state.invalidation_log_floor {
+            return true;
+        }
+        state
+            .invalidation_log
+            .iter()
+            .filter(|record| record.epoch > epoch)
+            .any(|record| {
+                record.affected.iter().any(|uri| units.contains(uri))
+                    || units
+                        .iter()
+                        .any(|unit| unit.to_file_path().is_ok_and(|path| path == record.path))
+            })
+    }
+
     pub(crate) fn take_closure_crawl_requests(&self) -> Vec<Url> {
         std::mem::take(&mut lock(&self.inner).closure_crawl_requests)
     }
@@ -4900,13 +5083,26 @@ impl ProjectCache {
 
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
-        state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
+        let parent = path
+            .parent()
+            .filter(|_| include_parent && !is_artifact_path(path));
+        // Only a build product or tool state file that no entry observes can
+        // be skipped: it is never read, so neither a stored entry nor a
+        // computation in flight can depend on it, and creating or removing it
+        // does not change what an observed listing means. Any other path
+        // stales the epoch, since a computation in flight may read it before
+        // it registers the dependency.
+        let relevant = !is_artifact_path(path)
+            || state.exact.contains_key(path)
+            || state.observed.contains_key(path);
+        if relevant {
+            state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
+        }
         crate::trace::trace!(
-            "cache invalidate {} (parent: {include_parent}) -> epoch {}",
+            "cache invalidate {} (parent: {include_parent}, relevant: {relevant}) -> epoch {}",
             path.display(),
             state.invalidation_epoch
         );
-        let parent = path.parent().filter(|_| include_parent);
         let doomed = state
             .exact
             .get(path)
@@ -4923,6 +5119,19 @@ impl ProjectCache {
             note_examined(&state);
             if remove_ready(&mut state, &key) && seen.insert(key.uri.clone()) {
                 affected.push(key.uri);
+            }
+        }
+        if relevant {
+            let epoch = state.invalidation_epoch;
+            state.invalidation_log.push_back(InvalidationRecord {
+                epoch,
+                path: path.to_path_buf(),
+                affected: affected.clone(),
+            });
+            if state.invalidation_log.len() > MAX_INVALIDATION_LOG
+                && let Some(dropped) = state.invalidation_log.pop_front()
+            {
+                state.invalidation_log_floor = dropped.epoch.wrapping_add(1);
             }
         }
         self.release(state);
@@ -4955,6 +5164,8 @@ impl ProjectCache {
             remove_ready(&mut state, &key);
         }
         state.closure_misses.clear();
+        state.invalidation_log.clear();
+        state.invalidation_log_floor = state.invalidation_epoch;
         self.release(state);
         self.inner.changed.notify_all();
         // Overflow lost which paths changed: no witness survives it.

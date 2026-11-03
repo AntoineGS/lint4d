@@ -418,6 +418,9 @@ const MAX_NAVIGATION_WALK_BYTES: usize = 32 * 1024 * 1024;
 thread_local! {
     static TEST_NAVIGATION_WALK_BYTES: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Every warning a workspace logged to stderr.
+    static TEST_LOGGED_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Loading the imports of a unit whose file name this is fails.
     static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
@@ -2388,9 +2391,11 @@ const MAX_LOGGED_PROJECT_WARNINGS: usize = 4096;
 
 #[derive(Default)]
 struct DiscoveryStore {
-    configuration_generation: u64,
-    entries: HashMap<(Url, u64), SharedDiscovery>,
-    logged_warnings: HashSet<String>,
+    /// Keyed by configuration generation, document and discovery inputs.
+    /// Jobs of an older generation may still run after a newer one started,
+    /// so generations are kept apart rather than cleared on each switch.
+    entries: HashMap<(u64, Url, u64), SharedDiscovery>,
+    logged_warnings: HashSet<(u64, String)>,
 }
 
 #[derive(Clone)]
@@ -2401,29 +2406,16 @@ struct SharedDiscovery {
 }
 
 impl SharedDiscoveries {
-    fn with_store<T>(
-        &self,
-        configuration_generation: u64,
-        operation: impl FnOnce(&mut DiscoveryStore) -> T,
-    ) -> T {
-        let mut store = lock(&self.0);
-        if store.configuration_generation != configuration_generation {
-            store.entries.clear();
-            store.logged_warnings.clear();
-            store.configuration_generation = configuration_generation;
-        }
-        operation(&mut store)
-    }
-
     fn get(
         &self,
         configuration_generation: u64,
         uri: &Url,
         inputs: u64,
     ) -> Option<SharedDiscovery> {
-        self.with_store(configuration_generation, |store| {
-            store.entries.get(&(uri.clone(), inputs)).cloned()
-        })
+        lock(&self.0)
+            .entries
+            .get(&(configuration_generation, uri.clone(), inputs))
+            .cloned()
     }
 
     fn insert(
@@ -2433,32 +2425,33 @@ impl SharedDiscoveries {
         inputs: u64,
         discovery: SharedDiscovery,
     ) {
-        self.with_store(configuration_generation, |store| {
-            if store.entries.len() >= MAX_SHARED_DISCOVERIES {
-                store.entries.clear();
-            }
-            store.entries.insert((uri, inputs), discovery);
-        });
+        let mut store = lock(&self.0);
+        if store.entries.len() >= MAX_SHARED_DISCOVERIES {
+            store.entries.clear();
+        }
+        store
+            .entries
+            .insert((configuration_generation, uri, inputs), discovery);
     }
 
     fn remove(&self, configuration_generation: u64, uri: &Url, inputs: u64) {
-        self.with_store(configuration_generation, |store| {
-            store.entries.remove(&(uri.clone(), inputs));
-        });
+        lock(&self.0)
+            .entries
+            .remove(&(configuration_generation, uri.clone(), inputs));
     }
 
     /// Whether `warning` was not yet logged in this configuration generation.
     fn first_report(&self, configuration_generation: u64, warning: &str) -> bool {
-        self.with_store(configuration_generation, |store| {
-            if store.logged_warnings.contains(warning) {
-                return false;
-            }
-            if store.logged_warnings.len() >= MAX_LOGGED_PROJECT_WARNINGS {
-                store.logged_warnings.clear();
-            }
-            store.logged_warnings.insert(warning.to_string());
-            true
-        })
+        let mut store = lock(&self.0);
+        let key = (configuration_generation, warning.to_string());
+        if store.logged_warnings.contains(&key) {
+            return false;
+        }
+        if store.logged_warnings.len() >= MAX_LOGGED_PROJECT_WARNINGS {
+            store.logged_warnings.clear();
+        }
+        store.logged_warnings.insert(key);
+        true
     }
 }
 
@@ -9714,8 +9707,18 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
+        // A resolver report repeats its context's discovery warnings.
+        let project_warnings = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context_observations.warnings.clone())
+            .unwrap_or_default();
         for warning in &report.warnings {
-            self.warn(warning.clone());
+            if project_warnings.contains(warning) {
+                self.warn_project(warning.clone());
+            } else {
+                self.warn(warning.clone());
+            }
         }
         for reason in &report.incomplete_reasons {
             self.warn(reason.clone());
@@ -13768,6 +13771,8 @@ impl Workspace {
         match self.warnings.len().cmp(&MAX_WORKSPACE_WARNINGS) {
             std::cmp::Ordering::Less => {
                 eprintln!("pascal-lsp: warning: {message}");
+                #[cfg(test)]
+                TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().push(message.clone()));
                 self.warnings.push(message);
             }
             std::cmp::Ordering::Equal => {

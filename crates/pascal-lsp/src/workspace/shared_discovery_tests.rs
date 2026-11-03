@@ -132,3 +132,44 @@ fn a_project_warning_is_logged_once_per_configuration_generation() {
         "a new configuration generation logs again"
     );
 }
+
+#[test]
+fn jobs_of_an_older_generation_do_not_log_a_warning_again() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let shared = workspace(temp.path()).shared_discoveries.clone();
+    assert!(shared.first_report(1, "ignored Target body"));
+    assert!(shared.first_report(2, "ignored Target body"));
+    assert!(
+        !shared.first_report(1, "ignored Target body"),
+        "a job still running under the older generation must not log again"
+    );
+}
+
+#[test]
+fn a_project_warning_is_logged_once_across_requests() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    fixture(root);
+    fs::write(
+        root.join("App.dproj"),
+        PROJECT.replace(
+            "</Project>",
+            "<Target Name=\"Custom\"><Exec Command=\"x\"/></Target></Project>",
+        ),
+    )
+    .expect("project with a target");
+    settle(root);
+    let workspace = workspace(root);
+    let main = Url::from_file_path(root.join("Main.pas")).expect("main URI");
+    super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().clear());
+
+    assert_eq!(definition(&workspace, &main), 1);
+    assert_eq!(definition(&workspace, &main), 1);
+
+    let logged = super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow().clone());
+    let targets = logged
+        .iter()
+        .filter(|warning| warning.contains("ignored Target body"))
+        .count();
+    assert_eq!(targets, 1, "{logged:#?}");
+}

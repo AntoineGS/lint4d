@@ -7086,6 +7086,7 @@ fn build_snapshot_with_policy(
             .as_ref()
             .is_some_and(|path| auto_import_observation_paths.contains(&path_key(path)));
     }
+    loader.index.set_best_effort_bindings(best_effort);
     Ok(RenameSnapshot {
         index: loader.index,
         sources,

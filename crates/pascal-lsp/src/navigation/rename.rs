@@ -1019,6 +1019,12 @@ impl NavigationIndex {
         check_cancel(Some(cancel)).is_ok()
     }
 
+    /// Bind globals best effort; see `best_effort_bindings`. Only read-only
+    /// features may set it.
+    pub(crate) fn set_best_effort_bindings(&mut self, best_effort: bool) {
+        self.best_effort_bindings = best_effort;
+    }
+
     pub(super) fn is_unknown_global_fallback(
         &self,
         document: &Document,
@@ -1042,6 +1048,9 @@ impl NavigationIndex {
         owner_type: Option<&str>,
         candidates: &[Candidate],
     ) -> bool {
+        if self.best_effort_bindings {
+            return false;
+        }
         let type_reference = has_ancestor_kind(identifier, "typeref");
         owner_type.is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
             && member_expression_at(identifier).is_none()

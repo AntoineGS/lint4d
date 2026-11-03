@@ -433,6 +433,10 @@ pub struct NavigationIndex {
     auto_import_unit_providers: HashMap<String, Vec<Url>>,
     compiled_unit_uris: HashSet<Url>,
     compiled_unit_bytes: usize,
+    /// Read-only features bind best effort (D16): an imported or unit-level
+    /// global referenced in a method binds even when an inherited member the
+    /// index cannot prove absent could shadow it.
+    best_effort_bindings: bool,
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -1084,6 +1088,7 @@ impl NavigationIndex {
             )?,
             compiled_unit_uris: self.compiled_unit_uris.clone(),
             compiled_unit_bytes: self.compiled_unit_bytes,
+            best_effort_bindings: false,
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;

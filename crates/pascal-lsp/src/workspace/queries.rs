@@ -1764,6 +1764,7 @@ pub(crate) fn navigation_from_input(
     }
 
     let mut workspace = super::Workspace::from_analysis_input(&input);
+    workspace.index.set_best_effort_bindings(true);
     let value = match workspace.navigate_with_cancel(&uri, position, target, cancel) {
         Ok(locations) => Ok(locations),
         Err(error) if error == CANCELLATION_MESSAGE => {

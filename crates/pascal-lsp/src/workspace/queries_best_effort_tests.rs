@@ -343,3 +343,51 @@ fn completion_past_its_byte_budget_returns_a_truncated_incomplete_list() {
     assert!(!completion.items.is_empty());
     assert!(completion.items.len() < 256, "{}", completion.items.len());
 }
+
+/// An imported routine called from a method binds even though an inherited
+/// member the index cannot see could shadow it (D16; seen on `EndsStr` in a
+/// method of a class whose ancestry spans unproven RTL units).
+#[test]
+fn an_imported_global_called_from_a_method_binds_for_read_only_features() {
+    let main = concat!(
+        "unit Main;\ninterface\nuses Dep;\ntype\n  TThing = class(TBase)\n    procedure Run;\n  end;\n",
+        "implementation\nprocedure TThing.Run;\nbegin\n  DepValue;\nend;\nend.\n",
+    );
+    let fixture = fixture(main, &dep_source(""), "", "");
+    let cancel = AtomicBool::new(false);
+    let at = Position::new(10, 4);
+    let hover = hover_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        at,
+        MarkupKind::PlainText,
+        &cancel,
+    )
+    .value
+    .expect("hover answers");
+    assert!(hover.is_some(), "hover must bind DepValue");
+    let definition = super::navigation_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        at,
+        crate::NavigationTarget::Definition,
+        &cancel,
+    )
+    .value
+    .expect("definition answers")
+    .locations;
+    assert_eq!(definition.len(), 1, "{definition:?}");
+    let rename = crate::workspace::rename::rename_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        at,
+        "Renamed",
+        false,
+        &cancel,
+    );
+    assert!(
+        rename.value.is_err(),
+        "rename keeps the conservative inherited-member model: {:?}",
+        rename.value
+    );
+}

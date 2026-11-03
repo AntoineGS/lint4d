@@ -268,7 +268,7 @@ fn declared(symbol: &Symbol) -> Option<DeclarationKind> {
 }
 
 /// Mirrors `lsp_kind` (`navigation/symbols.rs`) arm by arm.
-fn shape(symbol: &Symbol) -> DeclarationShape {
+pub(super) fn shape(symbol: &Symbol) -> DeclarationShape {
     match symbol.kind {
         SymbolKind::Unit => DeclarationShape::Unit,
         SymbolKind::Type => match symbol.type_kind {

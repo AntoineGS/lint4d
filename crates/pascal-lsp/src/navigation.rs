@@ -36,6 +36,7 @@ mod selection;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
+pub(crate) use symbols::{lsp_kind_for_shape, too_many_workspace_symbols};
 mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;

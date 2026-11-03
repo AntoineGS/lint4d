@@ -1,7 +1,6 @@
 //! The versioned workspace index (l4d-33): compact per-document facts of one
 //! project context, inverted for candidate selection. No I/O: the workspace
 //! side (`workspace::indexing`) supplies paths, stamps and facts.
-#![allow(dead_code)]
 
 use crate::navigation::canonical_name;
 use crate::workspace::PathStamp;
@@ -29,6 +28,7 @@ pub(crate) struct MemberDeclaration {
     pub(crate) display: Box<str>,
     pub(crate) kind: DeclarationKind,
     pub(crate) shape: DeclarationShape,
+    #[allow(dead_code)] // no l4d-33 query filters on visibility to importers
     pub(crate) exported: bool,
     pub(crate) unit_scope: bool,
     pub(crate) owner: Option<Box<str>>,
@@ -283,6 +283,7 @@ fn list_remove(map: &mut Inverted, name: NameId, id: MemberId) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn member_slot_bytes() -> usize {
     size_of::<Member>()
 }
@@ -327,7 +328,10 @@ pub(crate) struct Candidates {
 }
 
 pub(crate) struct IndexedSymbol {
+    /// The file of the declaration's slot (A14).
     pub(crate) path: PathBuf,
+    /// The member whose facts hold the declaration.
+    pub(crate) member: PathBuf,
     pub(crate) declaration: MemberDeclaration,
     pub(crate) container: Option<String>,
 }
@@ -350,6 +354,7 @@ impl ContextIndex {
     }
 
     /// `None`: the log no longer reaches back to `generation` (A18).
+    #[allow(dead_code)] // l4d-36 validates witnesses against it (A18)
     pub(crate) fn changes_since(&self, generation: u64) -> Option<Vec<PathBuf>> {
         if self
             .overflowed_through
@@ -380,6 +385,7 @@ impl ContextIndex {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn member_paths(&self) -> Vec<PathBuf> {
         self.by_path
             .values()
@@ -817,6 +823,7 @@ impl ContextIndex {
                 };
                 result.push(IndexedSymbol {
                     path: path.clone(),
+                    member: member.path.clone(),
                     declaration: declaration.clone(),
                     container,
                 });

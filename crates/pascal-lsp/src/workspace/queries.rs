@@ -2556,6 +2556,17 @@ pub(crate) fn workspace_diagnostics_from_input(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_FACT_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Workspace symbols answered from index facts since the last call.
+#[cfg(test)]
+pub(crate) fn test_take_fact_symbols() -> usize {
+    TEST_FACT_SYMBOLS.with(|count| count.replace(0))
+}
+
 pub(crate) fn workspace_symbols_from_input(
     input: WorkspaceInput,
     query: &str,
@@ -2567,6 +2578,219 @@ pub(crate) fn workspace_symbols_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
+    let mut workspace = Workspace::from_analysis_input(&input);
+    let targets =
+        match workspace.index_targets(&input, None, TargetPurpose::WorkspaceSymbols, cancel) {
+            Ok(targets) => targets,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => {
+                crate::trace::trace!("  workspace symbols: no index targets, walking: {error}");
+                return walked_workspace_symbols(input, query, cancel);
+            }
+        };
+    // A16: a small workspace with nothing open or configured keeps the walk.
+    if targets.from_open_or_configured == 0 && targets.small_workspace {
+        return walked_workspace_symbols(input, query, cancel);
+    }
+    match indexed_workspace_symbols(&mut workspace, &input, &targets, query, cancel) {
+        Ok((value, records)) => super::rename::Computed {
+            source_generation,
+            configuration_generation,
+            value: Ok(value),
+            records,
+        },
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            cancelled(source_generation, configuration_generation)
+        }
+        Err(error) => failed(source_generation, configuration_generation, error),
+    }
+}
+
+/// Workspace symbols of the target contexts (§6.2): index facts of the
+/// members proven current, merged with the parses of unverified members
+/// and open documents.
+fn indexed_workspace_symbols(
+    workspace: &mut Workspace,
+    input: &WorkspaceInput,
+    targets: &super::indexing::Targets,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<(Partial<Vec<SymbolInformation>>, Vec<SourceRecord>), String> {
+    let direct = targets.from_open_or_configured > 0;
+    let mut must_include = input.overlays.keys().cloned().collect::<Vec<_>>();
+    must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let (sources, facts) =
+        workspace.indexed_symbols(input, targets, query, direct, &must_include, cancel)?;
+    let mut coverage = Coverage::default();
+    if !direct {
+        coverage.note(
+            None,
+            "no project context is open; open a source or select a project",
+        );
+    }
+    let mut found = Vec::new();
+    let records = if sources.sources.is_empty() && input.overlays.is_empty() {
+        for gap in &sources.gaps {
+            coverage.note(None, gap.as_str());
+        }
+        sources
+            .baseline
+            .iter()
+            .filter_map(|(path, stamp)| {
+                super::rename::path_record_at(
+                    path.clone(),
+                    stamp.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    } else {
+        let snapshot = super::rename::build_indexed_snapshot(
+            input,
+            &[],
+            &[],
+            SnapshotMode::WorkspaceSymbols,
+            None,
+            sources,
+            cancel,
+        )?;
+        if !snapshot.complete {
+            coverage.note(
+                None,
+                snapshot
+                    .incomplete_reason
+                    .as_deref()
+                    .unwrap_or("bounded source discovery did not finish"),
+            );
+        }
+        for gap in &snapshot.index_gaps {
+            coverage.note(None, gap.as_str());
+        }
+        found.extend(
+            snapshot
+                .index
+                .workspace_symbols_with_cancel(query, cancel)?
+                .into_iter()
+                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri)),
+        );
+        snapshot_records(&snapshot)
+    };
+    found.extend(fact_symbols(workspace, facts, &mut coverage, cancel)?);
+
+    // The parses come first, so a duplicate keeps the live answer.
+    let key = |symbol: &SymbolInformation| {
+        let range = symbol.location.range;
+        (
+            symbol.location.uri.to_string(),
+            (range.start.line, range.start.character),
+            std::cmp::Reverse((range.end.line, range.end.character)),
+        )
+    };
+    found.sort_by_cached_key(key);
+    let mut seen = HashSet::new();
+    found.retain(|symbol| seen.insert((symbol.location.uri.clone(), symbol.location.range)));
+    if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
+        return Err(error);
+    }
+    Ok((
+        Partial {
+            value: found,
+            coverage,
+        },
+        records,
+    ))
+}
+
+/// Index declarations as symbol information. Each file with a match is read
+/// once to convert its byte ranges to UTF-16 positions.
+fn fact_symbols(
+    workspace: &Workspace,
+    facts: Vec<(super::ContextKey, crate::workspace_index::IndexedSymbol)>,
+    coverage: &mut Coverage,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let mut by_file = std::collections::BTreeMap::<String, Vec<_>>::new();
+    for (key, symbol) in facts {
+        by_file
+            .entry(super::rename::path_key(&symbol.path))
+            .or_default()
+            .push((key, symbol));
+    }
+    let mut result = Vec::new();
+    for symbols in by_file.into_values() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let (key, first) = &symbols[0];
+        let path = first.path.clone();
+        let Ok(uri) = Url::from_file_path(&path) else {
+            continue;
+        };
+        let text = match super::rename::read_context_source(workspace, key, &path, cancel) {
+            Ok(text) => text,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                coverage.note(
+                    Some(&uri),
+                    format!("indexed symbols could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let positions = crate::text::PositionIndex::new_with_cancel(&text, cancel)
+            .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+        let mut stale = false;
+        for (_, symbol) in symbols {
+            let declaration = symbol.declaration;
+            let Some((_, range)) = declaration.location else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                positions.offset_to_position(&text, range.start as usize),
+                positions.offset_to_position(&text, range.end as usize),
+            ) else {
+                stale = true;
+                continue;
+            };
+            #[cfg(test)]
+            TEST_FACT_SYMBOLS.with(|count| count.set(count.get() + 1));
+            #[allow(deprecated)]
+            result.push(SymbolInformation {
+                name: declaration.display.into(),
+                kind: crate::navigation::lsp_kind_for_shape(declaration.shape),
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: Range { start, end },
+                },
+                container_name: symbol.container,
+            });
+        }
+        if stale {
+            coverage.note(
+                Some(&uri),
+                "the file changed after it was indexed; some symbols were not listed",
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn walked_workspace_symbols(
+    input: WorkspaceInput,
+    query: &str,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Partial<Vec<SymbolInformation>>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
     let snapshot = match build_snapshot(
         &input,
         &[],
@@ -3928,23 +4152,298 @@ mod tests {
         assert_eq!(located(&locations), located(&walked));
     }
 
-    #[test]
-    fn two_workspace_symbol_requests_build_two_snapshots() {
-        let fixture = query_fixture();
-        let cancel = AtomicBool::new(false);
+    fn symbols(
+        input: &WorkspaceInput,
+        query: &str,
+    ) -> crate::coverage::Partial<Vec<lsp_types::SymbolInformation>> {
+        workspace_symbols_from_input(input.clone(), query, &AtomicBool::new(false))
+            .value
+            .expect("workspace symbols")
+    }
+
+    fn symbol_names(found: &[lsp_types::SymbolInformation]) -> Vec<(String, String)> {
+        found
+            .iter()
+            .map(|symbol| {
+                let file = symbol
+                    .location
+                    .uri
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                (symbol.name.clone(), file)
+            })
+            .collect()
+    }
+
+    /// A workspace of `files` under a fresh root with settled stamps, so the
+    /// index proves its members unchanged.
+    fn symbol_workspace(files: &[(&str, String)]) -> (TempDir, PathBuf, Workspace) {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        for (name, text) in files {
+            fs::write(root.join(name), text).expect("source");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        (temp, root, workspace)
+    }
+
+    fn open_source(workspace: &mut Workspace, path: &Path) -> Url {
+        let uri = source_uri(path);
+        workspace
+            .open_document(uri.clone(), fs::read_to_string(path).expect("text"), 1)
+            .expect("open source");
+        uri
+    }
+
+    fn reset_symbol_counters() {
         crate::workspace::rename::test_reset_workspace_snapshots();
-        let first = workspace_symbols_from_input(fixture.input.clone(), "Shared", &cancel)
+        super::test_take_fact_symbols();
+    }
+
+    /// No whole-workspace walk: every snapshot built read index candidates.
+    fn walks() -> usize {
+        crate::workspace::rename::test_workspace_snapshots()
+            - crate::workspace::rename::test_indexed_snapshots()
+    }
+
+    fn unit_text(name: &str, declarations: &str) -> String {
+        format!("unit {name};\ninterface\n{declarations}implementation\nend.\n")
+    }
+
+    #[test]
+    fn workspace_symbols_answer_from_the_index_without_a_snapshot() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        pascal_project::backdate_tree_for_test(&root);
+        let walked = symbols(&fixture.input, "Shared").value;
+        assert!(!walked.is_empty(), "the query must find SharedValue");
+
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        open_source(&mut workspace, &fixture.consumer);
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&fixture.provider));
+        reset_symbol_counters();
+        let first = symbols(&input, "Shared");
+        let second = symbols(&input, "Shared");
+        assert!(first.coverage.is_complete(), "{:?}", first.coverage);
+        // No A14 difference applies: SharedValue is a unit-scope constant
+        // of slot 0, so the index answer equals the walk's.
+        assert_eq!(first.value, walked);
+        assert_eq!(first.value, second.value);
+        // SharedValue from the facts, once per request.
+        assert_eq!(super::test_take_fact_symbols(), 2);
+        // The open document is answered from its parse by an indexed
+        // snapshot; nothing walks the workspace.
+        assert_eq!(walks(), 0);
+    }
+
+    #[test]
+    fn workspace_symbols_in_an_include_slot_report_the_include_file() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Provider.pas",
+                "unit Provider;\ninterface\n{$I Decls.inc}\nimplementation\nend.\n".to_owned(),
+            ),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Provider.pas")));
+        reset_symbol_counters();
+        let found = symbols(&input, "IncludedValue");
+        assert_eq!(found.value.len(), 1, "{:?}", found.value);
+        let symbol = &found.value[0];
+        assert_eq!(symbol.location.uri, source_uri(&root.join("Decls.inc")));
+        assert_eq!(symbol.location.range.start, Position::new(1, 2));
+        assert_eq!(symbol.container_name.as_deref(), Some("Provider"));
+        assert_eq!(super::test_take_fact_symbols(), 1);
+    }
+
+    #[test]
+    fn nested_routines_of_closed_files_are_not_listed_but_open_ones_are() {
+        let provider_text = "unit Provider;\ninterface\nimplementation\nprocedure Outer;\n  procedure NestedHelper;\n  begin\n  end;\nbegin\nend;\nend.\n";
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Provider.pas", provider_text.to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        let provider = root.join("Provider.pas");
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&provider));
+        let closed = symbols(&input, "NestedHelper");
+        assert!(closed.value.is_empty(), "{:?}", closed.value);
+
+        open_source(&mut workspace, &provider);
+        let opened = symbols(&workspace.analysis_input(), "NestedHelper");
+        assert_eq!(
+            symbol_names(&opened.value),
+            [("NestedHelper".to_owned(), "Provider.pas".to_owned())]
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_on_a_partial_index_report_coverage() {
+        let mut files = (1..=5)
+            .map(|n| {
+                (
+                    ["A1.pas", "A2.pas", "A3.pas", "A4.pas", "A5.pas"][n - 1],
+                    unit_text(&format!("A{n}"), &format!("const PartialValue{n} = {n};\n")),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.push(("Opened.pas", unit_text("Opened", "")));
+        let (_temp, root, mut workspace) = symbol_workspace(&files);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        Workspace::from_analysis_input(&input)
+            .advance_workspace_index(
+                &IndexAnchor::Document(source_uri(&root.join("A1.pas"))),
+                IndexBound::units(2),
+                &mut || Ok(()),
+                &AtomicBool::new(false),
+            )
+            .expect("index batch");
+        reset_symbol_counters();
+        let found = symbols(&input, "PartialValue");
+        let expected = (1..=5)
+            .map(|n| (format!("PartialValue{n}"), format!("A{n}.pas")))
+            .collect::<Vec<_>>();
+        assert_eq!(symbol_names(&found.value), expected);
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        assert_eq!(super::test_take_fact_symbols(), 2);
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_unverified_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_unverified_cap(Some(1));
+        let bounded = symbols(&input, "PartialValue");
+        assert_eq!(symbol_names(&bounded.value), expected[..3]);
+        assert!(
+            bounded
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.starts_with("2 units of ")
+                    && gap
+                        .reason
+                        .contains("are not indexed yet; 1 were searched directly")),
+            "{:?}",
+            bounded.coverage
+        );
+    }
+
+    #[test]
+    fn a_small_workspace_without_a_project_keeps_todays_answer() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(!found.value.is_empty());
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn a_large_workspace_without_a_project_reports_no_context() {
+        let fixture = query_fixture();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(1));
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let found = symbols(&fixture.input, "Shared");
+        assert!(found.value.is_empty(), "{:?}", found.value);
+        assert!(
+            found
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason
+                    == "no project context is open; open a source or select a project"),
+            "{:?}",
+            found.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 0);
+    }
+
+    #[test]
+    fn results_beyond_ten_thousand_keep_todays_error() {
+        let constants = |prefix: &str| {
+            let mut text = String::from("const\n");
+            for index in 0..5_001 {
+                text.push_str(&format!("  Val{prefix}{index} = 0;\n"));
+            }
+            text
+        };
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Alpha.pas", unit_text("Alpha", &constants("A"))),
+            ("Beta.pas", unit_text("Beta", &constants("B"))),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Alpha.pas")));
+        reset_symbol_counters();
+        let error = workspace_symbols_from_input(input, "Val", &AtomicBool::new(false))
             .value
-            .expect("first answer")
-            .value;
-        let second = workspace_symbols_from_input(fixture.input.clone(), "Shared", &cancel)
-            .value
-            .expect("second answer")
-            .value;
-        assert!(!first.is_empty(), "the query must find SharedValue");
-        assert_eq!(first, second);
-        // l4d-33 Task 11 changes this to 0 for a workspace with an open document.
-        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 2);
+            .expect_err("more than 10,000 results");
+        assert_eq!(
+            error,
+            "workspace symbol query returned more than 10000 results; narrow the query"
+        );
+        assert_eq!(walks(), 0);
+    }
+
+    #[test]
+    fn open_and_deleted_documents_are_not_served_from_disk_facts() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Provider.pas",
+                unit_text("Provider", "const SharedValue = 1;\n"),
+            ),
+            ("Gone.pas", unit_text("Gone", "const SharedGone = 3;\n")),
+            ("Kept.pas", unit_text("Kept", "const SharedKept = 4;\n")),
+        ]);
+        let provider = root.join("Provider.pas");
+        let gone = root.join("Gone.pas");
+        build_index_for(
+            &workspace.analysis_input(),
+            &source_uri(&root.join("Kept.pas")),
+        );
+        workspace
+            .open_document(
+                source_uri(&provider),
+                unit_text("Provider", "const SharedEdited = 1;\n"),
+                2,
+            )
+            .expect("open provider");
+        let mut input = workspace.analysis_input();
+        input
+            .deleted_overrides
+            .insert(source_uri(&gone), super::super::disk_stamp(&gone));
+        reset_symbol_counters();
+        let found = symbols(&input, "Shared");
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("SharedKept".to_owned(), "Kept.pas".to_owned()),
+                ("SharedEdited".to_owned(), "Provider.pas".to_owned()),
+            ]
+        );
+        assert_eq!(super::test_take_fact_symbols(), 1);
+        assert_eq!(walks(), 0);
     }
 
     #[test]

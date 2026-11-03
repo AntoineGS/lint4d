@@ -2307,6 +2307,19 @@ fn read_scan_source(
     })
 }
 
+/// The decoded text of `path` read under `context_key`'s read policy,
+/// bounded like a snapshot scan.
+pub(super) fn read_context_source(
+    workspace: &Workspace,
+    context_key: &ContextKey,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let (read_policy, path_entry) = snapshot_payload_dependency(workspace, context_key, path)?;
+    let scan = read_scan_source(path, &read_policy, &path_entry, cancel)?;
+    Ok(decode_bytes(&scan.data).into_owned())
+}
+
 fn unsupported_source_encoding(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0xFF, 0xFE, ..] => Some("UTF-16LE"),
@@ -6003,7 +6016,6 @@ pub(crate) struct IndexedSources {
 }
 
 /// A workspace snapshot over `sources` instead of the whole workspace.
-#[allow(dead_code)] // called by the query tasks of l4d-33
 pub(crate) fn build_indexed_snapshot(
     input: &WorkspaceInput,
     priority: &[Url],

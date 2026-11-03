@@ -25,8 +25,8 @@ use super::{
 use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
 use crate::workspace_index::{
-    CandidateQuery, Candidates, ContextIndex, IndexCoverage, MAX_UNVERIFIED_CANDIDATES,
-    MemberFacts, MemberStamp, MemberState,
+    CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
+    MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp, MemberState,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
@@ -148,6 +148,16 @@ pub(crate) fn test_set_unverified_cap(cap: Option<usize>) {
     CAP_OVERRIDES.with(|caps| {
         let mut value = caps.get();
         value.unverified = cap;
+        caps.set(value);
+    });
+}
+
+/// Sets the small-workspace source cap (A16) for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_set_small_workspace_sources(cap: Option<usize>) {
+    CAP_OVERRIDES.with(|caps| {
+        let mut value = caps.get();
+        value.small_sources = cap;
         caps.set(value);
     });
 }
@@ -1108,13 +1118,62 @@ impl Workspace {
         requesting: Option<&ContextKey>,
         cancel: &AtomicBool,
     ) -> Result<IndexedSources, String> {
+        self.select_sources(
+            input,
+            targets,
+            Selection::Candidates(query),
+            must_include,
+            requesting,
+            cancel,
+        )
+        .map(|(sources, _)| sources)
+    }
+
+    /// Workspace symbols of `targets` (§6.2): the declarations matching
+    /// `query` from the facts of members whose stamps still prove them
+    /// unchanged (A7), and the sources the snapshot reads for the rest:
+    /// members that are unverified or failed verification, within the bound
+    /// (A5), and members holding an open or client-deleted file (A4).
+    /// Without `direct`, unverified members are only counted.
+    pub(crate) fn indexed_symbols(
+        &mut self,
+        input: &WorkspaceInput,
+        targets: &Targets,
+        query: &str,
+        direct: bool,
+        must_include: &[Url],
+        cancel: &AtomicBool,
+    ) -> Result<(IndexedSources, Vec<(ContextKey, IndexedSymbol)>), String> {
+        self.select_sources(
+            input,
+            targets,
+            Selection::Symbols { query, direct },
+            must_include,
+            None,
+            cancel,
+        )
+    }
+
+    fn select_sources(
+        &mut self,
+        input: &WorkspaceInput,
+        targets: &Targets,
+        selection: Selection<'_>,
+        must_include: &[Url],
+        requesting: Option<&ContextKey>,
+        cancel: &AtomicBool,
+    ) -> Result<(IndexedSources, Vec<(ContextKey, IndexedSymbol)>), String> {
         let mut result = IndexedSources {
             gaps: targets.gaps.clone(),
             ..IndexedSources::default()
         };
+        let mut symbols = Vec::new();
         let mut taken = HashSet::<String>::new();
         let mut stamps = HashMap::<String, Option<PathStamp>>::new();
-        let mut unverified_left = max_unverified_candidates();
+        let mut unverified_left = match selection {
+            Selection::Symbols { direct: false, .. } => 0,
+            _ => max_unverified_candidates(),
+        };
         let mut refused = 0usize;
         let mut first_refusal = None::<Box<str>>;
         let mut memory = false;
@@ -1124,6 +1183,14 @@ impl Workspace {
             .filter_map(|uri| uri.to_file_path().ok())
             .map(|path| path_key(&absolute_path(path)))
             .collect::<HashSet<_>>();
+        // Disk facts never answer for open buffers or client deletes (A4).
+        let unserved = input
+            .overlays
+            .keys()
+            .chain(input.deleted_overrides.keys())
+            .filter_map(|uri| uri.to_file_path().ok())
+            .map(absolute_path)
+            .collect::<Vec<_>>();
         let deleted = |path: &Path| {
             Url::from_file_path(path).is_ok_and(|uri| {
                 [&uri, &super::canonical_file_uri(&uri)]
@@ -1174,7 +1241,7 @@ impl Workspace {
             let mut retried = false;
             let (view, listing) = loop {
                 let view = self.project_cache.read_index(key, |index, membership| {
-                    target_view(index, membership, query)
+                    target_view(index, membership, selection, &unserved)
                 });
                 #[cfg(test)]
                 if let Some(mut hook) = AFTER_TARGET_VIEW.with(|slot| slot.borrow_mut().take()) {
@@ -1254,6 +1321,7 @@ impl Workspace {
                         excluded,
                     },
                 recorded,
+                symbols: view_symbols,
                 coverage,
                 complete,
                 limit,
@@ -1262,6 +1330,7 @@ impl Workspace {
                 ..
             } = view;
 
+            let mut proven = HashSet::new();
             for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
                 check_workspace_cancel(Some(cancel))?;
                 let unchanged = recorded.first().is_some_and(|first| first.path == path)
@@ -1275,6 +1344,7 @@ impl Workspace {
                     self.project_cache.mark_index_stale(key, &path);
                 }
                 if resolved && unchanged {
+                    proven.insert(path_key(&path));
                     result.baseline.extend(
                         recorded
                             .into_iter()
@@ -1284,6 +1354,12 @@ impl Workspace {
                     unverified.push(path);
                 }
             }
+            symbols.extend(
+                view_symbols
+                    .into_iter()
+                    .filter(|symbol| proven.contains(&path_key(&symbol.member)))
+                    .map(|symbol| (key.clone(), symbol)),
+            );
             unverified.sort_by_cached_key(|path| path_key(path));
             let mut selected = selected;
             let outside =
@@ -1403,7 +1479,7 @@ impl Workspace {
                 .gaps
                 .push("the workspace index memory share is exhausted".to_owned());
         }
-        Ok(result)
+        Ok((result, symbols))
     }
 
     /// The configured project file; a relative one is looked up under the
@@ -1426,6 +1502,8 @@ struct TargetView {
     /// Per excluded member: whether every include slot resolved, and the
     /// stamps it was indexed under.
     recorded: Vec<(bool, Vec<MemberStamp>)>,
+    /// The matching declarations of the excluded members (symbols only).
+    symbols: Vec<IndexedSymbol>,
     coverage: IndexCoverage,
     scopes: Vec<(CatalogueKey, u64)>,
     complete: bool,
@@ -1434,21 +1512,61 @@ struct TargetView {
     owner_pending: usize,
 }
 
+/// What a request reads of each target's index.
+#[derive(Clone, Copy)]
+enum Selection<'a> {
+    /// References: the members `query` selects; `None` selects none.
+    Candidates(Option<&'a CandidateQuery>),
+    /// Workspace symbols: the members with declarations matching `query`
+    /// are excluded, so they are verified and answered from their facts.
+    Symbols { query: &'a str, direct: bool },
+}
+
 fn target_view(
     index: &ContextIndex,
     membership: &IndexMembership,
-    query: Option<&CandidateQuery>,
+    selection: Selection<'_>,
+    unserved: &[PathBuf],
 ) -> TargetView {
-    let candidates = match query {
-        Some(query) => index.candidates(query),
-        None => {
-            let mut all = index.candidates(&CandidateQuery {
-                names: Vec::new(),
-                top_level_units: None,
-                aliases: Vec::new(),
-            });
+    let every = || {
+        index.candidates(&CandidateQuery {
+            names: Vec::new(),
+            top_level_units: None,
+            aliases: Vec::new(),
+        })
+    };
+    let mut symbols = Vec::new();
+    let candidates = match selection {
+        Selection::Candidates(Some(query)) => index.candidates(query),
+        Selection::Candidates(None) => {
+            let mut all = every();
             all.selected.clear();
             all.excluded.clear();
+            all
+        }
+        Selection::Symbols { query, .. } => {
+            let mut all = every();
+            // A member reading an open or deleted file is read directly.
+            let mut direct = HashSet::new();
+            for path in unserved {
+                direct.insert(path_key(path));
+                direct.extend(
+                    index
+                        .include_dependents(path)
+                        .iter()
+                        .map(|member| path_key(member)),
+                );
+            }
+            symbols = index.symbols(query, &|path| {
+                !direct.is_empty() && direct.contains(&path_key(path))
+            });
+            all.selected.retain(|path| direct.contains(&path_key(path)));
+            let mut contributing = HashSet::new();
+            all.excluded = symbols
+                .iter()
+                .filter(|symbol| contributing.insert(path_key(&symbol.member)))
+                .map(|symbol| symbol.member.clone())
+                .collect();
             all
         }
     };
@@ -1466,6 +1584,7 @@ fn target_view(
     TargetView {
         candidates,
         recorded,
+        symbols,
         coverage: index.coverage(),
         scopes: membership.scopes.clone(),
         complete: membership.complete,

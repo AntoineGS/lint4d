@@ -5,6 +5,7 @@ use crate::text::PositionIndex;
 use lsp_types::{
     DocumentSymbol, Location, Range, SymbolInformation, SymbolKind as LspSymbolKind, Url,
 };
+use pascal_core::facts::DeclarationShape;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -111,10 +112,8 @@ fn workspace_symbols_impl(
             if !seen_selections.insert(((*uri).clone(), symbol.selection_span)) {
                 continue;
             }
-            if result.len() + matches.len() >= MAX_SYMBOL_RESULTS {
-                return Err(format!(
-                    "workspace symbol query returned more than {MAX_SYMBOL_RESULTS} results; narrow the query"
-                ));
+            if let Some(error) = too_many_workspace_symbols(result.len() + matches.len() + 1) {
+                return Err(error);
             }
             matches.push((symbol_index, symbol));
         }
@@ -456,12 +455,102 @@ fn lsp_kind(symbol: &Symbol) -> LspSymbolKind {
     }
 }
 
+/// The kind `lsp_kind` gives the symbol a declaration fact's shape came from.
+pub(crate) fn lsp_kind_for_shape(shape: DeclarationShape) -> LspSymbolKind {
+    match shape {
+        DeclarationShape::Unit => LspSymbolKind::MODULE,
+        DeclarationShape::Class => LspSymbolKind::CLASS,
+        DeclarationShape::Record => LspSymbolKind::STRUCT,
+        DeclarationShape::Interface => LspSymbolKind::INTERFACE,
+        DeclarationShape::Enum => LspSymbolKind::ENUM,
+        DeclarationShape::Array => LspSymbolKind::ARRAY,
+        DeclarationShape::Pointer | DeclarationShape::OtherType => LspSymbolKind::TYPE_PARAMETER,
+        DeclarationShape::Callable | DeclarationShape::Function | DeclarationShape::Procedure => {
+            LspSymbolKind::FUNCTION
+        }
+        DeclarationShape::String => LspSymbolKind::STRING,
+        DeclarationShape::File => LspSymbolKind::FILE,
+        DeclarationShape::Constructor => LspSymbolKind::CONSTRUCTOR,
+        DeclarationShape::Operator => LspSymbolKind::OPERATOR,
+        DeclarationShape::Method => LspSymbolKind::METHOD,
+        DeclarationShape::Variable => LspSymbolKind::VARIABLE,
+        DeclarationShape::Constant => LspSymbolKind::CONSTANT,
+        DeclarationShape::Field => LspSymbolKind::FIELD,
+        DeclarationShape::Property => LspSymbolKind::PROPERTY,
+        DeclarationShape::EnumValue => LspSymbolKind::ENUM_MEMBER,
+    }
+}
+
+/// Today's error for a workspace symbol answer of more than
+/// `MAX_SYMBOL_RESULTS` entries.
+pub(crate) fn too_many_workspace_symbols(count: usize) -> Option<String> {
+    (count > MAX_SYMBOL_RESULTS).then(|| {
+        format!(
+            "workspace symbol query returned more than {MAX_SYMBOL_RESULTS} results; narrow the query"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{NavigationIndex, SymbolKind};
     use super::{PositionIndex, project_workspace_symbols};
     use lsp_types::Url;
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn shapes_map_to_the_kinds_symbols_report() {
+        let uri = Url::parse("file:///workspace/Shapes.pas").expect("test URI");
+        let source = "unit Shapes;\ninterface\ntype\n  TFoo = class\n    FValue: Integer;\n    constructor Create;\n    procedure Run;\n    function Get: Integer;\n    property Value: Integer read FValue;\n  end;\n  TRec = record\n    class operator Add(A, B: TRec): TRec;\n  end;\n  IThing = interface\n  end;\n  TColor = (Red, Green);\n  TItems = array[0..1] of Integer;\n  TList = array of Integer;\n  PInt = ^Integer;\n  TCallback = procedure;\n  TName = string;\n  TData = file of Integer;\n  TCount = Integer;\nfunction Helper: Integer;\nprocedure Hello;\nconst Limit = 1;\nvar Counter: Integer;\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_string())
+            .expect("source parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let mut shapes = HashSet::new();
+        for symbol in &document.symbols {
+            if matches!(symbol.kind, SymbolKind::Parameter | SymbolKind::Label) {
+                continue;
+            }
+            let shape = super::super::facts::shape(symbol);
+            shapes.insert(format!("{shape:?}"));
+            assert_eq!(
+                super::lsp_kind_for_shape(shape),
+                super::lsp_kind(symbol),
+                "{} ({shape:?})",
+                symbol.name
+            );
+        }
+        let mut shapes = shapes.into_iter().collect::<Vec<_>>();
+        shapes.sort();
+        assert_eq!(
+            shapes,
+            [
+                "Array",
+                "Callable",
+                "Class",
+                "Constant",
+                "Constructor",
+                "Enum",
+                "EnumValue",
+                "Field",
+                "File",
+                "Function",
+                "Interface",
+                "Method",
+                "Operator",
+                "OtherType",
+                "Pointer",
+                "Procedure",
+                "Property",
+                "Record",
+                "String",
+                "Unit",
+                "Variable",
+            ]
+        );
+    }
 
     #[test]
     fn numeric_labels_are_label_symbols_like_named_labels() {

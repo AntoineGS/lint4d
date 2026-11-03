@@ -142,6 +142,16 @@ fn max_target_contexts() -> usize {
     MAX_TARGET_CONTEXTS
 }
 
+/// Sets the unverified-candidate bound for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_set_unverified_cap(cap: Option<usize>) {
+    CAP_OVERRIDES.with(|caps| {
+        let mut value = caps.get();
+        value.unverified = cap;
+        caps.set(value);
+    });
+}
+
 fn max_unverified_candidates() -> usize {
     #[cfg(test)]
     if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified) {
@@ -1086,7 +1096,6 @@ impl Workspace {
     /// (A7); those stamps and the membership's directories become the
     /// baseline. `query: None` (workspace symbols) reads the unverified
     /// members only. Client-deleted files are never sources.
-    #[allow(dead_code)] // called by the query tasks of l4d-33
     pub(crate) fn indexed_sources(
         &mut self,
         input: &WorkspaceInput,

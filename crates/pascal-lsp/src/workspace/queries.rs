@@ -1,18 +1,21 @@
+use super::indexing::TargetPurpose;
 use super::rename::{
-    BindingClassification, CANCELLATION_MESSAGE, MAX_SNAPSHOT_MAPPING_WORK, RenameSnapshot,
-    SnapshotMode, SnapshotSeed, SourceRecord, WorkspaceInput, auto_import_source_is_relevant,
-    build_snapshot, input_source_is_readable_with_owner, is_cancelled, owner_for_input,
+    BindingClassification, CANCELLATION_MESSAGE, IndexedSources, MAX_SNAPSHOT_MAPPING_WORK,
+    RenameSnapshot, SnapshotMode, SnapshotScope, SnapshotSeed, SourceRecord, WorkspaceInput,
+    auto_import_source_is_relevant, build_scoped_snapshot, build_snapshot,
+    input_source_is_readable_with_owner, is_cancelled, owner_for_input, path_key,
     project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
-use super::{KnownDocumentOwner, conditional_context_for_uri};
+use super::{KnownDocumentOwner, Workspace, conditional_context_for_uri};
 use crate::coverage::{Coverage, Partial};
 use crate::include_expansion::{MappingBudget, VirtualMapping};
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
     PhysicalProjection, SemanticTokenResolutionMode, completion_prefix_at_position,
 };
+use crate::workspace_index::CandidateQuery;
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
 use lsp_types::CompletionList;
@@ -973,7 +976,17 @@ pub(crate) fn references_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, false, classification, cancel) {
+    let local = classification
+        .info
+        .as_ref()
+        .is_some_and(|(info, _)| info.local);
+    // Local bindings and include documents keep the walk (A17).
+    let snapshot = if local || !is_unit_or_program_source(&uri) {
+        binding_snapshot(&input, &uri, position, false, classification, cancel)
+    } else {
+        indexed_reference_snapshot(&input, &uri, position, &owner, classification, cancel)
+    };
+    let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -989,6 +1002,9 @@ pub(crate) fn references_from_input(
             );
         }
     };
+    for gap in &snapshot.index_gaps {
+        coverage.note(None, gap.clone());
+    }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1112,12 +1128,181 @@ pub(crate) fn highlights_from_input(
     )
 }
 
+fn is_unit_or_program_source(uri: &Url) -> bool {
+    uri.to_file_path().ok().is_some_and(|path| {
+        path.extension().is_some_and(|extension| {
+            ["pas", "dpr", "dpk"]
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
+    })
+}
+
+/// References over index candidates (l4d-33 §6.1). Phase 1 resolves the
+/// binding in the bounded snapshot hover uses and decides the candidate
+/// rule (A3); phase 2 binds only the candidates the target indexes chose.
+/// When the index cannot answer, the request walks the workspace as before.
+fn indexed_reference_snapshot(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    owner: &KnownDocumentOwner,
+    classification: BindingClassification,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    let phase_one =
+        match binding_snapshot(input, uri, position, true, classification.clone(), cancel)
+            .and_then(|snapshot| snapshot.reference_targets(uri, position, cancel))
+        {
+            Ok(targets) => Some(targets),
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => {
+                crate::trace::trace!("  references: phase 1 failed, member rule: {error}");
+                None
+            }
+        };
+    let scope = match indexed_reference_scope(
+        input,
+        uri,
+        position,
+        owner,
+        &classification,
+        phase_one.as_ref(),
+        cancel,
+    ) {
+        Ok(Some(sources)) => SnapshotScope::Indexed(sources),
+        Ok(None) => SnapshotScope::Walk,
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(error) => {
+            crate::trace::trace!("  references: the index cannot answer, walking: {error}");
+            SnapshotScope::Walk
+        }
+    };
+    binding_snapshot_scoped(input, uri, position, false, classification, scope, cancel)
+}
+
+/// The candidate sources of the target contexts (A8), or `None` when no
+/// target context resolves.
+fn indexed_reference_scope(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    owner: &KnownDocumentOwner,
+    classification: &BindingClassification,
+    phase_one: Option<&crate::navigation::ReferenceTargets>,
+    cancel: &AtomicBool,
+) -> Result<Option<IndexedSources>, String> {
+    let mut names = binding_candidate_names(
+        &classification.record.text,
+        classification
+            .info
+            .as_ref()
+            .map(|(info, _)| info.names.clone()),
+        position,
+        uri,
+    )?;
+    if let Some(targets) = phase_one {
+        names.extend(targets.names.iter().cloned());
+        names.sort();
+        names.dedup();
+    }
+    let top_level_units = phase_one
+        .filter(|targets| {
+            !targets.members.is_empty() && targets.members.iter().all(|member| member.top_level)
+        })
+        .map(|targets| {
+            let mut units = targets
+                .members
+                .iter()
+                .map(|member| member.unit.clone())
+                .collect::<Vec<_>>();
+            units.sort();
+            units.dedup();
+            units
+        });
+
+    let mut workspace = Workspace::from_analysis_input(input);
+    let targets = workspace.index_targets(input, Some(uri), TargetPurpose::References, cancel)?;
+    if targets.contexts.is_empty() {
+        return Ok(None);
+    }
+    // Every target's aliases: a superset of the import names keeps the
+    // importer rule sound in each context.
+    let mut aliases = HashSet::new();
+    let contexts =
+        std::iter::once(&*owner.state).chain(targets.contexts.iter().filter_map(|(key, _)| {
+            workspace.contexts.get(key).or_else(|| {
+                input
+                    .document_owners
+                    .values()
+                    .find(|known| known.key == *key)
+                    .map(|known| &*known.state)
+            })
+        }));
+    for state in contexts {
+        aliases.extend(state.context.unit_aliases().iter().map(|(alias, target)| {
+            (
+                crate::navigation::canonical_name(alias),
+                crate::navigation::canonical_name(target),
+            )
+        }));
+    }
+    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+    aliases.sort();
+    let query = CandidateQuery {
+        names,
+        top_level_units,
+        aliases,
+    };
+
+    let mut must_include = vec![uri.clone()];
+    if let Some(targets) = phase_one {
+        must_include.extend(targets.members.iter().map(|member| member.uri.clone()));
+    }
+    must_include.extend(input.overlays.keys().cloned());
+    must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    must_include.dedup();
+    let mut sources =
+        workspace.indexed_sources(input, &targets, Some(&query), &must_include, cancel)?;
+    // As in the walk, only the requesting context's mapped roots are read:
+    // another context's members outside the workspace roots are not searched.
+    let required = must_include
+        .iter()
+        .filter_map(|uri| uri.to_file_path().ok())
+        .map(|path| path_key(&super::absolute_path(path)))
+        .collect::<HashSet<_>>();
+    sources.sources.retain(|(path, key)| {
+        *key == owner.key || workspace.accepts_path(path) || required.contains(&path_key(path))
+    });
+    Ok(Some(sources))
+}
+
 fn binding_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
     position: Position,
     document_local: bool,
     classification: BindingClassification,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    binding_snapshot_scoped(
+        input,
+        uri,
+        position,
+        document_local,
+        classification,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+fn binding_snapshot_scoped(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    document_local: bool,
+    classification: BindingClassification,
+    scope: SnapshotScope,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let uri = super::canonical_file_uri(uri);
@@ -1148,7 +1333,7 @@ fn binding_snapshot(
     } else {
         &[]
     };
-    build_binding_snapshot(
+    build_binding_snapshot_scoped(
         input,
         &uri,
         position,
@@ -1157,6 +1342,7 @@ fn binding_snapshot(
         consumed_configuration,
         mode,
         skip_imports_for,
+        scope,
         cancel,
     )
 }
@@ -1228,13 +1414,64 @@ fn build_binding_snapshot(
     skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
-    let original_name = super::rename::identifier_at_position(&target_record.text, position)
+    build_binding_snapshot_scoped(
+        input,
+        uri,
+        position,
+        target_record,
+        binding_info,
+        consumed_configuration,
+        mode,
+        skip_imports_for,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_binding_snapshot_scoped(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target_record: super::rename::SourceRecord,
+    binding_info: Option<crate::navigation::RenameBindingInfo>,
+    consumed_configuration: Vec<super::rename::SourceRecord>,
+    mode: SnapshotMode,
+    skip_imports_for: &[Url],
+    scope: SnapshotScope,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    let candidate_names = binding_candidate_names(
+        &target_record.text,
+        binding_info.map(|info| info.names),
+        position,
+        uri,
+    )?;
+    build_scoped_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &candidate_names,
+        mode,
+        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
+        skip_imports_for,
+        scope,
+        cancel,
+    )
+}
+
+/// The binding's names, or the identifier at `position` when it has none.
+fn binding_candidate_names(
+    text: &str,
+    names: Option<Vec<String>>,
+    position: Position,
+    uri: &Url,
+) -> Result<Vec<String>, String> {
+    let original_name = super::rename::identifier_at_position(text, position)
         .ok_or_else(|| format!("no identifier at navigation position in {uri}"))?;
-    let mut candidate_names = match binding_info {
-        Some(info) => {
-            let mut names = info.names;
+    let mut candidate_names = match names {
+        Some(mut names) => {
             if names.is_empty() {
-                names.push(original_name.clone());
+                names.push(original_name);
             }
             names
         }
@@ -1242,15 +1479,7 @@ fn build_binding_snapshot(
     };
     candidate_names.sort();
     candidate_names.dedup();
-    build_snapshot(
-        input,
-        std::slice::from_ref(uri),
-        &candidate_names,
-        mode,
-        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
-        skip_imports_for,
-        cancel,
-    )
+    Ok(candidate_names)
 }
 
 /// The include error that blocks a read-only feature on `uri`. An unsupported
@@ -2530,8 +2759,10 @@ mod tests {
         signature_help_from_input, type_definitions_from_input, workspace_symbols_from_input,
     };
     use crate::navigation::CompletionOptions;
+    use crate::project_cache::IndexAnchor;
     #[cfg(target_os = "linux")]
     use crate::workspace::content_hash_bytes;
+    use crate::workspace::indexing::IndexBound;
     use crate::workspace::rename::{
         CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input,
         install_snapshot_priority_barrier, owner_for_input, project_context_and_metadata_for_input,
@@ -3010,6 +3241,7 @@ mod tests {
     struct ManyUnits {
         _temp: TempDir,
         shared: PathBuf,
+        importers: Vec<PathBuf>,
         input: WorkspaceInput,
     }
 
@@ -3022,15 +3254,19 @@ mod tests {
             "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
         )
         .expect("shared");
-        for index in 0..importers {
-            fs::write(
-                root.join(format!("Importer{index:03}.pas")),
-                format!(
-                    "unit Importer{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
-                ),
-            )
-            .expect("importer");
-        }
+        let importers = (0..importers)
+            .map(|index| {
+                let path = root.join(format!("Importer{index:03}.pas"));
+                fs::write(
+                    &path,
+                    format!(
+                        "unit Importer{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                )
+                .expect("importer");
+                path
+            })
+            .collect();
         for index in 0..others {
             fs::write(
                 root.join(format!("Other{index:03}.pas")),
@@ -3040,17 +3276,58 @@ mod tests {
             )
             .expect("other");
         }
+        // Settled stamps, so the index proves the excluded units unchanged.
+        pascal_project::backdate_tree_for_test(&root);
         let workspace = test_workspace(vec![root], WorkspaceOptions::default());
         ManyUnits {
             _temp: temp,
             shared,
+            importers,
             input: workspace.analysis_input(),
         }
     }
 
+    /// Indexes every member of the context that owns `uri`.
+    fn build_index_for(input: &WorkspaceInput, uri: &Url) {
+        build_index_at(input, &IndexAnchor::Document(uri.clone()));
+    }
+
+    fn build_index_at(input: &WorkspaceInput, anchor: &IndexAnchor) {
+        let cancel = AtomicBool::new(false);
+        let progress = Workspace::from_analysis_input(input)
+            .advance_workspace_index(anchor, IndexBound::all(), &mut || Ok(()), &cancel)
+            .expect("index batch");
+        assert!(progress.complete, "{progress:?}");
+    }
+
+    fn located(locations: &[lsp_types::Location]) -> Vec<(Url, u32, u32)> {
+        let mut found = locations
+            .iter()
+            .map(|location| {
+                (
+                    location.uri.clone(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    }
+
+    fn bound_documents() -> Vec<Url> {
+        let mut bound = crate::navigation::test_bound_documents();
+        bound.sort();
+        bound.dedup();
+        bound
+    }
+
+    /// l4d-33 acceptance: with a built index, 500 units and one shared symbol
+    /// bind only the importers and the declaring unit.
     #[test]
-    fn references_today_bind_every_unit_containing_the_name() {
+    fn indexed_references_bind_only_the_importing_units() {
         let fixture = many_units(20, 479);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
         crate::navigation::test_reset_bound_documents();
         let computed = references_from_input(
             fixture.input.clone(),
@@ -3059,17 +3336,385 @@ mod tests {
             true,
             &AtomicBool::new(false),
         );
-        let locations = computed.value.expect("references").value;
-        assert_eq!(
-            locations.len(),
-            21,
-            "declaration plus 20 uses: {locations:?}"
-        );
+        let partial = computed.value.expect("references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert_eq!(partial.value.len(), 21);
         let mut bound = crate::navigation::test_bound_documents();
         bound.sort();
         bound.dedup();
-        // l4d-33 Task 10 replaces this with `bound.len() == 21`.
-        assert_eq!(bound.len(), 500, "today every unit with the name is bound");
+        let mut expected = fixture
+            .importers
+            .iter()
+            .map(|p| source_uri(p))
+            .collect::<Vec<_>>();
+        expected.push(source_uri(&fixture.shared));
+        expected.sort();
+        assert_eq!(bound, expected);
+    }
+
+    #[test]
+    fn references_on_an_unindexed_context_search_unverified_members_directly() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
+        // Recorded on the walk (Task 9 commit e9ae98e).
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+    }
+
+    #[test]
+    fn unverified_members_beyond_the_bound_are_a_gap() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        fs::write(
+            root.join("Another.pas"),
+            "unit Another;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("another consumer");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_unverified_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_unverified_cap(Some(1));
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(!partial.coverage.is_complete(), "{:?}", partial.coverage);
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.contains("not indexed yet")),
+            "{:?}",
+            partial.coverage
+        );
+        // Another.pas is first in path order; Provider.pas is the declaring
+        // document; Consumer.pas is beyond the bound.
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("Another.pas")), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_members_are_a_gap_not_a_candidate() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let big = root.join("Big.pas");
+        fs::write(
+            &big,
+            format!(
+                "unit Big;\ninterface\nuses Provider;\n{}implementation\nend.\n",
+                "{ SharedValue }\n".repeat(60)
+            ),
+        )
+        .expect("big");
+        pascal_project::backdate_tree_for_test(&root);
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let input = test_workspace(vec![root], options).analysis_input();
+        build_index_for(&input, &source_uri(&provider));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.reason.starts_with("1 units could not be indexed: ")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(located(&partial.value), vec![(source_uri(&provider), 2, 6)]);
+        assert!(!bound_documents().contains(&source_uri(&big)));
+    }
+
+    #[test]
+    fn references_search_every_target_context_sharing_the_declaring_unit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().to_path_buf());
+        let shared = root.join("shared/Shared.pas");
+        fs::create_dir_all(shared.parent().unwrap()).expect("shared directory");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for name in ["P1", "P2"] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).expect("project directory");
+            fs::write(
+                directory.join(format!("{name}.dproj")),
+                format!(
+                    "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource><DCC_UnitSearchPath>..\\shared</DCC_UnitSearchPath></PropertyGroup></Project>"
+                ),
+            )
+            .expect("descriptor");
+            fs::write(
+                directory.join(format!("{name}.dpr")),
+                format!("program {name};\nuses C{name};\nbegin\nend.\n"),
+            )
+            .expect("main source");
+            fs::write(
+                directory.join(format!("C{name}.pas")),
+                format!(
+                    "unit C{name};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                ),
+            )
+            .expect("consumer");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let mut workspace = test_workspace(
+            vec![root.clone()],
+            WorkspaceOptions {
+                project_file: Some(root.join("P2/P2.dproj")),
+                ..WorkspaceOptions::default()
+            },
+        );
+        let opened = root.join("P1/CP1.pas");
+        workspace
+            .open_document(
+                source_uri(&opened),
+                fs::read_to_string(&opened).expect("consumer text"),
+                1,
+            )
+            .expect("open P1 consumer");
+        let input = workspace.analysis_input();
+        for name in ["P1", "P2"] {
+            build_index_at(
+                &input,
+                &IndexAnchor::Project(root.join(name).join(format!("{name}.dproj"))),
+            );
+        }
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input,
+            &source_uri(&shared),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("P1/CP1.pas")), 6, 6),
+                (source_uri(&root.join("P2/CP2.pas")), 6, 6),
+                (source_uri(&shared), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+    }
+
+    #[test]
+    fn phase_one_failure_falls_back_to_the_member_rule() {
+        let fixture = many_units(2, 2);
+        let root = fixture.shared.parent().unwrap().to_path_buf();
+        let plain = root.join("Plain.pas");
+        fs::write(&plain, "unit Plain;\ninterface\nimplementation\nend.\n").expect("plain");
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.shared),
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+        let scoped = references();
+        crate::navigation::test_reset_bound_documents();
+        let failing = crate::workspace::rename::test_fail_reference_targets();
+        let fallback = references();
+        drop(failing);
+        assert_eq!(located(&fallback.value), located(&scoped.value));
+        assert!(fallback.coverage.is_complete(), "{:?}", fallback.coverage);
+        let mut expected = fixture
+            .importers
+            .iter()
+            .map(|path| source_uri(path))
+            .chain([
+                source_uri(&fixture.shared),
+                source_uri(&root.join("Other000.pas")),
+                source_uri(&root.join("Other001.pas")),
+            ])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(bound_documents(), expected);
+    }
+
+    #[test]
+    fn an_include_document_keeps_the_old_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main;\ninterface\n{$I Values.inc}\nimplementation\nend.\n",
+        )
+        .expect("main");
+        let include = root.join("Values.inc");
+        fs::write(&include, "const SharedValue = 1;\n").expect("include");
+        fs::write(
+            root.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Main;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input,
+            &source_uri(&include),
+            Position::new(0, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+        assert!(
+            located(&partial.value).contains(&(source_uri(&root.join("Consumer.pas")), 6, 6)),
+            "{:?}",
+            partial.value
+        );
+    }
+
+    #[test]
+    fn a_local_binding_keeps_the_old_path() {
+        let fixture = query_fixture();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let local = fixture.provider.parent().unwrap().join("Local.pas");
+        fs::write(
+            &local,
+            "unit Local;\ninterface\nimplementation\nprocedure Run;\nvar\n  Count: Integer;\nbegin\n  Count := 1;\nend;\nend.\n",
+        )
+        .expect("local");
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&local),
+            Position::new(5, 2),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(partial.value.len(), 2, "{:?}", partial.value);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+    }
+
+    #[test]
+    fn a_delivered_result_is_rejected_when_an_excluded_member_changes() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        let plain = root.join("Plain.pas");
+        fs::write(&plain, "unit Plain;\ninterface\nimplementation\nend.\n").expect("plain");
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.provider));
+        let cancel = AtomicBool::new(false);
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.provider),
+            shared_value_position(),
+            true,
+            &cancel,
+        );
+        assert!(computed.value.is_ok(), "{computed:?}");
+        assert!(
+            !bound_documents().contains(&source_uri(&plain)),
+            "Plain.pas is excluded"
+        );
+        revalidate_input(&fixture.input, &computed.records, &cancel)
+            .expect("unchanged reference inputs must remain valid");
+
+        fs::write(
+            &plain,
+            "unit Plain;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("changed excluded member");
+        revalidate_input(&fixture.input, &computed.records, &cancel)
+            .expect_err("a changed excluded member must stale delivered references");
+    }
+
+    #[test]
+    fn references_do_not_walk_the_workspace_once_indexed() {
+        let fixture = query_fixture();
+        let root = fixture.provider.parent().unwrap().to_path_buf();
+        pascal_project::backdate_tree_for_test(&root);
+        build_index_for(&fixture.input, &source_uri(&fixture.provider));
+        let cancel = AtomicBool::new(false);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &source_uri(&fixture.provider),
+                shared_value_position(),
+                true,
+                &cancel,
+            )
+        };
+        let first = references();
+        assert!(first.value.is_ok(), "{first:?}");
+        crate::catalogue::test_reset_listings();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let second = references();
+        let partial = second.value.expect("second references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.consumer), 6, 6),
+                (source_uri(&fixture.provider), 2, 6),
+            ]
+        );
+        assert!(
+            crate::catalogue::test_listings().is_empty(),
+            "{:?}",
+            crate::catalogue::test_listings()
+        );
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 1);
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
     }
 
     #[test]
@@ -3092,9 +3737,22 @@ mod tests {
             "unit User;\ninterface\nuses Mid;\nimplementation\nprocedure Run;\nbegin\n  Shared.Field := 1;\n  MakeBase.Field := 2;\nend;\nend.\n",
         )
         .expect("user");
+        pascal_project::backdate_tree_for_test(&root);
         let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let walked = references_from_input(
+            input.clone(),
+            &source_uri(&base),
+            Position::new(4, 4),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references before indexing")
+        .value;
+        build_index_for(&input, &source_uri(&base));
         let computed = references_from_input(
-            workspace.analysis_input(),
+            input,
             &source_uri(&base),
             Position::new(4, 4),
             true,
@@ -3104,20 +3762,13 @@ mod tests {
         // Characterization: neither `Shared.Field` nor `MakeBase.Field` in
         // `User.pas` (which never imports `Base`) is found today, nor are
         // inherited or `with` receivers; only the declaration is reported.
-        // l4d-33 Task 10 must keep the indexed result equal to this walk
-        // result.
-        let mut found: Vec<(Url, u32, u32)> = locations
-            .iter()
-            .map(|location| {
-                (
-                    location.uri.clone(),
-                    location.range.start.line,
-                    location.range.start.character,
-                )
-            })
-            .collect();
-        found.sort();
-        assert_eq!(found, vec![(source_uri(&base), 4, 4)], "{locations:?}");
+        // With a built index the result stays equal to the walk's.
+        assert_eq!(
+            located(&locations),
+            vec![(source_uri(&base), 4, 4)],
+            "{locations:?}"
+        );
+        assert_eq!(located(&locations), located(&walked));
     }
 
     #[test]

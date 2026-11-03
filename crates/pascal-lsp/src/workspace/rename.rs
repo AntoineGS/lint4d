@@ -107,6 +107,32 @@ thread_local! {
     static TEST_ENUMERATED_OWNERS: std::cell::RefCell<Vec<(PathBuf, ContextKey)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static TEST_SOURCE_OWNER_DISCOVERIES: Cell<usize> = const { Cell::new(0) };
+    static TEST_INDEXED_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
+    static TEST_FAIL_REFERENCE_TARGETS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes `RenameSnapshot::reference_targets` fail until the guard drops.
+#[cfg(test)]
+pub(crate) struct TestReferenceTargetsFailure;
+
+#[cfg(test)]
+impl Drop for TestReferenceTargetsFailure {
+    fn drop(&mut self) {
+        TEST_FAIL_REFERENCE_TARGETS.with(|fail| fail.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_fail_reference_targets() -> TestReferenceTargetsFailure {
+    TEST_FAIL_REFERENCE_TARGETS.with(|fail| fail.set(true));
+    TestReferenceTargetsFailure
+}
+
+/// Whole-workspace snapshots over index candidates built since the last
+/// `test_reset_workspace_snapshots`.
+#[cfg(test)]
+pub(crate) fn test_indexed_snapshots() -> usize {
+    TEST_INDEXED_SNAPSHOTS.with(Cell::get)
 }
 
 /// Enumerated sources whose owner the snapshot had to discover, since the
@@ -119,6 +145,7 @@ pub(crate) fn test_take_source_owner_discoveries() -> usize {
 #[cfg(test)]
 pub(crate) fn test_reset_workspace_snapshots() {
     TEST_WORKSPACE_SNAPSHOTS.with(|count| count.set(0));
+    TEST_INDEXED_SNAPSHOTS.with(|count| count.set(0));
 }
 
 /// Whole-workspace snapshots built since the last reset.
@@ -580,7 +607,6 @@ pub(crate) struct RenameSnapshot {
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
     /// What an indexed snapshot did not search (l4d-33 §7); empty for a walk.
-    #[allow(dead_code)] // read by the query tasks of l4d-33
     pub(crate) index_gaps: Vec<String>,
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
@@ -906,13 +932,16 @@ impl RenameSnapshot {
 
     /// The binding at `position` for the indexed references query (A3),
     /// merged over every virtual position the physical one maps to.
-    #[allow(dead_code)] // called by the query tasks of l4d-33
     pub(crate) fn reference_targets(
         &self,
         uri: &Url,
         position: Position,
         cancel: &AtomicBool,
     ) -> Result<crate::navigation::ReferenceTargets, String> {
+        #[cfg(test)]
+        if TEST_FAIL_REFERENCE_TARGETS.with(Cell::get) {
+            return Err("reference targets failed (test hook)".to_owned());
+        }
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
         let positions = self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         if positions.is_empty() {
@@ -2704,7 +2733,7 @@ pub(crate) fn input_source_is_readable_with_owner(
         || legacy_route)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BindingClassification {
     pub(crate) source: String,
     pub(crate) record: SourceRecord,
@@ -5914,6 +5943,29 @@ pub(crate) fn build_snapshot(
     skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
+    build_scoped_snapshot(
+        input,
+        priority,
+        candidate_names,
+        mode,
+        priority_seed,
+        skip_imports_for,
+        SnapshotScope::Walk,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_scoped_snapshot(
+    input: &WorkspaceInput,
+    priority: &[Url],
+    candidate_names: &[String],
+    mode: SnapshotMode,
+    priority_seed: Option<SnapshotSeed>,
+    skip_imports_for: &[Url],
+    scope: SnapshotScope,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
     build_snapshot_with_policy(
         input,
         priority,
@@ -5922,7 +5974,7 @@ pub(crate) fn build_snapshot(
         priority_seed,
         skip_imports_for,
         false,
-        SnapshotScope::Walk,
+        scope,
         cancel,
     )
 }
@@ -5933,14 +5985,12 @@ pub(crate) enum SnapshotScope {
     Walk,
     /// The candidates an index chose (l4d-33 §6): no walk, no owner discovery
     /// and no mapped-root walk.
-    #[allow(dead_code)] // built by the query tasks of l4d-33
     Indexed(IndexedSources),
 }
 
 /// The sources of an indexed snapshot, each with the target context that
 /// owns it.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) struct IndexedSources {
     pub(crate) sources: Vec<(PathBuf, ContextKey)>,
     /// What proves the members left out still current (A7): their stamps and
@@ -6021,6 +6071,10 @@ fn build_snapshot_with_policy(
         SnapshotMode::Workspace | SnapshotMode::WorkspaceSymbols
     ) {
         TEST_WORKSPACE_SNAPSHOTS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+    #[cfg(test)]
+    if matches!(scope, SnapshotScope::Indexed(_)) {
+        TEST_INDEXED_SNAPSHOTS.with(|count| count.set(count.get().saturating_add(1)));
     }
     let _span = crate::trace::Span::new(|| {
         format!(
@@ -6219,7 +6273,10 @@ fn build_snapshot_with_policy(
         } else {
             priority_contexts.values().cloned().collect()
         };
-        if !indexed {
+        // References over index candidates still read the requesting
+        // context's mapped roots as the walk does: index membership holds
+        // only their search-path directories, not what packages map in.
+        if !indexed || mode == SnapshotMode::Workspace {
             let context_states = enumeration.contexts.clone();
             enumerate_mapped_sources(
                 &mut loader,

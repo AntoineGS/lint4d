@@ -5722,6 +5722,8 @@ fn definition_adopts_a_bulk_references_import_claim() {
         release: barrier_directory.join("unused"),
     };
     let waited_marker = waited.entered.display().to_string();
+    let trace = environment.path().join("trace.log");
+    let trace_path = trace.display().to_string();
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         environment.path(),
         [
@@ -5730,6 +5732,7 @@ fn definition_adopts_a_bulk_references_import_claim() {
                 "PASCAL_LSP_TEST_INTERACTIVE_CLAIM_WAIT_MARKER",
                 waited_marker.as_str(),
             ),
+            ("PASCAL_LSP_TRACE", trace_path.as_str()),
         ],
     );
     server.initialize(root.path(), Value::Null);
@@ -5755,7 +5758,9 @@ fn definition_adopts_a_bulk_references_import_claim() {
         "textDocument/definition",
         navigation_params(&main, &source, "TProvided", 0),
     );
-    waited.wait_until_entered();
+    // Outlast any bounded wait (each mark is one 20 ms wait slice) before
+    // the claim is stored: the definition keeps waiting for it.
+    waited.wait_for_entries(2 + 1000 / 20);
     claim.release();
     let definition = server
         .response_with_timeout(&definition_id, IO_TIMEOUT)
@@ -5776,6 +5781,21 @@ fn definition_adopts_a_bulk_references_import_claim() {
     let references = server.response(&references_id);
     assert!(references.error.is_none(), "{references:?}");
     server.shutdown();
+
+    let trace = fs::read_to_string(&trace).expect("trace");
+    let resolutions = trace
+        .lines()
+        .filter(|line| line.contains("cache compute Import Main.pas "))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "the definition adopts the references job's resolution:\n{trace}"
+    );
+    assert!(
+        !trace.lines().any(|line| line.contains(" detached=")
+            && !line.contains(" detached=0 ")),
+        "nothing is computed uncached beside a claim:\n{trace}"
+    );
 }
 
 #[test]

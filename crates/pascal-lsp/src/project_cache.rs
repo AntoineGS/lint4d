@@ -3468,7 +3468,8 @@ pub(crate) fn claims_are_interactive_on_this_thread() -> bool {
     CLAIM_ROLE.with(|cell| cell.borrow().interactive)
 }
 
-/// Lets protocol tests see that an interactive lookup waits for a claim.
+/// Lets protocol tests see that an interactive lookup waits for a claim, and
+/// for how many wait slices.
 #[cfg(feature = "test-support")]
 fn mark_interactive_claim_wait_for_tests() {
     use std::io::Write as _;
@@ -4127,6 +4128,7 @@ impl ProjectCache {
                             started: std::time::Instant::now(),
                         });
                     }
+                    // One mark per wait slice, so tests can see a wait last.
                     #[cfg(feature = "test-support")]
                     if role.interactive && !wait_marked {
                         // The marker is a file: write it without the lock.
@@ -4143,6 +4145,10 @@ impl ProjectCache {
                         bounded_wait.map_or(WAIT_SLICE, |remaining| remaining.min(WAIT_SLICE));
                     state = wait_timeout_recovering_poison_for(&self.inner, state, slice).0;
                     state.waiting.remove(&thread);
+                    #[cfg(feature = "test-support")]
+                    {
+                        wait_marked = false;
+                    }
                 }
                 Some(Slot::Ready(entry))
                     if *entry.context == *context && entry.input_hash == input_hash =>

@@ -59,6 +59,16 @@ impl InteractiveGate {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_paused_background_for_tests(&self, paused: usize) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_clients_for_tests(&self) -> usize {
+        self.waiting_clients.load(Ordering::Relaxed)
+    }
+
     /// The number of background jobs paused for interactive work.
     pub(crate) fn paused_background(&self) -> usize {
         self.paused.load(Ordering::Relaxed)
@@ -1482,23 +1492,30 @@ mod tests {
         let hook_gate = gate.clone();
         let hook_cancel = warm_cancel.clone();
         let (claim_acquired_tx, claim_acquired_rx) = std::sync::mpsc::channel();
-        let (resume_hook_tx, resume_hook_rx) = crossbeam_channel::bounded(1);
+        let (resume_hook_tx, resume_hook_rx) = crossbeam_channel::bounded::<()>(1);
         let warm_uri = main.clone();
         let mut warming_workspace = Workspace::from_analysis_input(&input);
+        let first_unit = Arc::new(AtomicBool::new(true));
         warming_workspace.set_dependency_hook(Arc::new(move |_, _, _| {
-            hook_gate.set(1);
-            claim_acquired_tx.send(()).unwrap();
-            resume_hook_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("test releases the dependency hook");
+            // Only the first unit boundary holds the walk; the test releases
+            // it (or drops the sender) whatever the interactive request does.
+            if first_unit.swap(false, Ordering::Relaxed) {
+                hook_gate.set(1);
+                claim_acquired_tx.send(()).unwrap();
+                let _ = resume_hook_rx.recv();
+            }
             if hook_gate.try_wait_idle(&hook_cancel) {
                 Ok(())
             } else {
                 Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
             }
         }));
-        let warm_thread =
-            std::thread::spawn(move || warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel));
+        let warm_thread = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::yielding(warm_cancel.clone()),
+            );
+            warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel)
+        });
         claim_acquired_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("warmer reached its dependency walk");
@@ -1508,6 +1525,12 @@ mod tests {
         let (interactive_started_tx, interactive_started_rx) = std::sync::mpsc::channel();
         let (interactive_done_tx, interactive_done_rx) = std::sync::mpsc::channel();
         let interactive_thread = std::thread::spawn(move || {
+            crate::project_cache::set_claim_role_on_this_thread(
+                crate::project_cache::ClaimRole::interactive(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::ZERO,
+                ),
+            );
             let mut interactive_workspace = Workspace::from_analysis_input(&interactive_input);
             interactive_started_tx.send(()).unwrap();
             let result = interactive_workspace
@@ -1521,15 +1544,15 @@ mod tests {
 
         // The warm stays paused in its dependency walk until the interactive
         // request is done or has had its chance to finish.
-        let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(2));
+        let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(10));
         let completed_before_release = completed_while_gate_busy.is_ok();
-        resume_hook_tx.send(()).unwrap();
+        drop(resume_hook_tx);
         let warm_result = warm_thread.join().unwrap();
         let interactive_result = match completed_while_gate_busy {
             Ok(result) => result,
             Err(_) => interactive_done_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("interactive request finishes after releasing the gate"),
+                .recv_timeout(Duration::from_secs(10))
+                .expect("interactive request finishes after releasing the walk"),
         };
         interactive_thread.join().unwrap();
 

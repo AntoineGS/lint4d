@@ -7246,7 +7246,11 @@ fn build_snapshot_with_policy(
         }
         if indexed && !best_effort {
             // A provider of the requesting document can shadow the binding
-            // the references prove, so its failure still refuses them.
+            // the references prove, so it is audited as requested: an
+            // expansion failure fails the request, and a recorded failure
+            // (unresolved, ambiguous or unreadable include, no project
+            // context, unsafe include content) makes
+            // `read_only_reference_coverage` refuse.
             let providers = requested
                 .iter()
                 .flat_map(|uri| {

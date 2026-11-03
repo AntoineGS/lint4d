@@ -1751,6 +1751,40 @@ fn read_only_reference_coverage(
     if requested_has_include && let Some(error) = other_include_error {
         return Err(format!("reference workspace scan incomplete: {error}"));
     }
+    // The requesting document and its imports stay strict: a recorded
+    // include failure leaves every unit with an include directive unproven,
+    // and an unproven provider may declare a name shadowing the binding.
+    if let Some(error) = other_include_error {
+        let requesting = std::iter::once(uri).chain(
+            snapshot
+                .expansions
+                .iter()
+                .filter(|(_, expansion)| expansion.dependencies.contains(uri))
+                .map(|(owner, _)| owner),
+        );
+        let unproven_provider = requesting.flat_map(|document| {
+            snapshot
+                .index
+                .imports(document)
+                .into_iter()
+                .filter_map(|import| {
+                    snapshot
+                        .index
+                        .import_provider_uri(document, &import.name)
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(provider) = unproven_provider.into_iter().find(|provider| {
+            snapshot.sources.get(provider).is_some_and(|source| {
+                super::rename::may_contain_include_directive(source.as_bytes())
+            })
+        }) {
+            return Err(format!(
+                "reference workspace scan incomplete: {error} (the requesting document uses {provider})"
+            ));
+        }
+    }
     if snapshot
         .expansions
         .get(uri)
@@ -4139,6 +4173,41 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(rename.value.is_err(), "{:?}", rename.value);
+    }
+
+    /// l4d-jeh4 fix round 1: a provider of the requesting document whose
+    /// include is unresolved (a recorded audit failure) may declare a
+    /// shadowing name, so references from that document refuse.
+    #[test]
+    fn a_provider_with_an_unresolved_include_refuses_references() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Shared.pas"),
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            root.join("Failing.pas"),
+            "unit Failing;\ninterface\n{$I Missing.inc}\nimplementation\nend.\n",
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            "unit Downstream;\ninterface\nuses Shared, Failing;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let computed = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(computed.value.is_err(), "{:?}", computed.value);
     }
 
     #[test]

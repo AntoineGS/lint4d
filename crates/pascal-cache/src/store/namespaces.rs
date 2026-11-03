@@ -51,7 +51,8 @@ pub struct Reclaimed {
     pub rows: usize,
     /// No retired scope remains, and nothing in the live scope is left to
     /// delete: no retired row that nothing references, no orphan key
-    /// manifest.
+    /// manifest. `reclaim(0)` does not examine the live scope, so its
+    /// `complete` speaks for the retired scopes only.
     pub complete: bool,
 }
 

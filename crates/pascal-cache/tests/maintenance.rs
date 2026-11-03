@@ -1408,7 +1408,10 @@ fn a_skipped_step_still_renews_a_due_lease_and_every_step_does() {
     second.advance_clock_for_test(LEASE_RENEWAL);
     assert!(maintenance.step(&second, ROOMY, &never).unwrap().skipped);
     let renewed = newest_renewal(root.path());
-    assert!(renewed >= opened + 60, "{opened} -> {renewed}");
+    assert!(
+        renewed >= opened + LEASE_RENEWAL.as_secs() as i64,
+        "{opened} -> {renewed}"
+    );
     drop(held);
     // A step resuming past the Leases phase renews too.
     let limited = StepBudget { rows: 0, ..ROOMY };
@@ -1416,7 +1419,7 @@ fn a_skipped_step_still_renews_a_due_lease_and_every_step_does() {
     assert_eq!((report.rows, maintenance.phase()), (0, Phase::Hints));
     second.advance_clock_for_test(LEASE_RENEWAL);
     maintenance.step(&second, limited, &never).unwrap();
-    assert!(newest_renewal(root.path()) >= renewed + 60);
+    assert!(newest_renewal(root.path()) >= renewed + LEASE_RENEWAL.as_secs() as i64);
 }
 
 #[test]
@@ -1544,4 +1547,25 @@ fn wal_pressure_reached_mid_cycle_stops_the_writes_not_the_step() {
     reader.lock().unwrap().execute_batch("COMMIT").unwrap();
     let report = maintenance.step(&store, budget, &never).unwrap();
     assert!(report.cycle_complete && report.rows > 0, "{report:?}");
+}
+
+#[test]
+fn a_cycle_completes_only_once_every_retired_scope_is_gone() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    raw(root.path())
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40) \
+             INSERT INTO retired_scopes (namespace_id, reset_epoch) SELECT randomblob(32), 0 FROM n",
+        )
+        .unwrap();
+    let mut maintenance = Maintenance::new(EAGER).unwrap();
+    let never = AtomicBool::new(false);
+    let budget = StepBudget {
+        rows: 1000,
+        ..ROOMY
+    };
+    let report = maintenance.step(&store, budget, &never).unwrap();
+    assert!(report.cycle_complete, "{report:?}");
+    assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
 }

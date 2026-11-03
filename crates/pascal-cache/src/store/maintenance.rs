@@ -252,7 +252,7 @@ impl Maintenance {
             Phase::Delete => Ran::of(
                 store
                     .reclaim(batch)
-                    .map(|reclaimed| (reclaimed.rows, reclaimed.complete || reclaimed.rows == 0)),
+                    .map(|reclaimed| (reclaimed.rows, reclaimed.complete)),
             ),
             Phase::Vacuum => Ran::of(
                 store

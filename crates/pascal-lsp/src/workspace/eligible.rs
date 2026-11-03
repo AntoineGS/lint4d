@@ -19,17 +19,18 @@ use super::persist::PersistError;
 use super::{ContextKey, Workspace};
 use lsp_types::Url;
 use pascal_cache::{
-    Binding, Bypass, ContextKey as CacheContextKey, Digest, DiscoveryScope, EvidencePurpose,
-    EvidenceSubject, EvidenceTarget, EvidenceWrite, LookupKey, MAX_ROW_BATCH_ROWS, MemberCoverage,
-    MemberError, MemberHeader, MemberRecord, Observation, PublishedRecord, SnapshotCoverage,
-    SnapshotHeader, SnapshotSeal, SourceIdentity, Store, evidence_id,
+    Binding, Bypass, ContextKey as CacheContextKey, CoverageStatus, Digest, DiscoveryScope,
+    EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite, IncompleteReason, LookupKey,
+    MAX_ROW_BATCH_ROWS, MemberCoverage, MemberError, MemberHeader, MemberRecord, Observation,
+    PublishedRecord, SnapshotCoverage, SnapshotHeader, SnapshotSeal, SourceIdentity, Store,
+    encoded_content_bytes, evidence_id,
 };
 use pascal_core::facts::FactBudget;
 use pascal_core::resolver::ResolutionObservation;
-use pascal_project::ProjectObservations;
+use pascal_project::{ProjectContext, ProjectObservations, ProjectPathProvenance};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Observations that passed the capture gap checks: no editor state, no
 /// overlay listing, no overflow, no cancellation and nothing uncaptured
@@ -167,6 +168,12 @@ impl Workspace {
     /// the phase-5 persistability and evidence-gap rules; each binding's
     /// evidence ID is recomputed from the capture it came from under the
     /// member's context.
+    ///
+    /// A root over `maxFileBytes`, or facts over a store limit, is refused
+    /// for good under the same inputs (spec §5), so the member is kept
+    /// without an artifact or member evidence and its extraction is
+    /// `Incomplete(OverSizeLimit)`. Every other refusal (I/O, cancellation,
+    /// budget, editor state) stays ineligible, to be retried.
     pub(crate) fn eligible_member(
         &self,
         uri: &Url,
@@ -177,14 +184,39 @@ impl Workspace {
         if self.root_is_session_private(uri) {
             return Err(Ineligible::SessionPrivate(uri.clone()));
         }
-        let prepared = self
-            .prepare_artifact(uri, budget, cancel)
-            .map_err(Ineligible::Artifact)?;
         let state = self
             .document_contexts
             .get(uri)
             .and_then(|key| self.contexts.get(key))
             .ok_or(Ineligible::NoContext)?;
+        let path = uri
+            .to_file_path()
+            .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
+        let prepared = if self.root_over_size_limit(&path, &state.context) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Ineligible::Artifact(PersistError::Cancelled));
+            }
+            None
+        } else {
+            let prepared = self
+                .prepare_artifact(uri, budget, cancel)
+                .map_err(Ineligible::Artifact)?;
+            encoded_content_bytes(&prepared.facts)
+                .is_ok()
+                .then_some(prepared)
+        };
+        let mut coverage = draft.coverage;
+        let (artifact, member_evidence, origin) = match &prepared {
+            Some(prepared) => (
+                Some(prepared.artifact_id()),
+                prepared.member_evidence_id(),
+                prepared.origin,
+            ),
+            None => {
+                coverage.extraction = CoverageStatus::Incomplete(IncompleteReason::OverSizeLimit);
+                (None, None, state.context.source_origin(&path))
+            }
+        };
         let context = CacheContextKey::new(&state.context);
         let mut bindings = Vec::with_capacity(draft.bindings.len());
         let mut evidence = Vec::new();
@@ -204,9 +236,6 @@ impl Workspace {
             }
             bindings.push(checked.binding);
         }
-        let path = uri
-            .to_file_path()
-            .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
         let canonical = super::absolute_path(path);
         let record = MemberRecord {
             header: MemberHeader {
@@ -216,11 +245,11 @@ impl Workspace {
                     spelling: None,
                     uri: Some(uri.to_string()),
                 },
-                artifact: Some(prepared.artifact_id()),
-                member_evidence: prepared.member_evidence_id(),
-                origin: prepared.origin,
+                artifact,
+                member_evidence,
+                origin,
                 fallback_unit_name: draft.fallback_unit_name,
-                coverage: draft.coverage,
+                coverage,
             },
             bindings,
         };
@@ -229,6 +258,31 @@ impl Workspace {
             value: record,
             context,
             evidence,
+        })
+    }
+
+    /// Whether the saved root at `path` exceeds `maxFileBytes`, by its
+    /// metadata alone, so nothing oversized is read. A root `context` does
+    /// not authorize, or whose metadata cannot be read, is not:
+    /// `prepare_artifact` refuses it.
+    fn root_over_size_limit(&self, path: &Path, context: &ProjectContext) -> bool {
+        let Some(entry) = context.path_entry_for(path) else {
+            return false;
+        };
+        let policy = context.read_policy();
+        let metadata = if matches!(entry.provenance, ProjectPathProvenance::LegacyNative) {
+            if !policy.allows_legacy_payload_entry(&entry) {
+                return false;
+            }
+            std::fs::metadata(&entry.path)
+        } else {
+            if !policy.allows_entry(&entry) {
+                return false;
+            }
+            std::fs::symlink_metadata(&entry.path)
+        };
+        metadata.is_ok_and(|metadata| {
+            metadata.is_file() && metadata.len() > self.options.limits.max_file_bytes as u64
         })
     }
 
@@ -371,6 +425,7 @@ pub(in crate::workspace) mod tests {
         BindingKind, BindingOutcome, CoverageStatus, DiscoveryInputs, IncompleteReason, Lookup,
         LookupInputs, LookupKind, Published, ScannedDirectory,
     };
+    use pascal_core::facts::FactError;
     use pascal_project::ProjectPathEntry;
     use std::path::Path;
 
@@ -877,6 +932,186 @@ pub(in crate::workspace) mod tests {
                 .eligible_member(&uri, draft, &mut budget(), &no_cancel())
                 .err(),
             Some(Ineligible::Record(MemberError::Candidates { ordinal: 0 }))
+        );
+    }
+
+    const OVER_SIZE: CoverageStatus = CoverageStatus::Incomplete(IncompleteReason::OverSizeLimit);
+
+    /// `units_a_and_b`, then `B.pas` grows on disk past a lowered
+    /// `maxFileBytes`.
+    fn oversize_b(buffers: &[(&str, &str)]) -> Indexed {
+        let mut indexed = units_a_and_b(buffers, &["A.pas", "B.pas"]);
+        indexed.workspace.options.limits.max_file_bytes = 1024;
+        let grown = format!(
+            "unit B;\ninterface\n{{{}}}\nimplementation\nend.\n",
+            "x".repeat(2048)
+        );
+        std::fs::write(indexed.root.join("B.pas"), grown).unwrap();
+        indexed
+    }
+
+    #[test]
+    fn an_oversize_root_is_an_artifact_less_member_and_its_membership_seals() {
+        let indexed = oversize_b(&[]);
+        let workspace = &indexed.workspace;
+        let b = indexed.uri("B.pas");
+        let key = workspace.document_contexts[&b].clone();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let artifact_less = workspace
+            .eligible_member(&b, draft(), &mut budget(), &no_cancel())
+            .unwrap();
+        let header = &artifact_less.value().header;
+        assert_eq!(header.artifact, None);
+        assert_eq!(header.member_evidence, None);
+        assert_eq!(header.coverage.extraction, OVER_SIZE);
+        assert_eq!(
+            header.coverage.resolution,
+            CoverageStatus::Complete,
+            "the draft's resolution coverage is kept"
+        );
+        let path = indexed.root.join("B.pas");
+        assert_eq!(header.source.canonical, path);
+        assert_eq!(
+            header.origin,
+            workspace.contexts[&key].context.source_origin(&path)
+        );
+        assert_eq!(
+            publish_record(&store, &artifact_less).unwrap().published,
+            Published::Inserted
+        );
+        let mut members = workspace
+            .document_contexts
+            .iter()
+            .filter(|(uri, context)| **context == key && **uri != b)
+            .map(|(uri, _)| {
+                workspace
+                    .persist_source(uri, &store, &mut budget(), &no_cancel())
+                    .unwrap();
+                workspace
+                    .eligible_member(uri, draft(), &mut budget(), &no_cancel())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!members.is_empty(), "A is a member");
+        members.push(artifact_less);
+        let snapshot = workspace
+            .eligible_snapshot(
+                &key,
+                SnapshotDraft {
+                    members: members.clone(),
+                    discovery: discovery(&indexed.root),
+                    coverage: COMPLETE,
+                },
+            )
+            .unwrap();
+        let header = seal_snapshot(&store, &snapshot).unwrap();
+        assert_eq!(header.member_count(), members.len() as u64);
+    }
+
+    #[test]
+    fn facts_over_a_store_limit_make_an_artifact_less_member() {
+        let name = "L".repeat(pascal_cache::MAX_INDEX_KEY_BYTES + 1);
+        let source = format!("unit Long;\ninterface\nconst {name} = 1;\nimplementation\nend.\n");
+        let indexed = index(&[("Long.pas", source.as_bytes())], &["Long.pas"]);
+        let uri = indexed.uri("Long.pas");
+        let facts = indexed.facts("Long.pas").extracted;
+        assert_eq!(facts.persistable, Ok(()));
+        assert!(
+            pascal_cache::encoded_content_bytes(&facts.facts).is_err(),
+            "the store cannot hold these facts"
+        );
+        let member = indexed
+            .workspace
+            .eligible_member(&uri, draft(), &mut budget(), &no_cancel())
+            .unwrap();
+        let header = &member.value().header;
+        assert_eq!(header.artifact, None);
+        assert_eq!(header.member_evidence, None);
+        assert_eq!(header.coverage.extraction, OVER_SIZE);
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        assert_eq!(
+            publish_record(&store, &member).unwrap().published,
+            Published::Inserted
+        );
+        // Admission still comes first: a refused budget is retried.
+        assert!(matches!(
+            indexed.workspace.eligible_member(
+                &uri,
+                draft(),
+                &mut FactBudget::new(16),
+                &no_cancel()
+            ),
+            Err(Ineligible::Artifact(PersistError::Fact(
+                FactError::Budget { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn transient_artifact_refusals_stay_ineligible() {
+        let indexed = units_a_and_b(&[], &["A.pas", "B.pas"]);
+        let (a, b) = (indexed.uri("A.pas"), indexed.uri("B.pas"));
+        let workspace = &indexed.workspace;
+        let cancelled =
+            workspace.eligible_member(&a, draft(), &mut budget(), &AtomicBool::new(true));
+        assert!(
+            matches!(
+                cancelled,
+                Err(Ineligible::Artifact(
+                    PersistError::Cancelled | PersistError::Fact(FactError::Cancelled)
+                ))
+            ),
+            "{cancelled:?}"
+        );
+        let tight = workspace.eligible_member(&a, draft(), &mut FactBudget::new(16), &no_cancel());
+        assert!(
+            matches!(
+                tight,
+                Err(Ineligible::Artifact(PersistError::Fact(
+                    FactError::Budget { .. }
+                )))
+            ),
+            "{tight:?}"
+        );
+        std::fs::remove_file(indexed.root.join("B.pas")).unwrap();
+        let unreadable = workspace.eligible_member(&b, draft(), &mut budget(), &no_cancel());
+        assert!(
+            matches!(
+                unreadable,
+                Err(Ineligible::Artifact(PersistError::Unreadable(_)))
+            ),
+            "{unreadable:?}"
+        );
+        let oversize = oversize_b(&[]);
+        assert_eq!(
+            oversize
+                .workspace
+                .eligible_member(
+                    &oversize.uri("B.pas"),
+                    draft(),
+                    &mut budget(),
+                    &AtomicBool::new(true)
+                )
+                .err(),
+            Some(Ineligible::Artifact(PersistError::Cancelled))
+        );
+    }
+
+    #[test]
+    fn an_open_oversize_root_stays_session_private() {
+        let indexed = oversize_b(&[(
+            "B.pas",
+            "unit B;\ninterface\nconst Edited = 1;\nimplementation\nend.\n",
+        )]);
+        let b = indexed.uri("B.pas");
+        assert_eq!(
+            indexed
+                .workspace
+                .eligible_member(&b, draft(), &mut budget(), &no_cancel())
+                .err(),
+            Some(Ineligible::SessionPrivate(b))
         );
     }
 }

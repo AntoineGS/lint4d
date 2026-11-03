@@ -12,10 +12,11 @@
 // items that stay unused in production (the l4d-zf1b.8 batch API).
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pascal_project::ProjectReadStamp;
 
@@ -463,6 +464,193 @@ impl Catalogue {
             .map(|(directory, error)| path(directory) + error.len())
             .sum::<usize>();
         size_of::<Self>() + directories + files + names + unreadable
+    }
+}
+
+/// Catalogues one store keeps; the least recently used goes first.
+pub(crate) const MAX_SHARED_CATALOGUES: usize = 1_024;
+
+/// A stored catalogue as a view sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedCatalogue {
+    pub(crate) catalogue: Arc<Catalogue>,
+    /// The store generation it was published under: the token that
+    /// `publish` (as `base`) and `remove` compare.
+    pub(crate) generation: u64,
+    /// Watched natively and confirmed by a stamp check that began after the
+    /// watches were registered: it needs no stamp check (Task 8).
+    pub(crate) watched: bool,
+    /// Every listed directory has a native watch; the next passing stamp
+    /// check may confirm it (Task 8).
+    pub(crate) watch_registered: bool,
+}
+
+/// What a store dropped: its charge and the directory watches it held, both
+/// released by the caller once the store is unlocked.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Removed {
+    pub(crate) bytes: usize,
+    pub(crate) watch_directories: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct Stored {
+    catalogue: Arc<Catalogue>,
+    generation: u64,
+    last_used: u64,
+    bytes: usize,
+    watch_directories: Vec<PathBuf>,
+    watch_epoch: Option<u64>,
+    watched: bool,
+}
+
+/// Every catalogue a `ProjectCache` shares, with a reverse map from each
+/// listed directory to the catalogues that listed it.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogueStore {
+    entries: HashMap<CatalogueKey, Stored>,
+    by_directory: HashMap<PathBuf, HashSet<CatalogueKey>>,
+    clock: u64,
+    generation: u64,
+    watched_directories: usize,
+}
+
+impl CatalogueStore {
+    /// Advances on every publication and invalidation.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `watch_epoch` is the cache's current one: watches registered under an
+    /// older epoch belong to a watcher that no longer exists.
+    pub(crate) fn get(&mut self, key: &CatalogueKey, watch_epoch: u64) -> Option<SharedCatalogue> {
+        self.clock += 1;
+        let clock = self.clock;
+        let stored = self.entries.get_mut(key)?;
+        stored.last_used = clock;
+        let registered = stored.watch_epoch == Some(watch_epoch);
+        Some(SharedCatalogue {
+            catalogue: Arc::clone(&stored.catalogue),
+            generation: stored.generation,
+            watched: registered && stored.watched,
+            watch_registered: registered,
+        })
+    }
+
+    /// Stores `catalogue` when `base` is the generation now stored (`None`
+    /// when nothing is). Otherwise another view published or the stored one
+    /// was invalidated since the caller read it, and `Err` hands back the
+    /// caller's charge and watches.
+    pub(crate) fn publish(
+        &mut self,
+        key: CatalogueKey,
+        base: Option<u64>,
+        catalogue: Arc<Catalogue>,
+        bytes: usize,
+        watch_directories: Vec<PathBuf>,
+    ) -> Result<(u64, Vec<Removed>), Removed> {
+        let current = self.entries.get(&key).map(|stored| stored.generation);
+        if current != base {
+            return Err(Removed {
+                bytes,
+                watch_directories,
+            });
+        }
+        let mut removed = self.take(&key).into_iter().collect::<Vec<_>>();
+        self.generation += 1;
+        self.clock += 1;
+        for (directory, _) in catalogue.directories() {
+            self.by_directory
+                .entry(directory.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.watched_directories += watch_directories.len();
+        self.entries.insert(
+            key,
+            Stored {
+                catalogue,
+                generation: self.generation,
+                last_used: self.clock,
+                bytes,
+                watch_directories,
+                watch_epoch: None,
+                watched: false,
+            },
+        );
+        while self.entries.len() > MAX_SHARED_CATALOGUES {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, stored)| stored.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            removed.extend(self.take(&victim));
+        }
+        Ok((self.generation, removed))
+    }
+
+    pub(crate) fn remove(&mut self, key: &CatalogueKey, generation: u64) -> Option<Removed> {
+        if self.entries.get(key)?.generation != generation {
+            return None;
+        }
+        self.generation += 1;
+        self.take(key)
+    }
+
+    /// Drops the catalogues that listed `path`, and with `listing` (a
+    /// membership change) the ones that listed its parent.
+    pub(crate) fn invalidate(&mut self, path: &Path, listing: bool) -> Vec<Removed> {
+        let mut keys = self.by_directory.get(path).cloned().unwrap_or_default();
+        if listing
+            && let Some(parent) = path.parent()
+            && let Some(parents) = self.by_directory.get(parent)
+        {
+            keys.extend(parents.iter().cloned());
+        }
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        self.generation += 1;
+        keys.iter().filter_map(|key| self.take(key)).collect()
+    }
+
+    pub(crate) fn clear(&mut self) -> Vec<Removed> {
+        self.generation += 1;
+        self.by_directory.clear();
+        self.watched_directories = 0;
+        self.entries
+            .drain()
+            .map(|(_, stored)| Removed {
+                bytes: stored.bytes,
+                watch_directories: stored.watch_directories,
+            })
+            .collect()
+    }
+
+    fn take(&mut self, key: &CatalogueKey) -> Option<Removed> {
+        let stored = self.entries.remove(key)?;
+        for (directory, _) in stored.catalogue.directories() {
+            if let Some(keys) = self.by_directory.get_mut(directory) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.by_directory.remove(directory);
+                }
+            }
+        }
+        self.watched_directories = self
+            .watched_directories
+            .saturating_sub(stored.watch_directories.len());
+        Some(Removed {
+            bytes: stored.bytes,
+            watch_directories: stored.watch_directories,
+        })
     }
 }
 

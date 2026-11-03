@@ -328,11 +328,21 @@ impl WorkspaceInput {
         )
     )]
     pub(crate) fn disk_baseline(&self) -> WorkspaceInput {
-        let session_private_paths = self
+        // An open buffer equal to its saved file is no private input of a
+        // context (controller ruling, l4d-zf1b.8); member roots stay
+        // session-private while open (`root_is_session_private`).
+        let edited = self
             .overlays
+            .iter()
+            .filter_map(|(uri, overlay)| Some((uri.to_file_path().ok()?, overlay)))
+            .filter(|(path, overlay)| overlay_differs_from_disk(path, &overlay.text))
+            .map(|(path, _)| path);
+        let deleted = self
+            .deleted_overrides
             .keys()
-            .chain(self.deleted_overrides.keys())
-            .filter_map(|uri| uri.to_file_path().ok())
+            .filter_map(|uri| uri.to_file_path().ok());
+        let session_private_paths = edited
+            .chain(deleted)
             .map(|path| path_key(&absolute_path(path)))
             .chain(self.session_private_paths.iter().cloned())
             .collect();
@@ -348,6 +358,13 @@ impl WorkspaceInput {
             ..self.clone()
         }
     }
+}
+
+/// Whether `text` is not exactly the bytes saved at `path`; a file that
+/// cannot be read differs. The length is compared before anything is read.
+pub(crate) fn overlay_differs_from_disk(path: &Path, text: &str) -> bool {
+    let same_length = fs::metadata(path).is_ok_and(|metadata| metadata.len() == text.len() as u64);
+    !same_length || fs::read(path).map_or(true, |bytes| bytes != text.as_bytes())
 }
 
 /// The small portion of a workspace snapshot needed to revalidate a retained

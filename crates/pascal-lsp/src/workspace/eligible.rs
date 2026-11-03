@@ -291,7 +291,7 @@ impl Workspace {
     /// metadata alone, so nothing oversized is read. A root `context` does
     /// not authorize, or whose metadata cannot be read, is not:
     /// `prepare_artifact` refuses it.
-    fn root_over_size_limit(&self, path: &Path, context: &ProjectContext) -> bool {
+    pub(super) fn root_over_size_limit(&self, path: &Path, context: &ProjectContext) -> bool {
         let Some(entry) = context.path_entry_for(path) else {
             return false;
         };

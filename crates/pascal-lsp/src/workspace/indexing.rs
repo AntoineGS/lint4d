@@ -573,19 +573,37 @@ fn reused_slots(
             .iter()
             .map(|include| include.source.clone().map(absolute_path)),
     );
-    let observed: HashMap<String, &PathStamp> = include_stamps
-        .iter()
-        .map(|(held, stamp)| (path_key(&absolute_path(held.clone())), stamp))
+    let stamps = slot_stamps(
+        path,
+        own_stamp.clone(),
+        &slots,
+        include_stamps.iter().cloned(),
+    );
+    (slots, stamps)
+}
+
+/// The stamps of a member's slots: its own, then each resolved include's
+/// from `observed` (the stamps taken before its bytes were read), matched
+/// by `path_key`; an include without one keeps no stamp (A7).
+fn slot_stamps(
+    path: &Path,
+    own_stamp: PathStamp,
+    slots: &[Option<PathBuf>],
+    observed: impl IntoIterator<Item = (PathBuf, PathStamp)>,
+) -> Vec<MemberStamp> {
+    let observed: HashMap<String, PathStamp> = observed
+        .into_iter()
+        .map(|(held, stamp)| (path_key(&absolute_path(held)), stamp))
         .collect();
     let mut stamps = vec![MemberStamp {
         path: path.to_path_buf(),
-        stamp: Some(own_stamp.clone()),
+        stamp: Some(own_stamp),
     }];
     stamps.extend(slots.iter().skip(1).flatten().map(|slot| MemberStamp {
         path: slot.clone(),
-        stamp: observed.get(&path_key(slot)).map(|stamp| (*stamp).clone()),
+        stamp: observed.get(&path_key(slot)).cloned(),
     }));
-    (slots, stamps)
+    stamps
 }
 
 impl Workspace {
@@ -891,7 +909,12 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<MemberOutcome, String> {
         let Ok(uri) = Url::from_file_path(path) else {
-            return Ok(self.refuse_member(key, path, "the path has no file URI".to_owned()));
+            return Ok(self.refuse_member(
+                key,
+                path,
+                "the path has no file URI".to_owned(),
+                cancel,
+            ));
         };
         #[cfg(test)]
         if MEMBER_ERROR.with(|slot| slot.borrow().iter().any(|failing| failing == path)) {
@@ -904,12 +927,12 @@ impl Workspace {
         run_hook(&AFTER_LOAD, path);
         let outcome = match loaded {
             Err(error) if is_stable_load_refusal(&error) => {
-                Ok(self.refuse_unless_vanished(key, path, error))
+                Ok(self.refuse_unless_vanished(key, path, error, cancel))
             }
             Err(error) => Err(error),
             Ok(false) => match self.load_refusal.take() {
                 Some(reason) if is_stable_load_refusal(&reason) => {
-                    Ok(self.refuse_unless_vanished(key, path, reason))
+                    Ok(self.refuse_unless_vanished(key, path, reason, cancel))
                 }
                 // No stable reason: the member stays pending (a file that
                 // vanished is relisted by the membership instead).
@@ -937,12 +960,13 @@ impl Workspace {
         key: &ContextKey,
         path: &Path,
         reason: String,
+        cancel: &AtomicBool,
     ) -> MemberOutcome {
         if path_stamp(path).is_none() {
             self.project_cache.invalidate_path(path);
             return MemberOutcome::Skipped;
         }
-        self.refuse_member(key, path, reason)
+        self.refuse_member(key, path, reason, cancel)
     }
 
     fn publish_member(
@@ -960,7 +984,7 @@ impl Workspace {
         ) {
             Ok(facts) => facts,
             Err(FactError::Cancelled) => return Err(CANCELLATION_MESSAGE.to_owned()),
-            Err(error) => return Ok(self.refuse_member(key, path, error.to_string())),
+            Err(error) => return Ok(self.refuse_member(key, path, error.to_string(), cancel)),
         };
         match facts.extracted.persistable {
             Ok(()) => {}
@@ -969,7 +993,7 @@ impl Workspace {
             Err(NotPersistable::Transient) => {
                 check_workspace_cancel(Some(cancel))?;
                 self.project_cache.limit_index_member(key, path);
-                self.prove_unindexed(key, path, Unindexed::NotRecorded);
+                self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
                 return Ok(MemberOutcome::Limited);
             }
             // An unsaved buffer is not what the disk holds; the index
@@ -979,32 +1003,20 @@ impl Workspace {
             }
         }
         let slots = self.source_slot_paths(uri);
-        let mut stamps = vec![MemberStamp {
-            path: path.to_path_buf(),
-            stamp: Some(own_stamp),
-        }];
         // The include stamps are the ones the load observed when it read the
         // include (A7); a stat now could describe newer bytes.
-        let observed: HashMap<String, PathStamp> = self
+        let observed = self
             .expansions
             .get(uri)
-            .map(|record| {
-                record
-                    .include_observations
-                    .iter()
-                    .filter_map(|observation| {
-                        Some((
-                            path_key(&absolute_path(observation.path.clone())),
-                            path_stamp_from_project_read(observation.stamp.as_ref()?),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        stamps.extend(slots.iter().skip(1).flatten().map(|slot| MemberStamp {
-            path: slot.clone(),
-            stamp: observed.get(&path_key(slot)).cloned(),
-        }));
+            .into_iter()
+            .flat_map(|record| &record.include_observations)
+            .filter_map(|observation| {
+                Some((
+                    observation.path.clone(),
+                    path_stamp_from_project_read(observation.stamp.as_ref()?),
+                ))
+            });
+        let stamps = slot_stamps(path, own_stamp, &slots, observed);
         let member = MemberFacts::from_facts(path, &facts.extracted.facts, slots);
         let hash = facts.root_content_hash.unwrap_or(0);
         Ok(
@@ -1036,14 +1048,26 @@ impl Workspace {
         )
     }
 
-    fn refuse_member(&self, key: &ContextKey, path: &Path, reason: String) -> MemberOutcome {
-        let unindexed = if reason.contains("the configured per-file limit") {
+    fn refuse_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        reason: String,
+        cancel: &AtomicBool,
+    ) -> MemberOutcome {
+        self.project_cache.refuse_index_member(key, path, reason);
+        // Decided as `eligible_member` does: by the saved root's size, so
+        // every producer derives the same record.
+        let over_size = self
+            .contexts
+            .get(key)
+            .is_some_and(|state| self.root_over_size_limit(path, &state.context));
+        let unindexed = if over_size {
             Unindexed::OverSize
         } else {
             Unindexed::NotRecorded
         };
-        self.project_cache.refuse_index_member(key, path, reason);
-        self.prove_unindexed(key, path, unindexed);
+        self.prove_unindexed(key, path, unindexed, cancel);
         MemberOutcome::Refused
     }
 
@@ -1105,12 +1129,24 @@ impl Workspace {
             .persistent_cache()
             .job()
             .ok_or(PersistSkip::Unavailable)?;
-        let published = match prepared.publish(job.store()) {
-            Ok(_) => publish_proven(job.store(), &eligible),
-            Err(super::persist::PersistError::Store(bypass)) => Err(bypass),
+        let stopped = || job.is_cancelled() || cancel.load(Ordering::Relaxed);
+        if stopped() {
+            return Err(PersistSkip::Unavailable);
+        }
+        match prepared.publish(job.store()) {
+            Ok(_) => {}
+            Err(super::persist::PersistError::Store(bypass)) => {
+                job.observe(&bypass);
+                return Err(PersistSkip::Store(bypass));
+            }
             Err(error) => return Err(PersistSkip::Prepare(error)),
-        };
-        published.map_err(|bypass| {
+        }
+        // A published artifact without its record is still reusable: a
+        // later proof publishes the record.
+        if stopped() {
+            return Err(PersistSkip::Unavailable);
+        }
+        publish_proven(job.store(), &eligible).map_err(|bypass| {
             job.observe(&bypass);
             PersistSkip::Store(bypass)
         })
@@ -1119,18 +1155,35 @@ impl Workspace {
     /// Prove the record `inputs` derive for a member the index holds: found
     /// live in the store, else published. Without a proof the member only
     /// delays the context's snapshot.
-    fn prove_member(&self, key: &ContextKey, inputs: &RecordInputs<'_>) -> bool {
+    fn prove_member(
+        &self,
+        key: &ContextKey,
+        inputs: &RecordInputs<'_>,
+        cancel: &AtomicBool,
+    ) -> bool {
         if !self.may_publish(key) {
             return false;
         }
-        let Ok(eligible) = self.eligible_indexed_member(key, inputs) else {
-            return false;
+        let eligible = match self.eligible_indexed_member(key, inputs) {
+            Ok(eligible) => eligible,
+            Err(ineligible) => {
+                crate::trace::trace!(
+                    "  index member {} not proven: {ineligible:?}",
+                    inputs.path.display()
+                );
+                return false;
+            }
         };
         let Some(job) = self.persistent_cache().job() else {
             return false;
         };
+        let stopped = || job.is_cancelled() || cancel.load(Ordering::Relaxed);
+        if stopped() {
+            return false;
+        }
         let proof = match prove_existing(job.store(), &eligible) {
             Ok(Some(proof)) => Ok(proof),
+            Ok(None) if stopped() => return false,
             Ok(None) => publish_proven(job.store(), &eligible),
             Err(bypass) => Err(bypass),
         };
@@ -1147,7 +1200,13 @@ impl Workspace {
 
     /// A refused or limited member is listed by an artifact-less record, so
     /// a complete membership can still be sealed; the indexer retries it.
-    fn prove_unindexed(&self, key: &ContextKey, path: &Path, unindexed: Unindexed) {
+    fn prove_unindexed(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        unindexed: Unindexed,
+        cancel: &AtomicBool,
+    ) {
         let Some(state) = self.contexts.get(key) else {
             return;
         };
@@ -1161,6 +1220,7 @@ impl Workspace {
                 origin: state.context.source_origin(path),
                 unindexed: Some(unindexed),
             },
+            cancel,
         );
     }
 
@@ -1245,6 +1305,7 @@ impl Workspace {
                             origin: state.context.source_origin(path),
                             unindexed: None,
                         },
+                        cancel,
                     );
                 }
                 ReuseOutcome::Reused
@@ -5404,6 +5465,157 @@ pub(in crate::workspace) mod tests {
             assert!(restarted.context_inputs_are_disk_only(&key));
             assert_eq!(progress.reused, 0, "nothing was in the store");
             assert_eq!(progress.reuse_pending, 0, "every member was tried");
+            cache.shutdown();
+        }
+
+        /// Ruling (fix round 1): an open project file whose buffer equals
+        /// its saved bytes is no session-private input; an edited one is.
+        #[test]
+        fn an_open_unedited_main_source_does_not_block_publication() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (mut session, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            let main = temp.path().join("App.dpr");
+            let saved = fs::read_to_string(&main).unwrap();
+            session
+                .open_document(Url::from_file_path(&main).unwrap(), saved, 1)
+                .unwrap();
+            assert!(session.context_inputs_are_disk_only(&key));
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert!(view.context_inputs_are_disk_only(&key));
+            assert_eq!((progress.indexed, progress.persisted), (4, 4));
+            assert_eq!(recorded(&view, &key).len(), 4);
+            cache.shutdown();
+        }
+
+        /// Review finding 2: project discovery reads saved files only, so a
+        /// context the session discovers while a project file is edited
+        /// is a disk context, and a baseline view adopting it from the
+        /// shared discoveries publishes nothing of the buffer.
+        #[test]
+        fn a_baseline_view_adopting_a_session_discovery_sees_no_edited_project_file() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            named_unit(&root.join("ext/Extra.pas"), "ExtraProc");
+            let (session, key, _) = indexed_project(root, 3, WorkspaceOptions::default());
+            let member = Url::from_file_path(root.join("lib/U0.pas")).unwrap();
+            let anchor = IndexAnchor::Document(member.clone());
+            // The view exists before the edit, so its session-private set
+            // does not name the edited main source.
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let mut session = session;
+            session
+                .open_document(
+                    Url::from_file_path(root.join("App.dpr")).unwrap(),
+                    "program App;\nuses Extra in 'ext/Extra.pas';\nbegin end.\n".to_owned(),
+                    1,
+                )
+                .unwrap();
+            let discovered = context(&mut session, anchor.clone());
+            assert_eq!(discovered, key);
+            let units = |workspace: &Workspace| {
+                workspace.contexts[&key]
+                    .context
+                    .explicit_units()
+                    .into_values()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            };
+            assert!(units(&session).is_empty(), "discovery ignored the buffer");
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(progress.key.as_ref(), Some(&key));
+            assert!(units(&view).is_empty());
+            assert!(!members(&view, &key).contains(&root.join("ext/Extra.pas")));
+            assert!(selected(&view, &key, "ExtraProc").is_empty());
+            assert_eq!(progress.persisted, 3, "{progress:?}");
+            cache.shutdown();
+        }
+
+        /// The record kind comes from the root's size, not the message, as
+        /// `eligible_member` decides it.
+        #[test]
+        fn a_refusal_names_over_size_only_for_a_root_over_the_limit() {
+            use crate::workspace::eligible::member_record;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 3, WorkspaceOptions::default());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            advance(&mut view, &anchor, IndexBound::all());
+            let small = temp.path().join("lib/U0.pas");
+            view.refuse_member(
+                &key,
+                &small,
+                format!(
+                    "include owner {small:?} directive summary exceeds the configured per-file limit"
+                ),
+                &AtomicBool::new(false),
+            );
+            let expected = member_record(&RecordInputs {
+                path: &small,
+                facts: None,
+                artifact: None,
+                member_evidence: None,
+                origin: view.contexts[&key].context.source_origin(&small),
+                unindexed: Some(Unindexed::NotRecorded),
+            })
+            .id()
+            .unwrap();
+            let recorded = records(&view, &key)
+                .into_iter()
+                .find(|(path, _)| *path == small)
+                .and_then(|(_, record)| record);
+            assert_eq!(recorded, Some(expected));
+            cache.shutdown();
+        }
+
+        /// Review finding 1: a cancellation between the artifact and the
+        /// record stops the publication.
+        #[test]
+        fn a_cancellation_after_the_artifact_publishes_no_record() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 2, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (handle, flag, target) = (cache.clone(), Arc::clone(&cancel), member.clone());
+            set_before_persist_hook(Some(Box::new(move |path| {
+                if path == target {
+                    let flag = Arc::clone(&flag);
+                    let job = handle.job().expect("job");
+                    job.store()
+                        .set_before_commit_for_test(move || flag.store(true, Ordering::Relaxed));
+                }
+            })));
+            let result =
+                view.advance_workspace_index(&anchor, IndexBound::all(), &mut || Ok(()), &cancel);
+            set_before_persist_hook(None);
+            cache
+                .job()
+                .expect("job")
+                .store()
+                .set_before_commit_for_test(|| {});
+            assert!(cancel.load(Ordering::Relaxed), "the artifact committed");
+            // U0 is the last member, so the batch ends without another check.
+            let progress = result.expect("batch");
+            assert_eq!((progress.indexed, progress.persisted), (2, 1));
+            assert_eq!(state(&view, &key, &member), Some(MemberState::Fresh));
+            assert_eq!(recorded(&view, &key), vec![temp.path().join("App.dpr")]);
+            cache.shutdown();
+            // The artifact alone was published: a restart reuses it and
+            // proves the record then.
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 2, "{progress:?}");
             cache.shutdown();
         }
 

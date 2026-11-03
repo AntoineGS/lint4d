@@ -3703,23 +3703,33 @@ impl Workspace {
     }
 
     /// Whether every project metadata file `key`'s context consulted is
-    /// saved: none is open, overlaid or deleted in this workspace or, for a
-    /// baseline view, in the session it was derived from (spec §4.4).
+    /// saved: none is deleted, or open with a buffer that differs from its
+    /// saved bytes, in this workspace or, for a baseline view, in the
+    /// session it was derived from (spec §4.4; an unedited open buffer is
+    /// no private input, controller ruling l4d-zf1b.8).
     pub(crate) fn context_inputs_are_disk_only(&self, key: &ContextKey) -> bool {
         let Some(state) = self.contexts.get(key) else {
             return false;
         };
+        let deleted = resolver::deletion_overrides_by_path(&self.deleted_overrides);
         state
             .context_observations
             .metadata_files
             .iter()
             .map(|path| absolute_path(path.clone()))
             .all(|path| {
+                let Ok(uri) = Url::from_file_path(&path) else {
+                    return false;
+                };
+                let edited = [&uri, &canonical_file_uri(&uri)]
+                    .into_iter()
+                    .filter_map(|uri| self.open_documents.get(uri)?.text.as_ref())
+                    .any(|text| rename::overlay_differs_from_disk(&path, text));
                 !self
                     .session_private_paths
                     .contains(&rename::path_key(&path))
-                    && Url::from_file_path(&path)
-                        .is_ok_and(|uri| !self.root_is_session_private(&uri))
+                    && !resolver::deletion_applies(&deleted, &path)
+                    && !edited
             })
     }
 

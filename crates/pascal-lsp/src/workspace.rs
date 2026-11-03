@@ -137,6 +137,8 @@ pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
 pub(crate) mod signature;
+#[cfg(all(test, unix))]
+mod storage_failures;
 mod validate;
 
 pub(super) fn conditional_context_for_path(

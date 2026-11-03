@@ -4886,3 +4886,51 @@ fn uses_entry_explicit_path_is_preserved() {
         }
     }
 }
+
+// ── Ruling l4d-zaf0: program/library uses order is the unit initialization
+// order, maintained by the IDE; it is never sorted. Unit uses still are. ─
+
+#[test]
+fn program_and_library_uses_keep_their_source_order() {
+    for header in ["program P;", "library P;"] {
+        let src = format!(
+            "{header}\n\nuses\n  Windows,\n  Forms,\n  {{$IFDEF X}}\n  E in 'e.pas' {{FormE}},\n  {{$ENDIF}}\n  Environment in 'src\\Environment.pas' {{frmEnvironment: TFrame}},\n  B.C in '..\\B.C.pas',\n  Activex;\n\nbegin\nend.\n"
+        );
+        for result in format_three_modes_idempotent(&src) {
+            let order: Vec<usize> = [
+                "Windows",
+                "Forms",
+                "{$IFDEF X}",
+                "E in 'e.pas'",
+                "{FormE}",
+                "{$ENDIF}",
+                "Environment in 'src\\Environment.pas'",
+                "{frmEnvironment: TFrame}",
+                "B.C in '..\\B.C.pas'",
+                "Activex",
+            ]
+            .iter()
+            .map(|needle| {
+                result
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle:?} missing in:\n{result}"))
+            })
+            .collect();
+            assert!(order.is_sorted(), "{header} uses reordered:\n{result}");
+            for unit in ["Windows", "Forms", "E in", "Environment in", "B.C in"] {
+                let line = result[result.find(unit).unwrap()..].lines().next().unwrap();
+                assert!(line.contains(','), "{unit:?} lost its comma:\n{result}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unit_uses_are_still_sorted() {
+    let src = "unit U;\n\ninterface\n\nuses\n  Windows,\n  Forms;\n\nimplementation\n\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.find("Forms").unwrap() < result.find("Windows").unwrap(),
+        "{result}"
+    );
+}

@@ -543,7 +543,10 @@ fn parse_pp_uses_block(
                 }
             }
             K::K_IN | K::LITERAL_STRING => {
-                append_explicit_path(branch_items(&mut block, state), child, source, comments);
+                let items = branch_items(&mut block, state);
+                append_explicit_path(items, child, source, comments);
+                // A following `,` still belongs to the unit.
+                commas.pushed(items);
             }
             K::PP_USES_BLOCK => {
                 let items = branch_items(&mut block, state);
@@ -648,6 +651,8 @@ pub(crate) fn extract_uses_items(
             }
             K::K_IN | K::LITERAL_STRING => {
                 append_explicit_path(&mut items, child, source, comments);
+                // A following `,` still belongs to the unit.
+                commas.pushed(&items);
             }
             K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
                 items.extend(
@@ -717,6 +722,20 @@ type UnitComments<'a> = (&'a [String], &'a [String]);
 /// A clause holding an include is written as in the source, its items in
 /// their order and with their own punctuation: what the include lists is
 /// unknown, so nothing around it can be sorted, grouped or re-punctuated.
+/// Lay out a uses clause without moving any item: the order of a program's or
+/// library's uses is its unit initialization order, kept by the IDE.
+pub(crate) fn layout_uses_items_in_source_order(
+    items: &[UsesItem],
+    after: &[String],
+    indent: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
+    let style = ListStyle::Source { lead: false };
+    emit_list(&items, indent, ItemEnd::Semicolon, style, after, &mut lines);
+    lines
+}
+
 pub(crate) fn layout_uses_items(
     items: &[UsesItem],
     after: &[String],
@@ -724,13 +743,10 @@ pub(crate) fn layout_uses_items(
     indent: &str,
     external_units: &HashSet<String>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
     if has_include(items) {
-        let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
-        let style = ListStyle::Source { lead: false };
-        emit_list(&items, indent, ItemEnd::Semicolon, style, after, &mut lines);
-        return lines;
+        return layout_uses_items_in_source_order(items, after, indent);
     }
+    let mut lines = Vec::new();
     // Separate plain units from pinned items, recording the anchor (preceding unit name).
     // When grouping is enabled, ifdef blocks whose units all belong to one section
     // are placed in that section rather than pinned.

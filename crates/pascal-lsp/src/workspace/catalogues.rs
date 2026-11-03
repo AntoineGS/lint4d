@@ -29,7 +29,7 @@ impl CatalogueScope {
     /// Every non-excluded directory under `root`; `None` excludes nothing.
     pub(super) fn recursive(root: &Path, matcher: Option<&ExcludeMatcher>) -> Self {
         let root = absolute_path(root.to_path_buf());
-        let exclusions = matcher.map_or(Exclusions::Nothing, ExcludeMatcher::exclusions);
+        let exclusions = matcher.map_or(Exclusions::Nothing, |matcher| matcher.exclusions(&root));
         Self {
             key: CatalogueKey {
                 root,
@@ -582,5 +582,67 @@ mod tests {
         assert!(Arc::ptr_eq(&shared, &again));
         assert_eq!(view.project_cache().catalogue_generation(), generation);
         assert!(test_listings().is_empty(), "{:?}", test_listings());
+    }
+
+    /// l4d-vrw0: the store directory inside a root is not catalogued, and
+    /// the exclusion is part of the key only for roots containing it.
+    #[test]
+    fn a_root_containing_the_store_catalogues_none_of_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("Main.pas"));
+        let store = root.join(".cache/lint4d/analysis");
+        fs::create_dir_all(store.join("namespaces")).unwrap();
+        fs::write(store.join("analysis.sqlite3"), b"").unwrap();
+        fs::write(store.join("namespaces/0123.lock"), b"").unwrap();
+        let cache = crate::persistent_cache::CacheExclusion::new(&store);
+
+        let plain = workspace(&root);
+        let plain_scope = CatalogueScope::recursive(&root, Some(&plain.roots[0].excludes));
+        let mut view = workspace(&root).with_cache_exclusion(Some(cache.clone()));
+        let scope = CatalogueScope::recursive(&root, Some(&view.roots[0].excludes));
+        assert_ne!(scope.key(), plain_scope.key());
+        let catalogue = view
+            .shared_catalogue(&scope, MAX_CATALOGUE_ENTRIES, &mut no_io())
+            .unwrap();
+        assert_eq!(names(&catalogue, &root), [PathBuf::from("Main.pas")]);
+        let directories: Vec<_> = catalogue
+            .directories()
+            .iter()
+            .map(|(directory, _)| directory.clone())
+            .collect();
+        assert!(
+            directories
+                .iter()
+                .all(|directory| !cache.contains(directory)),
+            "{directories:?}"
+        );
+        assert!(
+            directories.contains(&root.join(".cache/lint4d")),
+            "{directories:?}"
+        );
+        assert!(!view.accepts_path(&store.join("Stray.pas")));
+        assert!(view.accepts_path(&root.join("Main.pas")));
+
+        // Request views and walks outside the roots leave it out too.
+        let request = Workspace::from_analysis_input(&view.analysis_input());
+        assert_eq!(
+            CatalogueScope::recursive(&root, Some(&request.roots[0].excludes)).key(),
+            scope.key()
+        );
+        let default = CatalogueScope::recursive(&root, Some(&view.default_excludes(&root)));
+        assert!(matches!(
+            default.key().exclusions,
+            Exclusions::WithCache { .. }
+        ));
+
+        // A root not containing it keeps the key it had.
+        let other = temp.path().join("other");
+        write(&other.join("Other.pas"));
+        let outside = workspace(&other).with_cache_exclusion(Some(cache));
+        assert_eq!(
+            CatalogueScope::recursive(&other, Some(&outside.roots[0].excludes)).key(),
+            CatalogueScope::recursive(&other, Some(&workspace(&other).roots[0].excludes)).key(),
+        );
     }
 }

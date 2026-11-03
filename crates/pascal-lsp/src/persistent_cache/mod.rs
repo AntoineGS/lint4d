@@ -17,12 +17,14 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod counters;
+pub(crate) mod exclusion;
 pub(crate) mod names;
 pub(crate) mod options;
 pub(crate) mod status;
 mod worker;
 
 pub(crate) use counters::Counters;
+pub(crate) use exclusion::CacheExclusion;
 pub(crate) use options::{
     CacheOptions, CacheOptionsOverride, CacheOptionsUpdate, parse_runtime_cache_options,
 };
@@ -106,6 +108,9 @@ pub(super) struct Shared {
     /// Resolved once at start (environment only, no IO); `None` when the
     /// platform has no default, so the open bypasses with that error.
     directory: Option<PathBuf>,
+    /// `directory` while the options are active and it holds no Pascal
+    /// sources: what the workspace leaves out (l4d-vrw0).
+    exclusion: Option<CacheExclusion>,
     store: Option<Arc<AdmittedStore>>,
     cancel: Arc<AtomicBool>,
     /// Admitted jobs, an in-flight open and a store being closed included.
@@ -136,19 +141,27 @@ impl Shared {
             .directory
             .clone()
             .or_else(|| pascal_cache::default_directory().ok());
+        let mut exclusion = None;
         let state = if let Some(message) = &options.invalid {
             CacheState::Bypassed(StatusCause::Configuration(message.clone()))
-        } else if options.enabled {
-            CacheState::Opening
-        } else {
+        } else if !options.enabled {
             CacheState::Disabled
+        } else {
+            match directory.as_deref().map(dedicated).transpose() {
+                Ok(dedicated) => {
+                    exclusion = dedicated;
+                    CacheState::Opening
+                }
+                Err(message) => CacheState::Bypassed(StatusCause::Configuration(message)),
+            }
         };
-        Self {
+        let mut shared = Self {
             state,
             after: CacheState::Disabled,
             generation: 0,
             options,
             directory,
+            exclusion,
             store: None,
             cancel: Arc::new(AtomicBool::new(false)),
             active: 0,
@@ -161,7 +174,11 @@ impl Shared {
             retry: None,
             logged: [None; names::BYPASS_KINDS],
             log: Vec::new(),
+        };
+        if shared.options.invalid.is_none() && matches!(shared.state, CacheState::Bypassed(_)) {
+            shared.log_transition();
         }
+        shared
     }
 
     /// The status name: `Fencing` is named by its target.
@@ -217,6 +234,13 @@ impl Shared {
         let line = format!("pascal-lsp: persistent cache {}{cause}", self.state_name());
         self.log.push(line);
     }
+}
+
+/// The exclusion of a store directory that holds no Pascal sources, or why
+/// it is refused (walks the directory: never under `Inner::shared`).
+fn dedicated(directory: &std::path::Path) -> Result<CacheExclusion, String> {
+    exclusion::check_dedicated(directory)?;
+    Ok(CacheExclusion::new(directory))
 }
 
 impl Inner {
@@ -439,12 +463,11 @@ impl PersistentCache {
 
     fn launch(inner: Inner) -> Self {
         let inner = Arc::new(inner);
-        {
-            let mut shared = inner.lock();
-            if shared.state == CacheState::Opening {
-                inner.request_open(&mut shared);
-            }
+        let mut shared = inner.lock();
+        if shared.state == CacheState::Opening {
+            inner.request_open(&mut shared);
         }
+        inner.unlock(shared);
         Self { inner: Some(inner) }
     }
 
@@ -497,6 +520,18 @@ impl PersistentCache {
         let Some(inner) = &self.inner else {
             return Ack::Done;
         };
+        // Leaving the rest for `Opening` checks the directory first, with no
+        // lock held.
+        let (directory, at_rest) = {
+            let shared = inner.lock();
+            (
+                shared.directory.clone(),
+                matches!(shared.state, CacheState::Disabled | CacheState::Bypassed(_)),
+            )
+        };
+        let checked = (at_rest && options.enabled)
+            .then(|| directory.as_deref().map(dedicated))
+            .flatten();
         let mut shared = inner.lock();
         if shared.options.invalid.is_some() {
             return Ack::Done;
@@ -511,6 +546,9 @@ impl PersistentCache {
         let (active, limits_changed) = (new.active(), new.limits() != old.limits());
         let mut store = None;
         let state = shared.state.clone();
+        if !active {
+            shared.exclusion = None;
+        }
         match (&state, active) {
             (CacheState::Enabled | CacheState::Opening, false) => {
                 store = inner.begin_fence(&mut shared, CacheState::Disabled);
@@ -522,9 +560,19 @@ impl PersistentCache {
                 inner.changed.notify_all();
             }
             (CacheState::Disabled, false) => {}
-            (CacheState::Disabled | CacheState::Bypassed(_), true) => {
-                inner.open_from_rest(&mut shared);
-            }
+            (CacheState::Disabled | CacheState::Bypassed(_), true) => match checked {
+                Some(Err(message)) => {
+                    shared.retry = None;
+                    shared.exclusion = None;
+                    shared.set_state(CacheState::Bypassed(StatusCause::Configuration(message)));
+                    inner.changed.notify_all();
+                }
+                Some(Ok(exclusion)) => {
+                    shared.exclusion = Some(exclusion);
+                    inner.open_from_rest(&mut shared);
+                }
+                None => inner.open_from_rest(&mut shared),
+            },
             (CacheState::Enabled | CacheState::Opening, true) if limits_changed => {
                 store = inner.begin_fence(&mut shared, CacheState::Opening);
             }
@@ -597,6 +645,12 @@ impl PersistentCache {
     /// A guard that shuts the handle down when dropped.
     pub(crate) fn close_on_drop(&self) -> CloseOnDrop {
         CloseOnDrop(self.clone())
+    }
+
+    /// The store directory the workspace leaves out: `Some` while the
+    /// options are active and the directory holds no Pascal sources.
+    pub(crate) fn exclusion(&self) -> Option<CacheExclusion> {
+        self.inner.as_ref()?.lock().exclusion.clone()
     }
 
     pub(crate) fn state(&self) -> CacheState {

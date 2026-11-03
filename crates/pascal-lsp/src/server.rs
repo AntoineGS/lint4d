@@ -3738,6 +3738,7 @@ impl ConfigurationCoordinator {
         let cache_after = self.cache_override.effective(&self.cache_base);
         if cache_after != cache_before {
             self.persistent.reconfigure(cache_after);
+            workspace.refresh_cache_exclusion();
         }
         let after = self.runtime_options.effective(&self.base_options);
         self.accepted_scope = Some(scope);
@@ -10761,6 +10762,46 @@ fn run_connection(
     )
 }
 
+/// `notification` without the events of the persistent-cache store's own
+/// files; `None` when nothing else is left. A rename is kept unless both of
+/// its endpoints are store files. Anything malformed is left for the
+/// worker's recovery.
+fn without_cache_file_events(
+    workspace: &Workspace,
+    mut notification: Notification,
+) -> Option<Notification> {
+    if workspace.cache_exclusion().is_none() {
+        return Some(notification);
+    }
+    let (list, endpoints): (&str, &[&str]) = match notification.method.as_str() {
+        "workspace/didChangeWatchedFiles" => ("changes", &["uri"]),
+        "workspace/didCreateFiles" | "workspace/didDeleteFiles" => ("files", &["uri"]),
+        "workspace/didRenameFiles" => ("files", &["oldUri", "newUri"]),
+        _ => return Some(notification),
+    };
+    let Some(entries) = notification
+        .params
+        .get_mut(list)
+        .and_then(Value::as_array_mut)
+    else {
+        return Some(notification);
+    };
+    if entries.is_empty() || entries.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+        return Some(notification);
+    }
+    let is_cache_entry = |entry: &Value| {
+        endpoints.iter().all(|endpoint| {
+            entry
+                .get(*endpoint)
+                .and_then(Value::as_str)
+                .and_then(|uri| Url::parse(uri).ok())
+                .is_some_and(|uri| workspace.is_cache_path(&uri))
+        })
+    };
+    entries.retain(|entry| !is_cache_entry(entry));
+    (!entries.is_empty()).then_some(notification)
+}
+
 fn is_workspace_file_event_notification(method: &str) -> bool {
     matches!(
         method,
@@ -11956,6 +11997,12 @@ fn event_loop(
                         .map_err(|error| error.to_string())
                 } else {
                     if is_workspace_file_event_notification(&notification_method) {
+                        // The store's own files are not workspace files
+                        // (l4d-vrw0): a batch of nothing else changes nothing.
+                        let Some(notification) = without_cache_file_events(workspace, notification)
+                        else {
+                            continue;
+                        };
                         file_notification_worker = Some(spawn_workspace_file_notification(
                             workspace,
                             notification,
@@ -12233,6 +12280,11 @@ fn drain_watch_events(
     rewarm.extend(watch_events.drain(
         workspace.project_cache(),
         crate::file_watch::MAX_WATCH_EVENTS_PER_TURN,
+        &|path| {
+            workspace
+                .cache_exclusion()
+                .is_some_and(|cache| cache.contains(path))
+        },
     ));
 }
 

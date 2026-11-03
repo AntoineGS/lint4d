@@ -342,8 +342,13 @@ impl Workspace {
             roots: self
                 .roots
                 .iter()
-                .map(|root| super::WorkspaceRoot::new(root.path.clone(), &options))
+                .map(|root| {
+                    let mut snapshot = super::WorkspaceRoot::new(root.path.clone(), &options);
+                    snapshot.set_cache_exclusion(self.cache_exclusion.as_ref());
+                    snapshot
+                })
                 .collect(),
+            cache_exclusion: self.cache_exclusion.clone(),
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
             build_selections: self.build_selections.clone(),

@@ -1395,6 +1395,27 @@ one, and `null` resets an option. `persistentCacheDirectory` is ignored with a
 warning, because runtime settings can come from workspace files and a project
 must not redirect where the server writes.
 
+#### A store directory inside a workspace
+
+The store directory may lie inside a workspace root, for example when `$HOME`
+is opened and the store is `~/.cache/lint4d/analysis`. While persistence is
+on, the server leaves that directory out of the workspace: walks, directory
+catalogues, workspace membership and file events (client and native watcher)
+ignore it, so the store's own writes never make a request fail or refresh
+diagnostics. Symlinked paths to it are recognized too.
+
+A directory that contains Pascal sources or project files (`.pas`, `.dpr`,
+`.dpk`, `.inc`, `.dproj`, ...), or more than 65,536 entries to check, is
+refused rather than hidden: the cache is `bypassed` with a `configuration`
+cause whose message names the directory, nothing is created there and its
+sources stay in the workspace. Set `persistentCacheDirectory` to a directory
+used only by the cache. The check runs at startup and whenever persistence is
+turned on again.
+
+The first run creates the store's missing parent directories. That one change
+to a workspace directory can still make a request running at that moment
+answer `-32803` once.
+
 #### Runtime changes
 
 - **Turning it off.** The server stops accepting new cache work, cancels what
@@ -1527,9 +1548,6 @@ A directory that fails the location checks is left untouched.
 
 #### What it does not solve
 
-- A cache directory inside a workspace root currently makes requests fail with
-  `-32803` and a `retry` message. Choose `persistentCacheDirectory` outside the
-  workspace, or set `persistentCacheEnabled` to `false`.
 - Processes do not share cold work: two servers indexing the same project both
   read and parse every source until facts are reused (`l4d-zf1b.8`).
 - It does not bound process memory. Only the pages, scratch and decoded facts

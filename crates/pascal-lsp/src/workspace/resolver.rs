@@ -96,6 +96,9 @@ pub(crate) struct LspSourceStore {
     project_cache: crate::project_cache::ProjectCache,
     disk: FilesystemSourceStore,
     capture: Option<Arc<super::capture::ReadCapture>>,
+    /// The persistent-cache store directory: never a listed child, so no
+    /// walk descends into it (l4d-vrw0).
+    cache_exclusion: Option<crate::persistent_cache::CacheExclusion>,
 }
 
 pub(crate) fn decode_source_bytes(bytes: &[u8]) -> String {
@@ -333,7 +336,18 @@ impl LspSourceStore {
             project_cache: input.project_cache.clone(),
             disk: FilesystemSourceStore::new(),
             capture: None,
+            cache_exclusion: input.cache_exclusion.clone(),
         }
+    }
+
+    /// `listing` without the store directory among its children.
+    fn without_cache_directory(&self, mut listing: DirectoryListing) -> DirectoryListing {
+        if let Some(cache) = &self.cache_exclusion {
+            listing
+                .directories
+                .retain(|directory| !cache.contains(directory));
+        }
+        listing
     }
 
     /// Record every disk listing and payload this store (and its clones)
@@ -518,12 +532,12 @@ impl SourceStore for LspSourceStore {
                         files.push(path.clone());
                     }
                 }
-                DirectoryListing {
+                self.without_cache_directory(DirectoryListing {
                     files,
                     directories: listing.directories.clone(),
                     stamp: listing.stamp.clone(),
                     complete: listing.complete,
-                }
+                })
             })
             .map_err(|_| SourceStoreError::AdmissionUnavailable)
     }
@@ -674,7 +688,11 @@ impl SourceStore for LspSourceStore {
         cancel: &dyn CancellationToken,
     ) -> Result<DirectoryListing, SourceStoreError> {
         let overlay_children = self.overlay_children(request.directory);
-        match self.disk.list_directory(request, cancel) {
+        match self
+            .disk
+            .list_directory(request, cancel)
+            .map(|listing| self.without_cache_directory(listing))
+        {
             Ok(mut listing) => {
                 if let Some(capture) = &self.capture {
                     let overlay = overlay_children
@@ -1600,5 +1618,59 @@ mod admitted_encoding_tests {
                 "poll {stop}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_exclusion_tests {
+    use super::*;
+    use pascal_core::NoCancellation;
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits};
+    use pascal_project::{ProjectOptions, delphi_overrides::OverrideSession};
+
+    /// l4d-vrw0: no resolver walk descends into the store directory.
+    #[test]
+    fn listings_never_offer_the_store_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let main = root.join("Main.pas");
+        std::fs::write(&main, b"unit Main; interface implementation end.").unwrap();
+        let store = root.join("cache/lint4d/analysis");
+        std::fs::create_dir_all(&store).unwrap();
+        let context = ProjectContext::discover(
+            &main,
+            std::slice::from_ref(&root),
+            &ProjectOptions::default(),
+        )
+        .unwrap()
+        .context;
+        let policy = context.read_policy().clone();
+        let lint4d = root.join("cache/lint4d");
+        let listed = |exclusion: Option<crate::persistent_cache::CacheExclusion>| {
+            let workspace = super::super::Workspace::with_override_session(
+                vec![root.clone()],
+                super::super::WorkspaceOptions::default(),
+                OverrideSession::new(None),
+            )
+            .with_cache_exclusion(exclusion);
+            let mut store =
+                LspSourceStore::from_input(context.clone(), &workspace.analysis_input());
+            let entry = context.path_entry_for(&lint4d).unwrap();
+            let request = DirectoryRequest {
+                directory: &lint4d,
+                entry: &entry,
+                read_policy: &policy,
+            };
+            let plain = store.list_directory(request, &NoCancellation).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let admitted = store
+                .list_directory_admitted(request, &mut budget, &NoCancellation)
+                .unwrap();
+            assert_eq!(plain.directories, admitted.directories);
+            plain.directories
+        };
+        assert_eq!(listed(None), std::slice::from_ref(&store));
+        let exclusion = crate::persistent_cache::CacheExclusion::new(&store);
+        assert!(listed(Some(exclusion)).is_empty());
     }
 }

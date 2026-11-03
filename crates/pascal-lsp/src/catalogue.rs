@@ -49,6 +49,12 @@ pub(crate) enum Exclusions {
         config_root: PathBuf,
         patterns: std::sync::Arc<[String]>,
     },
+    /// `exclusions` plus the persistent-cache store directory inside the
+    /// walked root, in each of its forms (l4d-vrw0).
+    WithCache {
+        exclusions: Box<Exclusions>,
+        cache: std::sync::Arc<[PathBuf]>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

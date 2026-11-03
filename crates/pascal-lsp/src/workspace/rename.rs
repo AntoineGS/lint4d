@@ -9,12 +9,11 @@
 use super::catalogues::CatalogueScope;
 use super::resolver as shared_resolver;
 use super::{
-    ContextKey, ContextState, DiskStamp, ExcludeMatcher, KnownDocumentOwner, OpenDocument,
-    PathStamp, Workspace, WorkspaceOptions, absolute_path, canonical_file_uri,
-    conditional_context_for_path, conditional_context_for_uri, disk_stamp,
-    is_analyzable_source_path, is_configuration_file, is_pascal_path, path_stamp,
-    path_stamp_result, path_starts_with_ci, path_starts_with_native, paths_equal_ci,
-    read_disk_source, read_disk_source_with_cancel,
+    ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
+    WorkspaceOptions, absolute_path, canonical_file_uri, conditional_context_for_path,
+    conditional_context_for_uri, disk_stamp, is_analyzable_source_path, is_configuration_file,
+    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
+    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
 use crate::catalogue::{Catalogue, Limit, MAX_CATALOGUE_ENTRIES, RootKind};
@@ -296,6 +295,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
     pub(crate) project_cache: crate::project_cache::ProjectCache,
     pub(crate) persistent_cache: crate::persistent_cache::PersistentCache,
+    pub(crate) cache_exclusion: Option<crate::persistent_cache::CacheExclusion>,
     pub(crate) shared_discoveries: super::SharedDiscoveries,
     pub(crate) cache_epoch: u64,
     pub(crate) rejected_documents: HashSet<Url>,
@@ -1619,6 +1619,7 @@ impl Workspace {
             cached_documents,
             project_cache: self.project_cache.clone(),
             persistent_cache: self.persistent_cache.clone(),
+            cache_exclusion: self.cache_exclusion.clone(),
             shared_discoveries: self.shared_discoveries.clone(),
             cache_epoch: self
                 .cache_epoch
@@ -2656,7 +2657,8 @@ pub(crate) fn input_source_is_editable(input: &WorkspaceInput, uri: &Url) -> boo
         input.roots.clone(),
         input.options.clone(),
         input.overrides.clone(),
-    );
+    )
+    .with_cache_exclusion(input.cache_exclusion.clone());
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
@@ -2674,7 +2676,8 @@ pub(crate) fn input_source_is_writable(input: &WorkspaceInput, uri: &Url) -> boo
         input.roots.clone(),
         input.options.clone(),
         input.overrides.clone(),
-    );
+    )
+    .with_cache_exclusion(input.cache_exclusion.clone());
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
@@ -2786,7 +2789,8 @@ pub(crate) fn input_source_is_readable_with_owner(
         input.roots.clone(),
         input.options.clone(),
         input.overrides.clone(),
-    );
+    )
+    .with_cache_exclusion(input.cache_exclusion.clone());
     let Ok(path) = uri.to_file_path() else {
         return false;
     };
@@ -5841,9 +5845,7 @@ fn enumerate_mapped_sources(
 
             let scope = match workspace.context_root_excludes(&context_key) {
                 Some(matcher) => CatalogueScope::recursive(&root, Some(matcher)),
-                None => {
-                    CatalogueScope::recursive(&root, Some(&ExcludeMatcher::new(&root, &root, &[])))
-                }
+                None => CatalogueScope::recursive(&root, Some(&workspace.default_excludes(&root))),
             };
             let catalogue = workspace.snapshot_catalogue(&scope, cancel)?;
             enumeration.visited_entries = enumeration
@@ -6183,7 +6185,8 @@ fn build_snapshot_with_policy(
         input.roots.clone(),
         loader_options,
         input.overrides.clone(),
-    );
+    )
+    .with_cache_exclusion(input.cache_exclusion.clone());
     loader.cached_documents = input.cached_documents.clone();
     // The loader publishes into the shared cache, so it must honour client
     // deletes exactly like the other analysis workers.
@@ -11497,7 +11500,8 @@ mod tests {
             input.roots.clone(),
             input.options.clone(),
             input.overrides.clone(),
-        );
+        )
+        .with_cache_exclusion(input.cache_exclusion.clone());
         assert!(
             rebuilt
                 .overrides

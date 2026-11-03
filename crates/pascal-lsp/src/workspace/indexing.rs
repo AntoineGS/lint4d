@@ -1095,13 +1095,17 @@ impl Workspace {
     /// while every stamp it was indexed under still proves it unchanged
     /// (A7); those stamps and the membership's directories become the
     /// baseline. `query: None` (workspace symbols) reads the unverified
-    /// members only. Client-deleted files are never sources.
+    /// members only. Client-deleted files are never sources. With
+    /// `requesting`, the members of every other target that lie outside the
+    /// workspace roots are a gap, not candidates: the walk reads only the
+    /// requesting context's mapped roots.
     pub(crate) fn indexed_sources(
         &mut self,
         input: &WorkspaceInput,
         targets: &Targets,
         query: Option<&CandidateQuery>,
         must_include: &[Url],
+        requesting: Option<&ContextKey>,
         cancel: &AtomicBool,
     ) -> Result<IndexedSources, String> {
         let mut result = IndexedSources {
@@ -1131,6 +1135,21 @@ impl Workspace {
                             .is_some_and(|stamp| disk_stamp(path) == *stamp)
                     })
             })
+        };
+        // Open buffers stay candidates (A4); deleted files are not counted.
+        let drop_outside = |workspace: &Self, key: &ContextKey, paths: &mut Vec<PathBuf>| {
+            if requesting.is_none_or(|requesting| requesting == key) {
+                return 0;
+            }
+            let mut outside = 0;
+            paths.retain(|path| {
+                let keep = workspace.accepts_path(path) || open.contains(&path_key(path));
+                if !keep && !deleted(path) {
+                    outside += 1;
+                }
+                keep
+            });
+            outside
         };
         let mut unowned = 0usize;
         for (key, anchor) in &targets.contexts {
@@ -1206,8 +1225,11 @@ impl Workspace {
                     None => self.index_membership(key, cancel)?,
                 };
                 memory = true;
+                let mut paths = membership.paths;
+                let outside = drop_outside(self, key, &mut paths);
+                outside_gap(&mut result.gaps, outside, &display);
                 let (skipped, searched) = take_unverified(
-                    membership.paths,
+                    paths,
                     key,
                     &open,
                     &deleted,
@@ -1263,6 +1285,10 @@ impl Workspace {
                 }
             }
             unverified.sort_by_cached_key(|path| path_key(path));
+            let mut selected = selected;
+            let outside =
+                drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
+            outside_gap(&mut result.gaps, outside, &display);
 
             for path in selected {
                 if !deleted(&path) && taken.insert(path_key(&path)) {
@@ -1487,6 +1513,14 @@ fn take_unverified(
         sources.push((path, key.clone()));
     }
     (skipped, searched)
+}
+
+fn outside_gap(gaps: &mut Vec<String>, outside: usize, display: &str) {
+    if outside > 0 {
+        gaps.push(format!(
+            "{outside} units of {display} outside the workspace roots were not searched"
+        ));
+    }
 }
 
 /// How coverage notes name a context: its project file, or the document
@@ -2798,7 +2832,14 @@ mod tests {
         must_include: &[Url],
     ) -> IndexedSources {
         workspace
-            .indexed_sources(input, targets, query, must_include, &AtomicBool::new(false))
+            .indexed_sources(
+                input,
+                targets,
+                query,
+                must_include,
+                None,
+                &AtomicBool::new(false),
+            )
             .expect("indexed sources")
     }
 

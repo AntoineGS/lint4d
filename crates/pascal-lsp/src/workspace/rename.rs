@@ -6273,10 +6273,7 @@ fn build_snapshot_with_policy(
         } else {
             priority_contexts.values().cloned().collect()
         };
-        // References over index candidates still read the requesting
-        // context's mapped roots as the walk does: index membership holds
-        // only their search-path directories, not what packages map in.
-        if !indexed || mode == SnapshotMode::Workspace {
+        if !indexed {
             let context_states = enumeration.contexts.clone();
             enumerate_mapped_sources(
                 &mut loader,
@@ -10913,7 +10910,7 @@ mod tests {
         };
         let input = workspace.analysis_input();
         let sources = workspace
-            .indexed_sources(&input, &targets, Some(&query), &[], &cancel)
+            .indexed_sources(&input, &targets, Some(&query), &[], None, &cancel)
             .expect("indexed sources");
         let user = Url::from_file_path(root.join("lib/User.pas")).unwrap();
         let names = vec!["sharedvalue".to_owned()];

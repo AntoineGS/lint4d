@@ -3,7 +3,7 @@ use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, IndexedSources, MAX_SNAPSHOT_MAPPING_WORK,
     RenameSnapshot, SnapshotMode, SnapshotScope, SnapshotSeed, SourceRecord, WorkspaceInput,
     auto_import_source_is_relevant, build_scoped_snapshot, build_snapshot,
-    input_source_is_readable_with_owner, is_cancelled, owner_for_input, path_key,
+    input_source_is_readable_with_owner, is_cancelled, owner_for_input,
     project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
@@ -981,7 +981,10 @@ pub(crate) fn references_from_input(
         .as_ref()
         .is_some_and(|(info, _)| info.local);
     // Local bindings and include documents keep the walk (A17).
-    let snapshot = if local || !is_unit_or_program_source(&uri) {
+    let pascal_source = uri
+        .to_file_path()
+        .is_ok_and(|path| super::is_pascal_path(&path));
+    let snapshot = if local || !pascal_source {
         binding_snapshot(&input, &uri, position, false, classification, cancel)
     } else {
         indexed_reference_snapshot(&input, &uri, position, &owner, classification, cancel)
@@ -1128,16 +1131,6 @@ pub(crate) fn highlights_from_input(
     )
 }
 
-fn is_unit_or_program_source(uri: &Url) -> bool {
-    uri.to_file_path().ok().is_some_and(|path| {
-        path.extension().is_some_and(|extension| {
-            ["pas", "dpr", "dpk"]
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        })
-    })
-}
-
 /// References over index candidates (l4d-33 §6.1). Phase 1 resolves the
 /// binding in the bounded snapshot hover uses and decides the candidate
 /// rule (A3); phase 2 binds only the candidates the target indexes chose.
@@ -1262,19 +1255,16 @@ fn indexed_reference_scope(
     must_include.extend(input.overlays.keys().cloned());
     must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     must_include.dedup();
-    let mut sources =
-        workspace.indexed_sources(input, &targets, Some(&query), &must_include, cancel)?;
-    // As in the walk, only the requesting context's mapped roots are read:
-    // another context's members outside the workspace roots are not searched.
-    let required = must_include
-        .iter()
-        .filter_map(|uri| uri.to_file_path().ok())
-        .map(|path| path_key(&super::absolute_path(path)))
-        .collect::<HashSet<_>>();
-    sources.sources.retain(|(path, key)| {
-        *key == owner.key || workspace.accepts_path(path) || required.contains(&path_key(path))
-    });
-    Ok(Some(sources))
+    workspace
+        .indexed_sources(
+            input,
+            &targets,
+            Some(&query),
+            &must_include,
+            Some(&owner.key),
+            cancel,
+        )
+        .map(Some)
 }
 
 fn binding_snapshot(
@@ -3717,6 +3707,165 @@ mod tests {
         assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
     }
 
+    /// The indexed scope does not walk mapped roots (l4d-33 §6.1): a mapped
+    /// search-path member the index excludes is not bound.
+    #[cfg(unix)]
+    #[test]
+    fn indexed_references_bind_only_index_candidates_under_a_mapped_search_path() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().join("project"));
+        let sdk = crate::workspace::absolute_path(temp.path().join("sdk"));
+        fs::create_dir_all(&root).expect("project directory");
+        fs::create_dir_all(&sdk).expect("SDK directory");
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("main");
+        let provider = sdk.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        let consumer = sdk.join("Consumer.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        // A posting for the name, but no import of Provider: excluded.
+        let other = sdk.join("Other.pas");
+        fs::write(
+            &other,
+            "unit Other;\ninterface\nconst SharedValue = 2;\nimplementation\nend.\n",
+        )
+        .expect("other");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project metadata");
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("path mapping");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        build_index_at(&input, &IndexAnchor::Project(root.join("App.dproj")));
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&main),
+            Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&root.join("Main.pas")), 6, 6),
+                (source_uri(&consumer), 6, 6),
+                (source_uri(&provider), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        let bound = bound_documents();
+        assert!(bound.contains(&source_uri(&consumer)), "{bound:?}");
+        assert!(!bound.contains(&source_uri(&other)), "{bound:?}");
+    }
+
+    /// Members of another target context outside the workspace roots are a
+    /// gap, not candidates (they would not be read by the walk either).
+    #[cfg(unix)]
+    #[test]
+    fn other_contexts_members_outside_the_roots_are_a_gap() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().join("workspace"));
+        let sdk = crate::workspace::absolute_path(temp.path().join("sdk"));
+        let project_a = root.join("A");
+        let project_b = root.join("B");
+        for directory in [&project_a, &project_b, &sdk] {
+            fs::create_dir_all(directory).expect("directory");
+        }
+        let provider = project_a.join("Provider.pas");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("provider");
+        fs::write(
+            project_a.join("Main.pas"),
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("main A");
+        fs::write(
+            project_a.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project A");
+        let consumer = sdk.join("Consumer.pas");
+        fs::write(
+            &consumer,
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("consumer");
+        fs::write(
+            project_b.join("Main.pas"),
+            "unit Main; interface implementation end.\n",
+        )
+        .expect("main B");
+        fs::write(
+            project_b.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"..\\A\\Provider.pas\" /></ItemGroup></Project>",
+        )
+        .expect("project B");
+        fs::write(
+            project_b.join(".delphi-tools.local.toml"),
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            ),
+        )
+        .expect("path mapping");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input,
+            &source_uri(&provider),
+            shared_value_position(),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("references");
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&project_a.join("Main.pas")), 6, 6),
+                (source_uri(&provider), 2, 6),
+            ],
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial.coverage.gaps.iter().any(|gap| gap.reason
+                == "1 units of App.dproj outside the workspace roots were not searched"),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(!bound_documents().contains(&source_uri(&consumer)));
+    }
+
     #[test]
     fn member_references_reach_units_that_never_import_the_declaring_unit() {
         let temp = tempfile::tempdir().expect("temporary workspace");
@@ -3751,6 +3900,7 @@ mod tests {
         .expect("references before indexing")
         .value;
         build_index_for(&input, &source_uri(&base));
+        crate::navigation::test_reset_bound_documents();
         let computed = references_from_input(
             input,
             &source_uri(&base),
@@ -3759,6 +3909,13 @@ mod tests {
             &AtomicBool::new(false),
         );
         let locations = computed.value.expect("references").value;
+        // The member rule took effect: User.pas never imports Base but has
+        // a posting for `Field`, so it is bound.
+        assert!(
+            bound_documents().contains(&source_uri(&temp.path().join("User.pas"))),
+            "{:?}",
+            bound_documents()
+        );
         // Characterization: neither `Shared.Field` nor `MakeBase.Field` in
         // `User.pas` (which never imports `Base`) is found today, nor are
         // inherited or `with` receivers; only the declaration is reported.

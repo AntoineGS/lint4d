@@ -9,8 +9,8 @@ use crate::{
 use pascal_core::ImportSection;
 use pascal_core::facts::{
     Activity, ArtifactFacts, Certainty, CoverageReason, DeclarationFact, DeclarationKind,
-    FactLocation, ImportFact, IncludeExpansion, Origin, PostingActivity, Region, SegmentFact,
-    SegmentTarget, TextRange, Visibility,
+    DeclarationShape, FactLocation, ImportFact, IncludeExpansion, Origin, PostingActivity, Region,
+    SegmentFact, SegmentTarget, TextRange, Visibility,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,32 @@ pub(super) fn kind_tag(kind: DeclarationKind) -> u8 {
         DeclarationKind::Field => 6,
         DeclarationKind::Property => 7,
         DeclarationKind::EnumValue => 8,
+    }
+}
+
+pub(super) fn shape_tag(shape: DeclarationShape) -> u8 {
+    match shape {
+        DeclarationShape::Unit => 1,
+        DeclarationShape::Class => 2,
+        DeclarationShape::Record => 3,
+        DeclarationShape::Interface => 4,
+        DeclarationShape::Enum => 5,
+        DeclarationShape::Array => 6,
+        DeclarationShape::Pointer => 7,
+        DeclarationShape::Callable => 8,
+        DeclarationShape::String => 9,
+        DeclarationShape::File => 10,
+        DeclarationShape::OtherType => 11,
+        DeclarationShape::Constructor => 12,
+        DeclarationShape::Function => 13,
+        DeclarationShape::Operator => 14,
+        DeclarationShape::Method => 15,
+        DeclarationShape::Procedure => 16,
+        DeclarationShape::Variable => 17,
+        DeclarationShape::Constant => 18,
+        DeclarationShape::Field => 19,
+        DeclarationShape::Property => 20,
+        DeclarationShape::EnumValue => 21,
     }
 }
 
@@ -142,6 +168,12 @@ fn declaration_bytes(declaration: &DeclarationFact) -> usize {
         + if declaration.parent.is_some() { 5 } else { 1 }
         + location_bytes(&declaration.location)
         + 2
+        + location_bytes(&declaration.extent)
+        + 2
+        + declaration
+            .owner
+            .as_ref()
+            .map_or(1, |owner| 1 + LENGTH_BYTES + owner.len())
 }
 
 fn import_bytes(import: &ImportFact) -> usize {
@@ -301,6 +333,12 @@ pub fn encode_facts(facts: &ArtifactFacts) -> Result<EncodedFacts, TooLarge> {
                 });
                 location(encoder, &declaration.location);
                 certainty(encoder, declaration.certainty);
+                location(encoder, &declaration.extent);
+                encoder.u8(shape_tag(declaration.shape));
+                encoder.bool(declaration.unit_scope);
+                encoder.option(declaration.owner.as_ref(), |encoder, owner| {
+                    encoder.str(owner)
+                });
             },
         ));
     }

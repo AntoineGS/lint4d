@@ -19,6 +19,7 @@ pub mod text;
 pub(crate) mod trace;
 pub(crate) mod warmer;
 pub mod workspace;
+pub(crate) mod workspace_index;
 
 pub use navigation::{NavigationIndex, NavigationTarget};
 /// Compatibility module for the former `pascal_lsp::project` API.

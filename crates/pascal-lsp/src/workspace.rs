@@ -127,6 +127,7 @@ mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
 #[cfg(test)]
@@ -2225,6 +2226,24 @@ fn selected_installation_id(context: &ProjectContext) -> Option<String> {
 }
 
 impl ContextKey {
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self {
+            project_file: None,
+            installation_id: None,
+            workspace_root: Some(PathBuf::from(name)),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -3074,6 +3093,14 @@ pub struct Workspace {
     /// Navigation answers best effort (D16): a dependency whose imports fail
     /// to load is skipped. The implementation code lens stays strict.
     best_effort_navigation: bool,
+    /// `true` in an index build view: loads then drop their cache claim
+    /// instead of publishing the parse (l4d-33 A13).
+    pub(crate) index_build: bool,
+    /// The context an index build is working in: no prune drops it.
+    pinned_context: Option<ContextKey>,
+    /// Why the last load that returned `Ok(false)` skipped its file: a read
+    /// error, a cache limit or a failed expansion.
+    load_refusal: Option<String>,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -8110,10 +8137,12 @@ impl Workspace {
                 provenance: ProjectPathProvenance::LegacyNative,
             },
             None => {
-                self.warn(format!(
+                let message = format!(
                     "source path is outside the effective project read roots: {}",
                     path.display()
-                ));
+                );
+                self.warn(message.clone());
+                self.load_refusal = Some(message);
                 return Ok(false);
             }
         };
@@ -8138,10 +8167,12 @@ impl Workspace {
             )
         };
         if !readable {
-            self.warn(format!(
+            let message = format!(
                 "source path is outside the effective project read roots: {}",
                 path.display()
-            ));
+            );
+            self.warn(message.clone());
+            self.load_refusal = Some(message);
             return Ok(false);
         }
 
@@ -8251,6 +8282,7 @@ impl Workspace {
             }
             Err(error) => {
                 self.warn(format!("skipping {}: {error}", path.display()));
+                self.load_refusal = Some(error);
                 self.remove_indexed_with_control(uri, cancel, budget, true)?;
                 return Ok(false);
             }
@@ -8347,6 +8379,11 @@ impl Workspace {
                     uri
                 ));
             }
+            self.load_refusal = Some(format!(
+                "source cache limit: {} files, {} bytes retained",
+                self.indexed_files.len(),
+                self.indexed_bytes
+            ));
             return Ok(false);
         }
         let context = self
@@ -8378,6 +8415,7 @@ impl Workspace {
             }
             None => (None, None),
         };
+        let claim = claim.filter(|_| !self.index_build);
         let expansion = if let Some(expansion) =
             cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
         {
@@ -8400,6 +8438,7 @@ impl Workspace {
                         self.warn(format!(
                             "include expansion failed for {uri}; navigation is incomplete: {error}"
                         ));
+                        self.load_refusal = Some(format!("include expansion failed: {error}"));
                         return Ok(false);
                     }
                 };
@@ -8459,6 +8498,7 @@ impl Workspace {
             }
             self.remove_indexed_with_control(uri, cancel, budget, true)?;
             self.warn(format!("cannot index {uri}: {error}"));
+            self.load_refusal = Some(format!("the parse failed: {error}"));
             return Ok(false);
         }
         // The index now holds this source's new parse; an older lease is stale.
@@ -13263,6 +13303,7 @@ impl Workspace {
             .document_contexts
             .values()
             .chain(self.open_document_contexts.values())
+            .chain(self.pinned_context.iter())
         {
             if unused.is_empty() {
                 break;
@@ -13464,6 +13505,10 @@ impl Workspace {
 
     pub(crate) fn set_persistent_cache(&mut self, cache: crate::persistent_cache::PersistentCache) {
         self.persistent_cache = cache;
+    }
+
+    pub(crate) fn configured_project_file(&self) -> Option<&Path> {
+        self.options.project_file.as_deref()
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {

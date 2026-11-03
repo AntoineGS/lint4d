@@ -69,6 +69,10 @@ fn sample() -> ArtifactFacts {
             parent: (index > 0).then_some(0),
             location: at(0, index as u32 * 2, index as u32 * 2 + 2),
             certainty: certain(activities[index % 3], index == 4),
+            extent: at(0, index as u32 * 2, index as u32 * 2 + 6),
+            shape: DeclarationShape::Constant,
+            unit_scope: index % 2 == 0,
+            owner: (index > 0).then(|| format!("TOwner{index}")),
         })
         .collect();
     declarations[7].location = FactLocation::Expanded {
@@ -213,6 +217,86 @@ fn facts_round_trip_through_rows() {
     );
     assert_eq!(encoded.rows[13].index_key, None);
     assert_eq!(decode(&stored(&encoded), &encoded.supplemental), Ok(facts));
+}
+
+#[test]
+fn declaration_rows_round_trip_extent_shape_scope_and_owner() {
+    let shapes = [
+        DeclarationShape::Unit,
+        DeclarationShape::Class,
+        DeclarationShape::Record,
+        DeclarationShape::Interface,
+        DeclarationShape::Enum,
+        DeclarationShape::Array,
+        DeclarationShape::Pointer,
+        DeclarationShape::Callable,
+        DeclarationShape::String,
+        DeclarationShape::File,
+        DeclarationShape::OtherType,
+        DeclarationShape::Constructor,
+        DeclarationShape::Function,
+        DeclarationShape::Operator,
+        DeclarationShape::Method,
+        DeclarationShape::Procedure,
+        DeclarationShape::Variable,
+        DeclarationShape::Constant,
+        DeclarationShape::Field,
+        DeclarationShape::Property,
+        DeclarationShape::EnumValue,
+    ];
+    let mut facts = sample();
+    facts.declarations = shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            let at_index = index as u32;
+            DeclarationFact {
+                id: at_index,
+                name: format!("d{index}"),
+                display: format!("D{index}"),
+                kind: DeclarationKind::Type,
+                visibility: Visibility::Public,
+                region: Region::Interface,
+                origin: Origin::Declaration,
+                exported: true,
+                parent: None,
+                location: at(0, at_index, at_index + 1),
+                certainty: certain(Activity::Active, false),
+                extent: if index % 2 == 0 {
+                    at(0, at_index, at_index + 5)
+                } else {
+                    FactLocation::Expanded {
+                        range: TextRange {
+                            start: at_index,
+                            end: at_index + 5,
+                        },
+                    }
+                },
+                shape: *shape,
+                unit_scope: index % 3 == 0,
+                owner: (index % 2 == 1).then(|| format!("TOwner{index}")),
+            }
+        })
+        .collect();
+    let encoded = encode_facts(&facts).unwrap();
+    assert_eq!(encoded_content_bytes(&facts), Ok(encoded.content_bytes()));
+    assert_eq!(decode(&stored(&encoded), &encoded.supplemental), Ok(facts));
+}
+
+#[test]
+fn an_unknown_shape_tag_is_malformed() {
+    let facts = sample();
+    let mut rows = stored(&encode_facts(&facts).unwrap());
+    // The first declaration has no owner, so its payload ends with the shape
+    // tag, the unit-scope flag and the empty owner option.
+    let payload = &mut rows[0].payload;
+    let shape_at = payload.len() - 1 - 1 - 1;
+    assert!((1..=21).contains(&payload[shape_at]), "{payload:?}");
+    payload[shape_at] = 99;
+    assert!(matches!(
+        decode(&rows, &encode_facts(&facts).unwrap().supplemental),
+        Err(FactDecodeError::Malformed(_))
+    ));
 }
 
 #[test]

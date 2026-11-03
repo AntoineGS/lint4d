@@ -95,6 +95,9 @@ mod selection;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
+#[cfg(test)]
+pub(crate) use symbols::test_set_symbol_result_cap;
+pub(crate) use symbols::{lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap};
 mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
@@ -159,6 +162,8 @@ pub(crate) use rename::RenameBindingInfo;
 pub(crate) use rename::test_cancel_after_checks;
 #[cfg(test)]
 pub(crate) use rename::test_exhaust_completion_member_lookup;
+#[allow(unused_imports)] // read by the query tasks of l4d-33
+pub(crate) use rename::{ReferenceTargetMember, ReferenceTargets};
 #[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
 pub(crate) use selection::validate_selection_position_count;
@@ -435,6 +440,28 @@ pub(super) fn test_reset_document_parse_count() {
 #[cfg(test)]
 pub(super) fn test_document_parse_count() -> usize {
     TEST_DOCUMENT_PARSE_CALLS.with(Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BOUND_DOCUMENTS: std::cell::RefCell<Vec<Url>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_record_bound_document(uri: &Url) {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().push(uri.clone()));
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_bound_documents() {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().clear());
+}
+
+/// Documents whose identifiers `collect_occurrences_bounded` walked, in order.
+#[cfg(test)]
+pub(crate) fn test_bound_documents() -> Vec<Url> {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow().clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20295,7 +20322,7 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     (0..node.named_child_count()).find_map(|index| node.named_child(index))
 }
 
-fn canonical_name(name: &str) -> String {
+pub(crate) fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
 }
 

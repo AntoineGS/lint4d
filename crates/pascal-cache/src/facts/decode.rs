@@ -1,6 +1,6 @@
 use super::encode::{
     activity_tag, coverage_tag, expansion_tag, kind_tag, origin_tag, posting_activity_tag,
-    region_tag, section_tag, visibility_tag,
+    region_tag, section_tag, shape_tag, visibility_tag,
 };
 use super::{
     DECLARATION_ROW, IMPORT_ROW, INCLUDE_ROW, LENGTH_BYTES, OCCURRENCE_BYTES, POSTING_ROW,
@@ -10,9 +10,9 @@ use crate::StoredRow;
 use pascal_core::ImportSection;
 use pascal_core::facts::{
     Activity, ArtifactFacts, Certainty, CoverageReason, DeclarationFact, DeclarationKind,
-    FactBudget, FactLocation, ImportFact, IncludeExpansion, IncludeFact, Origin, PostingActivity,
-    PostingFact, PostingOccurrence, Region, SegmentFact, SegmentTarget, TextRange, Visibility,
-    is_identifier_byte,
+    DeclarationShape, FactBudget, FactLocation, ImportFact, IncludeExpansion, IncludeFact, Origin,
+    PostingActivity, PostingFact, PostingOccurrence, Region, SegmentFact, SegmentTarget, TextRange,
+    Visibility, is_identifier_byte,
 };
 use std::mem::size_of;
 
@@ -128,6 +128,29 @@ const KINDS: [DeclarationKind; 8] = [
     DeclarationKind::Field,
     DeclarationKind::Property,
     DeclarationKind::EnumValue,
+];
+const SHAPES: [DeclarationShape; 21] = [
+    DeclarationShape::Unit,
+    DeclarationShape::Class,
+    DeclarationShape::Record,
+    DeclarationShape::Interface,
+    DeclarationShape::Enum,
+    DeclarationShape::Array,
+    DeclarationShape::Pointer,
+    DeclarationShape::Callable,
+    DeclarationShape::String,
+    DeclarationShape::File,
+    DeclarationShape::OtherType,
+    DeclarationShape::Constructor,
+    DeclarationShape::Function,
+    DeclarationShape::Operator,
+    DeclarationShape::Method,
+    DeclarationShape::Procedure,
+    DeclarationShape::Variable,
+    DeclarationShape::Constant,
+    DeclarationShape::Field,
+    DeclarationShape::Property,
+    DeclarationShape::EnumValue,
 ];
 const VISIBILITIES: [Visibility; 6] = [
     Visibility::Public,
@@ -264,7 +287,17 @@ impl<'b> FactDecoder<'b> {
         };
         let location = reader.location()?;
         let certainty = reader.certainty()?;
-        self.charge(size_of::<DeclarationFact>() + name.len() + display.len())?;
+        let extent = reader.location()?;
+        let shape = tagged(reader.u8()?, &SHAPES, shape_tag)?;
+        let unit_scope = reader.bool()?;
+        let owner = match reader.u8()? {
+            0 => None,
+            1 => Some(reader.str()?),
+            _ => return malformed("invalid option"),
+        };
+        self.charge(
+            size_of::<DeclarationFact>() + name.len() + display.len() + owner.map_or(0, str::len),
+        )?;
         self.facts.declarations.push(DeclarationFact {
             id: self.facts.declarations.len() as u32,
             name: name.to_owned(),
@@ -277,6 +310,10 @@ impl<'b> FactDecoder<'b> {
             parent,
             location,
             certainty,
+            extent,
+            shape,
+            unit_scope,
+            owner: owner.map(str::to_owned),
         });
         Ok(())
     }

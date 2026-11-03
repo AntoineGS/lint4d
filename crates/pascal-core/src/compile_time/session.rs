@@ -18,6 +18,128 @@ pub type AdmittedProviderSource = Arc<AdmittedShared<ProviderSource>>;
 pub type AdmittedSourceBacking = Arc<AdmittedShared<LoadedSource>>;
 pub type AdmittedInterfaceGraph = Arc<AdmittedShared<CompileTimeState>>;
 
+/// What a compiled provider interface depends on besides the resolver
+/// configuration, which the store that holds it fixes (l4d-4nbs D29): the
+/// source, the state of its file, the conditional context it was compiled
+/// under and the qualifiers that authorize it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderGraphKey {
+    pub source: crate::SourceId,
+    pub content_hash: u64,
+    /// The disk stamp (equality ignores whether it was settled), or none for
+    /// an overlay.
+    pub disk_stamp: Option<pascal_project::ProjectReadStamp>,
+    pub overlay_version: Option<i32>,
+    pub context: ConditionalContext,
+    /// Lowercased: unit qualifiers are Pascal identifiers.
+    pub qualifiers: Vec<String>,
+}
+
+/// One source a compiled provider interface depends on: the provider
+/// itself or one it compiled or reused, at the state it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDependency {
+    pub source: crate::SourceId,
+    pub path: std::path::PathBuf,
+    pub content_hash: u64,
+    pub disk_stamp: Option<pascal_project::ProjectReadStamp>,
+    pub overlay_version: Option<i32>,
+}
+
+impl ProviderDependency {
+    fn of(source: &LoadedSource) -> Self {
+        let (content_hash, disk_stamp, overlay_version) = match &source.revision {
+            crate::SourceRevision::Disk {
+                stamp,
+                content_hash,
+                ..
+            } => (*content_hash, Some(stamp.clone()), None),
+            crate::SourceRevision::Overlay {
+                version,
+                content_hash,
+            } => (*content_hash, None, Some(*version)),
+        };
+        Self {
+            source: source.id.clone(),
+            path: source.path.clone(),
+            content_hash,
+            disk_stamp,
+            overlay_version,
+        }
+    }
+}
+
+/// A provider interface compiled by one session, with the observations and
+/// warnings its compilation recorded (including those of the providers it
+/// compiled), so a session that reuses it reports the same dependencies.
+#[derive(Debug)]
+pub struct SharedProviderGraph {
+    pub occurrence: OccurrenceId,
+    /// `None`: the interface could not be completed.
+    pub graph: Option<AdmittedInterfaceGraph>,
+    pub observations: Vec<ResolutionObservation>,
+    pub warnings: Vec<String>,
+    /// Every provider source the graph was compiled from, nested ones
+    /// included: a store must validate them before reuse.
+    pub dependencies: Arc<Vec<ProviderDependency>>,
+    /// Bytes the graph retains, for the store's accounting.
+    pub retained_bytes: usize,
+}
+
+/// Compiled provider interfaces shared across sessions and requests
+/// (l4d-4nbs D29). A store is bound to one resolver configuration (search
+/// paths, namespaces, read policy) and validates an entry's observations
+/// before returning it; it is never required for correctness.
+pub trait SharedProviderGraphs: Send + Sync {
+    fn get(&self, key: &ProviderGraphKey) -> Option<Arc<SharedProviderGraph>>;
+    fn put(&self, key: ProviderGraphKey, graph: Arc<SharedProviderGraph>);
+}
+
+fn provider_graph_key(provider: &ProviderSource) -> ProviderGraphKey {
+    let (content_hash, disk_stamp, overlay_version) = match &provider.unit.source.revision {
+        crate::SourceRevision::Disk {
+            stamp,
+            content_hash,
+            ..
+        } => (*content_hash, Some(stamp.clone()), None),
+        crate::SourceRevision::Overlay {
+            version,
+            content_hash,
+        } => (*content_hash, None, Some(*version)),
+    };
+    ProviderGraphKey {
+        source: provider.unit.source.id.clone(),
+        content_hash,
+        disk_stamp,
+        overlay_version,
+        context: provider.context.clone(),
+        qualifiers: provider
+            .authorized_qualifiers
+            .iter()
+            .map(|q| q.to_ascii_lowercase())
+            .collect(),
+    }
+}
+
+fn observations_payload(observations: &[ResolutionObservation]) -> usize {
+    observations
+        .iter()
+        .map(|o| {
+            size_of::<ResolutionObservation>()
+                + match o {
+                    ResolutionObservation::Directory { path, entry, .. } => {
+                        path.as_os_str().len() + entry.path.as_os_str().len()
+                    }
+                    ResolutionObservation::Candidate { path, .. } => 2 * path.as_os_str().len(),
+                    ResolutionObservation::Payload {
+                        source_id, path, ..
+                    } => source_id.as_str().len() + path.as_os_str().len(),
+                    _ => 256,
+                }
+        })
+        .sum()
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderSource {
     pub unit: ResolvedUnit,
@@ -189,6 +311,11 @@ pub trait CompileTimeResolver {
     fn note_scanned(&mut self, _source: &LoadedSource, _end: usize) {}
     /// Whether raw UTF-8 validation of `source` is funded. A request funds
     /// it once per distinct source; repeated validation is paid.
+    /// Compiled provider interfaces shared beyond this session (l4d-4nbs
+    /// D29). The default shares nothing.
+    fn shared_provider_graphs(&self) -> Option<Arc<dyn SharedProviderGraphs>> {
+        None
+    }
     fn fund_validation(&mut self, _source: &LoadedSource) -> bool {
         true
     }
@@ -412,6 +539,7 @@ pub(crate) fn analyze_source_in_session(
         .map_err(|r| resolver_error(r, budget))?;
     let analysis = budget.admit_compilation(metadata.saturating_mul(2), |budget| {
         let mut providers = ProviderSession::new(budget)?;
+        providers.isolate_occurrences(resolver);
         analyze_source_with_providers_inner(
             root,
             context,
@@ -472,6 +600,8 @@ struct ProviderGraph {
     /// `None`: the interface could not be completed (an Unknown fact), which
     /// a repeated analysis of the same identity would find again.
     graph: Option<AdmittedInterfaceGraph>,
+    /// The provider sources the graph depends on, itself included.
+    dependencies: Arc<Vec<ProviderDependency>>,
 }
 
 /// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
@@ -521,6 +651,9 @@ struct ProviderSession {
     /// repeated analysis would be real work with no grant, since the session
     /// credits each source byte once.
     graphs: AdmittedOwned<Vec<AdmittedOwned<ProviderGraph>>>,
+    /// The dependencies each provider compilation in progress has used so
+    /// far (innermost last).
+    collecting: Vec<Vec<ProviderDependency>>,
     queries: usize,
     next_occurrence: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
@@ -601,6 +734,7 @@ pub(crate) fn header_with_coordinates_in_session(
 ) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
     let mut output = budget.admit_compilation(0, |budget| {
         let mut providers = ProviderSession::new(budget)?;
+        providers.isolate_occurrences(resolver);
         analyze_source_with_providers_inner(
             root,
             context,
@@ -643,10 +777,22 @@ impl ProviderSession {
             active,
             identities,
             graphs,
+            collecting: Vec::new(),
             declarations,
             queries: 0,
             next_occurrence: 1,
         })
+    }
+
+    /// A session that shares compiled provider interfaces numbers its
+    /// occurrences in a range of its own, so a graph another session compiled
+    /// never shares an id with one of this session (l4d-4nbs D29).
+    fn isolate_occurrences(&mut self, resolver: &dyn CompileTimeResolver) {
+        static NEXT_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if resolver.shared_provider_graphs().is_some() {
+            let range = NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.next_occurrence = range.saturating_mul(1 << 32).max(1);
+        }
     }
 
     fn credit(&self, source: &LoadedSource) -> Option<&ScanCredit> {
@@ -2173,6 +2319,8 @@ impl ProviderEngine<'_, '_> {
                 .position(|entry| entry.occurrence == occurrence)
             {
                 drop(provider);
+                let dependencies = self.providers.graphs[index].dependencies.clone();
+                self.note_dependencies(&dependencies)?;
                 let Some(graph) = self.providers.graphs[index].graph.clone() else {
                     return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
                 };
@@ -2182,6 +2330,27 @@ impl ProviderEngine<'_, '_> {
                 return Ok(Fact::Known(prepared));
             }
         }
+        let shared = if new_identity {
+            self.resolver.shared_provider_graphs()
+        } else {
+            None
+        };
+        let shared_key = if shared.is_some() {
+            admit_provider_context(&provider.context, self.budget, false)?;
+            self.budget
+                .charge(1, metadata, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            Some(provider_graph_key(&provider))
+        } else {
+            None
+        };
+        if let (Some(store), Some(key)) = (&shared, &shared_key)
+            && let Some(hit) = store.get(key)
+        {
+            return self.reuse_shared_graph(provider, metadata, &hit, name, pointers, depth);
+        }
+        let observations_before = self.observations.len();
+        let warnings_before = self.warnings.len();
         let occurrence = if let Some(key) = previous {
             key.occurrence
         } else {
@@ -2204,6 +2373,7 @@ impl ProviderEngine<'_, '_> {
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.active, key, self.budget)?;
+        self.providers.collecting.push(Vec::new());
         let result = analyze_source_with_providers(
             &provider.unit.source,
             &provider.context,
@@ -2249,6 +2419,14 @@ impl ProviderEngine<'_, '_> {
             .value_mut()
             .pop()
             .expect("active provider identity");
+        let mut dependencies = self.providers.collecting.pop().unwrap_or_default();
+        dependencies.push(ProviderDependency::of(&provider.unit.source));
+        dependencies.sort_by(|a, b| {
+            (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
+        });
+        dependencies.dedup();
+        let dependencies = Arc::new(dependencies);
+        self.note_dependencies(&dependencies)?;
         let mut analysis = result?;
         if new_identity {
             // Transfer the already admitted identity owner, not an interval of
@@ -2270,11 +2448,25 @@ impl ProviderEngine<'_, '_> {
         move_report_vector(self.warnings, warnings, self.budget)?;
         if !analysis.facts().interface_complete {
             drop(analysis);
+            if let (Some(store), Some(key)) = (&shared, shared_key) {
+                store.put(
+                    key,
+                    Arc::new(SharedProviderGraph {
+                        occurrence,
+                        graph: None,
+                        observations: self.observations[observations_before..].to_vec(),
+                        warnings: self.warnings[warnings_before..].to_vec(),
+                        dependencies: dependencies.clone(),
+                        retained_bytes: 0,
+                    }),
+                );
+            }
             let entry = self
                 .budget
                 .admit_owned(1, 0, 0, || ProviderGraph {
                     occurrence,
                     graph: None,
+                    dependencies,
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             push_owner(&mut self.providers.graphs, entry, self.budget)?;
@@ -2320,15 +2512,121 @@ impl ProviderEngine<'_, '_> {
             .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
         drop(analysis);
+        if let (Some(store), Some(key)) = (&shared, shared_key) {
+            let mut retained_bytes = 0usize;
+            let _ = graph.visit_snapshot_payload(&mut |n| {
+                retained_bytes = retained_bytes.saturating_add(n);
+                Ok(())
+            });
+            let observations = self.observations[observations_before..].to_vec();
+            retained_bytes = retained_bytes.saturating_add(observations_payload(&observations));
+            store.put(
+                key,
+                Arc::new(SharedProviderGraph {
+                    occurrence,
+                    graph: Some(graph.clone()),
+                    observations,
+                    warnings: self.warnings[warnings_before..].to_vec(),
+                    dependencies: dependencies.clone(),
+                    retained_bytes,
+                }),
+            );
+        }
         let entry = self
             .budget
             .admit_owned(1, 0, 0, || ProviderGraph {
                 occurrence,
                 graph: Some(graph.clone()),
+                dependencies,
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
         Ok(Fact::Known(graph))
+    }
+
+    /// Record that the compilation in progress used `dependencies`.
+    fn note_dependencies(
+        &mut self,
+        dependencies: &Arc<Vec<ProviderDependency>>,
+    ) -> Result<(), ResolverError> {
+        let Some(top) = self.providers.collecting.last_mut() else {
+            return Ok(());
+        };
+        self.budget
+            .charge(dependencies.len(), 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        top.extend(dependencies.iter().cloned());
+        Ok(())
+    }
+
+    /// Use a provider interface another session compiled: register its
+    /// identity, report the dependencies its compilation observed, and
+    /// prepare `name` on it as on a graph of this session. No source byte is
+    /// scanned, so nothing is granted (l4d-4nbs D29).
+    fn reuse_shared_graph(
+        &mut self,
+        provider: AdmittedProviderSource,
+        metadata: usize,
+        hit: &SharedProviderGraph,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        let occurrence = hit.occurrence;
+        let key = self
+            .budget
+            .admit_owned(1, metadata, metadata, || ProviderKey {
+                source: provider.unit.source.id.clone(),
+                revision: provider.unit.source.revision.clone(),
+                context: provider.context.clone(),
+                qualifiers: provider.authorized_qualifiers.clone(),
+                occurrence,
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.identities, key, self.budget)?;
+        drop(provider);
+        let bytes = observations_payload(&hit.observations);
+        let observations = self
+            .budget
+            .admit_owned(hit.observations.len(), bytes, bytes, || {
+                hit.observations.clone()
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        move_report_vector(self.observations, observations, self.budget)?;
+        let bytes = hit
+            .warnings
+            .iter()
+            .map(|w| w.len() + size_of::<String>())
+            .sum();
+        let warnings = self
+            .budget
+            .admit_owned(hit.warnings.len(), bytes, bytes, || hit.warnings.clone())
+            .map_err(|r| resolver_error(r, self.budget))?;
+        move_report_vector(self.warnings, warnings, self.budget)?;
+        self.note_dependencies(&hit.dependencies)?;
+        let Some(graph) = hit.graph.clone() else {
+            let entry = self
+                .budget
+                .admit_owned(1, 0, 0, || ProviderGraph {
+                    occurrence,
+                    graph: None,
+                    dependencies: hit.dependencies.clone(),
+                })
+                .map_err(|r| resolver_error(r, self.budget))?;
+            push_owner(&mut self.providers.graphs, entry, self.budget)?;
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        };
+        let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1)?;
+        let entry = self
+            .budget
+            .admit_owned(1, 0, 0, || ProviderGraph {
+                occurrence,
+                graph: Some(prepared.clone()),
+                dependencies: hit.dependencies.clone(),
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.graphs, entry, self.budget)?;
+        Ok(Fact::Known(prepared))
     }
 }
 

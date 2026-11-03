@@ -36,15 +36,25 @@ fn resolver_retaining(
     for (name, text) in files {
         std::fs::write(dir.path().join(name), text).unwrap();
     }
-    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+    let resolver = resolver_in(dir.path(), &path, retained);
+    (dir, path, resolver)
+}
+
+/// A new request's resolver over the files of `dir`.
+fn resolver_in(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    retained: usize,
+) -> UnitResolver<FilesystemSourceStore> {
+    let mut ctx = ProjectContext::discover(path, &[dir.into()], &ProjectOptions::default())
         .unwrap()
         .context;
     let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut ctx)).into_parts();
     parts.conditional_context = context(LayoutPlatform::Win32);
     ctx = ProjectContext::from_parts(parts).into();
-    let resolver = UnitResolver::new(
+    UnitResolver::new(
         ctx,
-        vec![dir.path().into()],
+        vec![dir.into()],
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_source_bytes: 16 * 1024 * 1024,
@@ -52,8 +62,7 @@ fn resolver_retaining(
             max_compile_time_retained_bytes: retained,
             ..ResolverLimits::default()
         },
-    );
-    (dir, path, resolver)
+    )
 }
 
 fn analyze_with(
@@ -609,5 +618,76 @@ fn pathological_byte_work_on_a_small_source_still_trips_the_byte_limit() {
         matches!(&result, Err(ResolverError::LimitExceeded { limit, .. }) if *limit == "max_byte_work"),
         "{} bytes: {result:?} {usage:?}",
         text.len()
+    );
+}
+
+/// Keeps every compiled provider interface it is given.
+#[derive(Default)]
+struct KeepAll(
+    std::sync::Mutex<
+        std::collections::HashMap<
+            pascal_core::compile_time::ProviderGraphKey,
+            std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+        >,
+    >,
+);
+
+impl pascal_core::compile_time::SharedProviderGraphs for KeepAll {
+    fn get(
+        &self,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+    ) -> Option<std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+    fn put(
+        &self,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+    ) {
+        self.0.lock().unwrap().insert(key, graph);
+    }
+}
+
+/// l4d-4nbs D29: a request that reuses a provider interface another request
+/// compiled scans none of its bytes, so it is granted nothing for them: its
+/// allowance is what the root alone earns, and it spends less than the
+/// compiling request.
+#[test]
+fn a_reused_provider_interface_grants_nothing() {
+    let padding = "{".to_string() + &"x".repeat(200_000) + "}";
+    let provider = format!("unit A; interface {padding} type TA = Int64; implementation end.");
+    let root =
+        "unit T; interface uses A; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.";
+    let store = std::sync::Arc::new(KeepAll::default());
+    let (dir, path, _) = resolver_with(root, &[("A.pas", &provider)]);
+    let request = |store: Option<&std::sync::Arc<KeepAll>>| {
+        let resolver = resolver_in(dir.path(), &path, 64 * 1024 * 1024);
+        let mut resolver = match store {
+            Some(store) => resolver.with_shared_provider_graphs(store.clone()),
+            None => resolver,
+        };
+        let mut source = support::loaded("T.pas", root);
+        source.path = path.clone();
+        let analysis = resolver
+            .analyze_compile_time(&source, &NoCancellation)
+            .unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        (
+            resolver.compile_time_work_allowance(),
+            resolver.compile_time_usage(),
+        )
+    };
+    let (alone, _) = request(None);
+    let (compiling, first) = request(Some(&store));
+    let (reusing, second) = request(Some(&store));
+    assert_eq!(compiling, alone, "sharing changes nothing for the compiler");
+    assert!(
+        reusing + 200_000 <= compiling,
+        "reuse granted the provider's bytes: {reusing} vs {compiling}"
+    );
+    assert!(second.work < first.work, "{first:?} then {second:?}");
+    assert!(
+        second.byte_work < first.byte_work,
+        "{first:?} then {second:?}"
     );
 }

@@ -73,6 +73,8 @@ pub struct Fixture {
     /// Find units whatever the spelling of the request, authorized under
     /// the requested spelling (`uses classes` and `uses Classes`).
     pub spelled_units: bool,
+    /// Compiled provider interfaces shared with other analyses.
+    pub shared: Option<std::sync::Arc<dyn SharedProviderGraphs>>,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -96,6 +98,7 @@ impl Fixture {
             importer_revisions: false,
             importer_entries: false,
             spelled_units: false,
+            shared: None,
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -224,6 +227,9 @@ impl Fixture {
     }
 }
 impl CompileTimeResolver for Fixture {
+    fn shared_provider_graphs(&self) -> Option<std::sync::Arc<dyn SharedProviderGraphs>> {
+        self.shared.clone()
+    }
     fn unit_report_capability(
         &mut self,
         request: UnitResolveRequest<'_>,

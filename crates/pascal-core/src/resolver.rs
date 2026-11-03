@@ -1503,6 +1503,9 @@ pub struct UnitResolver<S> {
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
     stop_when_incomplete: bool,
+    /// Compiled provider interfaces shared beyond this resolver's sessions
+    /// (l4d-4nbs D29), bound to this resolver's configuration.
+    shared_provider_graphs: Option<Arc<dyn crate::compile_time::SharedProviderGraphs>>,
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
@@ -3008,6 +3011,7 @@ impl<S: SourceStore> UnitResolver<S> {
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
+            shared_provider_graphs: None,
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
@@ -3031,6 +3035,17 @@ impl<S: SourceStore> UnitResolver<S> {
 
     /// Seed the resolution report with what constructing the context
     /// observed, so report consumers can revalidate those reads.
+    /// Share compiled provider interfaces through `store`, which must be bound
+    /// to this resolver's configuration (search paths, namespaces, read
+    /// policy) and validate what it returns (l4d-4nbs D29).
+    pub fn with_shared_provider_graphs(
+        mut self,
+        store: Arc<dyn crate::compile_time::SharedProviderGraphs>,
+    ) -> Self {
+        self.shared_provider_graphs = Some(store);
+        self
+    }
+
     pub fn with_context_observations(mut self, observations: &ProjectObservations) -> Self {
         for observation in &observations.metadata_observations {
             push_observation(
@@ -8351,6 +8366,9 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     }
     fn fund_validation(&mut self, source: &LoadedSource) -> bool {
         self.credit_compile_time_validation(source)
+    }
+    fn shared_provider_graphs(&self) -> Option<Arc<dyn crate::compile_time::SharedProviderGraphs>> {
+        self.shared_provider_graphs.clone()
     }
     fn include_capability(
         &mut self,

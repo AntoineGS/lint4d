@@ -2002,3 +2002,187 @@ fn the_byte_grant_covers_the_measured_closure_cost_with_margin() {
         pascal_core::compile_time::CompileTimeLimits::default().byte_work_per_source_byte as f64;
     assert!(grant >= 46.0 * 1.35, "{grant} byte work per source byte");
 }
+
+/// A shared store of compiled provider interfaces that counts compilations
+/// (puts) and reuses (hits).
+#[derive(Default)]
+struct CountingStore {
+    graphs: std::sync::Mutex<
+        std::collections::HashMap<
+            pascal_core::compile_time::ProviderGraphKey,
+            std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+        >,
+    >,
+    puts: std::sync::atomic::AtomicUsize,
+    hits: std::sync::atomic::AtomicUsize,
+    /// Overlay versions sources have now, as a real store's probes see them.
+    current: std::sync::Mutex<std::collections::HashMap<String, i32>>,
+}
+
+impl pascal_core::compile_time::SharedProviderGraphs for CountingStore {
+    fn get(
+        &self,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+    ) -> Option<std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        let current = self.current.lock().unwrap();
+        let hit = self
+            .graphs
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .filter(|graph| {
+                graph.dependencies.iter().all(|d| {
+                    current
+                        .get(d.source.as_str())
+                        .is_none_or(|version| d.overlay_version == Some(*version))
+                })
+            });
+        if hit.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit
+    }
+    fn put(
+        &self,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+    ) {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.graphs.lock().unwrap().insert(key, graph);
+    }
+}
+
+impl CountingStore {
+    fn puts(&self) -> usize {
+        self.puts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+const SHARED_ROOT: &str =
+    "unit Main; interface uses A; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.";
+
+fn shared_fixture(store: &std::sync::Arc<CountingStore>) -> Fixture {
+    let mut f = provider_fixture(
+        SHARED_ROOT,
+        &[(
+            "A",
+            "unit A; interface uses W; type TA = W.TW; implementation end.",
+        )],
+    );
+    f.shared = Some(store.clone());
+    f
+}
+
+/// l4d-4nbs D29: a second request compiles no provider again: it reuses
+/// the interfaces the first compiled, reports the same dependencies, and
+/// pays only for preparing names, not for scanning (nothing is granted).
+#[test]
+fn consecutive_requests_compile_each_provider_once() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let first = shared_fixture(&store).analyze().unwrap();
+    assert_eq!(activity(&first, "DEFINE HA"), Truth::True);
+    let compiled = store.puts();
+    assert_eq!(compiled, 2, "A and W");
+    let second = shared_fixture(&store).analyze().unwrap();
+    assert!(second.root.complete, "{:?}", second.reasons);
+    assert_eq!(activity(&second, "DEFINE HA"), Truth::True);
+    assert_eq!(store.puts(), compiled, "no provider compiled again");
+    assert!(store.hits() >= 1);
+    assert_eq!(
+        first.observations, second.observations,
+        "same dependencies reported"
+    );
+    let (one, two) = (
+        first.budget.budget_snapshot(),
+        second.budget.budget_snapshot(),
+    );
+    assert!(two.work * 4 < one.work, "{one:?} then {two:?}");
+}
+
+/// A changed provider source or define is a different key and compiles
+/// again; differing environments do not share.
+#[test]
+fn a_changed_provider_or_environment_compiles_again() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    shared_fixture(&store).analyze().unwrap();
+    let compiled = store.puts();
+    let mut changed = shared_fixture(&store);
+    changed.unit_revision("W", 7);
+    store
+        .current
+        .lock()
+        .unwrap()
+        .insert("/fixture/W.pas".into(), 7);
+    changed.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 2,
+        "W compiled again for its new revision, and A, which depends on it"
+    );
+    // The next fixtures read W at its first revision again.
+    store.current.lock().unwrap().remove("/fixture/W.pas");
+    let mut defined = shared_fixture(&store);
+    let mut extra = context(LayoutPlatform::Win32);
+    extra.set_define("EXTRA", pascal_project::ConditionalFact::True);
+    defined.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        extra,
+    );
+    defined.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 3,
+        "A compiled again under its new define"
+    );
+    let mut other = shared_fixture(&store);
+    other.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    other.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 4,
+        "a Win64 A does not reuse the Win32 one"
+    );
+}
+
+/// Occurrence ids are numbered per session, so a graph reused from another
+/// session must not share ids with the graphs this session compiles: the
+/// memo of compiled interfaces and declaration anchors tell them apart by
+/// occurrence.
+#[test]
+fn shared_graphs_never_share_occurrence_ids() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    shared_fixture(&store).analyze().unwrap();
+    let mut both = provider_fixture(
+        "unit Main; interface uses B, A; {$IF SizeOf(B.TB)=4}{$DEFINE HB}{$ENDIF}{$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface type TB = Integer; implementation end.",
+            ),
+        ],
+    );
+    both.shared = Some(store.clone());
+    let analysis = both.analyze().unwrap();
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    assert!(store.hits() >= 1, "A is reused");
+    let graphs = store.graphs.lock().unwrap();
+    let mut occurrences = graphs.values().map(|g| g.occurrence).collect::<Vec<_>>();
+    occurrences.sort_by_key(|o| o.0);
+    let count = occurrences.len();
+    occurrences.dedup();
+    assert_eq!(occurrences.len(), count, "{occurrences:?}");
+}

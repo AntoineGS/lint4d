@@ -36,16 +36,27 @@ impl CacheExclusion {
         }
     }
 
-    /// The directory's forms; a path under any of them is excluded.
-    pub(crate) fn directories(&self) -> &[PathBuf] {
-        &self.directories
-    }
-
     /// Whether `path` is the directory or under it, in one of its forms.
     pub(crate) fn contains(&self, path: &Path) -> bool {
         self.directories
             .iter()
             .any(|directory| pascal_project::path_identity::path_starts_with(path, directory))
+    }
+
+    /// The forms a walk of `root` can meet: those under `root`, or all of
+    /// them when `root` itself lies in the directory. The same prefix rule
+    /// as [`Self::contains`] (`path_identity::path_starts_with`, which folds
+    /// case on a case-insensitive volume), so a catalogue key names the
+    /// directory exactly when its walk leaves something out.
+    pub(crate) fn met_by_walk_of(&self, root: &Path) -> Vec<PathBuf> {
+        if self.contains(root) {
+            return self.directories.to_vec();
+        }
+        self.directories
+            .iter()
+            .filter(|directory| pascal_project::path_identity::path_starts_with(directory, root))
+            .cloned()
+            .collect()
     }
 
     /// The directory as seen through each of `bases` (a workspace root and
@@ -112,6 +123,8 @@ pub(crate) fn check_dedicated(directory: &Path) -> Result<(), String> {
     }
     let mut listed = 0usize;
     for entry in walkdir::WalkDir::new(directory).follow_links(false) {
+        // An entry that cannot be read cannot be shown as a workspace source
+        // either: every workspace walk skips unreadable entries the same way.
         let Ok(entry) = entry else {
             continue;
         };
@@ -125,15 +138,21 @@ pub(crate) fn check_dedicated(directory: &Path) -> Result<(), String> {
             ));
         }
         if entry.file_type().is_file() && crate::catalogue::is_retained_file(entry.path()) {
-            return Err(format!(
-                "persistentCacheDirectory {} contains Pascal sources or project files ({}); \
-                 set persistentCacheDirectory to a directory used only by the cache",
-                directory.display(),
-                entry.path().display()
-            ));
+            return Err(sources_message(directory, entry.path()));
         }
     }
     Ok(())
+}
+
+/// Why `directory` is refused: it holds `file`, a Pascal source or project
+/// file.
+pub(crate) fn sources_message(directory: &Path, file: &Path) -> String {
+    format!(
+        "persistentCacheDirectory {} contains Pascal sources or project files ({}); \
+         set persistentCacheDirectory to a directory used only by the cache",
+        directory.display(),
+        file.display()
+    )
 }
 
 #[cfg(test)]

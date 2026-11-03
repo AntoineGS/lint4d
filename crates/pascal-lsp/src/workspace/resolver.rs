@@ -688,12 +688,10 @@ impl SourceStore for LspSourceStore {
         cancel: &dyn CancellationToken,
     ) -> Result<DirectoryListing, SourceStoreError> {
         let overlay_children = self.overlay_children(request.directory);
-        match self
-            .disk
-            .list_directory(request, cancel)
-            .map(|listing| self.without_cache_directory(listing))
-        {
-            Ok(mut listing) => {
+        match self.disk.list_directory(request, cancel) {
+            Ok(listing) => {
+                // The disk listing is recorded as validation will list it
+                // again; only the session does not see the store directory.
                 if let Some(capture) = &self.capture {
                     let overlay = overlay_children
                         .0
@@ -701,6 +699,7 @@ impl SourceStore for LspSourceStore {
                         .any(|path| !listing.files.iter().any(|f| path_equivalent(f, path)));
                     capture.listed(request.directory, &listing, overlay);
                 }
+                let mut listing = self.without_cache_directory(listing);
                 for path in overlay_children.0 {
                     if !listing
                         .files
@@ -1672,5 +1671,69 @@ mod cache_exclusion_tests {
         assert_eq!(listed(None), std::slice::from_ref(&store));
         let exclusion = crate::persistent_cache::CacheExclusion::new(&store);
         assert!(listed(Some(exclusion)).is_empty());
+    }
+
+    /// l4d-vrw0 fix round 1: what a session records of the store's parent is
+    /// the disk listing validation compares with, store directory included,
+    /// so persisted evidence that listed it keeps holding.
+    #[test]
+    fn captured_listings_of_the_store_parent_match_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let main = root.join("Main.pas");
+        std::fs::write(&main, b"unit Main; interface implementation end.").unwrap();
+        let store = root.join("cache/lint4d/analysis");
+        std::fs::create_dir_all(&store).unwrap();
+        let context = ProjectContext::discover(
+            &main,
+            std::slice::from_ref(&root),
+            &ProjectOptions::default(),
+        )
+        .unwrap()
+        .context;
+        let policy = context.read_policy().clone();
+        let lint4d = root.join("cache/lint4d");
+        let entry = context.path_entry_for(&lint4d).unwrap();
+        let request = DirectoryRequest {
+            directory: &lint4d,
+            entry: &entry,
+            read_policy: &policy,
+        };
+        let disk = FilesystemSourceStore::new()
+            .list_directory(request, &NoCancellation)
+            .unwrap();
+        let expected = pascal_cache::listing_digest(&disk.files, &disk.directories);
+        let workspace = super::super::Workspace::with_override_session(
+            vec![root.clone()],
+            super::super::WorkspaceOptions::default(),
+            OverrideSession::new(None),
+        )
+        .with_cache_exclusion(Some(crate::persistent_cache::CacheExclusion::new(&store)));
+        for admitted in [false, true] {
+            let capture = Arc::new(super::super::capture::ReadCapture::default());
+            let mut source =
+                LspSourceStore::from_input(context.clone(), &workspace.analysis_input())
+                    .with_capture(Arc::clone(&capture));
+            let seen = if admitted {
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let listing = source
+                    .list_directory_admitted(request, &mut budget, &NoCancellation)
+                    .unwrap();
+                listing.directories.clone()
+            } else {
+                source
+                    .list_directory(request, &NoCancellation)
+                    .unwrap()
+                    .directories
+            };
+            assert!(seen.is_empty(), "admitted={admitted}: {seen:?}");
+            let reads = capture.snapshot();
+            let super::super::capture::ListingCapture::One(captured) = reads.listing_of(&lint4d)
+            else {
+                panic!("admitted={admitted}: one listing");
+            };
+            assert_eq!(captured.listing, expected, "admitted={admitted}");
+        }
     }
 }

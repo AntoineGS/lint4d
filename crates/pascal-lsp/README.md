@@ -1410,11 +1410,10 @@ refused rather than hidden: the cache is `bypassed` with a `configuration`
 cause whose message names the directory, nothing is created there and its
 sources stay in the workspace. Set `persistentCacheDirectory` to a directory
 used only by the cache. The check runs at startup and whenever persistence is
-turned on again.
-
-The first run creates the store's missing parent directories. That one change
-to a workspace directory can still make a request running at that moment
-answer `-32803` once.
+turned on again, and the store directory is created (mode `0700`) right after
+it, before the workspace is walked. A file event naming a Pascal source or
+project file under the store directory is never dropped: it refuses the
+directory the same way.
 
 #### Runtime changes
 

@@ -34,7 +34,7 @@ fn configure(server: &mut TestServer, settings: Value) {
 
 /// A workspace root (standing for `$HOME`) holding `Main.pas`,
 /// `Provider.pas`, four units with a lint finding each, and the cache home
-/// `cache`, whose store directory already exists as after a first run.
+/// `cache`.
 struct RootWithCache {
     _temp: tempfile::TempDir,
     environment: PathBuf,
@@ -43,7 +43,19 @@ struct RootWithCache {
 }
 
 impl RootWithCache {
+    /// The store directory already exists, as after a first run.
     fn new() -> Self {
+        let fixture = Self::first_run();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(fixture.store())
+            .unwrap();
+        fixture
+    }
+
+    /// Neither the cache home nor the store exist yet.
+    fn first_run() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let environment = temp.path().join("environment");
         let root = temp.path().join("home");
@@ -59,18 +71,12 @@ impl RootWithCache {
                 ),
             );
         }
-        let fixture = Self {
+        Self {
             _temp: temp,
             environment,
             root,
             main,
-        };
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(fixture.store())
-            .unwrap();
-        fixture
+        }
     }
 
     fn cache_home(&self) -> PathBuf {
@@ -356,5 +362,67 @@ fn a_cache_directory_holding_pascal_sources_is_refused_not_hidden() {
     assert_eq!(settled["status"]["state"], "bypassed", "{settled}");
     assert_eq!(settled["status"]["cause"]["kind"], "configuration");
     assert_eq!(fs::read_dir(&sources).unwrap().count(), 1);
+    server.shutdown();
+}
+
+/// Fix round 1: on a first run the server creates the store directory and
+/// its parents before it answers anything, so even the first request never
+/// sees the workspace change under it.
+#[test]
+fn the_first_request_of_a_first_run_never_retries() {
+    for attempt in 0..3 {
+        let fixture = RootWithCache::first_run();
+        let mut server = fixture.launch();
+        server.initialize_with_pull_diagnostics_options(&fixture.root, Value::Null);
+        workspace_diagnostic(&mut server);
+        assert!(fixture.store().is_dir(), "attempt {attempt}");
+        assert_eq!(settle(&mut server, true)["stepped"], true);
+        workspace_diagnostic(&mut server);
+        server.shutdown();
+    }
+}
+
+/// Fix round 1: sources must never be hidden. A Pascal source that turns up
+/// under the excluded store directory refuses it instead of being dropped.
+#[test]
+fn a_source_appearing_in_the_store_refuses_it() {
+    let fixture = RootWithCache::new();
+    let mut server = fixture.launch();
+    server.initialize_with_pull_diagnostics_options(&fixture.root, Value::Null);
+    assert_eq!(settle(&mut server, false)["status"]["state"], "enabled");
+    workspace_diagnostic(&mut server);
+    while refreshes(&mut server) {}
+
+    let stray = fixture.store().join("Stray.pas");
+    write_file(
+        &stray,
+        "unit Stray;\ninterface\nprocedure StrayRoutine;\nimplementation\nprocedure StrayRoutine;\nbegin\nend;\nend.\n",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&stray), "type": 1}]}),
+    );
+    assert!(refreshes(&mut server), "the source event was dropped");
+    let settled = settle(&mut server, false);
+    assert_eq!(settled["status"]["state"], "bypassed", "{settled}");
+    assert_eq!(
+        settled["status"]["cause"]["kind"], "configuration",
+        "{settled}"
+    );
+    let message = settled["status"]["cause"]["message"].as_str().unwrap();
+    assert!(message.contains("Stray.pas"), "{message}");
+    let id = next_id("symbols");
+    server.send_request(
+        id.clone(),
+        "workspace/symbol",
+        json!({"query": "StrayRoutine"}),
+    );
+    let symbols = assert_success(&mut server, &id, "workspace/symbol");
+    assert!(
+        symbols.as_array().is_some_and(|symbols| symbols
+            .iter()
+            .any(|symbol| symbol["location"]["uri"] == uri(&stray).as_str())),
+        "{symbols}"
+    );
     server.shutdown();
 }

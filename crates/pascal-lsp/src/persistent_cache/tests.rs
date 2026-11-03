@@ -864,3 +864,96 @@ fn a_directory_with_pascal_sources_is_refused() {
     assert!(cache.exclusion().is_some());
     cache.shutdown();
 }
+
+/// l4d-vrw0 fix round 1: a re-enable while a disable is still fencing
+/// checks the directory and restores the exclusion.
+#[test]
+fn a_reenable_during_a_pending_disable_keeps_the_exclusion() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let job = cache.job().unwrap();
+    let disabled = CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    };
+    assert_eq!(
+        cache.reconfigure_within(disabled, Duration::ZERO),
+        Ack::Pending
+    );
+    cache.reconfigure_within(options(root.path()), Duration::ZERO);
+    drop(job);
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(cache.exclusion().is_some());
+    cache.shutdown();
+}
+
+/// The same race with sources added meanwhile: the reopen is refused.
+#[test]
+fn a_reenable_during_a_pending_disable_refuses_a_directory_with_sources() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let job = cache.job().unwrap();
+    let disabled = CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    };
+    assert_eq!(
+        cache.reconfigure_within(disabled, Duration::ZERO),
+        Ack::Pending
+    );
+    std::fs::write(root.path().join("Unit1.pas"), b"unit Unit1;").unwrap();
+    cache.reconfigure_within(options(root.path()), Duration::ZERO);
+    drop(job);
+    assert!(matches!(
+        cache.settle(SETTLE),
+        CacheState::Bypassed(StatusCause::Configuration(_))
+    ));
+    assert_eq!(cache.exclusion(), None);
+    cache.shutdown();
+}
+
+/// Sources found under the excluded directory later refuse it.
+#[test]
+fn refusing_an_open_store_fences_it_into_the_configuration_bypass() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    cache.refuse_sources(&root.path().join("Stray.pas"));
+    let CacheState::Bypassed(StatusCause::Configuration(message)) = cache.settle(SETTLE) else {
+        panic!("{:?}", cache.state());
+    };
+    assert!(message.contains("Stray.pas"), "{message}");
+    assert_eq!(cache.exclusion(), None);
+    assert_eq!(live_leases(root.path()), 0);
+    cache.shutdown();
+}
+
+/// The store directory and its parents exist once the handle starts, so
+/// the first open changes nothing a workspace walk can see.
+#[test]
+fn an_enabled_start_creates_the_store_directory_before_returning() {
+    let root = private_dir();
+    let directory = root.path().join("cache/lint4d/analysis");
+    let project_cache = ProjectCache::new(64 << 20);
+    let (entered, _entered) = mpsc::channel();
+    let (_release, release) = mpsc::channel();
+    let cache = PersistentCache::start_paused_for_test(
+        options(&directory),
+        project_cache.clone(),
+        Arc::default(),
+        namespace(),
+        entered,
+        release,
+    );
+    assert!(directory.is_dir());
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&directory).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o700);
+    drop(cache);
+}

@@ -2750,9 +2750,12 @@ struct ExcludeMatcher {
     root: PathBuf,
     config_root: PathBuf,
     patterns: Option<Arc<ExcludeGlobs>>,
-    /// The persistent-cache store directory, as seen from this root
-    /// (l4d-vrw0).
+    /// The persistent-cache store directory, in the forms the workspace
+    /// sees it (l4d-vrw0).
     cache: Option<CacheExclusion>,
+    /// Only `cache` is excluded: a walk outside every workspace root, whose
+    /// key stays `Exclusions::Nothing` unless the store is under it.
+    cache_only: bool,
 }
 
 impl ExcludeMatcher {
@@ -2762,18 +2765,31 @@ impl ExcludeMatcher {
             config_root: config_root.to_path_buf(),
             patterns: compile_exclude_patterns(patterns),
             cache: None,
+            cache_only: false,
         }
     }
 
-    /// The default matcher of a walk outside the configured roots, leaving
-    /// out the store directory like every root does.
+    /// The default matcher of a mapped or package walk, leaving out the
+    /// store directory like every root does.
     fn with_cache(mut self, cache: Option<&CacheExclusion>) -> Self {
-        self.cache = cache.map(|cache| cache.seen_from([self.root.as_path()]));
+        self.cache = cache.cloned();
         self
     }
 
+    /// A walk outside every workspace root: nothing but the store directory
+    /// is excluded.
+    fn cache_only(root: &Path, cache: &CacheExclusion) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            config_root: root.to_path_buf(),
+            patterns: None,
+            cache: Some(cache.clone()),
+            cache_only: true,
+        }
+    }
+
     fn is_excluded(&self, path: &Path, source_root: &Path) -> bool {
-        if has_default_excluded_component_under(path, source_root) {
+        if !self.cache_only && has_default_excluded_component_under(path, source_root) {
             return true;
         }
         if self
@@ -2794,12 +2810,14 @@ impl ExcludeMatcher {
     }
 
     /// The identity of what this matcher excludes from a walk of `root`,
-    /// for catalogue keys. The store directory is part of it only when it
-    /// lies under `root`, so other catalogues are shared as before.
+    /// for catalogue keys. The store directory is part of it only when the
+    /// walk can meet it (it lies under `root`, or `root` lies in it), so
+    /// other catalogues are shared as before.
     fn exclusions(&self, root: &Path) -> crate::catalogue::Exclusions {
-        let exclusions = match &self.patterns {
-            None => crate::catalogue::Exclusions::Defaults,
-            Some(globs) => crate::catalogue::Exclusions::Globs {
+        let exclusions = match (&self.patterns, self.cache_only) {
+            (_, true) => crate::catalogue::Exclusions::Nothing,
+            (None, false) => crate::catalogue::Exclusions::Defaults,
+            (Some(globs), false) => crate::catalogue::Exclusions::Globs {
                 root: self.root.clone(),
                 config_root: self.config_root.clone(),
                 patterns: Arc::clone(&globs.text),
@@ -2807,11 +2825,9 @@ impl ExcludeMatcher {
         };
         let cache: Vec<PathBuf> = self
             .cache
-            .iter()
-            .flat_map(CacheExclusion::directories)
-            .filter(|directory| path_starts_with_native(directory, root))
-            .cloned()
-            .collect();
+            .as_ref()
+            .map(|cache| cache.met_by_walk_of(root))
+            .unwrap_or_default();
         if cache.is_empty() {
             exclusions
         } else {
@@ -3015,19 +3031,14 @@ impl WorkspaceRoot {
                 config_root,
                 patterns,
                 cache: None,
+                cache_only: false,
             },
         }
     }
 
-    /// Leave the store directory out of this root (l4d-vrw0), as seen from
-    /// the root and each of its source roots.
+    /// Leave the store directory out of this root (l4d-vrw0).
     fn set_cache_exclusion(&mut self, cache: Option<&CacheExclusion>) {
-        self.excludes.cache = cache.map(|cache| {
-            cache.seen_from(
-                std::iter::once(self.path.as_path())
-                    .chain(self.source_roots.iter().map(PathBuf::as_path)),
-            )
-        });
+        self.excludes.cache = cache.cloned();
     }
 
     fn accepts(&self, path: &Path) -> bool {
@@ -3135,8 +3146,12 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
-    /// The store directory every walk, catalogue, membership check and file
-    /// event leaves out; taken from `persistent_cache` (l4d-vrw0).
+    /// The store directory as `persistent_cache` gives it (l4d-vrw0).
+    cache_base: Option<CacheExclusion>,
+    /// `cache_base` in every form a walk of the roots can reach it through
+    /// (`CacheExclusion::seen_from`), computed once by the main workspace
+    /// and carried to request views: what every walk, catalogue,
+    /// membership check and file event leaves out.
     cache_exclusion: Option<CacheExclusion>,
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
@@ -3634,7 +3649,7 @@ impl Workspace {
             self.persistent_cache.readmit();
         }
         self.roots = prepared.roots;
-        self.attach_cache_exclusion();
+        self.see_cache_exclusion();
 
         self.bump_source_generation();
         self.bump_configuration_generation();
@@ -4876,8 +4891,13 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
-        if self.is_cache_path(uri) {
-            // The store's own files are not workspace files (l4d-vrw0).
+        if self.is_cache_path(uri)
+            && !uri
+                .to_file_path()
+                .is_ok_and(|path| crate::catalogue::is_retained_file(&path))
+        {
+            // The store's own files are not workspace files (l4d-vrw0); a
+            // source there is never dropped (the server refuses the store).
             return Ok(Vec::new());
         }
         if let Some(budget) = budget {
@@ -5948,12 +5968,12 @@ impl Workspace {
         for added in added {
             let added = absolute_path(added);
             if !self.roots.iter().any(|root| root.path == added) {
-                let mut root = WorkspaceRoot::new(added, &self.options);
-                root.set_cache_exclusion(self.cache_exclusion.as_ref());
+                let root = WorkspaceRoot::new(added, &self.options);
                 if let Err(error) = self.overrides.capture_workspace(&root.path) {
                     self.warn(error);
                 }
                 self.roots.push(root);
+                self.see_cache_exclusion();
             }
         }
         self.contexts.clear();
@@ -13147,7 +13167,8 @@ impl Workspace {
             .roots
             .iter()
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
-            .map(|workspace_root| workspace_root.excludes.clone());
+            .map(|workspace_root| workspace_root.excludes.clone())
+            .or_else(|| self.cache_only_excludes(&root));
         let scope = CatalogueScope::recursive(&root, matcher.as_ref());
         #[cfg(feature = "test-support")]
         let mut steps = 0usize;
@@ -13574,17 +13595,33 @@ impl Workspace {
     /// again, after its options changed. A change rebuilds the roots'
     /// matchers; catalogues follow through their keys.
     pub(crate) fn refresh_cache_exclusion(&mut self) {
-        let exclusion = self.persistent_cache.exclusion();
-        if exclusion == self.cache_exclusion {
+        let base = self.persistent_cache.exclusion();
+        if base == self.cache_base {
             return;
         }
-        self.cache_exclusion = exclusion;
+        self.cache_base = base;
+        self.cache_exclusion = None;
+        self.see_cache_exclusion();
         self.attach_cache_exclusion();
         self.bump_source_generation();
         self.mark_global_change();
     }
 
-    /// A view of a request's roots that leaves out the same store directory.
+    /// Resolve `cache_base` through the current roots and source roots
+    /// (symlinks), once, and attach the result.
+    fn see_cache_exclusion(&mut self) {
+        if let Some(base) = &self.cache_base {
+            let bases = self.roots.iter().flat_map(|root| {
+                std::iter::once(root.path.as_path())
+                    .chain(root.source_roots.iter().map(PathBuf::as_path))
+            });
+            self.cache_exclusion = Some(base.seen_from(bases));
+        }
+        self.attach_cache_exclusion();
+    }
+
+    /// A view of a request's roots that leaves out the same store directory
+    /// (already resolved by the main workspace).
     pub(crate) fn with_cache_exclusion(mut self, exclusion: Option<CacheExclusion>) -> Self {
         self.cache_exclusion = exclusion;
         self.attach_cache_exclusion();
@@ -13612,6 +13649,14 @@ impl Workspace {
     /// The matcher of a walk with no root exclusions of its own.
     fn default_excludes(&self, root: &Path) -> ExcludeMatcher {
         ExcludeMatcher::new(root, root, &[]).with_cache(self.cache_exclusion.as_ref())
+    }
+
+    /// The matcher of a walk outside every workspace root: the store
+    /// directory alone, `None` without one.
+    fn cache_only_excludes(&self, root: &Path) -> Option<ExcludeMatcher> {
+        self.cache_exclusion
+            .as_ref()
+            .map(|cache| ExcludeMatcher::cache_only(root, cache))
     }
 
     pub(crate) fn configured_project_file(&self) -> Option<&Path> {
@@ -17134,6 +17179,7 @@ mod tests {
             config_root: root.clone(),
             patterns: Some(Arc::clone(&patterns)),
             cache: None,
+            cache_only: false,
         };
 
         assert!(matcher.is_excluded(&root.join(".git/config.pas"), &root));
@@ -17162,6 +17208,7 @@ mod tests {
             config_root: root.clone(),
             patterns: Some(Arc::clone(&patterns)),
             cache: None,
+            cache_only: false,
         };
 
         assert_eq!(patterns.test_build_counts(), (1, 0));

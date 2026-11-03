@@ -238,8 +238,14 @@ impl Shared {
 
 /// The exclusion of a store directory that holds no Pascal sources, or why
 /// it is refused (walks the directory: never under `Inner::shared`).
+///
+/// The directory and its missing parents are created here, before the
+/// workspace takes the exclusion, so the first open changes nothing a
+/// workspace walk can see. A location the store refuses is left for the
+/// open to report.
 fn dedicated(directory: &std::path::Path) -> Result<CacheExclusion, String> {
     exclusion::check_dedicated(directory)?;
+    let _ = pascal_cache::StoreLocation::prepare(directory);
     Ok(CacheExclusion::new(directory))
 }
 
@@ -520,16 +526,13 @@ impl PersistentCache {
         let Some(inner) = &self.inner else {
             return Ack::Done;
         };
-        // Leaving the rest for `Opening` checks the directory first, with no
-        // lock held.
-        let (directory, at_rest) = {
+        // Enabling without an exclusion checks the directory first, with no
+        // lock held, whatever the state (a disable may still be fencing).
+        let (directory, unchecked) = {
             let shared = inner.lock();
-            (
-                shared.directory.clone(),
-                matches!(shared.state, CacheState::Disabled | CacheState::Bypassed(_)),
-            )
+            (shared.directory.clone(), shared.exclusion.is_none())
         };
-        let checked = (at_rest && options.enabled)
+        let checked = (unchecked && options.enabled)
             .then(|| directory.as_deref().map(dedicated))
             .flatten();
         let mut shared = inner.lock();
@@ -546,9 +549,18 @@ impl PersistentCache {
         let (active, limits_changed) = (new.active(), new.limits() != old.limits());
         let mut store = None;
         let state = shared.state.clone();
+        let mut refused = None;
         if !active {
             shared.exclusion = None;
+        } else if shared.exclusion.is_none() {
+            match checked {
+                Some(Ok(exclusion)) => shared.exclusion = Some(exclusion),
+                Some(Err(message)) => refused = Some(message),
+                None => {}
+            }
         }
+        let refusal =
+            refused.map(|message| CacheState::Bypassed(StatusCause::Configuration(message)));
         match (&state, active) {
             (CacheState::Enabled | CacheState::Opening, false) => {
                 store = inner.begin_fence(&mut shared, CacheState::Disabled);
@@ -560,26 +572,24 @@ impl PersistentCache {
                 inner.changed.notify_all();
             }
             (CacheState::Disabled, false) => {}
-            (CacheState::Disabled | CacheState::Bypassed(_), true) => match checked {
-                Some(Err(message)) => {
+            (CacheState::Disabled | CacheState::Bypassed(_), true) => match refusal {
+                Some(refusal) => {
                     shared.retry = None;
-                    shared.exclusion = None;
-                    shared.set_state(CacheState::Bypassed(StatusCause::Configuration(message)));
+                    shared.set_state(refusal);
                     inner.changed.notify_all();
-                }
-                Some(Ok(exclusion)) => {
-                    shared.exclusion = Some(exclusion);
-                    inner.open_from_rest(&mut shared);
                 }
                 None => inner.open_from_rest(&mut shared),
             },
+            (CacheState::Enabled | CacheState::Opening, true) if refusal.is_some() => {
+                store = inner.begin_fence(&mut shared, refusal.expect("guarded"));
+            }
             (CacheState::Enabled | CacheState::Opening, true) if limits_changed => {
                 store = inner.begin_fence(&mut shared, CacheState::Opening);
             }
             (CacheState::Enabled | CacheState::Opening, true) => {}
             (CacheState::Fencing, true) => {
                 if !shared.shut_down {
-                    shared.after = CacheState::Opening;
+                    shared.after = refusal.unwrap_or(CacheState::Opening);
                 }
             }
         }
@@ -649,6 +659,39 @@ impl PersistentCache {
 
     /// The store directory the workspace leaves out: `Some` while the
     /// options are active and the directory holds no Pascal sources.
+    /// A Pascal source or project file turned up under the excluded
+    /// directory: refuse it rather than hide the file. The store is fenced
+    /// into the configuration bypass; a later enable checks again.
+    pub(crate) fn refuse_sources(&self, path: &std::path::Path) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut shared = inner.lock();
+        let Some(directory) = shared.directory.clone() else {
+            return;
+        };
+        shared.exclusion = None;
+        let refusal = CacheState::Bypassed(StatusCause::Configuration(exclusion::sources_message(
+            &directory, path,
+        )));
+        let mut store = None;
+        match shared.state {
+            CacheState::Enabled | CacheState::Opening => {
+                store = inner.begin_fence(&mut shared, refusal);
+            }
+            CacheState::Fencing => shared.after = refusal,
+            CacheState::Disabled | CacheState::Bypassed(_) => {
+                if shared.options.active() {
+                    shared.retry = None;
+                    shared.set_state(refusal);
+                    inner.changed.notify_all();
+                }
+            }
+        }
+        inner.unlock(shared);
+        inner.close(store);
+    }
+
     pub(crate) fn exclusion(&self) -> Option<CacheExclusion> {
         self.inner.as_ref()?.lock().exclusion.clone()
     }

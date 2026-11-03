@@ -10762,10 +10762,42 @@ fn run_connection(
     )
 }
 
+/// The first Pascal source or project file `notification` names under the
+/// persistent-cache store directory: such an event is never dropped.
+fn cache_source_event(workspace: &Workspace, notification: &Notification) -> Option<PathBuf> {
+    workspace.cache_exclusion()?;
+    let list = match notification.method.as_str() {
+        "workspace/didChangeWatchedFiles" => "changes",
+        "workspace/didCreateFiles" | "workspace/didDeleteFiles" | "workspace/didRenameFiles" => {
+            "files"
+        }
+        _ => return None,
+    };
+    let entries = notification.params.get(list)?.as_array()?;
+    entries
+        .iter()
+        .take(MAX_FILE_OPERATION_BATCH_ENTRIES)
+        .flat_map(|entry| ["uri", "oldUri", "newUri"].map(|key| entry.get(key)))
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|uri| Url::parse(uri).ok())
+        .filter(|uri| workspace.is_cache_path(uri))
+        .filter_map(|uri| uri.to_file_path().ok())
+        .find(|path| crate::catalogue::is_retained_file(path))
+}
+
+/// Sources must never be hidden: a source under the store directory
+/// refuses it, and the workspace sees the directory again.
+fn refuse_cache_directory(workspace: &mut Workspace, source: &Path) {
+    workspace.persistent_cache().refuse_sources(source);
+    workspace.refresh_cache_exclusion();
+}
+
 /// `notification` without the events of the persistent-cache store's own
 /// files; `None` when nothing else is left. A rename is kept unless both of
-/// its endpoints are store files. Anything malformed is left for the
-/// worker's recovery.
+/// its endpoints are store files, and an event naming a Pascal source or
+/// project file is always kept. Anything malformed is left for the worker's
+/// recovery.
 fn without_cache_file_events(
     workspace: &Workspace,
     mut notification: Notification,
@@ -10795,7 +10827,12 @@ fn without_cache_file_events(
                 .get(*endpoint)
                 .and_then(Value::as_str)
                 .and_then(|uri| Url::parse(uri).ok())
-                .is_some_and(|uri| workspace.is_cache_path(&uri))
+                .is_some_and(|uri| {
+                    workspace.is_cache_path(&uri)
+                        && !uri
+                            .to_file_path()
+                            .is_ok_and(|path| crate::catalogue::is_retained_file(&path))
+                })
         })
     };
     entries.retain(|entry| !is_cache_entry(entry));
@@ -12003,6 +12040,9 @@ fn event_loop(
                         else {
                             continue;
                         };
+                        if let Some(source) = cache_source_event(workspace, &notification) {
+                            refuse_cache_directory(workspace, &source);
+                        }
                         file_notification_worker = Some(spawn_workspace_file_notification(
                             workspace,
                             notification,
@@ -12273,19 +12313,31 @@ fn event_loop(
 }
 
 fn drain_watch_events(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     watch_events: &crate::file_watch::WatchEvents,
     rewarm: &mut Vec<Url>,
 ) {
+    // Store files are dropped; a source there is kept and refuses the store.
+    let source = std::cell::RefCell::new(None);
     rewarm.extend(watch_events.drain(
         workspace.project_cache(),
         crate::file_watch::MAX_WATCH_EVENTS_PER_TURN,
         &|path| {
-            workspace
+            let under = workspace
                 .cache_exclusion()
-                .is_some_and(|cache| cache.contains(path))
+                .is_some_and(|cache| cache.contains(path));
+            if under && crate::catalogue::is_retained_file(path) {
+                source
+                    .borrow_mut()
+                    .get_or_insert_with(|| path.to_path_buf());
+                return false;
+            }
+            under
         },
     ));
+    if let Some(source) = source.into_inner() {
+        refuse_cache_directory(workspace, &source);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

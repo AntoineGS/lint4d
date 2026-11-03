@@ -645,4 +645,86 @@ mod tests {
             CatalogueScope::recursive(&other, Some(&workspace(&other).roots[0].excludes)).key(),
         );
     }
+
+    /// l4d-vrw0 fix round 1: a walk of a directory outside every workspace
+    /// root (a recursive search path above the workspace) leaves the store
+    /// out too, and keeps its `Nothing` key where the store is not under it.
+    #[test]
+    fn a_walk_outside_the_roots_leaves_the_store_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let above = temp.path().to_path_buf();
+        let root = above.join("workspace");
+        write(&root.join("Main.pas"));
+        write(&above.join("lib/Lib.pas"));
+        let store = above.join("cache/lint4d/analysis");
+        fs::create_dir_all(store.join("namespaces")).unwrap();
+        let cache = crate::persistent_cache::CacheExclusion::new(&store);
+        let mut view = workspace(&root).with_cache_exclusion(Some(cache.clone()));
+
+        let catalogue = view.filename_catalogue(&above);
+        assert_eq!(
+            names(&catalogue, &above),
+            [
+                PathBuf::from("lib/Lib.pas"),
+                PathBuf::from("workspace/Main.pas")
+            ]
+        );
+        assert!(
+            catalogue
+                .directories()
+                .iter()
+                .all(|(directory, _)| !cache.contains(directory)),
+            "{:?}",
+            catalogue.directories()
+        );
+        assert!(matches!(
+            view.recursive_scope(&above).key().exclusions,
+            Exclusions::WithCache { ref exclusions, .. } if **exclusions == Exclusions::Nothing
+        ));
+        // Not under the walked directory: the key it always had.
+        assert_eq!(
+            view.recursive_scope(&above.join("lib")).key().exclusions,
+            Exclusions::Nothing
+        );
+    }
+
+    /// One prefix rule decides both what is excluded and the key, and a
+    /// root inside the store keys on it too.
+    #[test]
+    fn the_key_and_the_walk_agree_on_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Home");
+        let store = root.join("cache/lint4d/analysis");
+        fs::create_dir_all(store.join("inner")).unwrap();
+        let cache = crate::persistent_cache::CacheExclusion::new(&store);
+        let view = workspace(&root).with_cache_exclusion(Some(cache.clone()));
+        let inner = store.join("inner");
+        let scope = CatalogueScope::recursive(&inner, Some(&view.roots[0].excludes));
+        assert!(matches!(
+            scope.key().exclusions,
+            Exclusions::WithCache { .. }
+        ));
+        assert!(scope.excluded(&inner.join("x")));
+
+        // A case-insensitive volume: a differently cased root holds it.
+        pascal_project::path_identity::with_case_insensitive_volumes(|| {
+            let upper = temp.path().join("HOME");
+            let view = workspace(&upper).with_cache_exclusion(Some(cache.clone()));
+            let scope = CatalogueScope::recursive(&upper, Some(&view.roots[0].excludes));
+            assert!(scope.excluded(&upper.join("cache/lint4d/analysis/x")));
+            assert!(matches!(
+                scope.key().exclusions,
+                Exclusions::WithCache { .. }
+            ));
+        });
+        // A case-sensitive one: it does not, and the key says so.
+        let upper = temp.path().join("HOME");
+        let view = workspace(&upper).with_cache_exclusion(Some(cache));
+        let scope = CatalogueScope::recursive(&upper, Some(&view.roots[0].excludes));
+        assert!(!scope.excluded(&upper.join("cache/lint4d/analysis/x")));
+        assert!(!matches!(
+            scope.key().exclusions,
+            Exclusions::WithCache { .. }
+        ));
+    }
 }

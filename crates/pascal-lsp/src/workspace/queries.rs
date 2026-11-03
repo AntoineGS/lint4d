@@ -2527,7 +2527,7 @@ mod tests {
         completion_from_input, completion_from_input_with_options, completion_metadata_from_input,
         document_symbols_from_input, highlights_from_input, hover_from_input,
         references_from_input, selection_ranges_from_input, semantic_tokens_from_input,
-        signature_help_from_input, type_definitions_from_input,
+        signature_help_from_input, type_definitions_from_input, workspace_symbols_from_input,
     };
     use crate::navigation::CompletionOptions;
     #[cfg(target_os = "linux")]
@@ -3003,6 +3003,138 @@ mod tests {
             consumer_source,
             input: workspace.analysis_input(),
         }
+    }
+
+    /// 500 units: `Shared` declares `SharedValue`; 20 importers use it; the
+    /// others declare their own `SharedValue` and never import `Shared`.
+    struct ManyUnits {
+        _temp: TempDir,
+        shared: PathBuf,
+        input: WorkspaceInput,
+    }
+
+    fn many_units(importers: usize, others: usize) -> ManyUnits {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for index in 0..importers {
+            fs::write(
+                root.join(format!("Importer{index:03}.pas")),
+                format!(
+                    "unit Importer{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                ),
+            )
+            .expect("importer");
+        }
+        for index in 0..others {
+            fs::write(
+                root.join(format!("Other{index:03}.pas")),
+                format!(
+                    "unit Other{index:03};\ninterface\nconst SharedValue = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("other");
+        }
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        ManyUnits {
+            _temp: temp,
+            shared,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    #[test]
+    fn references_today_bind_every_unit_containing_the_name() {
+        let fixture = many_units(20, 479);
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let locations = computed.value.expect("references").value;
+        assert_eq!(
+            locations.len(),
+            21,
+            "declaration plus 20 uses: {locations:?}"
+        );
+        let mut bound = crate::navigation::test_bound_documents();
+        bound.sort();
+        bound.dedup();
+        // l4d-33 Task 10 replaces this with `bound.len() == 21`.
+        assert_eq!(bound.len(), 500, "today every unit with the name is bound");
+    }
+
+    #[test]
+    fn member_references_reach_units_that_never_import_the_declaring_unit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let base = root.join("Base.pas");
+        fs::write(
+            &base,
+            "unit Base;\ninterface\ntype\n  TBase = class\n    Field: Integer;\n  end;\nimplementation\nend.\n",
+        )
+        .expect("base");
+        fs::write(
+            root.join("Mid.pas"),
+            "unit Mid;\ninterface\nuses Base;\ntype\n  TMid = class(TBase)\n  end;\nimplementation\nend.\n",
+        )
+        .expect("mid");
+        let user = root.join("User.pas");
+        fs::write(
+            &user,
+            "unit User;\ninterface\nuses Mid;\nimplementation\nprocedure Run(M: TMid);\nbegin\n  M.Field := 1;\n  with M do Field := 2;\nend;\nend.\n",
+        )
+        .expect("user");
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let computed = references_from_input(
+            workspace.analysis_input(),
+            &source_uri(&base),
+            Position::new(4, 4),
+            true,
+            &AtomicBool::new(false),
+        );
+        let locations = computed.value.expect("references").value;
+        let user_uri = source_uri(&user);
+        let user_lines: Vec<u32> = locations
+            .iter()
+            .filter(|location| location.uri == user_uri)
+            .map(|location| location.range.start.line)
+            .collect();
+        // Characterization: today the inherited member is not followed into a
+        // unit that reaches `Base` only through `Mid`, so neither use at lines
+        // 6 and 7 is reported. l4d-33 Task 10 must keep the declaration
+        // reported and should flip this to expect both uses.
+        assert!(
+            user_lines.is_empty(),
+            "today User.pas uses are not reached: {locations:?}"
+        );
+    }
+
+    #[test]
+    fn two_workspace_symbol_requests_build_two_snapshots() {
+        let fixture = query_fixture();
+        let cancel = AtomicBool::new(false);
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let first = workspace_symbols_from_input(fixture.input.clone(), "Shared", &cancel)
+            .value
+            .expect("first answer")
+            .value;
+        let second = workspace_symbols_from_input(fixture.input.clone(), "Shared", &cancel)
+            .value
+            .expect("second answer")
+            .value;
+        assert!(!first.is_empty(), "the query must find SharedValue");
+        assert_eq!(first, second);
+        // l4d-33 Task 11 changes this to 0 for a workspace with an open document.
+        assert_eq!(crate::workspace::rename::test_workspace_snapshots(), 2);
     }
 
     #[test]

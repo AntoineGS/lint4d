@@ -102,8 +102,20 @@ thread_local! {
     static TEST_ENUMERATED_CONTEXT_HOOK: std::cell::RefCell<Option<EnumeratedContextHook>> =
         std::cell::RefCell::new(None);
     static TEST_SIBLING_CONTEXT_REUSE_CHECKS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static TEST_WORKSPACE_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
     static TEST_ENUMERATED_OWNERS: std::cell::RefCell<Vec<(PathBuf, ContextKey)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_workspace_snapshots() {
+    TEST_WORKSPACE_SNAPSHOTS.with(|count| count.set(0));
+}
+
+/// Whole-workspace snapshots built since the last reset.
+#[cfg(test)]
+pub(crate) fn test_workspace_snapshots() -> usize {
+    TEST_WORKSPACE_SNAPSHOTS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -5890,6 +5902,13 @@ fn build_snapshot_with_policy(
 ) -> Result<RenameSnapshot, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    #[cfg(test)]
+    if matches!(
+        mode,
+        SnapshotMode::Workspace | SnapshotMode::WorkspaceSymbols
+    ) {
+        TEST_WORKSPACE_SNAPSHOTS.with(|count| count.set(count.get().saturating_add(1)));
     }
     let _span = crate::trace::Span::new(|| {
         format!(

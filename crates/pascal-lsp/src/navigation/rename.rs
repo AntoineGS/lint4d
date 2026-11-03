@@ -1894,6 +1894,8 @@ impl NavigationIndex {
             {
                 continue;
             }
+            #[cfg(test)]
+            super::test_record_bound_document(uri);
             if options.strict_resolution
                 && document.opaque_ranges.iter().any(|range| {
                     binding

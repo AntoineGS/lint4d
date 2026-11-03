@@ -376,6 +376,28 @@ pub(super) fn test_document_parse_count() -> usize {
     TEST_DOCUMENT_PARSE_CALLS.with(Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BOUND_DOCUMENTS: std::cell::RefCell<Vec<Url>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_record_bound_document(uri: &Url) {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().push(uri.clone()));
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_bound_documents() {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow_mut().clear());
+}
+
+/// Documents whose identifiers `collect_occurrences_bounded` walked, in order.
+#[cfg(test)]
+pub(crate) fn test_bound_documents() -> Vec<Url> {
+    TEST_BOUND_DOCUMENTS.with(|bound| bound.borrow().clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum IntegerKind {
     Literal,

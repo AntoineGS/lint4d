@@ -527,6 +527,40 @@ pub struct NavigationIndex {
     best_effort_bindings: bool,
     /// What best-effort binding decided that the strict rule would not.
     relaxed_bindings: RelaxedBindings,
+    /// Fenced documents queries looked up imports through (l4d-4nbs D44).
+    binding_demand: BindingDemand,
+}
+
+/// Documents whose unresolved imports a query consulted. A clone starts
+/// empty, like `RelaxedBindings`.
+#[derive(Default)]
+struct BindingDemand(std::sync::Mutex<Vec<Url>>);
+
+impl Clone for BindingDemand {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl BindingDemand {
+    fn record(&self, uri: &Url) {
+        let mut demand = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !demand.contains(uri) {
+            demand.push(uri.clone());
+        }
+    }
+
+    fn take(&self) -> Vec<Url> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 /// Distinct relaxed binding decisions retained for one answer.
@@ -1160,6 +1194,7 @@ impl NavigationIndex {
                 parsed,
                 import_bindings: None,
                 import_binding_fingerprint: None,
+                unbound: None,
             },
         );
         let urls = self.units.entry(unit).or_default();
@@ -1216,6 +1251,7 @@ impl NavigationIndex {
             compiled_unit_bytes: self.compiled_unit_bytes,
             best_effort_bindings: false,
             relaxed_bindings: RelaxedBindings::default(),
+            binding_demand: BindingDemand::default(),
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
@@ -1232,6 +1268,7 @@ impl NavigationIndex {
                     parsed: document.parsed.clone(),
                     import_bindings,
                     import_binding_fingerprint: document.import_binding_fingerprint,
+                    unbound: document.unbound.clone(),
                 },
             );
         }
@@ -2110,6 +2147,7 @@ impl NavigationIndex {
                 &bindings,
             ));
             document.import_bindings = Some(bindings);
+            document.unbound = None;
         }
     }
 
@@ -2122,6 +2160,22 @@ impl NavigationIndex {
                 &HashMap::new(),
             ));
             document.import_bindings = Some(HashMap::new());
+            document.unbound = (!document.interface_uses.is_empty()
+                || !document.implementation_uses.is_empty())
+            .then(|| uri.clone());
+        }
+    }
+
+    /// The documents whose fenced imports a query looked through since the
+    /// last call: resolving their imports is what could change its answer
+    /// (l4d-4nbs D44).
+    pub(crate) fn take_binding_demand(&self) -> Vec<Url> {
+        self.binding_demand.take()
+    }
+
+    fn demand_bindings(&self, document: &Document) {
+        if let Some(uri) = &document.unbound {
+            self.binding_demand.record(uri);
         }
     }
 
@@ -6501,6 +6555,7 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(true);
             };
+            self.demand_bindings(document);
             let Some(bindings) = document.import_bindings.as_ref() else {
                 return Ok(true);
             };
@@ -8104,6 +8159,7 @@ impl NavigationIndex {
         if current_document.unknown_imports.contains(name) {
             return Vec::new();
         }
+        self.demand_bindings(current_document);
         if let Some(bindings) = &current_document.import_bindings {
             return bindings.get(name).cloned().into_iter().collect();
         }
@@ -8120,6 +8176,7 @@ impl NavigationIndex {
         if current_document.unknown_imports.contains(name) {
             return Ok(Vec::new());
         }
+        self.demand_bindings(current_document);
         if let Some(bindings) = &current_document.import_bindings {
             let Some(uri) = bindings.get(name) else {
                 return Ok(Vec::new());
@@ -16341,6 +16398,10 @@ struct Document {
     parsed: Arc<ParsedDocument>,
     import_bindings: Option<HashMap<String, Url>>,
     import_binding_fingerprint: Option<u64>,
+    /// Set while the workspace has fenced this document's imports with an
+    /// empty map without resolving them: a lookup through them records the
+    /// document as a binding demand (l4d-4nbs D44).
+    unbound: Option<Url>,
 }
 
 impl Deref for Document {
@@ -16393,6 +16454,7 @@ impl Document {
                 parsed: previous.clone(),
                 import_bindings: None,
                 import_binding_fingerprint: None,
+                unbound: None,
             });
         }
         #[cfg(test)]
@@ -16852,6 +16914,7 @@ impl Document {
             parsed,
             import_bindings: None,
             import_binding_fingerprint: None,
+            unbound: None,
         })
     }
 

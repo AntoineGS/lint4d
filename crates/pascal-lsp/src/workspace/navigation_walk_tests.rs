@@ -92,6 +92,32 @@ fn a_dependency_whose_imports_fail_to_load_is_skipped_and_marked() {
     let root = temp.path();
     inherited_member_fixture(root);
     let mut workspace = workspace(root);
+    let _fail = FailImports::of("/Base.pas");
+
+    let locations = definition(&mut workspace, &root.join("Main.pas"), Position::new(7, 5));
+
+    assert!(
+        locations.is_empty(),
+        "TRoot binds through Base: {locations:?}"
+    );
+    assert!(
+        workspace.warnings.iter().any(|warning| warning
+            .contains("navigation skipped the imports of")
+            && warning.contains("Base.pas")),
+        "the skipped unit must be reported: {:?}",
+        workspace.warnings
+    );
+}
+
+/// l4d-4nbs D44: best-effort navigation loads the imports its query looks
+/// through: those of Bad, beside the ancestor chain, are not loaded, so
+/// their failure does not touch the answer.
+#[test]
+fn best_effort_navigation_does_not_load_imports_off_the_ancestor_chain() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    inherited_member_fixture(root);
+    let mut workspace = workspace(root);
     let _fail = FailImports::of("/Bad.pas");
 
     let locations = definition(&mut workspace, &root.join("Main.pas"), Position::new(7, 5));
@@ -99,10 +125,11 @@ fn a_dependency_whose_imports_fail_to_load_is_skipped_and_marked() {
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert_eq!(locations[0].uri, uri(&root.join("Root.pas")));
     assert!(
-        workspace.warnings.iter().any(|warning| warning
-            .contains("navigation skipped the imports of")
-            && warning.contains("Bad.pas")),
-        "the skipped unit must be reported: {:?}",
+        !workspace
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("navigation skipped the imports of")),
+        "{:?}",
         workspace.warnings
     );
 }
@@ -242,7 +269,7 @@ fn a_skipped_dependency_is_logged_once_per_configuration_generation() {
     inherited_member_fixture(root);
     let main_workspace = strict_workspace(root);
     let main = uri(&root.join("Main.pas"));
-    let _fail = FailImports::of("/Bad.pas");
+    let _fail = FailImports::of("/Base.pas");
     super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().clear());
 
     for _ in 0..2 {
@@ -256,7 +283,10 @@ fn a_skipped_dependency_is_logged_once_per_configuration_generation() {
         .value
         .expect("definition")
         .locations;
-        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(
+            locations.is_empty(),
+            "TRoot binds through Base: {locations:?}"
+        );
     }
 
     let logged = super::TEST_LOGGED_WARNINGS.with(|logged| logged.borrow().clone());

@@ -1676,6 +1676,9 @@ struct StoreCache {
     /// the latest read of a source, which alternating entries would replace.
     reads: Vec<LoadedSource>,
     reads_capacity: Option<AdmittedOwned<()>>,
+    /// l4d-4nbs D19: the file and directory names of this session's
+    /// search directories (`indexed_absent`).
+    search_index: HashMap<PathBuf, SearchSlot>,
     recorded_work: usize,
     recorded_byte_work: usize,
 }
@@ -4083,8 +4086,9 @@ impl<S: SourceStore> UnitResolver<S> {
                         ResolverError::InvalidRequest("unit explicit sizing overflow".into())
                     })
             })?;
+        // The search and browsing entries are borrowed from a shared context
+        // handle, not copied (l4d-4nbs D19): only their sizing pass reads them.
         let reserve = paths
-            .saturating_mul(2)
             .saturating_add(explicit.saturating_mul(2))
             .saturating_add(names.saturating_mul(
                 self.context.search_path_entries().len()
@@ -4229,15 +4233,15 @@ impl<S: SourceStore> UnitResolver<S> {
         {
             return Ok(result);
         }
-        let search_entries = self.context.search_path_entries().to_vec();
-        for entry in search_entries {
+        let context = Arc::clone(&self.context);
+        for entry in context.search_path_entries() {
             if let Some(result) = self.resolve_directory(
                 &entry.path,
                 &lookup,
                 &namespaces,
                 request.legacy_route,
                 cancel,
-                Some(&entry),
+                Some(entry),
                 requested,
             )? {
                 return Ok(result);
@@ -4248,14 +4252,14 @@ impl<S: SourceStore> UnitResolver<S> {
         // follow every project/client and selected-installation library path,
         // and missing explicit bindings were reserved above.
         if !skip_browsing {
-            for entry in self.context.browsing_path_entries().to_vec() {
+            for entry in context.browsing_path_entries() {
                 if let Some(result) = self.resolve_directory(
                     &entry.path,
                     &lookup,
                     &namespaces,
                     request.legacy_route,
                     cancel,
-                    Some(&entry),
+                    Some(entry),
                     requested,
                 )? {
                     return Ok(result);
@@ -4300,6 +4304,15 @@ impl<S: SourceStore> UnitResolver<S> {
         provided_entry: Option<&ProjectPathEntry>,
         requested: &str,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        // A search entry the session's name index proves cannot hold the
+        // unit is skipped before any per-directory scratch (l4d-4nbs D19).
+        if self.compile_time_store.is_some()
+            && let Some(provided) = provided_entry
+            && self.indexed_absent(directory, provided, unit_name, namespaces, cancel)?
+        {
+            return Ok(None);
+        }
+        let indexed = provided_entry.map(|provided| (directory.to_path_buf(), provided.clone()));
         let bytes = directory.as_os_str().len().saturating_mul(8); // canonical directory/entry scratch remains a later boundary
         self.admit_lookup_storage(1, bytes, bytes, cancel)?;
         let directory = canonical_path(directory);
@@ -4315,6 +4328,11 @@ impl<S: SourceStore> UnitResolver<S> {
             provenance: entry.provenance,
         };
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
+        if self.compile_time_store.is_some()
+            && let Some((path, provided)) = &indexed
+        {
+            self.index_directory(path, provided, &listing, cancel);
+        }
         if !listing.complete {
             return Ok(Some(Resolution::Incomplete {
                 reason: self.unit_reason_build(
@@ -4477,6 +4495,146 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         Ok(None)
+    }
+
+    /// Whether this session's name index proves that `directory` holds no
+    /// candidate for `unit_name` (l4d-4nbs D19): the directory is proven
+    /// unchanged since it was indexed (as for a reused listing), none of the
+    /// lookup's file names is in it and no overlay provides one there. A
+    /// lookup then costs a stat per directory it skips instead of a match
+    /// over its listing; the directories that may hold the unit are resolved
+    /// as before, in search order. Dotted names, which may live in nested
+    /// directories, are not indexed.
+    fn indexed_absent(
+        &self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        unit_name: &str,
+        namespaces: &[String],
+        cancel: &dyn CancellationToken,
+    ) -> Result<bool, ResolverError> {
+        if unit_name.contains('.') {
+            return Ok(false);
+        }
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let names = filename_tiers(unit_name, namespaces)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        budget
+            .charge(
+                names.len() + 2,
+                directory.as_os_str().len() + names.iter().map(String::len).sum::<usize>(),
+                0,
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+                return Ok(false);
+            }
+            let Some(slot) = cache
+                .search_index
+                .get(directory)
+                .filter(|slot| slot.entry == *entry)
+            else {
+                return Ok(false);
+            };
+            let current = path_stamp_result(directory).ok().flatten();
+            let unchanged = match (&slot.stamp, &current) {
+                (Some(stamp), Some(current)) => stamp.proves_unchanged(current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged
+                || names
+                    .iter()
+                    .any(|name| slot.names.contains(&name.to_ascii_lowercase()))
+            {
+                return Ok(false);
+            }
+        }
+        let overlays = self
+            .store
+            .overlay_candidates_admitted(&[directory.to_path_buf()], &names, &mut budget, cancel)
+            .map_err(root_store_error)?;
+        Ok(overlays.iter().all(|path| {
+            path.parent()
+                .is_none_or(|parent| !path_equivalent(parent, directory))
+        }))
+    }
+
+    /// Index the names of a complete listing of a settled (or absent)
+    /// directory for this session. Charged once per entry when the
+    /// directory is (re)indexed; refused retained bytes only stop indexing.
+    fn index_directory(
+        &self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        listing: &DirectoryListing,
+        cancel: &dyn CancellationToken,
+    ) {
+        if !listing.complete {
+            return;
+        }
+        let stamp = match &listing.stamp {
+            Some(stamp) if stamp.settled => Some(stamp.clone()),
+            None if listing.files.is_empty() && listing.directories.is_empty() => None,
+            _ => return,
+        };
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.value_mut();
+        if cache.reuse_policy.is_none() {
+            cache.reuse_policy = Some(self.context.read_policy().clone());
+        } else if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+            return;
+        }
+        if cache
+            .search_index
+            .get(directory)
+            .is_some_and(|slot| slot.stamp == stamp && slot.entry == *entry)
+        {
+            return;
+        }
+        let entries = listing.files.iter().chain(&listing.directories);
+        // The key, and a conservative share of the map's backing.
+        let mut bytes = 2 * directory.as_os_str().len() + 2 * size_of::<(PathBuf, SearchSlot)>();
+        entry
+            .visit_recovery_payload(&mut |n| {
+                bytes = bytes.saturating_add(n);
+                Ok(())
+            })
+            .expect("infallible size visitor");
+        let mut count = 0usize;
+        for path in entries.clone() {
+            count += 1;
+            bytes += path.file_name().map_or(0, |name| name.len()) + 2 * size_of::<String>();
+        }
+        let Ok(receipt) = budget.admit_owned(count + 1, bytes, bytes, || ()) else {
+            return;
+        };
+        let names = entries
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        cache.search_index.insert(
+            directory.to_path_buf(),
+            SearchSlot {
+                entry: entry.clone(),
+                stamp,
+                names,
+                _receipt: receipt,
+            },
+        );
     }
 
     fn explicit_structured_paths(
@@ -8613,6 +8771,14 @@ impl<T> std::ops::Deref for LookupScratch<T> {
             Self::Admitted(value) => value,
         }
     }
+}
+
+/// The names one search directory held when it was indexed.
+struct SearchSlot {
+    entry: ProjectPathEntry,
+    stamp: Option<ProjectReadStamp>,
+    names: HashSet<String>,
+    _receipt: AdmittedOwned<()>,
 }
 
 /// A session listing reuse key. The session's read policy is constant and

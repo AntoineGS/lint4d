@@ -960,11 +960,10 @@ fn analyze_source_with_providers_inner(
     if session.reasons.is_empty() && !header_only {
         let mut failure = None;
         for path in &mut session.current {
+            // An unknown declaration state is not a property of the file:
+            // each query that consults declarations answers Unknown instead.
             if let Err(reason) = path.finish_owned(session.budget) {
                 failure = Some(reason);
-                break;
-            } else if path.state().unknown {
-                failure = Some(IncompleteReason::MalformedSource);
                 break;
             }
         }

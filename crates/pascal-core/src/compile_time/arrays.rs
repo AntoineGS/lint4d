@@ -929,6 +929,12 @@ pub(super) fn scalar_query(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     use crate::conditional::ExpressionQuery;
+    if state.unknown && !matches!(query, ExpressionQuery::Defined(..)) {
+        // A declaration may be missing or misplaced: neither a binding, its
+        // absence nor a constant value is proven. Defines do not depend on it.
+        budget.charge(1, 0, 0)?;
+        return Ok(Some(BoundValue::Unproven));
+    }
     match query {
         ExpressionQuery::LexicalName(name, _) => {
             lexical_constant_name(state, site, name, depth, budget)

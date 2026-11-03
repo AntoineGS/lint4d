@@ -118,6 +118,9 @@ pub(super) struct Shared {
     /// A retry due for the `Bypassed` state of this generation.
     retry: Option<(u64, Instant)>,
     logged: [Option<Instant>; names::BYPASS_KINDS],
+    /// Transition lines, written by [`Inner::unlock`] once `shared` is
+    /// released (a client not draining stderr must not block the lock).
+    log: Vec<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -154,6 +157,7 @@ impl Shared {
             retry_delay: None,
             retry: None,
             logged: [None; names::BYPASS_KINDS],
+            log: Vec::new(),
         }
     }
 
@@ -180,8 +184,8 @@ impl Shared {
         self.log_transition();
     }
 
-    /// One stderr line for each settled state; a repeated bypass at most
-    /// once per [`LOG_REPEAT_INTERVAL`].
+    /// Queue one stderr line for each settled state; a repeated bypass at
+    /// most once per [`LOG_REPEAT_INTERVAL`].
     fn log_transition(&mut self) {
         let cause = match &self.state {
             CacheState::Opening | CacheState::Fencing => return,
@@ -207,7 +211,8 @@ impl Shared {
                 }
             }
         };
-        eprintln!("pascal-lsp: persistent cache {}{cause}", self.state_name());
+        let line = format!("pascal-lsp: persistent cache {}{cause}", self.state_name());
+        self.log.push(line);
     }
 }
 
@@ -310,20 +315,36 @@ impl Inner {
         self.changed.notify_all();
     }
 
+    /// Release `shared`, then write the transition lines it queued.
+    fn unlock(&self, mut shared: MutexGuard<'_, Shared>) {
+        let lines = std::mem::take(&mut shared.log);
+        drop(shared);
+        for line in lines {
+            eprintln!("{line}");
+        }
+    }
+
     /// One admitted operation ended (its store reference already dropped).
     fn release(self: &Arc<Self>) {
         let mut shared = self.lock();
         shared.active -= 1;
         self.finish_fence(&mut shared);
-        drop(shared);
+        self.unlock(shared);
         self.changed.notify_all();
     }
 
-    /// Drop a store handed out by [`Inner::begin_fence`] with no lock held.
+    /// After [`Inner::begin_fence`]: drop the store it handed out with no
+    /// lock held, then finish the fence. Always called, so a fence that
+    /// holds nothing (no job, no store, an open not yet claimed by the
+    /// worker) finishes here.
     fn close(self: &Arc<Self>, store: Option<Arc<AdmittedStore>>) {
         if let Some(store) = store {
             drop(store);
             self.release();
+        } else {
+            let mut shared = self.lock();
+            self.finish_fence(&mut shared);
+            self.unlock(shared);
         }
     }
 
@@ -502,7 +523,7 @@ impl PersistentCache {
                 }
             }
         }
-        drop(shared);
+        inner.unlock(shared);
         inner.close(store);
         inner.acknowledge(inner.lock(), wait)
     }
@@ -528,7 +549,7 @@ impl PersistentCache {
             }
             CacheState::Fencing | CacheState::Disabled | CacheState::Bypassed(_) => {}
         }
-        drop(shared);
+        inner.unlock(shared);
         inner.close(store);
         inner.acknowledge(inner.lock(), MAX_OPEN_WAIT)
     }
@@ -543,13 +564,13 @@ impl PersistentCache {
         shared.shut_down = true;
         shared.retry = None;
         let store = inner.begin_fence(&mut shared, CacheState::Disabled);
-        drop(shared);
+        inner.unlock(shared);
         inner.close(store);
         let mut shared = inner.wait_while(inner.lock(), MAX_OPEN_WAIT, |shared| {
             shared.state == CacheState::Fencing
         });
         let commands = shared.commands.take();
-        drop(shared);
+        inner.unlock(shared);
         if let Some(commands) = commands {
             let _ = commands.send(worker::Command::Shutdown);
         }
@@ -720,7 +741,7 @@ impl CacheJob {
         }
         self.inner.counters.record_bypass(bypass);
         let store = self.inner.begin_fence(&mut shared, CacheState::Opening);
-        drop(shared);
+        self.inner.unlock(shared);
         self.inner.close(store);
     }
 }

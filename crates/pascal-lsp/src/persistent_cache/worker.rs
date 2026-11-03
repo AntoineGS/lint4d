@@ -113,8 +113,10 @@ fn open(inner: &Arc<Inner>) -> bool {
         let mut shared = inner.lock();
         shared.active -= 1;
         inner.finish_fence(&mut shared);
+        let reopen = shared.state == CacheState::Opening;
+        inner.unlock(shared);
         inner.changed.notify_all();
-        return shared.state == CacheState::Opening;
+        return reopen;
     }
     shared.active -= 1;
     match opened {
@@ -137,6 +139,7 @@ fn open(inner: &Arc<Inner>) -> bool {
             }
         }
     }
+    inner.unlock(shared);
     inner.changed.notify_all();
     false
 }

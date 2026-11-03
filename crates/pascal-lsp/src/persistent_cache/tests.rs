@@ -427,10 +427,13 @@ fn an_open_refused_for_now_is_retried_after_the_backoff() {
     let holder = Arc::new(Store::open(root.path(), &namespace(), StoreLimits::default()).unwrap());
     // The holder's reclaim stops inside its write transaction.
     let (entered, release) = (mpsc::channel(), mpsc::channel::<()>());
-    let (entered_sender, release_receiver) = (Mutex::new(entered.0), Mutex::new(release.1));
+    // One-shot: a later commit on the holder passes straight through.
+    let hook = Mutex::new(Some((entered.0, release.1)));
     holder.set_before_commit_for_test(move || {
-        lock(&entered_sender).send(()).unwrap();
-        lock(&release_receiver).recv().unwrap();
+        if let Some((entered, release)) = lock(&hook).take() {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
     });
     let reclaim = {
         let holder = Arc::clone(&holder);
@@ -456,4 +459,84 @@ fn an_open_refused_for_now_is_retried_after_the_backoff() {
     assert!(cache.wait_for(|state| *state == CacheState::Enabled, SETTLE));
     drop(holder);
     assert_eq!(live_leases(root.path()), 1);
+}
+
+/// A handle that is `Opening` with the open not yet claimed by the worker
+/// (no worker, nothing admitted): the window between `request_open` and
+/// the worker's first lock.
+fn unclaimed_opening(project_cache: &ProjectCache, options: CacheOptions) -> PersistentCache {
+    let cache = PersistentCache {
+        inner: Some(Arc::new(Inner::new(
+            options,
+            project_cache.clone(),
+            Arc::default(),
+            namespace(),
+            false,
+        ))),
+    };
+    assert_eq!(cache.state(), CacheState::Opening);
+    assert!(!cache.has_worker_for_test());
+    cache
+}
+
+/// A fence that holds nothing (no job, no store, no open claimed yet)
+/// finishes at once.
+#[test]
+fn a_disable_before_the_open_is_claimed_is_acknowledged_at_once() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = unclaimed_opening(&project_cache, options(root.path()));
+    let generation = cache.generation();
+    assert_eq!(
+        cache.reconfigure_within(
+            CacheOptions {
+                enabled: false,
+                ..options(root.path())
+            },
+            Duration::ZERO
+        ),
+        Ack::Done
+    );
+    assert_eq!(cache.state(), CacheState::Disabled);
+    assert!(cache.generation() > generation);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_shutdown_before_the_open_is_claimed_finishes() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = unclaimed_opening(&project_cache, options(root.path()));
+    cache.shutdown();
+    assert_eq!(cache.state(), CacheState::Disabled);
+    assert!(!cache.has_worker_for_test());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_budget_change_before_the_open_is_claimed_reopens() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = unclaimed_opening(&project_cache, options(root.path()));
+    let smaller = CacheOptions {
+        scratch_bytes: 2 << 20,
+        ..options(root.path())
+    };
+    assert_eq!(
+        cache.reconfigure_within(smaller.clone(), Duration::ZERO),
+        Ack::Done
+    );
+    assert_ne!(cache.state(), CacheState::Fencing);
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert_eq!(cache.job().unwrap().store().limits(), smaller.limits());
+}
+
+#[test]
+fn a_readmission_before_the_open_is_claimed_reopens() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = unclaimed_opening(&project_cache, options(root.path()));
+    assert_eq!(cache.readmit(), Ack::Done);
+    assert_ne!(cache.state(), CacheState::Fencing);
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
 }

@@ -2004,7 +2004,7 @@ fn the_byte_grant_covers_the_measured_closure_cost_with_margin() {
 }
 
 /// A shared store of compiled provider interfaces that counts compilations
-/// (puts) and reuses (hits).
+/// (puts of a key it holds no valid graph for) and reuses (hits).
 #[derive(Default)]
 struct CountingStore {
     graphs: std::sync::Mutex<
@@ -2024,20 +2024,13 @@ impl pascal_core::compile_time::SharedProviderGraphs for CountingStore {
         &self,
         key: &pascal_core::compile_time::ProviderGraphKey,
     ) -> Option<std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>> {
-        let current = self.current.lock().unwrap();
         let hit = self
             .graphs
             .lock()
             .unwrap()
             .get(key)
             .cloned()
-            .filter(|graph| {
-                graph.dependencies.iter().all(|d| {
-                    current
-                        .get(d.source.as_str())
-                        .is_none_or(|version| d.overlay_version == Some(*version))
-                })
-            });
+            .filter(|graph| self.valid(graph));
         if hit.is_some() {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2048,12 +2041,25 @@ impl pascal_core::compile_time::SharedProviderGraphs for CountingStore {
         key: pascal_core::compile_time::ProviderGraphKey,
         graph: std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
     ) {
-        self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.graphs.lock().unwrap().insert(key, graph);
+        let mut graphs = self.graphs.lock().unwrap();
+        // A graph with more names prepared replaces a valid one: that is no
+        // compilation.
+        if !graphs.get(&key).is_some_and(|old| self.valid(old)) {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        graphs.insert(key, graph);
     }
 }
 
 impl CountingStore {
+    fn valid(&self, graph: &pascal_core::compile_time::SharedProviderGraph) -> bool {
+        let current = self.current.lock().unwrap();
+        graph.dependencies.iter().all(|d| {
+            current
+                .get(d.source.as_str())
+                .is_none_or(|version| d.overlay_version == Some(*version))
+        })
+    }
     fn puts(&self) -> usize {
         self.puts.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -2185,4 +2191,34 @@ fn shared_graphs_never_share_occurrence_ids() {
     let count = occurrences.len();
     occurrences.dedup();
     assert_eq!(occurrences.len(), count, "{occurrences:?}");
+}
+
+/// A name a reusing session prepares on a shared interface is shared too:
+/// the next session that asks for it copies and prepares nothing.
+#[test]
+fn names_prepared_on_a_shared_interface_are_shared() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let a = "unit A; interface uses W; type TA = W.TW; TB = W.TW; implementation end.";
+    let session = |root: &str| {
+        let mut f = provider_fixture(root, &[("A", a)]);
+        f.shared = Some(store.clone());
+        f.analyze().unwrap()
+    };
+    session(SHARED_ROOT);
+    let tb =
+        "unit Main; interface uses A; {$IF SizeOf(A.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.";
+    let preparing = session(tb);
+    assert_eq!(activity(&preparing, "DEFINE HB"), Truth::True);
+    let puts = store.puts();
+    let prepared = session(tb);
+    assert_eq!(activity(&prepared, "DEFINE HB"), Truth::True);
+    assert_eq!(store.puts(), puts, "nothing new is prepared");
+    let (one, two) = (
+        preparing.budget.budget_snapshot(),
+        prepared.budget.budget_snapshot(),
+    );
+    assert!(
+        two.retained_bytes < one.retained_bytes,
+        "{one:?} then {two:?}"
+    );
 }

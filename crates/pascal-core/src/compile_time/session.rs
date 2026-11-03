@@ -77,8 +77,8 @@ pub struct SharedProviderGraph {
     pub occurrence: OccurrenceId,
     /// `None`: the interface could not be completed.
     pub graph: Option<AdmittedInterfaceGraph>,
-    pub observations: Vec<ResolutionObservation>,
-    pub warnings: Vec<String>,
+    pub observations: Arc<Vec<ResolutionObservation>>,
+    pub warnings: Arc<Vec<String>>,
     /// Every provider source the graph was compiled from, nested ones
     /// included: a store must validate them before reuse.
     pub dependencies: Arc<Vec<ProviderDependency>>,
@@ -602,6 +602,36 @@ struct ProviderGraph {
     graph: Option<AdmittedInterfaceGraph>,
     /// The provider sources the graph depends on, itself included.
     dependencies: Arc<Vec<ProviderDependency>>,
+    /// Where the graph is shared beyond the session, with what its
+    /// compilation reported: a graph with more names prepared replaces it.
+    shared: Option<Arc<SharedOrigin>>,
+}
+
+struct SharedOrigin {
+    key: ProviderGraphKey,
+    observations: Arc<Vec<ResolutionObservation>>,
+    warnings: Arc<Vec<String>>,
+}
+
+fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
+    if more.is_empty() {
+        return base.clone();
+    }
+    let mut all = base.as_ref().clone();
+    all.extend_from_slice(more);
+    Arc::new(all)
+}
+
+fn shared_retained_bytes(
+    graph: &AdmittedInterfaceGraph,
+    observations: &[ResolutionObservation],
+) -> usize {
+    let mut retained_bytes = 0usize;
+    let _ = graph.visit_snapshot_payload(&mut |n| {
+        retained_bytes = retained_bytes.saturating_add(n);
+        Ok(())
+    });
+    retained_bytes.saturating_add(observations_payload(observations))
 }
 
 /// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
@@ -2023,13 +2053,41 @@ impl ProviderEngine<'_, '_> {
             }
             if let Some(provider) = state.interfaces[index].provided.take() {
                 match self.compile_provider_interface(provider, suffix, pointers, depth + 1)? {
-                    Fact::Known(graph) => state.interfaces[index].graph = Some(graph),
+                    Fact::Known(graph) => {
+                        state.interfaces[index].occurrence =
+                            self.providers.graphs.iter().find_map(|entry| {
+                                entry
+                                    .graph
+                                    .as_ref()
+                                    .is_some_and(|memo| Arc::ptr_eq(memo, &graph))
+                                    .then_some(entry.occurrence)
+                            });
+                        state.interfaces[index].graph = Some(graph);
+                    }
                     Fact::Unknown(reason) => state.interfaces[index].failure = Some(reason),
                     Fact::Incomplete(reason) => return Err(resolver_error(reason, self.budget)),
                 }
             } else if let Some(graph) = &state.interfaces[index].graph {
-                state.interfaces[index].graph =
-                    Some(self.replace_interface_graph(graph, suffix, pointers, depth + 1)?);
+                // Prepare on the session's graph with the most names
+                // prepared, which a shared graph follows; a graph of
+                // another session's numbering is prepared on its own.
+                let memo = state.interfaces[index].occurrence.and_then(|occurrence| {
+                    self.providers
+                        .graphs
+                        .iter()
+                        .position(|entry| entry.occurrence == occurrence && entry.graph.is_some())
+                });
+                self.budget
+                    .charge(self.providers.graphs.len() + 1, 0, 0)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                let prepared = match memo {
+                    Some(memo) => match self.prepare_memoized(memo, suffix, pointers, depth)? {
+                        Fact::Known(prepared) => prepared,
+                        _ => self.replace_interface_graph(graph, suffix, pointers, depth + 1)?,
+                    },
+                    None => self.replace_interface_graph(graph, suffix, pointers, depth + 1)?,
+                };
+                state.interfaces[index].graph = Some(prepared);
             }
         }
         Ok(())
@@ -2321,13 +2379,7 @@ impl ProviderEngine<'_, '_> {
                 drop(provider);
                 let dependencies = self.providers.graphs[index].dependencies.clone();
                 self.note_dependencies(&dependencies)?;
-                let Some(graph) = self.providers.graphs[index].graph.clone() else {
-                    return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
-                };
-                let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1)?;
-                // Keep the graph with the most names prepared.
-                self.providers.graphs.value_mut()[index].value_mut().graph = Some(prepared.clone());
-                return Ok(Fact::Known(prepared));
+                return self.prepare_memoized(index, name, pointers, depth);
             }
         }
         let shared = if new_identity {
@@ -2347,7 +2399,14 @@ impl ProviderEngine<'_, '_> {
         if let (Some(store), Some(key)) = (&shared, &shared_key)
             && let Some(hit) = store.get(key)
         {
-            return self.reuse_shared_graph(provider, metadata, &hit, name, pointers, depth);
+            return self.reuse_shared_graph(
+                provider,
+                metadata,
+                (&hit, key.clone()),
+                name,
+                pointers,
+                depth,
+            );
         }
         let observations_before = self.observations.len();
         let warnings_before = self.warnings.len();
@@ -2446,16 +2505,23 @@ impl ProviderEngine<'_, '_> {
         let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
         move_report_vector(self.observations, observations, self.budget)?;
         move_report_vector(self.warnings, warnings, self.budget)?;
+        let origin = shared_key.map(|key| {
+            Arc::new(SharedOrigin {
+                key,
+                observations: Arc::new(self.observations[observations_before..].to_vec()),
+                warnings: Arc::new(self.warnings[warnings_before..].to_vec()),
+            })
+        });
         if !analysis.facts().interface_complete {
             drop(analysis);
-            if let (Some(store), Some(key)) = (&shared, shared_key) {
+            if let (Some(store), Some(origin)) = (&shared, &origin) {
                 store.put(
-                    key,
+                    origin.key.clone(),
                     Arc::new(SharedProviderGraph {
                         occurrence,
                         graph: None,
-                        observations: self.observations[observations_before..].to_vec(),
-                        warnings: self.warnings[warnings_before..].to_vec(),
+                        observations: origin.observations.clone(),
+                        warnings: origin.warnings.clone(),
                         dependencies: dependencies.clone(),
                         retained_bytes: 0,
                     }),
@@ -2467,6 +2533,7 @@ impl ProviderEngine<'_, '_> {
                     occurrence,
                     graph: None,
                     dependencies,
+                    shared: origin,
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             push_owner(&mut self.providers.graphs, entry, self.budget)?;
@@ -2512,23 +2579,16 @@ impl ProviderEngine<'_, '_> {
             .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
         drop(analysis);
-        if let (Some(store), Some(key)) = (&shared, shared_key) {
-            let mut retained_bytes = 0usize;
-            let _ = graph.visit_snapshot_payload(&mut |n| {
-                retained_bytes = retained_bytes.saturating_add(n);
-                Ok(())
-            });
-            let observations = self.observations[observations_before..].to_vec();
-            retained_bytes = retained_bytes.saturating_add(observations_payload(&observations));
+        if let (Some(store), Some(origin)) = (&shared, &origin) {
             store.put(
-                key,
+                origin.key.clone(),
                 Arc::new(SharedProviderGraph {
                     occurrence,
                     graph: Some(graph.clone()),
-                    observations,
-                    warnings: self.warnings[warnings_before..].to_vec(),
+                    observations: origin.observations.clone(),
+                    warnings: origin.warnings.clone(),
                     dependencies: dependencies.clone(),
-                    retained_bytes,
+                    retained_bytes: shared_retained_bytes(&graph, &origin.observations),
                 }),
             );
         }
@@ -2538,6 +2598,7 @@ impl ProviderEngine<'_, '_> {
                 occurrence,
                 graph: Some(graph.clone()),
                 dependencies,
+                shared: origin,
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
@@ -2567,7 +2628,7 @@ impl ProviderEngine<'_, '_> {
         &mut self,
         provider: AdmittedProviderSource,
         metadata: usize,
-        hit: &SharedProviderGraph,
+        (hit, shared_key): (&SharedProviderGraph, ProviderGraphKey),
         name: &str,
         pointers: bool,
         depth: usize,
@@ -2589,7 +2650,7 @@ impl ProviderEngine<'_, '_> {
         let observations = self
             .budget
             .admit_owned(hit.observations.len(), bytes, bytes, || {
-                hit.observations.clone()
+                hit.observations.as_ref().clone()
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         move_report_vector(self.observations, observations, self.budget)?;
@@ -2600,32 +2661,90 @@ impl ProviderEngine<'_, '_> {
             .sum();
         let warnings = self
             .budget
-            .admit_owned(hit.warnings.len(), bytes, bytes, || hit.warnings.clone())
+            .admit_owned(hit.warnings.len(), bytes, bytes, || {
+                hit.warnings.as_ref().clone()
+            })
             .map_err(|r| resolver_error(r, self.budget))?;
         move_report_vector(self.warnings, warnings, self.budget)?;
         self.note_dependencies(&hit.dependencies)?;
-        let Some(graph) = hit.graph.clone() else {
-            let entry = self
-                .budget
-                .admit_owned(1, 0, 0, || ProviderGraph {
-                    occurrence,
-                    graph: None,
-                    dependencies: hit.dependencies.clone(),
-                })
-                .map_err(|r| resolver_error(r, self.budget))?;
-            push_owner(&mut self.providers.graphs, entry, self.budget)?;
-            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
-        };
-        let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1)?;
         let entry = self
             .budget
             .admit_owned(1, 0, 0, || ProviderGraph {
                 occurrence,
-                graph: Some(prepared.clone()),
+                graph: hit.graph.clone(),
                 dependencies: hit.dependencies.clone(),
+                shared: Some(Arc::new(SharedOrigin {
+                    key: shared_key,
+                    observations: hit.observations.clone(),
+                    warnings: hit.warnings.clone(),
+                })),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
+        let index = self.providers.graphs.len() - 1;
+        self.prepare_memoized(index, name, pointers, depth)
+    }
+
+    /// Prepare `name` on the session's graph at `index`. A copy with the
+    /// name prepared replaces it, and replaces the shared graph too, so later
+    /// sessions find the name prepared (l4d-4nbs D29); what preparing
+    /// observed and depended on joins what the shared graph reports.
+    fn prepare_memoized(
+        &mut self,
+        index: usize,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        let Some(graph) = self.providers.graphs[index].graph.clone() else {
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        };
+        let observations_before = self.observations.len();
+        let warnings_before = self.warnings.len();
+        self.providers.collecting.push(Vec::new());
+        let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1);
+        let added = Arc::new(self.providers.collecting.pop().unwrap_or_default());
+        let prepared = prepared?;
+        self.note_dependencies(&added)?;
+        if Arc::ptr_eq(&prepared, &graph) {
+            return Ok(Fact::Known(prepared));
+        }
+        let entry = self.providers.graphs.value_mut()[index].value_mut();
+        // Keep the graph with the most names prepared.
+        entry.graph = Some(prepared.clone());
+        if !added.is_empty() {
+            let mut dependencies = entry.dependencies.as_ref().clone();
+            dependencies.extend(added.iter().cloned());
+            dependencies.sort_by(|a, b| {
+                (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
+            });
+            dependencies.dedup();
+            entry.dependencies = Arc::new(dependencies);
+        }
+        let (Some(origin), Some(store)) =
+            (entry.shared.clone(), self.resolver.shared_provider_graphs())
+        else {
+            return Ok(Fact::Known(prepared));
+        };
+        let origin = Arc::new(SharedOrigin {
+            key: origin.key.clone(),
+            observations: extended(
+                &origin.observations,
+                &self.observations[observations_before..],
+            ),
+            warnings: extended(&origin.warnings, &self.warnings[warnings_before..]),
+        });
+        let entry = self.providers.graphs.value_mut()[index].value_mut();
+        entry.shared = Some(origin.clone());
+        let shared = SharedProviderGraph {
+            occurrence: entry.occurrence,
+            graph: Some(prepared.clone()),
+            observations: origin.observations.clone(),
+            warnings: origin.warnings.clone(),
+            dependencies: entry.dependencies.clone(),
+            retained_bytes: shared_retained_bytes(&prepared, &origin.observations),
+        };
+        store.put(origin.key.clone(), Arc::new(shared));
         Ok(Fact::Known(prepared))
     }
 }
@@ -2676,6 +2795,7 @@ impl RootSession<'_, '_> {
                                 qualifiers,
                                 site,
                                 graph: None,
+                                occurrence: None,
                                 pending,
                                 attempted: activity != Truth::True,
                                 provided: None,

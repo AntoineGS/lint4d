@@ -3917,6 +3917,89 @@ mod tests {
         );
     }
 
+    /// l4d-jeh4: 300 unverified units that never mention the name sort
+    /// before the 20 importers that do. References read at most the
+    /// interactive bound directly, the members that spell the name first,
+    /// and report the rest as a gap; rename keeps the complete walk.
+    #[test]
+    fn references_read_a_bounded_set_of_unverified_members_likely_ones_first() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for index in 0..300 {
+            fs::write(
+                root.join(format!("Alpha{index:03}.pas")),
+                format!(
+                    "unit Alpha{index:03};\ninterface\nuses Shared;\nconst OtherValue = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("alpha");
+        }
+        let importers = (0..20)
+            .map(|index| {
+                let path = root.join(format!("Zed{index:03}.pas"));
+                fs::write(
+                    &path,
+                    format!(
+                        "unit Zed{index:03};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                )
+                .expect("importer");
+                path
+            })
+            .collect::<Vec<_>>();
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        crate::navigation::test_reset_bound_documents();
+        let computed = references_from_input(
+            input.clone(),
+            &source_uri(&shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+        let bound = crate::workspace::indexing::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
+        assert!(
+            partial.coverage.gaps.iter().any(|gap| gap.reason
+                == format!(
+                    "{} units of {} are not indexed yet; {bound} were searched directly",
+                    321 - bound,
+                    shared.display()
+                )),
+            "{:?}",
+            partial.coverage
+        );
+        let mut expected = importers
+            .iter()
+            .map(|path| (source_uri(path), 6, 6))
+            .chain([(source_uri(&shared), 2, 6)])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(located(&partial.value), expected);
+
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let rename = crate::workspace::rename::rename_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+        let edit = rename.value.expect("rename walks the whole workspace");
+        let changes = edit.changes.expect("plain changes");
+        assert_eq!(changes.len(), 21, "{:?}", changes.keys());
+    }
+
     #[test]
     fn refused_members_are_a_gap_not_a_candidate() {
         let temp = tempfile::tempdir().expect("temporary workspace");

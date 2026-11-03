@@ -210,8 +210,8 @@ facts, and checked layout arithmetic cannot wrap to a known size.
 | Scope / type depth / array dimensions (each) | 256 |
 | Branch states | 64 |
 | Provider queries | 256 |
-| Work units | 2,000,000 |
-| Byte-work | 64 MiB |
+| Work units | 2,000,000, plus 8 per scanned source byte |
+| Byte-work | 64 MiB, plus 32 per scanned source byte |
 
 These are refusal ceilings, not promises that every input at the dimensional
 maximum fits. The finite work profile has measured 1.681x operation and 1.704x

@@ -472,6 +472,7 @@ pub(super) fn selected_import_header(
     let conditional_context = context.conditional_context_for(&root.path);
     let used = resolver.compile_time_usage();
     let granted = resolver.compile_time_work_allowance();
+    let granted_bytes = resolver.compile_time_byte_work_allowance();
     let mut adapter = HeaderResolver {
         inner: &mut resolver,
         captures: None,
@@ -488,6 +489,7 @@ pub(super) fn selected_import_header(
                 .saturating_sub(used.work),
             max_byte_work: limits
                 .max_compile_time_byte_work
+                .saturating_add(granted_bytes)
                 .saturating_sub(used.byte_work),
             max_retained_bytes: limits
                 .max_compile_time_retained_bytes

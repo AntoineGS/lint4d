@@ -50,7 +50,11 @@ fn is_work_limit(result: &Result<bool, ResolverError>) -> bool {
 
 /// About SynCommons.pas' size and shape: an interface of declarations and a
 /// large implementation of routine bodies, comments and conditional code.
-fn synthetic_library(bytes: usize) -> String {
+/// `statements` repeats each routine's statement block, so larger values
+/// make bigger routines with the same declarations.
+fn synthetic_library(bytes: usize, statements: usize) -> String {
+    let block = "  case Count mod 4 of\n    0: Result := Result + 1;\n    1: Result := Result - 1;\n    2: Result := Result * 2;\n  else\n    Result := 0;\n  end;\n"
+        .repeat(statements);
     let mut text = String::from(
         "unit T;\n\ninterface\n\n{$DEFINE FAST}\n{$IFDEF CPU64}\nconst Bits = 64;\n{$ELSE}\nconst Bits = 32;\n{$ENDIF}\n\ntype\n",
     );
@@ -79,7 +83,7 @@ fn synthetic_library(bytes: usize) -> String {
              for I := 1 to Length(Text) do\n    if Text[I] = 'x' then\n      Inc(Count)\n    else if Text[I] = 'y' then\n      Dec(Count)\n    else\n      Count := Count + Ord(Text[I]) mod 7;\n\
              if Count > 1000 then\n    Count := Count div 2\n  else\n    Count := Count * 3;\n\
              Result := Count + Length(Text) - 1; (* recompute the result from the state *)\n\
-             case Count mod 4 of\n    0: Result := Result + 1;\n    1: Result := Result - 1;\n    2: Result := Result * 2;\n  else\n    Result := 0;\n  end;\n\
+             {block}\
              if Text <> '' then\n    Result := Result + Ord(Text[1]);\n{body}end;\n\n"
         ));
         n += 1;
@@ -90,7 +94,7 @@ fn synthetic_library(bytes: usize) -> String {
 
 #[test]
 fn a_large_ordinary_source_with_directives_is_analysed() {
-    let text = synthetic_library(2_300_000);
+    let text = synthetic_library(2_300_000, 1);
     let (result, usage) = analyze(&text);
     assert!(
         !is_work_limit(&result),
@@ -98,6 +102,20 @@ fn a_large_ordinary_source_with_directives_is_analysed() {
         text.len()
     );
     assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+}
+
+/// Byte work, like steps, follows the input: an 8 MB ordinary unit (within
+/// the 16 MiB maxFileBytes ceiling) scans, copies and maps more than the
+/// fixed 64 MiB of byte work.
+#[test]
+fn a_larger_ordinary_source_fits_the_byte_budget() {
+    let text = synthetic_library(8_000_000, 16);
+    let (result, usage) = analyze(&text);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+    assert!(
+        usage.byte_work > CompileTimeLimits::default().max_byte_work,
+        "{usage:?}"
+    );
 }
 
 #[test]

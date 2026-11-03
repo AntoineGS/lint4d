@@ -2073,8 +2073,9 @@ path also runs before provider body/closure indexing when the body would refuse
 its finite work budget. Candidate selection and request-local prefix reproof use
 a header-purpose ceiling of 64 MiB byte-work and 256 reachable states; tighter
 caller limits and cancellation still apply. Whole-body sessions use the measured
-finite 2,000,000-operation / 64 MiB profile and retain their separate 64-state
-ceiling. Header selection and reproof inherit the same operation policy while
+finite 2,000,000-operation / 64 MiB profile, raised by 8 operations and 32 bytes
+of byte-work for each source byte the session scans (root, providers and
+includes), and retain their separate 64-state ceiling. Header selection and reproof inherit the same operation policy while
 keeping their 256-state purpose. Explicit smaller callers and shared remaining
 budgets are preserved. These are charged-work limits, not RSS or
 allocator measurements, and header availability does not certify body completion.
@@ -2309,7 +2310,8 @@ partial proof. Includes used by rename are separately bounded by 4,096 files,
 Compile-time work, byte-work, declaration/field/provider counts, pending text,
 scope/type depth and branch alternatives are also bounded and cancellable.
 Checked layout arithmetic never wraps into a known size. Core defaults include
-2,000,000 work units, 64 MiB byte-work, 1 MiB retained storage, depth 256 and
+2,000,000 work units and 64 MiB byte-work, each raised by 8 units and 32 bytes
+per scanned source byte, 1 MiB retained storage, depth 256 and
 64 branch states; other limits can refuse earlier. In particular, default
 include-depth 256 success has not been demonstrated: isolated depth probes
 refuse earlier at retention limits. The LSP preserves its existing **finite

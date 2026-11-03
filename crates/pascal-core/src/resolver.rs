@@ -1486,6 +1486,8 @@ pub struct UnitResolver<S> {
     /// Steps granted by source bytes scanned in finished sessions; they raise
     /// `max_compile_time_work` as they raised each session's `max_work`.
     compile_time_work_allowance: usize,
+    /// Byte work granted the same way; it raises `max_compile_time_byte_work`.
+    compile_time_byte_work_allowance: usize,
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
     callback_reports: Option<CallbackReports>,
@@ -2161,13 +2163,34 @@ impl<S: SourceStore> UnitResolver<S> {
         self.compile_time_work_allowance
     }
 
-    /// The part of `max_compile_time_work`, raised by granted steps, that
-    /// `used` has not consumed.
-    fn remaining_compile_time_work(&self, used: crate::compile_time::BudgetSnapshot) -> usize {
+    /// Byte work granted on top of `max_compile_time_byte_work` the same way.
+    pub fn compile_time_byte_work_allowance(&self) -> usize {
+        self.compile_time_byte_work_allowance
+    }
+
+    fn max_compile_time_work(&self) -> usize {
         self.limits
             .max_compile_time_work
             .saturating_add(self.compile_time_work_allowance)
-            .saturating_sub(used.work)
+    }
+
+    fn max_compile_time_byte_work(&self) -> usize {
+        self.limits
+            .max_compile_time_byte_work
+            .saturating_add(self.compile_time_byte_work_allowance)
+    }
+
+    /// The part of `max_compile_time_work`, raised by granted steps, that
+    /// `used` has not consumed.
+    fn remaining_compile_time_work(&self, used: crate::compile_time::BudgetSnapshot) -> usize {
+        self.max_compile_time_work().saturating_sub(used.work)
+    }
+
+    /// The part of `max_compile_time_byte_work`, raised by granted byte work,
+    /// that `used` has not consumed.
+    fn remaining_compile_time_byte_work(&self, used: crate::compile_time::BudgetSnapshot) -> usize {
+        self.max_compile_time_byte_work()
+            .saturating_sub(used.byte_work)
     }
 
     pub fn compile_time_usage(&self) -> crate::compile_time::BudgetSnapshot {
@@ -2249,13 +2272,13 @@ impl<S: SourceStore> UnitResolver<S> {
                 work: admit(
                     c.work,
                     work,
-                    self.limits.max_compile_time_work,
+                    self.max_compile_time_work(),
                     "max_compile_time_work",
                 )?,
                 byte_work: admit(
                     c.byte_work,
                     bytes,
-                    self.limits.max_compile_time_byte_work,
+                    self.max_compile_time_byte_work(),
                     "max_compile_time_byte_work",
                 )?,
                 retained_bytes: admit(
@@ -2363,11 +2386,9 @@ impl<S: SourceStore> UnitResolver<S> {
             max_work: defaults
                 .max_work
                 .min(self.remaining_compile_time_work(aggregate)),
-            max_byte_work: defaults.max_byte_work.min(
-                self.limits
-                    .max_compile_time_byte_work
-                    .saturating_sub(aggregate.byte_work),
-            ),
+            max_byte_work: defaults
+                .max_byte_work
+                .min(self.remaining_compile_time_byte_work(aggregate)),
             // An explicit resolver retention selection must reach this session.
             // Default resolver construction still selects the core 1 MiB cap.
             max_retained_bytes: self
@@ -2416,6 +2437,7 @@ impl<S: SourceStore> UnitResolver<S> {
         // resolver's aggregate step budget; only work beyond them does.
         self.compile_time_accounting.work += usage.work;
         self.compile_time_work_allowance += budget.work_allowance();
+        self.compile_time_byte_work_allowance += budget.byte_work_allowance();
         self.compile_time_accounting.byte_work += usage.byte_work;
         if let Some(root) = self
             .compile_time_caches
@@ -2449,11 +2471,9 @@ impl<S: SourceStore> UnitResolver<S> {
                     max_work: defaults
                         .max_work
                         .min(self.remaining_compile_time_work(used)),
-                    max_byte_work: defaults.max_byte_work.min(
-                        self.limits
-                            .max_compile_time_byte_work
-                            .saturating_sub(used.byte_work),
-                    ),
+                    max_byte_work: defaults
+                        .max_byte_work
+                        .min(self.remaining_compile_time_byte_work(used)),
                     max_retained_bytes: self
                         .limits
                         .max_compile_time_retained_bytes
@@ -2733,6 +2753,7 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
             compile_time_work_allowance: 0,
+            compile_time_byte_work_allowance: 0,
             compile_time_store: None,
             compile_time_caches: Vec::new(),
             callback_reports: None,
@@ -4655,9 +4676,7 @@ impl<S: SourceStore> UnitResolver<S> {
                         .remaining_compile_time_work(used)
                         .min(crate::compile_time::CompileTimeLimits::default().max_work),
                     max_byte_work: self
-                        .limits
-                        .max_compile_time_byte_work
-                        .saturating_sub(used.byte_work)
+                        .remaining_compile_time_byte_work(used)
                         .min(crate::compile_time::HEADER_MAX_BYTE_WORK),
                     max_retained_bytes: self
                         .limits
@@ -4702,6 +4721,7 @@ impl<S: SourceStore> UnitResolver<S> {
             self.report_owners.record_work(&budget);
             self.compile_time_accounting.work += usage.work;
             self.compile_time_work_allowance += budget.work_allowance();
+            self.compile_time_byte_work_allowance += budget.byte_work_allowance();
             self.compile_time_accounting.byte_work += usage.byte_work;
             if let Some(root) = self
                 .compile_time_caches

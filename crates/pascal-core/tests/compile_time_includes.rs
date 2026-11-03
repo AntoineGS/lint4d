@@ -790,6 +790,7 @@ fn nested_occurrences_share_definition_and_byte_work_limits() {
     // it is not computed from current usage and changes no production default.
     const OCCURRENCE_BYTE_WORK_LIMIT: usize = 16 * 1024;
     one.limits.max_byte_work = OCCURRENCE_BYTE_WORK_LIMIT;
+    one.limits.byte_work_per_source_byte = 0;
     let single = one.analyze().unwrap();
     assert!(single.root.complete);
     assert!((11 * 1024..=12 * 1024).contains(&single.budget.budget_snapshot().byte_work));
@@ -800,6 +801,7 @@ fn nested_occurrences_share_definition_and_byte_work_limits() {
     );
     many.include("body.inc", &comment);
     many.limits.max_byte_work = OCCURRENCE_BYTE_WORK_LIMIT;
+    many.limits.byte_work_per_source_byte = 0;
     let result = many.analyze();
     assert!(matches!(
         &result,

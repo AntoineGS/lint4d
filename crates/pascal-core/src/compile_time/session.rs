@@ -3604,16 +3604,19 @@ mod tests {
             limits,
             &NoCancellation,
         );
+        // 64 MiB plus the byte work granted by the scanned source bytes:
+        // forked declaration snapshots cost more than that grant.
+        let maximum = 67_108_864 + extreme.bytes.len() * limits.byte_work_per_source_byte;
         assert!(
             matches!(
                 refusal,
                 Err(ResolverError::LimitExceeded {
                     limit: "max_byte_work",
-                    maximum: 67_108_864,
+                    maximum: refused,
                     ..
-                })
+                }) if refused == maximum
             ),
-            "actual declaration snapshots must retain 64MiB fuse: {refusal:?}"
+            "actual declaration snapshots must retain the 64MiB fuse: {refusal:?}"
         );
     }
 

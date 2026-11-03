@@ -3248,8 +3248,12 @@ fn apply_path_directive_inner(
         }
     }
     conditional::apply_source_directive(&mut path.environment, directive, budget)?;
+    // Record a scalar snapshot (and advance the sequence) only when the
+    // directive may have changed a fact; an inert hint such as EXTERNALSYM
+    // leaves the latest snapshot exact.
     if matches!(directive.kind, DirectiveKind::Define | DirectiveKind::Undef)
-        || conditional::is_option_directive(&directive.body)
+        || (conditional::is_option_directive(&directive.body)
+            && conditional::option_directive_sets_facts(&directive.body))
     {
         let scalar = path.environment.snapshot_scalar(budget)?;
         budget.charge(

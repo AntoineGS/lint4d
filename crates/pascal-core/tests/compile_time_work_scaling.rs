@@ -144,3 +144,35 @@ fn directive_bodies_are_charged_for_the_bytes_they_read() {
     assert!(work <= 3.0, "{work} steps per directive body byte");
     assert!(bytes <= 24.0, "{bytes} byte work per directive body byte");
 }
+
+/// Windows.pas has 9,780 `{$EXTERNALSYM}` hints: directives that set no
+/// conditional fact must not snapshot the whole conditional environment.
+#[test]
+fn inert_directives_do_not_copy_the_environment() {
+    let mut text = String::from("unit T;\ninterface\n");
+    for n in 0..100 {
+        text.push_str(&format!("{{$DEFINE FEATURE_NUMBER_{n}}}\n"));
+    }
+    text.push_str("const\n");
+    for n in 0..5000 {
+        text.push_str(&format!("  {{$EXTERNALSYM X{n}}}\n  X{n} = {n};\n"));
+    }
+    text.push_str("implementation\nend.\n");
+    let (result, usage) = analyze(&text);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+    let mut plain = String::from("unit T;\ninterface\n");
+    for n in 0..100 {
+        plain.push_str(&format!("{{$DEFINE FEATURE_NUMBER_{n}}}\n"));
+    }
+    plain.push_str("const\n");
+    for n in 0..5000 {
+        plain.push_str(&format!("  X{n} = {n};\n"));
+    }
+    plain.push_str("implementation\nend.\n");
+    let (_, without) = analyze(&plain);
+    let per_directive = (usage.byte_work - without.byte_work) / 5000;
+    assert!(
+        per_directive < 1024,
+        "{per_directive} byte work per directive"
+    );
+}

@@ -2718,6 +2718,27 @@ fn apply_option_directive(
     apply_option_fact(environment, &canonical_name, value, activity, budget)
 }
 
+/// Whether applying option directive `body` may set a conditional fact. It
+/// follows `apply_option_directive`: a directive whose keyword names no
+/// option, such as `EXTERNALSYM X` or `WARN SYMBOL_DEPRECATED OFF`, sets none.
+/// Switch lists and unparsable bodies are conservatively reported as setting.
+pub(crate) fn option_directive_sets_facts(body: &str) -> bool {
+    if switch_list_members(body).is_some() || switch_list_candidates(body).is_some() {
+        return true;
+    }
+    let Some(keyword) = directive_keyword(body) else {
+        return true;
+    };
+    let argument = directive_arguments(body).trim();
+    let (name, suffix) = keyword
+        .strip_suffix('+')
+        .or_else(|| keyword.strip_suffix('-'))
+        .map_or((keyword, false), |name| (name, true));
+    let normalized = name.trim_end_matches(['+', '-']);
+    supported_option_name(normalized).is_some()
+        || ((suffix || state_value_word(argument)) && canonical_option_name(normalized).is_some())
+}
+
 pub(crate) fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     if !body.contains(',') {
         return None;

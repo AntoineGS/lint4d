@@ -26,10 +26,10 @@ use pascal_core::resolver::{
     DirectoryListing, DirectoryRequest, FilesystemSourceStore, ResolutionObservation,
     ResolverLimits, SourceStore, SourceStoreError,
 };
-use pascal_project::ProjectPathEntry;
+use pascal_project::{ProjectPathEntry, ProjectWorkBudget};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A context is sealed at most once a minute (§6.3 amendment, D31).
@@ -193,6 +193,54 @@ struct Directory {
     generation: u64,
 }
 
+impl Directory {
+    /// Whether `current` proves the directory unchanged since its catalogue
+    /// listed it; a missing directory stays missing.
+    fn proves(&self, current: Option<&PathStamp>) -> bool {
+        match (&self.recorded, current) {
+            (Some(recorded), Some(current)) => recorded.proves_unchanged(current),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The request's cancellation over a work budget (the validator polls the
+/// budget's `check_cancelled`).
+struct RequestCancel<'a> {
+    work: &'a dyn ProjectWorkBudget,
+    cancel: &'a AtomicBool,
+}
+
+impl ProjectWorkBudget for RequestCancel<'_> {
+    fn check_cancelled(&self) -> Result<(), String> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(super::rename::CANCELLATION_MESSAGE.to_owned());
+        }
+        self.work.check_cancelled()
+    }
+
+    fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+        self.work.charge_path_visits(amount)
+    }
+
+    fn charge_path_bytes(&self, amount: usize) -> Result<(), String> {
+        self.work.charge_path_bytes(amount)
+    }
+
+    fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+        self.work.ensure_file_read_fits(max_bytes)
+    }
+
+    fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+        self.work.charge_file_bytes(amount)
+    }
+
+    fn is_transient_error(&self, error: &str) -> bool {
+        self.work.is_transient_error(error)
+    }
+}
+
 impl Workspace {
     /// The directories `key`'s membership was read from, in scan order:
     /// the main source's, the explicit units', then the search paths, as
@@ -228,11 +276,14 @@ impl Workspace {
 
     /// One listing observation per membership directory, in scan order,
     /// captured in this baseline view; each directory's stamp must still
-    /// prove the catalogue's (`Catalogue::directories`) unchanged. A full
-    /// listing changes with unrelated churn too, which only costs the hint.
+    /// prove the catalogue's (`Catalogue::directories`) unchanged, before
+    /// listing and as the listing itself stamped it. A full listing changes
+    /// with unrelated churn too, which only costs the hint. `check` runs
+    /// before each directory (gate, cancellation).
     pub(crate) fn discovery_evidence(
         &self,
         key: &ContextKey,
+        check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(DiscoveryScope, CapturedEvidence), BaselineGap> {
         let directories = self.membership_directories(key)?;
         let state = &self.contexts[key];
@@ -246,18 +297,18 @@ impl Workspace {
         let capture = ReadCapture::default();
         let cancel = AtomicBool::new(false);
         let mut observations = Vec::with_capacity(directories.len());
+        let changed = |directory: &Directory| {
+            self.project_cache
+                .drop_catalogue(&directory.scope, directory.generation);
+            self.project_cache.mark_index_membership_dirty(key);
+            BaselineGap::Changed(directory.path.clone())
+        };
         for directory in &directories {
-            let current = super::path_stamp(&directory.path);
-            let unchanged = match (&directory.recorded, &current) {
-                (Some(recorded), Some(current)) => recorded.proves_unchanged(current),
-                (None, None) => true,
-                _ => false,
-            };
-            if !unchanged {
-                self.project_cache
-                    .drop_catalogue(&directory.scope, directory.generation);
-                self.project_cache.mark_index_membership_dirty(key);
-                return Err(BaselineGap::Changed(directory.path.clone()));
+            if check().is_err() {
+                return Err(BaselineGap::Capture(EvidenceGap::Cancelled));
+            }
+            if !directory.proves(super::path_stamp(&directory.path).as_ref()) {
+                return Err(changed(directory));
             }
             let entry = context
                 .path_entry_for(&directory.path)
@@ -283,11 +334,16 @@ impl Workspace {
                 }
                 Err(_) => return Err(BaselineGap::Capture(EvidenceGap::Incomplete)),
             };
+            // The stamp the listing took before it read the directory: a
+            // change between the check above and the listing shows here.
+            if !directory.proves(listing.stamp.as_ref()) {
+                return Err(changed(directory));
+            }
             capture.listed(&directory.path, &listing, false);
             observations.push(ResolutionObservation::Directory {
                 path: directory.path.clone(),
                 entry,
-                stamp: current,
+                stamp: listing.stamp.clone(),
                 complete: listing.complete,
                 listed: true,
             });
@@ -359,10 +415,14 @@ impl Workspace {
         ) else {
             return SealOutcome::NotDue;
         };
-        let discovery = match self.discovery_evidence(key) {
+        let discovery = match self.discovery_evidence(key, check) {
             Ok(discovery) => discovery,
             Err(BaselineGap::NotAProject) => {
                 return SealOutcome::Ineligible(Ineligible::NotAProject);
+            }
+            // `check` stopped the listing: retried after the next batch.
+            Err(BaselineGap::Capture(EvidenceGap::Cancelled)) => {
+                return SealOutcome::Interrupted;
             }
             Err(gap) => return SealOutcome::Gap(gap),
         };
@@ -376,6 +436,18 @@ impl Workspace {
             hint.records == records
                 && hint.header.discovery_evidence() == Some(eligible.value().discovery())
         }) {
+            // A hold refused before (`WalPressure`) is asked for once more.
+            if let Some(hint) = previous.filter(|hint| !hint.held)
+                && let Some(job) = self.persistent_cache().job()
+            {
+                match job.store().hold_snapshot(&hint.header) {
+                    Ok(true) => {
+                        self.install_hint(&job, key, BaselineHint { held: true, ..hint });
+                    }
+                    Ok(false) => {}
+                    Err(bypass) => job.observe(&bypass),
+                }
+            }
             self.project_cache.note_baseline_seal(key, now);
             return SealOutcome::Unchanged;
         }
@@ -442,22 +514,22 @@ impl Workspace {
     /// At the first batch of a context in this process: newest sealed
     /// candidate whose discovery evidence validates, held.
     #[cfg_attr(not(test), allow(dead_code))] // the startup crawl (l4d-zf1b.8)
-    pub(crate) fn adopt_baseline_hint(&self, key: &ContextKey) -> Option<()> {
-        matches!(self.adopt(key), Adoption::Adopted).then_some(())
+    pub(crate) fn adopt_baseline_hint(&self, key: &ContextKey, cancel: &AtomicBool) -> Option<()> {
+        matches!(self.adopt(key, cancel), Adoption::Adopted).then_some(())
     }
 
     /// The automatic adoption (M4): once per stored index, unless the
     /// attempt was cut short by something that may pass.
-    pub(super) fn adopt_baseline_hint_once(&self, key: &ContextKey) {
+    pub(super) fn adopt_baseline_hint_once(&self, key: &ContextKey, cancel: &AtomicBool) {
         if self.project_cache.baseline_adoption_tried(key) {
             return;
         }
-        if !matches!(self.adopt(key), Adoption::Retry) {
+        if !matches!(self.adopt(key, cancel), Adoption::Retry) {
             self.project_cache.note_baseline_adoption_tried(key);
         }
     }
 
-    fn adopt(&self, key: &ContextKey) -> Adoption {
+    fn adopt(&self, key: &ContextKey, cancel: &AtomicBool) -> Adoption {
         if self.project_cache.baseline_hint(key).is_some() {
             return Adoption::Adopted;
         }
@@ -486,7 +558,13 @@ impl Workspace {
         };
         let overlays = self.overlay_inputs();
         let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
-        let work = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        let reconciliation = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        // The store's fence through the validator's flag, the request's
+        // cancellation through its budget.
+        let work = RequestCancel {
+            work: &reconciliation,
+            cancel,
+        };
         let mut validator = Validator::new(
             CurrentInputs {
                 context: &context,
@@ -501,7 +579,7 @@ impl Workspace {
             job.cancel_flag(),
         );
         for header in candidates {
-            if job.is_cancelled() {
+            if job.is_cancelled() || cancel.load(Ordering::Relaxed) {
                 return Adoption::Retry;
             }
             let Some(discovery) = header.discovery_evidence() else {
@@ -584,7 +662,7 @@ impl Workspace {
         key: &ContextKey,
         hint: &BaselineHint,
         store: &Store,
-        work: &dyn pascal_project::ProjectWorkBudget,
+        work: &dyn ProjectWorkBudget,
         decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<HintReuse, Bypass> {
@@ -720,6 +798,7 @@ mod tests {
     use lsp_types::Url;
     use pascal_cache::{ContextKey as CacheContextKey, Lookup, SnapshotHeader, SnapshotId};
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
     fn seal(view: &Workspace, key: &ContextKey) -> SealOutcome {
@@ -987,7 +1066,7 @@ mod tests {
         let key = progress.key.clone().unwrap();
         assert_eq!(progress.persisted, 1, "{progress:?}");
         assert_eq!(
-            view.discovery_evidence(&key).err(),
+            view.discovery_evidence(&key, &mut || Ok(())).err(),
             Some(BaselineGap::NotAProject)
         );
         assert_eq!(
@@ -1016,7 +1095,10 @@ mod tests {
         assert_eq!(hint.header().id(), sealed.header().id());
         assert_eq!(hint.records(), sealed.records(), "the same record list");
         assert!(hint.held() && !hint.sealed());
-        assert_eq!(second.adopt_baseline_hint(&key), Some(()));
+        assert_eq!(
+            second.adopt_baseline_hint(&key, &AtomicBool::new(false)),
+            Some(())
+        );
         let progress = advance(
             &mut second,
             &anchor,
@@ -1094,25 +1176,163 @@ mod tests {
         cache.shutdown();
         let (mut second, cache) = persisting_view(&workspace(temp.path(), options), store.path());
         let progress = advance(&mut second, &anchor, IndexBound::all());
+        // The batch's spare bound retries it after every other member.
         assert_eq!(
-            (progress.reused, progress.retrying, progress.refused),
-            (2, 1, 0),
+            (
+                progress.reused,
+                progress.refused,
+                progress.retries_attempted
+            ),
+            (2, 1, 1),
+            "{progress:?}"
+        );
+        assert_eq!(progress.retrying, 0);
+        assert!(
+            progress.complete && !progress.worth_requeue(),
+            "{progress:?}"
+        );
+        assert!(second.project_cache.index_member_has_record(&key, &big));
+        assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
+        cache.shutdown();
+    }
+
+    /// A Full batch whose bound ends before the retried member asks to be
+    /// requeued, and the next batch extracts it.
+    #[test]
+    fn a_retry_left_by_the_bound_requeues_the_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 2, options.clone());
+        let big = temp.path().join("lib/U0.pas");
+        named_unit(&big, &"Long".repeat(60));
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        assert_eq!(advance(&mut first, &anchor, IndexBound::all()).refused, 1);
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        cache.shutdown();
+        let (mut second, cache) = persisting_view(&workspace(temp.path(), options), store.path());
+        let progress = advance(&mut second, &anchor, IndexBound::units(2));
+        assert_eq!(
+            (
+                progress.reused,
+                progress.retrying,
+                progress.retries_attempted
+            ),
+            (1, 1, 0),
             "{progress:?}"
         );
         assert!(progress.complete, "a retry is no pending work");
+        assert!(progress.worth_requeue(), "{progress:?}");
         let counts = second
             .project_cache
             .read_index(&key, |index, _| index.counts())
             .unwrap();
         assert_eq!((counts.retrying, counts.pending), (1, 1));
-        let progress = advance(&mut second, &anchor, IndexBound::all());
+        let progress = advance(&mut second, &anchor, IndexBound::units(2));
         assert_eq!(
-            (progress.refused, progress.retrying),
-            (1, 0),
+            (
+                progress.refused,
+                progress.retrying,
+                progress.retries_attempted
+            ),
+            (1, 0, 1),
             "{progress:?}"
         );
+        assert!(!progress.worth_requeue());
         assert!(second.project_cache.index_member_has_record(&key, &big));
-        assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
+        cache.shutdown();
+    }
+
+    #[test]
+    fn a_seal_cancelled_while_listing_is_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        advance(&mut view, &anchor, IndexBound::all());
+        let mut checks = 0;
+        let outcome = view.seal_baseline_if_due(&key, &mut || {
+            checks += 1;
+            Err(CANCELLATION_MESSAGE.to_owned())
+        });
+        assert_eq!(outcome, SealOutcome::Interrupted);
+        assert_eq!(checks, 1, "before the first directory");
+        assert!(snapshots(&view, &cache, &key).is_empty());
+        assert_eq!(seal(&view, &key), SealOutcome::Sealed, "retried");
+        cache.shutdown();
+    }
+
+    #[test]
+    fn a_cancelled_discovery_or_adoption_decides_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (key, anchor, sealed) = sealed_first_session(temp.path(), store.path(), 4);
+        let (mut second, cache) = restarted_view(temp.path(), store.path());
+        advance(
+            &mut second,
+            &anchor,
+            IndexBound::units(0).with_mode(IndexMode::Reuse),
+        );
+        assert_eq!(
+            second
+                .discovery_evidence(&key, &mut || Err(CANCELLATION_MESSAGE.to_owned()))
+                .err(),
+            Some(BaselineGap::Capture(EvidenceGap::Cancelled))
+        );
+        let hint = second.project_cache.baseline_hint(&key).unwrap();
+        second
+            .project_cache
+            .drop_baseline_hint(&key, hint.header().id());
+        cache
+            .job()
+            .unwrap()
+            .store()
+            .release_snapshot(hint.header().id())
+            .unwrap();
+        assert_eq!(
+            second.adopt_baseline_hint(&key, &AtomicBool::new(true)),
+            None
+        );
+        assert_eq!(hint_id(&second, &key), None);
+        assert_eq!(
+            second.adopt_baseline_hint(&key, &AtomicBool::new(false)),
+            Some(())
+        );
+        assert_eq!(hint_id(&second, &key), Some(sealed.header().id()));
+        cache.shutdown();
+    }
+
+    #[test]
+    fn an_unchanged_seal_holds_an_unheld_hint_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        advance(&mut view, &anchor, IndexBound::all());
+        let now = Instant::now();
+        assert_eq!(
+            view.seal_baseline_at(&key, now, &mut || Ok(())),
+            SealOutcome::Sealed
+        );
+        let hint = view.project_cache.baseline_hint(&key).unwrap();
+        let id = hint.header().id();
+        assert!(cache.job().unwrap().store().release_snapshot(id).unwrap());
+        view.project_cache.set_baseline_hint(
+            &key,
+            BaselineHint {
+                held: false,
+                ..hint
+            },
+        );
+        assert!(held(&cache).is_empty());
+        assert_eq!(
+            view.seal_baseline_at(&key, now + Duration::from_secs(61), &mut || Ok(())),
+            SealOutcome::Unchanged
+        );
+        assert_eq!(held(&cache), vec![id]);
+        assert!(view.project_cache.baseline_hint(&key).unwrap().held());
         cache.shutdown();
     }
 
@@ -1160,17 +1380,19 @@ mod tests {
         let (workspace, key, anchor) = indexed_project(temp.path(), 6, WorkspaceOptions::default());
         let (mut view, cache) = persisting_view(&workspace, store.path());
         advance(&mut view, &anchor, IndexBound::all());
+        // One check per listed directory (the project root and lib), one
+        // before the only member batch, then one before the seal.
         let mut checks = 0;
         let outcome = view.seal_baseline_if_due(&key, &mut || {
             checks += 1;
-            if checks > 1 {
+            if checks > 3 {
                 Err(CANCELLATION_MESSAGE.to_owned())
             } else {
                 Ok(())
             }
         });
         assert_eq!(outcome, SealOutcome::Interrupted);
-        assert_eq!(checks, 2, "stopped after the first batch");
+        assert_eq!(checks, 4, "stopped after the first batch");
         assert!(held(&cache).is_empty(), "no build is left held");
         assert!(snapshots(&view, &cache, &key).is_empty());
         assert_eq!(hint_id(&view, &key), None);
@@ -1225,10 +1447,10 @@ mod tests {
         let (workspace, key, anchor) = indexed_project(temp.path(), 4, WorkspaceOptions::default());
         let (mut view, cache) = persisting_view(&workspace, store.path());
         advance(&mut view, &anchor, IndexBound::all());
-        assert!(view.discovery_evidence(&key).is_ok());
+        assert!(view.discovery_evidence(&key, &mut || Ok(())).is_ok());
         let created = temp.path().join("lib/New.pas");
         named_unit(&created, "PNew");
-        match view.discovery_evidence(&key) {
+        match view.discovery_evidence(&key, &mut || Ok(())) {
             Err(BaselineGap::Changed(directory)) => {
                 assert!(directory.ends_with("lib"), "{directory:?}")
             }

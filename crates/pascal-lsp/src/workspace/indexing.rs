@@ -350,9 +350,12 @@ pub(crate) struct IndexProgress {
     pub(crate) reuse_deferred: usize,
     /// Members whose artifact and record this batch published.
     pub(crate) persisted: usize,
-    /// Members a held snapshot lists without an artifact, deferred to be
-    /// retried after every other member.
+    /// Closed members still pending only to retry a previous refusal (a
+    /// held snapshot lists them without an artifact); they do not hold
+    /// `complete` back.
     pub(crate) retrying: usize,
+    /// Members retrying a previous refusal this batch extracted.
+    pub(crate) retries_attempted: usize,
 }
 
 impl IndexProgress {
@@ -377,6 +380,7 @@ impl IndexProgress {
             reuse_deferred: 0,
             persisted: 0,
             retrying: 0,
+            retries_attempted: 0,
         }
     }
 
@@ -385,15 +389,24 @@ impl IndexProgress {
     /// deferred members already deferred is not requeued (no livelock); a
     /// request or invalidation asks for the anchor again. A reuse batch is
     /// requeued while members are left to try and it tried one for good, so
-    /// a run of retryable misses alone does not loop either.
+    /// a run of retryable misses alone does not loop either. A Full batch
+    /// that left members retrying a previous refusal (they go last, so its
+    /// bound may end before them) is requeued for them although the index
+    /// is `complete`, if it settled or retried anything: trying one clears
+    /// its retry, so this ends.
     pub(crate) fn worth_requeue(&self) -> bool {
-        !self.complete
-            && !self.memory
-            && (self.indexed + self.refreshed + self.refused + self.limited + self.reused > 0
-                || (self.deferred > 0 && self.untried > 0)
-                || (self.mode == IndexMode::Reuse
-                    && self.reuse_pending > 0
-                    && self.reuse_missed > 0))
+        let settled = self.indexed + self.refreshed + self.refused + self.limited + self.reused > 0;
+        if self.memory {
+            return false;
+        }
+        if self.complete {
+            return self.mode == IndexMode::Full
+                && self.retrying > 0
+                && (settled || self.retries_attempted > 0);
+        }
+        settled
+            || (self.deferred > 0 && self.untried > 0)
+            || (self.mode == IndexMode::Reuse && self.reuse_pending > 0 && self.reuse_missed > 0)
     }
 }
 
@@ -668,7 +681,7 @@ impl Workspace {
         self.ensure_index_membership(&key, anchor, cancel)?;
         if self.is_baseline() && self.persistent_cache().is_enabled() {
             self.release_evicted_holds();
-            self.adopt_baseline_hint_once(&key);
+            self.adopt_baseline_hint_once(&key, cancel);
         }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
         let started = Instant::now();
@@ -676,14 +689,23 @@ impl Workspace {
         let wanted = bound.units.saturating_add(self.open_documents.len());
         let pending = match bound.mode {
             IndexMode::Reuse => self.project_cache.reuse_pending_index_members(&key, wanted),
+            // A member retrying a previous refusal goes after every other
+            // pending member (H4/R8-3); without a hint, path order stays.
             IndexMode::Full => self
                 .project_cache
-                .read_index(&key, |index, _| index.pending(wanted))
+                .read_index(&key, |index, _| {
+                    let (retrying, others): (Vec<_>, Vec<_>) = index
+                        .pending(wanted)
+                        .into_iter()
+                        .partition(|path| index.retrying(path));
+                    others.into_iter().chain(retrying).collect::<Vec<_>>()
+                })
                 .unwrap_or_default(),
         };
+        let mut pending = std::collections::VecDeque::from(pending);
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
-        for path in pending {
+        while let Some(path) = pending.pop_front() {
             if tried.len() >= bound.units
                 || bound.time.is_some_and(|limit| started.elapsed() >= limit)
             {
@@ -729,13 +751,16 @@ impl Workspace {
                     progress.reuse_missed += 1;
                 }
                 ReuseOutcome::Retry => progress.reuse_deferred += 1,
-                // A previous refusal is retried after every other member, by
-                // a later batch (with no hint, members keep path order).
+                // A previous refusal is retried after every other member: a
+                // Full batch comes back to it at its end, within its bound,
+                // when it is tried for reuse no more.
                 ReuseOutcome::Retrying => {
                     self.project_cache.mark_index_reuse_tried(&key, &path);
                     self.project_cache
                         .defer_index_member(&key, &path, RETRYING_REFUSAL);
-                    progress.retrying += 1;
+                    if bound.mode == IndexMode::Full {
+                        pending.push_back(path);
+                    }
                     continue;
                 }
                 ReuseOutcome::Memory => {
@@ -752,6 +777,13 @@ impl Workspace {
             // member's first check still holds.
             if asked {
                 before_io()?;
+            }
+            if self
+                .project_cache
+                .read_index(&key, |index, _| index.retrying(&path))
+                .unwrap_or(false)
+            {
+                progress.retries_attempted += 1;
             }
             // One member's failure never stops the batch: it stays pending.
             let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
@@ -814,11 +846,11 @@ impl Workspace {
         progress.generation = generation;
         // Members retrying a previous refusal are coverage gaps, not
         // pending work (H4/R8-3).
-        let retrying = retrying
+        progress.retrying = retrying
             .iter()
             .filter(|path| !self.is_open_member(path))
             .count();
-        progress.complete = progress.pending == retrying && !progress.memory;
+        progress.complete = progress.pending == progress.retrying && !progress.memory;
         Ok(progress)
     }
 

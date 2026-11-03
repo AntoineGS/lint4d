@@ -32,6 +32,9 @@ pub enum IncompleteReason {
     OverSizeLimit,
     /// The read policy refused an input.
     Unauthorized,
+    /// The producer did not record this outcome (spec §5 amendment
+    /// 2026-11-03, D36).
+    NotRecorded,
 }
 
 impl IncompleteReason {
@@ -42,6 +45,7 @@ impl IncompleteReason {
             Self::CompiledProvider => 3,
             Self::OverSizeLimit => 4,
             Self::Unauthorized => 5,
+            Self::NotRecorded => 6,
         }
     }
 
@@ -52,6 +56,7 @@ impl IncompleteReason {
             3 => Some(Self::CompiledProvider),
             4 => Some(Self::OverSizeLimit),
             5 => Some(Self::Unauthorized),
+            6 => Some(Self::NotRecorded),
             _ => None,
         }
     }
@@ -415,6 +420,20 @@ impl RecordHasher {
 
     pub(crate) fn finish(&self) -> Digest {
         Digest::from_bytes(*self.0.finalize().as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    #[test]
+    fn not_recorded_has_tag_six_and_round_trips() {
+        assert_eq!(IncompleteReason::NotRecorded.tag(), 6);
+        assert_eq!(
+            IncompleteReason::from_tag(6),
+            Some(IncompleteReason::NotRecorded)
+        );
     }
 }
 

@@ -181,6 +181,28 @@ pub(in crate::workspace) mod tests {
     }
 
     #[test]
+    fn expanded_includes_name_the_file_they_read() {
+        let indexed = includes();
+        let facts = indexed.facts("Main.pas").extracted.facts;
+        let uri = indexed.uri("Main.pas");
+        let slots = indexed.workspace.source_slot_paths(&uri);
+        for include in &facts.includes {
+            let normalized = include.source.clone().map(crate::workspace::absolute_path);
+            assert_eq!(
+                normalized, slots[include.slot as usize],
+                "slot {}",
+                include.slot
+            );
+        }
+        assert!(
+            facts
+                .includes
+                .iter()
+                .any(|include| include.source.is_some())
+        );
+    }
+
+    #[test]
     fn include_facts_locate_every_occurrence_in_its_own_slot() {
         let indexed = includes();
         let source = indexed.facts("Main.pas");

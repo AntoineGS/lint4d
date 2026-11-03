@@ -554,7 +554,14 @@ fn includes(
     facts: &mut ArtifactFacts,
 ) -> Result<(), FactError> {
     for (index, slot) in slots.iter().enumerate() {
-        budget.charge(size_of::<IncludeFact>())?;
+        let source = match &slot.outcome {
+            IncludeSlotOutcome::Expanded { source, .. } => Some(source.path.clone()),
+            IncludeSlotOutcome::Unresolved(_) => None,
+        };
+        budget.charge(
+            size_of::<IncludeFact>()
+                .saturating_add(source.as_ref().map_or(0, |path| path.as_os_str().len())),
+        )?;
         facts.includes.push(IncludeFact {
             slot: length(index + 1)?,
             parent: slot.parent,
@@ -563,6 +570,7 @@ fn includes(
                 IncludeSlotOutcome::Expanded { .. } => IncludeExpansion::Expanded,
                 IncludeSlotOutcome::Unresolved(_) => IncludeExpansion::Unresolved,
             },
+            source,
         });
     }
     Ok(())

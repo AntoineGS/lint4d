@@ -5,6 +5,7 @@ use pascal_cache::{
 };
 use pascal_core::ImportSection;
 use pascal_core::facts::*;
+use std::path::{Path, PathBuf};
 
 fn at(slot: u32, start: u32, end: u32) -> FactLocation {
     FactLocation::Source {
@@ -124,6 +125,7 @@ fn sample() -> ArtifactFacts {
                 parent: 0,
                 directive: TextRange { start: 60, end: 70 },
                 expansion: IncludeExpansion::Expanded,
+                source: Some(PathBuf::from("/w/include/Types.inc")),
             },
             IncludeFact {
                 slot: 2,
@@ -133,6 +135,7 @@ fn sample() -> ArtifactFacts {
                     end: 118,
                 },
                 expansion: IncludeExpansion::Unresolved,
+                source: None,
             },
         ],
         segments: vec![
@@ -297,6 +300,40 @@ fn an_unknown_shape_tag_is_malformed() {
         decode(&rows, &encode_facts(&facts).unwrap().supplemental),
         Err(FactDecodeError::Malformed(_))
     ));
+}
+
+/// D35: an expanded include keeps the path it read through the rows.
+#[test]
+fn include_sources_round_trip() {
+    let facts = sample();
+    let encoded = encode_facts(&facts).unwrap();
+    let loaded = decode(&stored(&encoded), &encoded.supplemental).unwrap();
+    assert_eq!(
+        loaded.includes[0].source.as_deref(),
+        Some(Path::new("/w/include/Types.inc"))
+    );
+    assert_eq!(loaded.includes[1].source, None);
+    assert_eq!(loaded, facts);
+}
+
+/// A source on an unresolved include, or none on an expanded one, is malformed.
+#[test]
+fn an_include_source_must_match_its_expansion() {
+    let mismatch = "include source does not match its expansion";
+    let mut facts = sample();
+    facts.includes[1].source = Some(PathBuf::from("/w/Missing.inc"));
+    let encoded = encode_facts(&facts).unwrap();
+    assert_eq!(
+        decode(&stored(&encoded), &encoded.supplemental),
+        Err(FactDecodeError::Malformed(mismatch))
+    );
+    let mut facts = sample();
+    facts.includes[0].source = None;
+    let encoded = encode_facts(&facts).unwrap();
+    assert_eq!(
+        decode(&stored(&encoded), &encoded.supplemental),
+        Err(FactDecodeError::Malformed(mismatch))
+    );
 }
 
 #[test]

@@ -15,6 +15,7 @@ use pascal_core::facts::{
     Visibility, is_identifier_byte,
 };
 use std::mem::size_of;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactDecodeError {
@@ -80,6 +81,37 @@ impl<'a> ByteReader<'a> {
     fn str(&mut self) -> Decoded<&'a str> {
         let length = self.length()?;
         std::str::from_utf8(self.take(length)?).or_else(|_| malformed("text is not UTF-8"))
+    }
+
+    #[cfg(unix)]
+    fn path(&mut self) -> Decoded<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        if self.u8()? != 1 {
+            return malformed("foreign path encoding");
+        }
+        let length = self.length()?;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(
+            self.take(length)?,
+        )))
+    }
+
+    #[cfg(windows)]
+    fn path(&mut self) -> Decoded<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        if self.u8()? != 2 {
+            return malformed("foreign path encoding");
+        }
+        let units = self.length()?;
+        let bytes = self.take(
+            units
+                .checked_mul(2)
+                .map_or_else(|| malformed("length overflows"), Ok)?,
+        )?;
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect();
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&units)))
     }
 
     fn range(&mut self) -> Decoded<TextRange> {
@@ -386,12 +418,27 @@ impl<'b> FactDecoder<'b> {
             parent: reader.u32()?,
             directive: reader.range()?,
             expansion: tagged(reader.u8()?, &EXPANSIONS, expansion_tag)?,
+            source: if reader.bool()? {
+                Some(reader.path()?)
+            } else {
+                None
+            },
         };
+        if include.source.is_some() != (include.expansion == IncludeExpansion::Expanded) {
+            return malformed("include source does not match its expansion");
+        }
         if include.slot as usize != self.facts.includes.len() + 1 || include.parent >= include.slot
         {
             return malformed("include slots are not in expansion order");
         }
-        self.charge(size_of::<IncludeFact>())?;
+        self.charge(
+            size_of::<IncludeFact>().saturating_add(
+                include
+                    .source
+                    .as_ref()
+                    .map_or(0, |path| path.as_os_str().len()),
+            ),
+        )?;
         self.facts.includes.push(include);
         Ok(())
     }

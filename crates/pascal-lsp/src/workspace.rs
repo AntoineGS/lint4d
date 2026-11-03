@@ -2161,6 +2161,24 @@ fn selected_installation_id(context: &ProjectContext) -> Option<String> {
 }
 
 impl ContextKey {
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self {
+            project_file: None,
+            installation_id: None,
+            workspace_root: Some(PathBuf::from(name)),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            build_selection_modes: None,
+            conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

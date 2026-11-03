@@ -9,12 +9,14 @@ use std::time::Duration;
 use lsp_types::Url;
 use pascal_project::{ProjectContext, ProjectReadStamp};
 
-use crate::catalogue::{Catalogue, CatalogueKey, CatalogueStore, Removed, SharedCatalogue};
+use crate::catalogue::{Catalogue, CatalogueKey, CatalogueStore, Depth, Removed, SharedCatalogue};
 use crate::file_watch::DirectoryWatch;
 use crate::include_expansion::ExpansionResult;
 use crate::navigation::ParsedDocument;
 use crate::navigation::compiled_dcu::project_context_fingerprint;
+use crate::workspace::ContextKey;
 use crate::workspace::rename::OverlayInput;
+use crate::workspace_index::{ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp};
 
 /// Default for the `maxCacheBytes` limit.
 pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -28,6 +30,11 @@ pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09
 /// `maxCacheBytes`. Like a reservation, they may evict unpinned entries to
 /// make room, but never past that eighth of the budget.
 const CATALOGUE_BUDGET_SHARE: usize = 8;
+/// The workspace index may hold a quarter of `maxCacheBytes` (l4d-33).
+const INDEX_BUDGET_SHARE: usize = 4;
+pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
+const MAX_INDEX_REQUESTS: usize = 64;
+const MAX_OWNERS: usize = 4_096;
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2644,7 +2651,10 @@ struct WatcherState {
 /// queues watch-count changes in `State::watch_changes`, and `sync_watches`
 /// applies them after `state` is released. `witnesses` is never held together
 /// with either lock. `catalogues` is never held together with any other lock:
-/// what it drops is released (charge, watches) after it is unlocked.
+/// what it drops is released (charge, watches) after it is unlocked. `index`
+/// is likewise never held together with `state`, `watcher`, `witnesses` or
+/// `catalogues`: the charges of what it drops are released after it is
+/// unlocked.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
@@ -2654,6 +2664,8 @@ struct Inner {
     witnesses: Mutex<HashMap<PathBuf, Witness>>,
     /// Never held together with `state`, `watcher` or `witnesses`.
     catalogues: Mutex<CatalogueStore>,
+    /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
+    index: Mutex<IndexStore>,
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
@@ -2792,6 +2804,7 @@ pub(crate) struct CacheStats {
     pub reserved_scratch_bytes: usize,
     pub reserved_pages_bytes: usize,
     pub reserved_catalogue_bytes: usize,
+    pub reserved_index_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2801,6 +2814,7 @@ impl CacheStats {
             .saturating_add(self.reserved_scratch_bytes)
             .saturating_add(self.reserved_pages_bytes)
             .saturating_add(self.reserved_catalogue_bytes)
+            .saturating_add(self.reserved_index_bytes)
     }
 }
 
@@ -2819,10 +2833,13 @@ pub(crate) enum ReservationKind {
     /// bytes itself, not through a `Reservation`: a stored `Reservation`
     /// would keep `Inner` alive through its own `Arc`.
     Catalogues,
+    /// The workspace index (l4d-33). Held by the index store like the
+    /// catalogues, and released with `release_index`.
+    WorkspaceIndex,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
 
     fn index(self) -> usize {
         match self {
@@ -2830,6 +2847,7 @@ impl ReservationKind {
             Self::Scratch => 1,
             Self::Pages => 2,
             Self::Catalogues => 3,
+            Self::WorkspaceIndex => 4,
         }
     }
 }
@@ -2949,6 +2967,11 @@ fn recover_poisoned_state<'a>(
 }
 
 fn lock(inner: &Inner) -> MutexGuard<'_, State> {
+    #[cfg(test)]
+    assert!(
+        !HELD_INDEX.with(std::cell::Cell::get),
+        "the index lock is never held with the state lock"
+    );
     match inner.state.lock() {
         Ok(state) => state,
         Err(poisoned) => recover_poisoned_state(inner, poisoned.into_inner()),
@@ -4339,6 +4362,7 @@ impl ProjectCache {
         self.drop_witnesses(path, include_parent);
         let removed = self.catalogues().invalidate(path, include_parent);
         self.release_catalogues(removed);
+        self.invalidate_index(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
         }
@@ -4375,6 +4399,8 @@ impl ProjectCache {
         // Overflow lost which directories changed: no catalogue survives it.
         let removed = self.catalogues().clear();
         self.release_catalogues(removed);
+        // Overflow lost which paths changed: every member is suspect.
+        self.invalidate_index_all();
     }
 
     /// Remember that `path`, while it has `stamp`, holds what `proven` says.
@@ -4479,6 +4505,7 @@ impl ProjectCache {
             reserved_scratch_bytes: state.reserved[ReservationKind::Scratch.index()],
             reserved_pages_bytes: state.reserved[ReservationKind::Pages.index()],
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
+            reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
         }
     }
 
@@ -4619,6 +4646,11 @@ impl ProjectCache {
     /// took, since their `Removed` never reaches `release_catalogues`. Poison
     /// is cleared, not recovered from.
     fn catalogues(&self) -> MutexGuard<'_, CatalogueStore> {
+        #[cfg(test)]
+        assert!(
+            !HELD_INDEX.with(std::cell::Cell::get),
+            "the index lock is never held with the catalogues lock"
+        );
         self.inner.catalogues.lock().unwrap_or_else(|poisoned| {
             self.inner.catalogues.clear_poison();
             poisoned.into_inner()
@@ -4659,6 +4691,453 @@ impl ProjectCache {
             }
         }
         self.release(state);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set while this thread holds the index guard.
+    static HELD_INDEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What names the documents of an index: a document, or a project.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+pub(crate) enum IndexAnchor {
+    Document(Url),
+    Project(PathBuf),
+}
+
+/// The documents one context indexes, and what they were computed from.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+pub(crate) struct IndexMembership {
+    pub(crate) paths: Vec<PathBuf>,
+    /// The catalogues the paths came from, with the generation each had.
+    pub(crate) scopes: Vec<(CatalogueKey, u64)>,
+    pub(crate) complete: bool,
+    pub(crate) limit: Option<String>,
+    pub(crate) packages: bool,
+    pub(crate) owner_pending: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+pub(crate) enum PublishOutcome {
+    Indexed,
+    NotAMember,
+    /// No room in the index share: the member stays unindexed.
+    Memory,
+}
+
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+struct StoredIndex {
+    index: ContextIndex,
+    membership: IndexMembership,
+    anchor: IndexAnchor,
+    dirty: bool,
+    last_used: u64,
+    /// The membership's own charge. The members' charges are
+    /// `index.bytes()`.
+    charged: usize,
+    memory_exhausted: bool,
+}
+
+impl StoredIndex {
+    fn total_charge(&self) -> usize {
+        self.charged.saturating_add(self.index.bytes())
+    }
+}
+
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+struct IndexStore {
+    contexts: HashMap<ContextKey, StoredIndex>,
+    clock: u64,
+    owners: HashMap<PathBuf, ContextKey>,
+    requests: Vec<IndexAnchor>,
+    unit_limit: usize,
+}
+
+impl Default for IndexStore {
+    fn default() -> Self {
+        Self {
+            contexts: HashMap::new(),
+            clock: 0,
+            owners: HashMap::new(),
+            requests: Vec::new(),
+            unit_limit: MAX_WORKSPACE_UNITS,
+        }
+    }
+}
+
+impl IndexStore {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn request(&mut self, anchor: &IndexAnchor) {
+        if self.requests.len() < MAX_INDEX_REQUESTS && !self.requests.contains(anchor) {
+            self.requests.push(anchor.clone());
+        }
+    }
+
+    /// Removes the least recently used context other than `except` and
+    /// returns the charge it held, for the caller to release once the store
+    /// is unlocked.
+    fn evict_lru(&mut self, except: &ContextKey) -> Option<usize> {
+        let victim = self
+            .contexts
+            .iter()
+            .filter(|(key, _)| *key != except)
+            .min_by_key(|(_, stored)| stored.last_used)
+            .map(|(key, _)| key.clone())?;
+        let stored = self.contexts.remove(&victim)?;
+        self.owners.retain(|_, owner| *owner != victim);
+        Some(stored.total_charge())
+    }
+}
+
+/// The index lock; in tests it flags the thread so `lock` can refuse to run
+/// under it.
+struct IndexGuard<'a>(MutexGuard<'a, IndexStore>);
+
+impl<'a> IndexGuard<'a> {
+    fn new(guard: MutexGuard<'a, IndexStore>) -> Self {
+        #[cfg(test)]
+        HELD_INDEX.with(|held| held.set(true));
+        Self(guard)
+    }
+}
+
+impl std::ops::Deref for IndexGuard<'_> {
+    type Target = IndexStore;
+
+    fn deref(&self) -> &IndexStore {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for IndexGuard<'_> {
+    fn deref_mut(&mut self) -> &mut IndexStore {
+        &mut self.0
+    }
+}
+
+impl Drop for IndexGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        HELD_INDEX.with(|held| held.set(false));
+    }
+}
+
+fn membership_bytes(paths: &[PathBuf]) -> usize {
+    paths.iter().map(|path| path.as_os_str().len() + 48).sum()
+}
+
+/// The workspace index store (l4d-33): one `ContextIndex` per context, at
+/// most `MAX_INDEXED_CONTEXTS`, charged to a quarter of `maxCacheBytes`.
+#[allow(dead_code)] // read by the workspace index tasks of l4d-33
+impl ProjectCache {
+    /// A panic under the index lock can leave a charge unreleased; poison
+    /// is cleared, not recovered from.
+    fn index(&self) -> IndexGuard<'_> {
+        IndexGuard::new(self.inner.index.lock().unwrap_or_else(|poisoned| {
+            self.inner.index.clear_poison();
+            poisoned.into_inner()
+        }))
+    }
+
+    /// Charge `bytes` to the index share, evicting cache entries (never
+    /// pinned) like a reservation. The store holds the charge and releases
+    /// it with `release_index`.
+    fn charge_index(&self, bytes: usize) -> bool {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let slot = ReservationKind::WorkspaceIndex.index();
+        let share = state.max_bytes / INDEX_BUDGET_SHARE;
+        let admitted = state.reserved[slot]
+            .checked_add(bytes)
+            .is_some_and(|total| total <= share)
+            && make_room(&mut state, bytes);
+        if admitted {
+            state.reserved[slot] += bytes;
+        }
+        self.release(state);
+        admitted
+    }
+
+    fn release_index(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = lock(&self.inner);
+        let slot = ReservationKind::WorkspaceIndex.index();
+        state.reserved[slot] = state.reserved[slot].saturating_sub(bytes);
+        self.release(state);
+    }
+
+    /// `charge_index`, and when it fails evict the least recently used
+    /// context other than `except` once and try again.
+    fn charge_index_evicting(&self, bytes: usize, except: &ContextKey) -> bool {
+        if self.charge_index(bytes) {
+            return true;
+        }
+        let evicted = self.index().evict_lru(except);
+        let Some(evicted) = evicted else {
+            return false;
+        };
+        self.release_index(evicted);
+        self.charge_index(bytes)
+    }
+
+    pub(crate) fn index_membership_current(&self, key: &ContextKey) -> bool {
+        let scopes = {
+            let store = self.index();
+            match store.contexts.get(key) {
+                Some(stored) if !stored.dirty => stored.membership.scopes.clone(),
+                _ => return false,
+            }
+        };
+        scopes.iter().all(|(scope, generation)| {
+            self.catalogue(scope)
+                .is_some_and(|shared| shared.generation == *generation)
+        })
+    }
+
+    pub(crate) fn set_index_membership(
+        &self,
+        key: ContextKey,
+        anchor: IndexAnchor,
+        mut membership: IndexMembership,
+    ) {
+        let limit = self.index().unit_limit;
+        if membership.paths.len() > limit {
+            membership.paths.truncate(limit);
+            membership.complete = false;
+            membership.limit = Some(format!("more than {limit} documents"));
+        }
+        let mut exhausted = false;
+        for _ in 0..4 {
+            let wanted = membership_bytes(&membership.paths);
+            let held = self
+                .index()
+                .contexts
+                .get(&key)
+                .map_or(0, |stored| stored.charged);
+            let paid = wanted.saturating_sub(held);
+            if paid > 0 && !self.charge_index_evicting(paid, &key) {
+                exhausted = true;
+                membership.paths.clear();
+                membership.complete = false;
+                membership.limit = Some("the index memory share is exhausted".to_owned());
+                continue;
+            }
+            let mut store = self.index();
+            let clock = store.tick();
+            let current = store.contexts.get(&key).map_or(0, |stored| stored.charged);
+            if current != held {
+                drop(store);
+                self.release_index(paid);
+                continue;
+            }
+            let stored = store
+                .contexts
+                .entry(key.clone())
+                .or_insert_with(|| StoredIndex {
+                    index: ContextIndex::new(),
+                    membership: IndexMembership::default(),
+                    anchor: anchor.clone(),
+                    dirty: false,
+                    last_used: clock,
+                    charged: 0,
+                    memory_exhausted: false,
+                });
+            let (_, removed) = stored.index.set_members(membership.paths.clone());
+            stored.membership = membership;
+            stored.anchor = anchor;
+            stored.dirty = false;
+            stored.last_used = clock;
+            stored.charged = wanted;
+            stored.memory_exhausted |= exhausted;
+            let mut released = removed + held.saturating_sub(wanted);
+            while store.contexts.len() > MAX_INDEXED_CONTEXTS {
+                match store.evict_lru(&key) {
+                    Some(evicted) => released += evicted,
+                    None => break,
+                }
+            }
+            drop(store);
+            self.release_index(released);
+            return;
+        }
+    }
+
+    pub(crate) fn publish_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+    ) -> PublishOutcome {
+        let is_member = |store: &IndexStore| {
+            store
+                .contexts
+                .get(key)
+                .is_some_and(|stored| stored.index.stamps_of(path).is_some())
+        };
+        if !is_member(&self.index()) {
+            return PublishOutcome::NotAMember;
+        }
+        let bytes = ContextIndex::new().charge_for(&facts, &stamps);
+        if !self.charge_index_evicting(bytes, key) {
+            if let Some(stored) = self.index().contexts.get_mut(key) {
+                stored.memory_exhausted = true;
+            }
+            return PublishOutcome::Memory;
+        }
+        let mut store = self.index();
+        let clock = store.tick();
+        let old = store.contexts.get_mut(key).and_then(|stored| {
+            stored.last_used = clock;
+            stored.index.insert(path, facts, stamps, content_hash)
+        });
+        drop(store);
+        match old {
+            Some(old) => {
+                self.release_index(old);
+                PublishOutcome::Indexed
+            }
+            None => {
+                self.release_index(bytes);
+                PublishOutcome::NotAMember
+            }
+        }
+    }
+
+    pub(crate) fn refresh_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        stamps: Vec<MemberStamp>,
+    ) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.refresh(path, stamps);
+        }
+    }
+
+    pub(crate) fn refuse_index_member(&self, key: &ContextKey, path: &Path, reason: String) {
+        let old = self
+            .index()
+            .contexts
+            .get_mut(key)
+            .and_then(|stored| stored.index.refuse(path, reason));
+        if let Some(old) = old {
+            self.release_index(old);
+        }
+    }
+
+    pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_stale(path);
+        }
+    }
+
+    /// `read` runs under the index lock: it must not call back into the cache.
+    pub(crate) fn read_index<R>(
+        &self,
+        key: &ContextKey,
+        read: impl FnOnce(&ContextIndex, &IndexMembership) -> R,
+    ) -> Option<R> {
+        let mut store = self.index();
+        let clock = store.tick();
+        let stored = store.contexts.get_mut(key)?;
+        stored.last_used = clock;
+        Some(read(&stored.index, &stored.membership))
+    }
+
+    pub(crate) fn request_index(&self, anchor: IndexAnchor) {
+        self.index().request(&anchor);
+    }
+
+    pub(crate) fn take_index_requests(&self) -> Vec<IndexAnchor> {
+        std::mem::take(&mut self.index().requests)
+    }
+
+    pub(crate) fn index_memory_exhausted(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.memory_exhausted)
+    }
+
+    pub(crate) fn owner_of(&self, directory: &Path) -> Option<ContextKey> {
+        self.index().owners.get(directory).cloned()
+    }
+
+    pub(crate) fn remember_owner(&self, directory: PathBuf, key: ContextKey) {
+        let mut store = self.index();
+        if store.owners.len() >= MAX_OWNERS && !store.owners.contains_key(&directory) {
+            store.owners.clear();
+        }
+        store.owners.insert(directory, key);
+    }
+
+    /// `path` changed: mark the members it is (or includes into) stale, and
+    /// the memberships whose listing it may have changed dirty.
+    fn invalidate_index(&self, path: &Path, include_parent: bool) {
+        let mut store = self.index();
+        let parent = path.parent();
+        let mut touched = Vec::new();
+        for stored in store.contexts.values_mut() {
+            let stale = stored.index.mark_stale(path);
+            let listed = include_parent
+                && stored
+                    .membership
+                    .scopes
+                    .iter()
+                    .any(|(scope, _)| match scope.depth {
+                        Depth::Listing => parent == Some(scope.root.as_path()),
+                        Depth::Recursive => path != scope.root && path.starts_with(&scope.root),
+                    });
+            let newly_dirty = listed && !stored.dirty;
+            stored.dirty |= listed;
+            if stale || newly_dirty {
+                touched.push(stored.anchor.clone());
+            }
+        }
+        for anchor in &touched {
+            store.request(anchor);
+        }
+        if let Some(parent) = parent {
+            store.owners.remove(parent);
+        }
+    }
+
+    fn invalidate_index_all(&self) {
+        let mut store = self.index();
+        let mut anchors = Vec::new();
+        for stored in store.contexts.values_mut() {
+            stored.index.mark_all_stale();
+            stored.dirty = true;
+            anchors.push(stored.anchor.clone());
+        }
+        for anchor in &anchors {
+            store.request(anchor);
+        }
+        store.owners.clear();
+    }
+}
+
+#[cfg(test)]
+impl ProjectCache {
+    pub(crate) fn set_index_unit_limit_for_test(&self, units: usize) {
+        self.index().unit_limit = units;
+    }
+
+    pub(crate) fn indexed_context_count(&self) -> usize {
+        self.index().contexts.len()
     }
 }
 
@@ -4970,5 +5449,410 @@ mod catalogue_tests {
         cache.invalidate_after_overflow();
         assert_eq!(cache.catalogue_count(), 0);
         assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::workspace::ContextKey;
+    use crate::workspace_index::{CandidateQuery, MemberFacts, MemberStamp};
+    use pascal_core::facts::{ArtifactFacts, PostingFact};
+
+    fn key(name: &str) -> ContextKey {
+        ContextKey::for_test(name)
+    }
+
+    fn anchor(name: &str) -> IndexAnchor {
+        IndexAnchor::Project(PathBuf::from(format!("/anchors/{name}")))
+    }
+
+    fn membership(paths: &[&str]) -> IndexMembership {
+        IndexMembership {
+            paths: paths.iter().map(PathBuf::from).collect(),
+            complete: true,
+            ..IndexMembership::default()
+        }
+    }
+
+    fn membership_cost(paths: &[&str]) -> usize {
+        paths.iter().map(|path| path.len() + 48).sum()
+    }
+
+    fn facts_with(path: &str, posting: &str, slots: Vec<Option<PathBuf>>) -> MemberFacts {
+        let facts = ArtifactFacts {
+            postings: vec![PostingFact {
+                name: posting.to_owned(),
+                occurrences: Vec::new(),
+            }],
+            ..ArtifactFacts::default()
+        };
+        MemberFacts::from_facts(Path::new(path), &facts, slots)
+    }
+
+    fn facts(path: &str) -> MemberFacts {
+        facts_with(path, "thing", Vec::new())
+    }
+
+    fn charge(facts: &MemberFacts) -> usize {
+        crate::workspace_index::ContextIndex::new().charge_for(facts, &[])
+    }
+
+    fn stamps() -> Vec<MemberStamp> {
+        Vec::new()
+    }
+
+    fn publish(cache: &ProjectCache, key: &ContextKey, path: &str) -> PublishOutcome {
+        cache.publish_index_member(key, Path::new(path), facts(path), stamps(), 1)
+    }
+
+    fn unverified(cache: &ProjectCache, key: &ContextKey) -> Vec<PathBuf> {
+        cache
+            .read_index(key, |index, _| {
+                index
+                    .candidates(&CandidateQuery {
+                        names: Vec::new(),
+                        top_level_units: None,
+                        aliases: Vec::new(),
+                    })
+                    .unverified
+            })
+            .expect("context is stored")
+    }
+
+    fn generation(cache: &ProjectCache, key: &ContextKey) -> u64 {
+        cache
+            .read_index(key, |index, _| index.generation())
+            .expect("context is stored")
+    }
+
+    #[test]
+    fn index_bytes_are_charged_before_insertion_and_released_on_removal() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let base = cache.stats().reserved_index_bytes;
+        assert_eq!(base, membership_cost(&["/w/A.pas", "/w/B.pas"]));
+        let member = facts("/w/A.pas");
+        let expected = charge(&member);
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), member, stamps(), 1),
+            PublishOutcome::Indexed
+        );
+        assert_eq!(cache.stats().reserved_index_bytes, base + expected);
+        assert_eq!(cache.stats().reserved_bytes(), base + expected);
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/B.pas"]));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            membership_cost(&["/w/B.pas"])
+        );
+    }
+
+    #[test]
+    fn a_member_over_the_quarter_share_is_left_unindexed_with_a_gap() {
+        let cache = ProjectCache::new(4096);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let held = cache.stats().reserved_index_bytes;
+        let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert!(cache.index_memory_exhausted(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, held);
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+    }
+
+    #[test]
+    fn the_least_recently_used_context_is_evicted_once_for_room() {
+        let m = membership_cost(&["/w/A.pas"]);
+        let c = charge(&facts("/w/A.pas"));
+        let share = 3 * m + 2 * c + c / 2;
+        let cache = ProjectCache::new(share * 4);
+        let (a, b, third) = (key("a"), key("b"), key("c"));
+        for (key, name) in [(&a, "a"), (&b, "b")] {
+            cache.set_index_membership(key.clone(), anchor(name), membership(&["/w/A.pas"]));
+            assert_eq!(publish(&cache, key, "/w/A.pas"), PublishOutcome::Indexed);
+        }
+        cache.read_index(&a, |_, _| ());
+        cache.set_index_membership(third.clone(), anchor("c"), membership(&["/w/A.pas"]));
+        assert_eq!(cache.indexed_context_count(), 3);
+        assert_eq!(publish(&cache, &third, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(cache.indexed_context_count(), 2);
+        assert!(cache.read_index(&a, |_, _| ()).is_some());
+        assert!(cache.read_index(&b, |_, _| ()).is_none());
+        assert_eq!(cache.stats().reserved_index_bytes, 2 * m + 2 * c);
+
+        let big = facts_with("/w/A.pas", &"x".repeat(share), Vec::new());
+        assert_eq!(
+            cache.publish_index_member(&third, Path::new("/w/A.pas"), big, stamps(), 1),
+            PublishOutcome::Memory
+        );
+        assert_eq!(cache.indexed_context_count(), 1, "one eviction, not all");
+        assert!(cache.read_index(&third, |_, _| ()).is_some());
+        assert!(cache.index_memory_exhausted(&third));
+    }
+
+    #[test]
+    fn the_store_keeps_at_most_eight_contexts() {
+        let cache = ProjectCache::new(1 << 30);
+        for index in 0..=MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+        }
+        assert_eq!(cache.indexed_context_count(), MAX_INDEXED_CONTEXTS);
+        assert!(cache.read_index(&key("k0"), |_, _| ()).is_none());
+        assert!(cache.read_index(&key("k8"), |_, _| ()).is_some());
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            MAX_INDEXED_CONTEXTS * membership_cost(&["/w/A.pas"])
+        );
+    }
+
+    #[test]
+    fn two_contexts_sharing_a_document_each_charge_their_member() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        let c = charge(&facts("/w/A.pas"));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(publish(&cache, &b, "/w/A.pas"), PublishOutcome::Indexed);
+        assert_eq!(cache.stats().reserved_index_bytes, base + 2 * c);
+    }
+
+    #[test]
+    fn a_path_outside_the_membership_is_not_charged() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::NotAMember);
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        assert_eq!(publish(&cache, &a, "/w/Z.pas"), PublishOutcome::NotAMember);
+        assert_eq!(cache.stats().reserved_index_bytes, base);
+    }
+
+    #[test]
+    fn refusing_and_replacing_a_member_releases_its_old_charge() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        let base = cache.stats().reserved_index_bytes;
+        publish(&cache, &a, "/w/A.pas");
+        publish(&cache, &a, "/w/A.pas");
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            base + charge(&facts("/w/A.pas"))
+        );
+        cache.refuse_index_member(&a, Path::new("/w/A.pas"), "too big".into());
+        assert_eq!(cache.stats().reserved_index_bytes, base);
+    }
+
+    #[test]
+    fn invalidating_a_member_path_marks_it_stale_and_bumps_the_generation() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        publish(&cache, &a, "/w/A.pas");
+        assert!(unverified(&cache, &a).is_empty());
+        cache.take_index_requests();
+        let before = generation(&cache, &a);
+        cache.invalidate_file_contents(Path::new("/w/A.pas"));
+        cache.invalidate_file_contents(Path::new("/w/A.pas"));
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+        assert!(generation(&cache, &a) > before);
+        assert_eq!(cache.take_index_requests(), vec![anchor("a")]);
+        assert!(cache.take_index_requests().is_empty());
+    }
+
+    #[test]
+    fn invalidation_reaches_every_context_holding_the_path() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b, other) = (key("a"), key("b"), key("o"));
+        for (key, name, path) in [
+            (&a, "a", "/w/A.pas"),
+            (&b, "b", "/w/A.pas"),
+            (&other, "o", "/w/O.pas"),
+        ] {
+            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]));
+            publish(&cache, key, path);
+        }
+        cache.take_index_requests();
+        cache.invalidate_path(Path::new("/w/A.pas"));
+        assert_eq!(unverified(&cache, &a).len(), 1);
+        assert_eq!(unverified(&cache, &b).len(), 1);
+        assert!(unverified(&cache, &other).is_empty());
+        let mut requests = cache.take_index_requests();
+        requests.sort_by_key(|anchor| format!("{anchor:?}"));
+        assert_eq!(requests, vec![anchor("a"), anchor("b")]);
+    }
+
+    fn listing_scope(directory: &Path) -> (crate::catalogue::CatalogueKey, Arc<Catalogue>) {
+        use crate::catalogue::{Bound, Depth, Exclusions, MAX_CATALOGUE_ENTRIES};
+        let mut io = || -> Result<(), String> { Ok(()) };
+        let mut catalogue = Catalogue::new(directory, Depth::Listing, &mut io).unwrap();
+        catalogue
+            .advance(Bound::entries(MAX_CATALOGUE_ENTRIES), &|_| false, &mut io)
+            .unwrap();
+        let key = CatalogueKey {
+            root: directory.to_path_buf(),
+            depth: Depth::Listing,
+            exclusions: Exclusions::Nothing,
+        };
+        (key, Arc::new(catalogue))
+    }
+
+    #[test]
+    fn a_listing_change_dirties_the_membership_that_listed_the_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("A.pas"), b"").unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let (scope, catalogue) = listing_scope(&dir);
+        let generation = cache
+            .publish_catalogue(scope.clone(), None, catalogue)
+            .unwrap();
+        let a = key("a");
+        let mut recorded = membership(&["/w/A.pas"]);
+        recorded.scopes = vec![(scope, generation)];
+        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        assert!(cache.index_membership_current(&a));
+        cache.invalidate_file_contents(&dir.join("New.pas"));
+        assert!(
+            cache.index_membership_current(&a),
+            "a file's bytes are not membership"
+        );
+        cache.invalidate_path(&dir.join("New.pas"));
+        assert!(!cache.index_membership_current(&a));
+        assert!(!cache.index_membership_current(&key("absent")));
+    }
+
+    #[test]
+    fn a_listing_change_leaves_unrelated_memberships_current() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert!(cache.index_membership_current(&a));
+        cache.invalidate_path(Path::new("/elsewhere/New.pas"));
+        assert!(cache.index_membership_current(&a));
+    }
+
+    #[test]
+    fn a_changed_include_marks_its_dependents_stale() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let slots = vec![None, Some(PathBuf::from("/w/shared.inc"))];
+        let with_include = facts_with("/w/A.pas", "thing", slots);
+        cache.publish_index_member(&a, Path::new("/w/A.pas"), with_include, stamps(), 1);
+        publish(&cache, &a, "/w/B.pas");
+        cache.invalidate_file_contents(Path::new("/w/shared.inc"));
+        assert_eq!(unverified(&cache, &a), vec![PathBuf::from("/w/A.pas")]);
+    }
+
+    #[test]
+    fn overflow_marks_every_member_stale_and_clears_owners() {
+        let cache = ProjectCache::new(1 << 30);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/B.pas"]));
+        publish(&cache, &a, "/w/A.pas");
+        publish(&cache, &b, "/w/B.pas");
+        cache.remember_owner(PathBuf::from("/w"), a.clone());
+        assert_eq!(cache.owner_of(Path::new("/w")), Some(a.clone()));
+        cache.invalidate_after_overflow();
+        assert_eq!(unverified(&cache, &a).len(), 1);
+        assert_eq!(unverified(&cache, &b).len(), 1);
+        assert_eq!(cache.owner_of(Path::new("/w")), None);
+        assert!(!cache.index_membership_current(&a));
+    }
+
+    #[test]
+    fn a_listing_change_forgets_the_owner_of_the_directory() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.remember_owner(PathBuf::from("/w"), key("a"));
+        cache.remember_owner(PathBuf::from("/x"), key("a"));
+        cache.invalidate_path(Path::new("/w/New.pas"));
+        assert_eq!(cache.owner_of(Path::new("/w")), None);
+        assert_eq!(cache.owner_of(Path::new("/x")), Some(key("a")));
+    }
+
+    #[test]
+    fn requests_are_deduplicated() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.request_index(anchor("a"));
+        cache.request_index(anchor("a"));
+        cache.request_index(anchor("b"));
+        assert_eq!(cache.take_index_requests(), vec![anchor("a"), anchor("b")]);
+    }
+
+    #[test]
+    fn the_unit_limit_truncates_the_membership_and_records_it() {
+        let cache = ProjectCache::new(1 << 30);
+        cache.set_index_unit_limit_for_test(2);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+        );
+        let (count, limited, complete) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    index.member_paths().len(),
+                    membership.limit.is_some(),
+                    membership.complete,
+                )
+            })
+            .unwrap();
+        assert_eq!((count, limited, complete), (2, true, false));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            membership_cost(&["/w/A.pas", "/w/B.pas"])
+        );
+    }
+
+    #[test]
+    fn the_index_lock_is_never_held_with_state() {
+        let cache = ProjectCache::new(1 << 20);
+        let (a, b) = (key("a"), key("b"));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        cache.invalidate_path(Path::new("/w/A.pas"));
+        cache.invalidate_after_overflow();
+        for index in 0..=MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+        }
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]));
+        assert!(
+            cache
+                .read_index(&b, |_, _| HELD_INDEX.with(std::cell::Cell::get))
+                .unwrap(),
+            "the flag tracks the guard"
+        );
+        assert!(!HELD_INDEX.with(std::cell::Cell::get));
+        let inside = cache
+            .read_index(&b, |_, _| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.stats())).is_err()
+            })
+            .unwrap();
+        assert!(inside, "state is refused while the index guard lives");
+        assert!(!HELD_INDEX.with(std::cell::Cell::get));
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            cache.stats().reserved_bytes()
+        );
     }
 }

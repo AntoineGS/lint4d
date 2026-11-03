@@ -45058,6 +45058,9 @@ mod build_selection;
 #[path = "protocol/cache_baseline.rs"]
 mod cache_baseline;
 
+#[path = "protocol/persistent_cache_status.rs"]
+mod persistent_cache_status;
+
 fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
     write_file(
         &root.join("Base.pas"),

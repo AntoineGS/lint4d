@@ -19,6 +19,7 @@ fn metrics_launch_ordinary(environment: &Path, enabled: bool) -> TestServer {
         .arg("--stdio")
         .env("HOME", environment.join("home"))
         .env("XDG_CONFIG_HOME", environment.join("config"))
+        .env("XDG_CACHE_HOME", environment.join("cache"))
         .env_remove("PASCAL_LSP_ANALYSIS_METRICS")
         .envs(enabled.then_some(("PASCAL_LSP_ANALYSIS_METRICS", "1")))
         .stdin(Stdio::piped())

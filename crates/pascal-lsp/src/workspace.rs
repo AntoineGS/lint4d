@@ -2949,6 +2949,8 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    /// The process's persistent-cache handle; inert by default.
+    persistent_cache: crate::persistent_cache::PersistentCache,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3421,9 +3423,15 @@ impl Workspace {
         }
 
         let project_file_changed = self.options.project_file != prepared.options.project_file;
+        let budget_changed =
+            self.options.limits.max_cache_bytes != prepared.options.limits.max_cache_bytes;
         self.options = prepared.options;
         self.project_cache
             .set_max_bytes(self.options.limits.max_cache_bytes);
+        if budget_changed {
+            // Re-admit the store against the new budget (spec §11.1 amendment).
+            self.persistent_cache.readmit();
+        }
         self.roots = prepared.roots;
 
         self.bump_source_generation();
@@ -3520,6 +3528,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
+            persistent_cache: input.persistent_cache.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
@@ -13128,6 +13137,15 @@ impl Workspace {
 
     pub(crate) fn project_cache(&self) -> &crate::project_cache::ProjectCache {
         &self.project_cache
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
+    pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
+        &self.persistent_cache
+    }
+
+    pub(crate) fn set_persistent_cache(&mut self, cache: crate::persistent_cache::PersistentCache) {
+        self.persistent_cache = cache;
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {
@@ -24299,6 +24317,7 @@ BDS = '/fake/37'
             overlays,
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
+            persistent_cache: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
@@ -26374,6 +26393,26 @@ BDS = '/fake/37'
 
         assert!(workspace.contexts.contains_key(&live));
         assert!(!workspace.contexts.contains_key(&orphan));
+    }
+
+    #[test]
+    fn request_workspaces_carry_the_persistent_cache_handle() {
+        let mut workspace = Workspace::default();
+        let inert = format!("{:?}", workspace.persistent_cache());
+        assert!(inert.contains("inert: true"), "{inert}");
+        // Disabled: no worker, no store, no IO.
+        let options = crate::persistent_cache::CacheOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        workspace.set_persistent_cache(crate::persistent_cache::PersistentCache::start(
+            options,
+            workspace.project_cache().clone(),
+            Arc::default(),
+        ));
+        let request = Workspace::from_analysis_input(&workspace.analysis_input());
+        let carried = format!("{:?}", request.persistent_cache());
+        assert!(carried.contains("inert: false"), "{carried}");
     }
 
     #[test]

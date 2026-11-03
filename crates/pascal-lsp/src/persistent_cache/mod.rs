@@ -23,7 +23,9 @@ pub(crate) mod status;
 mod worker;
 
 pub(crate) use counters::Counters;
-pub(crate) use options::CacheOptions;
+pub(crate) use options::{
+    CacheOptions, CacheOptionsOverride, CacheOptionsUpdate, parse_runtime_cache_options,
+};
 pub(crate) use status::{CacheStatus, StatusCause};
 
 use crate::project_cache::ProjectCache;

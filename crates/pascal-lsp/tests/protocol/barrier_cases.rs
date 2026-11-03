@@ -12268,6 +12268,7 @@ fn client_request_id_cannot_collide_with_internal_diagnostic_job() {
         .arg("--stdio")
         .env("HOME", environment.path().join("home"))
         .env("XDG_CONFIG_HOME", environment.path().join("config"))
+        .env("XDG_CACHE_HOME", environment.path().join("cache"))
         .env("PASCAL_LSP_TEST_DIAGNOSTICS_BARRIER", &diagnostic_value)
         .env("PASCAL_LSP_TEST_FORMATTING_BARRIER", &formatting_value)
         .stdin(Stdio::piped())

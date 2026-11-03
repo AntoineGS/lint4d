@@ -1136,10 +1136,14 @@ pub(crate) fn highlights_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel) {
+    let mut snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    // Highlights mark every occurrence of one binding, like references: an
+    // inherited member the index cannot see must still withhold a global.
+    snapshot.index.set_best_effort_bindings(false);
     let records = snapshot_records(&snapshot);
     if let Err(error) = ensure_document_ready(&snapshot, &uri) {
         return with_records(

@@ -8,7 +8,7 @@ use common::records::{
     EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
     local_member, member, open, publish_bulk, raw, read_members, read_record, records, sealed,
 };
-use pascal_cache::admin::{self, RecoveryAdvice, StoreStatus};
+use pascal_cache::admin::{self, PruneLimits, PruneOutcome, RecoveryAdvice, StoreStatus};
 use pascal_cache::{
     ArtifactKeyRef, Bypass, DATABASE_FILE, Digest, DiscoveryInputs, DiscoveryScope, EvidenceTarget,
     EvidenceWrite, ExpandedArtifactKey, FaultPoint, Hint, HintStats, JOURNAL_SIZE_LIMIT_BYTES,
@@ -1676,6 +1676,91 @@ fn prune_returns_after_a_step_that_makes_no_progress() {
         "prune spun until its time budget: {report:?}"
     );
     assert_eq!((report.rows, report.cycle_complete), (0, false));
+}
+
+#[test]
+fn prune_until_an_absent_store_creates_nothing() {
+    let root = private_tempdir();
+    let directory = root.path().join("cache");
+    assert_eq!(
+        admin::prune_until(
+            &directory,
+            &namespace(),
+            StoreLimits::default(),
+            PruneLimits::default()
+        ),
+        Ok(None)
+    );
+    assert!(!directory.exists());
+}
+
+#[test]
+fn prune_until_runs_one_complete_cycle_even_within_budget() {
+    let root = private_tempdir();
+    drop(open(root.path()));
+    let report = admin::prune_until(
+        root.path(),
+        &namespace(),
+        StoreLimits::default(),
+        PruneLimits::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.outcome, PruneOutcome::WithinBudget, "{report:?}");
+    assert_eq!(report.cycles, 1);
+    assert_eq!(report.pressure, Pressure::None);
+    assert!(report.after.physical_bytes() > 0);
+}
+
+#[test]
+fn prune_stops_at_its_time_limit() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let report = admin::prune_store(
+        &store,
+        PruneLimits {
+            time: std::time::Duration::ZERO,
+            step_rows: 256,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (report.outcome, report.cycles, report.rows),
+        (PruneOutcome::TimeLimit, 0, 0)
+    );
+}
+
+/// Nothing is reclaimable, so the store stays over its headroom: the first
+/// complete cycle that changes no row ends the prune.
+#[test]
+fn prune_without_progress_ends_after_one_cycle() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let state = store.policy().unwrap();
+    store
+        .set_policy(
+            state.revision,
+            StorePolicy {
+                max_disk_bytes: 64 << 20,
+                wal_threshold_bytes: 8 << 20,
+            },
+        )
+        .unwrap();
+    store.pretend_usage_for_test(60 << 20);
+    let report = admin::prune_store(&store, PruneLimits::default()).unwrap();
+    assert_eq!(report.outcome, PruneOutcome::NoProgress, "{report:?}");
+    assert_eq!(report.cycles, 1);
+    assert_eq!(report.pressure, Pressure::OverHeadroom);
+}
+
+#[test]
+fn prune_ends_as_busy_while_another_maintainer_holds_the_lock() {
+    let root = private_tempdir();
+    let holder = open(root.path());
+    let _lock = holder.hold_maintenance_lock_for_test().unwrap();
+    let store = open(root.path());
+    let report = admin::prune_store(&store, PruneLimits::default()).unwrap();
+    assert_eq!((report.outcome, report.cycles), (PruneOutcome::Busy, 0));
 }
 
 #[test]

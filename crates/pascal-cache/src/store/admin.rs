@@ -257,6 +257,123 @@ pub fn prune(
     }
 }
 
+/// What `--cache-prune` may spend (spec §10 amendment 2026-11-03, D20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneLimits {
+    /// Real elapsed time for the whole prune.
+    pub time: std::time::Duration,
+    /// Rows one step may change.
+    pub step_rows: usize,
+}
+
+impl Default for PruneLimits {
+    fn default() -> Self {
+        Self {
+            time: std::time::Duration::from_secs(30),
+            step_rows: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// A complete cycle left the store with its maintenance headroom.
+    WithinBudget,
+    /// A complete cycle changed no row: nothing more is reclaimable now.
+    NoProgress,
+    TimeLimit,
+    /// Another process holds `maintenance.lock`; rerun later.
+    Busy,
+    /// The WAL stays at its threshold: a reader in another process keeps
+    /// the checkpoint from completing.
+    WalPressure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    pub outcome: PruneOutcome,
+    pub cycles: u32,
+    pub rows: usize,
+    pub before: Usage,
+    pub after: Usage,
+    pub pressure: Pressure,
+    pub policy: PolicyState,
+}
+
+/// [`prune_store`] on the store in `directory`; `None` for an absent store,
+/// which is not created.
+pub fn prune_until(
+    directory: &Path,
+    namespace: &Namespace,
+    limits: StoreLimits,
+    prune: PruneLimits,
+) -> Result<Option<PruneReport>, Bypass> {
+    super::count_operation();
+    if !database_exists(directory)? {
+        return Ok(None);
+    }
+    let store = Store::open(directory, namespace, limits)?;
+    prune_store(&store, prune).map(Some)
+}
+
+/// Repeat maintenance cycles until a complete cycle leaves the store with
+/// its headroom, a complete cycle changes no row, or `prune.time` runs out.
+/// At least one complete cycle runs. Rerunning resumes from the database.
+pub fn prune_store(store: &Store, prune: PruneLimits) -> Result<PruneReport, Bypass> {
+    let before = store.usage()?;
+    let mut maintenance = Maintenance::new(MaintenanceLimits::default())
+        .map_err(|_| Bypass::InvalidMaintenanceLimits)?;
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let (mut cycles, mut rows, mut cycle_rows) = (0u32, 0usize, 0usize);
+    let outcome = loop {
+        let remaining = prune.time.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break PruneOutcome::TimeLimit;
+        }
+        let phase = maintenance.phase();
+        let report = maintenance.step(
+            store,
+            StepBudget {
+                time: remaining,
+                rows: prune.step_rows,
+            },
+            &cancel,
+        )?;
+        rows += report.rows;
+        cycle_rows += report.rows;
+        let stalled = report.rows == 0 && maintenance.phase() == phase && !report.cycle_complete;
+        if report.skipped {
+            break PruneOutcome::Busy;
+        }
+        if report.cycle_complete {
+            cycles += 1;
+            if store.pressure()? == Pressure::None {
+                break PruneOutcome::WithinBudget;
+            }
+            if cycle_rows == 0 {
+                break PruneOutcome::NoProgress;
+            }
+            cycle_rows = 0;
+        } else if stalled {
+            break if report.pressure == Pressure::WalPressure {
+                PruneOutcome::WalPressure
+            } else {
+                PruneOutcome::NoProgress
+            };
+        }
+    };
+    Ok(PruneReport {
+        outcome,
+        cycles,
+        rows,
+        before,
+        after: store.usage()?,
+        pressure: store.pressure()?,
+        policy: store.policy()?,
+    })
+}
+
 /// Reset `namespace` of the store in `directory` logically and run one
 /// bounded reclamation; `false` for an absent store. The reset is durable
 /// once this returns `true`: a reclamation that cannot run now (WAL

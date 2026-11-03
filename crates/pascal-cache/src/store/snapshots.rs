@@ -449,7 +449,9 @@ impl Store {
     /// `l4d-zf1b.10` retires top-down (snapshots and builds, then records
     /// no live snapshot or build lists, then artifacts and evidence no live
     /// record references). Retiring a referenced artifact or evidence set
-    /// while its records are live breaks that contract.
+    /// while its records are live breaks that contract. `l4d-zf1b.10`
+    /// enforces that order: `Store::retire_step` (`gc.rs`) re-checks every
+    /// reference inside its write transaction.
     ///
     /// Discovery evidence must be discovery evidence of the snapshot's own
     /// context, or the seal is refused as `DiscoveryEvidence`.

@@ -69,13 +69,13 @@ pub use store::{
     MAX_PAGE_CACHE_BYTES, MAX_PENDING_HINTS, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS,
     MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES,
     MAX_WAIT, MIN_BUDGET_TO_WAL_RATIO, MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_HEALTH_BACKOFF,
-    MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, Malformed, MemberBatch, MemberRecordHeader,
-    MemberRecordReader, Miss, ObservationBatch, PolicyError, PolicyState, Pressure, Published,
-    PublishedEvidence, PublishedRecord, PublishedSet, ROW_CHECKSUM_CONTEXT, ROW_OVERHEAD_BYTES,
-    Reclaimed, RetireReport, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal,
-    SnapshotBuilder, SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader, SnapshotSeal,
-    Store, StoreLimits, StoreLocation, StorePolicy, StoredRow, TooLarge, Unhealthy, Usage,
-    default_directory,
+    MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, MaintenanceLimits, MaintenanceLimitsError,
+    Malformed, MemberBatch, MemberRecordHeader, MemberRecordReader, Miss, ObservationBatch,
+    PolicyError, PolicyState, Pressure, Published, PublishedEvidence, PublishedRecord,
+    PublishedSet, ROW_CHECKSUM_CONTEXT, ROW_OVERHEAD_BYTES, Reclaimed, RetireReport, RetireStep,
+    RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal, SnapshotBuilder,
+    SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader, SnapshotSeal, Store, StoreLimits,
+    StoreLocation, StorePolicy, StoredRow, TooLarge, Unhealthy, Usage, default_directory,
 };
 
 #[cfg(feature = "test-support")]

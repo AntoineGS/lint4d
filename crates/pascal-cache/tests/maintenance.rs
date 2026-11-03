@@ -4,12 +4,15 @@
 mod common;
 
 use common::private_tempdir;
-use common::records::{SEAL, binding_evidence, context, open, raw, records, sealed};
+use common::records::{
+    EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
+    local_member, open, raw, read_members, records, sealed,
+};
 use pascal_cache::{
     ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, FaultPoint, Hint,
     HintStats, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES, LocalArtifactKey, Lookup,
-    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, Miss, PolicyError, PolicyState,
-    Pressure, Published, SourceContent, Store, StorePolicy, Unhealthy,
+    MAX_LEASE_HOLDS, MAX_PENDING_HINTS, MIN_HEALTH_BACKOFF, MaintenanceLimits, Miss, PolicyError,
+    PolicyState, Pressure, Published, RetireStep, SourceContent, Store, StorePolicy, Unhealthy,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
 use std::path::Path;
@@ -475,4 +478,287 @@ fn a_renewal_that_lost_the_race_to_a_write_does_nothing() {
         row.2, opened.1,
         "renewed once: the floor is still the open-time sequence"
     );
+}
+
+fn lifecycle(directory: &Path, table: &str, column: &str, id: &[u8]) -> i64 {
+    raw(directory)
+        .query_row(
+            &format!("SELECT lifecycle FROM {table} WHERE {column} = ?1"),
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn retire_all(store: &Store, limits: &MaintenanceLimits) -> usize {
+    RetireStep::ALL
+        .iter()
+        .map(|step| store.retire_step(*step, limits).unwrap())
+        .sum()
+}
+
+const SMALL_POLICY: StorePolicy = StorePolicy {
+    max_disk_bytes: 64 * MIB,
+    wal_threshold_bytes: 16 * MIB,
+};
+
+#[test]
+fn retirement_never_breaks_the_reachability_invariant() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let used = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    let kept = store
+        .publish_member_record(&local_member(
+            &store,
+            "/w/Main.pas",
+            "unit Main;",
+            "/w/Shapes.pas",
+            used,
+        ))
+        .unwrap()
+        .record_id;
+    let snapshot = sealed(&store, &[kept]);
+    let stray_evidence = binding_evidence(&store, "other", "/w/Other.pas");
+    let stray_artifact = artifact(&store, "unit Stray;");
+    let stray_record = records(&store, "Stray", 1)[0];
+    age_past_grace(&store);
+    assert_eq!(retire_all(&store, &EAGER), 3);
+    assert_eq!(check_invariant(root.path()), 0);
+    let dir = root.path();
+    let record_of = |id: Digest| lifecycle(dir, "member_records", "record_id", id.as_bytes());
+    let evidence_of = |id: Digest| lifecycle(dir, "evidence_sets", "evidence_id", id.as_bytes());
+    assert_eq!(record_of(stray_record), 2);
+    assert_eq!(evidence_of(stray_evidence), 2);
+    assert_eq!(
+        lifecycle(dir, "artifacts", "artifact_id", stray_artifact.as_bytes()),
+        2
+    );
+    assert_eq!(record_of(kept), 1);
+    assert_eq!(evidence_of(used), 1);
+    assert_eq!(
+        read_members(&store, &snapshot).map(|m| m.len()),
+        Ok(1),
+        "still readable"
+    );
+    // Once nothing lists it, the record goes, then what only it referenced.
+    assert!(store.retire_snapshot(snapshot.id()).unwrap());
+    assert_eq!(retire_all(&store, &EAGER), 3);
+    assert_eq!(check_invariant(dir), 0);
+    assert_eq!(record_of(kept), 2);
+    assert_eq!(evidence_of(used), 2);
+}
+
+#[test]
+fn rows_published_since_the_last_renewal_are_not_collected() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    artifact(&store, "unit Fresh;");
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(0));
+    store.advance_clock_for_test(LEASE_RENEWAL);
+    store.renew_lease().unwrap();
+    assert_eq!(
+        store.retire_step(RetireStep::Artifacts, &EAGER),
+        Ok(0),
+        "the floor is still behind it"
+    );
+    age_past_grace(&store);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+}
+
+#[test]
+fn another_live_lease_holds_the_horizon_back() {
+    let root = private_tempdir();
+    let gc = open(root.path());
+    let other = open(root.path());
+    artifact(&other, "unit Theirs;");
+    age_past_grace(&gc);
+    assert_eq!(
+        gc.retire_step(RetireStep::Artifacts, &EAGER),
+        Ok(0),
+        "the other process's floor"
+    );
+    gc.advance_clock_for_test(LEASE_EXPIRY);
+    gc.renew_lease().unwrap();
+    assert_eq!(
+        gc.retire_step(RetireStep::Artifacts, &EAGER),
+        Ok(1),
+        "its lease expired"
+    );
+}
+
+#[test]
+fn the_recency_window_keeps_reused_facts_unless_the_store_is_under_pressure() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    artifact(&store, "unit Reused;");
+    age_past_grace(&store);
+    let limits = MaintenanceLimits::default();
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &limits), Ok(0));
+    store.set_policy(0, SMALL_POLICY).unwrap();
+    store.pretend_usage_for_test(60 * MIB);
+    assert_eq!(store.retire_step(RetireStep::Artifacts, &limits), Ok(1));
+}
+
+#[test]
+fn abandoned_builds_are_retired_and_held_ones_kept() {
+    let root = private_tempdir();
+    let builder_store = open(root.path());
+    let gc = open(root.path());
+    let ids = records(&builder_store, "M", 1);
+    let mut builder = builder_store.begin_snapshot(&context()).unwrap();
+    assert_eq!(
+        gc.retire_step(RetireStep::AbandonedBuilds, &EAGER),
+        Ok(0),
+        "held by a live lease"
+    );
+    // Past expiry: a lease renewed exactly LEASE_EXPIRY ago is still live.
+    gc.advance_clock_for_test(LEASE_EXPIRY + LEASE_RENEWAL);
+    assert_eq!(gc.retire_step(RetireStep::AbandonedBuilds, &EAGER), Ok(1));
+    assert_eq!(
+        builder_store.add_members(&mut builder, &ids),
+        Err(Bypass::BuilderFenced)
+    );
+    assert_eq!(check_invariant(root.path()), 0);
+}
+
+#[test]
+fn a_held_snapshot_and_the_newest_of_each_context_survive() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let ids = records(&store, "M", 1);
+    let headers: Vec<_> = (0..6).map(|_| sealed(&store, &ids)).collect();
+    assert_eq!(store.hold_snapshot(&headers[0]), Ok(true));
+    assert_eq!(
+        store.retire_step(RetireStep::UnusedSnapshots, &EAGER),
+        Ok(1),
+        "6 - 4 newest - 1 held"
+    );
+    store.set_policy(0, SMALL_POLICY).unwrap();
+    store.pretend_usage_for_test(60 * MIB);
+    assert_eq!(
+        store.retire_step(RetireStep::UnusedSnapshots, &EAGER),
+        Ok(3),
+        "under pressure: the newest one"
+    );
+    let Lookup::Hit(left) = store.find_snapshots(&context()).unwrap() else {
+        panic!()
+    };
+    let left: Vec<_> = left.iter().map(|header| header.id()).collect();
+    assert_eq!(left, [headers[5].id(), headers[0].id()]);
+}
+
+#[test]
+fn a_publisher_racing_retirement_references_a_live_row_or_retries() {
+    let root = private_tempdir();
+    let gc = open(root.path());
+    let publisher = std::sync::Arc::new(open(root.path()));
+    let evidence = binding_evidence(&publisher, "shapes", "/w/Shapes.pas");
+    let record = local_member(
+        &publisher,
+        "/w/Main.pas",
+        "unit Main;",
+        "/w/Shapes.pas",
+        evidence,
+    );
+    // The record's artifact and evidence exist but nothing references them yet.
+    age_past_grace(&gc);
+    gc.advance_clock_for_test(LEASE_EXPIRY); // the publisher's lease looks expired
+    let racer = std::sync::Arc::clone(&publisher);
+    let attempt = record.clone();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&seen);
+    gc.set_fault_for_test(FaultPoint::GcRetireBeforeCommit, move || {
+        // Inside the retirement transaction: the publisher cannot interleave.
+        *slot.lock().unwrap() = Some(racer.publish_member_record(&attempt).map(|p| p.published));
+    });
+    assert_eq!(gc.retire_step(RetireStep::Evidence, &EAGER), Ok(1));
+    gc.clear_fault_for_test(FaultPoint::GcRetireBeforeCommit);
+    assert_eq!(*seen.lock().unwrap(), Some(Err(Bypass::Busy)));
+    assert_eq!(
+        publisher
+            .publish_member_record(&record)
+            .map(|p| p.published),
+        Err(Bypass::Retiring)
+    );
+    assert_eq!(check_invariant(root.path()), 0);
+}
+
+#[test]
+fn retirement_refuses_invalid_limits_and_writes_nothing_at_the_wal_threshold() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let invalid = MaintenanceLimits {
+        keep_snapshots: 5,
+        ..MaintenanceLimits::DEFAULT
+    };
+    assert_eq!(
+        store.retire_step(RetireStep::Records, &invalid),
+        Err(Bypass::InvalidMaintenanceLimits)
+    );
+    artifact(&store, "unit Stray;");
+    age_past_grace(&store);
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    publish_bulk(&store, "unit Bulk;", 9, 1_000_000).unwrap();
+    assert_eq!(store.pressure(), Ok(Pressure::WalPressure));
+    assert_eq!(
+        store.retire_step(RetireStep::Artifacts, &EAGER),
+        Err(Bypass::WalPressure)
+    );
+}
+
+#[test]
+fn maintenance_limits_only_go_downward() {
+    assert_eq!(MaintenanceLimits::default(), MaintenanceLimits::DEFAULT);
+    assert_eq!(MaintenanceLimits::DEFAULT.validate(), Ok(()));
+    assert_eq!(EAGER.validate(), Ok(()));
+    let with = |change: fn(&mut MaintenanceLimits)| {
+        let mut limits = MaintenanceLimits::DEFAULT;
+        change(&mut limits);
+        limits.validate()
+    };
+    assert!(with(|l| l.keep_snapshots = 5).is_err());
+    assert!(with(|l| l.keep_snapshots_under_pressure = 0).is_err());
+    assert!(
+        with(|l| {
+            l.keep_snapshots = 1;
+            l.keep_snapshots_under_pressure = 2;
+        })
+        .is_err()
+    );
+    assert!(with(|l| l.recency_window = 65_537).is_err());
+    assert!(with(|l| l.batch_rows = 0).is_err());
+    assert!(with(|l| l.batch_rows = 257).is_err());
+    assert!(with(|l| l.vacuum_pages = 0).is_err());
+    assert!(with(|l| l.vacuum_pages = 257).is_err());
+    assert_eq!(
+        with(|l| {
+            l.keep_snapshots = 1;
+            l.batch_rows = 1;
+            l.vacuum_pages = 1;
+        }),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_batch_retires_at_most_batch_rows() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    records(&store, "Stray", 3);
+    age_past_grace(&store);
+    let one = MaintenanceLimits {
+        batch_rows: 2,
+        ..EAGER
+    };
+    assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(2));
+    assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(1));
+    assert_eq!(store.retire_step(RetireStep::Records, &one), Ok(0));
 }

@@ -17,6 +17,7 @@ mod clock;
 mod container;
 mod evidence;
 mod facts;
+mod gc;
 mod health;
 mod index;
 mod keys;
@@ -70,6 +71,7 @@ pub use budget::{
     PolicyState, Pressure, ROW_OVERHEAD_BYTES, StorePolicy, Usage,
 };
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
+pub use gc::{MaintenanceLimits, MaintenanceLimitsError, RetireStep};
 pub use health::{Access, MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
 pub use leases::{
     Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,

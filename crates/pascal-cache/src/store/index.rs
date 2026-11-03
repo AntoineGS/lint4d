@@ -1,7 +1,7 @@
 use super::Store;
 use super::health::Access;
 use super::limits::MAX_INDEX_PAGE;
-use super::namespaces::{ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use crate::Digest;
@@ -14,7 +14,7 @@ pub const INDEX_QUERY: &str = "SELECT r.artifact_id, r.ordinal FROM artifact_row
      JOIN artifacts a ON a.namespace_id = r.namespace_id AND a.reset_epoch = r.reset_epoch \
          AND a.artifact_id = r.artifact_id \
      WHERE r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.row_kind = ?3 AND r.index_key = ?4 \
-         AND (r.artifact_id, r.ordinal) > (?5, ?6) AND a.lifecycle = 1 \
+         AND (r.artifact_id, r.ordinal) > (?5, ?6) AND a.lifecycle = ?8 \
      ORDER BY r.artifact_id, r.ordinal LIMIT ?7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -72,7 +72,8 @@ impl Store {
                         index_key,
                         after_id,
                         after_ordinal,
-                        (limit + 1) as i64
+                        (limit + 1) as i64,
+                        LIVE
                     ],
                     |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
                 )

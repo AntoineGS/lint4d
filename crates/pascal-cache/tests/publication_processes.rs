@@ -365,12 +365,13 @@ fn ac2_death_at_each_publication_boundary_leaves_a_complete_record_or_a_clean_mi
                 FaultPoint::RetireBeforeCommit.name(),
                 FaultPoint::LeaseRenewDecided.name(),
             ])
+            .chain(FaultPoint::MAINTENANCE.iter().map(|point| point.name()))
             .collect::<BTreeSet<_>>(),
         FaultPoint::ALL
             .iter()
             .map(|point| point.name())
             .collect::<BTreeSet<_>>(),
-        "every point but retirement and lease renewal is on the build path"
+        "every point but RetireBeforeCommit, lease renewal and the maintenance points is on the build path"
     );
     for (point, seen) in cases {
         let root = private_tempdir();

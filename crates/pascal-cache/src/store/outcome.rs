@@ -33,6 +33,8 @@ pub enum Bypass {
     LowDiskSpace,
     /// A lease holds MAX_LEASE_HOLDS sealed snapshots already.
     TooManyHolds,
+    /// The maintenance limits raise a bound above its default.
+    InvalidMaintenanceLimits,
     Corrupt,
     OutOfMemory,
     ScratchExhausted,

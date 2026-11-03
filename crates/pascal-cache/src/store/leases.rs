@@ -128,7 +128,6 @@ pub(crate) fn live_since(now: u64) -> i64 {
 
 /// The lowest `floor_seq` of the scope's live leases, else the current
 /// sequence: rows published above it are inside the grace window.
-#[allow(dead_code)] // first used by reachability retirement
 pub(crate) fn horizon(connection: &Connection, scope: Scope, now: u64) -> Result<i64, Bypass> {
     connection
         .query_row(

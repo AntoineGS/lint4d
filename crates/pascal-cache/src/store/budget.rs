@@ -149,6 +149,26 @@ pub(crate) fn decide(
     Ok(())
 }
 
+/// What keeps new writes out under `policy`, if anything.
+pub(crate) fn pressure_of(policy: StorePolicy, usage: &Usage) -> Pressure {
+    if usage.wal_bytes >= policy.wal_threshold_bytes {
+        Pressure::WalPressure
+    } else if usage
+        .filesystem_free_bytes
+        .is_some_and(|free| free <= LOW_SPACE_MARGIN_BYTES)
+    {
+        Pressure::LowDiskSpace
+    } else if usage
+        .physical_bytes()
+        .saturating_add(policy.wal_threshold_bytes)
+        > policy.max_disk_bytes
+    {
+        Pressure::OverHeadroom
+    } else {
+        Pressure::None
+    }
+}
+
 pub(crate) fn read_policy(connection: &Connection) -> Result<PolicyState, Bypass> {
     connection
         .query_row(
@@ -272,23 +292,7 @@ impl Store {
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             let policy = read_policy(&transaction)?.policy;
-            let usage = read_usage(self, &transaction)?;
-            Ok(if usage.wal_bytes >= policy.wal_threshold_bytes {
-                Pressure::WalPressure
-            } else if usage
-                .filesystem_free_bytes
-                .is_some_and(|free| free <= LOW_SPACE_MARGIN_BYTES)
-            {
-                Pressure::LowDiskSpace
-            } else if usage
-                .physical_bytes()
-                .saturating_add(policy.wal_threshold_bytes)
-                > policy.max_disk_bytes
-            {
-                Pressure::OverHeadroom
-            } else {
-                Pressure::None
-            })
+            Ok(pressure_of(policy, &read_usage(self, &transaction)?))
         })
     }
 

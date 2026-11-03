@@ -1454,10 +1454,10 @@ pub struct ResolvedImports {
     pub complete: bool,
     /// The result follows from its inputs and the recorded lookup evidence:
     /// it is complete, or incomplete only because active imports resolved
-    /// to `Unavailable` or `Ambiguous` outcomes while nothing else in the
-    /// session (conditional analysis, limits, lookup errors, diagnostics)
-    /// was incomplete. Such a result is stable and may be reused while its
-    /// evidence holds.
+    /// to `Unavailable` or `Ambiguous` outcomes, and nothing else in the
+    /// session (conditional analysis, limits, lookup errors, catalogues,
+    /// diagnostics) was incomplete. Such a result is stable and may be
+    /// reused while its evidence holds.
     pub settled: bool,
 }
 
@@ -3375,7 +3375,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         self.check_cancel(cancel)?;
         // Read before the generic reason below marks the report incomplete.
-        let settled = complete || (settled && self.report.complete);
+        let settled = (complete || settled) && self.report.complete;
         if !complete {
             self.mark_incomplete("import resolution was incomplete".to_string());
         }

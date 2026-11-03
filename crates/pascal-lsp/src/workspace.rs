@@ -7332,7 +7332,7 @@ impl Workspace {
                     }
                 )
             });
-        let computed_probes =
+        let mut computed_probes =
             computed.then(|| crate::project_cache::report_probes(&report, &resolved));
         // Store the resolution before walking its dependencies, so that a
         // lookup waiting for this claim waits for the resolution only: each
@@ -7353,8 +7353,10 @@ impl Workspace {
         // it through the walk.
         if let Some(claim) = import_claim
             && reusable
-            && let Some((probes, watch_dirs)) = computed_probes.clone()
+            && let Some((probes, watch_dirs)) = computed_probes.take()
         {
+            // The interface entry below keeps the probes, not the watches.
+            computed_probes = Some((probes.clone(), Vec::new()));
             let value = crate::project_cache::ImportValue {
                 resolved: std::sync::Arc::clone(&resolved),
                 report: std::sync::Arc::clone(&report),
@@ -19884,6 +19886,53 @@ mod tests {
         assert_eq!(located[0].uri, provider_uri);
         assert_eq!(crate::navigation::test_document_parse_count(), 0);
         assert_eq!(super::test_import_resolution_count(), 0);
+    }
+
+    #[test]
+    fn a_missing_unit_appearing_in_a_search_directory_invalidates_the_stored_imports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().join("ws");
+        let lib = temp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let (main_uri, provider_uri) = provider_fixture(&root);
+        fs::write(
+            main_uri.to_file_path().unwrap(),
+            "unit Main;\ninterface\nuses Provider, Missing;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let options = WorkspaceOptions {
+            source_paths: vec![lib.display().to_string()],
+            ..Default::default()
+        };
+        let main = test_workspace(vec![root.clone()], options);
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(located[0].uri, provider_uri);
+        assert!(
+            main.project_cache
+                .ready_layers(&main_uri)
+                .contains(&"Import".to_string()),
+            "the settled resolution is stored"
+        );
+
+        let missing = lib.join("Missing.pas");
+        fs::write(&missing, "unit Missing;\ninterface\nimplementation\nend.\n").unwrap();
+        let affected = crate::file_watch::apply_watch_event(
+            &main.project_cache,
+            crate::file_watch::WatchEvent::Changed(vec![missing]),
+        );
+        assert!(affected.contains(&main_uri), "{affected:?}");
+        assert!(
+            !main
+                .project_cache
+                .ready_layers(&main_uri)
+                .contains(&"Import".to_string()),
+            "the watcher event removes the stored resolution"
+        );
     }
 
     #[test]

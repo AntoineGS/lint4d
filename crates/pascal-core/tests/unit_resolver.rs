@@ -280,6 +280,43 @@ fn imports_incomplete_only_through_a_missing_unit_are_settled() {
 }
 
 #[test]
+fn complete_imports_in_an_incomplete_session_are_not_settled() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface implementation end.",
+    )
+    .unwrap();
+    let unknown = "unit App; interface implementation {$IFOPT R+} uses Chosen; {$ENDIF} end.";
+    let path = temp.path().join("App.pas");
+    std::fs::write(&path, unknown).unwrap();
+    let mut resolver = task11_fix1_resolver(temp.path(), &path);
+    let source = resolver
+        .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+        .unwrap();
+    let unit = pascal_core::ResolvedUnit {
+        requested_name: "App".into(),
+        declared_name: "App".into(),
+        source,
+    };
+    // Something else made the session incomplete first.
+    let earlier = resolver
+        .resolve_imports_with_text(&unit, &task11_fix1_sites(unknown), unknown, &NoCancellation)
+        .unwrap();
+    assert!(!earlier.settled, "{earlier:?}");
+
+    let text = "unit App; interface uses Types; implementation end.";
+    let imports = resolver
+        .resolve_imports_with_text(&unit, &task11_fix1_sites(text), text, &NoCancellation)
+        .unwrap();
+    assert!(imports.complete, "{imports:?}");
+    assert!(
+        !imports.settled,
+        "a complete import list in an incomplete session is not settled: {imports:?}"
+    );
+}
+
+#[test]
 fn imports_with_unknown_conditional_activity_are_not_settled() {
     let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
     std::fs::write(

@@ -1366,6 +1366,11 @@ pub(crate) struct DirectiveScanner {
     /// Return after about this many bytes at a Normal-mode boundary, so the
     /// caller can stop before reading text it no longer needs.
     chunk: Option<usize>,
+    /// Bytes before this offset of the current source were already credited
+    /// to the request; reading them again grants nothing.
+    grant_floor: usize,
+    /// Offset the last scan reached in its source.
+    read_to: usize,
     mode: DirectiveLex,
     pending: AdmittedOwned<String>,
     fragments: AdmittedOwned<Vec<SourceAnchor>>,
@@ -1471,6 +1476,8 @@ impl DirectiveScanner {
         Ok(Self {
             stop_at_semicolon: false,
             chunk: None,
+            grant_floor: 0,
+            read_to: 0,
             mode: DirectiveLex::default(),
             pending,
             fragments,
@@ -1489,6 +1496,15 @@ impl DirectiveScanner {
     /// Suspend each scan after about `bytes` bytes at a Normal-mode boundary.
     pub(crate) fn set_chunk(&mut self, bytes: usize) {
         self.chunk = Some(bytes);
+    }
+    /// Grant per-byte allowance only for bytes at or after `offset` of the
+    /// source the next scan reads.
+    pub(crate) fn set_grant_floor(&mut self, offset: usize) {
+        self.grant_floor = offset;
+    }
+    /// The furthest offset the last scan read in its source.
+    pub(crate) fn read_to(&self) -> usize {
+        self.read_to
     }
     pub(crate) fn prefix(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
         let mut scanner = Self::new(budget)?;
@@ -1511,6 +1527,7 @@ impl DirectiveScanner {
         let mut deferred = budget.admit_owned(0, 0, 0, Vec::new)?;
         let mut deferred_slots = 0;
         while i < bytes.len() {
+            self.read_to = i;
             if cancel.is_cancelled() {
                 return Err(IncompleteReason::Cancelled);
             }
@@ -1532,15 +1549,16 @@ impl DirectiveScanner {
                 _ => None,
             };
             if let Some(delimiter) = delimiter {
-                let skip = bounded_trivia_run(source, i, delimiter, true, budget)?;
+                let skip =
+                    bounded_trivia_run(source, i, delimiter, Some(self.grant_floor), budget)?;
                 if skip > 0 {
                     i += skip;
                     continue;
                 }
             }
-            // The scanner reads each source byte once: this read grants the
-            // session's per-byte allowance (see CompileTimeBudget::charge_scanned).
-            budget.charge_scanned(1, 1, 1)?;
+            // This read grants the session's per-byte allowance for a byte not
+            // yet credited (see CompileTimeBudget::charge_scanned).
+            budget.charge_scanned(usize::from(i >= self.grant_floor), 1, 1)?;
             let b = bytes[i];
             if matches!(self.mode, Normal)
                 && let Some(probe) = &mut self.shape_probe
@@ -1549,6 +1567,7 @@ impl DirectiveScanner {
                 probe.normal_byte(source, i, budget)?;
             }
             if self.stop_at_semicolon && b == b';' && matches!(self.mode, Normal) {
+                self.read_to = i + 1;
                 return Ok(ScannerStep {
                     text_end: i + 1,
                     directive: None,
@@ -1612,6 +1631,7 @@ impl DirectiveScanner {
                     self.append(source, i..i + len, id, occurrence, budget)?;
                     i += len;
                     if closed {
+                        self.read_to = i;
                         let directive = self.finish(suffix, budget)?;
                         self.mode = Normal;
                         self.body_mode = Normal;
@@ -1690,6 +1710,7 @@ impl DirectiveScanner {
             }
             i += 1;
         }
+        self.read_to = i;
         let text_end = if self.pending.is_empty() {
             source.len()
         } else {
@@ -1953,13 +1974,14 @@ impl DirectiveScanner {
 /// crossing a UTF-8 boundary. Admit a search step and a visited-byte upper
 /// bound before each piece; the delimiter itself remains for the normal
 /// lexical machine. Pieces start at 8 bytes and double up to 512, so a short
-/// comment is charged about what it reads. When `scanned` (the directive
-/// scanner's own read), the consumed bytes grant the per-byte allowance.
+/// comment is charged about what it reads. With `grant_from` (the directive
+/// scanner's own read), consumed bytes at or after that offset grant the
+/// per-byte allowance.
 pub(crate) fn bounded_trivia_run(
     source: &str,
     start: usize,
     delimiter: char,
-    scanned: bool,
+    grant_from: Option<usize>,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<usize, IncompleteReason> {
     const RUN: usize = 4096;
@@ -1990,8 +2012,11 @@ pub(crate) fn bounded_trivia_run(
         from = end;
         piece_len = (piece_len * 2).min(MAX_PIECE);
     };
-    if scanned && consumed > 0 {
-        budget.charge_scanned(consumed, 0, 0)?;
+    if let Some(floor) = grant_from {
+        let granted = (start + consumed).saturating_sub(start.max(floor));
+        if granted > 0 {
+            budget.charge_scanned(granted, 0, 0)?;
+        }
     }
     Ok(consumed)
 }
@@ -3401,14 +3426,19 @@ fn source_directive_shape(source: &str, cancel: &dyn CancellationToken) -> (bool
 /// scanner so ordinary comment bytes cost bounded search steps, not an
 /// eight-times-source-size evaluator estimate. Directive bodies retain their
 /// conservative expression-work admission before shape inspection.
+/// `grant_floor` is the offset already credited to the request for this
+/// source; `read_to` receives the furthest offset read, even on refusal.
 pub(crate) fn source_directive_shape_in_session(
     source: &str,
     id: &crate::SourceId,
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
+    grant_floor: usize,
+    read_to: &mut usize,
 ) -> Result<(bool, bool, usize), IncompleteReason> {
     let mut scanner = DirectiveScanner::new(budget)?;
     scanner.shape_probe = Some(LayoutShapeProbe::default());
+    scanner.set_grant_floor(grant_floor);
     let mut cursor = 0;
     let mut count = 0;
     let mut includes = false;
@@ -3421,7 +3451,9 @@ pub(crate) fn source_directive_shape_in_session(
             crate::compile_time::OccurrenceId(0),
             budget,
             cancel,
-        )?;
+        );
+        *read_to = (*read_to).max(scanner.read_to());
+        let step = step?;
         if let Some(directive) = step.directive {
             budget.charge(
                 directive.body.len().saturating_mul(8),
@@ -5470,7 +5502,7 @@ mod tests {
         let charged = |start: usize| {
             let mut budget =
                 CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
-            let skip = super::bounded_trivia_run(&source, start, '}', false, &mut budget).unwrap();
+            let skip = super::bounded_trivia_run(&source, start, '}', None, &mut budget).unwrap();
             (skip, budget.snapshot().byte_work)
         };
         let (skip, bytes) = charged(0);
@@ -5661,7 +5693,9 @@ mod tests {
                 &source,
                 &id,
                 &mut budget,
-                &crate::NoCancellation
+                &crate::NoCancellation,
+                0,
+                &mut 0
             )
             .unwrap(),
             (false, false, 0)
@@ -5676,7 +5710,9 @@ mod tests {
                 source,
                 &id,
                 &mut budget,
-                &crate::NoCancellation
+                &crate::NoCancellation,
+                0,
+                &mut 0
             )
             .is_err()
         );

@@ -178,6 +178,20 @@ fn provider_owned_payload(provider: &ProviderSource) -> Result<usize, ResolverEr
 }
 
 pub trait CompileTimeResolver {
+    /// Offset of `source` already credited to the request-wide per-byte
+    /// allowance; the session's scanner grants nothing for bytes before it.
+    /// The default credits nothing request-wide, so every read is new.
+    fn scan_credit_floor(&mut self, _source: &LoadedSource) -> usize {
+        0
+    }
+    /// The session's scanner has read `source` up to offset `end`. A request
+    /// credits each distinct source's bytes once, up to the furthest offset.
+    fn note_scanned(&mut self, _source: &LoadedSource, _end: usize) {}
+    /// Whether raw UTF-8 validation of `source` is funded. A request funds
+    /// it once per distinct source; repeated validation is paid.
+    fn fund_validation(&mut self, _source: &LoadedSource) -> bool {
+        true
+    }
     /// Returned reports are an explicit owned capability. Defaults never call
     /// legacy callbacks; bounded adapters opt in with admitted constructors.
     fn unit_report_capability(
@@ -469,9 +483,20 @@ pub(crate) fn header_owned_in_session(
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
 ) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
-    let coordinate = super::coordinates::text(root, budget, cancel)?;
-    if let Some(header) = super::header::plain_header_in_session(root, &coordinate, budget, cancel)?
-    {
+    let funded = resolver.fund_validation(root);
+    let coordinate = super::coordinates::text(root, budget, cancel, funded)?;
+    let floor = resolver.scan_credit_floor(root);
+    let mut read_to = 0;
+    let header = super::header::plain_header_in_session(
+        root,
+        &coordinate,
+        budget,
+        cancel,
+        floor,
+        &mut read_to,
+    );
+    resolver.note_scanned(root, read_to);
+    if let Some(header) = header? {
         return Ok(header);
     }
     header_with_coordinates_in_session(root, &coordinate, context, resolver, budget, cancel)
@@ -784,7 +809,8 @@ fn analyze_source_with_providers_inner(
         .charge(1, root.id.as_str().len(), reserve)
         .map_err(|r| resolver_error(r, budget))?;
     let coordinate_owner = if prepared_coordinate.is_none() {
-        Some(super::coordinates::text(root, budget, cancel)?)
+        let funded = resolver.fund_validation(root);
+        Some(super::coordinates::text(root, budget, cancel, funded)?)
     } else {
         None
     };
@@ -2316,8 +2342,10 @@ impl RootSession<'_, '_> {
                         metadata + child.id.as_str().len() + size_of::<crate::SourceId>(),
                     )
                     .map_err(|r| resolver_error(r, self.budget))?;
-                let coordinate =
-                    super::coordinates::text(&output.source, self.budget, self.cancel)?;
+                let coordinate = {
+                    let funded = self.resolver.fund_validation(&output.source);
+                    super::coordinates::text(&output.source, self.budget, self.cancel, funded)?
+                };
                 let text = coordinate.as_ref();
                 let child = child.clone();
                 let occurrence = OccurrenceId(self.providers.next_occurrence);
@@ -2783,6 +2811,8 @@ impl SourceOrder for RootSession<'_, '_> {
                 directive: None,
             });
         }
+        self.scanner
+            .set_grant_floor(self.resolver.scan_credit_floor(&self.root));
         let scanned = self.scanner.next(
             source,
             cursor,
@@ -2791,6 +2821,8 @@ impl SourceOrder for RootSession<'_, '_> {
             self.budget,
             self.cancel,
         );
+        self.resolver
+            .note_scanned(&self.root, self.scanner.read_to());
         let next = match scanned {
             Ok(next) => next,
             Err(reason) => {

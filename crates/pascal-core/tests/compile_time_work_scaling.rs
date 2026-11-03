@@ -370,3 +370,65 @@ fn short_comments_are_charged_about_what_they_read() {
         plain.byte_work
     );
 }
+
+/// Round 3: funded whole-input charges (raw UTF-8 validation) and per-byte
+/// grants are credited to the request once per distinct source; repeating
+/// the analysis of the same raw source earns nothing more.
+#[test]
+fn repeated_analysis_of_one_raw_source_is_credited_once() {
+    let text = synthetic_library(300_000, 1);
+    let (_dir, path, mut resolver) = resolver_with(&text, &[]);
+    let mut source = support::loaded("T.pas", &text);
+    source.path = path;
+    source.decoded_text = None;
+    resolver
+        .analyze_compile_time(&source, &NoCancellation)
+        .unwrap();
+    let credited = resolver.compile_time_work_allowance();
+    let bytes = resolver.compile_time_byte_work_allowance();
+    for _ in 0..4 {
+        let _ = resolver.analyze_compile_time(&source, &NoCancellation);
+    }
+    assert_eq!(resolver.compile_time_work_allowance(), credited);
+    assert_eq!(resolver.compile_time_byte_work_allowance(), bytes);
+}
+
+/// Round 3: an importer with an include is read by the shape probe and then
+/// by the session; the request credits its text once.
+#[test]
+fn the_probe_and_session_credit_one_importer_once() {
+    let mut text = String::from("unit T;\ninterface\nuses U;\n{$I small.inc}\nimplementation\n");
+    let mut n = 0;
+    while text.len() < 200_000 {
+        text.push_str(&format!(
+            "procedure P{n}(var V: Integer);\nbegin\n  V := V + {n};\nend;\n"
+        ));
+        n += 1;
+    }
+    text.push_str("end.\n");
+    let include = "const Small = 1;";
+    let (_dir, path, mut resolver) = resolver_with(
+        &text,
+        &[
+            ("U.pas", "unit U; interface implementation end."),
+            ("small.inc", include),
+        ],
+    );
+    let mut source = support::loaded("T.pas", &text);
+    source.path = path;
+    let importer = pascal_core::ResolvedUnit {
+        requested_name: "T".into(),
+        declared_name: "T".into(),
+        source,
+    };
+    let imports = resolver.resolve_imports_with_text(&importer, &[], &text, &NoCancellation);
+    assert!(imports.is_ok(), "{imports:?}");
+    let per_byte = CompileTimeLimits::default().work_per_source_byte;
+    let distinct = text.len() + include.len() + "unit U; interface implementation end.".len();
+    let credited = resolver.compile_time_work_allowance();
+    // Each distinct byte once, plus the funded lexical estimate bound.
+    assert!(
+        credited <= distinct * (per_byte + 3),
+        "{credited} credited for {distinct} distinct bytes"
+    );
+}

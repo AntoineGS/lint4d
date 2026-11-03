@@ -305,7 +305,7 @@ impl CompileTimeState {
                         fragment.text,
                         i,
                         delimiter,
-                        false,
+                        None,
                         budget,
                     )?;
                     if skip > 0 {

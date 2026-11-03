@@ -245,6 +245,15 @@ struct HeaderResolver<'a> {
 }
 
 impl pascal_core::compile_time::CompileTimeResolver for HeaderResolver<'_> {
+    fn scan_credit_floor(&mut self, source: &LoadedSource) -> usize {
+        self.inner.scan_credit_floor(source)
+    }
+    fn note_scanned(&mut self, source: &LoadedSource, end: usize) {
+        self.inner.note_scanned(source, end);
+    }
+    fn fund_validation(&mut self, source: &LoadedSource) -> bool {
+        self.inner.fund_validation(source)
+    }
     fn include_capability(
         &mut self,
         request: pascal_core::IncludeResolveRequest<'_>,

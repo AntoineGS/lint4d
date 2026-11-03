@@ -250,6 +250,20 @@ impl<'a> CompileTimeBudget<'a> {
         self.charge_granted(grant, work, byte_work)
     }
 
+    /// `charge_funded` when `funded`, otherwise a plain charge.
+    pub(crate) fn charge_funded_if(
+        &mut self,
+        funded: bool,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        if funded {
+            self.charge_funded(work, byte_work)
+        } else {
+            self.charge(work, byte_work, 0)
+        }
+    }
+
     fn charge_granted(
         &mut self,
         grant: Allowance,

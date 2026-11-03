@@ -40,6 +40,17 @@ impl CancellationToken for NoCancellation {
     }
 }
 
+/// What one request has credited for one distinct source (l4d-9bxx).
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceCredit {
+    /// Furthest byte offset whose per-byte grant was credited.
+    scanned: usize,
+    /// Raw UTF-8 validation was funded.
+    validation: bool,
+    /// The lexical-only import estimate was funded.
+    lexical: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverLimits {
     pub max_dependency_units: usize,
@@ -1495,6 +1506,9 @@ pub struct UnitResolver<S> {
     compile_time_work_allowance: usize,
     /// Byte work granted the same way; it raises `max_compile_time_byte_work`.
     compile_time_byte_work_allowance: usize,
+    /// What the request has credited per distinct source (identity and
+    /// revision): grants are earned once per byte offset, funded charges once.
+    compile_time_credits: HashMap<SourceId, Vec<(SourceRevision, SourceCredit)>>,
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
     callback_reports: Option<CallbackReports>,
@@ -2173,6 +2187,115 @@ impl<S: SourceStore> UnitResolver<S> {
         self.compile_time_byte_work_allowance
     }
 
+    fn compile_time_credit(&mut self, source: &LoadedSource) -> &mut SourceCredit {
+        let revisions = self
+            .compile_time_credits
+            .entry(source.id.clone())
+            .or_default();
+        let index = match revisions
+            .iter()
+            .position(|(revision, _)| *revision == source.revision)
+        {
+            Some(index) => index,
+            None => {
+                revisions.push((source.revision.clone(), SourceCredit::default()));
+                revisions.len() - 1
+            }
+        };
+        &mut revisions[index].1
+    }
+
+    /// Offset of `source` already credited to the request.
+    fn compile_time_credit_floor(&self, source: &LoadedSource) -> usize {
+        self.compile_time_credits
+            .get(&source.id)
+            .and_then(|revisions| {
+                revisions
+                    .iter()
+                    .find(|(revision, _)| *revision == source.revision)
+            })
+            .map_or(0, |(_, credit)| credit.scanned)
+    }
+
+    /// A scanner read `source` to offset `end`: credit the request the
+    /// per-byte grant of the bytes beyond its furthest credited offset.
+    fn credit_compile_time_scan(&mut self, source: &LoadedSource, end: usize) {
+        let (work, bytes) = (
+            self.limits.compile_time_work_per_source_byte,
+            self.limits.compile_time_byte_work_per_source_byte,
+        );
+        if work == 0 && bytes == 0 {
+            return;
+        }
+        let credit = self.compile_time_credit(source);
+        let new = end.saturating_sub(credit.scanned);
+        credit.scanned = credit.scanned.max(end);
+        self.compile_time_work_allowance = self
+            .compile_time_work_allowance
+            .saturating_add(new.saturating_mul(work));
+        self.compile_time_byte_work_allowance = self
+            .compile_time_byte_work_allowance
+            .saturating_add(new.saturating_mul(bytes));
+    }
+
+    /// Whether raw UTF-8 validation of `source` is funded: the first time per
+    /// distinct source in this request, crediting the request what it costs
+    /// (about 3 steps and 3 bytes per source byte: validation, copy and the
+    /// shared backing). Later validations are paid.
+    fn credit_compile_time_validation(&mut self, source: &LoadedSource) -> bool {
+        let (work, bytes) = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if !work && !bytes {
+            // Fixed limits: charge_funded funds nothing anyway.
+            return true;
+        }
+        if source.decoded_text.is_some() {
+            return true;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.validation {
+            return false;
+        }
+        credit.validation = true;
+        let cost = source.bytes.len().saturating_mul(3);
+        if work {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(cost);
+        }
+        if bytes {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(cost);
+        }
+        true
+    }
+
+    /// The lexical-only import pass's whole-source estimate is funded once
+    /// per distinct source in this request.
+    fn credit_compile_time_lexical(&mut self, source: &LoadedSource, work: usize, bytes: usize) {
+        let enabled = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if enabled == (false, false) {
+            return;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.lexical {
+            return;
+        }
+        credit.lexical = true;
+        if enabled.0 {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(work);
+        }
+        if enabled.1 {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(bytes);
+        }
+    }
+
     fn max_compile_time_work(&self) -> usize {
         self.limits
             .max_compile_time_work
@@ -2444,11 +2567,9 @@ impl<S: SourceStore> UnitResolver<S> {
         // session. Failed-session storage has been dropped, never published.
         let usage = budget.snapshot();
         self.report_owners.record_work(&budget);
-        // Steps granted by the session's own source bytes do not consume the
-        // resolver's aggregate step budget; only work beyond them does.
+        // The request was credited the distinct bytes the session read, as it
+        // read them (note_scanned); its own per-session grants are not added.
         self.compile_time_accounting.work += usage.work;
-        self.compile_time_work_allowance += budget.work_allowance();
-        self.compile_time_byte_work_allowance += budget.byte_work_allowance();
         self.compile_time_accounting.byte_work += usage.byte_work;
         if let Some(root) = self
             .compile_time_caches
@@ -2495,17 +2616,20 @@ impl<S: SourceStore> UnitResolver<S> {
                 },
                 cancel,
             );
+            let floor = self.compile_time_credit_floor(source);
+            let mut read_to = 0;
             let shape = crate::conditional::source_directive_shape_in_session(
                 text,
                 &source.id,
                 &mut probe_budget,
                 cancel,
+                floor,
+                &mut read_to,
             );
             let scanned = probe_budget.snapshot();
-            // The probe's scanner read the text: its per-byte grant raises the
-            // aggregate exactly as a session's does, for what it consumed.
-            self.compile_time_work_allowance += probe_budget.work_allowance();
-            self.compile_time_byte_work_allowance += probe_budget.byte_work_allowance();
+            // The probe read the text: the request is credited its distinct
+            // bytes once; a later session over the same source earns nothing.
+            self.credit_compile_time_scan(source, read_to);
             // Transfer monotonic probe work to the same resolver aggregate on
             // success AND refusal. Only ephemeral scanner scratch has died.
             self.charge_compile_time(scanned.work, scanned.byte_work, 0, cancel)?;
@@ -2524,12 +2648,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 // as raw UTF-8 validation is: it neither consumes the fixed
                 // budget nor leaves anything for other work.
                 let estimate = text.len().saturating_mul(8);
-                if self.limits.compile_time_work_per_source_byte > 0 {
-                    self.compile_time_work_allowance += estimate;
-                }
-                if self.limits.compile_time_byte_work_per_source_byte > 0 {
-                    self.compile_time_byte_work_allowance += text.len();
-                }
+                self.credit_compile_time_lexical(source, estimate, text.len());
                 self.charge_compile_time(estimate, text.len(), 0, cancel)?;
                 let context = self.context.conditional_context_for(&source.path);
                 let mut context_bytes = 0usize;
@@ -2783,6 +2902,7 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_accounting: Default::default(),
             compile_time_work_allowance: 0,
             compile_time_byte_work_allowance: 0,
+            compile_time_credits: HashMap::new(),
             compile_time_store: None,
             compile_time_caches: Vec::new(),
             callback_reports: None,
@@ -4719,13 +4839,21 @@ impl<S: SourceStore> UnitResolver<S> {
             )
         };
         let result = (|| {
-            let coordinate = crate::compile_time::coordinate_text(source, &mut budget, cancel)?;
-            if let Some(header) = crate::compile_time::plain_header_in_session(
+            let funded = self.credit_compile_time_validation(source);
+            let coordinate =
+                crate::compile_time::coordinate_text(source, &mut budget, cancel, funded)?;
+            let floor = self.compile_time_credit_floor(source);
+            let mut read_to = 0;
+            let header = crate::compile_time::plain_header_in_session(
                 source,
                 &coordinate,
                 &mut budget,
                 cancel,
-            )? {
+                floor,
+                &mut read_to,
+            );
+            self.credit_compile_time_scan(source, read_to);
+            if let Some(header) = header? {
                 return Ok(header);
             }
             let reserve = conditional_context_reserve_polled(&self.context, cancel)?;
@@ -4751,8 +4879,6 @@ impl<S: SourceStore> UnitResolver<S> {
             let usage = budget.snapshot();
             self.report_owners.record_work(&budget);
             self.compile_time_accounting.work += usage.work;
-            self.compile_time_work_allowance += budget.work_allowance();
-            self.compile_time_byte_work_allowance += budget.byte_work_allowance();
             self.compile_time_accounting.byte_work += usage.byte_work;
             if let Some(root) = self
                 .compile_time_caches
@@ -7761,6 +7887,15 @@ impl<S: SourceStore> UnitResolver<S> {
 }
 
 impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S> {
+    fn scan_credit_floor(&mut self, source: &LoadedSource) -> usize {
+        self.compile_time_credit_floor(source)
+    }
+    fn note_scanned(&mut self, source: &LoadedSource, end: usize) {
+        self.credit_compile_time_scan(source, end);
+    }
+    fn fund_validation(&mut self, source: &LoadedSource) -> bool {
+        self.credit_compile_time_validation(source)
+    }
     fn include_capability(
         &mut self,
         request: IncludeResolveRequest<'_>,

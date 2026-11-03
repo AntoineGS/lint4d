@@ -2078,7 +2078,10 @@ of byte-work for each source byte the directive scanner actually reads (in the
 root, providers and includes; a header-only or interface-only scan reads only a
 prefix, so it is granted only that prefix), and retain their separate 64-state
 ceiling. Raw UTF-8 validation and the lexical-only import pass, which read a
-whole source, are granted exactly what they charge. Header selection and reproof inherit the same operation policy while
+whole source, are granted exactly what they charge. Request-wide limits gain these
+grants once per distinct source (path identity and revision), up to the furthest
+offset already credited: re-reading the same text, or validating it again, is
+paid from the fixed budget. Header selection and reproof inherit the same operation policy while
 keeping their 256-state purpose. Explicit smaller callers and shared remaining
 budgets are preserved. These are charged-work limits, not RSS or
 allocator measurements, and header availability does not certify body completion.

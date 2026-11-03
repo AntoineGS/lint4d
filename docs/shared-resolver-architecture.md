@@ -631,8 +631,9 @@ its open-file queue is empty, project anchors before document anchors, at most
 gate, and also when a new crawl is pending (a crawl flag checked between
 units); a paused batch is requeued. A batch is requeued when it is not
 complete, did not hit the memory limit, and made progress (indexed, refreshed,
-refused or limited something) or left pending members no batch has deferred
-yet; a batch that only deferred members already deferred is not, which avoids
+refused or limited something) or left pending members that no batch has
+deferred and this batch did not try (a member skipped unstamped every batch
+would otherwise keep it requeued); a batch that only deferred members already deferred is not, which avoids
 livelock. Such an anchor is asked for again by the next request that finds
 its index incomplete and by the warm end of its open file (an edit or
 invalidation), and then retries the longest deferred members first. Warm `End` of an open file requests its

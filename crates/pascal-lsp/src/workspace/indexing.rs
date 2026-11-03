@@ -285,7 +285,8 @@ pub(crate) struct IndexProgress {
     /// Members whose facts were limited: unverified candidates of every
     /// request until they change.
     pub(crate) limited: usize,
-    /// Pending closed members no batch has deferred yet.
+    /// Pending closed members no batch has deferred yet and this batch did
+    /// not try (a member skipped without a load stays untried otherwise).
     pub(crate) untried: usize,
 }
 
@@ -349,6 +350,19 @@ thread_local! {
 #[cfg(test)]
 fn set_member_error(path: Option<PathBuf>) {
     set_member_errors(path.into_iter().collect());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Members whose stamp fails, as for a file the listing returns but a
+    /// stat cannot reach.
+    static UNSTAMPABLE: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn set_unstampable(paths: Vec<PathBuf>) {
+    UNSTAMPABLE.with(|slot| *slot.borrow_mut() = paths);
 }
 
 #[cfg(test)]
@@ -456,18 +470,22 @@ impl Workspace {
             .project_cache
             .read_index(&key, |index, _| index.pending(wanted))
             .unwrap_or_default();
-        let mut taken = 0;
+        // Members this batch tried, skipped ones included, are never untried.
+        let mut tried = HashSet::new();
         for path in pending {
-            if taken >= bound.units {
+            if tried.len() >= bound.units {
                 break;
             }
             if self.is_open_member(&path) {
                 continue;
             }
-            taken += 1;
+            tried.insert(path_key(&path));
             // The stamp precedes the bytes it describes (A7); `before_io`
             // runs between them.
             let own_stamp = path_stamp(&path);
+            #[cfg(test)]
+            let own_stamp =
+                own_stamp.filter(|_| !UNSTAMPABLE.with(|slot| slot.borrow().contains(&path)));
             before_io()?;
             let Some(own_stamp) = own_stamp else {
                 // Gone behind the catalogues' back: relist on the next look.
@@ -517,7 +535,7 @@ impl Workspace {
             .count();
         progress.untried = untried
             .iter()
-            .filter(|path| !self.is_open_member(path))
+            .filter(|path| !tried.contains(&path_key(path)) && !self.is_open_member(path))
             .count();
         progress.pending = all_pending.len() - open;
         progress.skipped_open = open;
@@ -3022,6 +3040,38 @@ mod tests {
         for path in failing {
             assert_eq!(state(&workspace, &key, &path), Some(MemberState::Fresh));
         }
+    }
+
+    /// A member that cannot be stamped (listed, but its stat fails) is
+    /// skipped every batch without a load; beside a deferred member it must
+    /// not keep the anchor requeued.
+    #[test]
+    fn an_unstampable_member_beside_a_deferred_one_does_not_requeue_forever() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 4, WorkspaceOptions::default());
+        let broken = root.join("lib/U2.pas");
+        let failing = root.join("lib/U0.pas");
+        set_unstampable(vec![broken.clone()]);
+        set_member_errors(vec![failing.clone()]);
+        let mut batches = Vec::new();
+        for _ in 0..6 {
+            let progress = advance(&mut workspace, &anchor, IndexBound::all());
+            batches.push(progress);
+            if !progress.worth_requeue() {
+                break;
+            }
+        }
+        set_member_errors(Vec::new());
+        set_unstampable(Vec::new());
+        assert!(
+            state(&workspace, &key, &broken).is_some(),
+            "the unstampable file is still a member"
+        );
+        let last = batches.last().unwrap();
+        assert!(!last.worth_requeue(), "{batches:?}");
+        assert!(batches.len() <= 2, "{batches:?}");
+        assert!(last.deferred > 0 && last.pending >= 2, "{last:?}");
     }
 
     #[test]

@@ -254,6 +254,46 @@ fn task11_fix1_fake_sizeof_text_does_not_change_public_import_completeness() {
 }
 
 #[test]
+fn imports_incomplete_only_through_a_missing_unit_are_settled() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Types.pas"),
+        "unit Types; interface implementation end.",
+    )
+    .unwrap();
+    let text = "unit App; interface uses Types; implementation uses Chosen; end.";
+    for with_text in [false, true] {
+        let imports = task11_fix1_imports(temp.path(), text, with_text);
+        assert!(!imports.complete, "{imports:?}");
+        assert!(
+            matches!(
+                imports.bindings[1].target,
+                pascal_core::ResolutionTarget::Unavailable
+            ),
+            "{imports:?}"
+        );
+        assert!(imports.settled, "with_text={with_text}: {imports:?}");
+    }
+
+    let complete = task11_fix1_imports(temp.path(), "unit App; interface uses Types; end.", true);
+    assert!(complete.complete && complete.settled, "{complete:?}");
+}
+
+#[test]
+fn imports_with_unknown_conditional_activity_are_not_settled() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    std::fs::write(
+        temp.path().join("Chosen.pas"),
+        "unit Chosen; interface implementation end.",
+    )
+    .unwrap();
+    let text = "unit App; interface implementation {$IFOPT R+} uses Chosen; {$ENDIF} end.";
+    let imports = task11_fix1_imports(temp.path(), text, true);
+    assert!(!imports.complete, "{imports:?}");
+    assert!(!imports.settled, "{imports:?}");
+}
+
+#[test]
 fn task11_fix1_genuine_no_include_layout_queries_keep_shared_provider_decisions() {
     let temp = tempfile::tempdir_in("/tmp/opencode").unwrap();
     std::fs::write(

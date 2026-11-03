@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_lookup_can_proceed_after_warm_releases_import_claim() {
+    fn interactive_lookup_does_not_wait_for_a_paused_warm_walk() {
         let (_temp, workspace, main) = fixture();
         let input = workspace.analysis_input();
         let gate = Arc::new(InteractiveGate::default());
@@ -1311,7 +1311,7 @@ mod tests {
             std::thread::spawn(move || warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel));
         claim_acquired_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("warmer reached the dependency hook while holding its imports claim");
+            .expect("warmer reached its dependency walk");
 
         let interactive_input = workspace.analysis_input();
         let interactive_uri = main.clone();
@@ -1328,12 +1328,12 @@ mod tests {
         interactive_started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("interactive cache consumer started");
-        std::thread::sleep(Duration::from_millis(50));
-        resume_hook_tx.send(()).unwrap();
 
+        // The warm stays paused in its dependency walk until the interactive
+        // request is done or has had its chance to finish.
         let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(2));
         let completed_before_release = completed_while_gate_busy.is_ok();
-        gate.set(0);
+        resume_hook_tx.send(()).unwrap();
         let warm_result = warm_thread.join().unwrap();
         let interactive_result = match completed_while_gate_busy {
             Ok(result) => result,

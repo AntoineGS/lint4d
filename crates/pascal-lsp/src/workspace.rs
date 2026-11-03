@@ -7235,88 +7235,134 @@ impl Workspace {
             self.cache_epoch,
             lookup_cancel,
         );
-        let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
-            match import_lookup {
-                crate::project_cache::Lookup::Hit(hit) => (
-                    std::sync::Arc::clone(&hit.resolved),
-                    Some(std::sync::Arc::clone(&hit.report)),
-                    Some(hit.probes.clone()),
-                    None,
-                    None,
-                ),
-                crate::project_cache::Lookup::Compute(claim) => {
-                    #[cfg(feature = "test-support")]
-                    if !claim.is_detached()
-                        && !crate::project_cache::claims_are_interactive_on_this_thread()
-                    {
-                        wait_at_import_claim_test_barrier();
-                    }
-                    let input = self.analysis_input();
-                    let mut resolver = resolver::resolver_for_context_with_session_cache(
-                        context.clone(),
-                        &context_observations,
-                        input.roots.clone(),
-                        &input,
-                        resolver_session_cache,
-                    );
-                    let root = match resolver.load_source(
-                        &path,
-                        legacy_route.as_ref(),
-                        SourceKind::Unit,
-                        resolver_cancel,
-                    ) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            let report = resolver.finish();
-                            self.merge_resolution_report(&effective_context_key, &report);
-                            if matches!(error, pascal_core::ResolverError::Cancelled) {
-                                return Err(CANCELLATION_MESSAGE.to_string());
-                            }
-                            self.warn(format!("could not load indexed source {uri}: {error}"));
-                            self.index.bind_imports(uri, bindings);
-                            return Ok(Vec::new());
+        let (resolved, cached_report, cached_probes, import_claim, resolver) = match import_lookup {
+            crate::project_cache::Lookup::Hit(hit) => (
+                std::sync::Arc::clone(&hit.resolved),
+                Some(std::sync::Arc::clone(&hit.report)),
+                Some(hit.probes.clone()),
+                None,
+                None,
+            ),
+            crate::project_cache::Lookup::Compute(claim) => {
+                #[cfg(feature = "test-support")]
+                if !claim.is_detached()
+                    && !crate::project_cache::claims_are_interactive_on_this_thread()
+                {
+                    wait_at_import_claim_test_barrier();
+                }
+                let input = self.analysis_input();
+                let mut resolver = resolver::resolver_for_context_with_session_cache(
+                    context.clone(),
+                    &context_observations,
+                    input.roots.clone(),
+                    &input,
+                    resolver_session_cache,
+                );
+                let root = match resolver.load_source(
+                    &path,
+                    legacy_route.as_ref(),
+                    SourceKind::Unit,
+                    resolver_cancel,
+                ) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        let report = resolver.finish();
+                        self.merge_resolution_report(&effective_context_key, &report);
+                        if matches!(error, pascal_core::ResolverError::Cancelled) {
+                            return Err(CANCELLATION_MESSAGE.to_string());
                         }
-                    };
-                    let root = pascal_core::ResolvedUnit {
-                        requested_name: unit_name,
-                        declared_name: self
-                            .index
-                            .unit_name(uri)
-                            .expect("indexed source unit name remains available"),
-                        source: root,
-                    };
-                    #[cfg(test)]
-                    TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-                    let resolved = resolver
-                        .resolve_imports_with_text_skipping_browsing(
-                            &root,
-                            &sites,
-                            &indexed_text,
-                            &validated_compiled_names,
-                            resolver_cancel,
-                        )
-                        .map_err(|error| {
-                            if matches!(error, pascal_core::ResolverError::Cancelled) {
-                                CANCELLATION_MESSAGE.to_string()
-                            } else {
-                                error.to_string()
-                            }
-                        })?;
-                    (
-                        std::sync::Arc::new(resolved),
-                        None,
-                        None,
-                        Some(claim),
-                        Some(resolver),
+                        self.warn(format!("could not load indexed source {uri}: {error}"));
+                        self.index.bind_imports(uri, bindings);
+                        return Ok(Vec::new());
+                    }
+                };
+                let root = pascal_core::ResolvedUnit {
+                    requested_name: unit_name,
+                    declared_name: self
+                        .index
+                        .unit_name(uri)
+                        .expect("indexed source unit name remains available"),
+                    source: root,
+                };
+                #[cfg(test)]
+                TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+                let resolved = resolver
+                    .resolve_imports_with_text_skipping_browsing(
+                        &root,
+                        &sites,
+                        &indexed_text,
+                        &validated_compiled_names,
+                        resolver_cancel,
                     )
-                }
-                crate::project_cache::Lookup::Cancelled => {
-                    return Err(CANCELLATION_MESSAGE.to_string());
-                }
+                    .map_err(|error| {
+                        if matches!(error, pascal_core::ResolverError::Cancelled) {
+                            CANCELLATION_MESSAGE.to_string()
+                        } else {
+                            error.to_string()
+                        }
+                    })?;
+                (
+                    std::sync::Arc::new(resolved),
+                    None,
+                    None,
+                    Some(claim),
+                    Some(resolver),
+                )
+            }
+            crate::project_cache::Lookup::Cancelled => {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+        };
+        let computed = import_claim.is_some();
+        let report = match cached_report {
+            Some(report) => report,
+            None => std::sync::Arc::new(
+                resolver
+                    .expect("a resolver is present when imports were computed")
+                    .finish(),
+            ),
+        };
+        let graph_complete = report.complete
+            && !report.observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    pascal_core::ResolutionObservation::Directory {
+                        complete: false,
+                        ..
+                    }
+                )
+            });
+        let computed_probes =
+            computed.then(|| crate::project_cache::report_probes(&report, &resolved));
+        // Store the resolution before walking its dependencies, so that a
+        // lookup waiting for this claim waits for the resolution only: each
+        // dependency is then its own unit claim. A resolution incomplete
+        // only through settled missing or ambiguous imports is stable and
+        // reused too; its report keeps the incompleteness.
+        let reusable = resolved.settled
+            && !report.observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    pascal_core::ResolutionObservation::Directory {
+                        complete: false,
+                        ..
+                    }
+                )
+            });
+        if reusable
+            && let (Some(claim), Some((probes, watch_dirs))) =
+                (import_claim, computed_probes.clone())
+        {
+            let value = crate::project_cache::ImportValue {
+                resolved: std::sync::Arc::clone(&resolved),
+                report: std::sync::Arc::clone(&report),
+                probes,
+                watch_dirs,
             };
-        let resolved_for_cache = import_claim
-            .as_ref()
-            .map(|_| std::sync::Arc::clone(&resolved));
+            let bytes = value.retained_bytes();
+            self.project_cache
+                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
+        }
         if let Some((site, location, compiled)) = selected_header {
             let selected = resolved.bindings.iter().find(|binding| {
                 binding.site.byte_range == (site.span.start..site.span.end)
@@ -7333,15 +7379,6 @@ impl Workspace {
                 .is_some_and(|binding| matches!(binding.target, ResolutionTarget::Unavailable))
                 && compiled_by_name.contains_key(&compiled_name);
             if !*compiled {
-                let report = match cached_report {
-                    Some(report) => report,
-                    None => Arc::new(
-                        resolver
-                            .take()
-                            .expect("computed selection resolver")
-                            .finish(),
-                    ),
-                };
                 self.merge_resolution_report(&effective_context_key, &report);
                 if report
                     .warnings
@@ -7490,15 +7527,6 @@ impl Workspace {
             }
         }
         check_workspace_cancel(cancel)?;
-        let report = match cached_report {
-            Some(report) => report,
-            None => std::sync::Arc::new(
-                resolver
-                    .take()
-                    .expect("a resolver is present when imports were computed")
-                    .finish(),
-            ),
-        };
         let rejected_dependency = report
             .warnings
             .iter()
@@ -7508,38 +7536,11 @@ impl Workspace {
         if let Some(reason) = rejected_dependency {
             return Err(format!("required dependency was rejected: {reason}"));
         }
-        let graph_complete = report.complete
-            && !report.observations.iter().any(|observation| {
-                matches!(
-                    observation,
-                    pascal_core::ResolutionObservation::Directory {
-                        complete: false,
-                        ..
-                    }
-                )
-            });
-        let interface_probes = cached_probes.or_else(|| {
-            resolved_for_cache
-                .as_ref()
-                .map(|resolved| crate::project_cache::report_probes(&report, resolved).0)
-        });
+        let interface_probes = cached_probes.or_else(|| computed_probes.map(|(probes, _)| probes));
         if let Some(probes) = interface_probes {
             let bindings =
                 interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
             self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
-        }
-        if graph_complete && let (Some(claim), Some(resolved)) = (import_claim, resolved_for_cache)
-        {
-            let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
-            let value = crate::project_cache::ImportValue {
-                resolved,
-                report: std::sync::Arc::clone(&report),
-                probes,
-                watch_dirs,
-            };
-            let bytes = value.retained_bytes();
-            self.project_cache
-                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
         }
 
         // Source providers resolved above always win. Only unresolved imports
@@ -19851,6 +19852,46 @@ mod tests {
     }
 
     #[test]
+    fn imports_with_a_missing_unit_are_resolved_once() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main_path = main_uri.to_file_path().unwrap();
+        fs::write(
+            &main_path,
+            "unit Main;\ninterface\nuses Provider, Missing;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let navigate = || {
+            worker_view(&main).navigate(
+                &main_uri,
+                Position::new(6, 2),
+                NavigationTarget::Definition,
+            )
+        };
+
+        super::test_reset_import_resolution_count();
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(super::test_import_resolution_count(), 1);
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(
+            super::test_import_resolution_count(),
+            1,
+            "an import resolution that stays incomplete only through a missing unit is reused"
+        );
+
+        // The missing unit's lookup is evidence: once it appears, the
+        // resolution is computed again.
+        fs::write(
+            temp.path().join("Missing.pas"),
+            "unit Missing;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        assert_eq!(navigate()[0].uri, provider_uri);
+        assert_eq!(super::test_import_resolution_count(), 2);
+    }
+
+    #[test]
     fn dependency_hook_sees_each_dependency_and_can_cancel() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
@@ -19865,6 +19906,66 @@ mod tests {
         let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
         assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
         assert_eq!(*seen.lock().unwrap(), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn uses_clause_definitions_reuse_the_import_resolution() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        super::test_reset_import_resolution_count();
+        for _ in 0..2 {
+            let located = worker_view(&main).navigate(
+                &main_uri,
+                Position::new(2, 6),
+                NavigationTarget::Definition,
+            );
+            assert_eq!(located[0].uri, provider_uri);
+        }
+        assert_eq!(super::test_import_resolution_count(), 1);
+    }
+
+    #[test]
+    fn import_resolution_is_stored_before_its_dependencies_are_walked() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let mut worker = worker_view(&main);
+        let cache = main.project_cache.clone();
+        let importer = main_uri.clone();
+        let layers_at_walk = Arc::new(Mutex::new(None));
+        let recorded = layers_at_walk.clone();
+        worker.set_dependency_hook(Arc::new(move |_, done, _| {
+            if done == 0 {
+                *recorded.lock().unwrap() = Some(cache.ready_layers(&importer));
+            }
+            Err(super::CANCELLATION_MESSAGE.to_string())
+        }));
+        let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
+        assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
+        assert!(
+            layers_at_walk
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the walk started")
+                .contains(&"Import".to_string()),
+            "{layers_at_walk:?}"
+        );
+
+        super::test_reset_import_resolution_count();
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(located[0].uri, provider_uri);
+        assert_eq!(
+            super::test_import_resolution_count(),
+            0,
+            "a walk stopped in its dependencies keeps the resolution"
+        );
     }
 
     #[test]
@@ -23851,6 +23952,7 @@ BDS = '/fake/37'
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
+                    settled: true,
                 }),
                 report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],

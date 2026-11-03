@@ -165,6 +165,7 @@ mod tests {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
+                settled: true,
             }),
             report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],

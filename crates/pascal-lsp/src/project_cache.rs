@@ -596,6 +596,7 @@ mod cache_tests {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
+                settled: true,
             }),
             report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
@@ -966,6 +967,7 @@ mod cache_tests {
                 },
             }],
             complete: true,
+            settled: true,
         };
 
         assert_eq!(

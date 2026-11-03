@@ -4989,43 +4989,59 @@ impl ProjectCache {
         stamps: Vec<MemberStamp>,
         content_hash: u64,
     ) -> PublishOutcome {
-        let is_member = |store: &IndexStore| {
+        // The charge covers the names the context does not hold yet, so it
+        // is computed under the lock and checked again before inserting.
+        let charge_for = |store: &IndexStore| {
             store
                 .contexts
                 .get(key)
-                .is_some_and(|stored| stored.index.stamps_of(path).is_some())
+                .filter(|stored| stored.index.stamps_of(path).is_some())
+                .map(|stored| stored.index.charge_for(&facts, &stamps))
         };
-        if !is_member(&self.index()) {
-            return PublishOutcome::NotAMember;
-        }
-        let bytes = ContextIndex::new().charge_for(&facts, &stamps);
-        if !self.charge_index_evicting(bytes, key) {
-            if let Some(stored) = self.index().contexts.get_mut(key) {
-                stored.memory_exhausted = true;
+        for _ in 0..4 {
+            let Some(bytes) = charge_for(&self.index()) else {
+                return PublishOutcome::NotAMember;
+            };
+            if !self.charge_index_evicting(bytes, key) {
+                if let Some(stored) = self.index().contexts.get_mut(key) {
+                    stored.memory_exhausted = true;
+                }
+                return PublishOutcome::Memory;
             }
-            return PublishOutcome::Memory;
-        }
-        let mut store = self.index();
-        let clock = store.tick();
-        let old = store.contexts.get_mut(key).and_then(|stored| {
-            stored.last_used = clock;
-            let old = stored.index.insert(path, facts, stamps, content_hash);
-            if old.is_some() {
-                stored.memory_exhausted = false;
-            }
-            old
-        });
-        drop(store);
-        match old {
-            Some(old) => {
-                self.release_index(old);
-                PublishOutcome::Indexed
-            }
-            None => {
+            let mut store = self.index();
+            if charge_for(&store).is_some_and(|needed| needed > bytes) {
+                drop(store);
                 self.release_index(bytes);
-                PublishOutcome::NotAMember
+                continue;
             }
+            let clock = store.tick();
+            let old = store.contexts.get_mut(key).and_then(|stored| {
+                stored.last_used = clock;
+                let old = stored
+                    .index
+                    .insert_paid(path, facts, stamps, content_hash, bytes);
+                if old.is_some() {
+                    stored.memory_exhausted = false;
+                }
+                old
+            });
+            drop(store);
+            return match old {
+                Some(old) => {
+                    self.release_index(old);
+                    PublishOutcome::Indexed
+                }
+                None => {
+                    self.release_index(bytes);
+                    PublishOutcome::NotAMember
+                }
+            };
         }
+        // Retries lost to concurrent compactions: the member stays unindexed.
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.memory_exhausted = true;
+        }
+        PublishOutcome::Memory
     }
 
     pub(crate) fn refresh_index_member(
@@ -5527,6 +5543,11 @@ mod index_tests {
         crate::workspace_index::ContextIndex::new().charge_for(facts, &[])
     }
 
+    /// What a member's names cost its context, charged once.
+    fn names(facts: &MemberFacts) -> usize {
+        charge(facts) - crate::workspace_index::ContextIndex::member_charge(facts, &[])
+    }
+
     fn stamps() -> Vec<MemberStamp> {
         Vec::new()
     }
@@ -5574,11 +5595,14 @@ mod index_tests {
         );
         assert_eq!(cache.stats().reserved_index_bytes, base + expected);
         assert_eq!(cache.stats().reserved_bytes(), base + expected);
+        // A's names stay with the context until its interner is compacted.
         cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/B.pas"]));
         assert_eq!(
             cache.stats().reserved_index_bytes,
-            membership_cost(&["/w/B.pas"])
+            membership_cost(&["/w/B.pas"]) + names(&facts("/w/A.pas"))
         );
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]));
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
 
     #[test]
@@ -5745,7 +5769,34 @@ mod index_tests {
             base + charge(&facts("/w/A.pas"))
         );
         cache.refuse_index_member(&a, Path::new("/w/A.pas"), "too big".into());
-        assert_eq!(cache.stats().reserved_index_bytes, base);
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            base + names(&facts("/w/A.pas"))
+        );
+    }
+
+    #[test]
+    fn members_sharing_names_charge_them_once_per_context() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+        );
+        let base = cache.stats().reserved_index_bytes;
+        publish(&cache, &a, "/w/A.pas");
+        let first = cache.stats().reserved_index_bytes - base;
+        assert_eq!(first, charge(&facts("/w/A.pas")));
+        publish(&cache, &a, "/w/B.pas");
+        let second = cache.stats().reserved_index_bytes - base - first;
+        // B shares the posting; only its file stem is new.
+        assert!(second < charge(&facts("/w/B.pas")), "{second}");
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            cache.read_index(&a, |index, _| index.bytes()).unwrap()
+                + membership_cost(&["/w/A.pas", "/w/B.pas"])
+        );
     }
 
     #[test]

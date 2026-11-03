@@ -17,6 +17,15 @@ pub(crate) const MAX_UNVERIFIED_CANDIDATES: usize = 2_048;
 pub(crate) const MAX_INDEX_CHANGES: usize = 4_096;
 pub(crate) const IMPLICIT_UNITS: [&str; 2] = ["system", "sysinit"];
 
+/// One interner entry beside its string (rounded to 16): the map slot (a
+/// boxed string and an id, 25 bytes with its control byte) at the load a
+/// table has just after doubling, and the string allocation's header.
+const INTERNER_ENTRY_BYTES: usize = 80;
+/// One key of an inverted list: the map slot (an id and a vector, 33 bytes
+/// with its control byte) at the load a table has just after doubling, and
+/// the vector's first allocation.
+const INVERTED_KEY_BYTES: usize = 96;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct NameId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -122,15 +131,12 @@ impl MemberFacts {
         }
     }
 
-    /// The facts' own bytes. The index charge (`ContextIndex::charge_for`)
-    /// adds the inverted-list entries, interner names, include keys and stamps.
-    pub(crate) fn retained_bytes(&self) -> usize {
-        let strings = |items: &[Box<str>]| items.iter().map(|item| item.len()).sum::<usize>();
+    /// The bytes the facts keep once indexed, without the names the
+    /// interner holds. The member charge (`ContextIndex::member_charge`)
+    /// adds the list entries, include keys and stamps.
+    fn own_bytes(&self) -> usize {
         size_of::<Self>()
-            + strings(&self.unit_names)
             + self.unit_display.len()
-            + strings(&self.imports)
-            + strings(&self.postings)
             + self
                 .declarations
                 .iter()
@@ -148,6 +154,13 @@ impl MemberFacts {
                     size_of::<Option<PathBuf>>() + slot.as_ref().map_or(0, |p| p.as_os_str().len())
                 })
                 .sum::<usize>()
+    }
+
+    /// The names are interned once indexed; only their ids are kept.
+    fn drop_names(&mut self) {
+        self.unit_names = Box::default();
+        self.imports = Box::default();
+        self.postings = Box::default();
     }
 
     /// Import last segments, the short-name tier of the resolver (A1).
@@ -275,13 +288,15 @@ fn list_insert(map: &mut Inverted, name: NameId, id: MemberId) {
     }
 }
 
+/// The key stays (it was charged with the name); a list that shrank far
+/// gives its room back, since the members that grew it were refunded.
 fn list_remove(map: &mut Inverted, name: NameId, id: MemberId) {
     if let Some(list) = map.get_mut(&name) {
         if let Ok(at) = list.binary_search(&id) {
             list.remove(at);
         }
-        if list.is_empty() {
-            map.remove(&name);
+        if list.len() * 4 <= list.capacity() {
+            list.shrink_to_fit();
         }
     }
 }
@@ -313,6 +328,9 @@ pub(crate) struct ContextIndex {
     changes: VecDeque<(u64, PathBuf)>,
     overflowed_through: Option<u64>,
     member_bytes: usize,
+    /// The names the interner and the inverted-list keys hold, charged once
+    /// per context and kept until compaction.
+    name_bytes: usize,
 }
 
 pub(crate) struct CandidateQuery {
@@ -490,6 +508,7 @@ impl ContextIndex {
             self.units = HashMap::new();
             self.include_dependents = HashMap::new();
             self.member_bytes = 0;
+            removed_bytes += std::mem::take(&mut self.name_bytes);
         }
         if !changed.is_empty() {
             self.log(changed);
@@ -549,20 +568,22 @@ impl ContextIndex {
     }
 
     /// The bytes `insert` will store for this member, computable before
-    /// inserting (A12). It overcounts: every distinct name is charged as new
-    /// to the interner, and each list entry is counted twice (the inverted
-    /// list and the per-member list kept for removal).
+    /// inserting (A12): its own charge, plus the names it brings that this
+    /// context does not hold yet. Under one index lock the growth is exact;
+    /// names interned meanwhile only make it an overcount.
     pub(crate) fn charge_for(&self, facts: &MemberFacts, stamps: &[MemberStamp]) -> usize {
-        let tails = facts.import_tails();
-        let names = facts
-            .unit_names
-            .iter()
-            .chain(facts.imports.iter())
-            .chain(facts.postings.iter())
-            .chain(tails.iter());
-        let (count, interner) = names.fold((0, 0), |(count, bytes), name| {
-            (count + 1, bytes + name.len() + 16)
-        });
+        Self::member_charge(facts, stamps) + self.name_growth(facts)
+    }
+
+    /// What the member itself keeps: its facts without the names (the
+    /// interner holds them), its stamps, its include keys, and each list
+    /// entry twice (the inverted list, with room to grow, and the
+    /// per-member list kept for removal).
+    pub(crate) fn member_charge(facts: &MemberFacts, stamps: &[MemberStamp]) -> usize {
+        let count = facts.unit_names.len()
+            + facts.imports.len()
+            + facts.postings.len()
+            + facts.import_tails().len();
         let includes: usize = facts
             .slot_paths
             .iter()
@@ -570,20 +591,71 @@ impl ContextIndex {
             .flatten()
             .map(|slot| path_key(slot).len() + 24 + 2 * size_of::<MemberId>())
             .sum();
-        facts.retained_bytes()
+        facts.own_bytes()
             + stamps_bytes(stamps)
-            + interner
             + count * 2 * (size_of::<MemberId>() + size_of::<NameId>())
             + includes
     }
 
-    /// Returns the old charge, `None` if `path` is not a member.
+    /// The bytes the context grows by when it first holds the names of
+    /// `facts`: each new interner entry with its string, and each new key
+    /// of an inverted list. Both stay until the interner is compacted.
+    fn name_growth(&self, facts: &MemberFacts) -> usize {
+        let tails = facts.import_tails();
+        let mut fresh = HashSet::new();
+        let mut keys = 0;
+        let roles: [(&[Box<str>], &Inverted); 4] = [
+            (&facts.postings, &self.postings),
+            (&facts.imports, &self.importers),
+            (&tails, &self.importer_tails),
+            (&facts.unit_names, &self.units),
+        ];
+        for (names, list) in roles {
+            let mut role = HashSet::new();
+            for name in names {
+                if !role.insert(&**name) {
+                    continue;
+                }
+                match self.names.get(name) {
+                    Some(id) if list.contains_key(&id) => {}
+                    Some(_) => keys += 1,
+                    None => {
+                        keys += 1;
+                        fresh.insert(&**name);
+                    }
+                }
+            }
+        }
+        fresh
+            .iter()
+            .map(|name| name.len().next_multiple_of(16) + INTERNER_ENTRY_BYTES)
+            .sum::<usize>()
+            + keys * INVERTED_KEY_BYTES
+    }
+
+    /// Returns the old member charge, `None` if `path` is not a member.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         path: &Path,
         facts: MemberFacts,
         stamps: Vec<MemberStamp>,
         hash: u64,
+    ) -> Option<usize> {
+        let paid = self.charge_for(&facts, &stamps);
+        self.insert_paid(path, facts, stamps, hash, paid)
+    }
+
+    /// `insert` once `paid` (at least `charge_for` under this lock) was
+    /// charged: the member keeps its own charge, the rest pays for the
+    /// names. Returns the old member charge.
+    pub(crate) fn insert_paid(
+        &mut self,
+        path: &Path,
+        mut facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        hash: u64,
+        paid: usize,
     ) -> Option<usize> {
         let id = self.id_of(path)?;
         let old = self.release(id);
@@ -625,7 +697,9 @@ impl ContextIndex {
                 list.insert(at, id);
             }
         }
-        let charged = self.charge_for(&facts, &stamps);
+        let charged = Self::member_charge(&facts, &stamps);
+        // The interner holds the names now; the ids replace them.
+        facts.drop_names();
         let member = &mut self.members[id.0 as usize];
         member.posting_ids = posting_ids;
         member.import_ids = import_ids;
@@ -638,6 +712,7 @@ impl ContextIndex {
         member.charged = charged;
         let path = member.path.clone();
         self.member_bytes += charged;
+        self.name_bytes += paid.saturating_sub(charged);
         self.log([path]);
         Some(old)
     }
@@ -960,7 +1035,7 @@ impl ContextIndex {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.member_bytes
+        self.member_bytes + self.name_bytes
     }
 }
 
@@ -1548,6 +1623,7 @@ mod tests {
             stamp: None,
         }];
         let charge_a = index.charge_for(&facts_a, &stamps);
+        let own_a = ContextIndex::member_charge(&facts_a, &stamps);
         index.insert(&a, facts_a, stamps.clone(), 1);
         assert_eq!(index.bytes(), charge_a);
         let facts_b = MemberFacts::from_facts(&b, &facts("b", &["foo"], &["x"], &[]), vec![]);
@@ -1556,10 +1632,12 @@ mod tests {
         assert_eq!(index.bytes(), charge_a + charge_b);
         assert!(index.refresh(&a, stamps));
         assert_eq!(index.bytes(), charge_a + charge_b);
-        assert_eq!(index.refuse(&a, "r".into()), Some(charge_a));
-        assert_eq!(index.bytes(), charge_b);
+        // A refused member gives back its own charge; its names stay
+        // charged until the interner is compacted.
+        assert_eq!(index.refuse(&a, "r".into()), Some(own_a));
+        assert_eq!(index.bytes(), charge_a + charge_b - own_a);
         let (_, removed) = index.set_members(vec![]);
-        assert_eq!(removed, charge_b);
+        assert_eq!(removed, charge_a + charge_b - own_a);
         assert_eq!(index.bytes(), 0);
     }
 
@@ -1575,7 +1653,40 @@ mod tests {
     }
 
     #[test]
-    fn index_bytes_per_member_stay_within_the_estimate() {
+    fn names_are_charged_once_per_context() {
+        let mut index = ContextIndex::new();
+        let (a, b) = (PathBuf::from("/w/A.pas"), PathBuf::from("/w/B.pas"));
+        index.set_members(vec![a.clone(), b.clone()]);
+        let shared = |path: &Path, unit: &str| {
+            MemberFacts::from_facts(path, &facts(unit, &["shared"], &["x", "y"], &[]), vec![])
+        };
+        let facts_a = shared(&a, "u");
+        let first = index.charge_for(&facts_a, &[]);
+        let own = ContextIndex::member_charge(&facts_a, &[]);
+        assert!(first > own, "the first member pays for its names");
+        index.insert(&a, facts_a, vec![], 1);
+        // Only B's file stem is a new name (a new interner entry and a new
+        // key of the unit list).
+        let facts_b = shared(&b, "u");
+        assert_eq!(
+            index.charge_for(&facts_b, &[]) - ContextIndex::member_charge(&facts_b, &[]),
+            "b".len().next_multiple_of(16) + INTERNER_ENTRY_BYTES + INVERTED_KEY_BYTES,
+            "names already interned are not charged again"
+        );
+        index.insert(&b, facts_b, vec![], 1);
+        let both = index.bytes();
+        for _ in 0..10 {
+            index.insert(&a, shared(&a, "u"), vec![], 1);
+        }
+        assert_eq!(index.bytes(), both, "reindexing charges no name twice");
+        index.set_members(Vec::new());
+        assert_eq!(index.bytes(), 0, "compaction releases the names");
+    }
+
+    /// `MEMBERS` members of 300 postings, 20 imports and 40 declarations;
+    /// `unique` of the postings per member are names no other member uses,
+    /// the rest come from a shared vocabulary.
+    fn bytes_per_member(unique: usize) -> usize {
         const MEMBERS: usize = 1_000;
         let mut index = ContextIndex::new();
         let member_paths: Vec<PathBuf> = (0..MEMBERS)
@@ -1586,7 +1697,13 @@ mod tests {
             let imports: Vec<String> = (0..20).map(|n| format!("vendor.core.unit{n}")).collect();
             let imports: Vec<&str> = imports.iter().map(String::as_str).collect();
             let postings: Vec<String> = (0..300)
-                .map(|n| format!("identifier{id:04}x{n:03}"))
+                .map(|n| {
+                    if n < unique {
+                        format!("identifier{id:04}x{n:03}")
+                    } else {
+                        format!("sharedidentifier{:04}", (id * 7 + n) % 2_000)
+                    }
+                })
                 .collect();
             let postings: Vec<&str> = postings.iter().map(String::as_str).collect();
             let declarations: Vec<(String, DeclarationKind, DeclarationShape, bool)> = (0..40)
@@ -1615,11 +1732,25 @@ mod tests {
             }];
             assert!(index.insert(path, facts, stamps, 1).is_some());
         }
-        let per_member = index.bytes() / MEMBERS;
-        println!("workspace index bytes per member: {per_member}");
+        index.bytes() / MEMBERS
+    }
+
+    #[test]
+    fn index_bytes_per_member_stay_within_the_estimate() {
+        let distinct = bytes_per_member(300);
+        let shared = bytes_per_member(30);
+        println!(
+            "workspace index bytes per member: {distinct} (distinct names), {shared} (shared names)"
+        );
+        // Every name distinct is the worst case: each member pays for all
+        // of its names.
         assert!(
-            per_member <= 64 * 1024,
-            "{per_member} bytes per member exceeds the 64 KiB estimate"
+            distinct <= 96 * 1024,
+            "{distinct} bytes per member exceeds the 96 KiB estimate"
+        );
+        assert!(
+            shared * 2 < distinct,
+            "members sharing names must not pay for them each: {shared} vs {distinct}"
         );
     }
 }

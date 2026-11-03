@@ -26,7 +26,7 @@ use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
 use crate::workspace_index::{
     CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
-    MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp, MemberState,
+    MAX_UNVERIFIED_CANDIDATES, MemberFacts, MemberStamp, MemberState, SymbolKey,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
@@ -34,7 +34,6 @@ use crate::workspace_index::{
 pub(crate) const MAX_REQUEST_OWNER_DISCOVERY: usize = 256;
 
 /// At most this many contexts are searched by one indexed request.
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) const MAX_TARGET_CONTEXTS: usize = 16;
 
 /// What one request has spent on owner discovery: the directories it
@@ -47,13 +46,10 @@ struct OwnerDiscovery {
 
 /// A workspace with at most this many Pascal sources and descriptors under
 /// its roots still answers `workspace/symbol` the old way (A16).
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) const SMALL_WORKSPACE_SOURCES: usize = 2_048;
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) const SMALL_WORKSPACE_PROJECTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) enum TargetPurpose {
     References,
     WorkspaceSymbols,
@@ -61,7 +57,6 @@ pub(crate) enum TargetPurpose {
 
 /// The contexts one indexed request searches, in priority order.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // read by the query tasks of l4d-33
 pub(crate) struct Targets {
     pub(crate) contexts: Vec<(ContextKey, IndexAnchor)>,
     pub(crate) gaps: Vec<String>,
@@ -176,12 +171,12 @@ pub(crate) struct IndexBound {
     units: usize,
 }
 
-#[allow(dead_code)] // built by the warmer of l4d-33
 impl IndexBound {
     pub(crate) fn units(units: usize) -> Self {
         Self { units }
     }
 
+    #[cfg(test)]
     pub(crate) fn all() -> Self {
         Self { units: usize::MAX }
     }
@@ -270,7 +265,6 @@ enum MemberOutcome {
     Memory,
 }
 
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 impl Workspace {
     /// The paths behind the slots of the indexed `uri`: slot 0 is `None`
     /// (`MemberFacts::from_facts` fills it), then one entry per include slot,
@@ -1168,6 +1162,8 @@ impl Workspace {
             ..IndexedSources::default()
         };
         let mut symbols = Vec::new();
+        let mut seen = HashSet::<SymbolKey>::new();
+        let cap = crate::navigation::workspace_symbol_cap();
         let mut taken = HashSet::<String>::new();
         let mut stamps = HashMap::<String, Option<PathStamp>>::new();
         let mut unverified_left = match selection {
@@ -1241,7 +1237,7 @@ impl Workspace {
             let mut retried = false;
             let (view, listing) = loop {
                 let view = self.project_cache.read_index(key, |index, membership| {
-                    target_view(index, membership, selection, &unserved)
+                    target_view(index, membership, selection, &unserved, &mut seen, cap)
                 });
                 #[cfg(test)]
                 if let Some(mut hook) = AFTER_TARGET_VIEW.with(|slot| slot.borrow_mut().take()) {
@@ -1256,6 +1252,16 @@ impl Workspace {
                 let listing = self.membership_listing(&scopes);
                 if listing.is_some() || retried {
                     break (view, listing);
+                }
+                // The view is read again: its declarations are not seen yet.
+                for symbol in view.iter().flat_map(|view| &view.symbols) {
+                    if let Some((_, range)) = symbol.declaration.location {
+                        seen.remove(&(
+                            path_key(&symbol.path),
+                            range,
+                            symbol.declaration.display.clone(),
+                        ));
+                    }
                 }
                 retried = true;
                 let membership = self.index_membership(key, cancel)?;
@@ -1322,6 +1328,7 @@ impl Workspace {
                     },
                 recorded,
                 symbols: view_symbols,
+                exceeded,
                 coverage,
                 complete,
                 limit,
@@ -1330,6 +1337,12 @@ impl Workspace {
                 ..
             } = view;
 
+            if exceeded {
+                return Err(
+                    crate::navigation::too_many_workspace_symbols(cap.saturating_add(1))
+                        .unwrap_or_default(),
+                );
+            }
             let mut proven = HashSet::new();
             for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
                 check_workspace_cancel(Some(cancel))?;
@@ -1504,6 +1517,8 @@ struct TargetView {
     recorded: Vec<(bool, Vec<MemberStamp>)>,
     /// The matching declarations of the excluded members (symbols only).
     symbols: Vec<IndexedSymbol>,
+    /// More declarations matched than the request may return.
+    exceeded: bool,
     coverage: IndexCoverage,
     scopes: Vec<(CatalogueKey, u64)>,
     complete: bool,
@@ -1527,6 +1542,8 @@ fn target_view(
     membership: &IndexMembership,
     selection: Selection<'_>,
     unserved: &[PathBuf],
+    seen: &mut HashSet<SymbolKey>,
+    limit: usize,
 ) -> TargetView {
     let every = || {
         index.candidates(&CandidateQuery {
@@ -1536,6 +1553,7 @@ fn target_view(
         })
     };
     let mut symbols = Vec::new();
+    let mut exceeded = false;
     let candidates = match selection {
         Selection::Candidates(Some(query)) => index.candidates(query),
         Selection::Candidates(None) => {
@@ -1545,7 +1563,6 @@ fn target_view(
             all
         }
         Selection::Symbols { query, .. } => {
-            let mut all = every();
             // A member reading an open or deleted file is read directly.
             let mut direct = HashSet::new();
             for path in unserved {
@@ -1557,17 +1574,15 @@ fn target_view(
                         .map(|member| path_key(member)),
                 );
             }
-            symbols = index.symbols(query, &|path| {
-                !direct.is_empty() && direct.contains(&path_key(path))
-            });
-            all.selected.retain(|path| direct.contains(&path_key(path)));
-            let mut contributing = HashSet::new();
-            all.excluded = symbols
-                .iter()
-                .filter(|symbol| contributing.insert(path_key(&symbol.member)))
-                .map(|symbol| symbol.member.clone())
-                .collect();
-            all
+            let scan = index.symbol_scan(query, &direct, seen, limit);
+            exceeded = scan.exceeded;
+            symbols = scan.symbols;
+            Candidates {
+                selected: scan.direct,
+                unverified: scan.unverified,
+                refused: scan.refused,
+                excluded: scan.contributing,
+            }
         }
     };
     let recorded = candidates
@@ -1585,6 +1600,7 @@ fn target_view(
         candidates,
         recorded,
         symbols,
+        exceeded,
         coverage: index.coverage(),
         scopes: membership.scopes.clone(),
         complete: membership.complete,

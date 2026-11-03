@@ -481,13 +481,32 @@ pub(crate) fn lsp_kind_for_shape(shape: DeclarationShape) -> LspSymbolKind {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYMBOL_RESULT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lowers the workspace-symbol result cap for tests.
+#[cfg(test)]
+pub(crate) fn test_set_symbol_result_cap(cap: Option<usize>) {
+    SYMBOL_RESULT_CAP.with(|slot| slot.set(cap));
+}
+
+/// The most results one workspace symbol answer may hold.
+pub(crate) fn workspace_symbol_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = SYMBOL_RESULT_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_SYMBOL_RESULTS
+}
+
 /// Today's error for a workspace symbol answer of more than
-/// `MAX_SYMBOL_RESULTS` entries.
+/// `workspace_symbol_cap()` entries.
 pub(crate) fn too_many_workspace_symbols(count: usize) -> Option<String> {
-    (count > MAX_SYMBOL_RESULTS).then(|| {
-        format!(
-            "workspace symbol query returned more than {MAX_SYMBOL_RESULTS} results; narrow the query"
-        )
+    let cap = workspace_symbol_cap();
+    (count > cap).then(|| {
+        format!("workspace symbol query returned more than {cap} results; narrow the query")
     })
 }
 

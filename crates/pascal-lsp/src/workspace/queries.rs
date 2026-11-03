@@ -2559,6 +2559,14 @@ pub(crate) fn workspace_diagnostics_from_input(
 #[cfg(test)]
 thread_local! {
     static TEST_FACT_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_FACT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Files read to answer workspace symbols from index facts since the last
+/// call.
+#[cfg(test)]
+pub(crate) fn test_take_fact_reads() -> usize {
+    TEST_FACT_READS.with(|count| count.replace(0))
 }
 
 /// Workspace symbols answered from index facts since the last call.
@@ -2623,6 +2631,11 @@ fn indexed_workspace_symbols(
     must_include.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     let (sources, facts) =
         workspace.indexed_symbols(input, targets, query, direct, &must_include, cancel)?;
+    // The facts are distinct declarations, so an answer over the cap is
+    // known before any indexed file is read.
+    if let Some(error) = crate::navigation::too_many_workspace_symbols(facts.len()) {
+        return Err(error);
+    }
     let mut coverage = Coverage::default();
     if !direct {
         coverage.note(
@@ -2682,6 +2695,19 @@ fn indexed_workspace_symbols(
         );
         snapshot_records(&snapshot)
     };
+    let fact_files = facts
+        .iter()
+        .filter_map(|(_, symbol)| Url::from_file_path(&symbol.path).ok())
+        .collect::<HashSet<_>>();
+    let parsed_elsewhere = found
+        .iter()
+        .filter(|symbol| !fact_files.contains(&symbol.location.uri))
+        .count();
+    if let Some(error) =
+        crate::navigation::too_many_workspace_symbols(facts.len() + parsed_elsewhere)
+    {
+        return Err(error);
+    }
     found.extend(fact_symbols(workspace, facts, &mut coverage, cancel)?);
 
     // The parses come first, so a duplicate keeps the live answer.
@@ -2695,7 +2721,13 @@ fn indexed_workspace_symbols(
     };
     found.sort_by_cached_key(key);
     let mut seen = HashSet::new();
-    found.retain(|symbol| seen.insert((symbol.location.uri.clone(), symbol.location.range)));
+    found.retain(|symbol| {
+        seen.insert((
+            symbol.location.uri.clone(),
+            symbol.location.range,
+            symbol.name.clone(),
+        ))
+    });
     if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
         return Err(error);
     }
@@ -2733,6 +2765,8 @@ fn fact_symbols(
         let Ok(uri) = Url::from_file_path(&path) else {
             continue;
         };
+        #[cfg(test)]
+        TEST_FACT_READS.with(|count| count.set(count.get() + 1));
         let text = match super::rename::read_context_source(workspace, key, &path, cancel) {
             Ok(text) => text,
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
@@ -4404,6 +4438,86 @@ mod tests {
             "workspace symbol query returned more than 10000 results; narrow the query"
         );
         assert_eq!(walks(), 0);
+    }
+
+    #[test]
+    fn names_declared_together_are_all_listed_like_the_walk() {
+        let pair = "unit Pair;\ninterface\ntype\n  TPair = class\n    FA, FB: Integer;\n  end;\nvar A, B: Integer;\nconst\n  C1 = 1; C2 = 2;\nimplementation\nend.\n";
+        let files = [
+            ("Pair.pas", pair.to_owned()),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ];
+        let (_walk_temp, _, walk_workspace) = symbol_workspace(&files);
+        let walked = symbols(&walk_workspace.analysis_input(), "").value;
+        assert!(
+            symbol_names(&walked).contains(&("FB".to_owned(), "Pair.pas".to_owned())),
+            "{walked:?}"
+        );
+
+        let (_temp, root, mut workspace) = symbol_workspace(&files);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Pair.pas")));
+        reset_symbol_counters();
+        let indexed = symbols(&input, "").value;
+        assert!(super::test_take_fact_symbols() > 0);
+        let strip = |found: &[lsp_types::SymbolInformation]| {
+            found
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.name.clone(),
+                        symbol.kind,
+                        symbol
+                            .location
+                            .uri
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                            .to_owned(),
+                        symbol.location.range,
+                        symbol.container_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&indexed), strip(&walked));
+    }
+
+    #[test]
+    fn an_answer_over_the_cap_reads_no_indexed_file() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Alpha.pas", unit_text("Alpha", "const CapValueA = 1;\n")),
+            ("Beta.pas", unit_text("Beta", "const CapValueB = 2;\n")),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Alpha.pas")));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::navigation::test_set_symbol_result_cap(None);
+            }
+        }
+        let _reset = Reset;
+        crate::navigation::test_set_symbol_result_cap(Some(1));
+        super::test_take_fact_reads();
+        let error =
+            workspace_symbols_from_input(input.clone(), "CapValue", &AtomicBool::new(false))
+                .value
+                .expect_err("two results over a cap of one");
+        assert_eq!(
+            error,
+            "workspace symbol query returned more than 1 results; narrow the query"
+        );
+        assert_eq!(super::test_take_fact_reads(), 0);
+
+        crate::navigation::test_set_symbol_result_cap(Some(2));
+        let found = symbols(&input, "CapValue");
+        assert_eq!(found.value.len(), 2);
+        assert_eq!(super::test_take_fact_reads(), 2);
     }
 
     #[test]

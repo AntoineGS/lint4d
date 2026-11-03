@@ -327,6 +327,7 @@ pub(crate) struct Candidates {
     pub(crate) excluded: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
 pub(crate) struct IndexedSymbol {
     /// The file of the declaration's slot (A14).
     pub(crate) path: PathBuf,
@@ -334,6 +335,37 @@ pub(crate) struct IndexedSymbol {
     pub(crate) member: PathBuf,
     pub(crate) declaration: MemberDeclaration,
     pub(crate) container: Option<String>,
+}
+
+/// A declaration once per request: its slot file's path key, range and
+/// display name. Names declared together share a range.
+pub(crate) type SymbolKey = (String, TextRange, Box<str>);
+
+/// What one context contributes to a workspace-symbol request.
+#[derive(Debug, Default)]
+pub(crate) struct SymbolScan {
+    pub(crate) symbols: Vec<IndexedSymbol>,
+    /// Fresh members with a matching declaration, in path order.
+    pub(crate) contributing: Vec<PathBuf>,
+    /// Fresh members read directly instead (open or deleted files).
+    pub(crate) direct: Vec<PathBuf>,
+    pub(crate) unverified: Vec<PathBuf>,
+    pub(crate) refused: Vec<(PathBuf, Box<str>)>,
+    /// More declarations matched than the request may return.
+    pub(crate) exceeded: bool,
+}
+
+/// `display` contains `query` (already lowercased), ignoring case; ASCII
+/// names are compared without allocating.
+pub(crate) fn name_matches(display: &str, query: &str) -> bool {
+    if display.is_ascii() && query.is_ascii() {
+        let (display, query) = (display.as_bytes(), query.as_bytes());
+        return query.is_empty()
+            || display
+                .windows(query.len())
+                .any(|window| window.eq_ignore_ascii_case(query));
+    }
+    display.to_lowercase().contains(query)
 }
 
 pub(crate) struct IndexCoverage {
@@ -777,40 +809,74 @@ impl ContextIndex {
         result
     }
 
-    /// Declarations whose display name contains `query` (case-insensitive),
-    /// from Fresh members, in path order (spec 6.2).
+    /// One pass over the members for workspace symbols (spec 6.2): the
+    /// declarations of Fresh members whose display name contains `query`
+    /// (case-insensitive), in path order, with the members they came from.
+    /// Fresh members keyed in `direct` (open or deleted files and their
+    /// include dependents) are listed for a direct read instead. A
+    /// declaration already in `seen` (another context's copy) is not
+    /// repeated; once `seen` holds more than `limit`, the scan stops.
     /// Eligibility and container mirror `workspace_eligible` and
     /// `workspace_container_name` (`navigation/symbols.rs`).
-    pub(crate) fn symbols(&self, query: &str, skip: &dyn Fn(&Path) -> bool) -> Vec<IndexedSymbol> {
+    pub(crate) fn symbol_scan(
+        &self,
+        query: &str,
+        direct: &HashSet<String>,
+        seen: &mut HashSet<SymbolKey>,
+        limit: usize,
+    ) -> SymbolScan {
         let query = query.to_lowercase();
-        let mut result = Vec::new();
-        for (_, member) in self.live_members_with_ids() {
-            let Some(facts) = member
-                .facts
-                .as_ref()
-                .filter(|_| *member.state() == MemberState::Fresh)
-            else {
-                continue;
+        let mut scan = SymbolScan::default();
+        for (key, id) in &self.by_path {
+            let member = &self.members[id.0 as usize];
+            let facts = match member.state() {
+                MemberState::Unindexed | MemberState::Stale => {
+                    scan.unverified.push(member.path.clone());
+                    continue;
+                }
+                MemberState::Refused(reason) => {
+                    scan.refused.push((member.path.clone(), reason.clone()));
+                    continue;
+                }
+                MemberState::Fresh => match &member.facts {
+                    Some(facts) => facts,
+                    None => continue,
+                },
             };
-            if skip(&member.path) {
+            if !direct.is_empty() && direct.contains(key) {
+                scan.direct.push(member.path.clone());
                 continue;
             }
+            let mut contributed = false;
             for declaration in facts.declarations.iter() {
                 let eligible = match declaration.kind {
                     DeclarationKind::Variable | DeclarationKind::Constant => declaration.unit_scope,
                     _ => true,
                 };
-                if !eligible || !declaration.display.to_lowercase().contains(&query) {
+                if !eligible || !name_matches(&declaration.display, &query) {
                     continue;
                 }
-                let Some((slot, _)) = declaration.location else {
+                let Some((slot, range)) = declaration.location else {
                     continue;
                 };
                 let Some(Some(path)) = facts.slot_paths.get(slot as usize) else {
                     continue;
                 };
-                if skip(path) {
+                let slot_key = if slot == 0 {
+                    key.clone()
+                } else {
+                    let slot_key = path_key(path);
+                    if direct.contains(&slot_key) {
+                        continue;
+                    }
+                    slot_key
+                };
+                if !seen.insert((slot_key, range, declaration.display.clone())) {
                     continue;
+                }
+                if seen.len() > limit {
+                    scan.exceeded = true;
+                    return scan;
                 }
                 let container = if declaration.kind == DeclarationKind::Unit {
                     None
@@ -821,15 +887,19 @@ impl ContextIndex {
                         .map(str::to_owned)
                         .or_else(|| Some(facts.unit_display.to_string()))
                 };
-                result.push(IndexedSymbol {
+                scan.symbols.push(IndexedSymbol {
                     path: path.clone(),
                     member: member.path.clone(),
                     declaration: declaration.clone(),
                     container,
                 });
+                contributed = true;
+            }
+            if contributed {
+                scan.contributing.push(member.path.clone());
             }
         }
-        result
+        scan
     }
 
     pub(crate) fn stamps_of(&self, path: &Path) -> Option<&[MemberStamp]> {
@@ -1287,7 +1357,7 @@ mod tests {
         with_owner.declarations[6].extent = with_owner.declarations[6].location;
         let mut index = ContextIndex::new();
         member(&mut index, "/w/Shared.pas", &with_owner);
-        let symbols = index.symbols("sha", &|_| false);
+        let symbols = scan(&index, "sha", &[]).symbols;
         let names: Vec<(&str, Option<&str>)> = symbols
             .iter()
             .map(|symbol| (&*symbol.declaration.display, symbol.container.as_deref()))
@@ -1308,9 +1378,11 @@ mod tests {
         let mut index = ContextIndex::new();
         member(&mut index, "/w/A.pas", &facts("a", &[], &[], &[]));
         member(&mut index, "/w/B.pas", &facts("b", &[], &[], &[]));
-        let symbols = index.symbols("", &|path| path == Path::new("/w/A.pas"));
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].path, PathBuf::from("/w/B.pas"));
+        let found = scan(&index, "", &["/w/A.pas"]);
+        assert_eq!(found.symbols.len(), 1);
+        assert_eq!(found.symbols[0].path, PathBuf::from("/w/B.pas"));
+        assert_eq!(found.direct, paths(&["/w/A.pas"]));
+        assert_eq!(found.contributing, paths(&["/w/B.pas"]));
     }
 
     #[test]
@@ -1399,9 +1471,50 @@ mod tests {
         member(&mut index, "/w/A.pas", &facts("a", &[], &[], &[]));
         member(&mut index, "/w/B.pas", &facts("b", &[], &[], &[]));
         index.mark_stale(Path::new("/w/A.pas"));
-        let symbols = index.symbols("", &|_| false);
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].path, PathBuf::from("/w/B.pas"));
+        let found = scan(&index, "", &[]);
+        assert_eq!(found.symbols.len(), 1);
+        assert_eq!(found.symbols[0].path, PathBuf::from("/w/B.pas"));
+        assert_eq!(found.unverified, paths(&["/w/A.pas"]));
+    }
+
+    fn scan(index: &ContextIndex, query: &str, direct: &[&str]) -> SymbolScan {
+        let direct = direct
+            .iter()
+            .map(|path| path_key(Path::new(path)))
+            .collect();
+        index.symbol_scan(query, &direct, &mut HashSet::new(), usize::MAX)
+    }
+
+    #[test]
+    fn a_symbol_scan_stops_copying_past_the_limit() {
+        let mut index = ContextIndex::new();
+        for name in ["a", "b", "c", "d"] {
+            member(
+                &mut index,
+                &format!("/w/{name}.pas"),
+                &facts(name, &[], &[], &[]),
+            );
+        }
+        let mut seen = HashSet::new();
+        let found = index.symbol_scan("", &HashSet::new(), &mut seen, 2);
+        assert!(found.exceeded);
+        assert_eq!(found.symbols.len(), 2);
+        let mut seen = HashSet::new();
+        let found = index.symbol_scan("", &HashSet::new(), &mut seen, 4);
+        assert!(!found.exceeded);
+        assert_eq!(found.symbols.len(), 4);
+        // A second context sharing the declarations adds nothing new.
+        let again = index.symbol_scan("", &HashSet::new(), &mut seen, 4);
+        assert!(again.symbols.is_empty() && !again.exceeded);
+    }
+
+    #[test]
+    fn symbol_names_match_case_insensitively() {
+        assert!(name_matches("SharedValue", "redval"));
+        assert!(!name_matches("SharedValue", "shard"));
+        assert!(name_matches("Ärger", "är"));
+        assert!(name_matches("Größe", "grö"));
+        assert!(name_matches("anything", ""));
     }
 
     #[test]

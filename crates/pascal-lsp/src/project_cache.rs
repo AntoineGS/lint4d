@@ -34,6 +34,9 @@ pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09
 const CATALOGUE_BUDGET_SHARE: usize = 8;
 /// The workspace index may hold a quarter of `maxCacheBytes` (l4d-33).
 const INDEX_BUDGET_SHARE: usize = 4;
+/// Compiled provider interfaces may hold a quarter of `maxCacheBytes`
+/// (l4d-4nbs D29); past it their own least recently used are evicted.
+const PROVIDER_GRAPH_BUDGET_SHARE: usize = 4;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
 const MAX_OWNERS: usize = 4_096;
@@ -170,8 +173,6 @@ pub(crate) fn report_probes(
     report: &pascal_core::ResolutionReport,
     resolved: &pascal_core::ResolvedImports,
 ) -> (Vec<Probe>, Vec<PathBuf>) {
-    use pascal_core::ResolutionObservation as O;
-
     fn push_revision(probes: &mut Vec<Probe>, path: &Path, revision: &pascal_core::SourceRevision) {
         match revision {
             pascal_core::SourceRevision::Disk {
@@ -199,12 +200,28 @@ pub(crate) fn report_probes(
     }
 
     let mut probes = Vec::new();
-    let mut dirs = Vec::new();
-
     for unit in &resolved.dependencies {
         push_revision(&mut probes, &unit.source.path, &unit.source.revision);
     }
-    for observation in &report.observations {
+    let (observed, dirs) = observation_probes(&report.observations, &mut |path, revision| {
+        let mut probes = Vec::new();
+        push_revision(&mut probes, path, revision);
+        probes.pop()
+    });
+    probes.extend(observed);
+    (probes, dirs)
+}
+
+/// Probes for resolver observations, and the directories whose watches
+/// protect them. `revision` turns a payload's revision into its probe.
+pub(crate) fn observation_probes(
+    observations: &[pascal_core::ResolutionObservation],
+    revision: &mut dyn FnMut(&Path, &pascal_core::SourceRevision) -> Option<Probe>,
+) -> (Vec<Probe>, Vec<PathBuf>) {
+    use pascal_core::ResolutionObservation as O;
+    let mut probes = Vec::new();
+    let mut dirs = Vec::new();
+    for observation in observations {
         match observation {
             O::Directory { path, stamp, .. } => {
                 probes.push(Probe::Stamp {
@@ -226,7 +243,7 @@ pub(crate) fn report_probes(
                 path,
                 revision: source_revision,
                 ..
-            } => push_revision(&mut probes, path, source_revision),
+            } => probes.extend(revision(path, source_revision)),
             O::Metadata(pascal_project::MetadataObservation::Stat { path }) => {
                 probes.push(Probe::Stamp {
                     path: path.clone(),
@@ -2610,6 +2627,85 @@ mod cache_tests {
         assert_eq!(cache.stats().reserved_bytes(), 0);
     }
 
+    fn provider_key(name: &str) -> pascal_core::compile_time::ProviderGraphKey {
+        pascal_core::compile_time::ProviderGraphKey {
+            source: pascal_core::SourceId::new(format!("/p/{name}.pas")),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        }
+    }
+
+    fn provider_graph(bytes: usize) -> Arc<pascal_core::compile_time::SharedProviderGraph> {
+        Arc::new(pascal_core::compile_time::SharedProviderGraph {
+            occurrence: pascal_core::compile_time::OccurrenceId(1),
+            graph: None,
+            observations: Default::default(),
+            warnings: Default::default(),
+            dependencies: Default::default(),
+            retained_bytes: bytes,
+        })
+    }
+
+    /// l4d-4nbs D29: shared provider interfaces are charged to
+    /// `maxCacheBytes` and evicted least recently used first past their
+    /// share; reuse refreshes an entry.
+    #[test]
+    fn provider_interfaces_are_evicted_least_recently_used_first() {
+        let cache = ProjectCache::new(4 * 3_000);
+        let overlays = HashMap::new();
+        for name in ["A", "B"] {
+            assert!(cache.put_provider_graph(
+                7,
+                provider_key(name),
+                provider_graph(1_000),
+                vec![],
+                Default::default()
+            ));
+        }
+        let charged = cache.provider_graph_bytes();
+        assert!(charged >= 2_000, "{charged}");
+        assert!(
+            cache
+                .provider_graph(7, &provider_key("A"), &overlays)
+                .is_some()
+        );
+        assert!(
+            cache
+                .provider_graph(8, &provider_key("A"), &overlays)
+                .is_none(),
+            "another resolver configuration shares nothing"
+        );
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("C"),
+            provider_graph(1_000),
+            vec![],
+            Default::default()
+        ));
+        assert!(
+            cache
+                .provider_graph(7, &provider_key("B"), &overlays)
+                .is_none()
+        );
+        assert!(
+            cache
+                .provider_graph(7, &provider_key("A"), &overlays)
+                .is_some()
+        );
+        assert!(
+            cache
+                .provider_graph(7, &provider_key("C"), &overlays)
+                .is_some()
+        );
+        assert_eq!(cache.provider_graph_bytes(), charged);
+        cache.invalidate_after_overflow();
+        assert_eq!(cache.provider_graph_count(), 0);
+        assert_eq!(cache.provider_graph_bytes(), 0);
+    }
+
     #[test]
     fn reserved_bytes_count_in_eviction_and_room() {
         let cache = ProjectCache::new(20);
@@ -3134,6 +3230,8 @@ struct Inner {
     catalogues: Mutex<CatalogueStore>,
     /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
     index: Mutex<IndexStore>,
+    /// Never held together with any other lock.
+    provider_graphs: Mutex<ProviderGraphStore>,
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
@@ -3289,6 +3387,7 @@ pub(crate) struct CacheStats {
     pub reserved_pages_bytes: usize,
     pub reserved_catalogue_bytes: usize,
     pub reserved_index_bytes: usize,
+    pub reserved_provider_graph_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3299,6 +3398,7 @@ impl CacheStats {
             .saturating_add(self.reserved_pages_bytes)
             .saturating_add(self.reserved_catalogue_bytes)
             .saturating_add(self.reserved_index_bytes)
+            .saturating_add(self.reserved_provider_graph_bytes)
     }
 }
 
@@ -3320,10 +3420,13 @@ pub(crate) enum ReservationKind {
     /// The workspace index (l4d-33). Held by the index store like the
     /// catalogues, and released with `release_index`.
     WorkspaceIndex,
+    /// Compiled provider interfaces (l4d-4nbs D29), held by their store like
+    /// the catalogues.
+    ProviderGraphs,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     fn index(self) -> usize {
         match self {
@@ -3332,6 +3435,7 @@ impl ReservationKind {
             Self::Pages => 2,
             Self::Catalogues => 3,
             Self::WorkspaceIndex => 4,
+            Self::ProviderGraphs => 5,
         }
     }
 }
@@ -3564,7 +3668,17 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         state.max_bytes = max_bytes;
         evict_to_budget(&mut state);
+        let over = !fits(&state, state.bytes, 0);
         self.release(state);
+        // Shared provider interfaces keep to their new share, and give way
+        // entirely to what requests hold (l4d-4nbs D29).
+        let limit = if over {
+            0
+        } else {
+            max_bytes / PROVIDER_GRAPH_BUDGET_SHARE
+        };
+        let freed = self.provider_graphs().evict_until(limit);
+        self.release_provider_graphs(freed);
     }
 
     /// Charge `bytes` of `kind` before allocating them (spec §10 amendment
@@ -3594,7 +3708,19 @@ impl ProjectCache {
         prune_dead_leases(&mut state);
         if !make_room(&mut state, total) {
             self.release(state);
-            return None;
+            // Shared provider interfaces are only a cache: they give way to
+            // a reservation (l4d-4nbs D29).
+            let freed = self.provider_graphs().clear();
+            if freed == 0 {
+                return None;
+            }
+            self.release_provider_graphs(freed);
+            state = lock(&self.inner);
+            prune_dead_leases(&mut state);
+            if !make_room(&mut state, total) {
+                self.release(state);
+                return None;
+            }
         }
         for &(kind, bytes) in requests {
             state.reserved[kind.index()] += bytes;
@@ -4929,6 +5055,8 @@ impl ProjectCache {
         self.drop_witnesses(path, include_parent);
         let removed = self.catalogues().invalidate(path, include_parent);
         self.release_catalogues(removed);
+        let freed = self.provider_graphs().invalidate(path, include_parent);
+        self.release_provider_graphs(freed);
         self.invalidate_index(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
@@ -4966,6 +5094,8 @@ impl ProjectCache {
         // Overflow lost which directories changed: no catalogue survives it.
         let removed = self.catalogues().clear();
         self.release_catalogues(removed);
+        let freed = self.provider_graphs().clear();
+        self.release_provider_graphs(freed);
         // Overflow lost which paths changed: every member is suspect.
         self.invalidate_index_all();
     }
@@ -5073,6 +5203,7 @@ impl ProjectCache {
             reserved_pages_bytes: state.reserved[ReservationKind::Pages.index()],
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
+            reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
         }
     }
 
@@ -5258,6 +5389,232 @@ impl ProjectCache {
             }
         }
         self.release(state);
+    }
+
+    fn provider_graphs(&self) -> MutexGuard<'_, ProviderGraphStore> {
+        self.inner
+            .provider_graphs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn release_provider_graphs(&self, freed: usize) {
+        if freed == 0 {
+            return;
+        }
+        let mut state = lock(&self.inner);
+        let index = ReservationKind::ProviderGraphs.index();
+        state.reserved[index] = state.reserved[index].saturating_sub(freed);
+        self.release(state);
+    }
+
+    /// The provider interface compiled under resolver configuration
+    /// `configuration` for `key`, if its probes still hold (l4d-4nbs D29). A
+    /// stale entry is dropped.
+    pub(crate) fn provider_graph(
+        &self,
+        configuration: u64,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<SharedProviderGraphHit> {
+        let full = (configuration, key.clone());
+        let hit = {
+            let store = self.provider_graphs();
+            let entry = store.entries.get(&full)?;
+            SharedProviderGraphHit {
+                graph: Arc::clone(&entry.graph),
+                reads: Arc::clone(&entry.reads),
+                probes: Arc::clone(&entry.probes),
+            }
+        };
+        let held = probes_hold(&hit.probes, overlays);
+        let mut store = self.provider_graphs();
+        if !store
+            .entries
+            .get(&full)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.graph, &hit.graph))
+        {
+            return None;
+        }
+        if !held {
+            let freed = store.remove(&full);
+            drop(store);
+            self.release_provider_graphs(freed);
+            return None;
+        }
+        store.touch(&full);
+        Some(hit)
+    }
+
+    /// Keep a compiled provider interface, charged to `maxCacheBytes` within
+    /// its share. False when it does not fit (l4d-4nbs D29).
+    pub(crate) fn put_provider_graph(
+        &self,
+        configuration: u64,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: Arc<pascal_core::compile_time::SharedProviderGraph>,
+        probes: Vec<Probe>,
+        reads: crate::workspace::capture::CapturedReads,
+    ) -> bool {
+        let bytes = std::mem::size_of::<ProviderGraphEntry>()
+            .saturating_add(key.source.as_str().len())
+            .saturating_add(std::mem::size_of_val(key.qualifiers.as_slice()))
+            .saturating_add(graph.retained_bytes)
+            .saturating_add(probes_bytes(&probes))
+            .saturating_add(reads.retained_bytes());
+        let share = lock(&self.inner).max_bytes / PROVIDER_GRAPH_BUDGET_SHARE;
+        if bytes > share {
+            return false;
+        }
+        let full = (configuration, key);
+        let freed = {
+            let mut store = self.provider_graphs();
+            let freed = store.remove(&full);
+            freed.saturating_add(store.evict_until(share - bytes))
+        };
+        self.release_provider_graphs(freed);
+        let admitted = {
+            let mut state = lock(&self.inner);
+            prune_dead_leases(&mut state);
+            let admitted = make_room(&mut state, bytes);
+            if admitted {
+                state.reserved[ReservationKind::ProviderGraphs.index()] += bytes;
+            }
+            self.release(state);
+            admitted
+        };
+        if !admitted {
+            return false;
+        }
+        let replaced = self.provider_graphs().insert(
+            full,
+            ProviderGraphEntry {
+                graph,
+                probes: Arc::new(probes),
+                reads: Arc::new(reads),
+                bytes,
+            },
+        );
+        self.release_provider_graphs(replaced);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_graph_count(&self) -> usize {
+        self.provider_graphs().entries.len()
+    }
+
+    /// What the shared provider interfaces are charged.
+    #[cfg(test)]
+    pub(crate) fn provider_graph_bytes(&self) -> usize {
+        lock(&self.inner).reserved[ReservationKind::ProviderGraphs.index()]
+    }
+}
+
+/// A compiled provider interface reused from the cache, with the reads its
+/// compilation captured.
+pub(crate) struct SharedProviderGraphHit {
+    pub(crate) graph: Arc<pascal_core::compile_time::SharedProviderGraph>,
+    pub(crate) reads: Arc<crate::workspace::capture::CapturedReads>,
+    probes: Arc<Vec<Probe>>,
+}
+
+type ProviderGraphId = (u64, pascal_core::compile_time::ProviderGraphKey);
+
+struct ProviderGraphEntry {
+    graph: Arc<pascal_core::compile_time::SharedProviderGraph>,
+    probes: Arc<Vec<Probe>>,
+    reads: Arc<crate::workspace::capture::CapturedReads>,
+    bytes: usize,
+}
+
+/// Compiled provider interfaces by resolver configuration and provider key,
+/// least recently used first in `lru`.
+#[derive(Default)]
+struct ProviderGraphStore {
+    entries: HashMap<ProviderGraphId, ProviderGraphEntry>,
+    ticks: HashMap<ProviderGraphId, u64>,
+    lru: BTreeMap<u64, ProviderGraphId>,
+    next_tick: u64,
+    bytes: usize,
+}
+
+impl ProviderGraphStore {
+    fn touch(&mut self, id: &ProviderGraphId) {
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        if let Some(old) = self.ticks.insert(id.clone(), tick) {
+            self.lru.remove(&old);
+        }
+        self.lru.insert(tick, id.clone());
+    }
+
+    fn insert(&mut self, id: ProviderGraphId, entry: ProviderGraphEntry) -> usize {
+        let replaced = self.remove(&id);
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.entries.insert(id.clone(), entry);
+        self.touch(&id);
+        replaced
+    }
+
+    fn remove(&mut self, id: &ProviderGraphId) -> usize {
+        if let Some(tick) = self.ticks.remove(id) {
+            self.lru.remove(&tick);
+        }
+        let freed = self.entries.remove(id).map_or(0, |entry| entry.bytes);
+        self.bytes = self.bytes.saturating_sub(freed);
+        freed
+    }
+
+    /// Evicts least recently used entries until at most `limit` bytes remain.
+    fn evict_until(&mut self, limit: usize) -> usize {
+        let mut freed = 0usize;
+        while self.bytes > limit {
+            let Some((_, id)) = self.lru.pop_first() else {
+                break;
+            };
+            self.ticks.remove(&id);
+            if let Some(entry) = self.entries.remove(&id) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+                freed = freed.saturating_add(entry.bytes);
+            }
+        }
+        freed
+    }
+
+    /// Drops every entry a probe of which names `path` or lies under it, or
+    /// (`include_parent`) names its parent directory.
+    fn invalidate(&mut self, path: &Path, include_parent: bool) -> usize {
+        let parent = path.parent().filter(|_| include_parent);
+        let doomed = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.probes.iter().any(|probe| {
+                    let probed = match probe {
+                        Probe::Stamp { path, .. } | Probe::Content { path, .. } => path.clone(),
+                        Probe::Overlay { uri, .. } => match uri.to_file_path() {
+                            Ok(path) => path,
+                            Err(()) => return false,
+                        },
+                    };
+                    probed.starts_with(path) || parent.is_some_and(|parent| probed == parent)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        doomed
+            .iter()
+            .fold(0usize, |freed, id| freed.saturating_add(self.remove(id)))
+    }
+
+    fn clear(&mut self) -> usize {
+        let freed = self.bytes;
+        self.entries.clear();
+        self.ticks.clear();
+        self.lru.clear();
+        self.bytes = 0;
+        freed
     }
 }
 

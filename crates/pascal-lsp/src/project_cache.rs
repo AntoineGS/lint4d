@@ -4929,6 +4929,14 @@ impl ProjectCache {
                 .map_or(0, |stored| stored.charged);
             let paid = wanted.saturating_sub(held);
             if paid > 0 && !self.charge_index_evicting(paid, &key) {
+                // A stored context keeps the membership and members it
+                // holds; the gap stays visible until the share has room.
+                if let Some(stored) = self.index().contexts.get_mut(&key) {
+                    stored.memory_exhausted = true;
+                    stored.dirty = true;
+                    stored.membership.complete = false;
+                    return;
+                }
                 exhausted = true;
                 membership.paths.clear();
                 membership.complete = false;
@@ -5120,7 +5128,9 @@ impl ProjectCache {
                     .scopes
                     .iter()
                     .any(|(scope, _)| match scope.depth {
-                        Depth::Listing => parent == Some(scope.root.as_path()),
+                        Depth::Listing => {
+                            parent == Some(scope.root.as_path()) || path == scope.root
+                        }
                         Depth::Recursive => path != scope.root && path.starts_with(&scope.root),
                     });
             let newly_dirty = listed && !stored.dirty;
@@ -5685,6 +5695,39 @@ mod index_tests {
     }
 
     #[test]
+    fn a_grown_membership_that_cannot_be_charged_keeps_the_warm_index() {
+        let m = membership_cost(&["/w/A.pas"]);
+        let c = charge(&facts("/w/A.pas"));
+        let cache = ProjectCache::new((m + c + 16) * INDEX_BUDGET_SHARE);
+        let a = key("a");
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
+        let held = cache.stats().reserved_index_bytes;
+        let grown = (0..20)
+            .map(|index| format!("/w/U{index:02}.pas"))
+            .chain(["/w/A.pas".to_owned()])
+            .collect::<Vec<_>>();
+        let grown = grown.iter().map(String::as_str).collect::<Vec<_>>();
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown));
+        let (paths, complete, members) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    membership.paths.clone(),
+                    membership.complete,
+                    index.member_paths(),
+                )
+            })
+            .expect("the context stays stored");
+        assert_eq!(paths, [PathBuf::from("/w/A.pas")]);
+        assert_eq!(members, [PathBuf::from("/w/A.pas")]);
+        assert!(!complete);
+        assert!(unverified(&cache, &a).is_empty(), "the member stays fresh");
+        assert!(cache.index_memory_exhausted(&a));
+        assert!(!cache.index_membership_current(&a));
+        assert_eq!(cache.stats().reserved_index_bytes, held);
+    }
+
+    #[test]
     fn a_path_outside_the_membership_is_not_charged() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
@@ -5789,6 +5832,25 @@ mod index_tests {
         cache.invalidate_path(&dir.join("New.pas"));
         assert!(!cache.index_membership_current(&a));
         assert!(!cache.index_membership_current(&key("absent")));
+    }
+
+    #[test]
+    fn deleting_a_listed_directory_dirties_the_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ProjectCache::new(1 << 30);
+        let (scope, catalogue) = listing_scope(&dir);
+        let generation = cache
+            .publish_catalogue(scope.clone(), None, catalogue)
+            .unwrap();
+        let a = key("a");
+        let mut recorded = membership(&["/w/A.pas"]);
+        recorded.scopes = vec![(scope, generation)];
+        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        // Keep the catalogue current so only the membership's flag decides.
+        cache.invalidate_index(&dir, true);
+        assert!(!cache.index_membership_current(&a));
     }
 
     #[test]

@@ -20085,7 +20085,7 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     (0..node.named_child_count()).find_map(|index| node.named_child(index))
 }
 
-fn canonical_name(name: &str) -> String {
+pub(crate) fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
 }
 

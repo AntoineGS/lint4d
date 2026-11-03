@@ -8090,7 +8090,7 @@ fn capture_consumed_configuration_baseline(
     Ok(())
 }
 
-fn path_key(path: &Path) -> String {
+pub(crate) fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(path)
 }
 

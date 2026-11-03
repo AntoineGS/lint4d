@@ -354,7 +354,8 @@ pub(crate) struct IndexProgress {
     /// held snapshot lists them without an artifact); they do not hold
     /// `complete` back.
     pub(crate) retrying: usize,
-    /// Members retrying a previous refusal this batch extracted.
+    /// Members retrying a previous refusal whose retry this batch ended
+    /// (indexed, refused, limited or deferred for another reason).
     pub(crate) retries_attempted: usize,
 }
 
@@ -778,19 +779,22 @@ impl Workspace {
             if asked {
                 before_io()?;
             }
-            if self
+            let retrying = self
                 .project_cache
                 .read_index(&key, |index, _| index.retrying(&path))
-                .unwrap_or(false)
-            {
-                progress.retries_attempted += 1;
-            }
+                .unwrap_or(false);
             // One member's failure never stops the batch: it stays pending.
             let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
                 Ok(outcome) => outcome,
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                 Err(error) => MemberOutcome::Deferred(error),
             };
+            // Only an outcome that ends the retry counts: a skipped member
+            // (an unsaved overlay, no member any more) or a memory stop
+            // keeps it, and counting it would requeue the batch forever.
+            if retrying && !matches!(outcome, MemberOutcome::Skipped | MemberOutcome::Memory) {
+                progress.retries_attempted += 1;
+            }
             match outcome {
                 MemberOutcome::Published { persisted } => {
                     progress.indexed += 1;

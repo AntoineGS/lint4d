@@ -1245,6 +1245,63 @@ mod tests {
         cache.shutdown();
     }
 
+    /// A retried member a session view skips (an unsaved include overlay)
+    /// keeps its retry, but does not count as attempted: the requeue ends.
+    #[test]
+    fn a_skipped_retry_does_not_requeue_forever() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 2, options);
+        let include = temp.path().join("lib/Shared.inc");
+        write(&include, "const Shared = 1;\n");
+        let big = temp.path().join("lib/U0.pas");
+        write(
+            &big,
+            &format!(
+                "unit U0;\ninterface\n{{$I Shared.inc}}\nprocedure {};\nimplementation\nend.\n",
+                "Long".repeat(80)
+            ),
+        );
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        assert_eq!(advance(&mut first, &anchor, IndexBound::all()).refused, 1);
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        cache.shutdown();
+        // A new process with the default per-file limit: U0 would load now.
+        let mut session = workspace_of(temp.path());
+        let (mut view, cache) = persisting_view(&session, store.path());
+        let progress = advance(
+            &mut view,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert_eq!((progress.reused, progress.retrying), (1, 1), "{progress:?}");
+        session
+            .open_document(
+                Url::from_file_path(&include).unwrap(),
+                "const Shared = 2;\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        for batch in 0..2 {
+            let progress = advance(&mut session, &anchor, IndexBound::all());
+            assert_eq!(
+                (
+                    progress.retrying,
+                    progress.retries_attempted,
+                    progress.indexed
+                ),
+                (1, 0, 0),
+                "batch {batch}: {progress:?}"
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert!(!progress.worth_requeue(), "batch {batch}: {progress:?}");
+        }
+        cache.shutdown();
+    }
+
     #[test]
     fn a_seal_cancelled_while_listing_is_interrupted() {
         let temp = tempfile::tempdir().unwrap();

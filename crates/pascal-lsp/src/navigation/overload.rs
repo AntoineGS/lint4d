@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AncestryResolutionState, AncestryStatus, AssistanceBudget, BuiltinType, Candidate, Document,
     GenericSubstitution, IntegerKind, NavigationIndex, Origin, ParameterMode, Receiver, Region,
@@ -163,7 +164,7 @@ struct RoutineGroup {
 
 pub(super) fn call_for_identifier(identifier: Node<'_>) -> Option<Node<'_>> {
     let identifier_span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         if node.kind() == "exprCall"
             && node
@@ -172,7 +173,7 @@ pub(super) fn call_for_identifier(identifier: Node<'_>) -> Option<Node<'_>> {
         {
             return Some(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }
@@ -2684,7 +2685,7 @@ fn property_is_default_indexed(
     };
     let mut declaration = node;
     while declaration.kind() != "declProp" {
-        let Some(parent) = declaration.parent() else {
+        let Some(parent) = declaration.tree_parent() else {
             return Ok(false);
         };
         declaration = parent;

@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, MissingUnitUseKind,
     NavigationIndex, Origin, ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind,
@@ -3505,7 +3506,7 @@ fn member_expression_for_completion<'a>(
                 .source
                 .get(node.start_byte()..node.end_byte())
                 .is_some_and(|text| text == ".")
-            && let Some(parent) = node.parent()
+            && let Some(parent) = node.tree_parent()
         {
             budget.require_work(parent.named_child_count(), cancel)?;
             let mut receiver = None;
@@ -4315,7 +4316,7 @@ fn type_declaration_type_node<'a>(
         if current.kind() == "declType" {
             return Ok(current.child_by_field_name("type"));
         }
-        let Some(parent) = current.parent() else {
+        let Some(parent) = current.tree_parent() else {
             return Ok(None);
         };
         current = parent;
@@ -6305,7 +6306,7 @@ struct Ancestors<'a> {
 impl<'a> Ancestors<'a> {
     fn new(node: Node<'a>) -> Self {
         Self {
-            current: node.parent(),
+            current: node.tree_parent(),
         }
     }
 }
@@ -6315,7 +6316,7 @@ impl<'a> Iterator for Ancestors<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current?;
-        self.current = current.parent();
+        self.current = current.tree_parent();
         Some(current)
     }
 }
@@ -6388,7 +6389,7 @@ fn is_implicit_result_reference_with_budget(
                 .child_by_field_name("body")
                 .is_some_and(|body| Span::from_node(body).contains(identifier_span)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
 
     Ok(false)

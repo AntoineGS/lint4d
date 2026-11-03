@@ -1,3 +1,4 @@
+use super::TreeParent as _;
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, ROOT_SCOPE,
     ResolutionState, Span, Symbol, SymbolKind, canonical_name, collect_nodes_matching,
@@ -2752,7 +2753,7 @@ fn call_argument_for_identifier_with_budget<'a>(
     budget: &mut super::AssistanceBudget,
 ) -> Result<Option<(Node<'a>, usize, Node<'a>)>, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2780,7 +2781,7 @@ fn call_argument_for_identifier_with_budget<'a>(
             }
             return Ok(None);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -2846,7 +2847,7 @@ fn assignment_lhs_for_identifier_with_budget<'a>(
     budget: &mut super::AssistanceBudget,
 ) -> Result<Option<(Node<'a>, Node<'a>)>, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2856,7 +2857,7 @@ fn assignment_lhs_for_identifier_with_budget<'a>(
             };
             return Ok(Span::from_node(lhs).contains(span).then_some((node, lhs)));
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(None)
 }
@@ -2904,7 +2905,7 @@ fn identifier_is_foreach_iterator_with_budget(
     budget: &mut super::AssistanceBudget,
 ) -> Result<bool, String> {
     let span = Span::from_node(identifier);
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2915,7 +2916,7 @@ fn identifier_is_foreach_iterator_with_budget(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -2925,7 +2926,7 @@ fn is_address_operand_with_budget(
     cancel: &AtomicBool,
     budget: &mut super::AssistanceBudget,
 ) -> Result<bool, String> {
-    let mut current = identifier.parent();
+    let mut current = identifier.tree_parent();
     while let Some(node) = current {
         check_cancel(Some(cancel))?;
         budget.require_work(1, cancel)?;
@@ -2936,7 +2937,7 @@ fn is_address_operand_with_budget(
         {
             return Ok(true);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(false)
 }
@@ -3876,16 +3877,16 @@ fn parameter_binding_key(
             argument = Some(node);
             break;
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     let argument = argument?;
 
-    let mut routine_node = argument.parent();
+    let mut routine_node = argument.tree_parent();
     while let Some(node) = routine_node {
         if matches!(node.kind(), "declProc" | "defProc") {
             break;
         }
-        routine_node = node.parent();
+        routine_node = node.tree_parent();
     }
     let routine_node = routine_node?;
     let header = if routine_node.kind() == "defProc" {
@@ -3948,7 +3949,7 @@ fn candidate_key_site(document: &Document, symbol: &Symbol) -> Span {
         if matches!(node.kind(), "declProc" | "defProc") {
             return Span::from_node(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     symbol.span
 }
@@ -4025,7 +4026,7 @@ fn declaration_node_for_span(root: Node<'_>, span: Span) -> Option<Node<'_>> {
         {
             return Some(node);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     None
 }
@@ -4065,7 +4066,7 @@ fn cacheable_unqualified_use_with_budget(
         if node.kind() == "lambda" {
             return Ok(false);
         }
-        current = node.parent();
+        current = node.tree_parent();
     }
     Ok(!document.cache_unsafe_scopes.contains(&scope))
 }

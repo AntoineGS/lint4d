@@ -1376,7 +1376,7 @@ never stored.
 | `persistentCacheDirectory` | platform directory | absolute path, at most 4,096 bytes | initialization only; `~` is not expanded |
 | `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
 | `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
-| `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation |
+| `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
 | `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
 
 The limits can be lowered, not raised. In `initializationOptions`, a value

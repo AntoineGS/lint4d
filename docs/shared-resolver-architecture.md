@@ -347,21 +347,23 @@ exceed it. If they do, warming pauses and one warning is logged.
 
 The persistent analysis cache (`pascal-cache`) does not add a second memory
 budget: what it retains (decoded facts, scratch, page caches) is reserved from
-`maxCacheBytes` before it is allocated (`ProjectCache::reserve`). These are
-building blocks: nothing in production opens a store, reuses facts or
-publishes until `l4d-zf1b.8` adds the first caller. Three kinds of
-reservation are reported with the cache statistics:
+`maxCacheBytes` before it is allocated (`ProjectCache::reserve`). With
+persistence enabled (the default), the process opens one admitted store
+through `persistent_cache` and maintains it in the background; reusing facts
+and publishing them arrives with `l4d-zf1b.8`, the first caller of the
+store. Three kinds of reservation are reported with the cache statistics:
 
 - **Facts**: decoded persisted facts. Reuse reserves its decode limit before
   decoding, keeps what decoding used and holds that charge for as long as the
   facts live, also after eviction.
 - **Scratch**: the store's transient encode/decode buffers (16 MiB at most,
-  `persistentCacheScratchBytes` once `l4d-zf1b.11` adds the option).
+  lowered with `persistentCacheScratchBytes`, minimum 1 MiB).
   `AdmittedStore` reserves this budget from `maxCacheBytes` up front, not
   from `ProjectCache` per use. Inside the store, record and evidence
   encodings and query result pages reserve from that scratch budget first,
   from an upper bound computed from their inputs.
-- **Pages**: the SQLite page caches (16 MiB aggregate) plus a fixed overhead
+- **Pages**: the SQLite page caches (16 MiB aggregate, lowered with
+  `persistentCachePageBytes`) plus a fixed overhead
   allowance of 1 MiB per connection (2 readers and 1 writer). The store is
   to be opened only through `AdmittedStore`, which reserves Pages and Scratch
   together first and bypasses persistence, evicting nothing, when they do not

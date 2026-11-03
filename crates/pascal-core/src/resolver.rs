@@ -5171,44 +5171,84 @@ impl<S: SourceStore> UnitResolver<S> {
                 .map_err(ResolverError::InvalidRequest)?;
             entry_bound = entry_bound.max(bytes);
         }
-        let backing = count
-            .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
-            .ok_or_else(overflow)?;
-        let mut payload = backing;
-        let mut key_bytes = 0usize;
-        for path in listing.files.iter().chain(overlays.iter()) {
-            let path_bytes = path.as_os_str().len();
-            let copies = path_bytes
+        let key_bound = |path: &Path| {
+            path.as_os_str()
+                .len()
                 .checked_mul(8)
-                .and_then(|n| n.checked_add(entry_bound.checked_mul(2)?))
                 .and_then(|n| n.checked_add(32))
-                .ok_or_else(overflow)?;
-            payload = payload.checked_add(copies).ok_or_else(overflow)?;
-            key_bytes = key_bytes
-                .checked_add(
-                    path_bytes
-                        .checked_mul(8)
-                        .and_then(|n| n.checked_add(32))
-                        .ok_or_else(overflow)?,
-                )
+                .ok_or_else(overflow)
+        };
+        let mut key_bytes = 0usize;
+        let mut largest_key = 0usize;
+        for path in listing.files.iter().chain(overlays.iter()) {
+            let bound = key_bound(path)?;
+            key_bytes = key_bytes.checked_add(bound).ok_or_else(overflow)?;
+            largest_key = largest_key.max(bound);
+        }
+        // The name test is one pass over the listing, one lossy name live at
+        // a time. Dedup, entry construction, copies and sorting only touch
+        // the candidates it keeps, so only they pay pairwise or payload terms.
+        let name_work = count
+            .checked_mul(names.len().checked_add(1).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        budget
+            .charge(name_work, key_bytes, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let mut candidates = 0usize;
+        let mut candidate_keys = 0usize;
+        for path in listing.files.iter().filter(|path| {
+            path.file_name().is_some_and(|name| {
+                names
+                    .iter()
+                    .any(|wanted| name.to_string_lossy().eq_ignore_ascii_case(wanted))
+            })
+        }) {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            candidates = candidates.checked_add(1).ok_or_else(overflow)?;
+            candidate_keys = candidate_keys
+                .checked_add(key_bound(path)?)
                 .ok_or_else(overflow)?;
         }
+        for path in overlays.iter() {
+            candidates = candidates.checked_add(1).ok_or_else(overflow)?;
+            candidate_keys = candidate_keys
+                .checked_add(key_bound(path)?)
+                .ok_or_else(overflow)?;
+        }
+        let copies = entry_bound
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(candidates))
+            .and_then(|n| n.checked_add(candidate_keys))
+            .ok_or_else(overflow)?;
+        let backing = candidates
+            .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
+            .ok_or_else(overflow)?;
+        let payload = backing.checked_add(copies).ok_or_else(overflow)?;
         // Comparisons, lossy name and sorting keys have a separate temporary
         // construction owner; they never travel with the returned path Vec.
-        let work = count
+        let work = candidates
             .checked_mul(
-                count
+                candidates
                     .checked_add(self.context.explicit_unit_entries().len())
-                    .and_then(|n| n.checked_add(names.len()))
                     .and_then(|n| n.checked_add(2))
                     .ok_or_else(overflow)?,
             )
+            .and_then(|n| n.checked_add(name_work))
+            .ok_or_else(overflow)?;
+        let byte_work = candidate_keys
+            .checked_mul(candidates.max(1))
+            .and_then(|n| n.checked_add(key_bytes))
             .ok_or_else(overflow)?;
         let _sorting = budget
             .admit_owned(
                 work,
-                key_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
-                key_bytes.checked_add(backing).ok_or_else(overflow)?,
+                byte_work,
+                candidate_keys
+                    .checked_add(largest_key)
+                    .and_then(|n| n.checked_add(backing))
+                    .ok_or_else(overflow)?,
                 || (),
             )
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
@@ -5218,7 +5258,7 @@ impl<S: SourceStore> UnitResolver<S> {
             payload,
             crate::compile_time::resolver_error,
             || {
-                let mut paths: Vec<(PathBuf, ProjectPathEntry)> = Vec::with_capacity(count);
+                let mut paths: Vec<(PathBuf, ProjectPathEntry)> = Vec::with_capacity(candidates);
                 for path in &listing.files {
                     if cancel.is_cancelled() {
                         return Err(ResolverError::Cancelled);
@@ -6819,16 +6859,25 @@ impl<S: SourceStore> UnitResolver<S> {
             sort_bytes = sort_bytes
                 .checked_add(index_bytes.checked_mul(2).ok_or_else(overflow)?)
                 .ok_or_else(overflow)?;
-            let work = count
-                .checked_mul(count.checked_add(1).ok_or_else(overflow)?)
+            // One pass over the listing; dedup and sorting only touch the
+            // entries whose name matches, so only they pay the pairwise term.
+            let (matching, matching_bytes, largest_key) =
+                case_match_sizing(&listing, wanted, &mut budget, cancel)?;
+            let work = matching
+                .checked_mul(matching.checked_add(1).ok_or_else(overflow)?)
+                .and_then(|n| n.checked_add(count))
+                .ok_or_else(overflow)?;
+            let byte_work = matching_bytes
+                .checked_mul(matching.max(1))
+                .and_then(|n| n.checked_add(sort_bytes))
+                .ok_or_else(overflow)?;
+            // One lossy name is live at a time; only matches keep sort keys.
+            let scratch = matching_bytes
+                .checked_add(largest_key)
+                .and_then(|n| n.checked_add(index_bytes.checked_mul(2)?))
                 .ok_or_else(overflow)?;
             let _sorting = budget
-                .admit_owned(
-                    work,
-                    sort_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
-                    sort_bytes,
-                    || (),
-                )
+                .admit_owned(work, byte_work, scratch, || ())
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
             let candidate_at = |index: usize| {
                 if index < listing.files.len() {
@@ -9262,6 +9311,50 @@ fn case_sort_sizing(
             .ok_or_else(overflow)?;
     }
     Ok(bytes)
+}
+
+/// Counts the listing entries whose name matches `wanted` case-insensitively
+/// and their sort-key bytes, after charging the comparison pass. Also returns
+/// the largest single sort-key bound of the listing.
+fn case_match_sizing(
+    listing: &DirectoryListing,
+    wanted: &std::ffi::OsStr,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<(usize, usize, usize), ResolverError> {
+    let overflow = || ResolverError::InvalidRequest("case match sizing overflow".into());
+    let count = listing
+        .files
+        .len()
+        .checked_add(listing.directories.len())
+        .ok_or_else(overflow)?;
+    budget
+        .charge(count, 0, 0)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    let wanted = wanted.to_string_lossy();
+    let mut matching = 0usize;
+    let mut bytes = 0usize;
+    let mut largest = 0usize;
+    for candidate in listing.files.iter().chain(listing.directories.iter()) {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let bound = candidate
+            .as_os_str()
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(32))
+            .ok_or_else(overflow)?;
+        largest = largest.max(bound);
+        if candidate
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&wanted))
+        {
+            matching += 1;
+            bytes = bytes.checked_add(bound).ok_or_else(overflow)?;
+        }
+    }
+    Ok((matching, bytes, largest))
 }
 
 fn case_result_payload_size(
@@ -17041,9 +17134,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(missing.is_empty());
-            assert!(
-                missing.capacity() >= listing.files.len(),
-                "empty result still owns allocated receiving capacity until drop"
+            assert_eq!(
+                missing.capacity(),
+                0,
+                "receiving capacity is sized by name-matching candidates, not the listing"
             );
             drop(missing);
             assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);

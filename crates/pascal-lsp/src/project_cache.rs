@@ -4704,7 +4704,6 @@ thread_local! {
 
 /// What names the documents of an index: a document, or a project.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 pub(crate) enum IndexAnchor {
     Document(Url),
     Project(PathBuf),
@@ -4712,7 +4711,6 @@ pub(crate) enum IndexAnchor {
 
 /// The documents one context indexes, and what they were computed from.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 pub(crate) struct IndexMembership {
     pub(crate) paths: Vec<PathBuf>,
     /// The catalogues the paths came from, with the generation each had.
@@ -4724,7 +4722,6 @@ pub(crate) struct IndexMembership {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 pub(crate) enum PublishOutcome {
     Indexed,
     NotAMember,
@@ -4732,7 +4729,6 @@ pub(crate) enum PublishOutcome {
     Memory,
 }
 
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 struct StoredIndex {
     index: ContextIndex,
     membership: IndexMembership,
@@ -4751,7 +4747,6 @@ impl StoredIndex {
     }
 }
 
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 struct IndexStore {
     contexts: HashMap<ContextKey, StoredIndex>,
     clock: u64,
@@ -4839,7 +4834,6 @@ fn membership_bytes(paths: &[PathBuf]) -> usize {
 
 /// The workspace index store (l4d-33): one `ContextIndex` per context, at
 /// most `MAX_INDEXED_CONTEXTS`, charged to a quarter of `maxCacheBytes`.
-#[allow(dead_code)] // read by the workspace index tasks of l4d-33
 impl ProjectCache {
     /// A panic under the index lock can leave a charge unreleased; poison
     /// is cleared, not recovered from.

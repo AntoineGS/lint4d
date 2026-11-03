@@ -5,6 +5,7 @@
 //! sequence of rows a process reused, coalesced and rate-limited.
 
 use super::Store;
+use super::budget::refuse_at_wal_threshold;
 use super::health::Access;
 use super::namespaces::{LIVE, Scope, ensure_live, epoch};
 use super::outcome::Bypass;
@@ -197,7 +198,9 @@ impl Store {
     /// Renew this store's lease if a renewal interval has passed since the
     /// last one; otherwise a no-op that touches nothing (not even the
     /// scope check). Writes renew inside their own transaction, so callers
-    /// without writes of their own (maintenance) call this.
+    /// without writes of their own (maintenance) call this. Allowed at the
+    /// WAL threshold: refusing renewals during a stall would expire every
+    /// live lease.
     pub fn renew_lease(&self) -> Result<(), Bypass> {
         self.guarded(Access::Maintenance, || {
             let now = self.clock.unix_seconds();
@@ -220,7 +223,8 @@ impl Store {
     }
 
     /// Delete at most `max_rows` rows of expired leases (holds first, then
-    /// lease rows left without holds), whatever their scope.
+    /// lease rows left without holds), whatever their scope. Allowed at the
+    /// WAL threshold: it only deletes rows.
     pub fn expire_leases(&self, max_rows: usize) -> Result<usize, Bypass> {
         self.guarded(Access::Maintenance, || {
             let fail = |error: rusqlite::Error| classify(&error);
@@ -253,7 +257,13 @@ impl Store {
 
     /// Hold a sealed snapshot for this lease so maintenance keeps it. `false`
     /// when it is no longer sealed; at most `MAX_LEASE_HOLDS` sealed
-    /// snapshots per lease (builds' own holds do not count).
+    /// snapshots per lease (builds' own holds do not count). At the WAL
+    /// threshold it writes nothing (`WalPressure`).
+    ///
+    /// A hold lasts while the lease is live: to keep its holds a process
+    /// must renew at least every `LEASE_EXPIRY - LEASE_RENEWAL`, through an
+    /// admitted write, a [`crate::Maintenance::step`] (a skipped step still
+    /// renews) or [`Store::renew_lease`].
     pub fn hold_snapshot(&self, header: &SnapshotHeader) -> Result<bool, Bypass> {
         self.guarded(Access::Maintenance, || {
             if header.scope != self.scope {
@@ -263,6 +273,7 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            refuse_at_wal_threshold(self, &transaction)?;
             ensure_row(
                 &transaction,
                 self.scope,
@@ -329,7 +340,8 @@ impl Store {
         })
     }
 
-    /// Release this lease's hold on `id`; `false` if it held none.
+    /// Release this lease's hold on `id`; `false` if it held none. Allowed
+    /// at the WAL threshold: it only deletes a row.
     pub fn release_snapshot(&self, id: SnapshotId) -> Result<bool, Bypass> {
         self.guarded(Access::Maintenance, || {
             let fail = |error: rusqlite::Error| classify(&error);
@@ -387,7 +399,8 @@ impl Store {
     /// Bump the sequence of every pending hinted row in one transaction;
     /// rows retired or deleted meanwhile are skipped. Returns the rows
     /// changed, or 0 when the last flush is less than `LEASE_RENEWAL` old.
-    /// On a bypass the taken hints are dropped.
+    /// On a bypass the taken hints are dropped. At the WAL threshold it
+    /// writes nothing (`WalPressure`).
     pub fn flush_hints(&self) -> Result<usize, Bypass> {
         self.guarded(Access::Maintenance, || {
             let now = self.clock.unix_seconds();
@@ -413,6 +426,7 @@ impl Store {
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            refuse_at_wal_threshold(self, &transaction)?;
             let sequence = next_publication_seq(&transaction)?;
             let mut changed = 0;
             for hint in &taken {

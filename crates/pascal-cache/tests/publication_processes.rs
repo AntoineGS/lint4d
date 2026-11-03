@@ -14,8 +14,8 @@ use common::records::{
 };
 use pascal_cache::{
     Bypass, DATABASE_FILE, Digest, EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite,
-    FaultPoint, LEASE_EXPIRY, Lookup, Maintenance, MaintenanceLimits, Observation, RetireStep,
-    SnapshotHeader, StepBudget, Store, evidence_id,
+    FaultPoint, LEASE_EXPIRY, LEASE_RENEWAL, Lookup, Maintenance, MaintenanceLimits, Observation,
+    RetireStep, SnapshotHeader, StepBudget, Store, evidence_id,
 };
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -137,8 +137,10 @@ fn publisher_child_entry() {
         },
         "maintain" => {
             if variant == "expire" {
-                // Every other process's lease looks expired from here.
-                store.advance_clock_for_test(LEASE_EXPIRY);
+                // Every other process's lease is strictly past its expiry
+                // from here: with `age_past_grace` the clock moves
+                // LEASE_EXPIRY plus three renewal intervals.
+                store.advance_clock_for_test(LEASE_EXPIRY + LEASE_RENEWAL);
             }
             age_past_grace(&store);
             let mut maintenance = Maintenance::new(MaintenanceLimits {

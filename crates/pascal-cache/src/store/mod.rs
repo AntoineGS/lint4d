@@ -76,7 +76,8 @@ pub use budget::{
 };
 pub use container::{APPLICATION_ID, CONTAINER_VERSION};
 pub use gc::{MaintenanceLimits, MaintenanceLimitsError, RetireStep};
-pub use health::{Access, MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
+use health::Access;
+pub use health::{MAX_HEALTH_BACKOFF, MIN_HEALTH_BACKOFF, Unhealthy};
 pub use leases::{
     Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,
 };
@@ -155,6 +156,7 @@ impl Store {
                 deadline,
             )?;
             namespaces::ensure_live(&transaction, scope)?;
+            // Not refused at the WAL threshold: a renewal keeps the lease live.
             leases::renew(&transaction, scope, &lease, clock.unix_seconds())?;
             transaction
                 .commit()
@@ -251,6 +253,8 @@ impl Store {
     /// one transaction (spec §11.2). Every handle of the old scope, this one
     /// included, is `Fenced` from its next transaction; reopen to use the new
     /// epoch. The old rows are deleted in batches by [`Self::reclaim`].
+    /// Allowed at the WAL threshold: it is the administrator's escape hatch
+    /// (see [`crate::admin::reset`]).
     pub fn reset_namespace(&self) -> Result<(), Bypass> {
         self.guarded(Access::Maintenance, || {
             let fail = |error: rusqlite::Error| sqlite::classify(&error);

@@ -33,6 +33,10 @@ impl Default for StorePolicy {
 impl StorePolicy {
     /// Whether the policy keeps room for maintenance.
     pub fn check(&self) -> Result<(), PolicyError> {
+        let limit = i64::MAX as u64;
+        if self.max_disk_bytes > limit || self.wal_threshold_bytes > limit {
+            return Err(PolicyError::ValueTooLarge);
+        }
         if self.wal_threshold_bytes < MIN_WAL_THRESHOLD_BYTES {
             return Err(PolicyError::WalThresholdTooSmall);
         }
@@ -58,6 +62,8 @@ pub struct PolicyState {
 pub enum PolicyError {
     WalThresholdTooSmall,
     NoMaintenanceHeadroom,
+    /// A value is above `i64::MAX`, more than the store can record.
+    ValueTooLarge,
     /// Another administrator changed the policy first.
     RevisionChanged {
         current: u64,
@@ -223,6 +229,20 @@ fn filesystem_free_bytes(_directory: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// Refuse a write at the WAL threshold (spec D13): only a checkpoint makes
+/// room. Called inside the write's IMMEDIATE transaction, after the scope
+/// check.
+pub(crate) fn refuse_at_wal_threshold(
+    store: &Store,
+    transaction: &Connection,
+) -> Result<(), Bypass> {
+    let policy = read_policy(transaction)?.policy;
+    if pressure_of(policy, &read_usage(store, transaction)?) == Pressure::WalPressure {
+        return Err(Bypass::WalPressure);
+    }
+    Ok(())
+}
+
 pub(crate) fn read_usage(store: &Store, connection: &Connection) -> Result<Usage, Bypass> {
     #[allow(unused_mut)]
     let mut usage = read_usage_at(&store.location, connection)?;
@@ -303,7 +323,8 @@ impl Store {
         })
     }
 
-    /// Replace the policy if it is still at `expected_revision`.
+    /// Replace the policy if it is still at `expected_revision`. Allowed at
+    /// the WAL threshold: it is how an operator raises the threshold.
     pub fn set_policy(
         &self,
         expected_revision: u64,
@@ -326,8 +347,7 @@ impl Store {
         let mut writer = self.pool.acquire(Role::Writer, deadline).map_err(store)?;
         let transaction =
             begin_within(&mut writer, TransactionBehavior::Immediate, deadline).map_err(store)?;
-        let to_i64 =
-            |value: u64| i64::try_from(value).map_err(|_| PolicyError::Store(Bypass::Corrupt));
+        let to_i64 = |value: u64| i64::try_from(value).map_err(|_| PolicyError::ValueTooLarge);
         let changed = transaction
             .execute(
                 "UPDATE store_state SET max_disk_bytes = ?1, wal_threshold_bytes = ?2, \

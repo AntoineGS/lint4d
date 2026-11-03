@@ -7,7 +7,7 @@
 //! snapshot is current or verified.
 
 use super::Store;
-use super::budget::WriteEstimate;
+use super::budget::{WriteEstimate, refuse_at_wal_threshold};
 use super::health::Access;
 use super::keys::{admit_manifest, check_manifest_size, put_manifest};
 use super::limits::{
@@ -644,7 +644,8 @@ impl Store {
     }
 
     /// The builder retires its own unsealed build (token-checked). `false`
-    /// if the build was not building under this token any more.
+    /// if the build was not building under this token any more. At the WAL
+    /// threshold it writes nothing (`WalPressure`).
     pub fn retire_build(&self, builder: &SnapshotBuilder) -> Result<bool, Bypass> {
         self.guarded(Access::Maintenance, || {
             if builder.scope != self.scope {
@@ -655,7 +656,8 @@ impl Store {
     }
 
     /// Maintenance retires a building or sealed snapshot (no token). Read
-    /// eligibility ends at once; rows are deleted later (`l4d-zf1b.10`).
+    /// eligibility ends at once; rows are deleted later (`l4d-zf1b.10`). At
+    /// the WAL threshold it writes nothing (`WalPressure`).
     pub fn retire_snapshot(&self, id: SnapshotId) -> Result<bool, Bypass> {
         self.guarded(Access::Maintenance, || self.retire_where(id, None))
     }
@@ -667,6 +669,7 @@ impl Store {
         let mut writer = self.writer()?;
         let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
         ensure_live(&transaction, self.scope)?;
+        refuse_at_wal_threshold(self, &transaction)?;
         let changed = match token {
             Some(token) => transaction.execute(
                 "UPDATE snapshots SET state = ?4 WHERE namespace_id = ?1 AND reset_epoch = ?2 \
@@ -711,13 +714,15 @@ impl Store {
 
     /// Maintenance retires a member record (no token): no build can add it
     /// and no seal of a build listing it succeeds. `l4d-zf1b.10` calls this
-    /// only for records no live snapshot or build lists (Decision 11).
+    /// only for records no live snapshot or build lists (Decision 11). At
+    /// the WAL threshold it writes nothing (`WalPressure`).
     pub fn retire_member_record(&self, id: Digest) -> Result<bool, Bypass> {
         self.guarded(Access::Maintenance, || {
             let fail = |error: rusqlite::Error| classify(&error);
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
             ensure_live(&transaction, self.scope)?;
+            refuse_at_wal_threshold(self, &transaction)?;
             let changed = transaction
                 .execute(
                     "UPDATE member_records SET lifecycle = ?5 WHERE namespace_id = ?1 \

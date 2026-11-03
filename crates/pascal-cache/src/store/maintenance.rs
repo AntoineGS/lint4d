@@ -134,6 +134,11 @@ impl Maintenance {
     /// without waiting and skips the step when another holder has it. At
     /// the WAL threshold only a checkpoint runs. A bypass leaves the phase
     /// where it was, so the next step resumes there.
+    ///
+    /// Below the WAL threshold every step renews this store's lease when
+    /// due, a skipped one too. A process must renew at least every
+    /// `LEASE_EXPIRY - LEASE_RENEWAL`, through a step, an admitted write or
+    /// [`Store::renew_lease`], to keep its lease and its snapshot holds.
     pub fn step(
         &mut self,
         store: &Store,

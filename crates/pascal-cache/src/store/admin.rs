@@ -211,7 +211,9 @@ fn count(connection: &Connection, sql: &str, parameter: i64) -> Result<u64, Bypa
 /// Run the maintenance cycle on the store in `directory` until it completes
 /// or `budget.time` is spent; `None` for an absent store. Each step may
 /// change `budget.rows` rows; the report sums them. A step another
-/// maintainer's lock skips, or one stopped by WAL pressure, ends the call.
+/// maintainer's lock skips, one stopped by WAL pressure, or one that
+/// changed no row and stayed in its phase (a zero row budget, say) ends
+/// the call.
 pub fn prune(
     directory: &Path,
     namespace: &Namespace,
@@ -229,6 +231,7 @@ pub fn prune(
     let mut total = 0;
     loop {
         let remaining = budget.time.saturating_sub(started.elapsed());
+        let phase = maintenance.phase();
         let mut report = maintenance.step(
             &store,
             StepBudget {
@@ -237,9 +240,11 @@ pub fn prune(
             },
             &cancel,
         )?;
+        let stalled = report.rows == 0 && maintenance.phase() == phase;
         total += report.rows;
         report.rows = total;
-        if report.cycle_complete
+        if stalled
+            || report.cycle_complete
             || report.skipped
             || report.cancelled
             || started.elapsed() >= budget.time

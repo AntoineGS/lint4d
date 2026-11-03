@@ -133,6 +133,24 @@ fn the_policy_is_read_from_the_store_and_changed_against_its_revision() {
 }
 
 #[test]
+fn a_policy_value_sqlite_cannot_store_is_a_policy_error() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let huge = StorePolicy {
+        max_disk_bytes: i64::MAX as u64 + 1,
+        wal_threshold_bytes: 8 * MIB,
+    };
+    assert_eq!(huge.check(), Err(PolicyError::ValueTooLarge));
+    assert_eq!(store.set_policy(0, huge), Err(PolicyError::ValueTooLarge));
+    let at_limit = StorePolicy {
+        max_disk_bytes: i64::MAX as u64,
+        ..huge
+    };
+    assert_eq!(at_limit.check(), Ok(()));
+    assert_eq!(store.policy().unwrap().revision, 0);
+}
+
+#[test]
 fn a_policy_change_applies_to_the_next_write() {
     let root = private_tempdir();
     let writer = open(root.path());
@@ -1133,6 +1151,60 @@ fn a_held_reader_keeps_the_checkpoint_partial_and_writes_stop_at_the_threshold()
 }
 
 #[test]
+fn the_public_maintenance_writes_write_nothing_at_the_wal_threshold() {
+    let root = private_tempdir();
+    let store = open(root.path());
+    let ids = records(&store, "M", 2);
+    let held = sealed(&store, &ids);
+    let unheld = sealed(&store, &ids);
+    assert_eq!(store.hold_snapshot(&held), Ok(true));
+    let builder = store.begin_snapshot(&context()).unwrap();
+    let evidence = binding_evidence(&store, "shapes", "/w/Shapes.pas");
+    store.hint_used(Hint::Evidence(evidence));
+    store
+        .set_policy(
+            0,
+            StorePolicy {
+                max_disk_bytes: 64 * MIB,
+                wal_threshold_bytes: 8 * MIB,
+            },
+        )
+        .unwrap();
+    publish_bulk(&store, "unit Bulk;", 9, 1_000_000).unwrap();
+    assert_eq!(store.pressure(), Ok(Pressure::WalPressure));
+    let wal = file_len(root.path(), "-wal");
+    let state = || {
+        (
+            count(root.path(), "SELECT count(*) FROM lease_holds"),
+            count(
+                root.path(),
+                "SELECT count(*) FROM snapshots WHERE state = 2",
+            ),
+            count(
+                root.path(),
+                "SELECT count(*) FROM member_records WHERE lifecycle = 1",
+            ),
+            count(
+                root.path(),
+                "SELECT max(publication_seq) FROM evidence_sets",
+            ),
+        )
+    };
+    let before = state();
+    assert_eq!(store.hold_snapshot(&unheld), Err(Bypass::WalPressure));
+    assert_eq!(store.flush_hints(), Err(Bypass::WalPressure));
+    assert_eq!(store.retire_build(&builder), Err(Bypass::WalPressure));
+    assert_eq!(store.retire_snapshot(unheld.id()), Err(Bypass::WalPressure));
+    assert_eq!(store.retire_member_record(ids[0]), Err(Bypass::WalPressure));
+    assert_eq!(file_len(root.path(), "-wal"), wal, "nothing was written");
+    assert_eq!(state(), before);
+    // Exempt: a release only shrinks state, a renewal keeps the lease alive.
+    assert_eq!(store.release_snapshot(held.id()), Ok(true));
+    store.advance_clock_for_test(LEASE_RENEWAL);
+    assert_eq!(store.renew_lease(), Ok(()));
+}
+
+#[test]
 fn incremental_vacuum_returns_free_pages_in_bounded_batches() {
     let root = private_tempdir();
     let store = open(root.path());
@@ -1585,6 +1657,25 @@ fn status_of_an_absent_store_creates_nothing() {
         Ok(false)
     );
     assert!(!directory.exists());
+}
+
+#[test]
+fn prune_returns_after_a_step_that_makes_no_progress() {
+    let root = private_tempdir();
+    drop(open(root.path()));
+    let budget = StepBudget {
+        time: std::time::Duration::from_secs(30),
+        rows: 0,
+    };
+    let started = std::time::Instant::now();
+    let report = admin::prune(root.path(), &namespace(), StoreLimits::default(), budget)
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "prune spun until its time budget: {report:?}"
+    );
+    assert_eq!((report.rows, report.cycle_complete), (0, false));
 }
 
 #[test]

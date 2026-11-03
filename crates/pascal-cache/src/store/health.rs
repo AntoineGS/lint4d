@@ -45,7 +45,7 @@ impl Unhealthy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
+pub(crate) enum Access {
     Read,
     Write,
     Maintenance,

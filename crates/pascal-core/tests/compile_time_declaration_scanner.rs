@@ -300,3 +300,84 @@ fn background_task_with_locals_in_a_class_method() {
     assert!(analysis.reasons.is_empty(), "{:?}", analysis.reasons);
     assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
 }
+
+/// Composite types among an anonymous method's locals end with their own
+/// `end`, which must not close the method's opaque scope.
+#[test]
+fn anonymous_method_local_record_type_keeps_the_method_scope() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Go(procedure type C = record A: Integer; end; \
+             begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end); \
+         end;",
+    );
+}
+
+#[test]
+fn anonymous_method_local_record_variable_keeps_the_method_scope() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Go(procedure var C: record A: Integer; end; \
+             begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end); \
+         end;",
+    );
+}
+
+#[test]
+fn anonymous_method_local_variant_record_keeps_the_method_scope() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Go(procedure type C = packed record case Tag: Integer of \
+               0: (A: Integer); 1: (B: Byte; D: record E: Byte; end); end; \
+             begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end); \
+         end;",
+    );
+}
+
+#[test]
+fn anonymous_method_local_classes_keep_the_method_scope() {
+    assert_scope_local(
+        "procedure Run; begin \
+           Go(procedure type \
+               EFail = class(Exception); \
+               TMeta = class of TObject; \
+               IFoo = interface; \
+               C = class(TObject) \
+                 type TInner = class X: Integer; end; \
+                 class function Make: C; \
+                 F: procedure of object; \
+               end; \
+               IFoo = interface procedure P; end; \
+             begin {$IF C = 1}{$DEFINE INSIDE}{$ENDIF} end); \
+         end;",
+    );
+}
+
+#[test]
+fn anonymous_method_local_record_does_not_prove_absence() {
+    let source = "unit T; interface implementation procedure Run; begin \
+        Go(procedure type LocalRec = record A: Integer; end; \
+          begin {$IF Declared(LocalRec)}{$ELSE}{$DEFINE ABSENT}{$ENDIF} end); \
+        end; end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE ABSENT"), Truth::Unknown);
+}
+
+#[test]
+fn anonymous_methods_in_initialization_and_finalization() {
+    let source = "unit T; interface const C = 1; implementation \
+        initialization TTask.Run(procedure begin Work; end); \
+        {$IF C = 1}{$DEFINE INIT}{$ENDIF} \
+        finalization TThread.Queue(nil, procedure begin Done; end); \
+        {$IF Declared(C)}{$DEFINE FINAL}{$ENDIF} \
+        end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE INIT"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE FINAL"), Truth::True);
+}

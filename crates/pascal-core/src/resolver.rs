@@ -2260,17 +2260,19 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn compile_time_credit(&mut self, source: &LoadedSource) -> &mut SourceCredit {
-        let revisions = self
-            .compile_time_credits
-            .entry(source.id.clone())
-            .or_default();
-        let index = match revisions
-            .iter()
-            .position(|(revision, _)| *revision == source.revision)
-        {
+        self.compile_time_credit_of(&source.id, &source.revision)
+    }
+
+    fn compile_time_credit_of(
+        &mut self,
+        source: &SourceId,
+        revision: &SourceRevision,
+    ) -> &mut SourceCredit {
+        let revisions = self.compile_time_credits.entry(source.clone()).or_default();
+        let index = match revisions.iter().position(|(r, _)| r == revision) {
             Some(index) => index,
             None => {
-                revisions.push((source.revision.clone(), SourceCredit::default()));
+                revisions.push((revision.clone(), SourceCredit::default()));
                 revisions.len() - 1
             }
         };
@@ -2279,19 +2281,28 @@ impl<S: SourceStore> UnitResolver<S> {
 
     /// Offset of `source` already credited to the request.
     fn compile_time_credit_floor(&self, source: &LoadedSource) -> usize {
+        self.compile_time_credit_floor_of(&source.id, &source.revision)
+    }
+
+    fn compile_time_credit_floor_of(&self, source: &SourceId, revision: &SourceRevision) -> usize {
         self.compile_time_credits
-            .get(&source.id)
-            .and_then(|revisions| {
-                revisions
-                    .iter()
-                    .find(|(revision, _)| *revision == source.revision)
-            })
+            .get(source)
+            .and_then(|revisions| revisions.iter().find(|(r, _)| r == revision))
             .map_or(0, |(_, credit)| credit.scanned)
     }
 
     /// A scanner read `source` to offset `end`: credit the request the
     /// per-byte grant of the bytes beyond its furthest credited offset.
     fn credit_compile_time_scan(&mut self, source: &LoadedSource, end: usize) {
+        self.credit_compile_time_scan_of(&source.id, &source.revision, end);
+    }
+
+    fn credit_compile_time_scan_of(
+        &mut self,
+        source: &SourceId,
+        revision: &SourceRevision,
+        end: usize,
+    ) {
         let (work, bytes) = (
             self.limits.compile_time_work_per_source_byte,
             self.limits.compile_time_byte_work_per_source_byte,
@@ -2299,7 +2310,7 @@ impl<S: SourceStore> UnitResolver<S> {
         if work == 0 && bytes == 0 {
             return;
         }
-        let credit = self.compile_time_credit(source);
+        let credit = self.compile_time_credit_of(source, revision);
         let new = end.saturating_sub(credit.scanned);
         credit.scanned = credit.scanned.max(end);
         self.compile_time_work_allowance = self
@@ -8369,6 +8380,12 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     }
     fn shared_provider_graphs(&self) -> Option<Arc<dyn crate::compile_time::SharedProviderGraphs>> {
         self.shared_provider_graphs.clone()
+    }
+    fn reused_credit_floor(&mut self, source: &SourceId, revision: &SourceRevision) -> usize {
+        self.compile_time_credit_floor_of(source, revision)
+    }
+    fn note_reused_scan(&mut self, source: &SourceId, revision: &SourceRevision, end: usize) {
+        self.credit_compile_time_scan_of(source, revision, end);
     }
     fn include_capability(
         &mut self,

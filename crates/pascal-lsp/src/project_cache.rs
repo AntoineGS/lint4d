@@ -2645,6 +2645,7 @@ mod cache_tests {
             observations: Default::default(),
             warnings: Default::default(),
             dependencies: Default::default(),
+            scanned: Default::default(),
             retained_bytes: bytes,
         })
     }

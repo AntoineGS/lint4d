@@ -648,46 +648,48 @@ impl pascal_core::compile_time::SharedProviderGraphs for KeepAll {
     }
 }
 
-/// l4d-4nbs D29: a request that reuses a provider interface another request
-/// compiled scans none of its bytes, so it is granted nothing for them: its
-/// allowance is what the root alone earns, and it spends less than the
-/// compiling request.
+/// l4d-4nbs D29: a reused provider interface counts as scanned for the
+/// request's per-byte credit, so budget accounting is unchanged by reuse: a
+/// reusing request is funded as the compiling one was, a session that reuses
+/// within one request is credited nothing again, and reuse spends less.
 #[test]
-fn a_reused_provider_interface_grants_nothing() {
+fn a_reused_provider_interface_is_credited_as_scanned_once() {
     let padding = "{".to_string() + &"x".repeat(200_000) + "}";
     let provider = format!("unit A; interface {padding} type TA = Int64; implementation end.");
     let root =
         "unit T; interface uses A; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.";
     let store = std::sync::Arc::new(KeepAll::default());
     let (dir, path, _) = resolver_with(root, &[("A.pas", &provider)]);
-    let request = |store: Option<&std::sync::Arc<KeepAll>>| {
+    let mut source = support::loaded("T.pas", root);
+    source.path = path.clone();
+    let request = |store: Option<&std::sync::Arc<KeepAll>>, sessions: usize| {
         let resolver = resolver_in(dir.path(), &path, 64 * 1024 * 1024);
         let mut resolver = match store {
             Some(store) => resolver.with_shared_provider_graphs(store.clone()),
             None => resolver,
         };
-        let mut source = support::loaded("T.pas", root);
-        source.path = path.clone();
-        let analysis = resolver
-            .analyze_compile_time(&source, &NoCancellation)
-            .unwrap();
-        assert!(analysis.root.complete, "{:?}", analysis.reasons);
-        (
-            resolver.compile_time_work_allowance(),
-            resolver.compile_time_usage(),
-        )
+        let mut allowances = vec![];
+        for _ in 0..sessions {
+            let analysis = resolver
+                .analyze_compile_time(&source, &NoCancellation)
+                .unwrap();
+            assert!(analysis.root.complete, "{:?}", analysis.reasons);
+            allowances.push(resolver.compile_time_byte_work_allowance());
+        }
+        (allowances, resolver.compile_time_usage())
     };
-    let (alone, _) = request(None);
-    let (compiling, first) = request(Some(&store));
-    let (reusing, second) = request(Some(&store));
+    let (alone, _) = request(None, 1);
+    let (compiling, first) = request(Some(&store), 1);
+    let (reusing, second) = request(Some(&store), 2);
     assert_eq!(compiling, alone, "sharing changes nothing for the compiler");
-    assert!(
-        reusing + 200_000 <= compiling,
-        "reuse granted the provider's bytes: {reusing} vs {compiling}"
+    assert_eq!(
+        reusing[0], compiling[0],
+        "reuse is credited as the scan was"
     );
-    assert!(second.work < first.work, "{first:?} then {second:?}");
+    assert_eq!(reusing[1], reusing[0], "and only once per request");
+    assert!(second.work < 2 * first.work, "{first:?} then {second:?}");
     assert!(
-        second.byte_work < first.byte_work,
+        second.byte_work < 2 * first.byte_work,
         "{first:?} then {second:?}"
     );
 }

@@ -69,6 +69,14 @@ impl ProviderDependency {
     }
 }
 
+/// How far a provider compilation scanned one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedExtent {
+    pub source: crate::SourceId,
+    pub revision: crate::SourceRevision,
+    pub end: usize,
+}
+
 /// A provider interface compiled by one session, with the observations and
 /// warnings its compilation recorded (including those of the providers it
 /// compiled), so a session that reuses it reports the same dependencies.
@@ -82,6 +90,9 @@ pub struct SharedProviderGraph {
     /// Every provider source the graph was compiled from, nested ones
     /// included: a store must validate them before reuse.
     pub dependencies: Arc<Vec<ProviderDependency>>,
+    /// How far its compilation scanned each source, includes included: a
+    /// reuse is credited as that scan was.
+    pub scanned: Arc<Vec<ScannedExtent>>,
     /// Bytes the graph retains, for the store's accounting.
     pub retained_bytes: usize,
 }
@@ -309,13 +320,32 @@ pub trait CompileTimeResolver {
     /// The session's scanner has read `source` up to offset `end`. A request
     /// credits each distinct source's bytes once, up to the furthest offset.
     fn note_scanned(&mut self, _source: &LoadedSource, _end: usize) {}
-    /// Whether raw UTF-8 validation of `source` is funded. A request funds
-    /// it once per distinct source; repeated validation is paid.
+    /// The offset of a source a reused provider interface scanned that the
+    /// request already credited (l4d-4nbs D29). The default credits nothing
+    /// request-wide, like `scan_credit_floor`.
+    fn reused_credit_floor(
+        &mut self,
+        _source: &crate::SourceId,
+        _revision: &crate::SourceRevision,
+    ) -> usize {
+        0
+    }
+    /// A reused provider interface had scanned `source` to `end`: the
+    /// request credits it as if the session had read it.
+    fn note_reused_scan(
+        &mut self,
+        _source: &crate::SourceId,
+        _revision: &crate::SourceRevision,
+        _end: usize,
+    ) {
+    }
     /// Compiled provider interfaces shared beyond this session (l4d-4nbs
     /// D29). The default shares nothing.
     fn shared_provider_graphs(&self) -> Option<Arc<dyn SharedProviderGraphs>> {
         None
     }
+    /// Whether raw UTF-8 validation of `source` is funded. A request funds
+    /// it once per distinct source; repeated validation is paid.
     fn fund_validation(&mut self, _source: &LoadedSource) -> bool {
         true
     }
@@ -611,6 +641,7 @@ struct SharedOrigin {
     key: ProviderGraphKey,
     observations: Arc<Vec<ResolutionObservation>>,
     warnings: Arc<Vec<String>>,
+    scanned: Arc<Vec<ScannedExtent>>,
 }
 
 /// An address in the caller's stack frame: the stack grows down on every
@@ -620,6 +651,27 @@ struct SharedOrigin {
 fn stack_position() -> usize {
     let marker = 0u8;
     std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// `base` with `more`, each source at its furthest extent.
+fn merged_extents(
+    base: &Arc<Vec<ScannedExtent>>,
+    more: Vec<ScannedExtent>,
+) -> Arc<Vec<ScannedExtent>> {
+    if more.is_empty() {
+        return base.clone();
+    }
+    let mut all = base.as_ref().clone();
+    for extent in more {
+        match all
+            .iter_mut()
+            .find(|e| e.source == extent.source && e.revision == extent.revision)
+        {
+            Some(existing) => existing.end = existing.end.max(extent.end),
+            None => all.push(extent),
+        }
+    }
+    Arc::new(all)
 }
 
 fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
@@ -879,6 +931,61 @@ impl ProviderSession {
             }
         };
         Ok(self.credits.value_mut()[index].value_mut())
+    }
+
+    /// How far the session has scanned each source, to compare after a
+    /// provider compilation.
+    fn scan_positions(&self) -> Vec<usize> {
+        self.credits.iter().map(|credit| credit.scanned).collect()
+    }
+
+    /// The sources scanned further than `before` says.
+    fn scanned_since(&self, before: &[usize]) -> Vec<ScannedExtent> {
+        self.credits
+            .iter()
+            .enumerate()
+            .filter(|(index, credit)| before.get(*index).is_none_or(|end| credit.scanned > *end))
+            .map(|(_, credit)| ScannedExtent {
+                source: credit.source.clone(),
+                revision: credit.revision.clone(),
+                end: credit.scanned,
+            })
+            .collect()
+    }
+
+    fn extent_floor(&self, extent: &ScannedExtent) -> usize {
+        self.credits
+            .iter()
+            .find(|credit| credit.source == extent.source && credit.revision == extent.revision)
+            .map_or(0, |credit| credit.scanned)
+    }
+
+    /// A reused interface had scanned `extent`: the session credits it once.
+    fn note_extent(
+        &mut self,
+        extent: &ScannedExtent,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if let Some(credit) = self
+            .credits
+            .value_mut()
+            .iter_mut()
+            .find(|credit| credit.source == extent.source && credit.revision == extent.revision)
+        {
+            let credit = credit.value_mut();
+            credit.scanned = credit.scanned.max(extent.end);
+            return Ok(());
+        }
+        let bytes = extent.source.as_str().len();
+        let credit = budget
+            .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
+                source: extent.source.clone(),
+                revision: extent.revision.clone(),
+                scanned: extent.end,
+                validated: false,
+            })
+            .map_err(|r| resolver_error(r, budget))?;
+        push_owner(&mut self.credits, credit, budget)
     }
 
     /// The session read `source` to `end`.
@@ -2431,6 +2538,10 @@ impl ProviderEngine<'_, '_> {
         }
         let observations_before = self.observations.len();
         let warnings_before = self.warnings.len();
+        self.budget
+            .charge(self.providers.credits.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let scan_before = self.providers.scan_positions();
         let occurrence = if let Some(key) = previous {
             key.occurrence
         } else {
@@ -2531,6 +2642,7 @@ impl ProviderEngine<'_, '_> {
                 key,
                 observations: Arc::new(self.observations[observations_before..].to_vec()),
                 warnings: Arc::new(self.warnings[warnings_before..].to_vec()),
+                scanned: Arc::new(self.providers.scanned_since(&scan_before)),
             })
         });
         if !analysis.facts().interface_complete {
@@ -2544,6 +2656,7 @@ impl ProviderEngine<'_, '_> {
                         observations: origin.observations.clone(),
                         warnings: origin.warnings.clone(),
                         dependencies: dependencies.clone(),
+                        scanned: origin.scanned.clone(),
                         retained_bytes: 0,
                     }),
                 );
@@ -2609,6 +2722,7 @@ impl ProviderEngine<'_, '_> {
                     observations: origin.observations.clone(),
                     warnings: origin.warnings.clone(),
                     dependencies: dependencies.clone(),
+                    scanned: origin.scanned.clone(),
                     retained_bytes: shared_retained_bytes(&graph, &origin.observations),
                 }),
             );
@@ -2624,6 +2738,31 @@ impl ProviderEngine<'_, '_> {
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
         Ok(Fact::Known(graph))
+    }
+
+    /// Credit the scans a reused interface's compilation made as if this
+    /// session had made them: the session's budget is granted the bytes
+    /// neither it nor the request has credited yet, so budget accounting is
+    /// what compiling would have given, once per distinct source (l4d-4nbs
+    /// D29).
+    fn credit_reused_scan(&mut self, scanned: &[ScannedExtent]) -> Result<(), ResolverError> {
+        self.budget
+            .charge(scanned.len(), 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let mut granted = 0usize;
+        for extent in scanned {
+            let floor = self.providers.extent_floor(extent).max(
+                self.resolver
+                    .reused_credit_floor(&extent.source, &extent.revision),
+            );
+            granted = granted.saturating_add(extent.end.saturating_sub(floor));
+            self.resolver
+                .note_reused_scan(&extent.source, &extent.revision, extent.end);
+            self.providers.note_extent(extent, self.budget)?;
+        }
+        self.budget
+            .charge_scanned(granted, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))
     }
 
     /// Record that the compilation in progress used `dependencies`.
@@ -2688,6 +2827,7 @@ impl ProviderEngine<'_, '_> {
             .map_err(|r| resolver_error(r, self.budget))?;
         move_report_vector(self.warnings, warnings, self.budget)?;
         self.note_dependencies(&hit.dependencies)?;
+        self.credit_reused_scan(&hit.scanned)?;
         let entry = self
             .budget
             .admit_owned(1, 0, 0, || ProviderGraph {
@@ -2698,6 +2838,7 @@ impl ProviderEngine<'_, '_> {
                     key: shared_key,
                     observations: hit.observations.clone(),
                     warnings: hit.warnings.clone(),
+                    scanned: hit.scanned.clone(),
                 })),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
@@ -2722,6 +2863,10 @@ impl ProviderEngine<'_, '_> {
         };
         let observations_before = self.observations.len();
         let warnings_before = self.warnings.len();
+        self.budget
+            .charge(self.providers.credits.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let scan_before = self.providers.scan_positions();
         self.providers.collecting.push(Vec::new());
         let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1);
         let added = Arc::new(self.providers.collecting.pop().unwrap_or_default());
@@ -2754,6 +2899,7 @@ impl ProviderEngine<'_, '_> {
                 &self.observations[observations_before..],
             ),
             warnings: extended(&origin.warnings, &self.warnings[warnings_before..]),
+            scanned: merged_extents(&origin.scanned, self.providers.scanned_since(&scan_before)),
         });
         let entry = self.providers.graphs.value_mut()[index].value_mut();
         entry.shared = Some(origin.clone());
@@ -2763,6 +2909,7 @@ impl ProviderEngine<'_, '_> {
             observations: origin.observations.clone(),
             warnings: origin.warnings.clone(),
             dependencies: entry.dependencies.clone(),
+            scanned: origin.scanned.clone(),
             retained_bytes: shared_retained_bytes(&prepared, &origin.observations),
         };
         store.put(origin.key.clone(), Arc::new(shared));

@@ -129,6 +129,8 @@ pub(crate) mod extract;
 mod facts;
 #[cfg(all(test, unix))]
 mod isolation;
+#[cfg(test)]
+mod navigation_walk_tests;
 mod persist;
 pub mod project_catalogue;
 pub mod projects;
@@ -403,6 +405,29 @@ const DEFAULT_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_FILE_BYTES_CEILING: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+/// Units whose imports a navigation request loads while a name binds
+/// nowhere. A negative definition over a large closure walked 256 units in
+/// three minutes.
+const MAX_NAVIGATION_WALK_WORK: usize = 128;
+/// Source bytes of dependencies a navigation walk indexes before it stops.
+const MAX_NAVIGATION_WALK_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NAVIGATION_WALK_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Loading the imports of a unit whose file name this is fails.
+    static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn navigation_walk_byte_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_NAVIGATION_WALK_BYTES.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_NAVIGATION_WALK_BYTES
+}
 const MAX_PENDING_FILE_RENAMES: usize = 64;
 const MAX_PENDING_FILE_RENAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
@@ -6959,6 +6984,12 @@ impl Workspace {
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
         let mut work = 0;
+        // Source bytes of the dependencies the walk indexed. The document's
+        // own imports are always loaded; the walk past them is bounded so a
+        // name that binds nowhere answers promptly.
+        let mut walked_bytes = 0usize;
+        let mut walk_exhausted = false;
+        let walk_byte_limit = navigation_walk_byte_limit();
         let resolver_session_cache = ResolverSessionCache::default();
 
         loop {
@@ -6968,33 +6999,56 @@ impl Workspace {
                 self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
-            if frontier.is_empty() || work >= MAX_DEPENDENCY_WORK {
+            if frontier.is_empty() || walk_exhausted {
                 break;
             }
 
             let mut next = Vec::new();
             for current in frontier.drain(..) {
                 check_workspace_cancel(cancel)?;
-                if !visited.insert(current.clone()) {
+                if visited.contains(&current) {
                     continue;
                 }
+                if work > 0 && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
+                {
+                    walk_exhausted = true;
+                    break;
+                }
+                visited.insert(current.clone());
                 work += 1;
-                let dependencies = self.load_imports_with_session_cache(
+                let dependencies = match self.load_imports_with_session_cache(
                     &current,
                     context_key,
                     pinned,
                     cancel,
                     &resolver_session_cache,
-                )?;
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(error)
+                        if error == CANCELLATION_MESSAGE
+                            || error == compile_time::HEADER_CHANGED =>
+                    {
+                        return Err(error);
+                    }
+                    // D16: a dependency that cannot be loaded only hides what
+                    // binds through it; navigation returns what still binds.
+                    Err(error) if &current != uri => {
+                        self.warn(format!(
+                            "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
+                        ));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 for dependency in dependencies {
                     check_workspace_cancel(cancel)?;
                     if initialized.insert(dependency.clone()) {
                         self.index.clear_import_bindings(&dependency);
+                        walked_bytes = walked_bytes.saturating_add(
+                            self.index.source_text(&dependency).map_or(0, str::len),
+                        );
                     }
                     next.push(dependency);
-                }
-                if work >= MAX_DEPENDENCY_WORK {
-                    break;
                 }
             }
             next.retain(|dependency| !visited.contains(dependency));
@@ -7003,9 +7057,9 @@ impl Workspace {
             frontier = next;
         }
 
-        if work >= MAX_DEPENDENCY_WORK {
+        if walk_exhausted {
             self.warn(format!(
-                "dependency work limit ({MAX_DEPENDENCY_WORK}) reached while resolving {uri}; result is incomplete"
+                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {walk_byte_limit} source bytes) reached while resolving {uri}; result is incomplete"
             ));
         }
 
@@ -7122,6 +7176,14 @@ impl Workspace {
         )>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
+        #[cfg(test)]
+        if TEST_FAIL_IMPORTS_OF.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("injected import failure for {uri}"));
+        }
         let imports = self.index.imports(uri);
         let effective_context_key = self
             .document_contexts

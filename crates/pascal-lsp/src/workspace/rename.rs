@@ -503,6 +503,10 @@ pub(crate) struct SnapshotSeed {
     pub(crate) record: SourceRecord,
     pub(crate) consumed_configuration: Vec<SourceRecord>,
     pub(crate) completion_position: Option<Position>,
+    /// The snapshot serves a read-only feature that answers best effort
+    /// (D16): a dependency whose include audit cannot be proven becomes a
+    /// coverage gap instead of refusing the request.
+    pub(crate) best_effort: bool,
 }
 
 impl SnapshotSeed {
@@ -511,7 +515,13 @@ impl SnapshotSeed {
             record,
             consumed_configuration: Vec::new(),
             completion_position: None,
+            best_effort: false,
         }
+    }
+
+    pub(crate) fn best_effort(mut self) -> Self {
+        self.best_effort = true;
+        self
     }
 
     pub(crate) fn with_consumed_configuration(mut self, records: &[SourceRecord]) -> Self {
@@ -548,6 +558,13 @@ pub(crate) struct RenameSnapshot {
     pub(crate) unsupported_directive_owners: Vec<Url>,
     /// Whether `include_errors` has failures besides unsupported directives.
     pub(crate) other_include_errors: bool,
+    /// The include owner each entry of `include_errors` was recorded for.
+    pub(crate) include_error_owners: Vec<(Url, String)>,
+    /// Whether the include audit ran best effort (D16).
+    pub(crate) best_effort: bool,
+    /// Dependencies a best-effort snapshot could not prove (D16). Empty
+    /// unless the seed asked for best effort.
+    pub(crate) dependency_coverage: Coverage,
     /// Sources indexed under an ambiguous or incomplete project context:
     /// their defines and search paths, and so their bindings, are unproven.
     pub(crate) incomplete_context_sources: Vec<Url>,
@@ -6053,6 +6070,9 @@ fn build_snapshot_with_policy(
                     include_errors: Vec::new(),
                     unsupported_directive_owners: Vec::new(),
                     other_include_errors: false,
+                    include_error_owners: Vec::new(),
+                    best_effort: false,
+                    dependency_coverage: Coverage::default(),
                     incomplete_context_sources: Vec::new(),
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
@@ -6166,6 +6186,13 @@ fn build_snapshot_with_policy(
     let mut include_errors = Vec::new();
     let mut unsupported_directive_owners = Vec::new();
     let mut other_include_errors = false;
+    let mut include_error_owners = Vec::new();
+    let mut dependency_coverage = Coverage::default();
+    let best_effort = priority_seed.as_ref().is_some_and(|seed| seed.best_effort)
+        && matches!(
+            mode,
+            SnapshotMode::LocalWithImports | SnapshotMode::Assistance
+        );
     let mut incomplete_context_sources = Vec::new();
     let candidate_names_are_ascii = candidate_names
         .iter()
@@ -6954,7 +6981,18 @@ fn build_snapshot_with_policy(
     }
 
     if mode != SnapshotMode::WorkspaceSymbols {
+        // An include is audited through its owner, so a request on an include
+        // file is a request on its owners too.
+        let mut requested = priority.clone();
+        for uri in &priority {
+            if let Some(parents) = loader.include_parents.get(uri) {
+                requested.extend(parents.iter().cloned());
+            }
+        }
         let include_audit = audit_includes(IncludeAuditor {
+            requested: &requested,
+            best_effort,
+            current_owner: None,
             input,
             sources: &sources,
             loader: &mut loader,
@@ -6982,6 +7020,8 @@ fn build_snapshot_with_policy(
         include_errors.extend(include_audit.errors);
         unsupported_directive_owners = include_audit.unsupported_directive_owners;
         other_include_errors = include_audit.other_errors;
+        include_error_owners = include_audit.owner_errors;
+        dependency_coverage = include_audit.dependency_gaps;
         if let Some(reason) = include_audit.incomplete_reason {
             complete = false;
             incomplete_reason.get_or_insert(reason);
@@ -7055,6 +7095,9 @@ fn build_snapshot_with_policy(
         include_errors,
         unsupported_directive_owners,
         other_include_errors,
+        include_error_owners,
+        best_effort,
+        dependency_coverage,
         incomplete_context_sources,
         declaration_providers,
         baseline_records,
@@ -8254,6 +8297,10 @@ struct IncludeAuditResult {
     unsupported_directive_owners: Vec<Url>,
     other_errors: bool,
     incomplete_reason: Option<String>,
+    /// The owner each entry of `errors` was recorded for.
+    owner_errors: Vec<(Url, String)>,
+    /// What a best-effort audit could not prove about dependency owners.
+    dependency_gaps: Coverage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -8314,6 +8361,13 @@ impl IncludeAnalysis {
 }
 
 struct IncludeAuditor<'a> {
+    /// The documents (and owners of requested include files) whose own
+    /// include failures still refuse a best-effort request.
+    requested: &'a [Url],
+    /// Record a dependency owner's unprovable includes as coverage gaps
+    /// instead of errors (D16).
+    best_effort: bool,
+    current_owner: Option<Url>,
     input: &'a WorkspaceInput,
     sources: &'a HashMap<Url, String>,
     loader: &'a mut Workspace,
@@ -8353,8 +8407,19 @@ struct IncludeInspection<'a> {
 fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult, String> {
     let mut uris = auditor.sources.keys().cloned().collect::<Vec<_>>();
     uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    if auditor.best_effort {
+        // A dependency that stops the audit must not leave the requested
+        // document unaudited.
+        uris.sort_by_key(|uri| !auditor.requested.contains(uri));
+    }
     for uri in uris {
         if auditor.stopped {
+            if auditor.dependency_relaxed() {
+                auditor.result.dependency_gaps.note(
+                    None,
+                    "the include audit stopped before every dependency was audited",
+                );
+            }
             break;
         }
         // Expansion already audited this physical include through each owning
@@ -8367,6 +8432,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         if is_cancelled(auditor.cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
+        auditor.current_owner = Some(uri.clone());
         let context = auditor.context_for_source(&uri)?;
         let Some(mut source) = auditor.sources.get(&uri).cloned() else {
             continue;
@@ -8413,9 +8479,10 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             .iter()
             .any(|allowed_uri| allowed_uri == &uri);
         let Some((session_key, _, _)) = context.as_ref() else {
-            auditor.record_error(format!("include owner {uri} has no project context"));
-            auditor.stopped = true;
-            break;
+            if auditor.owner_failed(format!("include owner {uri} has no project context")) {
+                break;
+            }
+            continue;
         };
         let session = if let Some(session) = auditor
             .loader
@@ -8426,7 +8493,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         {
             session
         } else {
-            super::compile_time::expand(
+            let expanded = super::compile_time::expand(
                 auditor.loader,
                 &uri,
                 &source,
@@ -8434,10 +8501,21 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 auditor.loader.include_expansion_limits(),
                 cancel,
                 None,
-            )?
-            .expanded
-            .session
-            .ok_or("include audit has no shared session")?
+            )
+            .and_then(|expansion| {
+                expansion
+                    .expanded
+                    .session
+                    .ok_or_else(|| "include audit has no shared session".to_string())
+            });
+            match expanded {
+                Ok(session) => session,
+                Err(error) if error != CANCELLATION_MESSAGE && auditor.dependency_relaxed() => {
+                    auditor.note_gap(format!("include analysis is incomplete: {error}"));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         };
         let preliminary = &session.root;
         // Occurrence IDs are local to a shared analysis session. Keep payload
@@ -8458,28 +8536,31 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             directive.kind == ConditionalDirectiveKind::Include && directive.potentially_active()
         });
         if incomplete_context && allow_incomplete_context && has_potentially_active_include {
-            auditor.record_error(format!(
+            if auditor.owner_failed(format!(
                 "rename cannot prove completeness because potentially active include in {uri} depends on incomplete project search paths"
-            ));
-            auditor.stopped = true;
-            break;
+            )) {
+                break;
+            }
+            continue;
         }
 
         let Some((context_key, context, context_observations)) = context else {
-            auditor.record_error(format!(
+            if auditor.owner_failed(format!(
                 "rename cannot prove completeness because include owner {uri} has no project context"
-            ));
-            auditor.stopped = true;
-            break;
+            )) {
+                break;
+            }
+            continue;
         };
         let Some(mut environment) =
             conditional::ConditionalEnvironment::try_from_context(&conditional_context)
         else {
-            auditor.record_error(format!(
+            if auditor.owner_failed(format!(
                 "rename cannot prove completeness because conditional environment exceeds evaluator bounds for {uri}"
-            ));
-            auditor.stopped = true;
-            break;
+            )) {
+                break;
+            }
+            continue;
         };
         let report = pascal_core::resolver::ResolutionReport {
             observations: session.observations.clone(),
@@ -8488,6 +8569,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             incomplete_reasons: vec![],
         };
         auditor.observe_resolver_report(&context_key, &report);
+        let mut owner_unproven = false;
         for directive in preliminary
             .directives
             .iter()
@@ -8497,18 +8579,34 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 break;
             }
             if !auditor.take_directive_budget() {
-                auditor.record_error("include directive limit reached".into());
+                if auditor.dependency_relaxed() {
+                    auditor.note_gap("include directive limit reached");
+                } else {
+                    auditor.record_error("include directive limit reached".into());
+                }
                 auditor.stopped = true;
                 break;
             }
-            let analysis = auditor.inspect_top_level(
+            let analysis = match auditor.inspect_top_level(
                 &uri,
                 &legacy_directive(directive),
                 &context_key,
                 &context,
                 &context_observations,
                 Some(environment.clone()),
-            )?;
+            ) {
+                Ok(analysis) => analysis,
+                // An include past the point where the owner's session stopped
+                // has no proven occurrence. For a dependency that only leaves
+                // the rest of its includes unproven.
+                Err(error) if error != CANCELLATION_MESSAGE && auditor.dependency_relaxed() => {
+                    auditor.active.clear();
+                    auditor.note_gap(format!("include analysis is incomplete: {error}"));
+                    owner_unproven = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(next) = analysis.environment {
                 environment = next;
             }
@@ -8518,12 +8616,23 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if !conditional.complete {
-            auditor.result.incomplete_reason.get_or_insert_with(|| {
-                format!("conditional analysis is incomplete for include owner {uri}")
-            });
+            if auditor.dependency_relaxed() {
+                // Declarations in the unanalysed tail of the unit may shadow
+                // what the request binds through it.
+                auditor.note_gap(format!(
+                    "conditional analysis of {uri} is incomplete; a result bound through it may be shadowed"
+                ));
+            } else {
+                auditor.result.incomplete_reason.get_or_insert_with(|| {
+                    format!("conditional analysis is incomplete for include owner {uri}")
+                });
+            }
             if auditor.stopped {
                 break;
             }
+            continue;
+        }
+        if owner_unproven {
             continue;
         }
         if conditional.directives.iter().any(|directive| {
@@ -8798,10 +8907,9 @@ impl IncludeAuditor<'_> {
         conditional_environment: Option<conditional::ConditionalEnvironment>,
     ) -> Result<IncludeAnalysis, String> {
         let Some(owner_path) = uri.to_file_path().ok().map(absolute_path) else {
-            self.record_error(format!(
+            self.owner_failed(format!(
                 "rename cannot prove completeness because an include path in {uri} is unresolved"
             ));
-            self.stopped = true;
             return Ok(IncludeAnalysis::unsafe_with_reason(
                 format!("include path in {uri} is unresolved"),
                 false,
@@ -8833,31 +8941,28 @@ impl IncludeAuditor<'_> {
         let source = match resolution {
             Resolution::Found(source) => source,
             Resolution::Unavailable { .. } => {
-                self.record_error(format!(
+                self.owner_failed(format!(
                     "rename cannot prove completeness because an include path in {uri} is unresolved"
                 ));
-                self.stopped = true;
                 return Ok(IncludeAnalysis::unsafe_with_reason(
                     format!("include path in {uri} is unresolved"),
                     false,
                 ));
             }
             Resolution::Ambiguous { candidates } => {
-                self.record_error(format!(
+                self.owner_failed(format!(
                     "rename cannot prove completeness because include in {uri} is ambiguous ({})",
                     candidates.len()
                 ));
-                self.stopped = true;
                 return Ok(IncludeAnalysis::unsafe_with_reason(
                     format!("include in {uri} is ambiguous ({})", candidates.len()),
                     false,
                 ));
             }
             Resolution::Incomplete { reason, .. } => {
-                self.record_error(format!(
+                self.owner_failed(format!(
                     "rename cannot prove completeness because include in {uri} could not be read: {reason}"
                 ));
-                self.stopped = true;
                 return Ok(IncludeAnalysis::unsafe_with_reason(
                     format!("include in {uri} could not be read: {reason}"),
                     false,
@@ -8878,13 +8983,15 @@ impl IncludeAuditor<'_> {
                 .ok_or("include has no proven lexical-entry occurrence")?,
         };
         let analysis = self.inspect_include_file(&source, inspection, 0)?;
-        if !analysis.safe || (analysis.relevant && self.name_free_assistance) {
+        // Completion cannot tell which names an include's content declares,
+        // except in a dependency, whose expansion indexes them anyway.
+        let assistance_blocks = self.name_free_assistance && !self.dependency_relaxed();
+        if !analysis.safe || (analysis.relevant && assistance_blocks) {
             let reason = analysis
                 .reason
                 .clone()
                 .unwrap_or_else(|| format!("include {:?} contains source content", source.path));
-            self.record_error(format!("rename cannot prove completeness because {reason}"));
-            self.stopped = true;
+            self.owner_failed(format!("rename cannot prove completeness because {reason}"));
         } else if let Some(path) = &analysis.unsupported_directive {
             self.push_error(format!(
                 "rename cannot prove completeness because include {path:?} of owner {uri} contains an unsupported directive"
@@ -9012,6 +9119,9 @@ impl IncludeAuditor<'_> {
             inspection.conditional_environment.as_ref(),
         );
         cache_key.push_str(&format!("|occurrence:{}", inspection.occurrence.0));
+        if self.dependency_relaxed() {
+            cache_key.push_str("|dependency");
+        }
         if let Some(analysis) = self.cache.get(&cache_key) {
             return Ok(analysis.clone());
         }
@@ -9196,7 +9306,7 @@ impl IncludeAuditor<'_> {
                 format!("include {path:?} has conditional compilation affecting the rename"),
                 relevant,
             )
-        } else if self.name_free_assistance && relevant {
+        } else if self.name_free_assistance && relevant && !self.dependency_relaxed() {
             IncludeAnalysis::unsafe_with_reason(
                 format!("include {path:?} contains source content"),
                 true,
@@ -9221,19 +9331,54 @@ impl IncludeAuditor<'_> {
         Ok(analysis)
     }
 
+    /// Whether the owner being audited is a dependency of a best-effort
+    /// request, whose unprovable includes only leave coverage gaps.
+    fn dependency_relaxed(&self) -> bool {
+        self.best_effort
+            && self
+                .current_owner
+                .as_ref()
+                .is_some_and(|owner| !self.requested.contains(owner))
+    }
+
+    fn note_gap(&mut self, reason: impl Into<String>) {
+        self.result
+            .dependency_gaps
+            .note(self.current_owner.as_ref(), reason);
+    }
+
+    /// The current owner cannot be audited. Returns whether the audit stops:
+    /// a dependency of a best-effort request becomes a gap and the audit goes
+    /// on with the next owner.
+    fn owner_failed(&mut self, error: String) -> bool {
+        if self.dependency_relaxed() {
+            self.note_gap(error);
+            return false;
+        }
+        self.record_error(error);
+        self.stopped = true;
+        true
+    }
+
     fn record_error(&mut self, error: String) {
         self.result.other_errors = true;
         self.push_error(error);
     }
 
     fn push_error(&mut self, error: String) {
-        match self.result.errors.len().cmp(&MAX_RENAME_INCLUDE_ERRORS) {
-            std::cmp::Ordering::Less => self.result.errors.push(error),
-            std::cmp::Ordering::Equal => self.result.errors.push(format!(
+        let error = match self.result.errors.len().cmp(&MAX_RENAME_INCLUDE_ERRORS) {
+            std::cmp::Ordering::Less => error,
+            std::cmp::Ordering::Equal => format!(
                 "rename cannot prove completeness because include error limit ({MAX_RENAME_INCLUDE_ERRORS}) was reached"
-            )),
-            std::cmp::Ordering::Greater => {}
+            ),
+            std::cmp::Ordering::Greater => return,
+        };
+        if let Some(owner) = &self.current_owner {
+            self.result
+                .owner_errors
+                .push((owner.clone(), error.clone()));
         }
+        self.result.errors.push(error);
     }
 }
 

@@ -115,11 +115,79 @@ pub(crate) fn hover_from_input(
     }
     let value = snapshot
         .index
-        .hover_with_cancel(&uri, position, format, cancel);
+        .hover_with_cancel(&uri, position, format, cancel)
+        .map(|hover| hover.map(|hover| with_coverage_note(hover, &snapshot.dependency_coverage)));
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     with_records(source_generation, configuration_generation, value, records)
+}
+
+/// Units named in a hover's incompleteness note.
+const MAX_HOVER_NOTE_UNITS: usize = 3;
+
+/// D16: a hover answered over unproven dependencies says so.
+fn with_coverage_note(mut hover: Hover, coverage: &Coverage) -> Hover {
+    let Some(note) = coverage_note(coverage) else {
+        return hover;
+    };
+    match &mut hover.contents {
+        lsp_types::HoverContents::Markup(markup) => {
+            let separator = if markup.kind == MarkupKind::Markdown {
+                "\n\n---\n"
+            } else {
+                "\n\n"
+            };
+            markup.value.push_str(separator);
+            markup.value.push_str(&note);
+        }
+        lsp_types::HoverContents::Scalar(marked) => {
+            hover.contents = lsp_types::HoverContents::Array(vec![
+                marked.clone(),
+                lsp_types::MarkedString::String(note),
+            ]);
+        }
+        lsp_types::HoverContents::Array(items) => {
+            items.push(lsp_types::MarkedString::String(note));
+        }
+    }
+    hover
+}
+
+fn coverage_note(coverage: &Coverage) -> Option<String> {
+    if coverage.is_complete() {
+        return None;
+    }
+    let mut units = Vec::new();
+    for gap in &coverage.gaps {
+        let Some(name) = gap
+            .uri
+            .as_ref()
+            .and_then(|uri| uri.path_segments()?.next_back().map(str::to_string))
+        else {
+            continue;
+        };
+        if !units.contains(&name) {
+            units.push(name);
+        }
+    }
+    let named = units
+        .iter()
+        .take(MAX_HOVER_NOTE_UNITS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut subject = if named.is_empty() {
+        "some dependencies".to_string()
+    } else {
+        named.join(", ")
+    };
+    let more = units.len().saturating_sub(named.len());
+    if more > 0 {
+        subject.push_str(&format!(" and {more} more"));
+    }
+    Some(format!(
+        "Analysis of {subject} is incomplete; the result may be shadowed."
+    ))
 }
 
 #[cfg(test)]
@@ -203,7 +271,12 @@ pub(crate) fn completion_from_input_with_options(
     }
     let value = snapshot
         .index
-        .completion_with_cancel_and_options(&uri, position, options, cancel);
+        .completion_with_cancel_and_options(&uri, position, options, cancel)
+        .map(|mut result| {
+            // D16: candidates from unproven dependencies may be missing.
+            result.list.is_incomplete |= !snapshot.dependency_coverage.is_complete();
+            result
+        });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1182,7 +1255,8 @@ fn assistance_snapshot(
         Some(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
-                .with_completion_position(completion_position),
+                .with_completion_position(completion_position)
+                .best_effort(),
         ),
         &[],
         cancel,
@@ -1242,30 +1316,57 @@ fn build_binding_snapshot(
     };
     candidate_names.sort();
     candidate_names.dedup();
+    let seed =
+        SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration);
+    // Only the document-local read-only features (hover, highlights, type
+    // definition) bind in `LocalWithImports`; they answer best effort (D16).
+    let seed = if mode == SnapshotMode::LocalWithImports {
+        seed.best_effort()
+    } else {
+        seed
+    };
     build_snapshot(
         input,
         std::slice::from_ref(uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
+        Some(seed),
         skip_imports_for,
         cancel,
     )
 }
 
-/// The include error that blocks a read-only feature on `uri`. An unsupported
-/// directive in a unit the document only imports cannot change how the
-/// document parses, and at worst misclassifies an identifier bound through
-/// that unit. One in the document itself, or any other include error, still
-/// blocks. Rename, references, and code actions stay fail-closed.
+/// The include error that blocks a read-only feature on `uri`: the first one
+/// recorded for the document itself, or for an owner of it when it is an
+/// include file. A failure in a unit the document only imports cannot change
+/// how the document parses; a best-effort snapshot reports it as coverage
+/// (D16). Rename, references, and code actions stay fail-closed.
 fn blocking_include_error<'a>(snapshot: &'a RenameSnapshot, uri: &Url) -> Option<&'a str> {
-    let first = snapshot.include_errors.first()?;
-    let blocks = snapshot.other_include_errors
-        || snapshot
-            .unsupported_directive_owners
+    let owns_document = |owner: &Url| {
+        owner == uri
+            || snapshot
+                .expansions
+                .get(owner)
+                .is_some_and(|expansion| expansion.dependencies.contains(uri))
+    };
+    if let Some((_, error)) = snapshot
+        .include_error_owners
+        .iter()
+        .find(|(owner, _)| owns_document(owner))
+    {
+        return Some(error.as_str());
+    }
+    // Without a best-effort audit an early stop leaves later owners,
+    // possibly the document, unaudited.
+    if snapshot.other_include_errors && !snapshot.best_effort {
+        return snapshot
+            .include_errors
             .iter()
-            .any(|owner| owner == uri);
-    blocks.then_some(first.as_str())
+            .find(|error| !error.contains("unsupported directive"))
+            .or(snapshot.include_errors.first())
+            .map(String::as_str);
+    }
+    None
 }
 
 fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -2520,6 +2621,10 @@ fn completion_observations_equal(
             _ => true,
         }
 }
+
+#[cfg(test)]
+#[path = "queries_best_effort_tests.rs"]
+mod best_effort_tests;
 
 #[cfg(test)]
 mod tests {

@@ -14756,6 +14756,17 @@ impl AssistanceBudget {
         Ok(true)
     }
 
+    /// Whether `error` reports this budget running out, rather than a
+    /// cancellation or a failure a partial answer must not hide.
+    pub(super) fn exhausted_by(&self, error: &str, cancel: &AtomicBool) -> bool {
+        self.exhausted
+            && !cancel.load(Ordering::Relaxed)
+            && error.starts_with(self.operation)
+            && (error.ends_with("-byte scan limit")
+                || error.ends_with("-node traversal limit")
+                || error.ends_with("-byte proof/materialization limit"))
+    }
+
     pub(super) fn require_work(
         &mut self,
         amount: usize,

@@ -122,11 +122,10 @@ impl MemberFacts {
         }
     }
 
-    /// Facts plus the inverted-list entries they cause, each counted twice
-    /// (the inverted list and the per-member list kept for removal).
+    /// The facts' own bytes. The index charge (`ContextIndex::charge_for`)
+    /// adds the inverted-list entries, interner names, include keys and stamps.
     pub(crate) fn retained_bytes(&self) -> usize {
         let strings = |items: &[Box<str>]| items.iter().map(|item| item.len()).sum::<usize>();
-        let entries = self.unit_names.len() + self.imports.len() + self.postings.len();
         size_of::<Self>()
             + strings(&self.unit_names)
             + self.unit_display.len()
@@ -149,7 +148,18 @@ impl MemberFacts {
                     size_of::<Option<PathBuf>>() + slot.as_ref().map_or(0, |p| p.as_os_str().len())
                 })
                 .sum::<usize>()
-            + entries * (size_of::<MemberId>() + size_of::<NameId>())
+    }
+
+    /// Import last segments, the short-name tier of the resolver (A1).
+    fn import_tails(&self) -> Vec<Box<str>> {
+        let mut tails: Vec<Box<str>> = self
+            .imports
+            .iter()
+            .map(|import| import.rsplit('.').next().unwrap_or_default().into())
+            .collect();
+        tails.sort();
+        tails.dedup();
+        tails
     }
 }
 
@@ -175,15 +185,23 @@ fn stamps_bytes(stamps: &[MemberStamp]) -> usize {
 }
 
 /// Last dotted segment after `canonical_name`, or `None` when the name is
-/// not ASCII: postings prove nothing then (A2).
+/// not ASCII or the segment is empty: postings prove nothing then (A2).
 fn posting_key(name: &str) -> Option<String> {
     let name = canonical_name(name);
-    if !name.is_ascii() {
+    let key = name.rsplit('.').next().unwrap_or_default();
+    if !name.is_ascii() || key.is_empty() {
         return None;
     }
-    Some(name.rsplit('.').next().unwrap_or_default().to_owned())
+    Some(key.to_owned())
 }
 
+fn last_segment(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or_default().to_owned()
+}
+
+/// Every import spelling that can bind `unit` (A1): exact names, dotted
+/// suffixes, aliases, and (matched by last segment in `candidates`) the
+/// resolver's short-name tier.
 pub(crate) fn import_names_for(unit: &str, aliases: &[(String, String)]) -> HashSet<String> {
     let unit = canonical_name(unit);
     let mut names = HashSet::new();
@@ -195,8 +213,10 @@ pub(crate) fn import_names_for(unit: &str, aliases: &[(String, String)]) -> Hash
             None => break,
         }
     }
+    let tails: HashSet<String> = names.iter().map(|name| last_segment(name)).collect();
     for (alias, target) in aliases {
-        if names.contains(&canonical_name(target)) {
+        let target = canonical_name(target);
+        if names.contains(&target) || tails.contains(&last_segment(&target)) {
             names.insert(canonical_name(alias));
         }
     }
@@ -206,7 +226,6 @@ pub(crate) fn import_names_for(unit: &str, aliases: &[(String, String)]) -> Hash
 #[derive(Debug, Default)]
 struct Interner {
     ids: HashMap<Box<str>, NameId>,
-    bytes: usize,
 }
 
 impl Interner {
@@ -220,7 +239,6 @@ impl Interner {
         }
         let id = NameId(self.ids.len() as u32);
         self.ids.insert(name.into(), id);
-        self.bytes += name.len() + 16;
         id
     }
 }
@@ -234,6 +252,7 @@ struct Member {
     facts: Option<MemberFacts>,
     posting_ids: Vec<NameId>,
     import_ids: Vec<NameId>,
+    tail_ids: Vec<NameId>,
     unit_ids: Vec<NameId>,
     charged: usize,
 }
@@ -273,6 +292,7 @@ pub(crate) struct ContextIndex {
     names: Interner,
     postings: Inverted,
     importers: Inverted,
+    importer_tails: Inverted,
     units: Inverted,
     include_dependents: HashMap<String, Vec<MemberId>>,
     changes: VecDeque<(u64, PathBuf)>,
@@ -414,6 +434,7 @@ impl ContextIndex {
             self.names = Interner::default();
             self.postings = HashMap::new();
             self.importers = HashMap::new();
+            self.importer_tails = HashMap::new();
             self.units = HashMap::new();
             self.include_dependents = HashMap::new();
             self.member_bytes = 0;
@@ -430,6 +451,7 @@ impl ContextIndex {
         let member = &mut self.members[id.0 as usize];
         let posting_ids = std::mem::take(&mut member.posting_ids);
         let import_ids = std::mem::take(&mut member.import_ids);
+        let tail_ids = std::mem::take(&mut member.tail_ids);
         let unit_ids = std::mem::take(&mut member.unit_ids);
         let facts = member.facts.take();
         let charged = std::mem::take(&mut member.charged);
@@ -439,6 +461,9 @@ impl ContextIndex {
         }
         for name in import_ids {
             list_remove(&mut self.importers, name, id);
+        }
+        for name in tail_ids {
+            list_remove(&mut self.importer_tails, name, id);
         }
         for name in unit_ids {
             list_remove(&mut self.units, name, id);
@@ -471,7 +496,36 @@ impl ContextIndex {
             .collect()
     }
 
-    /// Returns the old charged bytes, `None` if `path` is not a member.
+    /// The bytes `insert` will store for this member, computable before
+    /// inserting (A12). It overcounts: every distinct name is charged as new
+    /// to the interner, and each list entry is counted twice (the inverted
+    /// list and the per-member list kept for removal).
+    pub(crate) fn charge_for(&self, facts: &MemberFacts, stamps: &[MemberStamp]) -> usize {
+        let tails = facts.import_tails();
+        let names = facts
+            .unit_names
+            .iter()
+            .chain(facts.imports.iter())
+            .chain(facts.postings.iter())
+            .chain(tails.iter());
+        let (count, interner) = names.fold((0, 0), |(count, bytes), name| {
+            (count + 1, bytes + name.len() + 16)
+        });
+        let includes: usize = facts
+            .slot_paths
+            .iter()
+            .skip(1)
+            .flatten()
+            .map(|slot| path_key(slot).len() + 24 + 2 * size_of::<MemberId>())
+            .sum();
+        facts.retained_bytes()
+            + stamps_bytes(stamps)
+            + interner
+            + count * 2 * (size_of::<MemberId>() + size_of::<NameId>())
+            + includes
+    }
+
+    /// Returns the old charge, `None` if `path` is not a member.
     pub(crate) fn insert(
         &mut self,
         path: &Path,
@@ -491,6 +545,11 @@ impl ContextIndex {
             .iter()
             .map(|name| self.names.intern(name))
             .collect::<Vec<_>>();
+        let tail_ids = facts
+            .import_tails()
+            .iter()
+            .map(|name| self.names.intern(name))
+            .collect::<Vec<_>>();
         let unit_ids = facts
             .unit_names
             .iter()
@@ -502,6 +561,9 @@ impl ContextIndex {
         for name in &import_ids {
             list_insert(&mut self.importers, *name, id);
         }
+        for name in &tail_ids {
+            list_insert(&mut self.importer_tails, *name, id);
+        }
         for name in &unit_ids {
             list_insert(&mut self.units, *name, id);
         }
@@ -511,10 +573,11 @@ impl ContextIndex {
                 list.insert(at, id);
             }
         }
-        let charged = facts.retained_bytes() + stamps_bytes(&stamps);
+        let charged = self.charge_for(&facts, &stamps);
         let member = &mut self.members[id.0 as usize];
         member.posting_ids = posting_ids;
         member.import_ids = import_ids;
+        member.tail_ids = tail_ids;
         member.unit_ids = unit_ids;
         member.facts = Some(facts);
         member.stamps = stamps;
@@ -527,24 +590,33 @@ impl ContextIndex {
         Some(old)
     }
 
-    /// Re-stamp a member whose bytes were verified unchanged.
+    /// Re-stamp a member whose bytes were verified unchanged. The facts do
+    /// not change, so this neither bumps the generation nor logs a change.
+    /// The charge is fixed: `false` (nothing changed) unless `stamps` name
+    /// the same paths as the stored ones.
     pub(crate) fn refresh(&mut self, path: &Path, stamps: Vec<MemberStamp>) -> bool {
         let Some(id) = self.id_of(path) else {
             return false;
         };
         let member = &mut self.members[id.0 as usize];
-        let Some(facts) = &member.facts else {
+        if member.facts.is_none()
+            || member.stamps.len() != stamps.len()
+            || member
+                .stamps
+                .iter()
+                .zip(&stamps)
+                .any(|(old, new)| old.path != new.path)
+        {
             return false;
-        };
-        let charged = facts.retained_bytes() + stamps_bytes(&stamps);
-        self.member_bytes = self.member_bytes - member.charged + charged;
-        member.charged = charged;
+        }
         member.stamps = stamps;
         member.state = Some(MemberState::Fresh);
         true
     }
 
-    /// Returns the old charged bytes, `None` if `path` is not a member.
+    /// Returns the old charge, `None` if `path` is not a member. A refused
+    /// member (a stable reason, A6) drops its facts, so it is no include
+    /// dependent of anything until it is indexed again.
     pub(crate) fn refuse(&mut self, path: &Path, reason: String) -> Option<usize> {
         let id = self.id_of(path)?;
         let old = self.release(id);
@@ -647,7 +719,8 @@ impl ContextIndex {
             {
                 return self.by_path.values().copied().collect();
             }
-            names
+            let tails: HashSet<String> = names.iter().map(|name| last_segment(name)).collect();
+            let exact = names
                 .iter()
                 .filter_map(|name| self.names.get(name))
                 .flat_map(|id| {
@@ -657,8 +730,12 @@ impl ContextIndex {
                         .flatten()
                         .chain(self.units.get(&id).into_iter().flatten())
                         .copied()
-                })
-                .collect()
+                });
+            let short = tails
+                .iter()
+                .filter_map(|tail| self.names.get(tail))
+                .flat_map(|id| self.importer_tails.get(&id).into_iter().flatten().copied());
+            exact.chain(short).collect()
         });
         let mut result = Candidates::default();
         for (id, member) in self.live_members_with_ids() {
@@ -684,14 +761,18 @@ impl ContextIndex {
     }
 
     /// Declarations whose display name contains `query` (case-insensitive),
-    /// from every member holding facts (Fresh or Stale), in path order.
+    /// from Fresh members, in path order (spec 6.2).
     /// Eligibility and container mirror `workspace_eligible` and
     /// `workspace_container_name` (`navigation/symbols.rs`).
     pub(crate) fn symbols(&self, query: &str, skip: &dyn Fn(&Path) -> bool) -> Vec<IndexedSymbol> {
         let query = query.to_lowercase();
         let mut result = Vec::new();
         for (_, member) in self.live_members_with_ids() {
-            let Some(facts) = &member.facts else {
+            let Some(facts) = member
+                .facts
+                .as_ref()
+                .filter(|_| *member.state() == MemberState::Fresh)
+            else {
                 continue;
             };
             if skip(&member.path) {
@@ -760,7 +841,7 @@ impl ContextIndex {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.member_bytes + self.names.bytes
+        self.member_bytes
     }
 }
 
@@ -1049,12 +1130,12 @@ mod tests {
     fn insert_replaces_old_facts() {
         let mut index = ContextIndex::new();
         abc(&mut index);
-        let before = MemberFacts::from_facts(
+        let before_facts = MemberFacts::from_facts(
             Path::new("/w/A.pas"),
             &facts("a", &["shared"], &["sharedvalue"], &[]),
             vec![],
-        )
-        .retained_bytes();
+        );
+        let before = index.charge_for(&before_facts, &[]);
         let after = MemberFacts::from_facts(
             Path::new("/w/A.pas"),
             &facts("a", &["shared"], &[], &[]),
@@ -1245,5 +1326,89 @@ mod tests {
                 .selected,
             paths(&["/w/B.pas"])
         );
+    }
+
+    #[test]
+    fn dotted_imports_match_by_last_segment() {
+        let mut index = ContextIndex::new();
+        member(
+            &mut index,
+            "/w/A.pas",
+            &facts("a", &["vendor.foo"], &["x"], &[]),
+        );
+        member(&mut index, "/w/B.pas", &facts("b", &["foo"], &["x"], &[]));
+        member(
+            &mut index,
+            "/w/C.pas",
+            &facts("c", &["vendor.bar"], &["x"], &[]),
+        );
+        let candidates = index.candidates(&top_level(&["foo"], &["x"]));
+        assert_eq!(candidates.selected, paths(&["/w/A.pas", "/w/B.pas"]));
+        assert_eq!(candidates.excluded, paths(&["/w/C.pas"]));
+        let candidates = index.candidates(&top_level(&["vendor.foo"], &["x"]));
+        assert_eq!(candidates.selected, paths(&["/w/A.pas", "/w/B.pas"]));
+        let aliased = CandidateQuery {
+            names: vec!["x".into()],
+            top_level_units: Some(vec!["foo".into()]),
+            aliases: vec![("f".into(), "ns.foo".into())],
+        };
+        member(&mut index, "/w/D.pas", &facts("d", &["lib.f"], &["x"], &[]));
+        assert!(
+            index
+                .candidates(&aliased)
+                .selected
+                .contains(&PathBuf::from("/w/D.pas"))
+        );
+    }
+
+    #[test]
+    fn symbols_serve_fresh_members_only() {
+        let mut index = ContextIndex::new();
+        member(&mut index, "/w/A.pas", &facts("a", &[], &[], &[]));
+        member(&mut index, "/w/B.pas", &facts("b", &[], &[], &[]));
+        index.mark_stale(Path::new("/w/A.pas"));
+        let symbols = index.symbols("", &|_| false);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].path, PathBuf::from("/w/B.pas"));
+    }
+
+    #[test]
+    fn charge_for_matches_the_stored_charge() {
+        let mut index = ContextIndex::new();
+        let a = PathBuf::from("/w/A.pas");
+        let b = PathBuf::from("/w/B.pas");
+        index.set_members(vec![a.clone(), b.clone()]);
+        let slots = vec![Some(a.clone()), Some(PathBuf::from("/w/x.inc"))];
+        let facts_a =
+            MemberFacts::from_facts(&a, &facts("a", &["vendor.foo"], &["x", "y"], &[]), slots);
+        let stamps = vec![MemberStamp {
+            path: a.clone(),
+            stamp: None,
+        }];
+        let charge_a = index.charge_for(&facts_a, &stamps);
+        index.insert(&a, facts_a, stamps.clone(), 1);
+        assert_eq!(index.bytes(), charge_a);
+        let facts_b = MemberFacts::from_facts(&b, &facts("b", &["foo"], &["x"], &[]), vec![]);
+        let charge_b = index.charge_for(&facts_b, &[]);
+        index.insert(&b, facts_b, vec![], 1);
+        assert_eq!(index.bytes(), charge_a + charge_b);
+        assert!(index.refresh(&a, stamps));
+        assert_eq!(index.bytes(), charge_a + charge_b);
+        assert_eq!(index.refuse(&a, "r".into()), Some(charge_a));
+        assert_eq!(index.bytes(), charge_b);
+        let (_, removed) = index.set_members(vec![]);
+        assert_eq!(removed, charge_b);
+        assert_eq!(index.bytes(), 0);
+    }
+
+    #[test]
+    fn empty_binding_names_skip_the_posting_filter() {
+        let mut index = ContextIndex::new();
+        member(&mut index, "/w/A.pas", &facts("a", &[], &[], &[]));
+        assert_eq!(
+            index.candidates(&member_rule(&["Vendor."])).selected.len(),
+            1
+        );
+        assert_eq!(index.candidates(&member_rule(&[""])).selected.len(), 1);
     }
 }

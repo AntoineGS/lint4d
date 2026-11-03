@@ -138,6 +138,8 @@ pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
+#[cfg(test)]
+mod shared_discovery_tests;
 pub(crate) mod signature;
 mod validate;
 
@@ -2363,6 +2365,103 @@ impl ContextState {
     }
 }
 
+/// Discovered project contexts shared by a workspace and the request
+/// workspaces built from its inputs, so a request does not re-evaluate the
+/// project files for every document it touches. An entry is keyed by the
+/// document and every discovery input; it is reused only while its watched
+/// files prove it fresh, exactly like a context the workspace retained.
+#[derive(Clone, Default)]
+pub(crate) struct SharedDiscoveries(Arc<Mutex<DiscoveryStore>>);
+
+impl std::fmt::Debug for SharedDiscoveries {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedDiscoveries")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Discoveries retained before the store is emptied.
+const MAX_SHARED_DISCOVERIES: usize = 512;
+/// Distinct project warnings remembered as already logged.
+const MAX_LOGGED_PROJECT_WARNINGS: usize = 4096;
+
+#[derive(Default)]
+struct DiscoveryStore {
+    configuration_generation: u64,
+    entries: HashMap<(Url, u64), SharedDiscovery>,
+    logged_warnings: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct SharedDiscovery {
+    key: ContextKey,
+    state: ContextState,
+    warnings: Vec<String>,
+}
+
+impl SharedDiscoveries {
+    fn with_store<T>(
+        &self,
+        configuration_generation: u64,
+        operation: impl FnOnce(&mut DiscoveryStore) -> T,
+    ) -> T {
+        let mut store = lock(&self.0);
+        if store.configuration_generation != configuration_generation {
+            store.entries.clear();
+            store.logged_warnings.clear();
+            store.configuration_generation = configuration_generation;
+        }
+        operation(&mut store)
+    }
+
+    fn get(
+        &self,
+        configuration_generation: u64,
+        uri: &Url,
+        inputs: u64,
+    ) -> Option<SharedDiscovery> {
+        self.with_store(configuration_generation, |store| {
+            store.entries.get(&(uri.clone(), inputs)).cloned()
+        })
+    }
+
+    fn insert(
+        &self,
+        configuration_generation: u64,
+        uri: Url,
+        inputs: u64,
+        discovery: SharedDiscovery,
+    ) {
+        self.with_store(configuration_generation, |store| {
+            if store.entries.len() >= MAX_SHARED_DISCOVERIES {
+                store.entries.clear();
+            }
+            store.entries.insert((uri, inputs), discovery);
+        });
+    }
+
+    fn remove(&self, configuration_generation: u64, uri: &Url, inputs: u64) {
+        self.with_store(configuration_generation, |store| {
+            store.entries.remove(&(uri.clone(), inputs));
+        });
+    }
+
+    /// Whether `warning` was not yet logged in this configuration generation.
+    fn first_report(&self, configuration_generation: u64, warning: &str) -> bool {
+        self.with_store(configuration_generation, |store| {
+            if store.logged_warnings.contains(warning) {
+                return false;
+            }
+            if store.logged_warnings.len() >= MAX_LOGGED_PROJECT_WARNINGS {
+                store.logged_warnings.clear();
+            }
+            store.logged_warnings.insert(warning.to_string());
+            true
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NavigationState {
     contexts: HashMap<ContextKey, ContextState>,
@@ -2942,6 +3041,9 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    /// Project contexts discovered by this workspace and the request
+    /// workspaces derived from it.
+    shared_discoveries: SharedDiscoveries,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3513,6 +3615,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
+            shared_discoveries: input.shared_discoveries.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
@@ -9870,6 +9973,18 @@ impl Workspace {
                 return Ok(owner.key);
             }
         }
+        let discovery_inputs =
+            self.discovery_inputs_fingerprint(&roots, &project_options, &deleted_paths);
+        if let Some(key) = self.reuse_shared_discovery(
+            uri,
+            &path,
+            discovery_inputs,
+            cancel,
+            budget,
+            defer_context_pruning,
+        )? {
+            return Ok(key);
+        }
         let discovered =
             discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
                 &path,
@@ -9901,8 +10016,9 @@ impl Workspace {
             project_selection,
             project_scope,
         } = discovery;
-        for warning in context_observations.warnings.iter().cloned() {
-            self.warn(warning);
+        let warnings = context_observations.warnings.clone();
+        for warning in warnings.iter().cloned() {
+            self.warn_project(warning);
         }
         let key = self.context_key_for_project_discovery(
             &path,
@@ -9929,7 +10045,110 @@ impl Workspace {
             budget,
             !defer_context_pruning,
         )?;
+        if let Some(state) = self.contexts.get(&key) {
+            self.shared_discoveries.insert(
+                self.configuration_generation,
+                uri.clone(),
+                discovery_inputs,
+                SharedDiscovery {
+                    key: key.clone(),
+                    state: state.clone(),
+                    warnings,
+                },
+            );
+        }
         Ok(key)
+    }
+
+    /// Everything automatic discovery for a document reads besides the
+    /// files its context watches. The cache epoch advances on every file
+    /// event, including Delphi override files.
+    fn discovery_inputs_fingerprint(
+        &self,
+        roots: &[PathBuf],
+        project_options: &ProjectOptions,
+        deleted_paths: &impl std::fmt::Debug,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn sorted<K: std::fmt::Debug, V: std::fmt::Debug>(map: &HashMap<K, V>) -> Vec<String> {
+            let mut entries = map
+                .iter()
+                .map(|entry| format!("{entry:?}"))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{roots:?}").hash(&mut hasher);
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            project_options.project_file,
+            project_options.build_config,
+            project_options.platform,
+            project_options.source_paths,
+            project_options.conditional_context
+        )
+        .hash(&mut hasher);
+        sorted(&project_options.installation_selections).hash(&mut hasher);
+        sorted(&project_options.build_selections).hash(&mut hasher);
+        sorted(&self.project_selections).hash(&mut hasher);
+        format!("{:?}", self.options.exclude).hash(&mut hasher);
+        format!("{deleted_paths:?}").hash(&mut hasher);
+        self.project_cache.invalidation_epoch().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Adopt the context another workspace sharing this one's discoveries
+    /// found for `uri` with the same inputs, if its watched files still
+    /// prove it current.
+    fn reuse_shared_discovery(
+        &mut self,
+        uri: &Url,
+        path: &Path,
+        discovery_inputs: u64,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
+    ) -> Result<Option<ContextKey>, String> {
+        let generation = self.configuration_generation;
+        let Some(discovery) = self
+            .shared_discoveries
+            .get(generation, uri, discovery_inputs)
+        else {
+            return Ok(None);
+        };
+        let installed = !self.contexts.contains_key(&discovery.key);
+        if installed {
+            self.contexts
+                .insert(discovery.key.clone(), discovery.state.clone());
+        }
+        if !(self.context_is_fresh_with_cancel(&discovery.key, cancel, budget)?
+            && self.context_matches_current_selection_with_cancel_and_budget(
+                path,
+                &discovery.key,
+                cancel,
+                budget,
+            )?)
+        {
+            if installed {
+                self.contexts.remove(&discovery.key);
+            }
+            self.shared_discoveries
+                .remove(generation, uri, discovery_inputs);
+            return Ok(None);
+        }
+        for warning in discovery.warnings {
+            self.warn_project(warning);
+        }
+        self.select_document_context_with_pruning(
+            uri,
+            &discovery.key,
+            self.owner_origin_for_context_key(&discovery.key),
+            cancel,
+            budget,
+            !defer_context_pruning,
+        )?;
+        Ok(Some(discovery.key))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13525,6 +13744,21 @@ impl Workspace {
     fn mark_global_change(&mut self) {
         self.global_source_change_generation = self.source_generation;
         self.global_configuration_change_generation = self.configuration_generation;
+    }
+
+    /// A project discovery warning: kept like any warning, but logged once
+    /// per configuration generation across the workspaces sharing
+    /// discoveries, which each rediscover the same project.
+    fn warn_project(&mut self, message: String) {
+        if self
+            .shared_discoveries
+            .first_report(self.configuration_generation, &message)
+        {
+            self.warn(message);
+        } else if !self.warnings.contains(&message) && self.warnings.len() < MAX_WORKSPACE_WARNINGS
+        {
+            self.warnings.push(message);
+        }
     }
 
     fn warn(&mut self, message: String) {
@@ -24295,6 +24529,7 @@ BDS = '/fake/37'
             overlays,
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
+            shared_discoveries: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),

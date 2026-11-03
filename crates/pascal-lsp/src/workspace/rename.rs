@@ -243,6 +243,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
     pub(crate) project_cache: crate::project_cache::ProjectCache,
+    pub(crate) shared_discoveries: super::SharedDiscoveries,
     pub(crate) cache_epoch: u64,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
@@ -1493,6 +1494,7 @@ impl Workspace {
             overlays,
             cached_documents,
             project_cache: self.project_cache.clone(),
+            shared_discoveries: self.shared_discoveries.clone(),
             cache_epoch: self
                 .cache_epoch
                 .unwrap_or_else(|| self.project_cache.invalidation_epoch()),
@@ -5952,6 +5954,7 @@ fn build_snapshot_with_policy(
     // deletes exactly like the other analysis workers.
     loader.deleted_overrides = input.deleted_overrides.clone();
     loader.project_cache = input.project_cache.clone();
+    loader.shared_discoveries = input.shared_discoveries.clone();
     loader.cache_epoch = Some(input.cache_epoch);
     loader.project_selections = input.project_selections.clone();
     loader.document_owners = input.document_owners.clone();

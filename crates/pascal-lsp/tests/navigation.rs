@@ -16994,3 +16994,87 @@ fn a_global_exported_by_two_used_units_returns_both_declarations() {
         }
     }
 }
+
+#[test]
+fn program_uses_with_explicit_paths_and_anonymous_methods_stay_navigable() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(root.join("src")).expect("create workspace");
+    let app = "program App;\n\nuses\n  Environment in 'src\\Environment.pas' {frmEnvironment: TFrame},\n  Helper in 'src\\Helper.pas';\n\n{$R *.res}\n\nbegin\n  {$IFDEF DEBUG}\n  Helper.Help;\n  {$ENDIF}\n  Environment.Start;\nend.\n";
+    let environment = "unit Environment;\ninterface\nuses Helper;\nprocedure Start;\nimplementation\nprocedure Start;\nbegin\n  Parallel.Async(procedure (const task: IOmniTask)\n    begin\n      if task <> nil then begin Help; end;\n    end);\n  {$IFDEF DEBUG}\n  Help;\n  {$ENDIF}\n  Help;\nend;\nend.\n";
+    let helper =
+        "unit Helper; interface procedure Help; implementation procedure Help; begin end; end.\n";
+    fs::write(root.join("App.dpr"), app).expect("write main source");
+    fs::write(root.join("src/Environment.pas"), environment).expect("write environment");
+    fs::write(root.join("src/Helper.pas"), helper).expect("write helper");
+    fs::write(
+        root.join("App.dproj"),
+        r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectVersion>12.0</ProjectVersion>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Debug</Config>
+    <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Base)'!=''"><DCC_Platform>x86</DCC_Platform></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define></PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+    <DCCReference Include="src\Environment.pas" />
+    <DCCReference Include="src\Helper.pas" />
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+  </ItemGroup>
+</Project>"#,
+    )
+    .expect("write project");
+
+    let app_uri = Url::from_file_path(root.join("App.dpr")).expect("app URI");
+    let environment_uri =
+        Url::from_file_path(root.join("src/Environment.pas")).expect("environment URI");
+    let helper_uri = Url::from_file_path(root.join("src/Helper.pas")).expect("helper URI");
+    let mut options = WorkspaceOptions {
+        project_file: Some(root.join("App.dproj")),
+        ..WorkspaceOptions::default()
+    };
+    options.conditional_context.compiler_version = Some(CompilerVersion::new(21, 0));
+    let mut workspace = test_workspace(vec![root.clone()], options);
+
+    let unit = workspace.navigate(
+        &app_uri,
+        position_of(app, "Environment", 0),
+        NavigationTarget::Definition,
+    );
+    assert_eq!(unit.len(), 1, "{unit:?} {:?}", workspace.warnings());
+    assert_eq!(unit[0].uri, environment_uri);
+
+    let routine = workspace.navigate(
+        &app_uri,
+        position_of(app, "Start", 0),
+        NavigationTarget::Definition,
+    );
+    assert_eq!(routine.len(), 1, "{routine:?}");
+    assert_eq!(routine[0].uri, environment_uri);
+
+    // After the anonymous method, the unit is still navigable.
+    let help = workspace.navigate(
+        &environment_uri,
+        position_of(environment, "Help;\nend;", 0),
+        NavigationTarget::Definition,
+    );
+    assert_eq!(help.len(), 1, "{help:?} {:?}", workspace.warnings());
+    assert_eq!(help[0].uri, helper_uri);
+
+    // The explicit path is a string, not a reference.
+    assert!(
+        workspace
+            .navigate(
+                &app_uri,
+                position_of(app, "src\\Environment.pas", 0),
+                NavigationTarget::Definition,
+            )
+            .is_empty()
+    );
+}

@@ -224,6 +224,10 @@ pub fn classify_unit(
     config: &UsesConfig,
     external_units: &HashSet<String>,
 ) -> UnitSection {
+    // An explicit `in 'path'` does not change the unit's section.
+    let unit_name = unit_name
+        .split_once(" in '")
+        .map_or(unit_name, |(name, _)| name);
     // 1. Core: dotted prefix matches CORE_PREFIXES
     if let Some(dot_pos) = unit_name.find('.') {
         let prefix = &unit_name[..dot_pos];
@@ -447,6 +451,27 @@ fn unit_item(node: tree_sitter::Node, source: &[u8], comments: &CommentMap) -> O
     })
 }
 
+/// Append a uses entry's explicit `in 'path'` to the unit it follows, with
+/// the comments around it (Delphi's `{Form: TForm}` trails the path).
+fn append_explicit_path(
+    items: &mut [UsesItem],
+    node: tree_sitter::Node,
+    source: &[u8],
+    comments: &CommentMap,
+) {
+    let Some(UsesItem::Unit { name, trailing, .. }) = items.last_mut() else {
+        return;
+    };
+    if node.kind() == K::K_IN {
+        name.push_str(" in");
+    } else {
+        name.push(' ');
+        name.push_str(&node_text(node, source));
+    }
+    trailing.extend(leading_texts(node, comments));
+    trailing.extend(trailing_texts(node, comments));
+}
+
 /// Whether the branch `state` points at started with a `,`.
 fn branch_lead(block: &mut IfDefBlock, state: BranchState) -> &mut bool {
     match state {
@@ -516,6 +541,12 @@ fn parse_pp_uses_block(
                     items.push(item);
                     commas.pushed(items);
                 }
+            }
+            K::K_IN | K::LITERAL_STRING => {
+                let items = branch_items(&mut block, state);
+                append_explicit_path(items, child, source, comments);
+                // A following `,` still belongs to the unit.
+                commas.pushed(items);
             }
             K::PP_USES_BLOCK => {
                 let items = branch_items(&mut block, state);
@@ -618,6 +649,11 @@ pub(crate) fn extract_uses_items(
                     commas.pushed(&items);
                 }
             }
+            K::K_IN | K::LITERAL_STRING => {
+                append_explicit_path(&mut items, child, source, comments);
+                // A following `,` still belongs to the unit.
+                commas.pushed(&items);
+            }
             K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
                 items.extend(
                     leading_texts(child, comments)
@@ -686,6 +722,20 @@ type UnitComments<'a> = (&'a [String], &'a [String]);
 /// A clause holding an include is written as in the source, its items in
 /// their order and with their own punctuation: what the include lists is
 /// unknown, so nothing around it can be sorted, grouped or re-punctuated.
+/// Lay out a uses clause without moving any item: the order of a program's or
+/// library's uses is its unit initialization order, kept by the IDE.
+pub(crate) fn layout_uses_items_in_source_order(
+    items: &[UsesItem],
+    after: &[String],
+    indent: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
+    let style = ListStyle::Source { lead: false };
+    emit_list(&items, indent, ItemEnd::Semicolon, style, after, &mut lines);
+    lines
+}
+
 pub(crate) fn layout_uses_items(
     items: &[UsesItem],
     after: &[String],
@@ -693,13 +743,10 @@ pub(crate) fn layout_uses_items(
     indent: &str,
     external_units: &HashSet<String>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
     if has_include(items) {
-        let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
-        let style = ListStyle::Source { lead: false };
-        emit_list(&items, indent, ItemEnd::Semicolon, style, after, &mut lines);
-        return lines;
+        return layout_uses_items_in_source_order(items, after, indent);
     }
+    let mut lines = Vec::new();
     // Separate plain units from pinned items, recording the anchor (preceding unit name).
     // When grouping is enabled, ifdef blocks whose units all belong to one section
     // are placed in that section rather than pinned.

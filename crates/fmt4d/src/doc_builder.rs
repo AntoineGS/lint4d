@@ -779,13 +779,24 @@ impl<'a> DocBuilder<'a> {
         let clause =
             crate::uses::extract_uses_items(node, self.source, self.comments, self.directives);
         let indent_str = " ".repeat(self.config.indent_size);
-        let lines = crate::uses::layout_uses_items(
-            &clause.items,
-            &clause.after,
-            &self.config.uses,
-            &indent_str,
-            self.external_units,
-        );
+        let in_project_source = node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), K::PROGRAM | K::LIBRARY));
+        let lines = if in_project_source {
+            crate::uses::layout_uses_items_in_source_order(
+                &clause.items,
+                &clause.after,
+                &indent_str,
+            )
+        } else {
+            crate::uses::layout_uses_items(
+                &clause.items,
+                &clause.after,
+                &self.config.uses,
+                &indent_str,
+                self.external_units,
+            )
+        };
 
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);

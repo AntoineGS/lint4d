@@ -1656,7 +1656,15 @@ impl Workspace {
                 let outside = drop_outside(self, key, &mut paths);
                 outside_gap(&mut result.gaps, outside, &display);
                 if let Some(ranking) = ranking.as_mut() {
-                    ranking.rank(&mut paths, unverified_left, cancel);
+                    ranking.rank(
+                        &mut paths,
+                        unverified_left,
+                        &|path: &Path| {
+                            let key = path_key(path);
+                            open.contains(&key) || taken.contains(&key) || deleted(path)
+                        },
+                        cancel,
+                    );
                 }
                 let (skipped, searched) = take_unverified(
                     paths,
@@ -1736,7 +1744,15 @@ impl Workspace {
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
             outside_gap(&mut result.gaps, outside, &display);
             if searched && let Some(ranking) = ranking.as_mut() {
-                ranking.rank(&mut unverified, unverified_left, cancel);
+                ranking.rank(
+                    &mut unverified,
+                    unverified_left,
+                    &|path: &Path| {
+                        let key = path_key(path);
+                        open.contains(&key) || taken.contains(&key) || deleted(path)
+                    },
+                    cancel,
+                );
             }
 
             for path in selected {
@@ -2094,15 +2110,29 @@ impl UnverifiedRanking {
     /// those spelling a name; then the unread; then the rest. Only the
     /// order changes, never the set, so the bound alone decides what is
     /// left out. Nothing is read when `left` already covers every path.
-    fn rank(&mut self, paths: &mut Vec<PathBuf>, left: usize, cancel: &AtomicBool) {
-        if paths.len() <= left || self.names.is_empty() {
+    /// Paths `unread` selects (open, deleted or already taken) do not use
+    /// the bound, so they are neither read nor counted.
+    ///
+    /// The scan is a byte search over the raw file: a UTF-16 file, or an
+    /// importer spelling the name only through an include, ranks last.
+    fn rank(
+        &mut self,
+        paths: &mut Vec<PathBuf>,
+        left: usize,
+        unread: &dyn Fn(&Path) -> bool,
+        cancel: &AtomicBool,
+    ) {
+        if self.names.is_empty() || paths.iter().filter(|path| !unread(path)).count() <= left {
             return;
         }
         let started = std::time::Instant::now();
         let mut likely = 0usize;
         let mut tiers = Vec::with_capacity(paths.len());
         for path in paths.iter() {
-            let tier = if likely >= left || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let tier = if unread(path)
+                || likely >= left
+                || cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 2
             } else {
                 match self.read(path) {
@@ -2232,6 +2262,51 @@ mod tests {
 
     fn unit(path: &Path) {
         write(path, "unit X; interface implementation end.\n");
+    }
+
+    /// l4d-jeh4 fix round 1: a path the bound will not read (taken, open
+    /// or deleted) is neither read nor counted as a likely member, so the
+    /// ranking does not stop before the bound holds a likely member.
+    #[test]
+    fn unverified_ranking_ignores_paths_the_bound_does_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let named =
+            "unit X;\ninterface\nuses Shared;\nconst Y = SharedValue;\nimplementation\nend.\n";
+        let a = temp.path().join("A.pas");
+        let b = temp.path().join("B.pas");
+        let c = temp.path().join("C.pas");
+        write(&a, named);
+        write(&b, "unit B;\ninterface\nimplementation\nend.\n");
+        write(&c, named);
+        let mut ranking = UnverifiedRanking::new(&CandidateQuery {
+            names: vec!["sharedvalue".to_owned()],
+            top_level_units: Some(vec!["shared".to_owned()]),
+            aliases: Vec::new(),
+        });
+        let mut paths = vec![a.clone(), b.clone(), c.clone()];
+        let taken = path_key(&a);
+        ranking.rank(
+            &mut paths,
+            1,
+            &|path: &Path| path_key(path) == taken,
+            &AtomicBool::new(false),
+        );
+        let c_at = paths.iter().position(|path| *path == c).unwrap();
+        let b_at = paths.iter().position(|path| *path == b).unwrap();
+        assert!(c_at < b_at, "{paths:?}");
+    }
+
+    #[test]
+    fn text_mentions_name_edges() {
+        use crate::navigation::text_mentions_name;
+        assert!(text_mentions_name(b"", ""));
+        assert!(text_mentions_name(b"abc", ""));
+        assert!(!text_mentions_name(b"foo", "foobar"));
+        assert!(!text_mentions_name(b"", "a"));
+        assert!(text_mentions_name(b"x := FOO", "foo"));
+        assert!(text_mentions_name(b"Foo", "foo"));
+        assert!(text_mentions_name(b"&fOo;", "foo"));
+        assert!(!text_mentions_name(b"x := FO", "foo"));
     }
 
     fn project(root: &Path, properties: &str, items: &str) -> PathBuf {

@@ -115,7 +115,7 @@ fn warn_exclude_glob(message: String) {
     eprintln!("pascal-lsp: warning: {message}");
 }
 
-mod admitted;
+pub(crate) mod admitted;
 mod authorize;
 pub(crate) mod capture;
 mod catalogues;
@@ -129,7 +129,7 @@ pub(crate) mod extract;
 mod facts;
 #[cfg(all(test, unix))]
 mod isolation;
-mod persist;
+pub(crate) mod persist;
 pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;

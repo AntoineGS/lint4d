@@ -4214,6 +4214,8 @@ impl ProjectCache {
         }
         self.release(state);
         self.drop_witnesses(path, include_parent);
+        let removed = self.catalogues().invalidate(path, include_parent);
+        self.release_catalogues(removed);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
         }
@@ -4247,6 +4249,9 @@ impl ProjectCache {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Overflow lost which directories changed: no catalogue survives it.
+        let removed = self.catalogues().clear();
+        self.release_catalogues(removed);
     }
 
     /// Remember that `path`, while it has `stamp`, holds what `proven` says.
@@ -4688,5 +4693,88 @@ mod catalogue_tests {
             cache.stats().reserved_catalogue_bytes,
             MAX_SHARED_CATALOGUES * catalogue.retained_bytes()
         );
+    }
+
+    #[test]
+    fn a_listing_change_drops_the_catalogues_that_listed_the_parent() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let before = cache.catalogue_generation();
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_path(&temp.path().join("sub/New.pas"));
+        assert!(cache.catalogue(&key).is_none());
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
+        assert!(cache.catalogue_generation() > before + 1);
+    }
+
+    #[test]
+    fn a_content_change_keeps_catalogues_unless_it_names_a_listed_directory() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        cache
+            .publish_catalogue(key.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_file_contents(&temp.path().join("A.pas"));
+        assert!(
+            cache.catalogue(&key).is_some(),
+            "a file's bytes are not membership"
+        );
+        cache.invalidate_file_contents(&temp.path().join("sub"));
+        assert!(
+            cache.catalogue(&key).is_none(),
+            "a listed directory's metadata changed"
+        );
+    }
+
+    #[test]
+    fn a_change_inside_an_excluded_directory_keeps_the_catalogue() {
+        use crate::catalogue::{Bound, Catalogue, Depth, MAX_CATALOGUE_ENTRIES};
+        let temp = tree();
+        std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        let mut io = || -> Result<(), String> { Ok(()) };
+        let mut catalogue = Catalogue::new(temp.path(), Depth::Recursive, &mut io).unwrap();
+        catalogue
+            .advance(
+                Bound::entries(MAX_CATALOGUE_ENTRIES),
+                &|path: &Path| path.ends_with("node_modules"),
+                &mut io,
+            )
+            .unwrap();
+        let (key, _) = listed_catalogue(temp.path());
+        let cache = ProjectCache::new(1 << 30);
+        cache
+            .publish_catalogue(key.clone(), None, Arc::new(catalogue))
+            .unwrap();
+        cache.invalidate_path(&temp.path().join("node_modules/pkg/index.js"));
+        assert!(cache.catalogue(&key).is_some());
+        cache.invalidate_path(&temp.path().join("node_modules"));
+        assert!(
+            cache.catalogue(&key).is_none(),
+            "the root's own listing changed"
+        );
+    }
+
+    #[test]
+    fn overflow_drops_every_catalogue_and_releases_its_charge() {
+        let temp = tree();
+        let cache = ProjectCache::new(1 << 30);
+        let (key, catalogue) = listed_catalogue(temp.path());
+        let other = crate::catalogue::CatalogueKey {
+            root: key.root.join("other"),
+            ..key.clone()
+        };
+        cache
+            .publish_catalogue(key.clone(), None, Arc::clone(&catalogue))
+            .unwrap();
+        cache
+            .publish_catalogue(other.clone(), None, catalogue)
+            .unwrap();
+        cache.invalidate_after_overflow();
+        assert_eq!(cache.catalogue_count(), 0);
+        assert_eq!(cache.stats().reserved_catalogue_bytes, 0);
     }
 }

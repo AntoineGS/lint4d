@@ -250,6 +250,32 @@ mod tests {
     }
 
     #[test]
+    fn an_event_drops_a_catalogue_this_request_already_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        write(&root.join("sub/A.pas"));
+        let mut view = workspace(&root);
+        view.filename_catalogue(&root);
+        write(&root.join("sub/New.pas"));
+        assert!(
+            view.filename_catalogue(&root)
+                .pascal_files_named("new.pas")
+                .next()
+                .is_none(),
+            "validated this request: no stamp check"
+        );
+        view.project_cache()
+            .invalidate_path(&root.join("sub/New.pas"));
+        assert!(
+            view.filename_catalogue(&root)
+                .pascal_files_named("new.pas")
+                .next()
+                .is_some(),
+            "the event dropped the catalogue"
+        );
+    }
+
+    #[test]
     fn worker_views_share_one_catalogue_and_list_nothing_the_second_time() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();

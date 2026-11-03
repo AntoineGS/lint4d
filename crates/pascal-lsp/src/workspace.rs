@@ -4673,7 +4673,6 @@ impl Workspace {
             }
         }
         let metadata_owners = self.invalidate_metadata_for_uri(uri, cancel, budget)?;
-        self.invalidate_directory_for_uri(uri);
         if self.open_documents.contains_key(uri) {
             // The editor buffer remains authoritative until didClose.
             self.schedule_diagnostics(uri.clone());
@@ -11512,8 +11511,6 @@ impl Workspace {
         let owners = self.invalidate_contexts_with_control(&affected, cancel, budget)?;
         Ok(owners)
     }
-
-    fn invalidate_directory_for_uri(&mut self, _uri: &Url) {}
 
     fn ensure_supported_with_context(&self, uri: &Url, key: &ContextKey) -> bool {
         let Ok(path) = uri.to_file_path() else {

@@ -431,6 +431,26 @@ fn assembler_labels_and_escaped_identifiers_are_not_keywords() {
     );
 }
 
+/// l4d-4nbs R11: ZLib.pas declares `EZLibError = class(Exception);`, a
+/// class with a heritage list and no body, which left its scope open.
+#[test]
+fn bodiless_classes_with_a_heritage_list_close_their_scope() {
+    let source = "unit T; interface \
+         type \
+           EBase = class(Exception); \
+           EDerived = class(EBase); \
+           TImpl = class(TInterfacedObject, IUnknown); \
+           TFull = class(TObject) procedure Run; end; \
+         const After = 1; \
+         {$IF Declared(After) and Declared(EDerived) and Declared(TFull)}{$DEFINE SEEN}{$ENDIF} \
+         implementation end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
+}
+
 /// Test-only harness (l4d-4nbs R11): analyse the real units listed in
 /// `L4D_SCAN_FILES` (separated by `;`) and report every incomplete reason.
 /// Includes are served from the unit's directory and `L4D_SCAN_INCLUDES`.

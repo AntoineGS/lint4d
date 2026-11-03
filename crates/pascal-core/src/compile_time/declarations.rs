@@ -103,6 +103,9 @@ pub struct CompileTimeState {
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// A composite header's heritage list opened at this paren level
+    /// (`class(Exception)`): a `;` right after it ends a bodiless class.
+    class_heritage: Option<usize>,
     parens: usize,
     implementation: bool,
     finished: bool,
@@ -247,6 +250,7 @@ impl CompileTimeState {
             composite_depth: 0,
             rhs: false,
             pending_class: false,
+            class_heritage: None,
             parens: 0,
             implementation: false,
             finished: false,
@@ -453,6 +457,7 @@ impl CompileTimeState {
         self.pending_start = self.logical;
         self.rhs = false;
         self.pending_class = false;
+        self.class_heritage = None;
     }
 
     fn lex_char(
@@ -549,6 +554,12 @@ impl CompileTimeState {
                 header.composites -= 1;
             }
         }
+        if ch == ';' && self.class_heritage == Some(self.parens) {
+            // `EBase = class(Exception);` declares no members.
+            self.class_heritage = None;
+            self.composite_depth = self.composite_depth.saturating_sub(1);
+            self.stack.pop();
+        }
         if ch == ';' && self.pending_class {
             // A bare composite header is retained as unsupported, not treated
             // as an unterminated body. The parser alone admits its syntax.
@@ -569,6 +580,9 @@ impl CompileTimeState {
             '/' => self.lex = Lex::Slash,
             '(' => {
                 self.lex = Lex::Paren;
+                if self.pending_class {
+                    self.class_heritage = Some(self.parens);
+                }
                 self.pending_class = false;
             }
             ')' => self.parens = self.parens.saturating_sub(1),
@@ -703,6 +717,10 @@ impl CompileTimeState {
             return Ok(());
         }
         budget.charge(1, self.word.len(), 0)?;
+        if self.class_heritage == Some(self.parens) {
+            // A member or `end` follows the heritage list: the class has a body.
+            self.class_heritage = None;
+        }
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
         let result = if std::mem::take(&mut self.escaped_word) {
@@ -1536,6 +1554,7 @@ impl CompileTimeState {
         self.unknown.hash(&mut h);
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
+        self.class_heritage.hash(&mut h);
         self.failure.hash(&mut h);
         self.option_stack.len().hash(&mut h);
         for saved in &self.option_stack {

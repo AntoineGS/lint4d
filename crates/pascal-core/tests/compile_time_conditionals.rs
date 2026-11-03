@@ -1643,3 +1643,20 @@ fn digit_leading_conditional_symbols_are_defined_and_tested() {
     let analysis = fixture.analyze().unwrap();
     assert!(analysis.root.complete, "{:?}", analysis.reasons);
 }
+
+/// l4d-4nbs R12: the VCL's legacy switches `{$P+,S-,W-,…}` and
+/// `{$C PRELOAD}` are harmless, and `{$C PRELOAD}` does not claim to know
+/// the assertions switch.
+#[test]
+fn legacy_vcl_switches_are_harmless() {
+    for keyword in ["P+", "S-", "W-", "C"] {
+        assert!(
+            pascal_core::conditional::is_harmless_directive_keyword(keyword),
+            "{keyword}"
+        );
+    }
+    let source = "unit T; interface {$P+,S-,W-,R-,T-,H+,X+}{$C PRELOAD}{$IFOPT C+}const A = 1;{$ENDIF} implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}

@@ -13256,6 +13256,15 @@ mod tests {
         }
     }
 
+    /// l4d-4nbs R12: Controls.pas and Forms.pas open with
+    /// `{$P+,S-,W-,R-,T-,H+,X+}` and `{$C PRELOAD}`.
+    #[test]
+    fn legacy_vcl_switches_are_harmless() {
+        for body in ["P+,S-,W-,R-,T-,H+,X+", "C PRELOAD", "P-", "S+", "W+", "C-"] {
+            assert_eq!(directive_kind(body), DirectiveKind::Harmless, "{body}");
+        }
+    }
+
     #[test]
     fn include_revalidation_requires_recorded_payload_authorization() {
         let temp = tempfile::tempdir().expect("temporary directory");

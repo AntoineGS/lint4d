@@ -5556,6 +5556,17 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "designonly"
             | "runonly"
             | "implicitbuild"
+            // Legacy single-letter switches (Controls.pas and Forms.pas open
+            // with `{$P+,S-,W-,…}` and `{$C PRELOAD}`): `P` is `OPENSTRINGS`
+            // and `W` is `STACKFRAMES` (both listed above), `S` is stack
+            // checking, a code generation switch, and `C` is `ASSERTIONS`,
+            // whose Win16 `{$C MOVEABLE PRELOAD …}` segment form DCC ignores.
+            // None changes parsing or name binding; `C` stays a tracked
+            // `$IFOPT` option through `supported_option_name`, like `R`.
+            | "c"
+            | "p"
+            | "s"
+            | "w"
     )
 }
 

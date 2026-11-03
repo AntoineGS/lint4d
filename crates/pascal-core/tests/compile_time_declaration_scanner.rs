@@ -502,8 +502,10 @@ fn scan_real_units_from_the_environment() {
         match f.analyze() {
             Ok(analysis) => {
                 eprintln!(
-                    "{file}: complete={} {:?}",
-                    analysis.root.complete, analysis.reasons
+                    "{file}: complete={} {:?} {:?}",
+                    analysis.root.complete,
+                    analysis.reasons,
+                    analysis.budget.budget_snapshot()
                 );
                 if !analysis.reasons.is_empty() {
                     failures.push(file.to_owned());

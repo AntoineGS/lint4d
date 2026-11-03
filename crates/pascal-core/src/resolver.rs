@@ -48,6 +48,8 @@ struct SourceCredit {
     validation: bool,
     /// The lexical-only import estimate was funded.
     lexical: bool,
+    /// A full read (unit lookup load) was funded.
+    load: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1664,6 +1666,11 @@ struct StoreCache {
     include_seen: HashSet<OwnedLoadedKey>,
     include_seen_capacity: Option<AdmittedOwned<()>>,
     directory_capacity: Option<AdmittedOwned<()>>,
+    /// l4d-4nbs R13: listings reusable within the session, with the receipt
+    /// of their key's storage.
+    reuse: HashMap<DirectoryReuseKey, (AdmittedOwned<()>, AdmittedShared<DirectoryListing>)>,
+    reuse_capacity: Option<AdmittedOwned<()>>,
+    reuse_policy: Option<ReadPolicy>,
     recorded_work: usize,
     recorded_byte_work: usize,
 }
@@ -1926,6 +1933,57 @@ impl StoreCache {
         let old = self.directories.remove_entry(&*key.0);
         drop(old);
         self.directories.insert(key, listing);
+        Ok(())
+    }
+}
+
+impl StoreCache {
+    /// Keep `listing` for reuse within this session. Refused retained bytes
+    /// only stop caching.
+    fn insert_reusable(
+        &mut self,
+        key: DirectoryReuseKey,
+        policy: &ReadPolicy,
+        listing: AdmittedShared<DirectoryListing>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        if self.reuse_policy.as_ref().is_some_and(|p| p != policy) {
+            return Ok(());
+        }
+        let mut key_bytes = 2 * key.path.as_os_str().len();
+        key.entry
+            .visit_recovery_payload(&mut |n| {
+                key_bytes = key_bytes.saturating_add(n);
+                Ok(())
+            })
+            .map_err(|_| crate::compile_time::IncompleteReason::MalformedSource)?;
+        if self.reuse_policy.is_none() {
+            let mut policy_bytes = 0usize;
+            policy
+                .visit_owned_clone_payload(&mut |n| {
+                    policy_bytes = policy_bytes.saturating_add(n);
+                    Ok(())
+                })
+                .map_err(|_| crate::compile_time::IncompleteReason::MalformedSource)?;
+            key_bytes = key_bytes.saturating_add(policy_bytes);
+        }
+        if self.reuse.len() == self.reuse.capacity() {
+            let count = (self.reuse.len() + 1).next_power_of_two().max(4);
+            let bytes = count.saturating_mul(2).saturating_mul(
+                std::mem::size_of::<(
+                    DirectoryReuseKey,
+                    (AdmittedOwned<()>, AdmittedShared<DirectoryListing>),
+                )>() + 1,
+            );
+            let capacity = budget.admit_owned(1, 0, bytes, || ())?;
+            self.reuse.reserve(count - self.reuse.len());
+            self.reuse_capacity = Some(capacity);
+        }
+        let receipt = budget.admit_owned(1, key_bytes, key_bytes, || ())?;
+        if self.reuse_policy.is_none() {
+            self.reuse_policy = Some(policy.clone());
+        }
+        self.reuse.insert(key, (receipt, listing));
         Ok(())
     }
 }
@@ -2263,6 +2321,40 @@ impl<S: SourceStore> UnitResolver<S> {
         if bytes {
             self.compile_time_byte_work_allowance =
                 self.compile_time_byte_work_allowance.saturating_add(cost);
+        }
+        true
+    }
+
+    /// Whether the full read of `source` by a unit or include lookup is
+    /// funded: the first time per distinct source in this request, crediting
+    /// the request what it cost. A provider scan reads only its interface and
+    /// is granted that prefix, but the lookup read the whole file (l4d-4nbs
+    /// R13). Later reads of the same source are paid.
+    fn credit_compile_time_load(
+        &mut self,
+        source: &LoadedSource,
+        work: usize,
+        bytes: usize,
+    ) -> bool {
+        let enabled = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if enabled == (false, false) {
+            return false;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.load {
+            return false;
+        }
+        credit.load = true;
+        if enabled.0 {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(work);
+        }
+        if enabled.1 {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(bytes);
         }
         true
     }
@@ -5629,6 +5721,39 @@ impl<S: SourceStore> UnitResolver<S> {
                 canonical_path(directory)
             })
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        // Reuse this session's listing only while the directory is proven
+        // unchanged: its listing stamp was settled and equals a stamp taken
+        // now (`ProjectReadStamp::proves_unchanged`). A changed, unsettled or
+        // incomplete directory is listed again. The reused listing was
+        // charged, and counted against the entry limit, when it was read.
+        let mut probe_bytes = 2 * canonical.as_os_str().len();
+        entry
+            .visit_recovery_payload(&mut |n| {
+                probe_bytes = probe_bytes.saturating_add(n);
+                Ok(())
+            })
+            .map_err(ResolverError::InvalidRequest)?;
+        let probe = budget
+            .admit_owned(1, probe_bytes, probe_bytes, || DirectoryReuseKey {
+                path: path_identity::path_lookup_key(&canonical),
+                entry: entry.clone(),
+                missing_is_incomplete,
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        if let Some(listing) = self.reusable_directory(&probe, &canonical, &mut budget)? {
+            self.record_observation_build(
+                report_path_payload(&canonical, Some(entry)),
+                cancel,
+                || ResolutionObservation::Directory {
+                    path: (*canonical).clone(),
+                    entry: entry.clone(),
+                    stamp: listing.stamp.clone(),
+                    complete: true,
+                    listed: true,
+                },
+            )?;
+            return Ok(DirectoryAccess::Admitted(listing));
+        }
         let mut key_bytes = canonical
             .as_os_str()
             .len()
@@ -5658,25 +5783,6 @@ impl<S: SourceStore> UnitResolver<S> {
                 })
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
         );
-        // Reuse this session's listing only while the directory is proven
-        // unchanged: its listing stamp was settled and equals a stamp taken
-        // now (`ProjectReadStamp::proves_unchanged`). A changed, unsettled or
-        // incomplete directory is listed again. The reused listing was
-        // charged, and counted against the entry limit, when it was read.
-        if let Some(listing) = self.reusable_directory(&key, &canonical, &mut budget)? {
-            self.record_observation_build(
-                report_path_payload(&canonical, Some(entry)),
-                cancel,
-                || ResolutionObservation::Directory {
-                    path: (*canonical).clone(),
-                    entry: entry.clone(),
-                    stamp: listing.stamp.clone(),
-                    complete: true,
-                    listed: true,
-                },
-            )?;
-            return Ok(DirectoryAccess::Admitted(listing));
-        }
         // Neither this request nor callbacks hold the lock.
         let result = self.store.list_directory_admitted(
             DirectoryRequest {
@@ -5745,6 +5851,27 @@ impl<S: SourceStore> UnitResolver<S> {
         if cacheable && complete {
             // The cache is an optimization: when its retained bytes are not
             // admitted, the listing is simply not kept.
+            if caller.stamp.as_ref().is_some_and(|stamp| stamp.settled)
+                && let Ok(reusable) = caller.try_clone(&mut budget)
+            {
+                let root = self
+                    .compile_time_store
+                    .as_ref()
+                    .expect("typed directory call");
+                let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                let policy = self.context.read_policy();
+                match cache.value_mut().insert_reusable(
+                    (*probe).clone(),
+                    policy,
+                    reusable,
+                    &mut budget,
+                ) {
+                    Ok(()) | Err(crate::compile_time::IncompleteReason::Limit { .. }) => {}
+                    Err(reason) => {
+                        return Err(crate::compile_time::resolver_error(reason, &budget));
+                    }
+                }
+            }
             if let Ok(cached) = caller.try_clone(&mut budget) {
                 let root = self
                     .compile_time_store
@@ -5768,7 +5895,7 @@ impl<S: SourceStore> UnitResolver<S> {
     /// unchanged since it was listed.
     fn reusable_directory(
         &self,
-        key: &OwnedDirectoryKey,
+        probe: &DirectoryReuseKey,
         canonical: &Path,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Option<AdmittedShared<DirectoryListing>>, ResolverError> {
@@ -5776,16 +5903,19 @@ impl<S: SourceStore> UnitResolver<S> {
             .compile_time_store
             .as_ref()
             .expect("typed directory call");
+        budget
+            .charge(8, 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
         let cached = {
             let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            match cache.directories.get(&*key.0) {
-                Some(listing) if listing.complete && listing.is_admitted_by(budget) => {
+            if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+                return Ok(None);
+            }
+            match cache.reuse.get(probe) {
+                Some((_, listing)) if listing.complete && listing.is_admitted_by(budget) => {
                     let Some(stamp) = listing.stamp.clone() else {
                         return Ok(None);
                     };
-                    if !stamp.settled {
-                        return Ok(None);
-                    }
                     match listing.try_clone(budget) {
                         Ok(listing) => (listing, stamp),
                         Err(_) => return Ok(None),
@@ -5878,7 +6008,11 @@ impl<S: SourceStore> UnitResolver<S> {
             kind,
             max_bytes,
         };
-        let mut loaded = if let Some(mut budget) = self.store_budget(cancel) {
+        let reused = self.reusable_loaded(&path, &entry, stamp.as_ref(), max_bytes, cancel)?;
+        let before_load = self.store_budget(cancel).map(|budget| budget.snapshot());
+        let mut loaded = if let Some(reused) = reused {
+            reused
+        } else if let Some(mut budget) = self.store_budget(cancel) {
             self.store.load_admitted(request, &mut budget, cancel)?
         } else {
             self.store.load(request, cancel)?
@@ -5904,6 +6038,18 @@ impl<S: SourceStore> UnitResolver<S> {
         let prepared_cache = if let Some(mut budget) = self.store_budget(cancel) {
             let cached = loaded.admitted_copy(&mut budget)?;
             let key = loaded_cache_key(&loaded.id, &mut budget)?;
+            // The read, decode and copy are proportional to the whole file,
+            // which a lookup must read: funded once per distinct source.
+            if let Some(before) = before_load {
+                let after = budget.snapshot();
+                let work = after.work.saturating_sub(before.work);
+                let bytes = after.byte_work.saturating_sub(before.byte_work);
+                if self.credit_compile_time_load(&loaded, work, bytes) {
+                    budget
+                        .fund_charged(work, bytes)
+                        .map_err(|r| store_admission_error(r, &budget))?;
+                }
+            }
             Some((key, cached))
         } else {
             None
@@ -5983,6 +6129,42 @@ impl<S: SourceStore> UnitResolver<S> {
             loaded,
             cached: prepared_cache,
         })
+    }
+
+    /// This session's read of `path`, if the file is proven unchanged since
+    /// (its settled read stamp equals `current`) and it was read through the
+    /// same entry and read policy (l4d-4nbs R13). Another lookup of the same
+    /// unit then shares the payload instead of reading the file again.
+    fn reusable_loaded(
+        &self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        current: Option<&ProjectReadStamp>,
+        max_bytes: usize,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Option<LoadedSource>, SourceStoreError> {
+        let (Some(current), Some(root)) = (current, self.compile_time_store.as_ref()) else {
+            return Ok(None);
+        };
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        budget
+            .charge(cache.loaded.len() + 1, 0, 0)
+            .map_err(|r| store_admission_error(r, &budget))?;
+        let Some(source) = cache.loaded.values().find(|source| {
+            source.path == path
+                && source.bytes.len() <= max_bytes
+                && matches!(
+                    &source.revision,
+                    SourceRevision::Disk { stamp, read_policy, path_entry, .. }
+                        if stamp.proves_unchanged(current)
+                            && path_entry == entry
+                            && read_policy == self.context.read_policy()
+                )
+        }) else {
+            return Ok(None);
+        };
+        source.admitted_copy(&mut budget).map(Some)
     }
 
     fn source_request_scratch(
@@ -8390,6 +8572,16 @@ impl<T> std::ops::Deref for LookupScratch<T> {
             Self::Admitted(value) => value,
         }
     }
+}
+
+/// A session listing reuse key. The session's read policy is constant and
+/// checked once (`StoreCache::reuse_policy`), so a reuse probe does not clone
+/// it per lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectoryReuseKey {
+    path: PathBuf,
+    entry: ProjectPathEntry,
+    missing_is_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -12644,27 +12836,33 @@ mod tests {
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
             (spent.work, peak)
         }
-        let (work, peak) = run(CompileTimeLimits::default(), false);
+        // Fixed limits: a funded read (l4d-4nbs R13) would raise the cap.
+        let fixed = CompileTimeLimits {
+            work_per_source_byte: 0,
+            byte_work_per_source_byte: 0,
+            ..CompileTimeLimits::default()
+        };
+        let (work, peak) = run(fixed, false);
         // Full three-entry receivers: seen preparation spends 2 hash + 3
         // sizing + 4 construction units after loaded preparation completes.
         run(
             CompileTimeLimits {
                 max_work: work - 10,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
         run(
             CompileTimeLimits {
                 max_work: work - 1,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
         run(
             CompileTimeLimits {
                 max_retained_bytes: peak - 1,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
@@ -14504,13 +14702,19 @@ mod tests {
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
             (spent.work, peak)
         }
+        // Fixed limits: a funded read (l4d-4nbs R13) would raise the cap.
+        let fixed = CompileTimeLimits {
+            work_per_source_byte: 0,
+            byte_work_per_source_byte: 0,
+            ..CompileTimeLimits::default()
+        };
         for growth in [false, true] {
-            let (work, peak) = run(growth, CompileTimeLimits::default(), false, true);
+            let (work, peak) = run(growth, fixed, false, true);
             run(
                 growth,
                 CompileTimeLimits {
                     max_work: work - 1,
-                    ..Default::default()
+                    ..fixed
                 },
                 true,
                 true,
@@ -14522,7 +14726,7 @@ mod tests {
                     false,
                     CompileTimeLimits {
                         max_work: work - 4,
-                        ..Default::default()
+                        ..fixed
                     },
                     true,
                     false,
@@ -14533,7 +14737,7 @@ mod tests {
                     growth,
                     CompileTimeLimits {
                         max_retained_bytes: peak - 1,
-                        ..Default::default()
+                        ..fixed
                     },
                     true,
                     true,

@@ -264,6 +264,29 @@ impl<'a> CompileTimeBudget<'a> {
         }
     }
 
+    /// Grant `work` and `byte_work` already charged for input the session had
+    /// to consume whole (a funded read), leaving nothing for other work.
+    /// Limits without per-byte grants (factor 0) fund nothing.
+    pub(crate) fn fund_charged(
+        &mut self,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: if self.limits.work_per_source_byte > 0 {
+                work
+            } else {
+                0
+            },
+            byte_work: if self.limits.byte_work_per_source_byte > 0 {
+                byte_work
+            } else {
+                0
+            },
+        };
+        self.charge_granted(grant, 0, 0)
+    }
+
     fn charge_granted(
         &mut self,
         grant: Allowance,

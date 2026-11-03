@@ -18,6 +18,18 @@ fn resolver_with(
     std::path::PathBuf,
     UnitResolver<FilesystemSourceStore>,
 ) {
+    resolver_retaining(root, files, 64 * 1024 * 1024)
+}
+
+fn resolver_retaining(
+    root: &str,
+    files: &[(&str, &str)],
+    retained: usize,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    UnitResolver<FilesystemSourceStore>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("T.pas");
     std::fs::write(&path, root).unwrap();
@@ -37,7 +49,7 @@ fn resolver_with(
         ResolverLimits {
             max_source_bytes: 16 * 1024 * 1024,
             // The LSP selects a retention cap derived from its file limits.
-            max_compile_time_retained_bytes: 64 * 1024 * 1024,
+            max_compile_time_retained_bytes: retained,
             ..ResolverLimits::default()
         },
     );
@@ -48,7 +60,15 @@ fn analyze_with(
     text: &str,
     files: &[(&str, &str)],
 ) -> (Result<bool, ResolverError>, BudgetSnapshot) {
-    let (_dir, path, mut resolver) = resolver_with(text, files);
+    analyze_retaining(text, files, 64 * 1024 * 1024)
+}
+
+fn analyze_retaining(
+    text: &str,
+    files: &[(&str, &str)],
+    retained: usize,
+) -> (Result<bool, ResolverError>, BudgetSnapshot) {
+    let (_dir, path, mut resolver) = resolver_retaining(text, files, retained);
     let mut source = support::loaded("T.pas", text);
     source.path = path;
     let result = resolver
@@ -533,4 +553,38 @@ fn the_session_after_a_probe_keeps_the_grant_of_the_probed_bytes() {
         report.incomplete_reasons,
         resolver.compile_time_usage()
     );
+}
+
+/// l4d-4nbs R13: a unit lookup reads its candidate whole, though a provider
+/// scan reads only its interface, so it is granted only that prefix.
+/// BaseRECORDLOCK's session spent 38M of byte work on 42 such reads with no
+/// grant. The first full read of each distinct source in the request is
+/// funded, as raw UTF-8 validation is.
+#[test]
+fn full_reads_of_looked_up_providers_are_funded_once() {
+    let units = 60;
+    let body = (0..12_000)
+        .map(|n| format!("procedure P{n}; begin end;\n"))
+        .collect::<String>();
+    let files = (0..units)
+        .map(|u| {
+            (
+                format!("U{u}.pas"),
+                format!("unit U{u}; interface const C{u} = {u}; implementation\n{body}end."),
+            )
+        })
+        .collect::<Vec<_>>();
+    let uses = (0..units)
+        .map(|u| format!("U{u}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let root = format!(
+        "unit T; interface uses {uses}; implementation {{$IF CompilerVersion > 21.0}}{{$DEFINE HIT}}{{$IFEND}} end."
+    );
+    let files = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect::<Vec<_>>();
+    let (result, usage) = analyze_retaining(&root, &files, 512 * 1024 * 1024);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
 }

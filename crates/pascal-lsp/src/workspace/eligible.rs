@@ -181,7 +181,7 @@ impl Workspace {
         budget: &mut FactBudget,
         cancel: &AtomicBool,
     ) -> Result<Eligible<MemberRecord>, Ineligible> {
-        let (state, path) = self.member_site(uri)?;
+        let (state, path) = self.member_site(uri, self.document_contexts.get(uri))?;
         let prepared = if self.root_over_size_limit(&path, &state.context) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Ineligible::Artifact(PersistError::Cancelled));
@@ -228,7 +228,7 @@ impl Workspace {
         }
         let record = MemberRecord {
             header: MemberHeader {
-                source: member_source(path, uri),
+                source: member_source(path),
                 artifact,
                 member_evidence,
                 origin,
@@ -256,10 +256,7 @@ impl Workspace {
     ) -> Result<Eligible<MemberRecord>, Ineligible> {
         let uri = Url::from_file_path(inputs.path)
             .map_err(|()| Ineligible::Artifact(PersistError::NotIndexed))?;
-        let (state, _) = self.member_site(&uri)?;
-        if self.document_contexts.get(&uri) != Some(key) {
-            return Err(Ineligible::NoContext);
-        }
+        let (state, _) = self.member_site(&uri, Some(key))?;
         let record = member_record(inputs);
         record.validate().map_err(Ineligible::Record)?;
         Ok(Eligible {
@@ -270,15 +267,18 @@ impl Workspace {
     }
 
     /// The checks `eligible_member` and `eligible_indexed_member` share:
-    /// `uri` is no session-private root, belongs to a known context, and is
-    /// a file; returns that context's state and the file path.
-    fn member_site(&self, uri: &Url) -> Result<(&super::ContextState, PathBuf), Ineligible> {
+    /// `uri` is no session-private root, `key` (the caller's choice of
+    /// context) is a known context, and `uri` is a file; returns that
+    /// context's state and the file path.
+    fn member_site(
+        &self,
+        uri: &Url,
+        key: Option<&ContextKey>,
+    ) -> Result<(&super::ContextState, PathBuf), Ineligible> {
         if self.root_is_session_private(uri) {
             return Err(Ineligible::SessionPrivate(uri.clone()));
         }
-        let state = self
-            .document_contexts
-            .get(uri)
+        let state = key
             .and_then(|key| self.contexts.get(key))
             .ok_or(Ineligible::NoContext)?;
         let path = uri
@@ -380,13 +380,15 @@ impl Workspace {
     }
 }
 
-fn member_source(path: PathBuf, uri: &Url) -> SourceIdentity {
+/// The one construction of a member's source identity.
+fn member_source(path: PathBuf) -> SourceIdentity {
     let canonical = super::absolute_path(path);
+    let uri = Url::from_file_path(&canonical).ok();
     SourceIdentity {
         canonical: canonical.clone(),
         logical: canonical,
         spelling: None,
-        uri: Some(uri.to_string()),
+        uri: uri.map(|uri| uri.to_string()),
     }
 }
 
@@ -411,8 +413,6 @@ pub(crate) struct RecordInputs<'a> {
 /// The member record `inputs` derive: bindings are not recorded (each is
 /// `Incomplete(NotRecorded)`), imports by ID then includes by slot.
 pub(crate) fn member_record(inputs: &RecordInputs<'_>) -> MemberRecord {
-    let canonical = super::absolute_path(inputs.path.to_path_buf());
-    let uri = Url::from_file_path(&canonical).ok();
     let has_unit = inputs.facts.is_some_and(|facts| {
         facts
             .declarations
@@ -482,12 +482,7 @@ pub(crate) fn member_record(inputs: &RecordInputs<'_>) -> MemberRecord {
     };
     MemberRecord {
         header: MemberHeader {
-            source: SourceIdentity {
-                canonical: canonical.clone(),
-                logical: canonical,
-                spelling: None,
-                uri: uri.map(|uri| uri.to_string()),
-            },
+            source: member_source(inputs.path.to_path_buf()),
             artifact: inputs.artifact,
             member_evidence: inputs.member_evidence,
             origin: inputs.origin,
@@ -1557,5 +1552,58 @@ pub(in crate::workspace) mod tests {
             .eligible_indexed_member(&key, &inputs(&path, None, Some(Unindexed::NotRecorded)))
             .unwrap();
         assert_eq!(eligible.value().header.source.canonical, path);
+    }
+
+    /// D31: an index member is reused and recorded under the index
+    /// context's key, whatever the workspace holds as document contexts.
+    #[test]
+    fn an_indexed_member_takes_its_context_from_the_given_key() {
+        use crate::project_cache::IndexAnchor;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for (name, bytes) in [
+            ("lib/Main.pas", MAIN.as_bytes()),
+            (
+                "app/App.dproj",
+                b"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>"
+                    as &[u8],
+            ),
+            ("app/App.dpr", b"program App; begin end.\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let uri = Url::from_file_path(root.join("lib/Main.pas")).unwrap();
+        let plain = Workspace::with_override_session(
+            vec![root.clone()],
+            Default::default(),
+            crate::workspace::OverrideSession::new(None),
+        );
+        let mut workspace = Workspace::from_analysis_input(&plain.analysis_input());
+        let key = workspace
+            .index_context_for(
+                &IndexAnchor::Project(root.join("app/App.dproj")),
+                &no_cancel(),
+            )
+            .unwrap();
+        assert!(!workspace.document_contexts.contains_key(&uri));
+        let expected = CacheContextKey::new(&workspace.contexts[&key].context);
+        let path = root.join("lib/Main.pas");
+        let record_inputs = inputs(&path, None, Some(Unindexed::NotRecorded));
+        let without_entry = workspace
+            .eligible_indexed_member(&key, &record_inputs)
+            .unwrap();
+        assert_eq!(without_entry.context(), &expected);
+        let stranger = index(&[("Cond.pas", CONDITIONAL)], &["Cond.pas"]);
+        let owner = stranger.workspace.document_contexts[&stranger.uri("Cond.pas")].clone();
+        assert_ne!(owner, key, "the document names another context");
+        workspace.document_contexts.insert(uri.clone(), owner);
+        let other_entry = workspace
+            .eligible_indexed_member(&key, &record_inputs)
+            .unwrap();
+        assert_eq!(other_entry.context(), &expected);
+        assert_eq!(other_entry.value(), without_entry.value());
     }
 }

@@ -381,3 +381,101 @@ fn anonymous_methods_in_initialization_and_finalization() {
     assert_eq!(activity(&analysis, "DEFINE INIT"), Truth::True);
     assert_eq!(activity(&analysis, "DEFINE FINAL"), Truth::True);
 }
+
+/// l4d-4nbs R11: SysUtils.FloatToTextFmt has a `var` section and an `asm`
+/// body whose labels (`@@1:`) looked like the type of a variable, so its
+/// `end` was skipped and every later routine nested one scope deeper.
+#[test]
+fn assembler_routine_with_local_variables_and_labels() {
+    assert_scans_completely(
+        "function Low: Integer; var Count: Integer; \
+         asm \
+         @@1: MOV EAX, Count \
+         DEC EAX \
+         JNZ @@1 \
+         end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
+/// An `asm` statement inside a `begin` block ends with its own `end`.
+#[test]
+fn assembler_statement_inside_a_routine_body() {
+    assert_scans_completely(
+        "procedure Wait; var Count: Integer; \
+         begin \
+           asm @@1: PAUSE \
+           DEC Count \
+           JNZ @@1 end; \
+           if Count = 0 then asm NOP end; \
+         end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
+/// Test-only harness (l4d-4nbs R11): analyse the real units listed in
+/// `L4D_SCAN_FILES` (separated by `;`) and report every incomplete reason.
+/// Includes are served from the unit's directory and `L4D_SCAN_INCLUDES`.
+#[test]
+#[ignore = "reads local Delphi sources named by L4D_SCAN_FILES"]
+fn scan_real_units_from_the_environment() {
+    let files = std::env::var("L4D_SCAN_FILES").unwrap_or_default();
+    let extra = std::env::var("L4D_SCAN_INCLUDES").unwrap_or_default();
+    let mut failures = Vec::new();
+    for file in files.split(';').filter(|f| !f.is_empty()) {
+        let path = std::path::Path::new(file);
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        let mut ctx = context(LayoutPlatform::Win32)
+            .with_compiler_version(pascal_project::CompilerVersion::new(21, 0));
+        for define in [
+            "MSWINDOWS",
+            "WIN32",
+            "CPU386",
+            "VER210",
+            "CONDITIONALEXPRESSIONS",
+        ] {
+            ctx.set_define(define, pascal_project::ConditionalFact::True);
+        }
+        ctx = ctx.with_absent_define(pascal_project::ConditionalFact::False);
+        let mut f = Fixture::new(&text, ctx);
+        f.limits.max_retained_bytes = 256 * 1024 * 1024;
+        let dirs = std::iter::once(path.parent().unwrap().to_path_buf())
+            .chain(extra.split(';').filter(|d| !d.is_empty()).map(Into::into));
+        for dir in dirs {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.to_ascii_lowercase().ends_with(".inc") {
+                    let body =
+                        String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).into_owned();
+                    // The fixture matches spellings exactly (`GETMEM.INC`).
+                    let stem = &name[..name.len() - 4];
+                    for spelling in [
+                        name.clone(),
+                        name.to_ascii_lowercase(),
+                        name.to_ascii_uppercase(),
+                        format!("{stem}.INC"),
+                        format!("{stem}.inc"),
+                    ] {
+                        f.include(&spelling, &body);
+                    }
+                }
+            }
+        }
+        match f.analyze() {
+            Ok(analysis) => {
+                eprintln!(
+                    "{file}: complete={} {:?}",
+                    analysis.root.complete, analysis.reasons
+                );
+                if !analysis.reasons.is_empty() {
+                    failures.push(file.to_owned());
+                }
+            }
+            Err(error) => {
+                eprintln!("{file}: error {error}");
+                failures.push(file.to_owned());
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}

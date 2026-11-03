@@ -753,10 +753,13 @@ impl CompileTimeState {
             self.hide_scope_declarations();
             return Ok(());
         }
+        // `asm` is reserved: it never continues a declaration, even when an
+        // assembler label's `:` follows a `var` section.
         if matches!(
             self.section,
             Section::Types | Section::Vars | Section::Consts
         ) && self.rhs
+            && word != "asm"
         {
             if self.pending_class {
                 if matches!(word, "abstract" | "sealed") {
@@ -841,8 +844,10 @@ impl CompileTimeState {
                     self.pending_start += start;
                 }
             }
-            "begin" | "try" | "case" | "repeat" => {
-                let kind = if word == "begin"
+            // An `asm` block is closed by `end` like `begin`: a routine's
+            // assembler body, or an assembler statement.
+            "begin" | "asm" | "try" | "case" | "repeat" => {
+                let kind = if matches!(word, "begin" | "asm")
                     && self.scopes[self.site().scope.0 as usize].kind == ScopeKind::Routine
                 {
                     ScopeKind::Body

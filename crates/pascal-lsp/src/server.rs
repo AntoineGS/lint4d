@@ -3762,6 +3762,12 @@ fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
         "maxFileBytes",
         "maxTotalBytes",
         "maxCacheBytes",
+        "maxWorkspaceUnits",
+        "persistentCacheEnabled",
+        "persistentCacheDirectory",
+        "persistentCachePageBytes",
+        "persistentCacheScratchBytes",
+        "persistentCacheWaitMs",
     ]
     .iter()
     .any(|key| object.contains_key(*key))
@@ -15563,6 +15569,25 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn bare_persistent_cache_settings_are_a_runtime_section() {
+        for key in [
+            "persistentCacheEnabled",
+            "persistentCacheDirectory",
+            "persistentCachePageBytes",
+            "persistentCacheScratchBytes",
+            "persistentCacheWaitMs",
+            "maxWorkspaceUnits",
+        ] {
+            let settings = serde_json::json!({ key: null });
+            assert_eq!(
+                super::runtime_settings_section(&settings),
+                Ok(Some(settings.clone())),
+                "{key}"
+            );
+        }
+    }
 
     #[test]
     fn workspace_notification_deadline_log_distinguishes_trigger_from_elapsed_time() {

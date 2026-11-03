@@ -492,12 +492,19 @@ fn filename_catalogue_entry_limit() -> usize {
     MAX_FILENAME_CATALOGUE_ENTRIES
 }
 
+/// Compact catalogue members per project/configuration (spec §8);
+/// `l4d-zf1b.8` is its first consumer.
+pub(crate) const DEFAULT_MAX_WORKSPACE_UNITS: usize = pascal_cache::MAX_SNAPSHOT_MEMBERS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
     pub max_cache_bytes: usize,
+    /// Compact catalogue members per project/configuration (spec §8);
+    /// `l4d-zf1b.8` is its first consumer.
+    pub max_workspace_units: usize,
 }
 
 impl Default for ResourceLimits {
@@ -507,6 +514,7 @@ impl Default for ResourceLimits {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+            max_workspace_units: DEFAULT_MAX_WORKSPACE_UNITS,
         }
     }
 }
@@ -545,6 +553,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
     pub(crate) max_cache_bytes: RuntimeOption<usize>,
+    pub(crate) max_workspace_units: RuntimeOption<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -559,6 +568,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -672,6 +682,7 @@ impl RuntimeOptionsUpdate {
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
             max_cache_bytes: RuntimeOption::Reset,
+            max_workspace_units: RuntimeOption::Reset,
         }
     }
 }
@@ -707,6 +718,9 @@ impl RuntimeOptionsOverride {
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
                 max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
                 max_cache_bytes: self.max_cache_bytes.unwrap_or(base.limits.max_cache_bytes),
+                max_workspace_units: self
+                    .max_workspace_units
+                    .unwrap_or(base.limits.max_workspace_units),
             },
         }
     }
@@ -764,11 +778,17 @@ impl RuntimeOptionsOverride {
             "maxCacheBytes",
             &mut warnings,
         );
+        apply_runtime_field(
+            &mut self.max_workspace_units,
+            update.max_workspace_units,
+            "maxWorkspaceUnits",
+            &mut warnings,
+        );
         warnings
     }
 }
 
-fn apply_runtime_field<T: Clone>(
+pub(crate) fn apply_runtime_field<T: Clone>(
     target: &mut Option<T>,
     value: RuntimeOption<T>,
     name: &str,
@@ -835,6 +855,11 @@ pub(crate) fn parse_runtime_options(
             object,
             "maxCacheBytes",
             crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+        ),
+        max_workspace_units: parse_runtime_limit(
+            object,
+            "maxWorkspaceUnits",
+            DEFAULT_MAX_WORKSPACE_UNITS,
         ),
     })
 }
@@ -1113,6 +1138,7 @@ struct RawWorkspaceOptions {
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
+    max_workspace_units: Option<usize>,
 }
 
 fn parse_conditional_context_values(
@@ -1300,6 +1326,10 @@ impl WorkspaceOptions {
                 crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
                 "maxCacheBytes",
             )?;
+        }
+        if let Some(value) = raw.max_workspace_units {
+            limits.max_workspace_units =
+                bounded_limit(value, 1, DEFAULT_MAX_WORKSPACE_UNITS, "maxWorkspaceUnits")?;
         }
         Ok(Self {
             source_paths: raw.source_paths,
@@ -23867,6 +23897,40 @@ BDS = '/fake/37'
     }
 
     #[test]
+    fn max_workspace_units_defaults_to_one_hundred_thousand() {
+        let options = WorkspaceOptions::parse(None).unwrap();
+        assert_eq!(options.limits.max_workspace_units, 100_000);
+    }
+
+    #[test]
+    fn max_workspace_units_is_configurable_downward_and_clamped() {
+        let parse = |value| WorkspaceOptions::parse(Some(&json!({"maxWorkspaceUnits": value})));
+        assert_eq!(parse(500).unwrap().limits.max_workspace_units, 500);
+        assert_eq!(parse(250_000).unwrap().limits.max_workspace_units, 100_000);
+        assert_eq!(
+            parse(0).unwrap_err(),
+            "initializationOptions.maxWorkspaceUnits must be at least 1"
+        );
+    }
+
+    #[test]
+    fn max_workspace_units_runtime_option_applies_keeps_and_resets() {
+        let base = WorkspaceOptions::default();
+        let mut runtime = super::RuntimeOptionsOverride::default();
+        runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 42})).unwrap());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        let warnings =
+            runtime.apply(super::parse_runtime_options(&json!({"maxWorkspaceUnits": 0})).unwrap());
+        assert_eq!(
+            warnings,
+            ["ignoring runtime maxWorkspaceUnits: must be at least 1"]
+        );
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 42);
+        runtime.apply(super::RuntimeOptionsUpdate::reset());
+        assert_eq!(runtime.effective(&base).limits.max_workspace_units, 100_000);
+    }
+
+    #[test]
     fn max_cache_bytes_initialization_option_sets_cache_budget() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let options = WorkspaceOptions::parse(Some(&json!({"maxCacheBytes": 1_048_576})))
@@ -25198,6 +25262,7 @@ BDS = '/fake/37'
                 max_file_bytes: source.len() + 3,
                 max_total_bytes: source.len() * 3,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };
@@ -25263,6 +25328,7 @@ BDS = '/fake/37'
                 max_file_bytes: 1024,
                 max_total_bytes: first_source.len() * 2 + second_source.len() * 2,
                 max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                max_workspace_units: super::DEFAULT_MAX_WORKSPACE_UNITS,
             },
             ..WorkspaceOptions::default()
         };

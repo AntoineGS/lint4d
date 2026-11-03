@@ -79,6 +79,7 @@ pub(crate) struct Validator<'a> {
     cancel: &'a AtomicBool,
     disk: FilesystemSourceStore,
     reads: usize,
+    held: Vec<(PathBuf, crate::workspace::PathStamp)>,
 }
 
 fn legacy(entry: &ProjectPathEntry) -> bool {
@@ -101,7 +102,14 @@ impl<'a> Validator<'a> {
             cancel,
             disk,
             reads: 0,
+            held: Vec::new(),
         }
+    }
+
+    /// The stamp taken before each payload that held (read or witnessed),
+    /// in check order.
+    pub(crate) fn held_payloads(&self) -> &[(PathBuf, crate::workspace::PathStamp)] {
+        &self.held
     }
 
     /// Payloads and listings read so far rather than witnessed.
@@ -178,6 +186,7 @@ impl<'a> Validator<'a> {
         };
         if let Some(Proven::Content(proven)) = self.inputs.cache.witness(path, &before) {
             return if proven == *content {
+                self.held.push((path.to_path_buf(), before));
                 Check::Holds
             } else {
                 stale(Stale::Content)
@@ -206,9 +215,10 @@ impl<'a> Validator<'a> {
         if path_stamp_result(path).ok().flatten().as_ref() == Some(&before) {
             self.inputs
                 .cache
-                .record_witness(path, before, Proven::Content(current));
+                .record_witness(path, before.clone(), Proven::Content(current));
         }
         if current == *content {
+            self.held.push((path.to_path_buf(), before));
             Check::Holds
         } else {
             stale(Stale::Content)
@@ -490,6 +500,48 @@ mod tests {
             fixture.absent("include/B.inc"),
         ]);
         assert_eq!(checks, vec![Check::Holds; 3]);
+    }
+
+    /// A7: the stamp a held payload reports is the one taken before its
+    /// bytes were read, so a rewrite after validation does not match it.
+    #[test]
+    fn include_stamps_are_taken_before_the_read() {
+        let fixture = fixture();
+        let path = fixture.root.join("include/A.inc");
+        let payload = fixture.payload();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(Arc::clone(&cancel));
+        let mut validator = Validator::new(
+            CurrentInputs {
+                context: &fixture.context,
+                read_policy: &fixture.policy,
+                overlays: &fixture.overlays,
+                deleted: &fixture.deleted,
+                cache: &fixture.cache,
+                max_file_bytes: 1 << 20,
+                directory_entries: 1024,
+            },
+            &budget,
+            &cancel,
+        );
+        assert!(validator.held_payloads().is_empty());
+        assert_eq!(validator.check(&fixture.listing()), Check::Holds);
+        assert_eq!(validator.check(&payload), Check::Holds);
+        let held = validator.held_payloads().to_vec();
+        assert_eq!(held.len(), 1, "only payloads are reported");
+        assert_eq!(held[0].0, path);
+        assert_eq!(Some(&held[0].1), path_stamp_result(&path).unwrap().as_ref());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"{$DEFINE B}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(5))
+            .unwrap();
+        let now = path_stamp_result(&path).unwrap().unwrap();
+        assert!(!held[0].1.proves_unchanged(&now));
+        assert_ne!(held[0].1, now);
     }
 
     #[test]

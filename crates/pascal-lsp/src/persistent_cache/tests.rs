@@ -773,6 +773,10 @@ fn record_reuse_counts_each_outcome_once_and_a_fenced_reuse_reopens() {
         },
         via: ReuseVia::Local,
         reads: 0,
+        artifact: pascal_cache::Digest::from_bytes([0; 32]),
+        evidence: None,
+        include_stamps: Vec::new(),
+        root_hash: 0,
     }));
     job.record_reuse(&Ok(Reuse::Miss(ReuseMiss::Open)));
     job.record_reuse(&Err(PersistError::Cancelled));

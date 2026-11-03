@@ -99,6 +99,8 @@ impl ContextKey {
         encoder.seq(context.project_unit_directories(), |encoder, directory| {
             encoder.encode(directory.as_path())
         });
+        encoder.field(29);
+        encoder.bool(context.unit_directories_unknown());
         Self(CanonicalKey::finish(KeyKind::Context, encoder))
     }
 

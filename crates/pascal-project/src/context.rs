@@ -144,6 +144,10 @@ pub struct ProjectContext {
     /// main source's directory, without caller source paths or IDE library
     /// paths: the directories whose units the project names as its own (D43).
     pub(crate) project_unit_directories: Vec<PathBuf>,
+    /// A `DCC_UnitSearchPath` entry depended on an undefined property's empty
+    /// expansion, so it was left out of `project_unit_directories` and a unit
+    /// no other way names may still be the project's own.
+    pub(crate) unit_directories_unknown: bool,
     pub(crate) config: Option<String>,
     pub(crate) platform: Option<String>,
     /// The selected build configuration and the `.dproj` configuration choices.
@@ -183,6 +187,10 @@ impl ProjectContext {
 
     pub fn project_unit_directories(&self) -> &[PathBuf] {
         &self.project_unit_directories
+    }
+
+    pub fn unit_directories_unknown(&self) -> bool {
+        self.unit_directories_unknown
     }
 
     pub fn installation_evidence(&self) -> &InstallationEvidence {
@@ -723,6 +731,7 @@ pub struct ProjectContextParts {
     pub library_conditional_context: ConditionalContext,
     pub project_source_roots: Vec<PathBuf>,
     pub project_unit_directories: Vec<PathBuf>,
+    pub unit_directories_unknown: bool,
     pub config: Option<String>,
     pub platform: Option<String>,
     pub config_selection: BuildSelection,
@@ -757,6 +766,7 @@ impl ProjectContext {
             library_conditional_context,
             project_source_roots,
             project_unit_directories,
+            unit_directories_unknown,
             config,
             platform,
             config_selection,
@@ -787,6 +797,7 @@ impl ProjectContext {
             library_conditional_context,
             project_source_roots,
             project_unit_directories,
+            unit_directories_unknown,
             config,
             platform,
             config_selection,
@@ -820,6 +831,7 @@ impl ProjectContext {
             library_conditional_context,
             project_source_roots,
             project_unit_directories,
+            unit_directories_unknown,
             config,
             platform,
             config_selection,
@@ -850,6 +862,7 @@ impl ProjectContext {
             library_conditional_context,
             project_source_roots,
             project_unit_directories,
+            unit_directories_unknown,
             config,
             platform,
             config_selection,

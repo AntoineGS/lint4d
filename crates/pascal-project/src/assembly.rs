@@ -598,8 +598,30 @@ pub(super) fn build_project_context(
     let option_base = relevant_workspace_root(file, roots)
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| project_dir.clone());
-    for (item, provenance) in builder.property_list_with_provenance("dcc_unitsearchpath") {
+    // D43: the directories the project names as its own leave out entries
+    // built on an undefined property's empty expansion.
+    let mut own_entries = vec![ProjectPathEntry::legacy(project_dir.clone())];
+    let mut unit_directories_unknown = false;
+    let empty_expansion_flags = builder.property_list_empty_expansion_flags("dcc_unitsearchpath");
+    for (index, (item, provenance)) in builder
+        .property_list_with_provenance("dcc_unitsearchpath")
+        .into_iter()
+        .enumerate()
+    {
         check_project_scan_cancel(cancel)?;
+        if empty_expansion_flags.get(index).copied().unwrap_or(false) {
+            unit_directories_unknown |= !item.trim().is_empty();
+        } else {
+            add_resolved_search_path_entry(
+                &item,
+                &project_dir,
+                &builder.overrides,
+                &mut own_entries,
+                &mut Vec::new(),
+                "DCC_UnitSearchPath",
+                provenance.clone(),
+            );
+        }
         add_resolved_search_path_entry(
             &item,
             &project_dir,
@@ -610,7 +632,7 @@ pub(super) fn build_project_context(
             provenance,
         );
     }
-    let mut project_unit_directories = paths_from_entries(&search_path_entries);
+    let mut project_unit_directories = paths_from_entries(&own_entries);
     if let Some(directory) = main_source_entry
         .as_ref()
         .and_then(|entry| entry.path.parent())
@@ -690,6 +712,7 @@ pub(super) fn build_project_context(
             &builder.configured_properties,
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
+            &builder.property_empty_expansions,
             &builder.unknown_properties,
             builder.undefined_is_empty(),
             &mut builder.warnings,
@@ -993,6 +1016,7 @@ pub(super) fn build_project_context(
             installation_selection,
             project_source_roots,
             project_unit_directories,
+            unit_directories_unknown,
             search_path_entries,
             browsing_path_entries: ide_paths.browsing,
             debug_dcu_path_entries: ide_paths.debug_dcu,
@@ -1128,6 +1152,7 @@ fn build_standalone_context(
             installation_selection: None,
             project_source_roots,
             project_unit_directories: Vec::new(),
+            unit_directories_unknown: false,
             search_path_entries,
             browsing_path_entries: Vec::new(),
             debug_dcu_path_entries: Vec::new(),

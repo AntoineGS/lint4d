@@ -45,6 +45,7 @@ fn every_context_field_changes_the_key() {
         library_conditional_context: _,
         project_source_roots: _,
         project_unit_directories: _,
+        unit_directories_unknown: _,
         config: _,
         platform: _,
         config_selection: _,
@@ -138,6 +139,9 @@ fn every_context_field_changes_the_key() {
         ("project_unit_directories", |parts| {
             parts.project_unit_directories.push("/w".into())
         }),
+        ("unit_directories_unknown", |parts| {
+            parts.unit_directories_unknown = true
+        }),
         ("config", |parts| parts.config = Some("Debug".into())),
         ("platform", |parts| parts.platform = Some("Win32".into())),
         ("config_selection", |parts| {
@@ -170,7 +174,7 @@ fn every_context_field_changes_the_key() {
             parts.override_error = Some("bad override".into())
         }),
     ];
-    assert_eq!(mutations.len(), 28);
+    assert_eq!(mutations.len(), 29);
     let base = key(ProjectContextParts::default());
     let mut seen = vec![base.digest()];
     for (name, mutate) in mutations {

@@ -233,3 +233,84 @@ fn project_membership_names_own_units_but_resolves_search_path_units() {
     assert!(context.resolves_unit_source(&searched));
     assert!(!context.resolves_unit_source(&unrelated));
 }
+
+/// C1: an ancestor whose search path cannot be evaluated (no installation
+/// defines `$(BDS)`) is not proof that it does not name the unit; it stays
+/// selected, incomplete, as before D43.
+#[test]
+fn an_incomplete_ancestor_context_keeps_the_ancestor() {
+    let temp = tempdir().unwrap();
+    let root = canonical(temp.path());
+    let project = ancestor_project(
+        &root,
+        "",
+        "<DCC_UnitSearchPath>$(BDS)\\rules</DCC_UnitSearchPath>",
+    );
+    let source = root.join("rules").join("Unrelated.pas");
+    unit(&source);
+
+    let context = discover(&source, &root, &ProjectOptions::default());
+
+    assert_eq!(context.project_file(), Some(project.as_path()));
+    assert!(!context.discovery_complete());
+}
+
+/// C1: `$(Undefined)\rules` expands to `\rules` (MSBuild's empty default),
+/// a path the project's author did not mean; membership through such an
+/// entry is unknown, so the ancestor stays selected.
+#[test]
+fn a_search_path_entry_with_an_undefined_property_keeps_the_ancestor() {
+    let temp = tempdir().unwrap();
+    let root = canonical(temp.path());
+    let project = ancestor_project(
+        &root,
+        "",
+        "<DCC_UnitSearchPath>$(Undefined)\\rules</DCC_UnitSearchPath>",
+    );
+    let source = root.join("rules").join("Unrelated.pas");
+    unit(&source);
+
+    let context = discover(&source, &root, &ProjectOptions::default());
+
+    assert_eq!(context.project_file(), Some(project.as_path()));
+}
+
+/// An undefined property in one entry leaves the other entries' verdicts
+/// alone: a unit no clean entry names is still unknown (the ancestor
+/// stays), and a unit a clean entry names is owned.
+#[test]
+fn an_undefined_property_taints_only_its_own_search_path_entry() {
+    let temp = tempdir().unwrap();
+    let root = canonical(temp.path());
+    let project = ancestor_project(
+        &root,
+        "",
+        "<DCC_UnitSearchPath>$(Undefined)\\elsewhere;rules</DCC_UnitSearchPath>",
+    );
+    let source = root.join("rules").join("Searched.pas");
+    unit(&source);
+    let context = discover(&source, &root, &ProjectOptions::default());
+    assert_eq!(context.project_file(), Some(project.as_path()));
+    assert!(context.owns_unit_source(&source));
+    let elsewhere = root.join("elsewhere").join("Other.pas");
+    unit(&elsewhere);
+    assert!(!context.owns_unit_source(&elsewhere));
+    assert!(context.unit_directories_unknown());
+}
+
+/// I5: the membership probe's build is the selected context's build.
+#[test]
+fn a_member_unit_builds_its_ancestor_project_once() {
+    let temp = tempdir().unwrap();
+    let root = canonical(temp.path());
+    let project = ancestor_project(&root, r#"<DCCReference Include="rules\Member.pas"/>"#, "");
+    let source = root.join("rules").join("Member.pas");
+    unit(&source);
+
+    pascal_project::test_reset_project_discovery_counts();
+    let context = discover(&source, &root, &ProjectOptions::default());
+    let (_, builds) = pascal_project::test_project_discovery_counts();
+
+    assert_eq!(context.project_file(), Some(project.as_path()));
+    assert_eq!(builds, 1, "the probe's build must be reused");
+}

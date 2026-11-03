@@ -269,6 +269,7 @@ fn parse_dproj_package_metadata(
             &builder.configured_properties,
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
+            &builder.property_empty_expansions,
             &builder.unknown_properties,
             undefined_is_empty,
             &mut metadata.warnings,

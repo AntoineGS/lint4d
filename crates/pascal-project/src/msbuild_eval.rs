@@ -14,6 +14,10 @@ pub(super) struct ProjectBuilder {
     pub(super) configured_ranges: HashMap<String, Vec<Range<usize>>>,
     pub(super) property_provenance_ranges: HashMap<String, Vec<ProvenanceRange>>,
     pub(super) property_default_provenances: HashMap<String, ProjectPathProvenance>,
+    /// Offsets in each property's value where an undefined property took the
+    /// MSBuild empty default, carried through later references (D43: a path
+    /// built on one is not evidence of what the project names).
+    pub(super) property_empty_expansions: HashMap<String, Vec<usize>>,
     pub(super) configured_properties: HashSet<String>,
     global_properties: HashSet<String>,
     pub(super) overrides: EffectiveOverrides,
@@ -140,6 +144,7 @@ impl ProjectBuilder {
             configured_ranges,
             property_provenance_ranges,
             property_default_provenances,
+            property_empty_expansions: HashMap::new(),
             configured_properties,
             global_properties,
             overrides: overrides.clone(),
@@ -266,6 +271,34 @@ impl ProjectBuilder {
             &default_provenance,
         ));
         result
+    }
+
+    /// For each item of the `;`-separated list property `name`, in the order
+    /// of [`Self::property_list_with_provenance`], whether it holds an
+    /// undefined property's empty expansion.
+    pub(super) fn property_list_empty_expansion_flags(&self, name: &str) -> Vec<bool> {
+        let Some(value) = self.property(name) else {
+            return Vec::new();
+        };
+        let points = self
+            .property_empty_expansions
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut bounds = value
+            .match_indices(';')
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        bounds.push(value.len());
+        let mut start = 0;
+        bounds
+            .into_iter()
+            .map(|end| {
+                let flagged = points.iter().any(|point| start <= *point && *point <= end);
+                start = end + 1;
+                flagged
+            })
+            .collect()
     }
 
     /// `bootstrap` is the descriptor payload discovery already read, if any.
@@ -434,6 +467,7 @@ impl ProjectBuilder {
                 &self.configured_properties,
                 &self.property_provenance_ranges,
                 &self.property_default_provenances,
+                &self.property_empty_expansions,
                 &self.unknown_properties,
                 self.undefined_is_empty(),
                 &mut self.warnings,
@@ -447,6 +481,12 @@ impl ProjectBuilder {
                 trim_ranges(&value.configured_ranges, trim_start, trimmed.len());
             let provenance_ranges =
                 trim_provenance_ranges(&value.provenance_ranges, trim_start, trimmed.len());
+            let empty_expansions = value
+                .empty_expansions
+                .iter()
+                .filter(|point| **point >= trim_start && **point - trim_start <= trimmed.len())
+                .map(|point| point - trim_start)
+                .collect::<Vec<_>>();
             self.set_property(
                 &property.name,
                 trimmed.to_string(),
@@ -457,6 +497,12 @@ impl ProjectBuilder {
                 source_provenance,
                 source_file,
             );
+            let key = property.name.to_ascii_lowercase();
+            if !empty_expansions.is_empty()
+                && self.properties.get(&key).map(String::as_str) == Some(trimmed)
+            {
+                self.property_empty_expansions.insert(key, empty_expansions);
+            }
         }
     }
 
@@ -490,6 +536,7 @@ impl ProjectBuilder {
             return;
         }
         self.property_bytes = new_bytes;
+        self.property_empty_expansions.remove(&key);
         if unknown || value.contains(UNRESOLVED_MARKER) {
             self.unknown_properties.insert(key.clone());
         } else {
@@ -549,6 +596,7 @@ impl ProjectBuilder {
                 .insert(key.clone(), UNRESOLVED_MARKER.to_string());
             self.configured_ranges.remove(&key);
             self.property_provenance_ranges.remove(&key);
+            self.property_empty_expansions.remove(&key);
             self.unknown_properties.insert(key);
         }
     }
@@ -657,6 +705,7 @@ impl ProjectBuilder {
             &self.configured_properties,
             &self.property_provenance_ranges,
             &self.property_default_provenances,
+            &self.property_empty_expansions,
             &self.unknown_properties,
             self.undefined_is_empty(),
             &mut self.warnings,
@@ -1191,6 +1240,8 @@ pub(super) struct ExpandedValue {
     /// [`ProjectBuilder::undefined_is_empty`]), so the value is unknowable
     /// and the project context is incomplete.
     pub(super) undefined_property_unknown: bool,
+    /// Offsets in `value` where an undefined property expanded to empty.
+    pub(super) empty_expansions: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1202,12 +1253,14 @@ pub(super) fn expand_value(
     configured_properties: &HashSet<String>,
     property_provenance_ranges: &HashMap<String, Vec<ProvenanceRange>>,
     property_default_provenances: &HashMap<String, ProjectPathProvenance>,
+    property_empty_expansions: &HashMap<String, Vec<usize>>,
     unknown_properties: &HashSet<String>,
     undefined_is_empty: bool,
     warnings: &mut Vec<String>,
     source_file: &Path,
     source_provenance: &ProjectPathProvenance,
 ) -> ExpandedValue {
+    let mut empty_expansions = Vec::new();
     let mut expanded = String::new();
     let mut unknown = false;
     let mut undefined_property_unknown = false;
@@ -1232,6 +1285,7 @@ pub(super) fn expand_value(
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
                 undefined_property_unknown,
+                empty_expansions: Vec::new(),
             };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
@@ -1246,6 +1300,7 @@ pub(super) fn expand_value(
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
                 undefined_property_unknown,
+                empty_expansions: Vec::new(),
             };
         };
         let end = start + 2 + relative_end;
@@ -1275,6 +1330,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
         } else if let Some(replacement) = properties.get(&key) {
@@ -1287,6 +1343,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
             let replacement_end = expanded.len();
@@ -1315,6 +1372,14 @@ pub(super) fn expand_value(
                     provenance: provenance.clone(),
                 });
             }
+            if let Some(points) = property_empty_expansions.get(&key) {
+                empty_expansions.extend(
+                    points
+                        .iter()
+                        .filter(|point| **point <= replacement.len())
+                        .map(|point| replacement_start + point),
+                );
+            }
             if let Some(ranges) = property_ranges.get(&key) {
                 for range in ranges {
                     if range.start < range.end && range.end <= replacement.len() {
@@ -1336,6 +1401,7 @@ pub(super) fn expand_value(
         } else if undefined_is_empty && !is_environment_provided_property(name) {
             // MSBuild expands an undefined property to the empty string.
             push_undefined_property_warning(warnings, name, source_file);
+            empty_expansions.push(expanded.len());
         } else {
             warnings.push(format!(
                 "unresolved property path $({name}) in {}",
@@ -1356,6 +1422,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
         }
@@ -1376,6 +1443,7 @@ pub(super) fn expand_value(
             configured_ranges: Vec::new(),
             provenance_ranges: Vec::new(),
             undefined_property_unknown,
+            empty_expansions: Vec::new(),
         };
     }
     ExpandedValue {
@@ -1385,6 +1453,7 @@ pub(super) fn expand_value(
         configured_ranges,
         provenance_ranges,
         undefined_property_unknown,
+        empty_expansions,
     }
 }
 

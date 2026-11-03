@@ -4600,6 +4600,9 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.project_unit_directories() != right.project_unit_directories() {
         fields.push("project_unit_directories".to_string());
     }
+    if left.unit_directories_unknown() != right.unit_directories_unknown() {
+        fields.push("unit_directories_unknown".to_string());
+    }
     if left.config() != right.config() {
         fields.push("config".to_string());
     }

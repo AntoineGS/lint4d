@@ -129,6 +129,8 @@ pub(crate) mod extract;
 mod facts;
 #[cfg(all(test, unix))]
 mod isolation;
+#[cfg(test)]
+mod navigation_walk_tests;
 pub(crate) mod persist;
 pub mod project_catalogue;
 pub mod projects;
@@ -136,6 +138,8 @@ pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
+#[cfg(test)]
+mod shared_discovery_tests;
 pub(crate) mod signature;
 #[cfg(all(test, unix))]
 mod storage_failures;
@@ -405,6 +409,32 @@ const DEFAULT_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_FILE_BYTES_CEILING: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+/// Units whose imports a navigation request loads while a name binds
+/// nowhere. A negative definition over a large closure walked 256 units in
+/// three minutes.
+const MAX_NAVIGATION_WALK_WORK: usize = 128;
+/// Source bytes of dependencies a navigation walk indexes before it stops.
+const MAX_NAVIGATION_WALK_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NAVIGATION_WALK_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Every warning a workspace logged to stderr.
+    static TEST_LOGGED_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Loading the imports of a unit whose file name this is fails.
+    static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn navigation_walk_byte_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_NAVIGATION_WALK_BYTES.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_NAVIGATION_WALK_BYTES
+}
 const MAX_PENDING_FILE_RENAMES: usize = 64;
 const MAX_PENDING_FILE_RENAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
@@ -2370,6 +2400,93 @@ impl ContextState {
     }
 }
 
+/// Discovered project contexts shared by a workspace and the request
+/// workspaces built from its inputs, so a request does not re-evaluate the
+/// project files for every document it touches. An entry is keyed by the
+/// document and every discovery input; it is reused only while its watched
+/// files prove it fresh, exactly like a context the workspace retained.
+#[derive(Clone, Default)]
+pub(crate) struct SharedDiscoveries(Arc<Mutex<DiscoveryStore>>);
+
+impl std::fmt::Debug for SharedDiscoveries {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedDiscoveries")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Discoveries retained before the store is emptied.
+const MAX_SHARED_DISCOVERIES: usize = 512;
+/// Distinct project warnings remembered as already logged.
+const MAX_LOGGED_PROJECT_WARNINGS: usize = 4096;
+
+#[derive(Default)]
+struct DiscoveryStore {
+    /// Keyed by configuration generation, document and discovery inputs.
+    /// Jobs of an older generation may still run after a newer one started,
+    /// so generations are kept apart rather than cleared on each switch.
+    entries: HashMap<(u64, Url, u64), SharedDiscovery>,
+    logged_warnings: HashSet<(u64, String)>,
+}
+
+#[derive(Clone)]
+struct SharedDiscovery {
+    key: ContextKey,
+    state: ContextState,
+    warnings: Vec<String>,
+}
+
+impl SharedDiscoveries {
+    fn get(
+        &self,
+        configuration_generation: u64,
+        uri: &Url,
+        inputs: u64,
+    ) -> Option<SharedDiscovery> {
+        lock(&self.0)
+            .entries
+            .get(&(configuration_generation, uri.clone(), inputs))
+            .cloned()
+    }
+
+    fn insert(
+        &self,
+        configuration_generation: u64,
+        uri: Url,
+        inputs: u64,
+        discovery: SharedDiscovery,
+    ) {
+        let mut store = lock(&self.0);
+        if store.entries.len() >= MAX_SHARED_DISCOVERIES {
+            store.entries.clear();
+        }
+        store
+            .entries
+            .insert((configuration_generation, uri, inputs), discovery);
+    }
+
+    fn remove(&self, configuration_generation: u64, uri: &Url, inputs: u64) {
+        lock(&self.0)
+            .entries
+            .remove(&(configuration_generation, uri.clone(), inputs));
+    }
+
+    /// Whether `warning` was not yet logged in this configuration generation.
+    fn first_report(&self, configuration_generation: u64, warning: &str) -> bool {
+        let mut store = lock(&self.0);
+        let key = (configuration_generation, warning.to_string());
+        if store.logged_warnings.contains(&key) {
+            return false;
+        }
+        if store.logged_warnings.len() >= MAX_LOGGED_PROJECT_WARNINGS {
+            store.logged_warnings.clear();
+        }
+        store.logged_warnings.insert(key);
+        true
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NavigationState {
     contexts: HashMap<ContextKey, ContextState>,
@@ -2951,6 +3068,12 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
+    /// Project contexts discovered by this workspace and the request
+    /// workspaces derived from it.
+    shared_discoveries: SharedDiscoveries,
+    /// Navigation answers best effort (D16): a dependency whose imports fail
+    /// to load is skipped. The implementation code lens stays strict.
+    best_effort_navigation: bool,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
@@ -3529,6 +3652,7 @@ impl Workspace {
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
             persistent_cache: input.persistent_cache.clone(),
+            shared_discoveries: input.shared_discoveries.clone(),
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
@@ -3539,6 +3663,11 @@ impl Workspace {
             request_generation: input.request_generation,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
+        self.best_effort_navigation = best_effort;
+        self.index.set_best_effort_bindings(best_effort);
     }
 
     pub(crate) fn navigation_state(&self) -> NavigationState {
@@ -7000,6 +7129,12 @@ impl Workspace {
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
         let mut work = 0;
+        // Source bytes of the dependencies the walk indexed. The document's
+        // own imports are always loaded; the walk past them is bounded so a
+        // name that binds nowhere answers promptly.
+        let mut walked_bytes = 0usize;
+        let mut walk_exhausted = false;
+        let walk_byte_limit = navigation_walk_byte_limit();
         let resolver_session_cache = ResolverSessionCache::default();
 
         loop {
@@ -7009,33 +7144,57 @@ impl Workspace {
                 self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
-            if frontier.is_empty() || work >= MAX_DEPENDENCY_WORK {
+            if frontier.is_empty() || walk_exhausted {
                 break;
             }
 
             let mut next = Vec::new();
             for current in frontier.drain(..) {
                 check_workspace_cancel(cancel)?;
-                if !visited.insert(current.clone()) {
+                if visited.contains(&current) {
                     continue;
                 }
+                if work > 0 && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
+                {
+                    walk_exhausted = true;
+                    break;
+                }
+                visited.insert(current.clone());
                 work += 1;
-                let dependencies = self.load_imports_with_session_cache(
+                let dependencies = match self.load_imports_with_session_cache(
                     &current,
                     context_key,
                     pinned,
                     cancel,
                     &resolver_session_cache,
-                )?;
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(error)
+                        if error == CANCELLATION_MESSAGE
+                            || error == compile_time::HEADER_CHANGED =>
+                    {
+                        return Err(error);
+                    }
+                    // D16: a dependency that cannot be loaded only hides what
+                    // binds through it; navigation returns what still binds.
+                    // Each request rebuilds the walk, so log it once.
+                    Err(error) if self.best_effort_navigation && &current != uri => {
+                        self.warn_project(format!(
+                            "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
+                        ));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 for dependency in dependencies {
                     check_workspace_cancel(cancel)?;
                     if initialized.insert(dependency.clone()) {
                         self.index.clear_import_bindings(&dependency);
+                        walked_bytes = walked_bytes.saturating_add(
+                            self.index.source_text(&dependency).map_or(0, str::len),
+                        );
                     }
                     next.push(dependency);
-                }
-                if work >= MAX_DEPENDENCY_WORK {
-                    break;
                 }
             }
             next.retain(|dependency| !visited.contains(dependency));
@@ -7044,9 +7203,9 @@ impl Workspace {
             frontier = next;
         }
 
-        if work >= MAX_DEPENDENCY_WORK {
+        if walk_exhausted {
             self.warn(format!(
-                "dependency work limit ({MAX_DEPENDENCY_WORK}) reached while resolving {uri}; result is incomplete"
+                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {walk_byte_limit} source bytes) reached while resolving {uri}; result is incomplete"
             ));
         }
 
@@ -7163,6 +7322,14 @@ impl Workspace {
         )>,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
+        #[cfg(test)]
+        if TEST_FAIL_IMPORTS_OF.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("injected import failure for {uri}"));
+        }
         let imports = self.index.imports(uri);
         let effective_context_key = self
             .document_contexts
@@ -9590,8 +9757,18 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
+        // A resolver report repeats its context's discovery warnings.
+        let project_warnings = self
+            .contexts
+            .get(context_key)
+            .map(|state| state.context_observations.warnings.clone())
+            .unwrap_or_default();
         for warning in &report.warnings {
-            self.warn(warning.clone());
+            if project_warnings.contains(warning) {
+                self.warn_project(warning.clone());
+            } else {
+                self.warn(warning.clone());
+            }
         }
         for reason in &report.incomplete_reasons {
             self.warn(reason.clone());
@@ -9849,6 +10026,18 @@ impl Workspace {
                 return Ok(owner.key);
             }
         }
+        let discovery_inputs =
+            self.discovery_inputs_fingerprint(&roots, &project_options, &deleted_paths);
+        if let Some(key) = self.reuse_shared_discovery(
+            uri,
+            &path,
+            discovery_inputs,
+            cancel,
+            budget,
+            defer_context_pruning,
+        )? {
+            return Ok(key);
+        }
         let discovered =
             discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
                 &path,
@@ -9880,8 +10069,9 @@ impl Workspace {
             project_selection,
             project_scope,
         } = discovery;
-        for warning in context_observations.warnings.iter().cloned() {
-            self.warn(warning);
+        let warnings = context_observations.warnings.clone();
+        for warning in warnings.iter().cloned() {
+            self.warn_project(warning);
         }
         let key = self.context_key_for_project_discovery(
             &path,
@@ -9908,7 +10098,121 @@ impl Workspace {
             budget,
             !defer_context_pruning,
         )?;
+        if let Some(state) = self.contexts.get(&key) {
+            self.shared_discoveries.insert(
+                self.configuration_generation,
+                uri.clone(),
+                discovery_inputs,
+                SharedDiscovery {
+                    key: key.clone(),
+                    state: state.clone(),
+                    warnings,
+                },
+            );
+        }
         Ok(key)
+    }
+
+    /// Everything automatic discovery for a document reads besides the
+    /// files its context watches. The cache epoch advances on every file
+    /// event, including Delphi override files.
+    fn discovery_inputs_fingerprint(
+        &self,
+        roots: &[PathBuf],
+        project_options: &ProjectOptions,
+        deleted_paths: &impl std::fmt::Debug,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn sorted<K: std::fmt::Debug, V: std::fmt::Debug>(map: &HashMap<K, V>) -> Vec<String> {
+            let mut entries = map
+                .iter()
+                .map(|entry| format!("{entry:?}"))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{roots:?}").hash(&mut hasher);
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            project_options.project_file,
+            project_options.build_config,
+            project_options.platform,
+            project_options.source_paths,
+            project_options.conditional_context
+        )
+        .hash(&mut hasher);
+        sorted(&project_options.installation_selections).hash(&mut hasher);
+        sorted(&project_options.build_selections).hash(&mut hasher);
+        sorted(&self.project_selections).hash(&mut hasher);
+        format!("{:?}", self.options.exclude).hash(&mut hasher);
+        format!("{deleted_paths:?}").hash(&mut hasher);
+        self.project_cache.invalidation_epoch().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Adopt the context another workspace sharing this one's discoveries
+    /// found for `uri` with the same inputs, if its watched files still
+    /// prove it current.
+    fn reuse_shared_discovery(
+        &mut self,
+        uri: &Url,
+        path: &Path,
+        discovery_inputs: u64,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
+    ) -> Result<Option<ContextKey>, String> {
+        let generation = self.configuration_generation;
+        let Some(discovery) = self
+            .shared_discoveries
+            .get(generation, uri, discovery_inputs)
+        else {
+            return Ok(None);
+        };
+        let installed = !self.contexts.contains_key(&discovery.key);
+        if installed {
+            self.contexts
+                .insert(discovery.key.clone(), discovery.state.clone());
+        } else if let Some(state) = self.contexts.get_mut(&discovery.key) {
+            // The installed state was discovered for another document; record
+            // the candidate memberships of this one's directories, as
+            // `install_context` would.
+            for (directory, membership) in &discovery.state.project_candidate_memberships {
+                state
+                    .project_candidate_memberships
+                    .entry(directory.clone())
+                    .or_insert_with(|| membership.clone());
+            }
+        }
+        self.extend_context_watch_paths(&discovery.key, path, cancel, budget)?;
+        if !(self.context_is_fresh_with_cancel(&discovery.key, cancel, budget)?
+            && self.context_matches_current_selection_with_cancel_and_budget(
+                path,
+                &discovery.key,
+                cancel,
+                budget,
+            )?)
+        {
+            if installed {
+                self.contexts.remove(&discovery.key);
+            }
+            self.shared_discoveries
+                .remove(generation, uri, discovery_inputs);
+            return Ok(None);
+        }
+        for warning in discovery.warnings {
+            self.warn_project(warning);
+        }
+        self.select_document_context_with_pruning(
+            uri,
+            &discovery.key,
+            self.owner_origin_for_context_key(&discovery.key),
+            cancel,
+            budget,
+            !defer_context_pruning,
+        )?;
+        Ok(Some(discovery.key))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13515,6 +13819,21 @@ impl Workspace {
         self.global_configuration_change_generation = self.configuration_generation;
     }
 
+    /// A project discovery warning: kept like any warning, but logged once
+    /// per configuration generation across the workspaces sharing
+    /// discoveries, which each rediscover the same project.
+    fn warn_project(&mut self, message: String) {
+        if self
+            .shared_discoveries
+            .first_report(self.configuration_generation, &message)
+        {
+            self.warn(message);
+        } else if !self.warnings.contains(&message) && self.warnings.len() < MAX_WORKSPACE_WARNINGS
+        {
+            self.warnings.push(message);
+        }
+    }
+
     fn warn(&mut self, message: String) {
         if self.warnings.iter().any(|warning| warning == &message) {
             return;
@@ -13522,6 +13841,8 @@ impl Workspace {
         match self.warnings.len().cmp(&MAX_WORKSPACE_WARNINGS) {
             std::cmp::Ordering::Less => {
                 eprintln!("pascal-lsp: warning: {message}");
+                #[cfg(test)]
+                TEST_LOGGED_WARNINGS.with(|logged| logged.borrow_mut().push(message.clone()));
                 self.warnings.push(message);
             }
             std::cmp::Ordering::Equal => {
@@ -24359,6 +24680,7 @@ BDS = '/fake/37'
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
             persistent_cache: Default::default(),
+            shared_discoveries: Default::default(),
             cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),

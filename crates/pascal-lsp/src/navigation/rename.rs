@@ -142,6 +142,29 @@ pub(crate) enum TestCancellationPhase {
 pub(crate) struct TestCancellationPhaseGuard(Option<TestCancellationPhase>);
 
 #[cfg(test)]
+thread_local! {
+    pub(super) static TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP: Cell<bool> =
+        const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestExhaustMemberLookupGuard;
+
+/// Completion's member lookups run out of budget while the guard lives.
+#[cfg(test)]
+pub(crate) fn test_exhaust_completion_member_lookup() -> TestExhaustMemberLookupGuard {
+    TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(|flag| flag.set(true));
+    TestExhaustMemberLookupGuard
+}
+
+#[cfg(test)]
+impl Drop for TestExhaustMemberLookupGuard {
+    fn drop(&mut self) {
+        TEST_EXHAUST_COMPLETION_MEMBER_LOOKUP.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn test_cancel_after_checks(checks: usize) -> TestCancellationGuard {
     let previous = TEST_CANCEL_AFTER_CHECKS.with(|budget| {
         let previous = budget.get();
@@ -1020,6 +1043,12 @@ impl NavigationIndex {
         check_cancel(Some(cancel)).is_ok()
     }
 
+    /// Bind globals best effort; see `best_effort_bindings`. Only read-only
+    /// features may set it.
+    pub(crate) fn set_best_effort_bindings(&mut self, best_effort: bool) {
+        self.best_effort_bindings = best_effort;
+    }
+
     pub(super) fn is_unknown_global_fallback(
         &self,
         document: &Document,
@@ -1044,7 +1073,8 @@ impl NavigationIndex {
         candidates: &[Candidate],
     ) -> bool {
         let type_reference = has_ancestor_kind(identifier, "typeref");
-        owner_type.is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
+        let unknown = owner_type
+            .is_some_and(|owner| self.has_unknown_class_ancestor(document, owner))
             && member_expression_at(identifier).is_none()
             && qualified_type_path_at(identifier, &document.source).is_none()
             && use_name_at(identifier, &document.source).is_none()
@@ -1054,7 +1084,27 @@ impl NavigationIndex {
                         || self
                             .symbol(candidate)
                             .is_none_or(|symbol| symbol.kind != SymbolKind::Type))
-            })
+            });
+        if unknown && self.best_effort_bindings {
+            // D16: bind the global, but say an inherited member may shadow it.
+            let owner = owner_type.unwrap_or_default();
+            let key = canonical_name(owner);
+            let name = document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Type && symbol.key == key)
+                .map_or(owner, |symbol| symbol.name.as_str());
+            self.relaxed_bindings.record(format!(
+                "Members inherited by {name} are unknown; the result may be shadowed."
+            ));
+            return false;
+        }
+        unknown
+    }
+
+    /// The relaxed binding decisions recorded since the last call.
+    pub(crate) fn take_relaxed_bindings(&self) -> Vec<String> {
+        self.relaxed_bindings.take()
     }
 
     fn candidate_is_global(&self, candidate: &Candidate) -> bool {

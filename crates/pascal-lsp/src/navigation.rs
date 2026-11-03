@@ -158,6 +158,8 @@ pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
 #[cfg(test)]
+pub(crate) use rename::test_exhaust_completion_member_lookup;
+#[cfg(test)]
 pub(crate) use rename::{TestCancellationPhase, test_cancel_in_phase};
 pub(crate) use selection::validate_selection_position_count;
 
@@ -492,6 +494,48 @@ pub struct NavigationIndex {
     auto_import_unit_providers: HashMap<String, Vec<Url>>,
     compiled_unit_uris: HashSet<Url>,
     compiled_unit_bytes: usize,
+    /// Read-only features bind best effort (D16): an imported or unit-level
+    /// global referenced in a method binds even when an inherited member the
+    /// index cannot prove absent could shadow it.
+    best_effort_bindings: bool,
+    /// What best-effort binding decided that the strict rule would not.
+    relaxed_bindings: RelaxedBindings,
+}
+
+/// Distinct relaxed binding decisions retained for one answer.
+const MAX_RELAXED_BINDINGS: usize = 8;
+
+/// Reasons a best-effort answer may be shadowed, recorded while a query
+/// resolves through a shared index. A clone starts empty: the record belongs
+/// to the queries of one index.
+#[derive(Default)]
+struct RelaxedBindings(std::sync::Mutex<Vec<String>>);
+
+impl Clone for RelaxedBindings {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl RelaxedBindings {
+    fn record(&self, reason: String) {
+        let mut reasons = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reasons.len() < MAX_RELAXED_BINDINGS && !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -1143,6 +1187,8 @@ impl NavigationIndex {
             )?,
             compiled_unit_uris: self.compiled_unit_uris.clone(),
             compiled_unit_bytes: self.compiled_unit_bytes,
+            best_effort_bindings: false,
+            relaxed_bindings: RelaxedBindings::default(),
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
@@ -14813,6 +14859,17 @@ impl AssistanceBudget {
         }
         self.remaining_bytes -= amount;
         Ok(true)
+    }
+
+    /// Whether `error` reports this budget running out, rather than a
+    /// cancellation or a failure a partial answer must not hide.
+    pub(super) fn exhausted_by(&self, error: &str, cancel: &AtomicBool) -> bool {
+        self.exhausted
+            && !cancel.load(Ordering::Relaxed)
+            && error.starts_with(self.operation)
+            && (error.ends_with("-byte scan limit")
+                || error.ends_with("-node traversal limit")
+                || error.ends_with("-byte proof/materialization limit"))
     }
 
     pub(super) fn require_work(

@@ -45061,6 +45061,9 @@ mod cache_baseline;
 #[path = "protocol/persistent_cache_status.rs"]
 mod persistent_cache_status;
 
+#[path = "protocol/best_effort.rs"]
+mod best_effort;
+
 fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
     write_file(
         &root.join("Base.pas"),

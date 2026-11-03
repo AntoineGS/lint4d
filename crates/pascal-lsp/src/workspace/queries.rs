@@ -115,11 +115,115 @@ pub(crate) fn hover_from_input(
     }
     let value = snapshot
         .index
-        .hover_with_cancel(&uri, position, format, cancel);
+        .hover_with_cancel(&uri, position, format, cancel)
+        .map(|hover| hover.map(|hover| with_coverage_note(hover, &answer_coverage(&snapshot))));
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
     with_records(source_generation, configuration_generation, value, records)
+}
+
+/// Units named in a hover's incompleteness note.
+const MAX_HOVER_NOTE_UNITS: usize = 3;
+
+/// D16: a hover answered over unproven dependencies says so.
+fn with_coverage_note(mut hover: Hover, coverage: &Coverage) -> Hover {
+    let Some(note) = coverage_note(coverage) else {
+        return hover;
+    };
+    match &mut hover.contents {
+        lsp_types::HoverContents::Markup(markup) => {
+            let separator = if markup.kind == MarkupKind::Markdown {
+                "\n\n---\n"
+            } else {
+                "\n\n"
+            };
+            markup.value.push_str(separator);
+            markup.value.push_str(&note);
+        }
+        lsp_types::HoverContents::Scalar(marked) => {
+            hover.contents = lsp_types::HoverContents::Array(vec![
+                marked.clone(),
+                lsp_types::MarkedString::String(note),
+            ]);
+        }
+        lsp_types::HoverContents::Array(items) => {
+            items.push(lsp_types::MarkedString::String(note));
+        }
+    }
+    hover
+}
+
+fn coverage_note(coverage: &Coverage) -> Option<String> {
+    if coverage.is_complete() {
+        return None;
+    }
+    let mut units = Vec::new();
+    let mut reasons = Vec::new();
+    for gap in &coverage.gaps {
+        let Some(name) = gap
+            .uri
+            .as_ref()
+            .and_then(|uri| uri.path_segments()?.next_back().map(str::to_string))
+        else {
+            let reason = sentence(&gap.reason);
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+            continue;
+        };
+        if !units.contains(&name) {
+            units.push(name);
+        }
+    }
+    let mut sentences = Vec::new();
+    if !units.is_empty() || coverage.omitted > 0 {
+        let named = units
+            .iter()
+            .take(MAX_HOVER_NOTE_UNITS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut subject = if named.is_empty() {
+            "some dependencies".to_string()
+        } else {
+            named.join(", ")
+        };
+        // Gaps past the coverage's retention limit are units too.
+        let more = units
+            .len()
+            .saturating_sub(named.len())
+            .saturating_add(coverage.omitted);
+        if more > 0 {
+            subject.push_str(&format!(" and {more} more"));
+        }
+        sentences.push(format!(
+            "Analysis of {subject} is incomplete; the result may be shadowed."
+        ));
+    }
+    sentences.extend(reasons);
+    Some(sentences.join(" "))
+}
+
+fn sentence(reason: &str) -> String {
+    let mut characters = reason.trim().chars();
+    let mut text = characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect::<String>())
+        .unwrap_or_default();
+    if !text.ends_with('.') {
+        text.push('.');
+    }
+    text
+}
+
+/// The coverage of a best-effort answer: the dependencies the snapshot
+/// could not prove and the bindings the relaxed rules decided.
+fn answer_coverage(snapshot: &RenameSnapshot) -> Coverage {
+    let mut coverage = snapshot.dependency_coverage.clone();
+    for reason in snapshot.index.take_relaxed_bindings() {
+        coverage.note(None, reason);
+    }
+    coverage
 }
 
 #[cfg(test)]
@@ -203,7 +307,12 @@ pub(crate) fn completion_from_input_with_options(
     }
     let value = snapshot
         .index
-        .completion_with_cancel_and_options(&uri, position, options, cancel);
+        .completion_with_cancel_and_options(&uri, position, options, cancel)
+        .map(|mut result| {
+            // D16: candidates from unproven dependencies may be missing.
+            result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
+            result
+        });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1063,10 +1172,14 @@ pub(crate) fn highlights_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel) {
+    let mut snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    // Highlights mark every occurrence of one binding, like references: an
+    // inherited member the index cannot see must still withhold a global.
+    snapshot.index.set_best_effort_bindings(false);
     let records = snapshot_records(&snapshot);
     if let Err(error) = ensure_document_ready(&snapshot, &uri) {
         return with_records(
@@ -1182,7 +1295,8 @@ fn assistance_snapshot(
         Some(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
-                .with_completion_position(completion_position),
+                .with_completion_position(completion_position)
+                .best_effort(),
         ),
         &[],
         cancel,
@@ -1242,30 +1356,71 @@ fn build_binding_snapshot(
     };
     candidate_names.sort();
     candidate_names.dedup();
+    let seed =
+        SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration);
+    // Only the document-local read-only features (hover, highlights, type
+    // definition) bind in `LocalWithImports`; they answer best effort (D16).
+    let seed = if mode == SnapshotMode::LocalWithImports {
+        seed.best_effort()
+    } else {
+        seed
+    };
     build_snapshot(
         input,
         std::slice::from_ref(uri),
         &candidate_names,
         mode,
-        Some(SnapshotSeed::new(target_record).with_consumed_configuration(&consumed_configuration)),
+        Some(seed),
         skip_imports_for,
         cancel,
     )
 }
 
-/// The include error that blocks a read-only feature on `uri`. An unsupported
-/// directive in a unit the document only imports cannot change how the
-/// document parses, and at worst misclassifies an identifier bound through
-/// that unit. One in the document itself, or any other include error, still
-/// blocks. Rename, references, and code actions stay fail-closed.
+/// The include error that blocks a read-only feature on `uri`: the first one
+/// recorded for the document itself, or for an owner of it when it is an
+/// include file. A failure in a unit the document only imports cannot change
+/// how the document parses; a best-effort snapshot reports it as coverage
+/// (D16). Rename, references, and code actions stay fail-closed.
 fn blocking_include_error<'a>(snapshot: &'a RenameSnapshot, uri: &Url) -> Option<&'a str> {
-    let first = snapshot.include_errors.first()?;
-    let blocks = snapshot.other_include_errors
-        || snapshot
-            .unsupported_directive_owners
+    let owns_document = |owner: &Url| {
+        owner == uri
+            || snapshot
+                .expansions
+                .get(owner)
+                .is_some_and(|expansion| expansion.dependencies.contains(uri))
+    };
+    if let Some((_, error)) = snapshot
+        .include_error_owners
+        .iter()
+        .find(|(owner, _)| owns_document(owner))
+    {
+        return Some(error.as_str());
+    }
+    // Past the error limit owners are no longer recorded, but an owner with
+    // an unsupported directive still is.
+    if snapshot
+        .unsupported_directive_owners
+        .iter()
+        .any(owns_document)
+    {
+        return snapshot
+            .include_errors
             .iter()
-            .any(|owner| owner == uri);
-    blocks.then_some(first.as_str())
+            .find(|error| error.contains(uri.as_str()))
+            .or(snapshot.include_errors.last())
+            .map(String::as_str);
+    }
+    // Without a best-effort audit an early stop leaves later owners,
+    // possibly the document, unaudited.
+    if snapshot.other_include_errors && !snapshot.best_effort {
+        return snapshot
+            .include_errors
+            .iter()
+            .find(|error| !error.contains("unsupported directive"))
+            .or(snapshot.include_errors.first())
+            .map(String::as_str);
+    }
+    None
 }
 
 fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -1655,6 +1810,29 @@ pub(crate) fn navigation_from_input(
     target: NavigationTarget,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<NavigationResult> {
+    navigation_from_input_with_policy(input, uri, position, target, true, cancel)
+}
+
+/// Navigation for a caller that must not answer best effort: the
+/// implementation code lens shows a bare count, like the references lens.
+pub(crate) fn strict_navigation_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target: NavigationTarget,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<NavigationResult> {
+    navigation_from_input_with_policy(input, uri, position, target, false, cancel)
+}
+
+fn navigation_from_input_with_policy(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    target: NavigationTarget,
+    best_effort: bool,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<NavigationResult> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = super::canonical_file_uri(uri);
@@ -1663,8 +1841,14 @@ pub(crate) fn navigation_from_input(
     }
 
     let mut workspace = super::Workspace::from_analysis_input(&input);
+    workspace.set_best_effort_navigation(best_effort);
     let value = match workspace.navigate_with_cancel(&uri, position, target, cancel) {
-        Ok(locations) => Ok(locations),
+        Ok(locations) => {
+            for reason in workspace.index.take_relaxed_bindings() {
+                workspace.warn_project(format!("navigation in {uri}: {reason}"));
+            }
+            Ok(locations)
+        }
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
         }
@@ -2520,6 +2704,10 @@ fn completion_observations_equal(
             _ => true,
         }
 }
+
+#[cfg(test)]
+#[path = "queries_best_effort_tests.rs"]
+mod best_effort_tests;
 
 #[cfg(test)]
 mod tests {

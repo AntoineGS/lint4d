@@ -3084,13 +3084,12 @@ mod tests {
         .expect("base");
         fs::write(
             root.join("Mid.pas"),
-            "unit Mid;\ninterface\nuses Base;\ntype\n  TMid = class(TBase)\n  end;\nimplementation\nend.\n",
+            "unit Mid;\ninterface\nuses Base;\nvar\n  Shared: TBase;\nfunction MakeBase: TBase;\nimplementation\nfunction MakeBase: TBase;\nbegin\n  Result := Shared;\nend;\nend.\n",
         )
         .expect("mid");
-        let user = root.join("User.pas");
         fs::write(
-            &user,
-            "unit User;\ninterface\nuses Mid;\nimplementation\nprocedure Run(M: TMid);\nbegin\n  M.Field := 1;\n  with M do Field := 2;\nend;\nend.\n",
+            root.join("User.pas"),
+            "unit User;\ninterface\nuses Mid;\nimplementation\nprocedure Run;\nbegin\n  Shared.Field := 1;\n  MakeBase.Field := 2;\nend;\nend.\n",
         )
         .expect("user");
         let workspace = test_workspace(vec![root], WorkspaceOptions::default());
@@ -3102,20 +3101,23 @@ mod tests {
             &AtomicBool::new(false),
         );
         let locations = computed.value.expect("references").value;
-        let user_uri = source_uri(&user);
-        let user_lines: Vec<u32> = locations
+        // Characterization: neither `Shared.Field` nor `MakeBase.Field` in
+        // `User.pas` (which never imports `Base`) is found today, nor are
+        // inherited or `with` receivers; only the declaration is reported.
+        // l4d-33 Task 10 must keep the indexed result equal to this walk
+        // result.
+        let mut found: Vec<(Url, u32, u32)> = locations
             .iter()
-            .filter(|location| location.uri == user_uri)
-            .map(|location| location.range.start.line)
+            .map(|location| {
+                (
+                    location.uri.clone(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
             .collect();
-        // Characterization: today the inherited member is not followed into a
-        // unit that reaches `Base` only through `Mid`, so neither use at lines
-        // 6 and 7 is reported. l4d-33 Task 10 must keep the declaration
-        // reported and should flip this to expect both uses.
-        assert!(
-            user_lines.is_empty(),
-            "today User.pas uses are not reached: {locations:?}"
-        );
+        found.sort();
+        assert_eq!(found, vec![(source_uri(&base), 4, 4)], "{locations:?}");
     }
 
     #[test]

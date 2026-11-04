@@ -1227,7 +1227,9 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.invalidate_project_selection_uris(&affected_uris, None, None)?;
-        self.project_context(&uri)
+        let info = self.project_context(&uri)?;
+        self.reclaim_projectless_units(None, None)?;
+        Ok(info)
     }
 
     pub(crate) fn prepare_select_project_with_control(
@@ -1399,6 +1401,7 @@ impl Workspace {
         }
         let info = context.info.clone();
         self.apply_project_context_preparation(context);
+        self.reclaim_projectless_units(None, Some(budget))?;
         Ok(info)
     }
 
@@ -1454,7 +1457,7 @@ impl Workspace {
         (lint, fmt, checked_paths)
     }
 
-    fn watch_context_paths(&mut self, key: &ContextKey, paths: Vec<PathBuf>) {
+    pub(super) fn watch_context_paths(&mut self, key: &ContextKey, paths: Vec<PathBuf>) {
         let Some(state) = self.contexts.get_mut(key) else {
             return;
         };

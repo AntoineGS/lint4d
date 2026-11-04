@@ -4045,6 +4045,51 @@ mod tests {
         (workspace, descriptor, main, other)
     }
 
+    /// An open document whose own project is separate from the requesting
+    /// one (it names its unit itself, so no D43 claim applies) is a second
+    /// target under its own key.
+    #[test]
+    fn an_open_document_with_a_separate_owner_is_another_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, _, main, _) = selected_project(root);
+        let solo = root.join("solo/Solo.pas");
+        write(
+            &root.join("solo/Solo.dproj"),
+            "<Project><PropertyGroup><MainSource>Solo.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Solo.pas\"/></ItemGroup></Project>",
+        );
+        write(&root.join("solo/Solo.dpr"), "program Solo; begin end.\n");
+        write(&solo, OTHER.replace("unit Other", "unit Solo").as_str());
+        pascal_project::backdate_tree_for_test(root);
+        let solo_uri = Url::from_file_path(&solo).unwrap();
+        workspace
+            .open_document(solo_uri.clone(), fs::read_to_string(&solo).unwrap(), 3)
+            .unwrap();
+        let input = workspace.analysis_input();
+        let solo_key = input.document_owners[&solo_uri].key.clone();
+        assert_eq!(
+            solo_key.project_file.as_deref(),
+            Some(root.join("solo/Solo.dproj").as_path())
+        );
+        assert_ne!(solo_key, input.document_owners[&main].key);
+
+        let mut request = Workspace::from_analysis_input(&input);
+        let found = request
+            .index_targets(
+                &input,
+                Some(&main),
+                TargetPurpose::References,
+                &AtomicBool::new(false),
+            )
+            .expect("targets");
+
+        assert!(
+            found.contexts.iter().any(|(key, _)| *key == solo_key),
+            "the separate owner must be a target: {:?}",
+            found.contexts
+        );
+    }
+
     /// A request works on a workspace built from its input, whose document
     /// owners may hold an older resolution of their project (here: the
     /// descriptor changed after they were recorded). The project is still one

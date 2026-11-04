@@ -2221,6 +2221,14 @@ pub(crate) struct ContextKey {
     overrides: EffectiveOverrides,
 }
 
+/// A deterministic digest of the whole key, the order of D43 claimants.
+pub(super) fn context_key_digest(key: &ContextKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn selected_installation_id(context: &ProjectContext) -> Option<String> {
     match context.installation_selection() {
         Some(pascal_project::InstallationSelection::Selected { id, .. }) => Some(id.clone()),
@@ -2457,6 +2465,36 @@ struct SharedDiscovery {
     key: ContextKey,
     state: ContextState,
     warnings: Vec<String>,
+    /// For a projectless or D43-claimed result, the claimant set it was
+    /// decided against; a different set makes it stale.
+    claimants: Option<u64>,
+    /// The result is a D43 claim.
+    claimed: bool,
+}
+
+/// A project that may claim a projectless unit (D43).
+struct Claimant {
+    selected: bool,
+    digest: u64,
+    key: ContextKey,
+    /// The owner's state when the context is not installed here.
+    state: Option<Arc<ContextState>>,
+    context: Arc<ProjectContext>,
+}
+
+/// The outcome of a D43 claim.
+enum Claim {
+    Claimed(Box<ContextKey>),
+    /// No claimant resolves the unit; `claimants` identifies the set asked.
+    Unclaimed {
+        claimants: u64,
+    },
+}
+
+/// Units a project resolves by name: `.pas` sources.
+fn is_claimable_unit(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
 }
 
 impl SharedDiscoveries {
@@ -2687,6 +2725,9 @@ pub(crate) struct KnownDocumentOwner {
     needs_revalidation: bool,
     follow_current_project_file: bool,
     pub(crate) legacy_route: Option<LegacyRouteProof>,
+    /// The owner is a D43 claim: the document's own discovery is
+    /// projectless and it shares a claimant project's context.
+    pub(crate) claimed: bool,
 }
 
 impl KnownDocumentOwner {
@@ -3158,6 +3199,10 @@ pub struct Workspace {
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
+    /// A D43 claim is resolving claimant documents (no nested resolution).
+    claiming: bool,
+    /// Documents D43 reclaiming invalidated, for the server to refresh.
+    reclaimed_uris: Vec<Url>,
     /// Navigation answers best effort (D16): a dependency whose imports fail
     /// to load is skipped. The implementation code lens stays strict.
     best_effort_navigation: bool,
@@ -4402,7 +4447,7 @@ impl Workspace {
         }
         self.accept_open_document(uri.clone(), text, version, context_key, false)?;
         self.clear_rejected_open_fence(&uri);
-        Ok(())
+        self.reclaim_projectless_units(None, None)
     }
 
     #[cfg(test)]
@@ -4686,6 +4731,11 @@ impl Workspace {
             }
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
+            if let Err(error) = self.reclaim_projectless_units(None, None) {
+                self.warn(format!(
+                    "could not revisit D43 claims after closing {uri}: {error}"
+                ));
+            }
         }
         was_open || cleared_rejected_fence
     }
@@ -10177,23 +10227,6 @@ impl Workspace {
             budget,
             defer_context_pruning,
         )? {
-            let projectless = self.contexts.get(&key).is_some_and(|state| {
-                state.context.project_file().is_none() && state.context.discovery_complete()
-            });
-            if projectless
-                && key.selection_scope.is_none()
-                && project_options.project_file.is_none()
-                && let Some(claimed) = self.claim_projectless_unit(
-                    uri,
-                    &path,
-                    discovery_inputs,
-                    cancel,
-                    budget,
-                    defer_context_pruning,
-                )?
-            {
-                return Ok(claimed);
-            }
             return Ok(key);
         }
         let discovered =
@@ -10219,20 +10252,24 @@ impl Workspace {
                 ));
             }
         };
+        let mut claimants = None;
         if discovery.context.project_file().is_none()
             && discovery.context.discovery_complete()
             && discovery.project_selection.is_none()
             && project_options.project_file.is_none()
-            && let Some(claimed) = self.claim_projectless_unit(
+        {
+            match self.claim_projectless_unit(
                 uri,
                 &path,
                 discovery_inputs,
+                discovery.context_observations.metadata_files.clone(),
                 cancel,
                 budget,
                 defer_context_pruning,
-            )?
-        {
-            return Ok(claimed);
+            )? {
+                Claim::Claimed(key) => return Ok(*key),
+                Claim::Unclaimed { claimants: set } => claimants = Some(set),
+            }
         }
         let ProjectDiscovery {
             context,
@@ -10280,6 +10317,8 @@ impl Workspace {
                     key: key.clone(),
                     state: state.clone(),
                     warnings,
+                    claimants,
+                    claimed: false,
                 },
             );
         }
@@ -10324,82 +10363,191 @@ impl Workspace {
         hasher.finish()
     }
 
+    /// D43: the projects that may claim a projectless unit other than
+    /// `uri`'s own, in precedence order: selected projects, then open
+    /// documents' projects, each ordered by full key digest. An open
+    /// document's key that no longer matches the current selection is
+    /// resolved again (outside a claim already in progress); documents that
+    /// are themselves claims never claim.
+    fn claimants(
+        &mut self,
+        uri: Option<&Url>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Claimant>, String> {
+        let mut documents = self
+            .open_documents
+            .keys()
+            .filter(|document| Some(*document) != uri)
+            .cloned()
+            .collect::<Vec<_>>();
+        documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut claimants = Vec::<Claimant>::new();
+        let push = |claimants: &mut Vec<Claimant>,
+                    workspace: &Self,
+                    key: ContextKey,
+                    state: Option<Arc<ContextState>>| {
+            let Some(context) = workspace
+                .contexts
+                .get(&key)
+                .map(|state| state.context.clone())
+                .or_else(|| state.as_ref().map(|state| state.context.clone()))
+            else {
+                return;
+            };
+            if context.project_file().is_none()
+                || claimants.iter().any(|claimant| claimant.key == key)
+            {
+                return;
+            }
+            let selected = key
+                .selection_scope
+                .as_deref()
+                .zip(key.selection_project.as_deref())
+                .is_some_and(|(scope, project)| {
+                    workspace
+                        .project_selections
+                        .get(scope)
+                        .is_some_and(|current| paths_equal_ci(current, project))
+                });
+            claimants.push(Claimant {
+                selected,
+                digest: context_key_digest(&key),
+                key,
+                state,
+                context,
+            });
+        };
+        let installed_selected = self
+            .contexts
+            .keys()
+            .filter(|key| key.selection_scope.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in installed_selected {
+            push(&mut claimants, self, key, None);
+        }
+        for document in documents {
+            check_workspace_cancel(cancel)?;
+            let Ok(path) = document.to_file_path().map(absolute_path) else {
+                continue;
+            };
+            if self
+                .open_documents
+                .get(&document)
+                .is_some_and(|open| open.rejection.is_some() || open.text.is_none())
+            {
+                continue;
+            }
+            let owner = self.document_owners.get(&document);
+            if owner.is_some_and(|owner| owner.claimed) {
+                continue;
+            }
+            let Some(key) = self
+                .open_document_contexts
+                .get(&document)
+                .or(owner.map(|owner| &owner.key))
+                .cloned()
+            else {
+                continue;
+            };
+            let state = owner
+                .filter(|owner| owner.key == key)
+                .map(|owner| owner.state.clone());
+            let has_project = self
+                .contexts
+                .get(&key)
+                .map(|state| state.context.project_file().is_some())
+                .or_else(|| {
+                    state
+                        .as_ref()
+                        .map(|state| state.context.project_file().is_some())
+                })
+                .unwrap_or(false);
+            // Only a selection can make a project key stale here; freshness
+            // is checked when a claim is made.
+            let current = self.project_selections.is_empty()
+                || self.context_matches_current_selection_with_cancel_and_budget(
+                    &path, &key, cancel, budget,
+                )?;
+            if current {
+                if has_project {
+                    push(&mut claimants, self, key, state);
+                }
+                continue;
+            }
+            if self.claiming || !is_analyzable_source_path(&path) {
+                continue;
+            }
+            self.claiming = true;
+            let resolved = self.context_for_uri_with_cancel_and_budget(&document, cancel, budget);
+            self.claiming = false;
+            match resolved {
+                Ok(key) => {
+                    if self
+                        .document_owners
+                        .get(&document)
+                        .is_some_and(|owner| owner.claimed)
+                    {
+                        continue;
+                    }
+                    push(&mut claimants, self, key, None);
+                }
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => {}
+            }
+        }
+        // Installed selected contexts were only a pre-filter.
+        claimants.retain(|claimant| !claimant.key.selection_scope.is_some() || claimant.selected);
+        claimants.sort_by(|left, right| {
+            right
+                .selected
+                .cmp(&left.selected)
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        Ok(claimants)
+    }
+
+    /// The identity of a claimant list, for shared discoveries.
+    fn claimant_fingerprint(claimants: &[Claimant]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for claimant in claimants {
+            claimant.digest.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// D43: a unit no project of its ancestor directories names keeps the
-    /// context of a selected project, else of an open document's project,
-    /// whose unit search path resolves it, instead of a projectless one.
-    /// Selected projects come first, then open documents' projects, each in
-    /// project path order; the first fresh one is shared, never duplicated.
+    /// context of the first claimant (see [`Self::claimants`]) whose unit
+    /// search path resolves it and whose context is fresh, instead of a
+    /// projectless one. The claimant's key is shared, never duplicated; the
+    /// skipped ancestors' metadata (`watch`) joins its watch set, so a later
+    /// edit there revisits the claim.
+    #[allow(clippy::too_many_arguments)]
     fn claim_projectless_unit(
         &mut self,
         uri: &Url,
         path: &Path,
         discovery_inputs: u64,
+        watch: Vec<PathBuf>,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
         defer_context_pruning: bool,
-    ) -> Result<Option<ContextKey>, String> {
-        if !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
-        {
-            return Ok(None);
+    ) -> Result<Claim, String> {
+        if !is_claimable_unit(path) {
+            return Ok(Claim::Unclaimed { claimants: 0 });
         }
-        let is_selected = |key: &ContextKey| {
-            key.selection_scope
-                .as_deref()
-                .zip(key.selection_project.as_deref())
-                .is_some_and(|(scope, project)| {
-                    self.project_selections
-                        .get(scope)
-                        .is_some_and(|current| paths_equal_ci(current, project))
-                })
-        };
-        // A request workspace starts from the document owners alone, so the
-        // open documents' contexts come from their owners when not installed.
-        let mut claimants = Vec::<(bool, ContextKey, Option<Arc<ContextState>>)>::new();
-        let open = self
-            .open_documents
-            .keys()
-            .filter(|document| *document != uri)
-            .filter_map(|document| {
-                let owner = self.document_owners.get(document);
-                let key = self
-                    .open_document_contexts
-                    .get(document)
-                    .or(owner.map(|owner| &owner.key))?;
-                let state = owner
-                    .filter(|owner| owner.key == *key)
-                    .map(|owner| owner.state.clone());
-                Some((key, state))
-            });
-        let installed_selected = self
-            .contexts
-            .keys()
-            .filter(|key| is_selected(key))
-            .map(|key| (key, None));
-        for (key, state) in installed_selected.chain(open) {
-            if claimants.iter().any(|(_, existing, _)| existing == key) {
+        let claimants = self.claimants(Some(uri), cancel, budget)?;
+        let fingerprint = Self::claimant_fingerprint(&claimants);
+        for claimant in claimants {
+            if !claimant.context.resolves_unit_source(path) {
                 continue;
             }
-            let claims = self
-                .contexts
-                .get(key)
-                .or(state.as_deref())
-                .is_some_and(|state| state.context.resolves_unit_source(path));
-            if claims {
-                claimants.push((is_selected(key), key.clone(), state));
-            }
-        }
-        claimants.sort_by(|(left_selected, left, _), (right_selected, right, _)| {
-            right_selected
-                .cmp(left_selected)
-                .then_with(|| left.project_file.cmp(&right.project_file))
-                .then_with(|| left.selection_scope.cmp(&right.selection_scope))
-        });
-        for (_, key, state) in claimants {
+            let key = claimant.key;
             let installed = !self.contexts.contains_key(&key);
             if installed {
-                let Some(state) = state else {
+                let Some(state) = claimant.state else {
                     continue;
                 };
                 self.contexts
@@ -10416,6 +10564,7 @@ impl Workspace {
                 path.display(),
                 key.project_file
             );
+            self.watch_context_paths(&key, watch);
             self.extend_context_watch_paths(&key, path, cancel, budget)?;
             self.select_document_context_with_pruning(
                 uri,
@@ -10425,6 +10574,9 @@ impl Workspace {
                 budget,
                 !defer_context_pruning,
             )?;
+            if let Some(owner) = self.document_owners.get_mut(uri) {
+                owner.claimed = true;
+            }
             if let Some(state) = self.contexts.get(&key) {
                 self.shared_discoveries.insert(
                     self.configuration_generation,
@@ -10434,12 +10586,79 @@ impl Workspace {
                         key: key.clone(),
                         state: state.clone(),
                         warnings: Vec::new(),
+                        claimants: Some(fingerprint),
+                        claimed: true,
                     },
                 );
             }
-            return Ok(Some(key));
+            return Ok(Claim::Claimed(Box::new(key)));
         }
-        Ok(None)
+        Ok(Claim::Unclaimed {
+            claimants: fingerprint,
+        })
+    }
+
+    /// D43: a claimant appeared or left (an open, a close, a selection).
+    /// Every projectless or claimed Automatic owner whose winning claimant
+    /// changed is invalidated, with the l4d-33 owners of its directory, and
+    /// rediscovers on its next use.
+    pub(crate) fn reclaim_projectless_units(
+        &mut self,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let mut candidates = self
+            .document_owners
+            .iter()
+            .filter(|(_, owner)| owner.origin == OwnerOrigin::Automatic)
+            .filter_map(|(uri, owner)| {
+                let path = uri.to_file_path().ok().map(absolute_path)?;
+                let projectless = owner.key.selection_scope.is_none()
+                    && owner.state.context.project_file().is_none()
+                    && owner.state.context.discovery_complete();
+                (is_claimable_unit(&path) && (owner.claimed || projectless))
+                    .then(|| (uri.clone(), path, owner.claimed.then(|| owner.key.clone())))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        candidates.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        let claimants = self.claimants(None, cancel, budget)?;
+        let mut affected = HashSet::new();
+        let mut directories = Vec::new();
+        for (uri, path, current) in candidates {
+            check_workspace_cancel(cancel)?;
+            let winner = claimants
+                .iter()
+                .find(|claimant| claimant.context.resolves_unit_source(&path))
+                .map(|claimant| &claimant.key);
+            if winner != current.as_ref() {
+                crate::trace::trace!("  owner: {} changes claimant (D43)", path.display());
+                directories.extend(path.parent().map(Path::to_path_buf));
+                affected.insert(uri);
+            }
+        }
+        if affected.is_empty() {
+            return Ok(());
+        }
+        self.invalidate_project_selection_uris(&affected, cancel, budget)?;
+        for uri in &affected {
+            if let Some(owner) = self.document_owners.get_mut(uri) {
+                owner.claimed = false;
+            }
+        }
+        self.project_cache.reassign_owners(&directories);
+        self.reclaimed_uris.extend(affected);
+        Ok(())
+    }
+
+    /// The documents [`Self::reclaim_projectless_units`] invalidated since
+    /// the last call, for the server to refresh.
+    pub(crate) fn take_reclaimed_uris(&mut self) -> Vec<Url> {
+        let mut uris = std::mem::take(&mut self.reclaimed_uris);
+        uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris
     }
 
     /// Adopt the context another workspace sharing this one's discoveries
@@ -10461,6 +10680,14 @@ impl Workspace {
         else {
             return Ok(None);
         };
+        if let Some(expected) = discovery.claimants {
+            let claimants = self.claimants(Some(uri), cancel, budget)?;
+            if Self::claimant_fingerprint(&claimants) != expected {
+                self.shared_discoveries
+                    .remove(generation, uri, discovery_inputs);
+                return Ok(None);
+            }
+        }
         let installed = !self.contexts.contains_key(&discovery.key);
         if installed {
             self.contexts
@@ -10495,14 +10722,24 @@ impl Workspace {
         for warning in discovery.warnings {
             self.warn_project(warning);
         }
+        let origin = if discovery.claimed {
+            OwnerOrigin::Automatic
+        } else {
+            self.owner_origin_for_context_key(&discovery.key)
+        };
         self.select_document_context_with_pruning(
             uri,
             &discovery.key,
-            self.owner_origin_for_context_key(&discovery.key),
+            origin,
             cancel,
             budget,
             !defer_context_pruning,
         )?;
+        if discovery.claimed
+            && let Some(owner) = self.document_owners.get_mut(uri)
+        {
+            owner.claimed = true;
+        }
         Ok(Some(discovery.key))
     }
 
@@ -10964,6 +11201,10 @@ impl Workspace {
                 .flatten()
                 .filter(|route| route.context == *key)
         });
+        let claimed = self
+            .document_owners
+            .get(uri)
+            .is_some_and(|owner| owner.key == *key && owner.claimed);
         self.use_clock = self.use_clock.saturating_add(1);
         self.owner_last_used.insert(uri.clone(), self.use_clock);
         self.document_owners.insert(
@@ -10975,6 +11216,7 @@ impl Workspace {
                 needs_revalidation: false,
                 follow_current_project_file: false,
                 legacy_route,
+                claimed,
             },
         );
         self.trim_document_owners();
@@ -17719,6 +17961,7 @@ mod tests {
                     origin: super::OwnerOrigin::Automatic,
                     needs_revalidation: false,
                     follow_current_project_file: false,
+                    claimed: false,
                     legacy_route: None,
                 },
             );
@@ -24247,6 +24490,7 @@ BDS = '/fake/37'
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
             follow_current_project_file: false,
+            claimed: false,
             legacy_route: None,
         };
         let workspace = test_workspace(vec![root], WorkspaceOptions::default());
@@ -26535,6 +26779,7 @@ BDS = '/fake/37'
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
+            claimed: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source: source.clone(),
                 context: key.clone(),
@@ -26573,6 +26818,7 @@ BDS = '/fake/37'
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
+            claimed: false,
             legacy_route: Some(super::LegacyRouteProof {
                 source,
                 context: key,

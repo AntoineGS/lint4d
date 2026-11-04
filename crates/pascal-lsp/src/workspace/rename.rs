@@ -2777,6 +2777,10 @@ pub(crate) fn owner_for_input(
                 .then(|| owner.legacy_route.clone())
                 .flatten()
         }),
+        claimed: workspace
+            .document_owners
+            .get(&uri)
+            .is_some_and(|owner| owner.key == key && owner.claimed),
     })
 }
 
@@ -12344,6 +12348,7 @@ mod tests {
                 origin: super::super::OwnerOrigin::Inherited,
                 needs_revalidation: false,
                 follow_current_project_file: false,
+                claimed: false,
                 legacy_route: None,
             },
         );

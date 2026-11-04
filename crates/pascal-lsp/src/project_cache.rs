@@ -6039,6 +6039,17 @@ impl ProjectCache {
         store.owners.insert(directory, key);
     }
 
+    /// D43: the owners of `directories` changed because a claimant project
+    /// appeared or left. Forget them and dirty the memberships that list
+    /// them, as a change to an entry of each directory would.
+    pub(crate) fn reassign_owners(&self, directories: &[PathBuf]) {
+        for directory in directories {
+            // A child name no file has: only the listing and owner effects
+            // of `invalidate_index` apply.
+            self.invalidate_index(&directory.join("\u{0}d43-owner"), true);
+        }
+    }
+
     /// `path` changed: mark the members it is (or includes into) stale, and
     /// the memberships whose listing it may have changed dirty.
     fn invalidate_index(&self, path: &Path, include_parent: bool) {

@@ -896,6 +896,17 @@ helper exposes `:PascalProject` / `<leader>wp`, project browsing, and
 `:PascalDelphiVersion`; changing a selection does not restart the server.
 See [`examples/pascal_project.lua`](examples/pascal_project.lua).
 
+A single `.dproj` in a directory *above* the unit's own directory owns the unit
+only when it names it: as its main source, a `DCCReference` or `uses … in`
+entry, or a unit of the project directory, the main source's directory or a
+`DCC_UnitSearchPath` directory (IDE library paths and client `sourcePaths` do
+not count). An ancestor whose context is incomplete, or whose search-path entry
+depends on an undefined property, keeps the unit as before. Otherwise the unit
+is analysed in the context of the selected project, else of an open document's
+project, whose search paths resolve it, and follows that project as it is
+selected, opened or closed. With no such project open, and in the `lint4d`
+CLI, such a unit is projectless.
+
 The automatic search falls back to a `.dpr` or
 `.dpk`. Multiple candidates can be narrowed to a unique proven source owner;
 shared ownership, uncertain dependencies, and incomplete candidate metadata

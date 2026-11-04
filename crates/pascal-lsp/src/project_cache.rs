@@ -2857,6 +2857,7 @@ mod cache_tests {
                 content_hash: 1,
             },
             lookup: (0, 0),
+            names: None,
             retained_bytes: bytes,
         })
     }

@@ -792,6 +792,10 @@ fn qualified_proofs_stay_isolated_from_an_unknown_unqualified_import() {
     }
 }
 
+/// An uncertain interface that could declare `SizeOf`. One that never
+/// spells the name could not shadow the intrinsic (l4d-onnm, D46).
+const UNCERTAIN_OTHER: &str = "unit Other; interface {$IFDEF OPEN} type Export=Int64; {$ELSE} type Export=UInt64; {$ENDIF} {$IFDEF SHADOW} function SizeOf(X: Byte): Byte; {$ENDIF} implementation end.";
+
 #[test]
 fn qualified_layout_keeps_its_proof_after_an_uncertain_provider_query() {
     for selected_include in ["", "{$I hit.inc}"] {
@@ -806,7 +810,7 @@ fn qualified_layout_keeps_its_proof_after_an_uncertain_provider_query() {
         "unit Types; interface type Export=Int64; const Value=8; implementation {$I forbidden.inc} end.",
         context(LayoutPlatform::Win32),
     );
-        f.unit("Other", "unit Other; interface {$IFDEF OPEN} type Export=Int64; {$ELSE} type Export=UInt64; {$ENDIF} implementation end.", context(LayoutPlatform::Win32));
+        f.unit("Other", UNCERTAIN_OTHER, context(LayoutPlatform::Win32));
         f.include("hit.inc", "{$DEFINE INCLUDED}");
         f.deny_include("forbidden.inc");
         let a = f.analyze().unwrap();
@@ -878,7 +882,7 @@ fn authorized_alias_and_namespace_proofs_are_independent_of_provider_query_order
                     context(LayoutPlatform::Win32),
                 );
                 f.unit_qualifiers("Alias", &["Alias", "Vendor.Types"]);
-                f.unit("Other", "unit Other; interface {$IFDEF OPEN} type Export=Int64; {$ELSE} type Export=UInt64; {$ENDIF} implementation end.", context(LayoutPlatform::Win32));
+                f.unit("Other", UNCERTAIN_OTHER, context(LayoutPlatform::Win32));
                 f.include("hit.inc", " ");
                 let a = f.analyze().unwrap();
                 if selected_include.is_empty() {
@@ -1002,7 +1006,7 @@ fn qualified_layout_stays_proven_without_an_earlier_uncertain_provider_query() {
                 "unit Types; interface type Export=Int64; const Value=8; implementation end.",
                 context(LayoutPlatform::Win32),
             );
-            f.unit("Other", "unit Other; interface {$IFDEF OPEN} type Export=Int64; {$ELSE} type Export=UInt64; {$ENDIF} implementation end.", context(LayoutPlatform::Win32));
+            f.unit("Other", UNCERTAIN_OTHER, context(LayoutPlatform::Win32));
             f.include("hit.inc", " ");
             let a = f.analyze().unwrap();
             if selected_include.is_empty() || !prior.is_empty() {

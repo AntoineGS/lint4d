@@ -5583,6 +5583,9 @@ struct StoredIndex {
     last_seal: Option<std::time::Instant>,
     /// Whether this process looked for a sealed snapshot to start from.
     hint_tried: bool,
+    /// A batch indexed members while the store was not enabled: they have
+    /// no record until the next persisting batch proves them again.
+    memory_only: bool,
 }
 
 impl StoredIndex {
@@ -6020,6 +6023,7 @@ impl ProjectCache {
                     baseline: None,
                     last_seal: None,
                     hint_tried: false,
+                    memory_only: false,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -6052,6 +6056,32 @@ impl ProjectCache {
         facts: MemberFacts,
         stamps: Vec<MemberStamp>,
         content_hash: u64,
+    ) -> PublishOutcome {
+        self.publish_member(key, path, facts, stamps, content_hash, false)
+    }
+
+    /// `publish_index_member` for facts from the store: the member is
+    /// marked reused under the same lock, so no status reads it as
+    /// extracted.
+    pub(crate) fn publish_reused_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+    ) -> PublishOutcome {
+        self.publish_member(key, path, facts, stamps, content_hash, true)
+    }
+
+    fn publish_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+        reused: bool,
     ) -> PublishOutcome {
         // The charge covers the names the context does not hold yet, so it
         // is computed under the lock and checked again before inserting.
@@ -6086,6 +6116,9 @@ impl ProjectCache {
                     .insert_paid(path, facts, stamps, content_hash, bytes);
                 if old.is_some() {
                     stored.memory_exhausted = false;
+                    if reused {
+                        stored.index.mark_reused(path);
+                    }
                 }
                 old
             });
@@ -6237,12 +6270,6 @@ impl ProjectCache {
             .any(|stored| stored.index.proven_with_hash(path, hash))
     }
 
-    pub(crate) fn mark_index_reused(&self, key: &ContextKey, path: &Path) {
-        if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.index.mark_reused(path);
-        }
-    }
-
     /// `context` is the cache digest of the context the caller indexes
     /// under (`CacheContextKey::new(&state.context)`); a proof made under
     /// another context is refused.
@@ -6306,6 +6333,43 @@ impl ProjectCache {
             .take(MAX_INDEXED_CONTEXTS)
             .map(|stored| IndexStatusEntry::of(stored, is_open))
             .collect()
+    }
+
+    /// A batch of `key` indexed members while the store was not enabled.
+    pub(crate) fn note_index_memory_only(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.memory_only = true;
+        }
+    }
+
+    /// After `note_index_memory_only`, once: marks every fresh member of
+    /// `key` without a record stale, so the next batches prove it again
+    /// (the reprove path). Returns how many.
+    pub(crate) fn restale_memory_only_members(&self, key: &ContextKey) -> usize {
+        let mut store = self.index();
+        let Some(stored) = store
+            .contexts
+            .get_mut(key)
+            .filter(|stored| stored.memory_only)
+        else {
+            return 0;
+        };
+        stored.memory_only = false;
+        let unrecorded = stored
+            .index
+            .records()
+            .into_iter()
+            .filter(|(path, record)| {
+                record.is_none()
+                    && stored.index.state_of(path)
+                        == Some(crate::workspace_index::MemberState::Fresh)
+            })
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        for path in &unrecorded {
+            stored.index.mark_stale(path);
+        }
+        unrecorded.len()
     }
 
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
@@ -6956,6 +7020,35 @@ mod index_tests {
         assert!(text.len() <= 8192, "{} bytes", text.len());
         assert!(text.contains("\"anchorTruncated\":true"), "{text}");
         assert!(!text.contains("/w/A.pas"));
+    }
+
+    /// Task 10b: a member reused from the store is never counted as
+    /// extracted, not even between its publication and its mark: the
+    /// status reads the index between the two (protocol tests
+    /// `a_second_server_fills_the_index_from_the_store_without_extracting`,
+    /// `two_servers_index_the_same_workspace`).
+    #[test]
+    fn a_reused_member_is_published_reused() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        assert_eq!(
+            cache.publish_reused_index_member(
+                &k,
+                Path::new("/w/A.pas"),
+                facts("/w/A.pas"),
+                stamps(),
+                1
+            ),
+            PublishOutcome::Indexed
+        );
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!((counts.reused, counts.extracted), (1, 0), "{counts:?}");
     }
 
     #[test]

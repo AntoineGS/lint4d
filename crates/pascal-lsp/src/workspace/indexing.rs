@@ -701,9 +701,18 @@ impl Workspace {
         // view holds a document only while it loads one.
         self.pinned_context = Some(key.clone());
         self.ensure_index_membership(&key, anchor, cancel)?;
-        if self.is_baseline() && self.persistent_cache().is_enabled() {
+        let persisting = self.persistent_cache().is_enabled();
+        if self.is_baseline() && persisting {
             self.release_evicted_holds();
             self.adopt_baseline_hint_once(&key, cancel);
+            // Members an earlier batch indexed while the store was not
+            // enabled get their records now, without a restart.
+            if self.may_publish(&key) {
+                let restaled = self.project_cache.restale_memory_only_members(&key);
+                if restaled > 0 {
+                    crate::trace::trace!("  {restaled} members indexed memory-only to prove");
+                }
+            }
         }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
         let started = Instant::now();
@@ -821,6 +830,9 @@ impl Workspace {
                 MemberOutcome::Published { persisted } => {
                     progress.indexed += 1;
                     progress.persisted += usize::from(persisted);
+                    if !persisted && !self.persistent_cache().is_enabled() {
+                        self.project_cache.note_index_memory_only(&key);
+                    }
                 }
                 MemberOutcome::Refused => progress.refused += 1,
                 MemberOutcome::Limited => progress.limited += 1,
@@ -1535,10 +1547,9 @@ impl Workspace {
         let member = MemberFacts::from_facts(path, &facts.facts, slots);
         let outcome = match self
             .project_cache
-            .publish_index_member(key, path, member, stamps, root_hash)
+            .publish_reused_index_member(key, path, member, stamps, root_hash)
         {
             PublishOutcome::Indexed => {
-                self.project_cache.mark_index_reused(key, path);
                 if let Some(state) = self.contexts.get(key) {
                     self.prove_member(
                         key,
@@ -5905,6 +5916,44 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// Task 10b: a batch that ran memory-only (the store opened after
+        /// `MAX_OPEN_WAIT`, or was enabled later) leaves members without a
+        /// record. Once the store is enabled, the next batch proves them, so
+        /// they get records and a snapshot without a restart.
+        #[test]
+        fn members_indexed_memory_only_are_proven_once_the_store_is_enabled() {
+            const COUNT: usize = 4;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), COUNT, WorkspaceOptions::default());
+            let cache = start(&workspace, store.path(), false);
+            assert_eq!(cache.state(), CacheState::Disabled);
+            let mut view = view_with(&workspace, &cache);
+            let first = advance(&mut view, &anchor, IndexBound::all());
+            assert!(first.complete, "{first:?}");
+            assert_eq!((first.indexed, first.persisted), (COUNT, 0), "{first:?}");
+
+            let ack = cache.reconfigure(CacheOptions {
+                enabled: true,
+                directory: Some(store.path().to_path_buf()),
+                ..CacheOptions::default()
+            });
+            assert_eq!(ack, Ack::Done);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let second = advance(&mut view, &anchor, IndexBound::all());
+            assert!(second.complete, "{second:?}");
+            assert_eq!(second.persisted, COUNT, "{second:?}");
+            assert_eq!(recorded(&view, &key).len(), COUNT);
+            let third = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(
+                (third.indexed, third.reused, third.persisted),
+                (0, 0, 0),
+                "proven once: {third:?}"
+            );
+            cache.shutdown();
+        }
+
         #[test]
         fn a_disable_mid_batch_continues_memory_only_without_store_calls() {
             let temp = tempfile::tempdir().unwrap();
@@ -6429,6 +6478,90 @@ pub(in crate::workspace) mod tests {
                 "only what the crawl did not publish is loaded"
             );
             assert_eq!(recorded(&view, &key).len(), ROOT_UNITS + 2);
+            cache.shutdown();
+        }
+
+        /// `App.dpr` using `U0..U5` in `lib`, `App.dproj` configured, and a
+        /// session that has resolved no index context yet: what a server
+        /// sees at its first `didOpen` of the main source.
+        fn configured_main_source(root: &Path) -> (Workspace, Url) {
+            for index in 0..ROOT_UNITS {
+                named_unit(
+                    &root.join(format!("lib/U{index}.pas")),
+                    &format!("P{index}"),
+                );
+            }
+            let uses = (0..ROOT_UNITS)
+                .map(|index| format!("U{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!("program App;\nuses {uses};\nbegin\nend.\n");
+            write(
+                &root.join("App.dproj"),
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup><ItemGroup></ItemGroup></Project>",
+            );
+            write(&root.join("App.dpr"), &text);
+            pascal_project::backdate_tree_for_test(root);
+            let mut session = workspace(root, configured(root));
+            let open = Url::from_file_path(root.join("App.dpr")).unwrap();
+            session.open_document(open.clone(), text, 1).unwrap();
+            (session, open)
+        }
+
+        fn configured(root: &Path) -> WorkspaceOptions {
+            WorkspaceOptions {
+                project_file: Some(root.join("App.dproj")),
+                ..WorkspaceOptions::default()
+            }
+        }
+
+        /// I-2 (Task 10b): the crawl of a configured project's main source
+        /// and a later `Project` anchor of that project derive one context,
+        /// so the anchor's extraction reuses what the crawl published.
+        #[test]
+        fn a_project_anchor_reuses_what_the_crawl_of_its_main_source_published() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, open) = configured_main_source(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let crawled = crawl(&session, &cache, &open);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                units(root, ROOT_UNITS)
+            );
+            let unit = Url::from_file_path(root.join("lib/U0.pas")).unwrap();
+            let crawl_context = crawled
+                .document_contexts
+                .get(&unit)
+                .and_then(|key| crawled.contexts.get(key))
+                .map(|state| state.context.clone())
+                .expect("the crawl's context");
+            cache.shutdown();
+
+            let (mut restarted, cache) =
+                persisting_view(&workspace(root, configured(root)), store.path());
+            let anchor = IndexAnchor::Project(root.join("App.dproj"));
+            let key = restarted
+                .index_context_for(&anchor, &AtomicBool::new(false))
+                .expect("context");
+            let anchor_context = restarted.contexts[&key].context.clone();
+            assert_eq!(
+                CacheContextKey::new(&anchor_context).digest(),
+                CacheContextKey::new(&crawl_context).digest(),
+                "crawl: {crawl_context:#?}\nanchor: {anchor_context:#?}"
+            );
+            let loaded = record_loads();
+            let progress = advance(&mut restarted, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.reused, ROOT_UNITS, "{progress:?}");
+            assert_eq!(
+                *loaded.borrow(),
+                vec![root.join("App.dpr")],
+                "only the open main source is extracted"
+            );
             cache.shutdown();
         }
 

@@ -800,6 +800,9 @@ impl Workspace {
         self.pinned_context = Some(key.clone());
         self.ensure_index_membership(&key, anchor, cancel)?;
         let persisting = self.persistent_cache().is_enabled();
+        // A publication refused for room: the batch waits once at most for
+        // the maintenance it woke (here, or before its next extraction).
+        let mut waited_for_room = false;
         if self.is_baseline() && persisting {
             self.release_evicted_holds();
             self.adopt_baseline_hint_once(&key, cancel);
@@ -810,11 +813,20 @@ impl Workspace {
                 if restaled > 0 {
                     crate::trace::trace!("  {restaled} members indexed memory-only to prove");
                 }
-                if self.project_cache.index_awaiting_room(&key) > 0
-                    && self.store_has_room(before_io)?
-                {
-                    let restaled = self.project_cache.restale_awaiting_room(&key);
-                    crate::trace::trace!("  {restaled} members refused for room to prove");
+                if self.project_cache.index_awaiting_room(&key) > 0 {
+                    waited_for_room = true;
+                    // After a wait that found no room, a batch with other
+                    // members to extract does not wait again; one left with
+                    // nothing else does, which paces the retries.
+                    let others = self
+                        .project_cache
+                        .read_index(&key, |index, _| !index.pending(1).is_empty())
+                        .unwrap_or(false);
+                    let may_wait = !others || !self.project_cache.index_room_wait_failed(&key);
+                    if self.store_has_room(&key, may_wait, before_io)? {
+                        let restaled = self.project_cache.restale_awaiting_room(&key);
+                        crate::trace::trace!("  {restaled} members refused for room to prove");
+                    }
                 }
             }
         }
@@ -840,10 +852,6 @@ impl Workspace {
         let mut pending = std::collections::VecDeque::from(pending);
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
-        // A publication refused for room: the next extraction waits once
-        // for the maintenance it woke, so the members after it publish
-        // rather than being refused in turn.
-        let mut waited_for_room = false;
         while let Some(path) = pending.pop_front() {
             if tried.len() >= bound.units
                 || bound.time.is_some_and(|limit| started.elapsed() >= limit)
@@ -918,9 +926,13 @@ impl Workspace {
             if asked {
                 before_io()?;
             }
+            // A refusal for room in this batch: wait for the maintenance
+            // it woke, so the members after it publish rather than being
+            // refused in turn.
             if !waited_for_room && self.project_cache.index_is_awaiting_room(&key) {
                 waited_for_room = true;
-                if self.store_has_room(before_io)? {
+                let may_wait = !self.project_cache.index_room_wait_failed(&key);
+                if self.store_has_room(&key, may_wait, before_io)? {
                     self.project_cache.restale_awaiting_room(&key);
                 }
             }
@@ -1010,14 +1022,23 @@ impl Workspace {
         Ok(progress)
     }
 
-    /// Whether the store takes writes again. Under pressure the cache's
-    /// maintenance is woken and given one step (`check` runs while
-    /// waiting), then the pressure is read again.
+    /// Whether the store takes writes again. Under pressure a maintenance
+    /// step can clear (the WAL threshold, the budget's headroom) and with
+    /// `may_wait`, the cache's maintenance is woken and given one step
+    /// (`check` runs while waiting), then the pressure is read again; a
+    /// wait that found no room is noted for `key`, and room clears it.
+    /// Low free space returns at once.
     fn store_has_room(
         &self,
+        key: &ContextKey,
+        may_wait: bool,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<bool, String> {
         let pressure = || {
+            #[cfg(test)]
+            if let Some(pressure) = self.persistent_cache().pressure_for_test() {
+                return Some(pressure);
+            }
             let job = self.persistent_cache().job()?;
             match job.store().pressure() {
                 Ok(pressure) => Some(pressure),
@@ -1027,18 +1048,27 @@ impl Workspace {
                 }
             }
         };
+        let room = |pressure: Option<pascal_cache::Pressure>| {
+            let room = pressure == Some(pascal_cache::Pressure::None);
+            if room {
+                self.project_cache.set_index_room_wait_failed(key, false);
+            }
+            room
+        };
         match pressure() {
-            Some(pascal_cache::Pressure::None) => return Ok(true),
-            Some(_) => {}
-            None => return Ok(false),
+            Some(pascal_cache::Pressure::WalPressure | pascal_cache::Pressure::OverHeadroom)
+                if may_wait => {}
+            other => return Ok(room(other)),
         }
-        if !self
+        if self
             .persistent_cache()
             .await_maintenance(ROOM_WAIT, check)?
+            && room(pressure())
         {
-            return Ok(false);
+            return Ok(true);
         }
-        Ok(pressure() == Some(pascal_cache::Pressure::None))
+        self.project_cache.set_index_room_wait_failed(key, true);
+        Ok(false)
     }
 
     /// An open document (rejected ones included) is answered from the
@@ -1302,11 +1332,12 @@ impl Workspace {
                                 // store woke it): the member waits for a
                                 // batch that finds no pressure rather than
                                 // being extracted into the same refusal.
+                                // `LowDiskSpace` and this store's own
+                                // `ScratchExhausted` are not pressure
+                                // maintenance clears: memory-only.
                                 PersistSkip::Store(
                                     pascal_cache::Bypass::WalPressure
-                                    | pascal_cache::Bypass::OverBudget
-                                    | pascal_cache::Bypass::LowDiskSpace
-                                    | pascal_cache::Bypass::ScratchExhausted,
+                                    | pascal_cache::Bypass::OverBudget,
                                 ) => self.project_cache.note_index_awaiting_room(key),
                                 _ => {}
                             }
@@ -1421,6 +1452,11 @@ impl Workspace {
         let stopped = || job.is_cancelled() || cancel.load(Ordering::Relaxed);
         if stopped() {
             return Err(PersistSkip::Unavailable);
+        }
+        #[cfg(test)]
+        if let Some(bypass) = self.persistent_cache().publish_fault_for_test(&path) {
+            job.observe(&bypass);
+            return Err(PersistSkip::Store(bypass));
         }
         #[cfg(test)]
         let wal = WalGrowth::new(job.store());
@@ -6120,6 +6156,100 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// Batches until one is not worth requeueing; at most `limit`.
+        fn until_settled(
+            view: &mut Workspace,
+            anchor: &IndexAnchor,
+            bound: IndexBound,
+            limit: usize,
+        ) -> IndexProgress {
+            for _ in 0..limit {
+                let progress = advance(view, anchor, bound);
+                if !progress.worth_requeue() {
+                    return progress;
+                }
+            }
+            panic!("the batches never end ({limit} batches)");
+        }
+
+        /// Fix round 2 (A): `ScratchExhausted` is this store's own scratch
+        /// budget, not pressure maintenance clears: a member that exhausts
+        /// it every time is extracted once and stays memory-only, and the
+        /// batches end.
+        #[test]
+        fn a_publication_that_always_exhausts_scratch_is_extracted_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let target = member.clone();
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path == target).then_some(pascal_cache::Bypass::ScratchExhausted)
+            })));
+            let loaded = record_loads();
+            let last = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            set_after_load_hook(None);
+            assert_eq!(
+                loaded
+                    .borrow()
+                    .iter()
+                    .filter(|path| **path == member)
+                    .count(),
+                1,
+                "{last:?}"
+            );
+            assert!(!view.project_cache.index_member_has_record(&key, &member));
+            assert_eq!(recorded(&view, &key).len(), 3);
+            cache.shutdown();
+        }
+
+        /// One `WalPressure` refusal of the first publication.
+        fn refuse_first_publication(cache: &PersistentCache) {
+            let mut refused = false;
+            cache.set_publish_fault_for_test(Some(Box::new(move |_| {
+                (!std::mem::replace(&mut refused, true))
+                    .then_some(pascal_cache::Bypass::WalPressure)
+            })));
+        }
+
+        /// Fix round 2 (B): free disk space is not something a maintenance
+        /// step makes, so no batch waits for one.
+        #[test]
+        fn no_batch_waits_for_room_under_low_disk_space() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, _, anchor) =
+                indexed_project(temp.path(), 8, WorkspaceOptions::default());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            refuse_first_publication(&cache);
+            cache.set_pressure_for_test(Some(Box::new(|_| pascal_cache::Pressure::LowDiskSpace)));
+            let last = until_settled(&mut view, &anchor, IndexBound::units(3), 10);
+            assert_eq!(last.awaiting_room, 1, "{last:?}");
+            assert_eq!(cache.room_waits_for_test(), 0);
+            cache.shutdown();
+        }
+
+        /// Fix round 2 (B): under WAL pressure a batch waits once, and once
+        /// a wait found no room, the batches that still have members to
+        /// extract do not wait again; only the one left with nothing but
+        /// the refused member does.
+        #[test]
+        fn a_wait_for_room_that_found_none_is_not_repeated_by_each_batch() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, _, anchor) =
+                indexed_project(temp.path(), 10, WorkspaceOptions::default());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            refuse_first_publication(&cache);
+            cache.set_pressure_for_test(Some(Box::new(|_| pascal_cache::Pressure::WalPressure)));
+            let last = until_settled(&mut view, &anchor, IndexBound::units(3), 10);
+            assert_eq!(last.awaiting_room, 1, "{last:?}");
+            assert_eq!(cache.room_waits_for_test(), 2);
+            cache.shutdown();
+        }
+
         /// Task 10b: a batch that ran memory-only (the store opened after
         /// `MAX_OPEN_WAIT`, or was enabled later) leaves members without a
         /// record. Once the store is enabled, the next batch proves them, so
@@ -7513,8 +7643,9 @@ end.
                 // Fewer when a publication refused for room was not proven
                 // again before the kill.
                 assert!(
-                    published.len() <= target && !published.is_empty(),
-                    "{killed:?}"
+                    published.len() <= target && published.len() >= target * 9 / 10,
+                    "{} of {target}: {killed:?}",
+                    published.len()
                 );
                 let pressure_killed = wal_pressure_bypasses(&cache);
                 cache.shutdown();

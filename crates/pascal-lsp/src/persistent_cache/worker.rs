@@ -72,6 +72,7 @@ pub(super) fn new_cursor() -> Cursor {
 /// dropped on return.
 pub(super) fn step(inner: &Arc<Inner>, cursor: &mut Cursor) -> Option<StepResult> {
     let job = inner.job()?;
+    let number = inner.note_step_begun();
     if cursor.0 != job.generation() {
         *cursor = (job.generation(), new_cursor().1);
     }
@@ -89,7 +90,7 @@ pub(super) fn step(inner: &Arc<Inner>, cursor: &mut Cursor) -> Option<StepResult
         Err(bypass) => job.observe(bypass),
     }
     drop(job);
-    inner.note_step();
+    inner.note_step(number);
     Some(result)
 }
 

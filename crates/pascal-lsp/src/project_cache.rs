@@ -5590,6 +5590,8 @@ struct StoredIndex {
     /// disk budget, free space): its members stay memory-only until the
     /// store reports no pressure, then a batch proves them again.
     awaiting_room: bool,
+    /// A batch's wait for maintenance found no room; cleared by room.
+    room_wait_failed: bool,
 }
 
 impl StoredIndex {
@@ -6041,6 +6043,7 @@ impl ProjectCache {
                     hint_tried: false,
                     memory_only: false,
                     awaiting_room: false,
+                    room_wait_failed: false,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -6383,6 +6386,19 @@ impl ProjectCache {
     pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.awaiting_room = true;
+        }
+    }
+
+    pub(crate) fn index_room_wait_failed(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.room_wait_failed)
+    }
+
+    pub(crate) fn set_index_room_wait_failed(&self, key: &ContextKey, failed: bool) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.room_wait_failed = failed;
         }
     }
 

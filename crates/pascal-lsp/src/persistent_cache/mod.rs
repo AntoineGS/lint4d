@@ -95,6 +95,24 @@ pub(super) struct Inner {
     /// Jobs this handle admitted (a handle-local count of store work).
     #[cfg(test)]
     jobs_issued: std::sync::atomic::AtomicUsize,
+    /// Test seams for index batches under store pressure (Task 11).
+    #[cfg(test)]
+    seams: Mutex<IndexSeams>,
+}
+
+#[cfg(test)]
+pub(crate) type PublishFault = Box<dyn FnMut(&std::path::Path) -> Option<Bypass> + Send>;
+
+/// What an index batch sees instead of the store, in tests.
+#[cfg(test)]
+#[derive(Default)]
+struct IndexSeams {
+    /// The store's pressure, given the waits so far.
+    pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
+    /// A bypass for the publication of an extracted member.
+    publish: Option<PublishFault>,
+    /// `await_maintenance` calls.
+    waits: u64,
 }
 
 /// Test seam: the worker sends on the first and blocks on the second after
@@ -123,6 +141,10 @@ pub(super) struct Shared {
     worker_thread: Option<ThreadId>,
     /// Maintenance steps the worker completed (any generation).
     steps: u64,
+    /// Steps the worker began; each step is numbered by this count.
+    steps_begun: u64,
+    /// The number of the last step that completed.
+    last_step_done: u64,
     /// The last retry delay, doubled by each retried bypass.
     retry_delay: Option<Duration>,
     /// A retry due for the `Bypassed` state of this generation.
@@ -165,6 +187,8 @@ impl Shared {
             commands: None,
             worker_thread: None,
             steps: 0,
+            steps_begun: 0,
+            last_step_done: 0,
             retry_delay: None,
             retry: None,
             logged: [None; names::BYPASS_KINDS],
@@ -249,6 +273,8 @@ impl Inner {
             open_hook: Mutex::new(None),
             #[cfg(test)]
             jobs_issued: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            seams: Mutex::new(IndexSeams::default()),
         }
     }
 
@@ -384,9 +410,19 @@ impl Inner {
         }
     }
 
-    /// A maintenance step finished.
-    fn note_step(&self) {
-        self.lock().steps += 1;
+    /// A maintenance step begins; returns its number.
+    fn note_step_begun(&self) -> u64 {
+        let mut shared = self.lock();
+        shared.steps_begun += 1;
+        shared.steps_begun
+    }
+
+    /// Step `number` finished.
+    fn note_step(&self, number: u64) {
+        let mut shared = self.lock();
+        shared.steps += 1;
+        shared.last_step_done = shared.last_step_done.max(number);
+        drop(shared);
         self.changed.notify_all();
     }
 
@@ -512,6 +548,48 @@ impl PersistentCache {
         let inner = Inner::new(options, project_cache, gate, namespace, false);
         *lock(&inner.open_hook) = Some((entered, release));
         Self::launch(inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pressure_for_test(
+        &self,
+        pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
+    ) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).pressure = pressure;
+        }
+    }
+
+    /// The pressure the seam reports, if one is set.
+    #[cfg(test)]
+    pub(crate) fn pressure_for_test(&self) -> Option<pascal_cache::Pressure> {
+        let inner = self.inner.as_ref()?;
+        let mut seams = lock(&inner.seams);
+        let waits = seams.waits;
+        seams.pressure.as_mut().map(|pressure| pressure(waits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_publish_fault_for_test(&self, fault: Option<PublishFault>) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).publish = fault;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
+        let inner = self.inner.as_ref()?;
+        lock(&inner.seams)
+            .publish
+            .as_mut()
+            .and_then(|fault| fault(path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn room_waits_for_test(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| lock(&inner.seams).waits)
     }
 
     #[cfg(test)]
@@ -773,6 +851,10 @@ impl PersistentCache {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<bool, String> {
         const SLICE: Duration = Duration::from_millis(25);
+        #[cfg(test)]
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).waits += 1;
+        }
         let Some(inner) = self
             .inner
             .as_ref()
@@ -780,15 +862,17 @@ impl PersistentCache {
         else {
             return Ok(false);
         };
-        let before = inner.lock().steps;
+        // A step already running may have read the pressure before the
+        // refusal: only one that begins after the wake counts.
+        let before = inner.lock().steps_begun;
         inner.wake_maintenance();
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let shared = inner.wait_while(inner.lock(), left.min(SLICE), |shared| {
-                shared.steps == before && !shared.shut_down
+                shared.last_step_done <= before && !shared.shut_down
             });
-            if shared.steps != before {
+            if shared.last_step_done > before {
                 return Ok(true);
             }
             if shared.shut_down || left.is_zero() {

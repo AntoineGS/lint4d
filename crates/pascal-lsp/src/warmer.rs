@@ -21,6 +21,10 @@ const INDEX_BATCH_UNITS: usize = crate::workspace::indexing::EXTRACTION_BATCH_UN
 const MAX_INDEX_ANCHORS: usize = 16;
 /// Seals a store bypass retired that an anchor tries again in a row.
 const MAX_SEAL_RETRIES: usize = 3;
+/// Batches an anchor is asked for again, in a row, for members refused for
+/// room while the store's pressure outlasts their waits (each waits for a
+/// maintenance step, which paces them).
+const MAX_ROOM_RETRIES: usize = 3;
 
 #[derive(Default)]
 pub(crate) struct InteractiveGate {
@@ -743,6 +747,9 @@ pub(crate) struct Warmer {
     reuse_done: HashSet<IndexAnchor>,
     /// Seals of each anchor a store bypass retired in a row.
     seal_retries: HashMap<IndexAnchor, usize>,
+    /// Batches of each anchor asked for again in a row for members refused
+    /// for room.
+    room_retries: HashMap<IndexAnchor, usize>,
     /// The index batch in flight.
     index_in_flight: Option<(IndexAnchor, IndexMode)>,
     /// The configured project's absolute path, as of the last poll.
@@ -795,6 +802,7 @@ impl Warmer {
             unsettled_since: None,
             reuse_done: HashSet::new(),
             seal_retries: HashMap::new(),
+            room_retries: HashMap::new(),
             index_in_flight: None,
             configured_project: None,
             crawl_pending: Arc::new(AtomicBool::new(false)),
@@ -932,6 +940,7 @@ impl Warmer {
         self.reuse_due.store(false, Ordering::Relaxed);
         self.reuse_done.clear();
         self.seal_retries.clear();
+        self.room_retries.clear();
         self.interleave = false;
         self.crawl_resume.clear();
         self.dispatched_epochs.clear();
@@ -1318,7 +1327,26 @@ impl Warmer {
                 // cannot gain from a retry.
                 // A cold store ends the pass at once: hashing every member
                 // before the crawl would find nothing either.
-                if progress.worth_requeue() && !progress.found_a_cold_store() {
+                let requeued = progress.worth_requeue() && !progress.found_a_cold_store();
+                let settled = progress.indexed
+                    + progress.refreshed
+                    + progress.refused
+                    + progress.limited
+                    + progress.reused
+                    > 0;
+                // Members refused for room hold `complete` back; a batch
+                // that found no room settled nothing and is not requeued,
+                // so nothing else would ask for the anchor again.
+                if progress.complete || settled {
+                    self.room_retries.remove(anchor);
+                } else if !requeued && progress.awaiting_room > 0 {
+                    let retries = self.room_retries.entry(anchor.clone()).or_default();
+                    if *retries < MAX_ROOM_RETRIES {
+                        *retries += 1;
+                        self.request_index(anchor.clone());
+                    }
+                }
+                if requeued {
                     self.requeue_index(anchor, progress.mode);
                 } else if progress.mode == IndexMode::Reuse {
                     // The pass is done: extraction follows the crawl.
@@ -4053,6 +4081,47 @@ mod tests {
                 bypassed < position(&events, |event| sealed(event, &SealOutcome::Sealed)),
                 "{events:?}"
             );
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// Task 11 fix round 2 (C): a publication refused for room while
+        /// the pressure outlasts the batches' waits. The batch that settles
+        /// nothing is not requeued, so the warmer asks for the anchor again
+        /// itself; once the pressure clears, the member is proven and the
+        /// context seals with no request from outside.
+        #[test]
+        fn members_refused_for_room_are_proven_once_the_pressure_outlasts_a_wait() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let cache = workspace.persistent_cache().clone();
+            let mut refused = false;
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path.ends_with("App.dpr") && !std::mem::replace(&mut refused, true))
+                    .then_some(pascal_cache::Bypass::WalPressure)
+            })));
+            // Two waits find no room; the next look finds it cleared.
+            cache.set_pressure_for_test(Some(Box::new(|waits| {
+                if waits >= 2 {
+                    pascal_cache::Pressure::None
+                } else {
+                    pascal_cache::Pressure::WalPressure
+                }
+            })));
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed))
+            });
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    WarmEvent::IndexProgress { progress, .. } if progress.awaiting_room > 0
+                )),
+                "{events:?}"
+            );
+            assert!(cache.room_waits_for_test() >= 2);
             workspace.persistent_cache().shutdown();
         }
 

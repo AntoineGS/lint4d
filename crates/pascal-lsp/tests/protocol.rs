@@ -23580,9 +23580,10 @@ fn open_dependency_keeps_its_selected_project_context_across_requests() {
         &root.join("A/App.dproj"),
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
     );
+    // A names Shared as its own unit, so A owns the opened Shared (D43).
     write_file(
         &root.join("A/App.dpr"),
-        "program App; uses Config in 'lib/Config.pas'; begin end.\n",
+        "program App; uses Shared in 'src/Shared.pas', Config in 'lib/Config.pas'; begin end.\n",
     );
     write_file(
         &root.join("B/App.dproj"),
@@ -24725,9 +24726,10 @@ fn open_document_context_survives_metadata_invalidation_before_dependency_load()
         &a_project,
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
     );
+    // A names Shared as its own unit, so A owns the opened Shared (D43).
     write_file(
         &root.join("A/App.dpr"),
-        "program App; uses Config in 'lib/Config.pas'; begin end.\n",
+        "program App; uses Shared in 'src/Shared.pas', Config in 'lib/Config.pas'; begin end.\n",
     );
     write_file(
         &root.join("B/App.dproj"),

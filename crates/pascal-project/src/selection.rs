@@ -657,6 +657,7 @@ fn discover_context_with_selections_inner(
         .as_ref()
         .map(|(scope, requested, _, _)| (scope.clone(), requested.clone()));
 
+    let mut probed = None;
     let mut selected_project =
         if let Some((scope, requested, selected, candidates)) = runtime_selection {
             let Some(project_file) = selected else {
@@ -701,6 +702,7 @@ fn discover_context_with_selections_inner(
                 cancel,
                 exclusions,
                 deleted_paths,
+                &mut probed,
             )
         };
     if let ProjectSelection::Selected { path, .. } = &selected_project
@@ -794,31 +796,11 @@ fn discover_context_with_selections_inner(
             for observation in &metadata_observations {
                 read_tracker.record_metadata_observation(observation.clone());
             }
-            let option_base = relevant_workspace_root(&file_path, &roots)
-                .or_else(|| file_path.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| {
-                    project_file
-                        .parent()
-                        .map_or_else(PathBuf::new, Path::to_path_buf)
-                });
-            let cache_key = ProjectContextBuildCacheKey {
-                project_file: project_file.clone(),
-                roots: roots.clone(),
-                deleted_paths: cache_path_list(deleted_paths),
-                option_base,
-                options: ProjectOptionsCacheKey::new(&options, &project_file),
-                overrides: effective_overrides.clone(),
-                exclusions: exclusions.to_vec(),
-                warnings: warnings.clone(),
-                explicit,
-            };
-            let cached = project_context_cache_get(&cache_key, cancel, work_budget)?;
-            let project = if let Some(cached) = cached {
-                read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
-                cached.project
+            let probed_project = ProbedProject::take_for(&mut probed, &project_file, &warnings);
+            let project = if let Some(project) = probed_project {
+                project
             } else {
-                let mut build_tracker = ProjectReadTracker::with_budget(work_budget, deleted_paths);
-                let project = build_project_context(
+                build_project_context_cached(
                     project_file,
                     &file_path,
                     &roots,
@@ -827,21 +809,10 @@ fn discover_context_with_selections_inner(
                     effective_overrides,
                     warnings,
                     explicit,
-                    Vec::new(),
-                    Vec::new(),
                     exclusions,
-                    &mut build_tracker,
+                    &mut read_tracker,
                     cancel,
-                )?;
-                let cached = CachedProjectContext {
-                    project: project.clone(),
-                    observations: build_tracker.observations,
-                    metadata_paths: build_tracker.metadata_paths,
-                    metadata_observations: build_tracker.metadata_observations,
-                };
-                read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
-                project_context_cache_insert(cache_key, cached);
-                project
+                )?
             };
             if let Some(work_budget) = work_budget {
                 work_budget.check_cancelled()?;
@@ -890,6 +861,73 @@ fn discover_context_with_selections_inner(
             Ok(read_tracker.into_discovery(project, discovery_selection.clone()))
         }
     }
+}
+
+/// Build `project_file`'s context for `file` through the request-scoped
+/// context cache, merging the reads into `read_tracker`.
+#[allow(clippy::too_many_arguments)]
+fn build_project_context_cached(
+    project_file: PathBuf,
+    file: &Path,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
+    installation_config: crate::installation_config::ProjectConfiguration,
+    effective_overrides: EffectiveOverrides,
+    warnings: Vec<String>,
+    explicit: bool,
+    exclusions: &[String],
+    read_tracker: &mut ProjectReadTracker<'_>,
+    cancel: Option<&AtomicBool>,
+) -> Result<DiscoveredProject, String> {
+    let work_budget = read_tracker.work_budget;
+    let deleted_paths = read_tracker.deleted_paths;
+    let option_base = relevant_workspace_root(file, roots)
+        .or_else(|| file.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| {
+            project_file
+                .parent()
+                .map_or_else(PathBuf::new, Path::to_path_buf)
+        });
+    let cache_key = ProjectContextBuildCacheKey {
+        project_file: project_file.clone(),
+        roots: roots.to_vec(),
+        deleted_paths: cache_path_list(deleted_paths),
+        option_base,
+        options: ProjectOptionsCacheKey::new(options, &project_file),
+        overrides: effective_overrides.clone(),
+        exclusions: exclusions.to_vec(),
+        warnings: warnings.clone(),
+        explicit,
+    };
+    if let Some(cached) = project_context_cache_get(&cache_key, cancel, work_budget)? {
+        read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
+        return Ok(cached.project);
+    }
+    let mut build_tracker = ProjectReadTracker::with_budget(work_budget, deleted_paths);
+    let project = build_project_context(
+        project_file,
+        file,
+        roots,
+        options,
+        installation_config,
+        effective_overrides,
+        warnings,
+        explicit,
+        Vec::new(),
+        Vec::new(),
+        exclusions,
+        &mut build_tracker,
+        cancel,
+    )?;
+    let cached = CachedProjectContext {
+        project: project.clone(),
+        observations: build_tracker.observations,
+        metadata_paths: build_tracker.metadata_paths,
+        metadata_observations: build_tracker.metadata_observations,
+    };
+    read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
+    project_context_cache_insert(cache_key, cached);
+    Ok(project)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1417,10 +1455,12 @@ fn discover_project_file(
     cancel: Option<&AtomicBool>,
     exclusions: &[String],
     deleted_paths: &[PathBuf],
+    probed: &mut Option<ProbedProject>,
 ) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let mut fallback_dpr = None;
     let mut ambiguous_fallback_dpr = None;
+    let mut skipped = SkippedAncestors::default();
 
     loop {
         if let Err(error) = check_project_scan_cancel(cancel) {
@@ -1448,20 +1488,68 @@ fn discover_project_file(
         dpr_or_dpk.retain(|path| !is_deleted_path(path, deleted_paths));
 
         if !dproj.is_empty() {
-            return choose_project_candidate(
-                dproj,
-                &directory,
-                "project files",
-                file,
-                false,
-                roots,
-                options,
-                overrides,
-                warnings,
-                tracker,
-                cancel,
-                exclusions,
-            );
+            let ancestor = file
+                .parent()
+                .is_some_and(|parent| !paths_equal_ci(parent, &directory));
+            // Several candidates keep the established ambiguity policy: a
+            // unique member among them is not proof of ownership.
+            let candidates = if ancestor && dproj.len() == 1 {
+                match probe_ancestor(
+                    &dproj[0],
+                    file,
+                    roots,
+                    options,
+                    overrides,
+                    warnings,
+                    &mut skipped,
+                    probed,
+                    tracker,
+                    cancel,
+                    exclusions,
+                ) {
+                    Ok(AncestorVerdict::NotOwned) => None,
+                    Ok(AncestorVerdict::Owns | AncestorVerdict::Unknown) => Some(dproj),
+                    Err(error) => {
+                        warnings.push(error);
+                        return skipped.attach(ProjectSelection::Incomplete {
+                            metadata_files: Vec::new(),
+                            metadata_observations: Vec::new(),
+                            override_error: None,
+                        });
+                    }
+                }
+            } else {
+                Some(dproj)
+            };
+            if let Some(candidates) = candidates {
+                return skipped.attach(choose_project_candidate(
+                    candidates,
+                    &directory,
+                    "project files",
+                    file,
+                    false,
+                    roots,
+                    options,
+                    overrides,
+                    warnings,
+                    tracker,
+                    cancel,
+                    exclusions,
+                ));
+            }
+            // D43: no project here names the unit, so neither these projects
+            // nor this directory's DPR/DPK fallback own it.
+            if workspace_root.is_some_and(|root| paths_equal_ci(&directory, root)) {
+                break;
+            }
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            if parent == directory {
+                break;
+            }
+            directory = parent.to_path_buf();
+            continue;
         }
         if fallback_dpr.is_none() && ambiguous_fallback_dpr.is_none() && !dpr_or_dpk.is_empty() {
             if dpr_or_dpk.len() == 1 {
@@ -1483,7 +1571,7 @@ fn discover_project_file(
         directory = parent.to_path_buf();
     }
     if let Some((candidates, directory)) = ambiguous_fallback_dpr {
-        return choose_project_candidate(
+        return skipped.attach(choose_project_candidate(
             candidates,
             &directory,
             "DPR/DPK files",
@@ -1496,9 +1584,9 @@ fn discover_project_file(
             tracker,
             cancel,
             exclusions,
-        );
+        ));
     }
-    fallback_dpr.map_or(
+    skipped.attach(fallback_dpr.map_or(
         ProjectSelection::Standalone {
             metadata_files: Vec::new(),
             metadata_observations: Vec::new(),
@@ -1509,7 +1597,189 @@ fn discover_project_file(
             metadata_files: Vec::new(),
             metadata_observations: Vec::new(),
         },
-    )
+    ))
+}
+
+/// The metadata read while rejecting ancestor projects that do not name the
+/// unit (D43). The final selection carries it, so editing one of those
+/// projects to name the unit invalidates the discovery.
+#[derive(Debug, Default)]
+struct SkippedAncestors {
+    metadata_files: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
+}
+
+impl SkippedAncestors {
+    fn attach(self, selection: ProjectSelection) -> ProjectSelection {
+        if self.metadata_files.is_empty() && self.metadata_observations.is_empty() {
+            return selection;
+        }
+        let extend = |files: &mut Vec<PathBuf>, observations: &mut Vec<MetadataObservation>| {
+            for path in self.metadata_files {
+                add_unique_path(files, path);
+            }
+            for observation in self.metadata_observations {
+                add_metadata_observation(observations, observation);
+            }
+        };
+        match selection {
+            ProjectSelection::Selected {
+                path,
+                explicit,
+                mut metadata_files,
+                mut metadata_observations,
+            } => {
+                extend(&mut metadata_files, &mut metadata_observations);
+                ProjectSelection::Selected {
+                    path,
+                    explicit,
+                    metadata_files,
+                    metadata_observations,
+                }
+            }
+            ProjectSelection::Standalone {
+                mut metadata_files,
+                mut metadata_observations,
+            } => {
+                extend(&mut metadata_files, &mut metadata_observations);
+                ProjectSelection::Standalone {
+                    metadata_files,
+                    metadata_observations,
+                }
+            }
+            ProjectSelection::Incomplete {
+                mut metadata_files,
+                mut metadata_observations,
+                override_error,
+            } => {
+                extend(&mut metadata_files, &mut metadata_observations);
+                ProjectSelection::Incomplete {
+                    metadata_files,
+                    metadata_observations,
+                    override_error,
+                }
+            }
+        }
+    }
+}
+
+/// The context a membership probe built, reused when its project is then
+/// selected with the same warnings (one build per discovery).
+pub(super) struct ProbedProject {
+    project_file: PathBuf,
+    warnings: Vec<String>,
+    project: DiscoveredProject,
+}
+
+impl ProbedProject {
+    pub(super) fn take_for(
+        probed: &mut Option<Self>,
+        project_file: &Path,
+        warnings: &[String],
+    ) -> Option<DiscoveredProject> {
+        probed
+            .take()
+            .filter(|probed| {
+                project_paths_equal(&probed.project_file, project_file)
+                    && probed.warnings == warnings
+            })
+            .map(|probed| probed.project)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AncestorVerdict {
+    /// The project names the unit as its own.
+    Owns,
+    /// The project was evaluated completely and does not name the unit.
+    NotOwned,
+    /// The project could not prove either (its context is incomplete, an
+    /// entry hid behind an undefined property, or it did not build): the
+    /// directory keeps its candidate, as before D43.
+    Unknown,
+}
+
+/// Whether the single `.dproj` of an ancestor directory names `file` as one
+/// of its own units (D43). Cancellation and transient budget errors are
+/// returned; any other build failure is `Unknown`.
+#[allow(clippy::too_many_arguments)]
+fn probe_ancestor(
+    candidate: &Path,
+    file: &Path,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
+    overrides: &OverrideSession,
+    warnings: &[String],
+    skipped: &mut SkippedAncestors,
+    probed: &mut Option<ProbedProject>,
+    tracker: &mut ProjectReadTracker<'_>,
+    cancel: Option<&AtomicBool>,
+    exclusions: &[String],
+) -> Result<AncestorVerdict, String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(budget) = tracker.work_budget {
+        budget.check_cancelled()?;
+    }
+    let Ok(effective_overrides) = effective_overrides_for_project(candidate, roots, overrides)
+    else {
+        return Ok(AncestorVerdict::Unknown);
+    };
+    let installation_workspace = candidate
+        .parent()
+        .and_then(|directory| relevant_override_workspace_root(directory, roots));
+    let installation_config = overrides
+        .configuration_for(installation_workspace.as_deref(), Some(candidate))
+        .unwrap_or_else(|_| {
+            crate::installation_config::ProjectConfiguration::from_layers(Vec::new())
+        });
+    let project = match build_project_context_cached(
+        candidate.to_path_buf(),
+        file,
+        roots,
+        options,
+        installation_config,
+        effective_overrides,
+        warnings.to_vec(),
+        false,
+        exclusions,
+        tracker,
+        cancel,
+    ) {
+        Ok(project) => project,
+        Err(error) => {
+            check_project_scan_cancel(cancel)?;
+            if let Some(budget) = tracker.work_budget {
+                budget.check_cancelled()?;
+                if budget.is_transient_error(&error) {
+                    return Err(error);
+                }
+            }
+            return Ok(AncestorVerdict::Unknown);
+        }
+    };
+    let verdict = if project.context.owns_unit_source(file) {
+        AncestorVerdict::Owns
+    } else if !project.context.discovery_complete() || project.context.unit_directories_unknown() {
+        AncestorVerdict::Unknown
+    } else {
+        AncestorVerdict::NotOwned
+    };
+    if verdict == AncestorVerdict::NotOwned {
+        add_unique_path(&mut skipped.metadata_files, candidate.to_path_buf());
+        for path in &project.observations.metadata_files {
+            add_unique_path(&mut skipped.metadata_files, path.clone());
+        }
+        for observation in &project.observations.metadata_observations {
+            add_metadata_observation(&mut skipped.metadata_observations, observation.clone());
+        }
+    } else {
+        *probed = Some(ProbedProject {
+            project_file: candidate.to_path_buf(),
+            warnings: warnings.to_vec(),
+            project,
+        });
+    }
+    Ok(verdict)
 }
 
 pub(super) fn push_bounded_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {

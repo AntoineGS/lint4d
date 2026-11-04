@@ -1053,8 +1053,26 @@ impl Workspace {
         };
         match snapshot_context_for_uri(self, &uri, cancel, false) {
             Ok(owner) => {
-                self.project_cache
-                    .remember_owner(directory.to_path_buf(), owner.clone());
+                let claimable = self
+                    .document_owners
+                    .get(&uri)
+                    .is_some_and(|known| known.claimed && known.key == owner)
+                    || self
+                        .contexts
+                        .get(&owner)
+                        .is_some_and(|state| state.context.project_file().is_none());
+                // N4: a claim decided against an older claimant list (a
+                // request built before a close or a selection) is not
+                // recorded over the owners the main workspace reassigned.
+                if !claimable
+                    || self.claimant_list.generation == self.project_cache.claim_generation()
+                {
+                    self.project_cache.remember_owner_claimable(
+                        directory.to_path_buf(),
+                        owner.clone(),
+                        claimable,
+                    );
+                }
                 discovery.fresh.insert(owner.clone(), true);
                 Ok(Some(owner))
             }
@@ -4209,7 +4227,8 @@ mod tests {
 
     /// `app/` with two project candidates, `B.dproj` selected for the open
     /// `app/Main.pas`, and an open `lib/Other.pas` from the projects' search
-    /// path outside their directory.
+    /// path outside their directory, which keeps the selected project's
+    /// context (D43).
     fn selected_project(root: &Path) -> (Workspace, PathBuf, Url, Url) {
         let app = root.join("app");
         for name in ["A", "B"] {
@@ -4241,6 +4260,51 @@ mod tests {
             .open_document(other.clone(), OTHER.to_owned(), 2)
             .unwrap();
         (workspace, descriptor, main, other)
+    }
+
+    /// An open document whose own project is separate from the requesting
+    /// one (it names its unit itself, so no D43 claim applies) is a second
+    /// target under its own key.
+    #[test]
+    fn an_open_document_with_a_separate_owner_is_another_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, _, main, _) = selected_project(root);
+        let solo = root.join("solo/Solo.pas");
+        write(
+            &root.join("solo/Solo.dproj"),
+            "<Project><PropertyGroup><MainSource>Solo.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Solo.pas\"/></ItemGroup></Project>",
+        );
+        write(&root.join("solo/Solo.dpr"), "program Solo; begin end.\n");
+        write(&solo, OTHER.replace("unit Other", "unit Solo").as_str());
+        pascal_project::backdate_tree_for_test(root);
+        let solo_uri = Url::from_file_path(&solo).unwrap();
+        workspace
+            .open_document(solo_uri.clone(), fs::read_to_string(&solo).unwrap(), 3)
+            .unwrap();
+        let input = workspace.analysis_input();
+        let solo_key = input.document_owners[&solo_uri].key.clone();
+        assert_eq!(
+            solo_key.project_file.as_deref(),
+            Some(root.join("solo/Solo.dproj").as_path())
+        );
+        assert_ne!(solo_key, input.document_owners[&main].key);
+
+        let mut request = Workspace::from_analysis_input(&input);
+        let found = request
+            .index_targets(
+                &input,
+                Some(&main),
+                TargetPurpose::References,
+                &AtomicBool::new(false),
+            )
+            .expect("targets");
+
+        assert!(
+            found.contexts.iter().any(|(key, _)| *key == solo_key),
+            "the separate owner must be a target: {:?}",
+            found.contexts
+        );
     }
 
     /// A request works on a workspace built from its input, whose document
@@ -4278,11 +4342,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(projects, std::slice::from_ref(&resolved));
         assert_eq!(found.requesting.as_ref(), Some(&resolved));
+        assert_eq!(
+            input.document_owners[&other].key, input.document_owners[&main].key,
+            "the search-path unit keeps the selected project's context (D43)"
+        );
         assert!(
             found
                 .contexts
                 .iter()
-                .any(|(key, _)| *key == input.document_owners[&other].key)
+                .all(|(key, _)| *key != input.document_owners[&other].key),
+            "the older resolution must not be a second target"
         );
         let query = shared_query(Some(&["shared"]));
         let sources = request

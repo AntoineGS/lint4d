@@ -3238,8 +3238,6 @@ pub struct Workspace {
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
-    /// The claimant list is being recomputed: no claim is made meanwhile.
-    claiming: bool,
     /// The D43 claimants of the current claim generation (shared with
     /// request workspaces through [`rename::WorkspaceInput`]).
     claimant_list: Arc<ClaimantList>,
@@ -10451,10 +10449,9 @@ impl Workspace {
     ) -> Result<(), String> {
         #[cfg(test)]
         TEST_CLAIMANT_LIST_COMPUTES.with(|count| count.set(count.get() + 1));
-        self.claiming = true;
-        let computed = self.compute_claimants(cancel, budget);
-        self.claiming = false;
-        let mut entries = computed?;
+        // Documents resolved here may claim through the previous list; the
+        // reclaim that follows the new list corrects them.
+        let mut entries = self.compute_claimants(cancel, budget)?;
         entries.sort_by(|left, right| {
             right
                 .selected
@@ -10662,6 +10659,12 @@ impl Workspace {
             if self.context_is_fresh_with_cancel(&claimant.key, cancel, budget)? {
                 return Ok(Some(claimant.key.clone()));
             }
+            crate::trace::trace!(
+                "  claimants: {:?} is stale for {} (installed here: {})",
+                claimant.key.project_file,
+                path.display(),
+                !installed
+            );
             if installed {
                 self.contexts.remove(&claimant.key);
             }
@@ -10687,7 +10690,7 @@ impl Workspace {
         defer_context_pruning: bool,
     ) -> Result<Claim, String> {
         let fingerprint = self.claimant_list.fingerprint;
-        if !is_claimable_unit(path) || self.claiming {
+        if !is_claimable_unit(path) {
             return Ok(Claim::Unclaimed {
                 claimants: fingerprint,
             });
@@ -10727,6 +10730,11 @@ impl Workspace {
             }
             return Ok(Claim::Claimed(Box::new(key)));
         }
+        crate::trace::trace!(
+            "  owner: {} unclaimed by {} claimants (D43)",
+            path.display(),
+            self.claimant_list.entries.len()
+        );
         Ok(Claim::Unclaimed {
             claimants: fingerprint,
         })

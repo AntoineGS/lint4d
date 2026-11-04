@@ -556,3 +556,74 @@ fn reclaim_skips_a_stale_claimant_as_a_claim_does() {
     let (main_definition, request_definition) = definitions(&mut workspace, &fixture.users);
     assert_eq!(main_definition, request_definition, "main {main:?}");
 }
+
+/// pascal/projectContext and project selections run on a project-operation
+/// snapshot, which must see the claimant list like any request workspace.
+#[test]
+fn a_project_operation_snapshot_reports_the_claim() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    // The selection reclaims Users; the snapshot resolves it first.
+    select(&mut workspace, &fixture.app, &fixture.app_project);
+    let mut snapshot = workspace.project_operation_snapshot(None);
+
+    let info = snapshot
+        .workspace_mut()
+        .project_context(&uri(&fixture.users))
+        .expect("project context");
+
+    assert_eq!(info.selected_project_uri, Some(uri(&fixture.app_project)));
+}
+
+/// The server's requests often resolve a reclaimed unit before the main
+/// workspace does: a request workspace must claim from the carried list on
+/// its own (no shared discovery to reuse yet).
+#[test]
+fn a_request_claims_through_a_closed_selection_before_the_main_workspace() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert!(workspace.close_document(&uri(&fixture.app)));
+
+    let request = super::queries::navigation_from_input(
+        workspace.analysis_input(),
+        &uri(&fixture.users),
+        TBASE,
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("request navigation")
+    .locations;
+
+    assert_eq!(definition_targets(request), vec![uri(&fixture.base)]);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+/// A second claim generation can start before a reclaimed unit resolved
+/// again (here: an unrelated open right after the selection reclaimed it).
+/// Recomputing the list resolves that open unit and must let it claim, not
+/// leave it projectless.
+#[test]
+fn a_reclaimed_unit_survives_a_second_generation_before_it_resolves() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    select(&mut workspace, &fixture.app, &fixture.app_project);
+    open(
+        &mut workspace,
+        &fixture.root.join("Projects").join("Other").join("Base.pas"),
+    );
+
+    let request = super::queries::navigation_from_input(
+        workspace.analysis_input(),
+        &uri(&fixture.users),
+        TBASE,
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("request navigation")
+    .locations;
+
+    assert_eq!(definition_targets(request), vec![uri(&fixture.base)]);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}

@@ -7725,8 +7725,10 @@ impl Workspace {
             // Background work over a whole closure gives way to interactive
             // requests between units.
             #[cfg(feature = "test-support")]
-            if index == 1 && crate::warmer::has_background_gate_on_this_thread() {
-                wait_at_background_walk_test_barrier();
+            if crate::warmer::has_background_gate_on_this_thread() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER", index);
+            } else if self.dependency_hook.is_some() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_WARM_CRAWL_BARRIER", index);
             }
             if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -15945,18 +15947,30 @@ fn wait_at_import_claim_test_barrier() {
     }
 }
 
-/// Holds background work (diagnostics) after the first unit of a closure
-/// walk, so protocol tests can issue interactive work while it runs.
+/// Holds a closure walk before its unit `index` when `variable` is
+/// `entered|release[|units]` and `index == units` (default 1): background
+/// work (diagnostics, `PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER`) so protocol
+/// tests can issue interactive work while it runs, or the warm crawl
+/// (`PASCAL_LSP_TEST_WARM_CRAWL_BARRIER`) once it has analysed and published
+/// exactly `units` units.
 #[cfg(feature = "test-support")]
-fn wait_at_background_walk_test_barrier() {
+fn wait_at_walk_test_barrier(variable: &str, index: usize) {
     use std::io::Write as _;
 
-    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER") else {
+    let Ok(spec) = std::env::var(variable) else {
         return;
     };
-    let Some((entered, release)) = spec.split_once('|') else {
+    let mut fields = spec.split('|');
+    let (Some(entered), Some(release)) = (fields.next(), fields.next()) else {
         return;
     };
+    let units = fields
+        .next()
+        .and_then(|units| units.parse::<usize>().ok())
+        .unwrap_or(1);
+    if index != units {
+        return;
+    }
     if let Ok(mut marker) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)

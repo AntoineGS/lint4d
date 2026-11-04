@@ -217,78 +217,117 @@ fn a_killed_server_resumes_from_published_members() {
     shutdown(second);
 }
 
-/// Answers warm-progress creates and returns once the crawl of `App.dpr`
-/// reports `at_least` units done.
-fn wait_crawl_progress(server: &mut TestServer, at_least: usize) -> usize {
-    let deadline = Instant::now() + INDEX_DEADLINE;
-    let mut tokens = Vec::new();
-    loop {
-        match server.receive_until(deadline) {
-            Message::Request(create) if create.method == "window/workDoneProgress/create" => {
-                server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
-                tokens.push(create.params["token"].clone());
-            }
-            Message::Notification(progress)
-                if progress.method == "$/progress"
-                    && tokens.contains(&progress.params["token"]) =>
-            {
-                let value = &progress.params["value"];
-                if value["kind"] == "begin" && value["title"] != "Indexing App" {
-                    tokens.retain(|token| *token != progress.params["token"]);
-                    continue;
-                }
-                let done = value["message"]
-                    .as_str()
-                    .and_then(|message| message.split('/').next())
-                    .and_then(|done| done.parse::<usize>().ok());
-                if let Some(done) = done
-                    && done >= at_least
-                {
-                    return done;
-                }
-                assert_ne!(value["kind"], "end", "the crawl ended early: {value}");
-            }
-            _ => {}
-        }
+/// Units the first server's crawl analyses and publishes before it is held
+/// at the warm-crawl barrier and killed.
+const CRAWLED: u64 = 100;
+
+/// A server whose warm crawl stops before its unit `CRAWLED`, every unit
+/// before it analysed and published, until it is killed.
+fn launch_held_crawl(environment: &Path) -> (TestServer, TestBarrier) {
+    let directory = environment.join("warm-crawl-barrier");
+    fs::create_dir_all(&directory).unwrap();
+    let barrier = TestBarrier {
+        entered: directory.join("entered"),
+        release: directory.join("release"),
+    };
+    let spec = format!(
+        "{}|{}|{CRAWLED}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let cache_home = environment.join("cache");
+    let server = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment,
+        [
+            ("XDG_CACHE_HOME", cache_home.to_str().expect("UTF-8 path")),
+            ("PASCAL_LSP_TEST_WARM_CRAWL_BARRIER", spec.as_str()),
+        ],
+    );
+    (server, barrier)
+}
+
+/// While the crawl is held, nothing was extracted: every context's
+/// `extracted` is 0 (extraction batches follow the crawl).
+fn assert_nothing_extracted(server: &mut TestServer) {
+    let status = request(server, "pascal/indexStatus", json!({}));
+    for context in status["contexts"].as_array().unwrap() {
+        assert_eq!(context["extracted"], 0, "{status}");
     }
 }
 
+/// Opens `App.dpr` with an unsaved edit: the crawl's context then comes
+/// from an unsaved project input and publishes nothing, while the index
+/// batches read the saved files.
+fn open_app_edited(server: &mut TestServer, root: &Path) {
+    let app = root.join("App.dpr");
+    let edited = format!("{}{{ unsaved }}\n", fs::read_to_string(&app).unwrap());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&app), "languageId": "pascal", "version": 1, "text": edited}}),
+    );
+}
+
 /// D42: the warm crawl publishes the disk units it analyses. The first
-/// server is killed during its crawl of `App.dpr`, before any extraction
-/// batch (those follow the crawl). The second opens `App.dpr` with an
-/// unsaved edit: its own crawl then publishes nothing (the context comes
-/// from an unsaved project input), while its index batches read the saved
-/// files, so what it reuses is what the first crawl published.
+/// server is killed during its crawl of `App.dpr`, held after exactly
+/// `CRAWLED` units and before any extraction batch (those follow the
+/// crawl). The second opens `App.dpr` with an unsaved edit: its own crawl
+/// then publishes nothing, while its index batches read the saved files, so
+/// what it reuses is exactly what the first crawl published.
 #[test]
 fn a_server_killed_during_the_crawl_reuses_what_the_crawl_published() {
-    const CRAWLED: usize = 100;
     let environment = tempfile::tempdir().unwrap();
-    // Heavier units, so that the crawl is still running when it is killed.
-    let root = project_fixture(environment.path(), UNITS, true, 200);
-    let mut first = launch(environment.path());
-    first.initialize_with_progress(&root);
-    open_disk(&mut first, &root.join("App.dpr"));
-    let crawled = wait_crawl_progress(&mut first, CRAWLED);
+    let root = project_fixture(environment.path(), UNITS, true, 0);
+    let (mut first, barrier) = launch_held_crawl(environment.path());
+    initialize_and_open(&mut first, &root, "App.dpr");
+    barrier.wait_until_entered();
+    assert_nothing_extracted(&mut first);
     first.kill();
 
     let mut second = launch(environment.path());
     second.initialize(&root, Value::Null);
-    let app = root.join("App.dpr");
-    let edited = format!("{}{{ unsaved }}\n", fs::read_to_string(&app).unwrap());
-    second.send_notification(
-        "textDocument/didOpen",
-        json!({"textDocument": {"uri": uri(&app), "languageId": "pascal", "version": 1, "text": edited}}),
-    );
+    open_app_edited(&mut second, &root);
     let done = wait_index(&mut second, complete);
     assert_eq!(done["members"], MEMBERS, "{done}");
-    let reused = done["reused"].as_u64().unwrap();
-    assert!(reused >= CRAWLED as u64, "crawled {crawled}: {done}");
+    assert_eq!(done["reused"], CRAWLED, "{done}");
+    assert_eq!(done["extracted"], MEMBERS - CRAWLED, "{done}");
+    assert_nothing_refused(&done);
+    shutdown(second);
+}
+
+/// I-2 (Task 10b): with `projectFile` configured, the crawl of the main
+/// source and the project's anchor derive one context, so what a crawl
+/// killed midway published is reused for the configured anchor.
+#[test]
+fn a_configured_project_reuses_what_a_killed_crawl_published() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = project_fixture(environment.path(), UNITS, true, 0);
+    // Absolute: the warmer anchors only an absolute configured project.
+    let options = json!({"projectFile": root.join("App.dproj").display().to_string()});
+    let (mut first, barrier) = launch_held_crawl(environment.path());
+    first.initialize(&root, options.clone());
+    open_disk(&mut first, &root.join("App.dpr"));
+    barrier.wait_until_entered();
+    assert_nothing_extracted(&mut first);
+    first.kill();
+
+    let mut second = launch(environment.path());
+    second.initialize(&root, options);
+    open_app_edited(&mut second, &root);
+    let deadline = Instant::now() + INDEX_DEADLINE;
+    let done = loop {
+        let status = request(&mut second, "pascal/indexStatus", json!({}));
+        if let Some(context) = app_context(&status).filter(complete) {
+            break context;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+    };
+    assert_eq!(done["members"], MEMBERS, "{done}");
     assert!(
-        reused < UNITS as u64,
-        "the first server was killed during its crawl ({crawled} done): {done}"
+        done["reused"].as_u64().unwrap() >= CRAWLED,
+        "the configured anchor reuses the crawl's publications: {done}"
     );
     assert_eq!(
-        reused + done["extracted"].as_u64().unwrap(),
+        done["reused"].as_u64().unwrap() + done["extracted"].as_u64().unwrap(),
         MEMBERS,
         "{done}"
     );

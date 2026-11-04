@@ -2,8 +2,8 @@
 //! a walk for a name that binds nowhere.
 
 use super::{
-    MAX_NAVIGATION_WALK_WORK, TEST_FAIL_IMPORTS_OF, TEST_NAVIGATION_WALK_BYTES, Workspace,
-    WorkspaceOptions,
+    MAX_NAVIGATION_WALK_WORK, TEST_FAIL_EXPANSION_OF, TEST_FAIL_IMPORTS_OF,
+    TEST_NAVIGATION_WALK_BYTES, Workspace, WorkspaceOptions,
 };
 use crate::NavigationTarget;
 use lsp_types::{Location, Position, Url};
@@ -335,5 +335,38 @@ fn a_relaxed_global_binding_is_logged_by_definition() {
             .iter()
             .any(|warning| warning.contains("Members inherited by TThing are unknown")),
         "{logged:#?}"
+    );
+}
+
+/// l4d-4nbs review (D16 intent): a dependency off the ancestor chain that
+/// the walk loads and that fails to load is skipped with a note, and the
+/// answer still binds through the chain.
+#[test]
+fn an_off_chain_dependency_that_fails_to_load_is_noted_and_the_answer_binds() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    inherited_member_fixture(root);
+    // Bad is loaded with Dep's imports and needs a compile-time session,
+    // which fails.
+    fs::write(
+        root.join("Bad.pas"),
+        "unit Bad;\ninterface\nuses Root;\n{$IFDEF X}{$ENDIF}\nconst BadValue = 1;\nimplementation\nend.\n",
+    )
+    .expect("failing dependency");
+    let mut workspace = workspace(root);
+    TEST_FAIL_EXPANSION_OF.with(|name| *name.borrow_mut() = Some("/Bad.pas".into()));
+
+    let locations = definition(&mut workspace, &root.join("Main.pas"), Position::new(7, 5));
+    TEST_FAIL_EXPANSION_OF.with(|name| *name.borrow_mut() = None);
+
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].uri, uri(&root.join("Root.pas")));
+    assert!(
+        workspace
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Bad.pas") && warning.contains("incomplete")),
+        "the failed dependency must be noted: {:?}",
+        workspace.warnings
     );
 }

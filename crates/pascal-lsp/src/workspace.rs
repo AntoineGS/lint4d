@@ -428,6 +428,9 @@ thread_local! {
     /// Loading the imports of a unit whose file name this is fails.
     static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Expanding a unit whose file name this is fails.
+    static TEST_FAIL_EXPANSION_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn navigation_walk_byte_limit() -> usize {
@@ -8852,6 +8855,14 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<crate::include_expansion::ExpansionResult, String> {
+        #[cfg(test)]
+        if TEST_FAIL_EXPANSION_OF.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("injected expansion failure for {uri}"));
+        }
         let fallback = AtomicBool::new(false);
         let cancel = cancel.unwrap_or(&fallback);
         rename::expand_source_with_workspace(

@@ -1601,6 +1601,18 @@ impl CompileTimeState {
         self.visit_payload(visit, true)
     }
 
+    /// Source bytes and decoded text this state keeps alive through its
+    /// provider sources and backings (l4d-4nbs re-review I1).
+    pub fn retained_source_bytes(&self) -> usize {
+        self.provider_sources
+            .iter()
+            .chain(self.provider_backings.iter().map(|backing| &***backing))
+            .map(|source| {
+                source.bytes.len() + source.decoded_text.as_ref().map_or(0, |text| text.len())
+            })
+            .sum()
+    }
+
     pub(crate) fn visit_snapshot_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

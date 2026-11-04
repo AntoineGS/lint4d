@@ -3122,7 +3122,18 @@ impl ProviderEngine<'_, '_> {
                             + occurrences.len() * size_of::<LoadedSource>(),
                     )
                     .map_err(|r| resolver_error(r, budget))?;
-                facts.provider_sources = occurrences.iter().map(|o| o.source.clone()).collect();
+                // Consumers read only each occurrence's identity, path and
+                // revision: the stored interface does not keep the include
+                // text alive (l4d-4nbs re-review I1).
+                facts.provider_sources = occurrences
+                    .iter()
+                    .map(|o| LoadedSource {
+                        bytes: Arc::from(&[][..]),
+                        decoded_text: None,
+                        compile_time_backing: None,
+                        ..o.source.clone()
+                    })
+                    .collect();
                 facts.provider_backings.push(
                     provider
                         .backing

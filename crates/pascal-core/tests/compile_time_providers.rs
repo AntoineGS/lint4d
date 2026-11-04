@@ -2314,3 +2314,39 @@ fn a_shared_interface_is_charged_what_it_retains() {
         w.retained_bytes
     );
 }
+
+/// l4d-4nbs re-review I1: an interface whose provider includes a 1 MB file
+/// keeps no more source text than it is charged for.
+#[test]
+fn a_shared_interface_keeps_no_uncharged_include_text() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let mut f = Fixture::new(SHARED_ROOT, context(LayoutPlatform::Win32));
+    f.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "W",
+        "unit W; interface {$I big.inc} type TW = Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("big.inc", &format!("{{{}}}", "x".repeat(1_000_000)));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f.shared = Some(store.clone());
+    let analysis = f.analyze().unwrap();
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    let graphs = store.graphs.lock().unwrap();
+    for (key, graph) in graphs.iter() {
+        let kept = graph
+            .graph
+            .as_ref()
+            .map_or(0, |graph| graph.retained_source_bytes());
+        assert!(
+            kept <= graph.retained_bytes,
+            "{} keeps {kept} source bytes, charged {}",
+            key.source.as_str(),
+            graph.retained_bytes
+        );
+    }
+}

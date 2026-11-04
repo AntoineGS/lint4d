@@ -608,13 +608,40 @@ fn completion_loads_the_units_an_inherited_member_needs() {
 /// A chain `Main -> X: T0`, `T{n} = class(T{n+1})` in unit `U{n}` (which uses
 /// `U{n+1}`), each declaring a documented member `M{n}`.
 fn ancestor_chain(levels: usize) -> (TempDir, WorkspaceInput, Url, Position) {
+    ancestor_chain_sharing(levels, None)
+}
+
+/// [`ancestor_chain`] where every unit also uses `Shared`, whose source is
+/// `shared_bytes` long.
+fn ancestor_chain_sharing(
+    levels: usize,
+    shared_bytes: Option<usize>,
+) -> (TempDir, WorkspaceInput, Url, Position) {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();
+    let shared = if let Some(bytes) = shared_bytes {
+        let text = "unit Shared;\ninterface\nconst Big = 0;\nimplementation\nend.\n";
+        let padding = "x".repeat(bytes.saturating_sub(text.len() + 2));
+        fs::write(root.join("Shared.pas"), format!("{{{padding}}}{text}")).expect("shared unit");
+        "Shared, "
+    } else {
+        ""
+    };
     for n in 0..levels {
         let (uses, base) = if n + 1 == levels {
-            (String::new(), String::new())
+            (
+                if shared.is_empty() {
+                    String::new()
+                } else {
+                    "uses Shared;\n".to_string()
+                },
+                String::new(),
+            )
         } else {
-            (format!("uses U{};\n", n + 1), format!("(T{})", n + 1))
+            (
+                format!("uses {shared}U{};\n", n + 1),
+                format!("(T{})", n + 1),
+            )
         };
         fs::write(
             root.join(format!("U{n}.pas")),
@@ -818,4 +845,30 @@ fn an_eager_completion_reuses_its_snapshot() {
         .find(|item| item.label == "M1")
         .expect("M1");
     assert!(m1.documentation.is_some(), "rendered eagerly: {m1:?}");
+}
+
+/// l4d-4nbs final round (1): the demand byte bound counts a source every
+/// demanded unit imports once, not once per importer.
+#[test]
+fn the_demand_byte_bound_counts_a_shared_source_once() {
+    const SHARED: usize = 100_000;
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(Some(SHARED * 3 / 2)));
+    let (_temp, input, main, position) = ancestor_chain_sharing(5, Some(SHARED));
+    let completion = completion_from_input(input, &main, position, &AtomicBool::new(false))
+        .value
+        .expect("completion answers");
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(None));
+    let labels = completion
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect::<Vec<_>>();
+    for member in ["M0", "M1", "M2", "M3", "M4"] {
+        assert!(labels.contains(&member), "{member}: {labels:?}");
+    }
+    let coverage = super::completion_coverage_for_test();
+    assert!(
+        !coverage.iter().any(|gap| gap.contains("walk limit")),
+        "{coverage:?}"
+    );
 }

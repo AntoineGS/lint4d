@@ -7048,6 +7048,7 @@ fn build_snapshot_with_policy(
             .unwrap_or_default();
         let byte_limit = super::navigation_walk_byte_limit();
         let (mut demand_units, mut demand_bytes) = (0usize, 0usize);
+        let mut counted_sources = HashSet::new();
         for demanded in demanded {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -7085,9 +7086,12 @@ fn build_snapshot_with_policy(
                     continue;
                 }
             };
+            // A source several demanded units import is counted once.
             for dependency in &direct {
-                demand_bytes = demand_bytes
-                    .saturating_add(loader.index.source_text(dependency).map_or(0, str::len));
+                if counted_sources.insert(dependency.clone()) {
+                    demand_bytes = demand_bytes
+                        .saturating_add(loader.index.source_text(dependency).map_or(0, str::len));
+                }
             }
             let mut fenced = owned_sources.clone();
             fenced.insert(demanded.clone());

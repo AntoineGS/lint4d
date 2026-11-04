@@ -1620,6 +1620,22 @@ struct ClientFeatures {
     folding_range_kind_value_set: Option<u8>,
 }
 
+/// Whether a completion's dependency observations fit what resolving its
+/// items may retain (l4d-4nbs re-review): past it the completion renders
+/// documentation and detail eagerly instead of refusing.
+fn completion_resolution_fits(records: &[SourceRecord], demanded: &[Url]) -> bool {
+    let Ok((compact, bytes)) = compact_completion_records(records) else {
+        return false;
+    };
+    let bytes = demanded.iter().fold(bytes, |total, uri| {
+        total
+            .saturating_add(size_of::<Url>())
+            .saturating_add(uri.as_str().len())
+    });
+    compact.len() <= MAX_COMPLETION_RESOLUTION_RECORDS
+        && bytes <= MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+}
+
 #[derive(Debug, Clone)]
 struct CompletionResolutionContext {
     source_uri: Url,
@@ -5757,7 +5773,9 @@ impl AnalysisJobs {
                             resolve_documentation,
                             resolve_detail,
                         } => {
-                            let computed = queries::completion_from_input_with_options(
+                            let deferred = resolve_documentation || resolve_detail;
+                            let eager_input = deferred.then(|| input.clone());
+                            let mut computed = queries::completion_from_input_with_options(
                                 input,
                                 &uri,
                                 position,
@@ -5769,6 +5787,28 @@ impl AnalysisJobs {
                                 },
                                 &worker_cancellation,
                             );
+                            // Too many dependencies to resolve items later:
+                            // render them now instead of refusing.
+                            let (mut resolve_documentation, mut resolve_detail) =
+                                (resolve_documentation, resolve_detail);
+                            if let (Some(input), Ok(result)) = (eager_input, &computed.value)
+                                && !completion_resolution_fits(&computed.records, &result.demanded)
+                            {
+                                computed = queries::completion_from_input_with_options(
+                                    input,
+                                    &uri,
+                                    position,
+                                    CompletionOptions {
+                                        format: format.clone(),
+                                        defer_documentation: false,
+                                        defer_detail: false,
+                                        snippet_support,
+                                    },
+                                    &worker_cancellation,
+                                );
+                                resolve_documentation = false;
+                                resolve_detail = false;
+                            }
                             AnalysisResult {
                                 id: worker_id,
                                 source_generation: computed.source_generation,
@@ -18788,6 +18828,24 @@ mod tests {
                 .expect_err("diagnostic count is checked before projecting records"),
             "diagnostic validation evidence exceeds the 32768-record limit"
         );
+    }
+
+    /// l4d-4nbs re-review: a completion whose dependency observations do not
+    /// fit the resolution bounds is answered eagerly instead of refused.
+    #[test]
+    fn completion_resolution_fit_follows_the_record_bound() {
+        let records = |count: usize| {
+            (0..count)
+                .map(|n| {
+                    test_completion_record(
+                        Url::parse(&format!("file:///completion-fit-{n}.pas")).expect("fit URI"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(super::completion_resolution_fits(&records(16), &[]));
+        let over = records(super::MAX_COMPLETION_RESOLUTION_RECORDS + 1);
+        assert!(!super::completion_resolution_fits(&over, &[]));
     }
 
     #[test]

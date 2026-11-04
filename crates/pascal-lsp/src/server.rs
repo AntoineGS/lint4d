@@ -1678,6 +1678,22 @@ struct ClientFeatures {
     folding_range_kind_value_set: Option<u8>,
 }
 
+/// Whether a completion's dependency observations fit what resolving its
+/// items may retain (l4d-4nbs re-review): past it the completion renders
+/// documentation and detail eagerly instead of refusing.
+fn completion_resolution_fits(records: &[SourceRecord], demanded: &[Url]) -> bool {
+    let Ok((compact, bytes)) = compact_completion_records(records) else {
+        return false;
+    };
+    let bytes = demanded.iter().fold(bytes, |total, uri| {
+        total
+            .saturating_add(size_of::<Url>())
+            .saturating_add(uri.as_str().len())
+    });
+    compact.len() <= MAX_COMPLETION_RESOLUTION_RECORDS
+        && bytes <= MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+}
+
 #[derive(Debug, Clone)]
 struct CompletionResolutionContext {
     source_uri: Url,
@@ -1689,6 +1705,8 @@ struct CompletionResolutionContext {
     resolve_documentation: bool,
     resolve_detail: bool,
     records: Vec<SourceRecord>,
+    /// Units the completion's demand rounds loaded (l4d-4nbs re-review).
+    demanded: Vec<Url>,
 }
 
 #[derive(Debug, Clone)]
@@ -1818,6 +1836,11 @@ impl CompletionResolutionStore {
         }
 
         let (compact_records, context_bytes) = compact_completion_records(records)?;
+        let context_bytes = result.demanded.iter().fold(context_bytes, |total, uri| {
+            total
+                .saturating_add(size_of::<Url>())
+                .saturating_add(uri.as_str().len())
+        });
         if compact_records.len() > MAX_COMPLETION_RESOLUTION_RECORDS {
             return Err("completion dependency observations exceed the bounded limit".to_string());
         }
@@ -1840,6 +1863,7 @@ impl CompletionResolutionStore {
             resolve_documentation,
             resolve_detail,
             records: compact_records,
+            demanded: result.demanded.clone(),
         });
 
         let mut pending = Vec::with_capacity(result.list.items.len());
@@ -3450,8 +3474,7 @@ impl ConfigurationPreparationJobs {
         let root_paths = request.root_paths;
         let worker_options = options.clone();
         let worker_root_paths = root_paths.clone();
-        let handle = thread::Builder::new()
-            .name("PascalLspConfiguration".to_string())
+        let handle = analysis_thread("PascalLspConfiguration")
             .spawn(move || {
                 let prepared = Workspace::prepare_runtime_options_for_roots(
                     worker_root_paths.clone(),
@@ -3796,6 +3819,7 @@ impl ConfigurationCoordinator {
         let cache_after = self.cache_override.effective(&self.cache_base);
         if cache_after != cache_before {
             self.persistent.reconfigure(cache_after);
+            workspace.refresh_cache_exclusion();
         }
         let after = self.runtime_options.effective(&self.base_options);
         self.accepted_scope = Some(scope);
@@ -4147,8 +4171,7 @@ impl PartialDeliveryValidation {
         let test_barriers = self.test_barriers.clone();
         #[cfg(test)]
         let runs = Arc::clone(&self.runs);
-        let handle = thread::Builder::new()
-            .name("PascalLspPartialValidation".to_string())
+        let handle = analysis_thread("PascalLspPartialValidation")
             .spawn(move || {
                 #[cfg(test)]
                 runs.fetch_add(1, Ordering::Relaxed);
@@ -5507,8 +5530,7 @@ impl AnalysisJobs {
             let test_barriers = self.test_barriers.clone();
             let worker_id = id;
             let panic_symbols = symbols.clone();
-            let handle = thread::Builder::new()
-                .name("PascalLspCompiledContent".to_string())
+            let handle = analysis_thread("PascalLspCompiledContent")
                 .spawn(move || {
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let result = wait_at_test_barrier(
@@ -5749,8 +5771,7 @@ impl AnalysisJobs {
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
-        let handle = thread::Builder::new()
-            .name("PascalLspAnalysis".to_string())
+        let handle = analysis_thread("PascalLspAnalysis")
             .spawn(move || {
                 let _span = crate::trace::Span::new(|| {
                     format!(
@@ -5817,7 +5838,9 @@ impl AnalysisJobs {
                             resolve_documentation,
                             resolve_detail,
                         } => {
-                            let computed = queries::completion_from_input_with_options(
+                            // Too many dependencies to resolve items later:
+                            // the same computation renders them now.
+                            let computed = queries::completion_from_input_within(
                                 input,
                                 &uri,
                                 position,
@@ -5827,8 +5850,12 @@ impl AnalysisJobs {
                                     defer_detail: resolve_detail,
                                     snippet_support,
                                 },
+                                &completion_resolution_fits,
                                 &worker_cancellation,
                             );
+                            let eager = computed.value.as_ref().is_ok_and(|result| result.eager);
+                            let resolve_documentation = resolve_documentation && !eager;
+                            let resolve_detail = resolve_detail && !eager;
                             AnalysisResult {
                                 id: worker_id,
                                 source_generation: computed.source_generation,
@@ -6384,6 +6411,7 @@ impl AnalysisJobs {
                                     context.resolve_detail,
                                     context.snippet_support,
                                     &context.records,
+                                    &context.demanded,
                                     &worker_cancellation,
                                 );
                                 // Keep the identity's original generation as the
@@ -6748,8 +6776,7 @@ impl AnalysisJobs {
             | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
             _ => unreachable!("only project protocol requests use this worker"),
         };
-        let handle = thread::Builder::new()
-                .name("PascalLspProjectOperation".to_string())
+        let handle = analysis_thread("PascalLspProjectOperation")
                 .spawn(move || {
                 let mut request = request;
                 let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
@@ -9618,6 +9645,8 @@ fn deliver_analysis_result_with_store(
             let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             match workspace.commit_prepared_project_selection(prepared, &budget) {
                 Ok(context) => {
+                    // Reclaimed D43 units were scheduled with the selection.
+                    let _ = workspace.take_reclaimed_uris();
                     selection_committed = true;
                     send_ok(
                         connection,
@@ -10375,6 +10404,24 @@ fn send_diagnostic_server_cancelled(
     Ok(())
 }
 
+/// Stack of every thread that runs analysis (l4d-4nbs review I4). A
+/// compile-time session stops nesting providers at 1 MiB of stack
+/// (`max_provider_stack_bytes`, about 52 KB a provider in a debug build and
+/// 11 KB in release); within one provider, type preparation recurses up to
+/// `max_type_depth` (256) levels at about 2.7 KB a level in debug (0.4 KB in
+/// release). Measured peaks with nesting at the limit and a 250-level chain
+/// in the innermost provider: 1.24 MiB debug, 0.71 MiB release, plus the
+/// request's own frames above the session. 16 MiB leaves a wide margin and
+/// costs only address space until touched.
+pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// A builder for a thread that runs analysis, with its explicit stack.
+pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(ANALYSIS_THREAD_STACK_BYTES)
+}
+
 /// Run one native LSP session over stdin/stdout.
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
     run_stdio_with_config(TestBarrierConfig::disabled())
@@ -10827,6 +10874,83 @@ fn run_connection(
     )
 }
 
+/// The first Pascal source or project file `notification` names under the
+/// persistent-cache store directory: such an event is never dropped.
+fn cache_source_event(workspace: &Workspace, notification: &Notification) -> Option<PathBuf> {
+    workspace.cache_exclusion()?;
+    let list = match notification.method.as_str() {
+        "workspace/didChangeWatchedFiles" => "changes",
+        "workspace/didCreateFiles" | "workspace/didDeleteFiles" | "workspace/didRenameFiles" => {
+            "files"
+        }
+        _ => return None,
+    };
+    let entries = notification.params.get(list)?.as_array()?;
+    entries
+        .iter()
+        .take(MAX_FILE_OPERATION_BATCH_ENTRIES)
+        .flat_map(|entry| ["uri", "oldUri", "newUri"].map(|key| entry.get(key)))
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|uri| Url::parse(uri).ok())
+        .filter(|uri| workspace.is_cache_path(uri))
+        .filter_map(|uri| uri.to_file_path().ok())
+        .find(|path| crate::catalogue::is_retained_file(path))
+}
+
+/// Sources must never be hidden: a source under the store directory
+/// refuses it, and the workspace sees the directory again.
+fn refuse_cache_directory(workspace: &mut Workspace, source: &Path) {
+    workspace.persistent_cache().refuse_sources(source);
+    workspace.refresh_cache_exclusion();
+}
+
+/// `notification` without the events of the persistent-cache store's own
+/// files; `None` when nothing else is left. A rename is kept unless both of
+/// its endpoints are store files, and an event naming a Pascal source or
+/// project file is always kept. Anything malformed is left for the worker's
+/// recovery.
+fn without_cache_file_events(
+    workspace: &Workspace,
+    mut notification: Notification,
+) -> Option<Notification> {
+    if workspace.cache_exclusion().is_none() {
+        return Some(notification);
+    }
+    let (list, endpoints): (&str, &[&str]) = match notification.method.as_str() {
+        "workspace/didChangeWatchedFiles" => ("changes", &["uri"]),
+        "workspace/didCreateFiles" | "workspace/didDeleteFiles" => ("files", &["uri"]),
+        "workspace/didRenameFiles" => ("files", &["oldUri", "newUri"]),
+        _ => return Some(notification),
+    };
+    let Some(entries) = notification
+        .params
+        .get_mut(list)
+        .and_then(Value::as_array_mut)
+    else {
+        return Some(notification);
+    };
+    if entries.is_empty() || entries.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+        return Some(notification);
+    }
+    let is_cache_entry = |entry: &Value| {
+        endpoints.iter().all(|endpoint| {
+            entry
+                .get(*endpoint)
+                .and_then(Value::as_str)
+                .and_then(|uri| Url::parse(uri).ok())
+                .is_some_and(|uri| {
+                    workspace.is_cache_path(&uri)
+                        && !uri
+                            .to_file_path()
+                            .is_ok_and(|path| crate::catalogue::is_retained_file(&path))
+                })
+        })
+    };
+    entries.retain(|entry| !is_cache_entry(entry));
+    (!entries.is_empty()).then_some(notification)
+}
+
 fn is_workspace_file_event_notification(method: &str) -> bool {
     matches!(
         method,
@@ -11035,8 +11159,7 @@ fn spawn_workspace_file_notification(
     };
     let project_cache = workspace.project_cache().clone();
     let owned_workspace = std::mem::take(workspace);
-    let join = thread::Builder::new()
-        .name("PascalLspWorkspaceMutation".to_string())
+    let join = analysis_thread("PascalLspWorkspaceMutation")
         .spawn(move || {
             let mut workspace = owned_workspace;
             let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
@@ -12081,6 +12204,15 @@ fn event_loop(
                         .map_err(|error| error.to_string())
                 } else {
                     if is_workspace_file_event_notification(&notification_method) {
+                        // The store's own files are not workspace files
+                        // (l4d-vrw0): a batch of nothing else changes nothing.
+                        let Some(notification) = without_cache_file_events(workspace, notification)
+                        else {
+                            continue;
+                        };
+                        if let Some(source) = cache_source_event(workspace, &notification) {
+                            refuse_cache_directory(workspace, &source);
+                        }
                         file_notification_worker = Some(spawn_workspace_file_notification(
                             workspace,
                             notification,
@@ -12351,14 +12483,31 @@ fn event_loop(
 }
 
 fn drain_watch_events(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     watch_events: &crate::file_watch::WatchEvents,
     rewarm: &mut Vec<Url>,
 ) {
+    // Store files are dropped; a source there is kept and refuses the store.
+    let source = std::cell::RefCell::new(None);
     rewarm.extend(watch_events.drain(
         workspace.project_cache(),
         crate::file_watch::MAX_WATCH_EVENTS_PER_TURN,
+        &|path| {
+            let under = workspace
+                .cache_exclusion()
+                .is_some_and(|cache| cache.contains(path));
+            if under && crate::catalogue::is_retained_file(path) {
+                source
+                    .borrow_mut()
+                    .get_or_insert_with(|| path.to_path_buf());
+                return false;
+            }
+            under
+        },
     ));
+    if let Some(source) = source.into_inner() {
+        refuse_cache_directory(workspace, &source);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12397,7 +12546,7 @@ fn maintain_warmer(
     }
     for uri in cache.take_closure_crawl_requests() {
         if workspace.is_open(&uri) {
-            warmer.request_closure_crawl(uri, cache.invalidation_epoch());
+            warmer.request_closure_crawl(uri, cache);
         }
     }
     for anchor in cache.take_index_requests() {
@@ -13458,6 +13607,11 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            // An item rendered eagerly has nothing left to resolve.
+            if item.data.is_none() {
+                send_ok(connection, id, item)?;
+                return Ok(());
+            }
             let resolve_request = match jobs.completion_resolution_request(&item) {
                 Ok(resolve_request) => resolve_request,
                 Err(error) => {
@@ -14511,6 +14665,13 @@ fn handle_notification_with_control_inner(
                 mark_publication_root_stale(connection, workspace, &open_uri);
                 effect.refresh_uri(open_uri);
             }
+            // D43: the opened project may claim already-open units.
+            for reclaimed in workspace.take_reclaimed_uris() {
+                if workspace.open_document_uris().contains(&reclaimed) {
+                    mark_publication_root_stale(connection, workspace, &reclaimed);
+                    effect.refresh_uri(reclaimed);
+                }
+            }
             Ok(effect)
         }
         "textDocument/didChange" => {
@@ -14580,6 +14741,8 @@ fn handle_notification_with_control_inner(
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
+            // D43 units the close released are refreshed with every open root.
+            let _ = workspace.take_reclaimed_uris();
             if let Some(warmer) = warmer {
                 warmer.close(&uri, workspace.project_cache());
             }
@@ -15528,6 +15691,7 @@ fn commit_automatic_selection(
         })) => {
             let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             workspace.commit_prepared_project_selection(prepared.clone(), &budget)?;
+            let _ = workspace.take_reclaimed_uris();
             Ok(Some(source_uri.clone()))
         }
         AnalysisResultValue::ProjectOperation(Ok(
@@ -18337,6 +18501,8 @@ mod tests {
                     }],
                 },
                 seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
+                demanded: Vec::new(),
+                eager: false,
             }),
         }
     }
@@ -18948,6 +19114,24 @@ mod tests {
                 .expect_err("diagnostic count is checked before projecting records"),
             "diagnostic validation evidence exceeds the 32768-record limit"
         );
+    }
+
+    /// l4d-4nbs re-review: a completion whose dependency observations do not
+    /// fit the resolution bounds is answered eagerly instead of refused.
+    #[test]
+    fn completion_resolution_fit_follows_the_record_bound() {
+        let records = |count: usize| {
+            (0..count)
+                .map(|n| {
+                    test_completion_record(
+                        Url::parse(&format!("file:///completion-fit-{n}.pas")).expect("fit URI"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(super::completion_resolution_fits(&records(16), &[]));
+        let over = records(super::MAX_COMPLETION_RESOLUTION_RECORDS + 1);
+        assert!(!super::completion_resolution_fits(&over, &[]));
     }
 
     #[test]

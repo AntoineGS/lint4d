@@ -76,6 +76,18 @@ fn charge_binding_work(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_OCCURRENCE_PREFILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Turns the textual skip of `collect_occurrences_bounded` off, so tests can
+/// compare its results with the unskipped walk.
+#[cfg(test)]
+pub(crate) fn test_set_occurrence_prefilter(enabled: bool) {
+    TEST_OCCURRENCE_PREFILTER.with(|value| value.set(enabled));
+}
+
 fn charge_shared_work(
     shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
     cancel: Option<&AtomicBool>,
@@ -1996,6 +2008,22 @@ impl NavigationIndex {
         let mut unqualified_cache =
             HashMap::<UnqualifiedReferenceCacheKey, (Vec<Candidate>, bool)>::new();
         let binding_has_class_owner = self.has_class_owned_member(binding);
+        // Outside the documents of its members, an occurrence is an
+        // identifier spelling one of the names, so a document whose text
+        // (what its tree was parsed from, includes expanded) spells none of
+        // them holds none and is not walked (l4d-vbeh). Unit occurrences
+        // also come from aliases and namespace prefixes, so they keep the walk.
+        // A walk restricted to one document (highlights) walks it anyway.
+        let prefilter_occurrences =
+            binding.kind != SymbolKind::Unit && options.document_uri.is_none();
+        #[cfg(test)]
+        let prefilter_occurrences =
+            prefilter_occurrences && TEST_OCCURRENCE_PREFILTER.with(std::cell::Cell::get);
+        let scan_names = binding
+            .names
+            .iter()
+            .map(|name| name.rsplit('.').next().unwrap_or_default())
+            .collect::<Vec<_>>();
         for (uri, document) in documents {
             check_cancel(options.cancel)?;
             charge_binding_work(
@@ -2009,8 +2037,6 @@ impl NavigationIndex {
             {
                 continue;
             }
-            #[cfg(test)]
-            super::test_record_bound_document(uri);
             if options.strict_resolution
                 && document.opaque_ranges.iter().any(|range| {
                     binding
@@ -2027,6 +2053,22 @@ impl NavigationIndex {
                 })?;
                 continue;
             }
+            if prefilter_occurrences {
+                charge_shared_bytes(
+                    &mut options.shared_work_budget,
+                    options.cancel,
+                    document.source.len(),
+                )?;
+                if !binding.members.iter().any(|member| member.uri == *uri)
+                    && !scan_names
+                        .iter()
+                        .any(|name| super::text_mentions_name(document.source.as_bytes(), name))
+                {
+                    continue;
+                }
+            }
+            #[cfg(test)]
+            super::test_record_bound_document(uri);
 
             let root = document.tree.root_node();
             let unit_spans = if binding.kind == SymbolKind::Unit {
@@ -4581,5 +4623,152 @@ mod tests {
                 "indexed and linear declaration membership differ at {span:?}"
             );
         }
+    }
+
+    fn bounded_references(
+        index: &NavigationIndex,
+        name: &str,
+        source: &str,
+        needle: &str,
+        work: usize,
+    ) -> Result<Vec<(String, u32, u32)>, String> {
+        let uri = Url::parse(&format!("file:///{name}.pas")).expect("valid file URL");
+        let offset = source.find(needle).expect("needle is present");
+        let position = crate::text::offset_to_position(source, offset).expect("position");
+        let mut work_budget = super::BindingWorkBudget::new(work);
+        let mut shared = super::super::AssistanceBudget::new(work, 32 * 1024 * 1024, "test");
+        let mut gaps = crate::coverage::Coverage::default();
+        let locations = index.partial_binding_locations_with_cancel_and_work_budget(
+            &uri,
+            position,
+            true,
+            &AtomicBool::new(false),
+            &mut work_budget,
+            &mut shared,
+            &mut gaps,
+        )?;
+        let mut found = locations
+            .into_iter()
+            .map(|location| {
+                (
+                    location.uri.to_string(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        Ok(found)
+    }
+
+    struct PrefilterReset;
+    impl Drop for PrefilterReset {
+        fn drop(&mut self) {
+            super::test_set_occurrence_prefilter(true);
+        }
+    }
+
+    /// l4d-vbeh: a retained dependency that cannot contain the name is not
+    /// walked, so large dependencies do not exhaust the traversal limit.
+    #[test]
+    fn bounded_references_skip_documents_without_the_name() {
+        let mut big = String::from("unit Big;\ninterface\nconst\n");
+        for index in 0..20_000 {
+            big.push_str(&format!("  B{index} = {index};\n"));
+        }
+        big.push_str("implementation\nend.\n");
+        let decl = "unit Decl;\ninterface\nconst Foo = 1;\nimplementation\nend.\n";
+        let user = "unit User;\ninterface\nuses Big, Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(Foo + B1);\nend;\nend.\n";
+        let index = indexed(&[("Big", &big), ("Decl", decl), ("User", user)]);
+        crate::navigation::test_reset_bound_documents();
+        let found = bounded_references(&index, "User", user, "Foo +", 60_000)
+            .expect("the dependency is not walked");
+        assert_eq!(
+            found,
+            vec![
+                ("file:///Decl.pas".to_owned(), 2, 6),
+                ("file:///User.pas".to_owned(), 6, 6),
+            ]
+        );
+        assert!(
+            !crate::navigation::test_bound_documents()
+                .iter()
+                .any(|uri| uri.as_str() == "file:///Big.pas")
+        );
+    }
+
+    /// l4d-vbeh fix round 1: a walk restricted to the requested document
+    /// (document highlights) spends nothing on the name scan.
+    #[test]
+    fn highlights_spend_no_bytes_on_the_occurrence_prefilter() {
+        let decl = "unit Decl;\ninterface\nconst Foo = 1;\nimplementation\nend.\n";
+        let user = "unit User;\ninterface\nuses Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(Foo);\nend;\nend.\n";
+        let index = indexed(&[("Decl", decl), ("User", user)]);
+        let uri = Url::parse("file:///User.pas").expect("valid file URL");
+        let offset = user.find("Foo)").expect("needle");
+        let position = crate::text::offset_to_position(user, offset).expect("position");
+        let _reset = PrefilterReset;
+        let mut spent = Vec::new();
+        for prefilter in [false, true] {
+            super::test_set_occurrence_prefilter(prefilter);
+            let mut budget =
+                super::super::AssistanceBudget::new(1_000_000, 32 * 1024 * 1024, "test");
+            let highlights = index
+                .binding_highlights_in_document_with_cancel_and_work_budget_and_shared_budget(
+                    &uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut super::BindingWorkBudget::new(1_000_000),
+                    &mut budget,
+                )
+                .expect("highlights");
+            assert_eq!(highlights.len(), 1);
+            spent.push(budget.byte_limit - budget.remaining_bytes);
+        }
+        assert_eq!(spent[0], spent[1]);
+    }
+
+    /// l4d-vbeh soundness: the textual skip keeps every occurrence spelled
+    /// in another case or escaped with `&`, and matches the unskipped walk.
+    #[test]
+    fn the_occurrence_prefilter_matches_the_unskipped_walk() {
+        let decl = "unit Decl;\ninterface\nconst Foo = 1;\nimplementation\nend.\n";
+        let upper = "unit Upper;\ninterface\nuses Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(FOO);\nend;\nend.\n";
+        let escaped = "unit Escaped;\ninterface\nuses Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(&Foo);\nend;\nend.\n";
+        let comment = "unit Comment;\ninterface\nuses Decl;\nimplementation\n{ foo }\nprocedure Run;\nbegin\nend;\nend.\n";
+        let none = "unit None;\ninterface\nuses Decl;\nimplementation\nprocedure Run;\nbegin\n  Log(Bar);\nend;\nend.\n";
+        let index = indexed(&[
+            ("Decl", decl),
+            ("Upper", upper),
+            ("Escaped", escaped),
+            ("Comment", comment),
+            ("None", none),
+        ]);
+        let _reset = PrefilterReset;
+        let mut results = Vec::new();
+        for prefilter in [true, false] {
+            super::test_set_occurrence_prefilter(prefilter);
+            crate::navigation::test_reset_bound_documents();
+            let found =
+                bounded_references(&index, "Decl", decl, "Foo =", 1_000_000).expect("references");
+            let mut bound = crate::navigation::test_bound_documents()
+                .into_iter()
+                .map(|uri| uri.to_string())
+                .collect::<Vec<_>>();
+            bound.sort();
+            results.push((found, bound));
+        }
+        let (skipped, walked) = (&results[0], &results[1]);
+        assert_eq!(skipped.0, walked.0);
+        assert_eq!(
+            skipped.0,
+            vec![
+                ("file:///Decl.pas".to_owned(), 2, 6),
+                ("file:///Escaped.pas".to_owned(), 6, 6),
+                ("file:///Upper.pas".to_owned(), 6, 6),
+            ]
+        );
+        assert!(!skipped.1.contains(&"file:///None.pas".to_owned()));
+        assert!(walked.1.contains(&"file:///None.pas".to_owned()));
     }
 }

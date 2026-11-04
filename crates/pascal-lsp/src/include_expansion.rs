@@ -110,7 +110,10 @@ impl ExpandedSource {
     ) -> Result<(), String> {
         visit(self.text.len())?;
         if let Some(session) = &self.session {
-            visit(session.budget.budget_snapshot().retained_bytes)?;
+            // What the cached session itself keeps, not its budget ledger,
+            // which also counts graphs the provider graph store charges
+            // (l4d-4nbs D44).
+            visit(session.projection_bytes())?;
         }
         if let Some(reads) = &self.reads {
             visit(reads.retained_bytes())?;

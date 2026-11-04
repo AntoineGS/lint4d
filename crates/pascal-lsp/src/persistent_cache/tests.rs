@@ -827,3 +827,163 @@ fn record_reuse_counts_each_outcome_once_and_a_fenced_reuse_reopens() {
     );
     cache.shutdown();
 }
+
+/// l4d-vrw0: the directory is excluded while the options are active.
+#[test]
+fn the_exclusion_follows_the_active_options() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let disabled = CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    };
+    let cache = start(&project_cache, disabled.clone());
+    assert_eq!(cache.exclusion(), None);
+    cache.reconfigure(options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let exclusion = cache.exclusion().expect("enabled: excluded");
+    assert!(exclusion.contains(&root.path().join("analysis.sqlite3-wal")));
+    // A reopen keeps it.
+    cache.readmit();
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert_eq!(cache.exclusion(), Some(exclusion));
+    assert_eq!(cache.reconfigure(disabled), Ack::Done);
+    assert_eq!(cache.exclusion(), None);
+    cache.shutdown();
+
+    let cache = start(&project_cache, options(root.path()));
+    assert!(cache.exclusion().is_some());
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    cache.shutdown();
+}
+
+/// l4d-vrw0: a directory holding Pascal sources is refused, not excluded,
+/// and nothing is created in it.
+#[test]
+fn a_directory_with_pascal_sources_is_refused() {
+    let root = private_dir();
+    std::fs::write(root.path().join("Unit1.pas"), b"unit Unit1;").unwrap();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    let CacheState::Bypassed(StatusCause::Configuration(message)) = cache.settle(SETTLE) else {
+        panic!("{:?}", cache.state());
+    };
+    assert!(message.contains("Pascal sources"), "{message}");
+    assert_eq!(cache.exclusion(), None);
+    assert!(cache.job().is_none());
+    // A runtime re-enable checks again.
+    cache.reconfigure(CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    });
+    cache.reconfigure(options(root.path()));
+    assert!(matches!(
+        cache.settle(SETTLE),
+        CacheState::Bypassed(StatusCause::Configuration(_))
+    ));
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+
+    // Once the sources are gone, enabling opens the store.
+    std::fs::remove_file(root.path().join("Unit1.pas")).unwrap();
+    cache.reconfigure(CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    });
+    cache.reconfigure(options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(cache.exclusion().is_some());
+    cache.shutdown();
+}
+
+/// l4d-vrw0 fix round 1: a re-enable while a disable is still fencing
+/// checks the directory and restores the exclusion.
+#[test]
+fn a_reenable_during_a_pending_disable_keeps_the_exclusion() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let job = cache.job().unwrap();
+    let disabled = CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    };
+    assert_eq!(
+        cache.reconfigure_within(disabled, Duration::ZERO),
+        Ack::Pending
+    );
+    cache.reconfigure_within(options(root.path()), Duration::ZERO);
+    drop(job);
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    assert!(cache.exclusion().is_some());
+    cache.shutdown();
+}
+
+/// The same race with sources added meanwhile: the reopen is refused.
+#[test]
+fn a_reenable_during_a_pending_disable_refuses_a_directory_with_sources() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let job = cache.job().unwrap();
+    let disabled = CacheOptions {
+        enabled: false,
+        ..options(root.path())
+    };
+    assert_eq!(
+        cache.reconfigure_within(disabled, Duration::ZERO),
+        Ack::Pending
+    );
+    std::fs::write(root.path().join("Unit1.pas"), b"unit Unit1;").unwrap();
+    cache.reconfigure_within(options(root.path()), Duration::ZERO);
+    drop(job);
+    assert!(matches!(
+        cache.settle(SETTLE),
+        CacheState::Bypassed(StatusCause::Configuration(_))
+    ));
+    assert_eq!(cache.exclusion(), None);
+    cache.shutdown();
+}
+
+/// Sources found under the excluded directory later refuse it.
+#[test]
+fn refusing_an_open_store_fences_it_into_the_configuration_bypass() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = start(&project_cache, options(root.path()));
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    cache.refuse_sources(&root.path().join("Stray.pas"));
+    let CacheState::Bypassed(StatusCause::Configuration(message)) = cache.settle(SETTLE) else {
+        panic!("{:?}", cache.state());
+    };
+    assert!(message.contains("Stray.pas"), "{message}");
+    assert_eq!(cache.exclusion(), None);
+    assert_eq!(live_leases(root.path()), 0);
+    cache.shutdown();
+}
+
+/// The store directory and its parents exist once the handle starts, so
+/// the first open changes nothing a workspace walk can see.
+#[test]
+fn an_enabled_start_creates_the_store_directory_before_returning() {
+    let root = private_dir();
+    let directory = root.path().join("cache/lint4d/analysis");
+    let project_cache = ProjectCache::new(64 << 20);
+    let (entered, _entered) = mpsc::channel();
+    let (_release, release) = mpsc::channel();
+    let cache = PersistentCache::start_paused_for_test(
+        options(&directory),
+        project_cache.clone(),
+        Arc::default(),
+        namespace(),
+        entered,
+        release,
+    );
+    assert!(directory.is_dir());
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&directory).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o700);
+    drop(cache);
+}

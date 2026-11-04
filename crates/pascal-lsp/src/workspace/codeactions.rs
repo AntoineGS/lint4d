@@ -5978,9 +5978,11 @@ fn lint_configuration_for_input(
         input.roots.clone(),
         input.options.clone(),
         input.overrides.clone(),
-    );
+    )
+    .with_cache_exclusion(input.cache_exclusion.clone());
     workspace.project_selections = input.project_selections.clone();
     workspace.document_owners = input.document_owners.clone();
+    workspace.claimant_list = input.claimant_list.clone();
     let context_key = workspace.context_for_uri(uri)?;
     let (context, context_observations) = workspace
         .contexts

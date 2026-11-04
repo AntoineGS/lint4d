@@ -896,6 +896,17 @@ helper exposes `:PascalProject` / `<leader>wp`, project browsing, and
 `:PascalDelphiVersion`; changing a selection does not restart the server.
 See [`examples/pascal_project.lua`](examples/pascal_project.lua).
 
+A single `.dproj` in a directory *above* the unit's own directory owns the unit
+only when it names it: as its main source, a `DCCReference` or `uses … in`
+entry, or a unit of the project directory, the main source's directory or a
+`DCC_UnitSearchPath` directory (IDE library paths and client `sourcePaths` do
+not count). An ancestor whose context is incomplete, or whose search-path entry
+depends on an undefined property, keeps the unit as before. Otherwise the unit
+is analysed in the context of the selected project, else of an open document's
+project, whose search paths resolve it, and follows that project as it is
+selected, opened or closed. With no such project open, and in the `lint4d`
+CLI, such a unit is projectless.
+
 The automatic search falls back to a `.dpr` or
 `.dpk`. Multiple candidates can be narrowed to a unique proven source owner;
 shared ownership, uncertain dependencies, and incomplete candidate metadata
@@ -970,11 +981,25 @@ strings. Missing facts are `Unknown`; the server never infers them from the
 host OS, current date, Rust toolchain, or an unrelated target platform.
 
 Project discovery additionally reads explicit `CompilerVersion`/
-`DCC_CompilerVersion` metadata and a bounded set of option properties such as
-`DCC_RangeChecks`, `DCC_OverflowChecks`, `DCC_Optimization`,
-`DCC_Assertions`, `DCC_RuntimeChecks`, and `DCC_DebugInformation`. Explicit
-client facts win over these properties; unsupported or malformed metadata
-stays unknown and is reported as a warning. The same context identity is part
+`DCC_CompilerVersion` metadata and the compiler-switch properties that
+CodeGear.Delphi.Targets passes to dcc: `DCC_FullBooleanEvaluations` (`B`),
+`DCC_AssertionsAtRuntime` (`C`), `DCC_DebugInformation` (`D`),
+`DCC_LongStrings` (`H`), `DCC_IOChecking` (`I`), `DCC_Optimize` (`O`),
+`DCC_IntegerOverflowCheck` (`Q`), `DCC_RangeChecking` (`R`),
+`DCC_TypedAtParameter` (`T`), `DCC_ExtendedSyntax` (`X`) and
+`DCC_SymbolReferenceInfo` (`Y`), plus `DCC_RuntimeChecks`. Explicit client
+facts win over these properties; unsupported or malformed values stay unknown.
+A switch the project, its option sets, its configurations and the
+installation's `environment.proj` leave unset takes dcc's default
+(B- C+ D+ H+ I+ O+ Q- R- T- X+ Y+), for the compilers whose defaults were
+observed: 21.0 Win32, and 24.0 and 37.0 Win32/Win64. It stays unknown for
+other compilers and platforms, when the installation is not selected or did
+not load, when the project metadata is incomplete or an import was not
+evaluated, and whenever `GlobalOptionFile` is (or may be) set, because
+CodeGear.Common.Targets imports that file after the project. Library sources
+(outside the project's own roots) get a switch only where the project's value
+is that default, because dcc compiles them with the project's switches when
+their source is on the search path and their DCUs' switches are not known. The same context identity is part
 of project, parsed-source, include-expansion, package, and completion caches,
 so two projects can analyze the same physical source independently.
 
@@ -1462,6 +1487,26 @@ one, and `null` resets an option. `persistentCacheDirectory` is ignored with a
 warning, because runtime settings can come from workspace files and a project
 must not redirect where the server writes.
 
+#### A store directory inside a workspace
+
+The store directory may lie inside a workspace root, for example when `$HOME`
+is opened and the store is `~/.cache/lint4d/analysis`. While persistence is
+on, the server leaves that directory out of the workspace: walks, directory
+catalogues, workspace membership and file events (client and native watcher)
+ignore it, so the store's own writes never make a request fail or refresh
+diagnostics. Symlinked paths to it are recognized too.
+
+A directory that contains Pascal sources or project files (`.pas`, `.dpr`,
+`.dpk`, `.inc`, `.dproj`, ...), or more than 65,536 entries to check, is
+refused rather than hidden: the cache is `bypassed` with a `configuration`
+cause whose message names the directory, nothing is created there and its
+sources stay in the workspace. Set `persistentCacheDirectory` to a directory
+used only by the cache. The check runs at startup and whenever persistence is
+turned on again, and the store directory is created (mode `0700`) right after
+it, before the workspace is walked. A file event naming a Pascal source or
+project file under the store directory is never dropped: it refuses the
+directory the same way.
+
 #### Runtime changes
 
 - **Turning it off.** The server stops accepting new cache work, cancels what
@@ -1594,9 +1639,6 @@ A directory that fails the location checks is left untouched.
 
 #### What it does not solve
 
-- A cache directory inside a workspace root currently makes requests fail with
-  `-32803` and a `retry` message. Choose `persistentCacheDirectory` outside the
-  workspace, or set `persistentCacheEnabled` to `false`.
 - Processes do not share cold work in flight: two servers indexing the same
   project at once both parse what neither has published yet.
 - It does not bound process memory. Only the pages, scratch and decoded facts

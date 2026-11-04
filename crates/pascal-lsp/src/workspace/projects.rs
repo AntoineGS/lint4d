@@ -91,7 +91,7 @@ pub struct RtlConstantsInfo {
 
 /// Admission-time immutable authority for project protocol workers.
 pub(crate) struct ProjectOperationSnapshot {
-    workspace: Workspace,
+    pub(super) workspace: Workspace,
     source_generation: u64,
     configuration_generation: u64,
     expected_installation: Option<String>,
@@ -144,6 +144,8 @@ pub(crate) struct ProjectContextPreparation {
     state: super::ContextState,
     owner: Option<super::KnownDocumentOwner>,
     pub(crate) info: ProjectContextInfo,
+    /// The D43 claim generation the preparation was decided against.
+    claim_generation: u64,
 }
 
 impl ProjectContextPreparation {
@@ -342,8 +344,13 @@ impl Workspace {
             roots: self
                 .roots
                 .iter()
-                .map(|root| super::WorkspaceRoot::new(root.path.clone(), &options))
+                .map(|root| {
+                    let mut snapshot = super::WorkspaceRoot::new(root.path.clone(), &options);
+                    snapshot.set_cache_exclusion(self.cache_exclusion.as_ref());
+                    snapshot
+                })
                 .collect(),
+            cache_exclusion: self.cache_exclusion.clone(),
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
             build_selections: self.build_selections.clone(),
@@ -358,6 +365,7 @@ impl Workspace {
             global_configuration_change_generation: self.global_configuration_change_generation,
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
+            claimant_list: self.claimant_list.clone(),
             ..Workspace::default()
         };
         let expected_installation =
@@ -416,8 +424,12 @@ impl Workspace {
         uri: &Url,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ProjectContextInfo, String> {
-        self.prepare_project_context_with_control(uri, cancel, None)
-            .map(|prepared| prepared.info)
+        let info = self
+            .prepare_project_context_with_control(uri, cancel, None)
+            .map(|prepared| prepared.info)?;
+        // Resolving the document may have rebuilt a claimant (D43).
+        self.revisit_claims_if_replaced_logged("a project context request");
+        Ok(info)
     }
 
     pub(crate) fn prepare_project_context_with_control(
@@ -563,6 +575,7 @@ impl Workspace {
             state,
             owner,
             info,
+            claim_generation: self.claimant_list.generation,
         })
     }
 
@@ -576,15 +589,30 @@ impl Workspace {
             state,
             owner,
             info: _,
+            claim_generation,
         } = prepared;
+        // D43: a preparation decided against an older claimant list must not
+        // bring back the binding of a unit that list claimed or left
+        // projectless.
+        let stale_claim = claim_generation != self.claimant_list.generation
+            && (owner
+                .as_ref()
+                .is_some_and(|owner| super::owner_is_claim_eligible(&uri, owner))
+                || self
+                    .document_owners
+                    .get(&uri)
+                    .is_some_and(|owner| super::owner_is_claim_eligible(&uri, owner)));
         let watched_paths = state.watched_paths.keys().cloned().collect::<Vec<_>>();
         self.contexts.entry(key.clone()).or_insert(state);
-        self.document_contexts.insert(uri.clone(), key.clone());
-        if let Some(owner) = owner {
-            self.document_owners.insert(uri.clone(), owner);
+        if !stale_claim {
+            self.document_contexts.insert(uri.clone(), key.clone());
+            if let Some(owner) = owner {
+                self.document_owners.insert(uri.clone(), owner);
+            }
         }
         self.watch_context_paths(&key, watched_paths);
         self.refresh_known_owners_for_context(&key);
+        self.revisit_claims_if_replaced_logged("a project context request");
     }
 
     pub fn installation_context(
@@ -747,6 +775,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(build_context_info(project_uri, &validation))
     }
 
@@ -900,6 +929,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(InstallationContextInfo {
             project_uri: canonical_file_uri(project_uri),
             candidates,
@@ -980,6 +1010,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(())
     }
 
@@ -1051,6 +1082,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(())
     }
 
@@ -1222,7 +1254,11 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.invalidate_project_selection_uris(&affected_uris, None, None)?;
-        self.project_context(&uri)
+        let info = self.project_context(&uri)?;
+        // The selection is applied: a failed revisit is reported, not
+        // returned as a failed selection.
+        self.revisit_claims_logged("a project selection");
+        Ok(info)
     }
 
     pub(crate) fn prepare_select_project_with_control(
@@ -1394,6 +1430,7 @@ impl Workspace {
         }
         let info = context.info.clone();
         self.apply_project_context_preparation(context);
+        self.revisit_claims_logged("a project selection");
         Ok(info)
     }
 
@@ -1449,7 +1486,7 @@ impl Workspace {
         (lint, fmt, checked_paths)
     }
 
-    fn watch_context_paths(&mut self, key: &ContextKey, paths: Vec<PathBuf>) {
+    pub(super) fn watch_context_paths(&mut self, key: &ContextKey, paths: Vec<PathBuf>) {
         let Some(state) = self.contexts.get_mut(key) else {
             return;
         };

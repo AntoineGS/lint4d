@@ -20,11 +20,150 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// Compiled provider interfaces shared through the project cache (l4d-4nbs
+/// D29) by every analysis under one resolver configuration. A reuse replays
+/// into this session's capture what the compilation read.
+struct CachedProviderGraphs {
+    cache: crate::project_cache::ProjectCache,
+    configuration: u64,
+    overlays: Arc<std::collections::HashMap<Url, super::rename::OverlayInput>>,
+    capture: Arc<super::capture::ReadCapture>,
+}
+
+impl CachedProviderGraphs {
+    /// Core revisions hash exact bytes; overlay probes use the framed text
+    /// hash of the buffer that was read. `None` when that buffer is gone.
+    fn overlay_probe(
+        &self,
+        path: &std::path::Path,
+        version: i32,
+        content_hash: u64,
+    ) -> Option<crate::project_cache::Probe> {
+        let uri = Url::from_file_path(path).ok()?;
+        let overlay = self.overlays.get(&uri)?;
+        (overlay.version == version
+            && pascal_project::content_hash_bytes(overlay.text.as_bytes()) == content_hash)
+            .then(|| crate::project_cache::Probe::Overlay {
+                uri,
+                version,
+                content_hash: crate::project_cache::overlay_content_hash(&overlay.text),
+            })
+    }
+}
+
+impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
+    fn get(
+        &self,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+    ) -> Option<Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        let hit = self
+            .cache
+            .provider_graph(self.configuration, key, &self.overlays)?;
+        self.capture.replay(&hit.reads);
+        Some(hit.graph)
+    }
+
+    fn put(
+        &self,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: Arc<pascal_core::compile_time::SharedProviderGraph>,
+    ) {
+        use crate::project_cache::Probe;
+        let mut shareable = true;
+        let mut probe = |path: &std::path::Path, hash: u64, disk: Option<&_>, version| {
+            let probe = match (disk, version) {
+                (Some(stamp), _) => Some(Probe::Content {
+                    path: path.to_path_buf(),
+                    stamp: Some(Clone::clone(stamp)),
+                    content_hash: hash,
+                }),
+                (None, Some(version)) => self.overlay_probe(path, version, hash),
+                (None, None) => None,
+            };
+            shareable &= probe.is_some();
+            probe
+        };
+        let (mut probes, _) =
+            crate::project_cache::observation_probes(&graph.observations, &mut |path, revision| {
+                match revision {
+                    SourceRevision::Disk {
+                        stamp,
+                        content_hash,
+                        ..
+                    } => probe(path, *content_hash, Some(stamp), None),
+                    SourceRevision::Overlay {
+                        version,
+                        content_hash,
+                    } => probe(path, *content_hash, None, Some(*version)),
+                }
+            });
+        // Every directory a unit lookup of the interface or of a nested
+        // provider consulted, which the session's report may have
+        // deduplicated away (l4d-4nbs review C1): a unit created there may
+        // shadow what the lookup found.
+        let (traced, _) = crate::project_cache::observation_probes(&graph.trace, &mut |_, _| None);
+        probes.extend(traced);
+        // The provider sources themselves, nested ones included: a session
+        // loads a provider before compiling it, so its observations may not
+        // name it.
+        for dependency in graph.dependencies.iter() {
+            probes.extend(probe(
+                &dependency.path,
+                dependency.content_hash,
+                dependency.disk_stamp.as_ref(),
+                dependency.overlay_version,
+            ));
+        }
+        if !shareable {
+            return;
+        }
+        let reads = self.capture.snapshot().restricted_to(&graph.observations);
+        self.cache
+            .put_provider_graph(self.configuration, key, graph, probes, reads);
+    }
+}
+
+/// What a provider interface compiled for `context` depends on besides its
+/// key: the lookup configuration and the editor state that shapes listings.
+fn provider_graph_configuration(
+    workspace: &Workspace,
+    context: &pascal_project::ProjectContext,
+    input: &super::rename::WorkspaceInput,
+    limits: &ResolverLimits,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::navigation::compiled_dcu::project_context_fingerprint(context).hash(&mut hasher);
+    workspace.workspace_root_paths().hash(&mut hasher);
+    format!("{limits:?}").hash(&mut hasher);
+    // A buffer without a disk file joins its directory's listing, which a
+    // directory probe cannot see; deletions and rejections hide files.
+    let mut unsaved = input
+        .overlays
+        .keys()
+        .filter(|uri| uri.to_file_path().is_ok_and(|path| !path.exists()))
+        .map(Url::as_str)
+        .collect::<Vec<_>>();
+    unsaved.sort_unstable();
+    unsaved.hash(&mut hasher);
+    let mut hidden = input
+        .deleted_overrides
+        .keys()
+        .chain(input.rejected_documents.iter())
+        .map(Url::as_str)
+        .collect::<Vec<_>>();
+    hidden.sort_unstable();
+    hidden.hash(&mut hasher);
+    hasher.finish()
+}
+
 struct Control<'a> {
     cancel: &'a AtomicBool,
     budget: Option<&'a ReconciliationBudget>,
 }
 
+#[cfg(test)]
+thread_local! { pub(super) static TEST_KEEP_DECLARATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static TEST_BODY_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
@@ -32,6 +171,14 @@ thread_local! { static TEST_HEADER_REVALIDATION_HOOK: std::cell::RefCell<Option<
 #[cfg(test)]
 pub(super) fn test_header_revalidation_hook(hook: Option<Box<dyn FnMut()>>) {
     TEST_HEADER_REVALIDATION_HOOK.with(|value| *value.borrow_mut() = hook);
+}
+#[cfg(test)]
+thread_local! { static TEST_EXPANSION_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+/// Makes every expansion of a document whose URI ends with `suffix` fail
+/// as an exhausted resolver limit does.
+#[cfg(test)]
+pub(crate) fn test_fail_expansion_of(suffix: Option<&str>) {
+    TEST_EXPANSION_FAILURE.with(|value| *value.borrow_mut() = suffix.map(str::to_owned));
 }
 #[cfg(test)]
 pub(super) fn take_body_analyses() -> usize {
@@ -746,6 +893,15 @@ pub(super) fn expand_with_limits(
     let limits = limits.expansion;
     let control = Control { cancel, budget };
     control.check()?;
+    #[cfg(test)]
+    if TEST_EXPANSION_FAILURE.with(|value| {
+        value
+            .borrow()
+            .as_deref()
+            .is_some_and(|suffix| uri.as_str().ends_with(suffix))
+    }) {
+        return Err("resolver limit max_byte_work exceeded: 2 > 1".into());
+    }
     if !requires_session(source) {
         if source.len() > limits.max_expanded_bytes
             || source.len() > limits.max_work
@@ -826,13 +982,21 @@ pub(super) fn expand_with_limits(
         store,
         control: &control,
     };
+    let configuration = provider_graph_configuration(workspace, &context, &input, &resolver_limits);
+    let shared = Arc::new(CachedProviderGraphs {
+        cache: workspace.project_cache.clone(),
+        configuration,
+        overlays: workspace.overlay_inputs(),
+        capture: Arc::clone(&capture),
+    });
     let mut resolver = UnitResolver::new(
         context,
         workspace.workspace_root_paths(),
         store,
         resolver_limits,
     )
-    .with_context_observations(&state.context_observations);
+    .with_context_observations(&state.context_observations)
+    .with_shared_provider_graphs(shared);
     let root = control.finish(resolver.load_source(
         &path,
         route.as_ref(),
@@ -846,7 +1010,16 @@ pub(super) fn expand_with_limits(
     // and derives its source-specific context before invoking analyze_source.
     #[cfg(test)]
     TEST_BODY_ANALYSES.with(|count| count.set(count.get() + 1));
-    let analysis = control.finish(resolver.analyze_compile_time(&root, &control))?;
+    let mut analysis = control.finish(resolver.analyze_compile_time(&root, &control))?;
+    // The expansion is cached and read for its projection only (l4d-4nbs
+    // D44): drop the declarations and provider graphs the session holds.
+    #[cfg(test)]
+    let release = !TEST_KEEP_DECLARATIONS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let release = true;
+    if release {
+        control.finish(analysis.release_declarations(&control))?;
+    }
     if let Some(b) = budget {
         b.check_cancelled()?;
     }
@@ -1245,6 +1418,336 @@ mod tests {
     use crate::NavigationTarget;
     use lsp_types::Position;
     use pascal_project::delphi_overrides::OverrideSession;
+
+    fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = {n};\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("A.pas"),
+            format!("unit A; interface const\n{declarations}Flag = 8; implementation end."),
+        )
+        .unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        (workspace, uri, source.into(), key)
+    }
+
+    fn expand_main(
+        workspace: &Workspace,
+        uri: &Url,
+        source: &str,
+        key: &ContextKey,
+    ) -> ExpansionResult {
+        let cancel = AtomicBool::new(false);
+        let result = expand(
+            workspace,
+            uri,
+            source,
+            key,
+            workspace.include_expansion_limits(),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        let session = result.expanded.session.as_ref().unwrap();
+        assert!(session.root.complete, "{:?}", session.reasons);
+        result
+    }
+
+    fn work(result: &ExpansionResult) -> usize {
+        let session = result.expanded.session.as_ref().unwrap();
+        session.budget.budget_snapshot().work
+    }
+
+    /// l4d-4nbs D29: a later analysis reuses the provider interface an
+    /// earlier one compiled, from the project cache, and reports the same
+    /// dependencies; the cache charges it to `maxCacheBytes`.
+    #[test]
+    fn a_later_expansion_reuses_compiled_provider_interfaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        let first = expand_main(&workspace, &uri, &source, &key);
+        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        assert!(charged > 0, "the shared interface is charged");
+        let second = expand_main(&workspace, &uri, &source, &key);
+        assert_eq!(
+            first.expanded.session.as_ref().unwrap().observations,
+            second.expanded.session.as_ref().unwrap().observations
+        );
+        assert!(
+            work(&second) * 2 < work(&first),
+            "{} then {}",
+            work(&first),
+            work(&second)
+        );
+        assert_eq!(
+            first.expanded.reads, second.expanded.reads,
+            "the reuse replays what the compilation read"
+        );
+    }
+
+    /// l4d-4nbs D44: a cached expansion keeps a compact projection of its
+    /// session, not the declaration state and provider graphs it compiled, so
+    /// what it retains is a small multiple of the source it covers.
+    #[test]
+    fn a_cached_expansion_retains_a_small_multiple_of_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        let result = expand_main(&workspace, &uri, &source, &key);
+        let session = result.expanded.session.as_ref().unwrap();
+        let mut declarations = 0usize;
+        session
+            .facts
+            .visit_recovery_payload(&mut |bytes| {
+                declarations += bytes;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            declarations < 8 * 1024,
+            "the session keeps {declarations} bytes of declarations and provider graphs"
+        );
+        let retained = crate::project_cache::expansion_bytes(&result);
+        let provider = std::fs::metadata(temp.path().join("A.pas")).unwrap().len() as usize;
+        assert!(
+            retained < 16 * source.len() + 16 * 1024,
+            "{retained} bytes for a {} byte root (its provider is {provider} bytes)",
+            source.len()
+        );
+    }
+
+    /// A changed provider file is not reused, whether or not a watcher saw
+    /// the change; a watched change drops the entry and its charge.
+    #[test]
+    fn a_changed_provider_is_compiled_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        let first = expand_main(&workspace, &uri, &source, &key);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let path = temp.path().join("A.pas");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("Flag = 8", "Flag = 4")).unwrap();
+        let second = expand_main(&workspace, &uri, &source, &key);
+        assert!(
+            work(&second) * 2 > work(&first),
+            "{} then {}",
+            work(&first),
+            work(&second)
+        );
+        let inactive = |result: &ExpansionResult| {
+            let conditionals = result.expanded.conditionals.as_ref().unwrap();
+            conditionals
+                .inactive_spans
+                .iter()
+                .map(|span| source[span.clone()].to_string())
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        assert!(
+            inactive(&first).contains("Other"),
+            "{:?}",
+            first.expanded.conditionals
+        );
+        assert!(
+            inactive(&second).contains("Eight"),
+            "A.Flag is 4 now: {}",
+            inactive(&second)
+        );
+        assert_eq!(
+            workspace.project_cache.provider_graph_count(),
+            2,
+            "both revisions are kept"
+        );
+        workspace
+            .project_cache
+            .invalidate_file_contents(&temp.path().join("A.pas"));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 0);
+        assert_eq!(workspace.project_cache.provider_graph_bytes(), 0);
+    }
+
+    /// l4d-4nbs review C1 (the reviewer's probe): P in c/ uses W in b/;
+    /// creating a/W.pas, earlier in the search path, shadows it. The stored
+    /// P interface carries the directories its lookup of W consulted, so the
+    /// same workspace computes P.Flag from the new W, as a fresh one does.
+    #[test]
+    fn a_unit_shadowing_a_nested_lookup_invalidates_the_shared_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let c = temp.path().join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let source = "unit Main; interface uses W, P; {$IF W.Flag = 1} const WOne = 1; {$ENDIF} {$IF P.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
+        std::fs::write(a.join("Main.pas"), source).unwrap();
+        std::fs::write(
+            b.join("W.pas"),
+            "unit W; interface const Flag = 1; implementation end.",
+        )
+        .unwrap();
+        std::fs::write(
+            c.join("P.pas"),
+            "unit P; interface uses W; const Flag = W.Flag * 8; implementation end.",
+        )
+        .unwrap();
+        let make = || {
+            let mut ws = Workspace::with_override_session(
+                vec![a.clone(), b.clone(), c.clone()],
+                Default::default(),
+                OverrideSession::new(None),
+            );
+            let uri = Url::from_file_path(a.join("Main.pas")).unwrap();
+            let key = ws.context_for_uri_with_cancel(&uri, None).unwrap();
+            let _ = &mut ws;
+            (ws, uri, key)
+        };
+        let inactive = |result: &ExpansionResult| {
+            let c = result.expanded.conditionals.as_ref().unwrap();
+            c.inactive_spans
+                .iter()
+                .map(|s| source[s.clone()].to_string())
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        let (ws, uri, key) = make();
+        let first = expand(
+            &ws,
+            &uri,
+            source,
+            &key,
+            ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert!(inactive(&first).contains("Other"), "{}", inactive(&first));
+        assert_eq!(ws.project_cache.provider_graph_count(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(
+            a.join("W.pas"),
+            "unit W; interface const Flag = 2; implementation end.",
+        )
+        .unwrap();
+        let second = expand(
+            &ws,
+            &uri,
+            source,
+            &key,
+            ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let (fresh_ws, fresh_uri, fresh_key) = make();
+        let fresh = expand(
+            &fresh_ws,
+            &fresh_uri,
+            source,
+            &fresh_key,
+            fresh_ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inactive(&second),
+            inactive(&fresh),
+            "reused workspace disagrees with a fresh one"
+        );
+        // A watched creation in a directory P's lookup consulted drops P,
+        // not W, which no lookup of its own depends on.
+        assert_eq!(fresh_ws.project_cache.provider_graph_count(), 2);
+        fresh_ws.project_cache.invalidate_path(&a.join("X.pas"));
+        assert_eq!(fresh_ws.project_cache.provider_graph_count(), 1);
+    }
+
+    /// l4d-4nbs review I4: nested providers up to the session's stack limit,
+    /// each resolving a 250-level type alias chain, run on an analysis thread
+    /// without overflowing it.
+    fn deep_nesting_on(builder: std::thread::Builder, levels: usize) -> bool {
+        builder
+            .spawn(move || {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                for n in 0..levels {
+                    let mut text = format!("unit U{n};\ninterface\n");
+                    let leaf = n + 1 == levels;
+                    let base = if leaf {
+                        "Int64".to_string()
+                    } else {
+                        text.push_str(&format!("uses U{};\n", n + 1));
+                        format!("U{}.T{}", n + 1, n + 1)
+                    };
+                    // The innermost provider prepares a chain at max_type_depth.
+                    let chain = if leaf { 250 } else { 1 };
+                    text.push_str(&format!("type\n  T{n}_0 = {base};\n"));
+                    for k in 1..chain {
+                        text.push_str(&format!("  T{n}_{k} = T{n}_{};\n", k - 1));
+                    }
+                    text.push_str(&format!("  T{n} = T{n}_{};\nimplementation\nend.\n", chain - 1));
+                    std::fs::write(root.join(format!("U{n}.pas")), text).unwrap();
+                }
+                let source = "unit Main; interface uses U0; {$IF SizeOf(U0.T0)=8}{$DEFINE DEEP}{$ENDIF} implementation end.";
+                std::fs::write(root.join("Main.pas"), source).unwrap();
+                let mut workspace = Workspace::with_override_session(
+                    vec![root.into()],
+                    Default::default(),
+                    OverrideSession::new(None),
+                );
+                let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                let cancel = AtomicBool::new(false);
+                let _ = expand(
+                    &workspace,
+                    &uri,
+                    source,
+                    &key,
+                    workspace.include_expansion_limits(),
+                    &cancel,
+                    None,
+                );
+            })
+            .unwrap()
+            .join()
+            .is_ok()
+    }
+
+    #[test]
+    fn deep_provider_and_type_nesting_fit_an_analysis_thread() {
+        // A debug build stops nesting at about 17 such providers; release
+        // goes past 40. Measured peaks: 1.24 MiB debug, 0.71 MiB release.
+        for levels in [16, 40] {
+            assert!(deep_nesting_on(
+                crate::server::analysis_thread("PascalLspTestAnalysis"),
+                levels
+            ));
+        }
+    }
+
+    /// An interface larger than its share of `maxCacheBytes` is not kept.
+    #[test]
+    fn a_provider_interface_past_its_share_is_not_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        expand_main(&workspace, &uri, &source, &key);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        workspace.project_cache.set_max_bytes(charged * 2);
+        workspace
+            .project_cache
+            .invalidate_file_contents(&temp.path().join("A.pas"));
+        expand_main(&workspace, &uri, &source, &key);
+        assert_eq!(workspace.project_cache.provider_graph_count(), 0);
+        assert_eq!(workspace.project_cache.provider_graph_bytes(), 0);
+    }
 
     #[test]
     fn compatibility_retention_uses_finite_existing_size_domains() {

@@ -14,7 +14,6 @@ use pascal_project::{
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,13 +48,14 @@ struct SourceCredit {
     validation: bool,
     /// The lexical-only import estimate was funded.
     lexical: bool,
+    /// A full read (unit lookup load) was funded.
+    load: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverLimits {
     pub max_dependency_units: usize,
     pub max_directory_entries: usize,
-    pub max_scanned_bytes: usize,
     pub max_source_bytes: usize,
     pub max_include_files: usize,
     pub max_include_bytes: usize,
@@ -84,7 +84,6 @@ impl Default for ResolverLimits {
         Self {
             max_dependency_units: 256,
             max_directory_entries: 1_048_576,
-            max_scanned_bytes: 8 * 1024 * 1024 * 1024,
             max_source_bytes: 16 * 1024 * 1024,
             max_include_files: 4_096,
             max_include_bytes: 256 * 1024 * 1024,
@@ -1500,11 +1499,16 @@ pub struct UnitResolver<S> {
     package_lookups: usize,
     package_catalogue_count: usize,
     scanned_entries: usize,
-    scanned_bytes: usize,
     project_includes: Vec<ResolvedInclude>,
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
     stop_when_incomplete: bool,
+    /// Compiled provider interfaces shared beyond this resolver's sessions
+    /// (l4d-4nbs D29), bound to this resolver's configuration.
+    shared_provider_graphs: Option<Arc<dyn crate::compile_time::SharedProviderGraphs>>,
+    /// Directories unit lookups consulted while a session traces them
+    /// (l4d-4nbs review C1), with their stamps when consulted.
+    lookup_trace: Option<Vec<(PathBuf, ProjectPathEntry, Option<ProjectReadStamp>)>>,
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
@@ -1675,6 +1679,19 @@ struct StoreCache {
     include_seen: HashSet<OwnedLoadedKey>,
     include_seen_capacity: Option<AdmittedOwned<()>>,
     directory_capacity: Option<AdmittedOwned<()>>,
+    /// l4d-4nbs R13: listings reusable within the session, with the receipt
+    /// of their key's storage.
+    reuse: HashMap<DirectoryReuseKey, (AdmittedOwned<()>, AdmittedShared<DirectoryListing>)>,
+    reuse_capacity: Option<AdmittedOwned<()>>,
+    reuse_policy: Option<ReadPolicy>,
+    /// l4d-4nbs R13: this session's disk reads, one per file and entry, for
+    /// lookups of the same unit through the same entry. `loaded` keeps only
+    /// the latest read of a source, which alternating entries would replace.
+    reads: Vec<LoadedSource>,
+    reads_capacity: Option<AdmittedOwned<()>>,
+    /// l4d-4nbs D19: the file and directory names of this session's
+    /// search directories (`indexed_absent`).
+    search_index: HashMap<PathBuf, SearchSlot>,
     recorded_work: usize,
     recorded_byte_work: usize,
 }
@@ -1941,6 +1958,57 @@ impl StoreCache {
     }
 }
 
+impl StoreCache {
+    /// Keep `listing` for reuse within this session. Refused retained bytes
+    /// only stop caching.
+    fn insert_reusable(
+        &mut self,
+        key: DirectoryReuseKey,
+        policy: &ReadPolicy,
+        listing: AdmittedShared<DirectoryListing>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        if self.reuse_policy.as_ref().is_some_and(|p| p != policy) {
+            return Ok(());
+        }
+        let mut key_bytes = 2 * key.path.as_os_str().len();
+        key.entry
+            .visit_recovery_payload(&mut |n| {
+                key_bytes = key_bytes.saturating_add(n);
+                Ok(())
+            })
+            .map_err(|_| crate::compile_time::IncompleteReason::MalformedSource)?;
+        if self.reuse_policy.is_none() {
+            let mut policy_bytes = 0usize;
+            policy
+                .visit_owned_clone_payload(&mut |n| {
+                    policy_bytes = policy_bytes.saturating_add(n);
+                    Ok(())
+                })
+                .map_err(|_| crate::compile_time::IncompleteReason::MalformedSource)?;
+            key_bytes = key_bytes.saturating_add(policy_bytes);
+        }
+        if self.reuse.len() == self.reuse.capacity() {
+            let count = (self.reuse.len() + 1).next_power_of_two().max(4);
+            let bytes = count.saturating_mul(2).saturating_mul(
+                std::mem::size_of::<(
+                    DirectoryReuseKey,
+                    (AdmittedOwned<()>, AdmittedShared<DirectoryListing>),
+                )>() + 1,
+            );
+            let capacity = budget.admit_owned(1, 0, bytes, || ())?;
+            self.reuse.reserve(count - self.reuse.len());
+            self.reuse_capacity = Some(capacity);
+        }
+        let receipt = budget.admit_owned(1, key_bytes, key_bytes, || ())?;
+        if self.reuse_policy.is_none() {
+            self.reuse_policy = Some(policy.clone());
+        }
+        self.reuse.insert(key, (receipt, listing));
+        Ok(())
+    }
+}
+
 impl AdmittedOwned<StoreCache> {
     fn prepare_seen(
         &self,
@@ -2195,17 +2263,19 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn compile_time_credit(&mut self, source: &LoadedSource) -> &mut SourceCredit {
-        let revisions = self
-            .compile_time_credits
-            .entry(source.id.clone())
-            .or_default();
-        let index = match revisions
-            .iter()
-            .position(|(revision, _)| *revision == source.revision)
-        {
+        self.compile_time_credit_of(&source.id, &source.revision)
+    }
+
+    fn compile_time_credit_of(
+        &mut self,
+        source: &SourceId,
+        revision: &SourceRevision,
+    ) -> &mut SourceCredit {
+        let revisions = self.compile_time_credits.entry(source.clone()).or_default();
+        let index = match revisions.iter().position(|(r, _)| r == revision) {
             Some(index) => index,
             None => {
-                revisions.push((source.revision.clone(), SourceCredit::default()));
+                revisions.push((revision.clone(), SourceCredit::default()));
                 revisions.len() - 1
             }
         };
@@ -2214,19 +2284,28 @@ impl<S: SourceStore> UnitResolver<S> {
 
     /// Offset of `source` already credited to the request.
     fn compile_time_credit_floor(&self, source: &LoadedSource) -> usize {
+        self.compile_time_credit_floor_of(&source.id, &source.revision)
+    }
+
+    fn compile_time_credit_floor_of(&self, source: &SourceId, revision: &SourceRevision) -> usize {
         self.compile_time_credits
-            .get(&source.id)
-            .and_then(|revisions| {
-                revisions
-                    .iter()
-                    .find(|(revision, _)| *revision == source.revision)
-            })
+            .get(source)
+            .and_then(|revisions| revisions.iter().find(|(r, _)| r == revision))
             .map_or(0, |(_, credit)| credit.scanned)
     }
 
     /// A scanner read `source` to offset `end`: credit the request the
     /// per-byte grant of the bytes beyond its furthest credited offset.
     fn credit_compile_time_scan(&mut self, source: &LoadedSource, end: usize) {
+        self.credit_compile_time_scan_of(&source.id, &source.revision, end);
+    }
+
+    fn credit_compile_time_scan_of(
+        &mut self,
+        source: &SourceId,
+        revision: &SourceRevision,
+        end: usize,
+    ) {
         let (work, bytes) = (
             self.limits.compile_time_work_per_source_byte,
             self.limits.compile_time_byte_work_per_source_byte,
@@ -2234,7 +2313,7 @@ impl<S: SourceStore> UnitResolver<S> {
         if work == 0 && bytes == 0 {
             return;
         }
-        let credit = self.compile_time_credit(source);
+        let credit = self.compile_time_credit_of(source, revision);
         let new = end.saturating_sub(credit.scanned);
         credit.scanned = credit.scanned.max(end);
         self.compile_time_work_allowance = self
@@ -2274,6 +2353,40 @@ impl<S: SourceStore> UnitResolver<S> {
         if bytes {
             self.compile_time_byte_work_allowance =
                 self.compile_time_byte_work_allowance.saturating_add(cost);
+        }
+        true
+    }
+
+    /// Whether the full read of `source` by a unit or include lookup is
+    /// funded: the first time per distinct source in this request, crediting
+    /// the request what it cost. A provider scan reads only its interface and
+    /// is granted that prefix, but the lookup read the whole file (l4d-4nbs
+    /// R13). Later reads of the same source are paid.
+    fn credit_compile_time_load(
+        &mut self,
+        source: &LoadedSource,
+        work: usize,
+        bytes: usize,
+    ) -> bool {
+        let enabled = (
+            self.limits.compile_time_work_per_source_byte > 0,
+            self.limits.compile_time_byte_work_per_source_byte > 0,
+        );
+        if enabled == (false, false) {
+            return false;
+        }
+        let credit = self.compile_time_credit(source);
+        if credit.load {
+            return false;
+        }
+        credit.load = true;
+        if enabled.0 {
+            self.compile_time_work_allowance =
+                self.compile_time_work_allowance.saturating_add(work);
+        }
+        if enabled.1 {
+            self.compile_time_byte_work_allowance =
+                self.compile_time_byte_work_allowance.saturating_add(bytes);
         }
         true
     }
@@ -2521,12 +2634,21 @@ impl<S: SourceStore> UnitResolver<S> {
         let previous = std::mem::replace(&mut self.compile_time_route, route);
         let defaults = crate::compile_time::CompileTimeLimits::default();
         let aggregate = self.compile_time_usage();
+        // The session grants only bytes beyond the request's credit floor; a
+        // shape probe may already have credited the request for the bytes
+        // below it. Give the session that grant back so it is funded as a
+        // fresh session would be, still within the request remainder.
+        let floor = self.compile_time_credit_floor(root);
         let limits = crate::compile_time::CompileTimeLimits {
             max_work: defaults
                 .max_work
+                .saturating_add(floor.saturating_mul(self.limits.compile_time_work_per_source_byte))
                 .min(self.remaining_compile_time_work(aggregate)),
             max_byte_work: defaults
                 .max_byte_work
+                .saturating_add(
+                    floor.saturating_mul(self.limits.compile_time_byte_work_per_source_byte),
+                )
                 .min(self.remaining_compile_time_byte_work(aggregate)),
             // An explicit resolver retention selection must reach this session.
             // Default resolver construction still selects the core 1 MiB cap.
@@ -2899,11 +3021,12 @@ impl<S: SourceStore> UnitResolver<S> {
             package_lookups: 0,
             package_catalogue_count: 0,
             scanned_entries: 0,
-            scanned_bytes: 0,
             project_includes: Vec::new(),
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
+            shared_provider_graphs: None,
+            lookup_trace: None,
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
@@ -2927,6 +3050,17 @@ impl<S: SourceStore> UnitResolver<S> {
 
     /// Seed the resolution report with what constructing the context
     /// observed, so report consumers can revalidate those reads.
+    /// Share compiled provider interfaces through `store`, which must be bound
+    /// to this resolver's configuration (search paths, namespaces, read
+    /// policy) and validate what it returns (l4d-4nbs D29).
+    pub fn with_shared_provider_graphs(
+        mut self,
+        store: Arc<dyn crate::compile_time::SharedProviderGraphs>,
+    ) -> Self {
+        self.shared_provider_graphs = Some(store);
+        self
+    }
+
     pub fn with_context_observations(mut self, observations: &ProjectObservations) -> Self {
         for observation in &observations.metadata_observations {
             push_observation(
@@ -3999,15 +4133,22 @@ impl<S: SourceStore> UnitResolver<S> {
                         ResolverError::InvalidRequest("unit explicit sizing overflow".into())
                     })
             })?;
-        let reserve = paths
-            .saturating_mul(2)
-            .saturating_add(explicit.saturating_mul(2))
-            .saturating_add(names.saturating_mul(
-                self.context.search_path_entries().len()
-                    + self.context.browsing_path_entries().len()
-                    + 2,
-            ))
-            .saturating_add(request.requested_name.len().saturating_mul(8));
+        // The search and browsing entries are borrowed from a shared context
+        // handle, not copied (l4d-4nbs D19): only their sizing pass reads them.
+        // A typed lookup admits its tiers and the looked-up name's explicit
+        // paths where it copies them, so it reserves only the namespace copy.
+        let reserve = if self.compile_time_store.is_some() {
+            names.saturating_mul(2)
+        } else {
+            paths
+                .saturating_add(explicit.saturating_mul(2))
+                .saturating_add(names.saturating_mul(
+                    self.context.search_path_entries().len()
+                        + self.context.browsing_path_entries().len()
+                        + 2,
+                ))
+        }
+        .saturating_add(request.requested_name.len().saturating_mul(8));
         self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         let requested = request.requested_name.trim();
         if requested.is_empty() {
@@ -4145,15 +4286,15 @@ impl<S: SourceStore> UnitResolver<S> {
         {
             return Ok(result);
         }
-        let search_entries = self.context.search_path_entries().to_vec();
-        for entry in search_entries {
+        let context = Arc::clone(&self.context);
+        for entry in context.search_path_entries() {
             if let Some(result) = self.resolve_directory(
                 &entry.path,
                 &lookup,
                 &namespaces,
                 request.legacy_route,
                 cancel,
-                Some(&entry),
+                Some(entry),
                 requested,
             )? {
                 return Ok(result);
@@ -4164,14 +4305,14 @@ impl<S: SourceStore> UnitResolver<S> {
         // follow every project/client and selected-installation library path,
         // and missing explicit bindings were reserved above.
         if !skip_browsing {
-            for entry in self.context.browsing_path_entries().to_vec() {
+            for entry in context.browsing_path_entries() {
                 if let Some(result) = self.resolve_directory(
                     &entry.path,
                     &lookup,
                     &namespaces,
                     request.legacy_route,
                     cancel,
-                    Some(&entry),
+                    Some(entry),
                     requested,
                 )? {
                     return Ok(result);
@@ -4205,6 +4346,34 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
+    /// Record that a unit lookup consulted `directory`, with its stamp taken
+    /// before the lookup decided: a change after it proves nothing about the
+    /// lookup any more.
+    fn trace_lookup(
+        &mut self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        stamp: Option<ProjectReadStamp>,
+    ) {
+        let Some(trace) = self.lookup_trace.as_mut() else {
+            return;
+        };
+        if trace.iter().any(|(path, _, _)| path == directory) {
+            return;
+        }
+        trace.push((directory.to_path_buf(), entry.clone(), stamp));
+    }
+
+    /// The stamp of `directory` when lookups are traced and it is not traced
+    /// yet: a directory is stamped once, when first consulted.
+    fn untraced_stamp(&self, directory: &Path) -> Option<Option<ProjectReadStamp>> {
+        let trace = self.lookup_trace.as_ref()?;
+        if trace.iter().any(|(path, _, _)| path == directory) {
+            return None;
+        }
+        Some(pascal_project::path_stamp_result(directory).ok().flatten())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_directory(
         &mut self,
@@ -4216,6 +4385,21 @@ impl<S: SourceStore> UnitResolver<S> {
         provided_entry: Option<&ProjectPathEntry>,
         requested: &str,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        // A search entry the session's name index proves cannot hold the
+        // unit is skipped before any per-directory scratch (l4d-4nbs D19).
+        // Stamp before the index decides, as a listing stamps before it lists.
+        if self.compile_time_store.is_some()
+            && let Some(provided) = provided_entry
+        {
+            let stamp = self.untraced_stamp(directory);
+            if self.indexed_absent(directory, provided, unit_name, namespaces, cancel)? {
+                if let Some(stamp) = stamp {
+                    self.trace_lookup(directory, provided, stamp);
+                }
+                return Ok(None);
+            }
+        }
+        let indexed = provided_entry.map(|provided| (directory.to_path_buf(), provided.clone()));
         let bytes = directory.as_os_str().len().saturating_mul(8); // canonical directory/entry scratch remains a later boundary
         self.admit_lookup_storage(1, bytes, bytes, cancel)?;
         let directory = canonical_path(directory);
@@ -4230,7 +4414,15 @@ impl<S: SourceStore> UnitResolver<S> {
             path: directory.clone(),
             provenance: entry.provenance,
         };
+        if let Some(stamp) = self.untraced_stamp(&directory) {
+            self.trace_lookup(&directory, &entry, stamp);
+        }
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
+        if self.compile_time_store.is_some()
+            && let Some((path, provided)) = &indexed
+        {
+            self.index_directory(path, provided, &listing, cancel);
+        }
         if !listing.complete {
             return Ok(Some(Resolution::Incomplete {
                 reason: self.unit_reason_build(
@@ -4393,6 +4585,146 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         Ok(None)
+    }
+
+    /// Whether this session's name index proves that `directory` holds no
+    /// candidate for `unit_name` (l4d-4nbs D19): the directory is proven
+    /// unchanged since it was indexed (as for a reused listing), none of the
+    /// lookup's file names is in it and no overlay provides one there. A
+    /// lookup then costs a stat per directory it skips instead of a match
+    /// over its listing; the directories that may hold the unit are resolved
+    /// as before, in search order. Dotted names, which may live in nested
+    /// directories, are not indexed.
+    fn indexed_absent(
+        &self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        unit_name: &str,
+        namespaces: &[String],
+        cancel: &dyn CancellationToken,
+    ) -> Result<bool, ResolverError> {
+        if unit_name.contains('.') {
+            return Ok(false);
+        }
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let names = filename_tiers(unit_name, namespaces)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        budget
+            .charge(
+                names.len() + 2,
+                directory.as_os_str().len() + names.iter().map(String::len).sum::<usize>(),
+                0,
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+                return Ok(false);
+            }
+            let Some(slot) = cache
+                .search_index
+                .get(directory)
+                .filter(|slot| slot.entry == *entry)
+            else {
+                return Ok(false);
+            };
+            let current = path_stamp_result(directory).ok().flatten();
+            let unchanged = match (&slot.stamp, &current) {
+                (Some(stamp), Some(current)) => stamp.proves_unchanged(current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged
+                || names
+                    .iter()
+                    .any(|name| slot.names.contains(&name.to_ascii_lowercase()))
+            {
+                return Ok(false);
+            }
+        }
+        let overlays = self
+            .store
+            .overlay_candidates_admitted(&[directory.to_path_buf()], &names, &mut budget, cancel)
+            .map_err(root_store_error)?;
+        Ok(overlays.iter().all(|path| {
+            path.parent()
+                .is_none_or(|parent| !path_equivalent(parent, directory))
+        }))
+    }
+
+    /// Index the names of a complete listing of a settled (or absent)
+    /// directory for this session. Charged once per entry when the
+    /// directory is (re)indexed; refused retained bytes only stop indexing.
+    fn index_directory(
+        &self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        listing: &DirectoryListing,
+        cancel: &dyn CancellationToken,
+    ) {
+        if !listing.complete {
+            return;
+        }
+        let stamp = match &listing.stamp {
+            Some(stamp) if stamp.settled => Some(stamp.clone()),
+            None if listing.files.is_empty() && listing.directories.is_empty() => None,
+            _ => return,
+        };
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.value_mut();
+        if cache.reuse_policy.is_none() {
+            cache.reuse_policy = Some(self.context.read_policy().clone());
+        } else if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+            return;
+        }
+        if cache
+            .search_index
+            .get(directory)
+            .is_some_and(|slot| slot.stamp == stamp && slot.entry == *entry)
+        {
+            return;
+        }
+        let entries = listing.files.iter().chain(&listing.directories);
+        // The key, and a conservative share of the map's backing.
+        let mut bytes = 2 * directory.as_os_str().len() + 2 * size_of::<(PathBuf, SearchSlot)>();
+        entry
+            .visit_recovery_payload(&mut |n| {
+                bytes = bytes.saturating_add(n);
+                Ok(())
+            })
+            .expect("infallible size visitor");
+        let mut count = 0usize;
+        for path in entries.clone() {
+            count += 1;
+            bytes += path.file_name().map_or(0, |name| name.len()) + 2 * size_of::<String>();
+        }
+        let Ok(receipt) = budget.admit_owned(count + 1, bytes, bytes, || ()) else {
+            return;
+        };
+        let names = entries
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        cache.search_index.insert(
+            directory.to_path_buf(),
+            SearchSlot {
+                entry: entry.clone(),
+                stamp,
+                names,
+                _receipt: receipt,
+            },
+        );
     }
 
     fn explicit_structured_paths(
@@ -5578,18 +5910,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 .len()
                 .saturating_add(listing.directories.len()),
         );
-        self.scanned_bytes = self.scanned_bytes.saturating_add(
-            listing
-                .files
-                .iter()
-                .filter_map(|path| fs::symlink_metadata(path).ok())
-                .filter(|metadata| !metadata.file_type().is_symlink())
-                .map(|metadata| metadata.len() as usize)
-                .sum::<usize>(),
-        );
-        let complete = listing.complete
-            && self.scanned_entries <= self.limits.max_directory_entries
-            && self.scanned_bytes <= self.limits.max_scanned_bytes;
+        // A listing reads names only; the listed files' sizes are not
+        // scanned, so only entries count toward the request's scan limit.
+        let complete =
+            listing.complete && self.scanned_entries <= self.limits.max_directory_entries;
         let listing = DirectoryListing {
             complete,
             ..listing
@@ -5650,6 +5974,39 @@ impl<S: SourceStore> UnitResolver<S> {
                 canonical_path(directory)
             })
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        // Reuse this session's listing only while the directory is proven
+        // unchanged: its listing stamp was settled and equals a stamp taken
+        // now (`ProjectReadStamp::proves_unchanged`). A changed, unsettled or
+        // incomplete directory is listed again. The reused listing was
+        // charged, and counted against the entry limit, when it was read.
+        let mut probe_bytes = 2 * canonical.as_os_str().len();
+        entry
+            .visit_recovery_payload(&mut |n| {
+                probe_bytes = probe_bytes.saturating_add(n);
+                Ok(())
+            })
+            .map_err(ResolverError::InvalidRequest)?;
+        let probe = budget
+            .admit_owned(1, probe_bytes, probe_bytes, || DirectoryReuseKey {
+                path: path_identity::path_lookup_key(&canonical),
+                entry: entry.clone(),
+                missing_is_incomplete,
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        if let Some(listing) = self.reusable_directory(&probe, &canonical, &mut budget)? {
+            self.record_observation_build(
+                report_path_payload(&canonical, Some(entry)),
+                cancel,
+                || ResolutionObservation::Directory {
+                    path: (*canonical).clone(),
+                    entry: entry.clone(),
+                    stamp: listing.stamp.clone(),
+                    complete: true,
+                    listed: true,
+                },
+            )?;
+            return Ok(DirectoryAccess::Admitted(listing));
+        }
         let mut key_bytes = canonical
             .as_os_str()
             .len()
@@ -5679,8 +6036,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 })
                 .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
         );
-        // Typed lookups deliberately reread; do not replace freshness checks by
-        // a same-root map hit. Neither this request nor callbacks hold the lock.
+        // Neither this request nor callbacks hold the lock.
         let result = self.store.list_directory_admitted(
             DirectoryRequest {
                 directory: &canonical,
@@ -5716,18 +6072,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 .len()
                 .saturating_add(listing.directories.len()),
         );
-        self.scanned_bytes = self.scanned_bytes.saturating_add(
-            listing
-                .files
-                .iter()
-                .filter_map(|path| fs::symlink_metadata(path).ok())
-                .filter(|metadata| !metadata.file_type().is_symlink())
-                .map(|metadata| metadata.len() as usize)
-                .sum::<usize>(),
-        );
-        let complete = listing.complete
-            && self.scanned_entries <= self.limits.max_directory_entries
-            && self.scanned_bytes <= self.limits.max_scanned_bytes;
+        // A listing reads names only; the listed files' sizes are not
+        // scanned, so only entries count toward the request's scan limit.
+        let complete =
+            listing.complete && self.scanned_entries <= self.limits.max_directory_entries;
         listing.value_mut().complete = complete;
         self.record_observation_build(
             report_path_payload(&canonical, Some(entry)),
@@ -5753,20 +6101,90 @@ impl<S: SourceStore> UnitResolver<S> {
         let caller = listing
             .into_shared(&mut budget)
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-        if cacheable {
-            let cached = caller
-                .try_clone(&mut budget)
-                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-            let root = self
-                .compile_time_store
-                .as_ref()
-                .expect("typed directory call");
-            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .value_mut()
-                .insert_directory(key, cached, &mut budget)?;
+        if cacheable && complete {
+            // The cache is an optimization: when its retained bytes are not
+            // admitted, the listing is simply not kept.
+            if caller.stamp.as_ref().is_some_and(|stamp| stamp.settled)
+                && let Ok(reusable) = caller.try_clone(&mut budget)
+            {
+                let root = self
+                    .compile_time_store
+                    .as_ref()
+                    .expect("typed directory call");
+                let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                let policy = self.context.read_policy();
+                match cache.value_mut().insert_reusable(
+                    (*probe).clone(),
+                    policy,
+                    reusable,
+                    &mut budget,
+                ) {
+                    Ok(()) | Err(crate::compile_time::IncompleteReason::Limit { .. }) => {}
+                    Err(reason) => {
+                        return Err(crate::compile_time::resolver_error(reason, &budget));
+                    }
+                }
+            }
+            if let Ok(cached) = caller.try_clone(&mut budget) {
+                let root = self
+                    .compile_time_store
+                    .as_ref()
+                    .expect("typed directory call");
+                let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                match cache.value_mut().insert_directory(key, cached, &mut budget) {
+                    Ok(()) => {}
+                    Err(ResolverError::LimitExceeded {
+                        limit: "max_retained_bytes",
+                        ..
+                    }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(DirectoryAccess::Admitted(caller))
+    }
+
+    /// This session's listing of `canonical`, if its directory is proven
+    /// unchanged since it was listed.
+    fn reusable_directory(
+        &self,
+        probe: &DirectoryReuseKey,
+        canonical: &Path,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Option<AdmittedShared<DirectoryListing>>, ResolverError> {
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed directory call");
+        budget
+            .charge(8, 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let cached = {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.reuse_policy.as_ref() != Some(self.context.read_policy()) {
+                return Ok(None);
+            }
+            match cache.reuse.get(probe) {
+                Some((_, listing)) if listing.complete && listing.is_admitted_by(budget) => {
+                    let Some(stamp) = listing.stamp.clone() else {
+                        return Ok(None);
+                    };
+                    match listing.try_clone(budget) {
+                        Ok(listing) => (listing, stamp),
+                        Err(_) => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        };
+        // One stat of the directory instead of a listing of its entries.
+        budget
+            .charge(1, canonical.as_os_str().len(), 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let current = path_stamp_result(canonical).ok().flatten();
+        Ok(current
+            .is_some_and(|current| cached.1.proves_unchanged(&current))
+            .then_some(cached.0))
     }
 
     fn load_candidate(
@@ -5843,7 +6261,12 @@ impl<S: SourceStore> UnitResolver<S> {
             kind,
             max_bytes,
         };
-        let mut loaded = if let Some(mut budget) = self.store_budget(cancel) {
+        let reused = self.reusable_loaded(&path, &entry, stamp.as_ref(), max_bytes, cancel)?;
+        let fresh_read = reused.is_none();
+        let before_load = self.store_budget(cancel).map(|budget| budget.snapshot());
+        let mut loaded = if let Some(reused) = reused {
+            reused
+        } else if let Some(mut budget) = self.store_budget(cancel) {
             self.store.load_admitted(request, &mut budget, cancel)?
         } else {
             self.store.load(request, cancel)?
@@ -5869,6 +6292,21 @@ impl<S: SourceStore> UnitResolver<S> {
         let prepared_cache = if let Some(mut budget) = self.store_budget(cancel) {
             let cached = loaded.admitted_copy(&mut budget)?;
             let key = loaded_cache_key(&loaded.id, &mut budget)?;
+            // The read, decode and copy are proportional to the whole file,
+            // which a lookup must read: funded once per distinct source.
+            if let Some(before) = before_load {
+                let after = budget.snapshot();
+                let work = after.work.saturating_sub(before.work);
+                let bytes = after.byte_work.saturating_sub(before.byte_work);
+                if self.credit_compile_time_load(&loaded, work, bytes) {
+                    budget
+                        .fund_charged(work, bytes)
+                        .map_err(|r| store_admission_error(r, &budget))?;
+                }
+            }
+            if fresh_read {
+                self.keep_read(&loaded, &mut budget);
+            }
             Some((key, cached))
         } else {
             None
@@ -5948,6 +6386,74 @@ impl<S: SourceStore> UnitResolver<S> {
             loaded,
             cached: prepared_cache,
         })
+    }
+
+    /// This session's read of `path`, if the file is proven unchanged since
+    /// (its settled read stamp equals `current`) and it was read through the
+    /// same entry and read policy (l4d-4nbs R13). Another lookup of the same
+    /// unit then shares the payload instead of reading the file again.
+    fn reusable_loaded(
+        &self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        current: Option<&ProjectReadStamp>,
+        max_bytes: usize,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Option<LoadedSource>, SourceStoreError> {
+        let (Some(current), Some(root)) = (current, self.compile_time_store.as_ref()) else {
+            return Ok(None);
+        };
+        let mut budget = root.view.store_budget(root.limits, cancel);
+        let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        budget
+            .charge(cache.reads.len() + 1, 0, 0)
+            .map_err(|r| store_admission_error(r, &budget))?;
+        let Some(source) = cache.reads.iter().find(|source| {
+            source.path == path
+                && source.bytes.len() <= max_bytes
+                && matches!(
+                    &source.revision,
+                    SourceRevision::Disk { stamp, read_policy, path_entry, .. }
+                        if stamp.proves_unchanged(current)
+                            && path_entry == entry
+                            && read_policy == self.context.read_policy()
+                )
+        }) else {
+            return Ok(None);
+        };
+        // A copy this budget cannot admit is simply read again.
+        Ok(source.admitted_copy(&mut budget).ok())
+    }
+
+    /// Keep a settled disk read for reuse within the session. Refused
+    /// retained bytes only stop caching.
+    fn keep_read(&self, loaded: &LoadedSource, budget: &mut CompileTimeBudget<'_>) {
+        let (Some(root), SourceRevision::Disk { stamp, .. }) =
+            (self.compile_time_store.as_ref(), &loaded.revision)
+        else {
+            return;
+        };
+        if !stamp.settled {
+            return;
+        }
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.value_mut();
+        if cache.reads.len() == cache.reads.capacity() {
+            let count = (cache.reads.len() + 1).next_power_of_two().max(4);
+            let Ok(capacity) =
+                budget.admit_owned(1, 0, count * std::mem::size_of::<LoadedSource>(), || ())
+            else {
+                return;
+            };
+            cache.reads.reserve_exact(count - cache.reads.len());
+            cache.reads_capacity = Some(capacity);
+        }
+        if let Ok(copy) = loaded.admitted_copy(budget) {
+            cache
+                .reads
+                .retain(|read| !(read.path == loaded.path && read.revision == loaded.revision));
+            cache.reads.push(copy);
+        }
     }
 
     fn source_request_scratch(
@@ -7913,6 +8419,33 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     fn fund_validation(&mut self, source: &LoadedSource) -> bool {
         self.credit_compile_time_validation(source)
     }
+    fn shared_provider_graphs(&self) -> Option<Arc<dyn crate::compile_time::SharedProviderGraphs>> {
+        self.shared_provider_graphs.clone()
+    }
+    fn reused_credit_floor(&mut self, source: &SourceId, revision: &SourceRevision) -> usize {
+        self.compile_time_credit_floor_of(source, revision)
+    }
+    fn note_reused_scan(&mut self, source: &SourceId, revision: &SourceRevision, end: usize) {
+        self.credit_compile_time_scan_of(source, revision, end);
+    }
+    fn trace_unit_lookups(&mut self, start: bool) -> Vec<ResolutionObservation> {
+        if start {
+            self.lookup_trace = Some(Vec::new());
+            return Vec::new();
+        }
+        self.lookup_trace
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, entry, stamp)| ResolutionObservation::Directory {
+                path,
+                entry,
+                complete: true,
+                listed: true,
+                stamp,
+            })
+            .collect()
+    }
     fn include_capability(
         &mut self,
         request: IncludeResolveRequest<'_>,
@@ -8355,6 +8888,24 @@ impl<T> std::ops::Deref for LookupScratch<T> {
             Self::Admitted(value) => value,
         }
     }
+}
+
+/// The names one search directory held when it was indexed.
+struct SearchSlot {
+    entry: ProjectPathEntry,
+    stamp: Option<ProjectReadStamp>,
+    names: HashSet<String>,
+    _receipt: AdmittedOwned<()>,
+}
+
+/// A session listing reuse key. The session's read policy is constant and
+/// checked once (`StoreCache::reuse_policy`), so a reuse probe does not clone
+/// it per lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectoryReuseKey {
+    path: PathBuf,
+    entry: ProjectPathEntry,
+    missing_is_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -9884,6 +10435,7 @@ fn path_equivalent_ignore_case(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn admission_root(text: &str) -> ResolvedUnit {
         ResolvedUnit {
@@ -10416,6 +10968,95 @@ mod tests {
             Default::default(),
         );
         (dir, root, resolver)
+    }
+
+    /// l4d-4nbs final round (4): a traced lookup stamps each directory it
+    /// consults once; the importer's directory, also a search entry, is not
+    /// stamped again.
+    #[test]
+    fn a_traced_lookup_stamps_each_directory_once() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let stamps = |trace: bool| {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let scope = TestScope::new();
+            if trace {
+                resolver.trace_unit_lookups(true);
+            }
+            let outcome = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        requested_name: "Missing",
+                        importer_path: &root,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(!matches!(outcome.result(), Resolution::Found(_)));
+            let traced = resolver.trace_unit_lookups(false).len();
+            (
+                scope.snapshot().counts[Metric::ProjectStampProbes as usize],
+                traced,
+            )
+        };
+        let (untraced, _) = stamps(false);
+        let (traced, directories) = stamps(true);
+        assert_eq!(directories, 1, "one directory consulted");
+        assert_eq!(
+            traced - untraced,
+            directories as u64,
+            "one stamp per traced directory"
+        );
+    }
+
+    /// l4d-4nbs R13: a file read through two entries (provenances) in
+    /// alternation is read once per entry: the session keeps each read,
+    /// not only the latest read of the source.
+    #[test]
+    fn alternating_entries_reuse_each_read() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        pascal_project::backdate_for_test(&path);
+        let configured = ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::Configured,
+        };
+        let legacy = ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let mut read = |entry: &ProjectPathEntry| {
+            call.load_candidate_with_limit(
+                &path,
+                entry,
+                None,
+                SourceKind::Unit,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap()
+        };
+        let first = read(&configured);
+        let second = read(&legacy);
+        let third = read(&configured);
+        let fourth = read(&legacy);
+        assert_ne!(first.revision, second.revision, "two entries");
+        assert_eq!(
+            first.bytes.as_ptr(),
+            third.bytes.as_ptr(),
+            "configured read reused"
+        );
+        assert_eq!(
+            second.bytes.as_ptr(),
+            fourth.bytes.as_ptr(),
+            "legacy read reused"
+        );
     }
 
     #[test]
@@ -12608,27 +13249,33 @@ mod tests {
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
             (spent.work, peak)
         }
-        let (work, peak) = run(CompileTimeLimits::default(), false);
+        // Fixed limits: a funded read (l4d-4nbs R13) would raise the cap.
+        let fixed = CompileTimeLimits {
+            work_per_source_byte: 0,
+            byte_work_per_source_byte: 0,
+            ..CompileTimeLimits::default()
+        };
+        let (work, peak) = run(fixed, false);
         // Full three-entry receivers: seen preparation spends 2 hash + 3
         // sizing + 4 construction units after loaded preparation completes.
         run(
             CompileTimeLimits {
                 max_work: work - 10,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
         run(
             CompileTimeLimits {
                 max_work: work - 1,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
         run(
             CompileTimeLimits {
                 max_retained_bytes: peak - 1,
-                ..Default::default()
+                ..fixed
             },
             true,
         );
@@ -14468,13 +15115,19 @@ mod tests {
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
             (spent.work, peak)
         }
+        // Fixed limits: a funded read (l4d-4nbs R13) would raise the cap.
+        let fixed = CompileTimeLimits {
+            work_per_source_byte: 0,
+            byte_work_per_source_byte: 0,
+            ..CompileTimeLimits::default()
+        };
         for growth in [false, true] {
-            let (work, peak) = run(growth, CompileTimeLimits::default(), false, true);
+            let (work, peak) = run(growth, fixed, false, true);
             run(
                 growth,
                 CompileTimeLimits {
                     max_work: work - 1,
-                    ..Default::default()
+                    ..fixed
                 },
                 true,
                 true,
@@ -14486,7 +15139,7 @@ mod tests {
                     false,
                     CompileTimeLimits {
                         max_work: work - 4,
-                        ..Default::default()
+                        ..fixed
                     },
                     true,
                     false,
@@ -14497,7 +15150,7 @@ mod tests {
                     growth,
                     CompileTimeLimits {
                         max_retained_bytes: peak - 1,
-                        ..Default::default()
+                        ..fixed
                     },
                     true,
                     true,
@@ -18428,6 +19081,22 @@ mod tests {
                 Ok(caller) => {
                     callers.push(caller);
                     let mut cache = root_cache.view.lock().unwrap();
+                    if cache.directories.len() == 3 {
+                        // l4d-4nbs R13: a refused map growth only stops
+                        // caching; the lookup itself succeeds and the old
+                        // backing and entries are preserved.
+                        assert_eq!(cache.directories.capacity(), old_capacity);
+                        assert!(cache.directory_capacity.is_some());
+                        for caller in &callers[..3] {
+                            assert!(
+                                cache
+                                    .directories
+                                    .values()
+                                    .any(|v| v.files.as_ptr() == caller.files.as_ptr())
+                            );
+                        }
+                        continue;
+                    }
                     assert_eq!(cache.directories.len(), 4);
                     assert_eq!(cache.directories.capacity(), 7);
                     for caller in &callers {

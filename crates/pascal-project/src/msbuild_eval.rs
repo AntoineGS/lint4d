@@ -14,6 +14,10 @@ pub(super) struct ProjectBuilder {
     pub(super) configured_ranges: HashMap<String, Vec<Range<usize>>>,
     pub(super) property_provenance_ranges: HashMap<String, Vec<ProvenanceRange>>,
     pub(super) property_default_provenances: HashMap<String, ProjectPathProvenance>,
+    /// Offsets in each property's value where an undefined property took the
+    /// MSBuild empty default, carried through later references (D43: a path
+    /// built on one is not evidence of what the project names).
+    pub(super) property_empty_expansions: HashMap<String, Vec<usize>>,
     pub(super) configured_properties: HashSet<String>,
     global_properties: HashSet<String>,
     pub(super) overrides: EffectiveOverrides,
@@ -28,6 +32,12 @@ pub(super) struct ProjectBuilder {
     pub(super) path_issues: Vec<ProjectPathIssue>,
     pub(super) warnings: Vec<String>,
     pub(super) incomplete: bool,
+    /// Properties an element that was not evaluated (an unknown condition,
+    /// an unknown value, a value over budget) could have assigned. Imports
+    /// that were not evaluated are covered by [`Self::undefined_is_empty`].
+    pub(super) unevaluated_assignments: HashSet<String>,
+    /// Incompleteness that may have hidden any property.
+    pub(super) unbounded_incomplete: bool,
     active_imports: HashSet<PathBuf>,
     import_count: usize,
     pub(super) project_dir: PathBuf,
@@ -140,6 +150,7 @@ impl ProjectBuilder {
             configured_ranges,
             property_provenance_ranges,
             property_default_provenances,
+            property_empty_expansions: HashMap::new(),
             configured_properties,
             global_properties,
             overrides: overrides.clone(),
@@ -151,6 +162,8 @@ impl ProjectBuilder {
             path_issues: Vec::new(),
             warnings,
             incomplete,
+            unevaluated_assignments: HashSet::new(),
+            unbounded_incomplete: incomplete,
             active_imports: HashSet::new(),
             import_count: 0,
             project_dir,
@@ -266,6 +279,34 @@ impl ProjectBuilder {
             &default_provenance,
         ));
         result
+    }
+
+    /// For each item of the `;`-separated list property `name`, in the order
+    /// of [`Self::property_list_with_provenance`], whether it holds an
+    /// undefined property's empty expansion.
+    pub(super) fn property_list_empty_expansion_flags(&self, name: &str) -> Vec<bool> {
+        let Some(value) = self.property(name) else {
+            return Vec::new();
+        };
+        let points = self
+            .property_empty_expansions
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut bounds = value
+            .match_indices(';')
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        bounds.push(value.len());
+        let mut start = 0;
+        bounds
+            .into_iter()
+            .map(|end| {
+                let flagged = points.iter().any(|point| start <= *point && *point <= end);
+                start = end + 1;
+                flagged
+            })
+            .collect()
     }
 
     /// `bootstrap` is the descriptor payload discovery already read, if any.
@@ -390,6 +431,8 @@ impl ProjectBuilder {
             TruthValue::Unknown => {
                 self.incomplete = true;
                 for property in group.properties {
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                 }
                 return;
@@ -415,6 +458,8 @@ impl ProjectBuilder {
                 TruthValue::False => continue,
                 TruthValue::Unknown => {
                     self.incomplete = true;
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                     continue;
                 }
@@ -434,6 +479,7 @@ impl ProjectBuilder {
                 &self.configured_properties,
                 &self.property_provenance_ranges,
                 &self.property_default_provenances,
+                &self.property_empty_expansions,
                 &self.unknown_properties,
                 self.undefined_is_empty(),
                 &mut self.warnings,
@@ -447,6 +493,12 @@ impl ProjectBuilder {
                 trim_ranges(&value.configured_ranges, trim_start, trimmed.len());
             let provenance_ranges =
                 trim_provenance_ranges(&value.provenance_ranges, trim_start, trimmed.len());
+            let empty_expansions = value
+                .empty_expansions
+                .iter()
+                .filter(|point| **point >= trim_start && **point - trim_start <= trimmed.len())
+                .map(|point| point - trim_start)
+                .collect::<Vec<_>>();
             self.set_property(
                 &property.name,
                 trimmed.to_string(),
@@ -457,6 +509,15 @@ impl ProjectBuilder {
                 source_provenance,
                 source_file,
             );
+            let key = property.name.to_ascii_lowercase();
+            if value.undefined_property_unknown {
+                self.unevaluated_assignments.insert(key.clone());
+            }
+            if !empty_expansions.is_empty()
+                && self.properties.get(&key).map(String::as_str) == Some(trimmed)
+            {
+                self.property_empty_expansions.insert(key, empty_expansions);
+            }
         }
     }
 
@@ -483,6 +544,8 @@ impl ProjectBuilder {
             .saturating_add(value.len());
         if new_bytes > MAX_TOTAL_PROPERTY_BYTES {
             self.incomplete = true;
+            self.unevaluated_assignments.insert(key.clone());
+            self.unknown_properties.insert(key.clone());
             self.warnings.push(format!(
                 "property memory budget exceeded while evaluating {name} in {}; value ignored",
                 source_file.display()
@@ -490,10 +553,14 @@ impl ProjectBuilder {
             return;
         }
         self.property_bytes = new_bytes;
+        self.property_empty_expansions.remove(&key);
         if unknown || value.contains(UNRESOLVED_MARKER) {
             self.unknown_properties.insert(key.clone());
         } else {
+            // A later definite assignment replaces whatever an earlier
+            // unevaluated element could have assigned.
             self.unknown_properties.remove(&key);
+            self.unevaluated_assignments.remove(&key);
         }
         if explicit_dependency {
             self.configured_properties.insert(key.clone());
@@ -549,6 +616,7 @@ impl ProjectBuilder {
                 .insert(key.clone(), UNRESOLVED_MARKER.to_string());
             self.configured_ranges.remove(&key);
             self.property_provenance_ranges.remove(&key);
+            self.property_empty_expansions.remove(&key);
             self.unknown_properties.insert(key);
         }
     }
@@ -657,6 +725,7 @@ impl ProjectBuilder {
             &self.configured_properties,
             &self.property_provenance_ranges,
             &self.property_default_provenances,
+            &self.property_empty_expansions,
             &self.unknown_properties,
             self.undefined_is_empty(),
             &mut self.warnings,
@@ -871,6 +940,11 @@ enum FrameKind {
         operation: usize,
         condition: Option<String>,
     },
+    /// `Choose`: `branches` holds the conditions of the `When`s seen so far.
+    Choose {
+        condition: Option<String>,
+        branches: Vec<String>,
+    },
     Property {
         operation: usize,
         condition: Option<String>,
@@ -883,6 +957,7 @@ impl FrameKind {
     fn condition(&self) -> Option<&str> {
         match self {
             Self::Other { condition, .. }
+            | Self::Choose { condition, .. }
             | Self::PropertyGroup { condition, .. }
             | Self::Property { condition, .. } => condition.as_deref(),
         }
@@ -891,7 +966,7 @@ impl FrameKind {
     fn in_target(&self) -> bool {
         match self {
             Self::Other { in_target, .. } | Self::Property { in_target, .. } => *in_target,
-            Self::PropertyGroup { .. } => false,
+            Self::PropertyGroup { .. } | Self::Choose { .. } => false,
         }
     }
 }
@@ -944,6 +1019,63 @@ pub(super) fn parse_xml_operations(
                         kind: FrameKind::Other {
                             condition: effective_condition,
                             in_target: true,
+                        },
+                        text: String::new(),
+                    });
+                } else if name.eq_ignore_ascii_case("choose") {
+                    frames.push(XmlFrame {
+                        kind: FrameKind::Choose {
+                            condition: effective_condition,
+                            branches: Vec::new(),
+                        },
+                        text: String::new(),
+                    });
+                } else if (name.eq_ignore_ascii_case("when")
+                    || name.eq_ignore_ascii_case("otherwise"))
+                    && matches!(
+                        frames.last().map(|frame| &frame.kind),
+                        Some(FrameKind::Choose { .. })
+                    )
+                {
+                    // MSBuild applies the first `When` whose condition holds,
+                    // else `Otherwise`: each branch is guarded by the
+                    // negation of every earlier `When`.
+                    let is_when = name.eq_ignore_ascii_case("when");
+                    let Some(XmlFrame {
+                        kind:
+                            FrameKind::Choose {
+                                condition,
+                                branches,
+                            },
+                        ..
+                    }) = frames.last_mut()
+                    else {
+                        unreachable!("the parent frame was just matched as a Choose");
+                    };
+                    let mut guard = branches
+                        .iter()
+                        .map(|earlier| format!("!({earlier})"))
+                        .collect::<Vec<_>>()
+                        .join(" And ");
+                    if is_when {
+                        let own = own_condition
+                            .clone()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "'1'=='1'".to_string());
+                        if !guard.is_empty() {
+                            guard.push_str(" And ");
+                        }
+                        guard.push_str(&format!("({own})"));
+                        branches.push(own);
+                    }
+                    let branch_condition = combine_conditions(
+                        condition.as_deref(),
+                        Some(guard.as_str()).filter(|value| !value.is_empty()),
+                    );
+                    frames.push(XmlFrame {
+                        kind: FrameKind::Other {
+                            condition: branch_condition,
+                            in_target: false,
                         },
                         text: String::new(),
                     });
@@ -1191,6 +1323,8 @@ pub(super) struct ExpandedValue {
     /// [`ProjectBuilder::undefined_is_empty`]), so the value is unknowable
     /// and the project context is incomplete.
     pub(super) undefined_property_unknown: bool,
+    /// Offsets in `value` where an undefined property expanded to empty.
+    pub(super) empty_expansions: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1202,12 +1336,14 @@ pub(super) fn expand_value(
     configured_properties: &HashSet<String>,
     property_provenance_ranges: &HashMap<String, Vec<ProvenanceRange>>,
     property_default_provenances: &HashMap<String, ProjectPathProvenance>,
+    property_empty_expansions: &HashMap<String, Vec<usize>>,
     unknown_properties: &HashSet<String>,
     undefined_is_empty: bool,
     warnings: &mut Vec<String>,
     source_file: &Path,
     source_provenance: &ProjectPathProvenance,
 ) -> ExpandedValue {
+    let mut empty_expansions = Vec::new();
     let mut expanded = String::new();
     let mut unknown = false;
     let mut undefined_property_unknown = false;
@@ -1232,6 +1368,7 @@ pub(super) fn expand_value(
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
                 undefined_property_unknown,
+                empty_expansions: Vec::new(),
             };
         }
         let Some(relative_end) = value[start + 2..].find(')') else {
@@ -1246,6 +1383,7 @@ pub(super) fn expand_value(
                 configured_ranges: Vec::new(),
                 provenance_ranges: Vec::new(),
                 undefined_property_unknown,
+                empty_expansions: Vec::new(),
             };
         };
         let end = start + 2 + relative_end;
@@ -1275,6 +1413,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
         } else if let Some(replacement) = properties.get(&key) {
@@ -1287,6 +1426,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
             let replacement_end = expanded.len();
@@ -1315,6 +1455,14 @@ pub(super) fn expand_value(
                     provenance: provenance.clone(),
                 });
             }
+            if let Some(points) = property_empty_expansions.get(&key) {
+                empty_expansions.extend(
+                    points
+                        .iter()
+                        .filter(|point| **point <= replacement.len())
+                        .map(|point| replacement_start + point),
+                );
+            }
             if let Some(ranges) = property_ranges.get(&key) {
                 for range in ranges {
                     if range.start < range.end && range.end <= replacement.len() {
@@ -1336,6 +1484,7 @@ pub(super) fn expand_value(
         } else if undefined_is_empty && !is_environment_provided_property(name) {
             // MSBuild expands an undefined property to the empty string.
             push_undefined_property_warning(warnings, name, source_file);
+            empty_expansions.push(expanded.len());
         } else {
             warnings.push(format!(
                 "unresolved property path $({name}) in {}",
@@ -1356,6 +1505,7 @@ pub(super) fn expand_value(
                     configured_ranges: Vec::new(),
                     provenance_ranges: Vec::new(),
                     undefined_property_unknown,
+                    empty_expansions: Vec::new(),
                 };
             }
         }
@@ -1376,6 +1526,7 @@ pub(super) fn expand_value(
             configured_ranges: Vec::new(),
             provenance_ranges: Vec::new(),
             undefined_property_unknown,
+            empty_expansions: Vec::new(),
         };
     }
     ExpandedValue {
@@ -1385,6 +1536,7 @@ pub(super) fn expand_value(
         configured_ranges,
         provenance_ranges,
         undefined_property_unknown,
+        empty_expansions,
     }
 }
 
@@ -1744,6 +1896,14 @@ impl TruthValue {
         }
     }
 
+    pub(super) fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
     pub(super) fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::True, _) | (_, Self::True) => Self::True,
@@ -1762,6 +1922,7 @@ enum ConditionToken {
     LeftParen,
     RightParen,
     Comma,
+    Bang,
 }
 
 fn tokenize_condition(condition: &str) -> Result<Vec<ConditionToken>, String> {
@@ -1787,6 +1948,10 @@ fn tokenize_condition(condition: &str) -> Result<Vec<ConditionToken>, String> {
             continue;
         }
         match first {
+            '!' => {
+                tokens.push(ConditionToken::Bang);
+                cursor += 1;
+            }
             '(' => {
                 tokens.push(ConditionToken::LeftParen);
                 cursor += 1;
@@ -1887,6 +2052,9 @@ impl ConditionParser<'_> {
     }
 
     fn parse_primary(&mut self) -> Result<TruthValue, String> {
+        if self.take_token(|token| matches!(token, ConditionToken::Bang)) {
+            return Ok(self.parse_primary()?.not());
+        }
         if self.take_token(|token| matches!(token, ConditionToken::LeftParen)) {
             let value = self.parse_or()?;
             if !self.take_token(|token| matches!(token, ConditionToken::RightParen)) {

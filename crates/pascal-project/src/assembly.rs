@@ -14,6 +14,7 @@ use super::msbuild_eval::{
 };
 use super::packages::parse_explicit_unit_paths;
 use super::selection::{is_deleted_path, relevant_workspace_root, standalone_overrides};
+use super::switches::SwitchFacts;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -385,6 +386,7 @@ pub(super) fn build_project_context(
     let mut rtl_constants_override = None;
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
+    let mut installation_failed = false;
     let mut ide_path_warnings = Vec::new();
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
@@ -480,6 +482,7 @@ pub(super) fn build_project_context(
                         installation_environment = Some(environment);
                     }
                     Err(error) => {
+                        installation_failed = true;
                         installation_warnings.push(error);
                     }
                 }
@@ -494,6 +497,7 @@ pub(super) fn build_project_context(
                 }
             }
             Err(error) => {
+                installation_failed = true;
                 installation_warnings.push(error);
             }
         }
@@ -598,8 +602,30 @@ pub(super) fn build_project_context(
     let option_base = relevant_workspace_root(file, roots)
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| project_dir.clone());
-    for (item, provenance) in builder.property_list_with_provenance("dcc_unitsearchpath") {
+    // D43: the directories the project names as its own leave out entries
+    // built on an undefined property's empty expansion.
+    let mut own_entries = vec![ProjectPathEntry::legacy(project_dir.clone())];
+    let mut unit_directories_unknown = false;
+    let empty_expansion_flags = builder.property_list_empty_expansion_flags("dcc_unitsearchpath");
+    for (index, (item, provenance)) in builder
+        .property_list_with_provenance("dcc_unitsearchpath")
+        .into_iter()
+        .enumerate()
+    {
         check_project_scan_cancel(cancel)?;
+        if empty_expansion_flags.get(index).copied().unwrap_or(false) {
+            unit_directories_unknown |= !item.trim().is_empty();
+        } else {
+            add_resolved_search_path_entry(
+                &item,
+                &project_dir,
+                &builder.overrides,
+                &mut own_entries,
+                &mut Vec::new(),
+                "DCC_UnitSearchPath",
+                provenance.clone(),
+            );
+        }
         add_resolved_search_path_entry(
             &item,
             &project_dir,
@@ -609,6 +635,16 @@ pub(super) fn build_project_context(
             "DCC_UnitSearchPath",
             provenance,
         );
+    }
+    let mut project_unit_directories = paths_from_entries(&own_entries);
+    if let Some(directory) = main_source_entry
+        .as_ref()
+        .and_then(|entry| entry.path.parent())
+        && !project_unit_directories
+            .iter()
+            .any(|existing| project_paths_equal(existing, directory))
+    {
+        project_unit_directories.push(directory.to_path_buf());
     }
     for item in &options.source_paths {
         check_project_scan_cancel(cancel)?;
@@ -680,6 +716,7 @@ pub(super) fn build_project_context(
             &builder.configured_properties,
             &builder.property_provenance_ranges,
             &builder.property_default_provenances,
+            &builder.property_empty_expansions,
             &builder.unknown_properties,
             builder.undefined_is_empty(),
             &mut builder.warnings,
@@ -811,6 +848,7 @@ pub(super) fn build_project_context(
     } else {
         ConditionalFact::Unknown
     };
+    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     let mut conditional_warnings = Vec::new();
     let mut conditional_context = merge_project_conditional_context(
         &evaluation_options,
@@ -819,8 +857,21 @@ pub(super) fn build_project_context(
         &mut conditional_warnings,
     );
     builder.warnings.extend(conditional_warnings);
+    let switch_facts = SwitchFacts::evaluate(
+        &builder,
+        installation_environment
+            .as_ref()
+            .map(|environment| &environment.properties),
+        crate::switches::defaults_known(
+            installation_selection.as_ref(),
+            installation_failed,
+            target_platform.as_ref(),
+            builder.unknown_properties.contains("platform"),
+            conditional_context.compiler_version,
+        ),
+    );
+    switch_facts.apply_project(&mut conditional_context);
 
-    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
         target_platform.as_ref(),
@@ -866,6 +917,7 @@ pub(super) fn build_project_context(
         rtl_constants.as_deref(),
     );
     library_conditional_context.absent_define = ConditionalFact::Unknown;
+    switch_facts.apply_library(&mut library_conditional_context);
 
     let metadata_observations = complete_metadata_observations(
         &metadata_files,
@@ -982,6 +1034,8 @@ pub(super) fn build_project_context(
             installation_evidence: installation_evidence.clone(),
             installation_selection,
             project_source_roots,
+            project_unit_directories,
+            unit_directories_unknown,
             search_path_entries,
             browsing_path_entries: ide_paths.browsing,
             debug_dcu_path_entries: ide_paths.debug_dcu,
@@ -1116,6 +1170,8 @@ fn build_standalone_context(
             installation_evidence: InstallationEvidence::default(),
             installation_selection: None,
             project_source_roots,
+            project_unit_directories: Vec::new(),
+            unit_directories_unknown: false,
             search_path_entries,
             browsing_path_entries: Vec::new(),
             debug_dcu_path_entries: Vec::new(),
@@ -1470,24 +1526,11 @@ fn merge_project_conditional_context(
         }
     }
 
-    // These are the bounded project-property spellings with stable Delphi
-    // IFOPT aliases.  Unknown properties are intentionally not guessed.
-    const OPTION_PROPERTIES: &[(&str, &str)] = &[
-        ("dcc_rangechecks", "R"),
-        ("dcc_overflowchecks", "Q"),
-        ("dcc_optimization", "O"),
-        ("dcc_assertions", "C"),
-        ("dcc_runtimechecks", "RUNTIME_CHECKS"),
-        ("dcc_debuginformation", "D"),
-    ];
-    for (property, canonical) in OPTION_PROPERTIES {
-        let Some(raw) = builder.property(property) else {
-            continue;
-        };
+    if let Some(raw) = builder.property("dcc_runtimechecks")
+        && !context.options.contains_key("RUNTIME_CHECKS")
+    {
         let value = parse_conditional_fact(&raw).unwrap_or(ConditionalFact::Unknown);
-        if !context.options.contains_key(*canonical) {
-            context.set_option(canonical, value);
-        }
+        context.set_option("RUNTIME_CHECKS", value);
     }
     context
 }

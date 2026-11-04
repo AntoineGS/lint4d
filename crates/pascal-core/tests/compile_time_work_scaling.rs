@@ -18,37 +18,66 @@ fn resolver_with(
     std::path::PathBuf,
     UnitResolver<FilesystemSourceStore>,
 ) {
+    resolver_retaining(root, files, 64 * 1024 * 1024)
+}
+
+fn resolver_retaining(
+    root: &str,
+    files: &[(&str, &str)],
+    retained: usize,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    UnitResolver<FilesystemSourceStore>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("T.pas");
     std::fs::write(&path, root).unwrap();
     for (name, text) in files {
         std::fs::write(dir.path().join(name), text).unwrap();
     }
-    let mut ctx = ProjectContext::discover(&path, &[dir.path().into()], &ProjectOptions::default())
+    let resolver = resolver_in(dir.path(), &path, retained);
+    (dir, path, resolver)
+}
+
+/// A new request's resolver over the files of `dir`.
+fn resolver_in(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    retained: usize,
+) -> UnitResolver<FilesystemSourceStore> {
+    let mut ctx = ProjectContext::discover(path, &[dir.into()], &ProjectOptions::default())
         .unwrap()
         .context;
     let mut parts = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut ctx)).into_parts();
     parts.conditional_context = context(LayoutPlatform::Win32);
     ctx = ProjectContext::from_parts(parts).into();
-    let resolver = UnitResolver::new(
+    UnitResolver::new(
         ctx,
-        vec![dir.path().into()],
+        vec![dir.into()],
         FilesystemSourceStore::new(),
         ResolverLimits {
             max_source_bytes: 16 * 1024 * 1024,
             // The LSP selects a retention cap derived from its file limits.
-            max_compile_time_retained_bytes: 64 * 1024 * 1024,
+            max_compile_time_retained_bytes: retained,
             ..ResolverLimits::default()
         },
-    );
-    (dir, path, resolver)
+    )
 }
 
 fn analyze_with(
     text: &str,
     files: &[(&str, &str)],
 ) -> (Result<bool, ResolverError>, BudgetSnapshot) {
-    let (_dir, path, mut resolver) = resolver_with(text, files);
+    analyze_retaining(text, files, 64 * 1024 * 1024)
+}
+
+fn analyze_retaining(
+    text: &str,
+    files: &[(&str, &str)],
+    retained: usize,
+) -> (Result<bool, ResolverError>, BudgetSnapshot) {
+    let (_dir, path, mut resolver) = resolver_retaining(text, files, retained);
     let mut source = support::loaded("T.pas", text);
     source.path = path;
     let result = resolver
@@ -474,4 +503,281 @@ fn repeated_includes_through_a_default_hook_adapter_credit_once_per_session() {
             .as_ref()
             .map(|analysis| (&analysis.reasons, analysis.budget.budget_snapshot()))
     );
+}
+
+/// l4d-4nbs R1: the legacy 1 MiB cap on the conditional environment bounds
+/// its DEFINE/option facts only. The typed declaration state is admitted by
+/// the compile-time budget, so a unit with more than 1 MiB of declarations
+/// still applies later switches, DEFINEs and includes (SynCommons failed at
+/// `{$M+}` with 1.3 MB of typed state and 2,877 scalar entries).
+#[test]
+fn directives_after_a_megabyte_of_declarations_are_applied() {
+    let mut text = String::from("unit T;\ninterface\nconst\n");
+    let value = "x".repeat(100);
+    for n in 0..12_000 {
+        text.push_str(&format!("  C{n} = '{value}';\n"));
+    }
+    text.push_str(
+        "{$M+}\n{$DEFINE LATE}\n{$IFDEF LATE}\nconst Late = 1;\n{$ENDIF}\n{$I late.inc}\n{$IF Late = 1}{$DEFINE AFTER}{$IFEND}\nimplementation\nend.\n",
+    );
+    let (result, usage) = analyze_with(&text, &[("late.inc", "const FromInclude = 2;\n")]);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+}
+
+/// l4d-4nbs R2: the shape probe credits the request for the importer's
+/// bytes, so the session that follows earns no per-byte grant of its own.
+/// It must still get what a fresh session over the same text would get
+/// (Windows.pas, 1.3 MB with includes, failed at `max_work 2000001 >
+/// 2000000` while the request still had 10.5M steps of earned allowance).
+#[test]
+fn the_session_after_a_probe_keeps_the_grant_of_the_probed_bytes() {
+    let mut text = String::from("unit T;\ninterface\nuses U;\n{$I small.inc}\nimplementation\n");
+    let mut n = 0;
+    while text.len() < 1_300_000 {
+        text.push_str(&format!(
+            "procedure P{n}(var V: Integer);\nbegin\n  case V mod 4 of\n    0: V := V + {n};\n    1: V := V - 1;\n  else\n    V := 0;\n  end;\nend;\n"
+        ));
+        n += 1;
+    }
+    text.push_str("end.\n");
+    let (_dir, path, mut resolver) = resolver_with(
+        &text,
+        &[
+            ("U.pas", "unit U; interface implementation end."),
+            ("small.inc", "const Small = 1;"),
+        ],
+    );
+    let mut source = support::loaded("T.pas", &text);
+    source.path = path;
+    let importer = pascal_core::ResolvedUnit {
+        requested_name: "T".into(),
+        declared_name: "T".into(),
+        source,
+    };
+    let imports = resolver.resolve_imports_with_text(&importer, &[], &text, &NoCancellation);
+    let report = resolver.report();
+    assert!(
+        imports.as_ref().is_ok_and(|imports| imports.complete),
+        "{imports:?} {:?} {:?}",
+        report.incomplete_reasons,
+        resolver.compile_time_usage()
+    );
+}
+
+/// l4d-4nbs R13: a unit lookup reads its candidate whole, though a provider
+/// scan reads only its interface, so it is granted only that prefix.
+/// BaseRECORDLOCK's session spent 38M of byte work on 42 such reads with no
+/// grant. The first full read of each distinct source in the request is
+/// funded, as raw UTF-8 validation is.
+#[test]
+fn full_reads_of_looked_up_providers_are_funded_once() {
+    let units = 60;
+    let body = (0..12_000)
+        .map(|n| format!("procedure P{n}; begin end;\n"))
+        .collect::<String>();
+    let files = (0..units)
+        .map(|u| {
+            (
+                format!("U{u}.pas"),
+                format!("unit U{u}; interface const C{u} = {u}; implementation\n{body}end."),
+            )
+        })
+        .collect::<Vec<_>>();
+    let uses = (0..units)
+        .map(|u| format!("U{u}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let root = format!(
+        "unit T; interface uses {uses}; implementation {{$IF CompilerVersion > 21.0}}{{$DEFINE HIT}}{{$IFEND}} end."
+    );
+    let files = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect::<Vec<_>>();
+    let (result, usage) = analyze_retaining(&root, &files, 512 * 1024 * 1024);
+    assert!(matches!(result, Ok(true)), "{result:?} {usage:?}");
+}
+
+/// l4d-4nbs D19: raising the byte grant per source byte keeps superlinear
+/// byte work on a small source refused: each layout query copies the whole
+/// declaration state, so queries times declarations bytes from about 200 KiB.
+#[test]
+fn pathological_byte_work_on_a_small_source_still_trips_the_byte_limit() {
+    let mut text = String::from("unit T;\ninterface\nuses U;\ntype\n");
+    for n in 0..3000 {
+        text.push_str(&format!("  R{n} = record A, B: Integer; end;\n"));
+    }
+    for _ in 0..3000 {
+        text.push_str("{$IF SizeOf(R2999) = 8}{$IFEND}\n");
+    }
+    text.push_str("implementation\nend.\n");
+    assert!(text.len() < 256 * 1024, "{}", text.len());
+    let (result, usage) =
+        analyze_with(&text, &[("U.pas", "unit U; interface implementation end.")]);
+    assert!(
+        matches!(&result, Err(ResolverError::LimitExceeded { limit, .. }) if *limit == "max_byte_work"),
+        "{} bytes: {result:?} {usage:?}",
+        text.len()
+    );
+}
+
+/// Keeps every compiled provider interface it is given.
+#[derive(Default)]
+struct KeepAll(
+    std::sync::Mutex<
+        std::collections::HashMap<
+            pascal_core::compile_time::ProviderGraphKey,
+            std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+        >,
+    >,
+);
+
+impl pascal_core::compile_time::SharedProviderGraphs for KeepAll {
+    fn get(
+        &self,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+    ) -> Option<std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+    fn put(
+        &self,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+    ) {
+        self.0.lock().unwrap().insert(key, graph);
+    }
+}
+
+/// l4d-4nbs D29: a reused provider interface counts as scanned for the
+/// request's per-byte credit, so budget accounting is unchanged by reuse: a
+/// reusing request is funded as the compiling one was, a session that reuses
+/// within one request is credited nothing again, and reuse spends less.
+#[test]
+fn a_reused_provider_interface_is_credited_as_scanned_once() {
+    let padding = "{".to_string() + &"x".repeat(200_000) + "}";
+    let provider = format!("unit A; interface {padding} type TA = Int64; implementation end.");
+    let root =
+        "unit T; interface uses A; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.";
+    let store = std::sync::Arc::new(KeepAll::default());
+    let (dir, path, _) = resolver_with(root, &[("A.pas", &provider)]);
+    let mut source = support::loaded("T.pas", root);
+    source.path = path.clone();
+    let request = |store: Option<&std::sync::Arc<KeepAll>>, sessions: usize| {
+        let resolver = resolver_in(dir.path(), &path, 64 * 1024 * 1024);
+        let mut resolver = match store {
+            Some(store) => resolver.with_shared_provider_graphs(store.clone()),
+            None => resolver,
+        };
+        let mut allowances = vec![];
+        for _ in 0..sessions {
+            let analysis = resolver
+                .analyze_compile_time(&source, &NoCancellation)
+                .unwrap();
+            assert!(analysis.root.complete, "{:?}", analysis.reasons);
+            allowances.push(resolver.compile_time_byte_work_allowance());
+        }
+        (allowances, resolver.compile_time_usage())
+    };
+    let (alone, _) = request(None, 1);
+    let (compiling, first) = request(Some(&store), 1);
+    let (reusing, second) = request(Some(&store), 2);
+    assert_eq!(compiling, alone, "sharing changes nothing for the compiler");
+    assert_eq!(
+        reusing[0], compiling[0],
+        "reuse is credited as the scan was"
+    );
+    assert_eq!(reusing[1], reusing[0], "and only once per request");
+    assert!(second.work < 2 * first.work, "{first:?} then {second:?}");
+    assert!(
+        second.byte_work < 2 * first.byte_work,
+        "{first:?} then {second:?}"
+    );
+}
+
+fn shared_nested_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let files = [
+        (
+            "A.pas",
+            "unit A; interface uses W; type TA = W.TW; implementation end.",
+        ),
+        (
+            "B.pas",
+            "unit B; interface uses W; type TB = W.TW; implementation end.",
+        ),
+        (
+            "W.pas",
+            "unit W; interface type TW = Int64; implementation end.",
+        ),
+    ];
+    let (dir, path, _) = resolver_with("unit T; interface implementation end.", &files);
+    (dir, path)
+}
+
+/// One request against `store` for a root that queries `units`: its
+/// observations of unit payloads, and its usage.
+fn nested_request(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    store: &std::sync::Arc<KeepAll>,
+    units: &[&str],
+) -> (
+    Vec<std::path::PathBuf>,
+    pascal_core::compile_time::BudgetSnapshot,
+) {
+    let queries = units
+        .iter()
+        .map(|unit| format!("{{$IF SizeOf({unit}.T{unit})=8}}{{$DEFINE H{unit}}}{{$ENDIF}}"))
+        .collect::<String>();
+    let root = format!(
+        "unit T; interface uses {}; {queries} implementation end.",
+        units.join(", ")
+    );
+    let mut source = support::loaded("T.pas", &root);
+    source.path = path.to_path_buf();
+    let mut resolver =
+        resolver_in(dir, path, 64 * 1024 * 1024).with_shared_provider_graphs(store.clone());
+    let analysis = resolver
+        .analyze_compile_time(&source, &NoCancellation)
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    let mut payloads = analysis
+        .observations
+        .iter()
+        .filter_map(|o| match o {
+            pascal_core::ResolutionObservation::Payload { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    payloads.sort();
+    let mut distinct = payloads.clone();
+    distinct.dedup();
+    assert_eq!(distinct, payloads, "each payload is reported once");
+    (payloads, resolver.compile_time_usage())
+}
+
+/// l4d-4nbs D44: a reused interface reports what its nested providers'
+/// compilation observed even when its session found them compiled already,
+/// and two reused interfaces sharing a nested provider report it once, as
+/// compiling them did, and pay for it once: replaying the nested provider
+/// for each overshot max_work on GIFImg.pas.
+#[test]
+fn reused_interfaces_report_a_shared_nested_provider_once() {
+    let (dir, path) = shared_nested_fixture();
+    let fresh = std::sync::Arc::new(KeepAll::default());
+    let (both_compiled, first) = nested_request(dir.path(), &path, &fresh, &["A", "B"]);
+    let (b_alone, _) = nested_request(
+        dir.path(),
+        &path,
+        &std::sync::Arc::new(KeepAll::default()),
+        &["B"],
+    );
+    let (b_reused, _) = nested_request(dir.path(), &path, &fresh, &["B"]);
+    assert_eq!(b_reused, b_alone, "B reused reports W as compiling B did");
+
+    let separately = std::sync::Arc::new(KeepAll::default());
+    nested_request(dir.path(), &path, &separately, &["A"]);
+    nested_request(dir.path(), &path, &separately, &["B"]);
+    let (both_reused, second) = nested_request(dir.path(), &path, &separately, &["A", "B"]);
+    assert_eq!(both_reused, both_compiled, "W is reported once");
+    assert!(second.work <= first.work, "{first:?} then {second:?}");
 }

@@ -1624,3 +1624,58 @@ fn source_routines_block_later_intrinsic_calls_without_rebinding_earlier_constan
     assert_eq!(activity(&a, "DEFINE RUNTIME_CALLS"), Truth::Unknown);
     assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
+
+/// l4d-4nbs R10: Delphi accepts conditional symbols that start with a digit
+/// (FastMM4: `{$define 32Bit}` ... `{$ifdef 32Bit}`); DEFINE, UNDEF, IFDEF
+/// and IFNDEF must apply them instead of marking the source malformed.
+#[test]
+fn digit_leading_conditional_symbols_are_defined_and_tested() {
+    let source = "unit T; interface {$define 32Bit}{$IFDEF 32Bit}const A = 1;{$ELSE}const B = 2;{$ENDIF}{$undef 32Bit}{$IFNDEF 32Bit}const C = 3;{$ENDIF} implementation end.";
+    let legacy = pascal_core::conditional::analyze(source, &[]);
+    assert!(legacy.complete);
+    let active = legacy.projected_source;
+    assert!(
+        active.contains("A = 1") && active.contains("C = 3"),
+        "{active}"
+    );
+    assert!(!active.contains("B = 2"), "{active}");
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}
+
+/// l4d-4nbs R12: the VCL's legacy switches `{$P+,S-,W-,…}` and
+/// `{$C PRELOAD}` are harmless, and `{$C PRELOAD}` does not claim to know
+/// the assertions switch.
+#[test]
+fn legacy_vcl_switches_are_harmless() {
+    for keyword in ["P+", "S-", "W-", "C"] {
+        assert!(
+            pascal_core::conditional::is_harmless_directive_keyword(keyword),
+            "{keyword}"
+        );
+    }
+    let source = "unit T; interface {$P+,S-,W-,R-,T-,H+,X+}{$C PRELOAD}{$IFOPT C+}const A = 1;{$ENDIF} implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}
+
+/// l4d-4nbs R11: HPPEMIT emits raw C++ text, and DCC ends the directive at
+/// the first closer whatever quotes it holds. ShlObj, msxml, OleDB, StdVCL
+/// and DXFile have such bodies: an unterminated literal
+/// (`'#pragma link "shell32.lib"}`), an apostrophe in the text (`don't`)
+/// and a `{` inside `(*$ … *)`.
+#[test]
+fn hppemit_bodies_end_at_the_first_closer() {
+    let source = "unit T; interface\n\
+         {$HPPEMIT '#pragma link \"shell32.lib\"}\n\
+         (*$HPPEMIT '// we don't '*)\n\
+         (*$HPPEMIT '#include \"dxfile.h\"'{*)\n\
+         {$DEFINE AFTER}{$IFDEF AFTER}const A = 1;{$ENDIF}\n\
+         implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
+}

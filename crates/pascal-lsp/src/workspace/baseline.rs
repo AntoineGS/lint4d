@@ -290,10 +290,8 @@ impl Workspace {
         let context = &state.context;
         let policy = context.read_policy();
         // The validator's listing (`Validator::new`), so both agree.
-        let mut disk = FilesystemSourceStore::with_limits(
-            ResolverLimits::default().max_directory_entries,
-            usize::MAX,
-        );
+        let mut disk =
+            FilesystemSourceStore::with_limits(ResolverLimits::default().max_directory_entries);
         let capture = ReadCapture::default();
         let cancel = AtomicBool::new(false);
         let mut observations = Vec::with_capacity(directories.len());

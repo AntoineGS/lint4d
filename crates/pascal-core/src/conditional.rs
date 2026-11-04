@@ -820,6 +820,13 @@ impl ConditionalEnvironment {
     fn keys(&self) -> impl Iterator<Item = &String> {
         self.values.keys()
     }
+    /// Bytes of the DEFINE/option/constant facts, which the legacy
+    /// `MAX_ENVIRONMENT_BYTES` cap bounds. The typed declaration state grows
+    /// with the unit and is admitted by the compile-time budget instead.
+    fn scalar_bytes(&self) -> usize {
+        self.bytes
+    }
+
     fn bytes(&self) -> usize {
         let mut bytes = self.bytes;
         if let Some(state) = &self.typed_state {
@@ -1783,6 +1790,7 @@ impl DirectiveScanner {
         };
         if !protected {
             self.body_mode = match byte {
+                b'{' | b'(' | b'/' | b'\'' if self.opaque_body() => Normal,
                 b'{' => Brace,
                 b'(' => Paren,
                 b'/' => Slash,
@@ -1791,6 +1799,18 @@ impl DirectiveScanner {
             };
         }
         Ok(protected)
+    }
+
+    /// Whether the directive read so far is `HPPEMIT`, whose body is raw C++
+    /// text: DCC ends it at the first closer, whatever quotes or comment
+    /// openers it holds (ShlObj's `'#pragma link "shell32.lib"}`, StdVCL's
+    /// `'… we don't '*)`, DXFile's `'#include "dxfile.h"'{*)`).
+    fn opaque_body(&self) -> bool {
+        const KEYWORD: &str = "HPPEMIT";
+        let body = self.pending.get(self.prefix..).unwrap_or("").trim_start();
+        body.len() > KEYWORD.len()
+            && body.as_bytes()[..KEYWORD.len()].eq_ignore_ascii_case(KEYWORD.as_bytes())
+            && !is_identifier_byte(body.as_bytes()[KEYWORD.len()])
     }
 
     fn append(
@@ -2425,7 +2445,9 @@ fn canonical_symbol_ref(symbol: &str) -> Option<&str> {
     let symbol = symbol.trim().trim_start_matches('&');
     let mut bytes = symbol.bytes();
     let first = bytes.next()?;
-    if (!first.is_ascii_alphabetic() && first != b'_')
+    // Conditional symbols are not identifiers: Delphi accepts a leading
+    // digit (FastMM4's `{$define 32Bit}` / `{$ifdef 32Bit}`).
+    if (!first.is_ascii_alphanumeric() && first != b'_')
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
     {
         return None;
@@ -2482,14 +2504,15 @@ fn apply_fact(
         if !budget.charge_bytes(symbol.len()) {
             return false;
         }
-        if !environment.contains_key(&symbol) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
+        if !environment.contains_key(&symbol) && environment.scalar_len() >= MAX_ENVIRONMENT_ENTRIES
+        {
             budget.exhausted = true;
             return false;
         }
         if !environment.contains_key(&symbol)
             && !budget.check_environment_bytes(
                 environment
-                    .bytes()
+                    .scalar_bytes()
                     .saturating_add(symbol.len().saturating_add(size_of::<Truth>())),
             )
         {
@@ -2523,12 +2546,14 @@ fn apply_option_fact(
     if !budget.charge_bytes(key.len()) {
         return false;
     }
-    if !environment.options.contains_key(&key) && environment.len() >= MAX_ENVIRONMENT_ENTRIES {
+    if !environment.options.contains_key(&key)
+        && environment.scalar_len() >= MAX_ENVIRONMENT_ENTRIES
+    {
         budget.exhausted = true;
         return false;
     }
     let bytes = environment
-        .bytes()
+        .scalar_bytes()
         .saturating_add(key.len().saturating_add(size_of::<Truth>()));
     if !environment.options.contains_key(&key) && !budget.check_environment_bytes(bytes) {
         return false;
@@ -3371,7 +3396,9 @@ fn merge_environment(
             return false;
         }
     }
-    if current.len() > MAX_ENVIRONMENT_ENTRIES || current.bytes() > MAX_ENVIRONMENT_BYTES {
+    if current.scalar_len() > MAX_ENVIRONMENT_ENTRIES
+        || current.scalar_bytes() > MAX_ENVIRONMENT_BYTES
+    {
         budget.exhausted = true;
         return false;
     }
@@ -3792,7 +3819,7 @@ fn directive_symbol(body: &str) -> Option<String> {
     let symbol = argument.strip_prefix('&').unwrap_or(argument);
     let mut characters = symbol.chars();
     let first = characters.next()?;
-    if !first.is_ascii_alphabetic() && first != '_' {
+    if !first.is_ascii_alphanumeric() && first != '_' {
         return None;
     }
     if !characters
@@ -5542,6 +5569,17 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "designonly"
             | "runonly"
             | "implicitbuild"
+            // Legacy single-letter switches (Controls.pas and Forms.pas open
+            // with `{$P+,S-,W-,…}` and `{$C PRELOAD}`): `P` is `OPENSTRINGS`
+            // and `W` is `STACKFRAMES` (both listed above), `S` is stack
+            // checking, a code generation switch, and `C` is `ASSERTIONS`,
+            // whose Win16 `{$C MOVEABLE PRELOAD …}` segment form DCC ignores.
+            // None changes parsing or name binding; `C` stays a tracked
+            // `$IFOPT` option through `supported_option_name`, like `R`.
+            | "c"
+            | "p"
+            | "s"
+            | "w"
     )
 }
 

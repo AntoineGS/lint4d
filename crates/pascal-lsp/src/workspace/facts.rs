@@ -387,6 +387,83 @@ pub(in crate::workspace) mod tests {
         assert_eq!(posting(&facts, "caf").occurrences.len(), 1);
     }
 
+    /// l4d-4nbs D44: a cached expansion keeps only its session's projection.
+    /// Facts, evidence, slot paths and navigation are what the whole session
+    /// gave, on a source with includes, conditionals and a provider query.
+    #[test]
+    fn consumers_read_the_same_from_a_released_session() {
+        let files: &[(&str, &[u8])] = &[
+            (
+                "Main.pas",
+                b"unit Main;\ninterface\nuses Shapes;\n{$I Flags.inc}\n{$IFDEF READY}\nconst Ready = 1;\n{$ENDIF}\n{$IF Shapes.Size = 8}\n{$I Wide.inc}\n{$ELSE}\nconst Narrow = 1;\n{$ENDIF}\nimplementation\nend.\n",
+            ),
+            ("Flags.inc", b"{$DEFINE READY}\n"),
+            ("Wide.inc", b"const Wide = Ready;\n"),
+            (
+                "Shapes.pas",
+                b"unit Shapes;\ninterface\nconst Size = 8;\nimplementation\nend.\n",
+            ),
+        ];
+        let observe = |keep: bool| {
+            crate::workspace::compile_time::TEST_KEEP_DECLARATIONS.with(|k| k.set(keep));
+            let indexed = index(files, &["Main.pas"]);
+            let mut source = indexed.facts("Main.pas");
+            // Each observation indexes its own root: include sources are
+            // compared relative to it.
+            for include in &mut source.extracted.facts.includes {
+                if let Some(path) = include.source.as_mut()
+                    && let Ok(relative) = path.strip_prefix(&indexed.root)
+                {
+                    *path = relative.to_path_buf();
+                }
+            }
+            let uri = indexed.uri("Main.pas");
+            let evidence = indexed
+                .workspace
+                .source_evidence(&uri, &AtomicBool::new(false))
+                .map(|observations| {
+                    format!("{observations:?}")
+                        .replace(&indexed.root.display().to_string(), "<root>")
+                });
+            let slots = indexed.workspace.source_slot_paths(&uri);
+            let mut workspace = indexed.workspace;
+            let wide = workspace.navigate(
+                &uri,
+                lsp_types::Position::new(8, 4),
+                crate::NavigationTarget::Definition,
+            );
+            crate::workspace::compile_time::TEST_KEEP_DECLARATIONS.with(|k| k.set(false));
+            (
+                source.extracted.facts,
+                source.extracted.persistable,
+                source.extracted.provider_dependent,
+                evidence,
+                slots
+                    .iter()
+                    .map(|p| p.as_ref().and_then(|p| p.file_name()).map(|n| n.to_owned()))
+                    .collect::<Vec<_>>(),
+                wide.iter().map(|l| l.range).collect::<Vec<_>>(),
+            )
+        };
+        let whole = observe(true);
+        assert!(
+            whole
+                .0
+                .declarations
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case("wide")),
+            "{:?}",
+            whole.0.declarations
+        );
+        let released = observe(false);
+        assert_eq!(released.0, whole.0, "facts");
+        assert_eq!(released.1, whole.1, "persistable");
+        assert_eq!(released.2, whole.2, "provider dependence");
+        assert_eq!(released.3, whole.3, "evidence");
+        assert_eq!(released.4, whole.4, "slot paths");
+        assert_eq!(released.5, whole.5, "navigation");
+    }
+
     #[test]
     fn provider_dependent_compile_time_facts_say_so() {
         let indexed = index(

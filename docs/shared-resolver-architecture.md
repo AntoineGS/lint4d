@@ -95,8 +95,13 @@ directive metadata, and `complete`. The bounded analyzer understands `IFDEF`,
 `UNDEF`, and `I`/`INCLUDE` directives in the supported Pascal directive comment
 forms. Expressions cover defined/true/false values, `NOT`/`AND`/`OR`,
 parentheses, and bounded numeric/string/boolean comparisons. `IFOPT` uses
-explicit named compiler-option facts; absent facts remain unknown because
-compiler-option state is not inferred from the host.
+explicit named compiler-option facts; absent facts remain unknown, and the
+host is never consulted. Project discovery supplies those facts (D45): a
+switch the project's metadata and the installation leave unset takes dcc's
+observed default for the selected compiler and platform, library code gets a
+switch only where the project's value is that default, and anything an
+unevaluated import or `GlobalOptionFile` could change stays unknown
+(`pascal-project/src/switches.rs`).
 
 Known-inactive branches can be excluded. Unknown activity remains potentially
 active. Malformed nesting, unsupported active directives, cancellation, encoding
@@ -554,11 +559,16 @@ generation the membership recorded), join the snapshot baseline, so a result is
 rejected when one of them changed.
 
 Unindexed, stale and unverified members of a searched target are candidates:
-the snapshot reads and filters them as before, in path order, at most
-`MAX_UNVERIFIED_CANDIDATES = 2,048` per references request and
-`MAX_UNVERIFIED_SYMBOL_CANDIDATES = 256` per `workspace/symbol` request (an
-interactive bound: on multidev 2,050 direct reads took about 65 s, 258 about
-10 s). Members refused for a stable reason (over the size limit,
+the snapshot reads and filters them as before, at most
+`MAX_INTERACTIVE_UNVERIFIED_CANDIDATES = 256` per references or
+`workspace/symbol` request (an interactive bound: on multidev 2,050 direct
+reads took about 65 s for workspace symbols and 530 s for references, 258
+about 10 s); the rest are a coverage gap. Workspace symbols read them in path
+order. References first rank them by their raw text (at most 128 MiB per
+request): members spelling a binding name and a name of a declaring unit,
+then those spelling a name, then the unread, then the rest, so the bound is
+spent on likely importers. Rename never uses the index and walks the whole
+workspace. Members refused for a stable reason (over the size limit,
 unreadable, an include expansion over a compile-time limit, which a direct
 read in a request fails the same way) are reported, not searched. Transient
 failures leave a member pending, and one member's failure never stops a batch:

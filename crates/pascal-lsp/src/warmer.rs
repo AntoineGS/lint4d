@@ -784,8 +784,7 @@ impl Warmer {
         let (jobs, job_receiver) = crossbeam_channel::unbounded::<WarmJob>();
         let (event_sender, events) = crossbeam_channel::unbounded();
         let worker_gate = gate.clone();
-        let thread = std::thread::Builder::new()
-            .name("PascalLspWarmer".to_string())
+        let thread = crate::server::analysis_thread("PascalLspWarmer")
             .spawn(move || {
                 lower_thread_priority();
                 for job in job_receiver {
@@ -870,12 +869,32 @@ impl Warmer {
     /// closure uncached, unless it was already crawled, or a crawl is in
     /// flight, since the cache was last invalidated. Otherwise a unit that can
     /// never be cached would trigger a crawl on every request.
-    pub(crate) fn request_closure_crawl(&mut self, uri: Url, invalidation_epoch: u64) {
+    pub(crate) fn request_closure_crawl(
+        &mut self,
+        uri: Url,
+        cache: &crate::project_cache::ProjectCache,
+    ) {
+        let missed = cache.closure_misses(&uri);
+        self.request_closure_crawl_at(uri, cache.invalidation_epoch(), |dispatched| {
+            cache.units_invalidated_since(dispatched, &missed)
+        });
+    }
+
+    /// A crawl in flight covers the request while none of the missed units
+    /// was invalidated since it was dispatched, whatever else changed.
+    fn request_closure_crawl_at(
+        &mut self,
+        uri: Url,
+        invalidation_epoch: u64,
+        invalidated_since: impl FnOnce(u64) -> bool,
+    ) {
         let in_flight = self
             .busy_attempt
             .as_ref()
             .is_some_and(|(busy_uri, _)| busy_uri == &uri)
-            && self.dispatched_epochs.get(&uri) == Some(&invalidation_epoch);
+            && self.dispatched_epochs.get(&uri).is_some_and(|&dispatched| {
+                dispatched == invalidation_epoch || !invalidated_since(dispatched)
+            });
         if in_flight || self.crawled_epochs.get(&uri) == Some(&invalidation_epoch) {
             crate::trace::trace!(
                 "warm closure crawl for {uri} skipped (in flight: {in_flight}, epoch {invalidation_epoch})"
@@ -1937,10 +1956,10 @@ mod tests {
         run_until_end(&mut warmer, &workspace);
         let epoch = workspace.project_cache().invalidation_epoch();
 
-        warmer.request_closure_crawl(main.clone(), epoch);
+        warmer.request_closure_crawl_at(main.clone(), epoch, |_| true);
         assert!(warmer.queue.is_empty(), "this epoch was already crawled");
 
-        warmer.request_closure_crawl(main, epoch + 1);
+        warmer.request_closure_crawl_at(main, epoch + 1, |_| true);
         assert!(
             !warmer.queue.is_empty(),
             "a newer epoch allows another crawl"
@@ -1958,16 +1977,49 @@ mod tests {
         assert!(warmer.queue.is_empty(), "the crawl was dispatched");
         let epoch = workspace.project_cache().invalidation_epoch();
 
-        warmer.request_closure_crawl(main.clone(), epoch);
+        warmer.request_closure_crawl_at(main.clone(), epoch, |_| true);
         assert!(
             warmer.queue.is_empty(),
             "the in-flight crawl already covers this epoch"
         );
 
-        warmer.request_closure_crawl(main, epoch + 1);
+        warmer.request_closure_crawl_at(main, epoch + 1, |_| true);
         assert!(
             !warmer.queue.is_empty(),
             "a newer epoch allows another crawl"
+        );
+        gate.set(0);
+    }
+
+    #[test]
+    fn a_crawl_in_flight_survives_invalidations_of_unrelated_files() {
+        let (temp, workspace, main) = fixture();
+        let cache = workspace.project_cache();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+        cache.report_closure_misses(&main, HashSet::from([uri("Sync.pas")]));
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        warmer.poll(&workspace);
+        assert!(warmer.queue.is_empty(), "the crawl was dispatched");
+        let dispatched = cache.invalidation_epoch();
+
+        for index in 0..5 {
+            cache.invalidate_file_contents(&temp.path().join(format!("Unrelated{index}.pas")));
+        }
+        assert_ne!(cache.invalidation_epoch(), dispatched);
+        warmer.request_closure_crawl(main.clone(), cache);
+        assert!(
+            warmer.queue.is_empty(),
+            "no missed unit was invalidated, so the crawl in flight still covers them"
+        );
+
+        cache.invalidate_file_contents(&uri("Sync.pas").to_file_path().unwrap());
+        warmer.request_closure_crawl(main, cache);
+        assert!(
+            !warmer.queue.is_empty(),
+            "a missed unit was invalidated since the dispatch"
         );
         gate.set(0);
     }
@@ -1998,7 +2050,7 @@ mod tests {
             vec![main.clone()],
             "the invalidated crawl did not settle the closure"
         );
-        warmer.request_closure_crawl(main.clone(), cache.invalidation_epoch());
+        warmer.request_closure_crawl(main.clone(), cache);
         assert!(!warmer.queue.is_empty(), "the crawl is queued again");
 
         run_until_end(&mut warmer, &workspace);

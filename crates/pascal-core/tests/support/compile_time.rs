@@ -64,6 +64,21 @@ pub struct Fixture {
     pub requests: Vec<(std::path::PathBuf, std::ops::Range<usize>, String)>,
     pub include_warnings: Vec<String>,
     pub unit_requests: Vec<(std::path::PathBuf, String)>,
+    /// Serve each unit with a revision that depends on its importer, as a
+    /// file found through different search entries is (same content).
+    pub importer_revisions: bool,
+    /// Serve each unit read from disk through an entry that depends on its
+    /// importer: the same file state, a different authorization route.
+    pub importer_entries: bool,
+    /// Find units whatever the spelling of the request, authorized under
+    /// the requested spelling (`uses classes` and `uses Classes`).
+    pub spelled_units: bool,
+    /// Compiled provider interfaces shared with other analyses.
+    pub shared: Option<std::sync::Arc<dyn SharedProviderGraphs>>,
+    /// Whether unit lookup tracing is on, as the session last left it.
+    pub tracing: bool,
+    /// A lookup of this unit fails as cancelled.
+    pub fail_unit_lookup: Option<String>,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -84,6 +99,12 @@ impl Fixture {
             requests: vec![],
             include_warnings: vec![],
             unit_requests: vec![],
+            importer_revisions: false,
+            importer_entries: false,
+            spelled_units: false,
+            shared: None,
+            tracing: false,
+            fail_unit_lookup: None,
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -212,6 +233,13 @@ impl Fixture {
     }
 }
 impl CompileTimeResolver for Fixture {
+    fn shared_provider_graphs(&self) -> Option<std::sync::Arc<dyn SharedProviderGraphs>> {
+        self.shared.clone()
+    }
+    fn trace_unit_lookups(&mut self, start: bool) -> Vec<pascal_core::ResolutionObservation> {
+        self.tracing = start;
+        Vec::new()
+    }
     fn unit_report_capability(
         &mut self,
         request: UnitResolveRequest<'_>,
@@ -246,7 +274,12 @@ impl CompileTimeResolver for Fixture {
         budget: &mut CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<AdmittedProviderSource>, ResolverError> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled()
+            || self
+                .fail_unit_lookup
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(request.requested_name))
+        {
             return Err(ResolverError::Cancelled);
         }
         let log_bytes = request.importer_path.as_os_str().len()
@@ -268,7 +301,43 @@ impl CompileTimeResolver for Fixture {
             }
         } else if self.ambiguous_units.contains(request.requested_name) {
             Resolution::Ambiguous { candidates: vec![] }
-        } else if let Some(provider) = self.units.get(request.requested_name) {
+        } else if let Some(provider) = self.units.get(request.requested_name).or_else(|| {
+            self.spelled_units
+                .then(|| {
+                    self.units
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(request.requested_name))
+                        .map(|(_, provider)| provider)
+                })
+                .flatten()
+        }) {
+            let mut provider = provider.clone();
+            if self.spelled_units {
+                provider.authorized_qualifiers = vec![request.requested_name.into()];
+            }
+            if self.importer_revisions {
+                provider.unit.source.revision = SourceRevision::Overlay {
+                    version: pascal_project::content_hash_bytes(
+                        request.importer_path.as_os_str().as_encoded_bytes(),
+                    ) as i32,
+                    content_hash: pascal_project::content_hash_bytes(&provider.unit.source.bytes),
+                };
+            }
+            if self.importer_entries {
+                let mut revision = disk_revision(&provider.unit.source.bytes);
+                if let SourceRevision::Disk { path_entry, .. } = &mut revision {
+                    *path_entry = pascal_project::ProjectPathEntry::configured(
+                        request
+                            .importer_path
+                            .parent()
+                            .unwrap()
+                            .join("entry")
+                            .join(request.importer_path.file_name().unwrap()),
+                    );
+                }
+                provider.unit.source.revision = revision;
+            }
+            let provider = &provider;
             let reusable = self.cached_unit.as_ref().is_some_and(|s| {
                 s.is_admitted_by(budget)
                     && s.id == provider.unit.source.id

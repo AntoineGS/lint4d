@@ -7248,9 +7248,33 @@ fn build_snapshot_with_policy(
                 requested.extend(parents.iter().cloned());
             }
         }
+        if indexed && !best_effort {
+            // A provider of the requesting document can shadow the binding
+            // the references prove, so it is audited as requested: an
+            // expansion failure fails the request, and a recorded failure
+            // (unresolved, ambiguous or unreadable include, no project
+            // context, unsafe include content) makes
+            // `read_only_reference_coverage` refuse.
+            let providers = requested
+                .iter()
+                .flat_map(|uri| {
+                    loader
+                        .index
+                        .imports(uri)
+                        .into_iter()
+                        .filter_map(|import| {
+                            loader.index.import_provider_uri(uri, &import.name).cloned()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            requested.extend(providers);
+        }
         let include_audit = audit_includes(IncludeAuditor {
             requested: &requested,
-            best_effort,
+            // Only read-only references build an indexed snapshot here: a
+            // candidate whose audit fails is their coverage gap (l4d-jeh4).
+            best_effort: best_effort || indexed,
             current_owner: None,
             input,
             sources: &sources,

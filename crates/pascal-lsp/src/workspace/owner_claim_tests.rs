@@ -627,3 +627,47 @@ fn a_reclaimed_unit_survives_a_second_generation_before_it_resolves() {
     assert_eq!(definition_targets(request), vec![uri(&fixture.base)]);
     assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
 }
+
+/// A request decided against an older claimant list (here: before the
+/// claimant opened) must not merge its projectless owner back.
+#[test]
+fn a_stale_request_state_does_not_undo_a_claim() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    open(&mut workspace, &fixture.users);
+    let stale = super::queries::navigation_from_input(
+        workspace.analysis_input(),
+        &uri(&fixture.users),
+        TBASE,
+        NavigationTarget::Definition,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("request navigation")
+    .state;
+    open(&mut workspace, &fixture.app);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+
+    workspace.apply_navigation_state(stale);
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+/// The same for a projectContext preparation made before a selection.
+#[test]
+fn a_stale_project_context_preparation_does_not_undo_a_claim() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    open(&mut workspace, &fixture.users);
+    let mut snapshot = workspace.project_operation_snapshot(None);
+    let prepared = snapshot
+        .workspace_mut()
+        .prepare_project_context_with_control(&uri(&fixture.users), None, None)
+        .expect("prepared");
+    open(&mut workspace, &fixture.app);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+
+    workspace.apply_project_context_preparation(prepared);
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}

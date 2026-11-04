@@ -2530,6 +2530,19 @@ enum Claim {
     },
 }
 
+/// Whether `owner` is an Automatic owner of a unit a D43 claim decides: a
+/// claim, or projectless.
+fn owner_is_claim_eligible(uri: &Url, owner: &KnownDocumentOwner) -> bool {
+    owner.origin == OwnerOrigin::Automatic
+        && uri
+            .to_file_path()
+            .is_ok_and(|path| is_claimable_unit(&path))
+        && (owner.claimed
+            || (owner.key.selection_scope.is_none()
+                && owner.state.context.project_file().is_none()
+                && owner.state.context.discovery_complete()))
+}
+
 /// Units a project resolves by name: `.pas` sources.
 fn is_claimable_unit(path: &Path) -> bool {
     path.extension()
@@ -2596,6 +2609,8 @@ pub(crate) struct NavigationState {
     compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
     use_clock: u64,
+    /// The D43 claim generation the state was decided against.
+    claim_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3888,6 +3903,7 @@ impl Workspace {
             compiled_units: self.compiled_units.clone(),
             owner_last_used: self.owner_last_used.clone(),
             use_clock: self.use_clock,
+            claim_generation: self.claimant_list.generation,
         }
     }
 
@@ -3898,7 +3914,31 @@ impl Workspace {
         self.request_generation = self.request_generation.wrapping_add(1);
     }
 
-    pub(crate) fn apply_navigation_state(&mut self, state: NavigationState) {
+    pub(crate) fn apply_navigation_state(&mut self, mut state: NavigationState) {
+        if state.claim_generation != self.claimant_list.generation {
+            // D43: a state decided against an older claimant list must not
+            // bring back the owner of a unit that list claimed or left
+            // projectless; the unit resolves again under the current list.
+            let stale = state
+                .document_owners
+                .iter()
+                .filter(|(uri, owner)| {
+                    owner_is_claim_eligible(uri, owner)
+                        || self
+                            .document_owners
+                            .get(*uri)
+                            .is_some_and(|current| owner_is_claim_eligible(uri, current))
+                })
+                .map(|(uri, _)| uri.clone())
+                .collect::<HashSet<_>>();
+            state.document_owners.retain(|uri, _| !stale.contains(uri));
+            state
+                .document_contexts
+                .retain(|uri, _| !stale.contains(uri));
+            state
+                .open_document_contexts
+                .retain(|uri, _| !stale.contains(uri));
+        }
         for (key, incoming) in state.contexts {
             let preserve_existing = !incoming.context.discovery_complete()
                 && self.contexts.get(&key).is_some_and(|existing| {

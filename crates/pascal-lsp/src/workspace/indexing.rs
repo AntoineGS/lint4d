@@ -1129,6 +1129,19 @@ impl Workspace {
                                     path.display()
                                 );
                             }
+                            // Another process's writes pass: the next batch
+                            // proves the member again (reuse, else
+                            // extraction), so no extracted member stays
+                            // without its record and the snapshot can be
+                            // sealed (D33, §6.3).
+                            if matches!(
+                                skip,
+                                PersistSkip::Store(
+                                    pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering
+                                )
+                            ) {
+                                self.project_cache.mark_index_stale(key, path);
+                            }
                             false
                         }
                     };
@@ -5855,6 +5868,40 @@ pub(in crate::workspace) mod tests {
                 IndexBound::all().with_mode(IndexMode::Reuse),
             );
             assert_eq!(progress.reused, 2, "{progress:?}");
+            cache.shutdown();
+        }
+
+        /// Another process's writes made a publication `Busy`: the member
+        /// keeps its facts and the next batch proves it, so this process
+        /// can still seal its snapshot (protocol test
+        /// `two_servers_index_the_same_workspace`, l4d-zf1b.8).
+        #[test]
+        fn a_busy_publication_is_proven_by_the_next_batch() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 3, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let (handle, target) = (cache.clone(), member.clone());
+            set_before_persist_hook(Some(Box::new(move |path| {
+                if path == target {
+                    handle
+                        .job()
+                        .expect("job")
+                        .store()
+                        .fail_next_for_test(pascal_cache::Bypass::Busy);
+                }
+            })));
+            let first = advance(&mut view, &anchor, IndexBound::all());
+            set_before_persist_hook(None);
+            assert_eq!((first.indexed, first.persisted), (3, 2), "{first:?}");
+            assert!(!view.project_cache.index_member_has_record(&key, &member));
+            assert!(!first.complete, "the member is still to prove: {first:?}");
+            let second = advance(&mut view, &anchor, IndexBound::all());
+            assert!(second.complete, "{second:?}");
+            assert_eq!(second.indexed + second.reused, 1, "{second:?}");
+            assert_eq!(recorded(&view, &key).len(), 3);
             cache.shutdown();
         }
 

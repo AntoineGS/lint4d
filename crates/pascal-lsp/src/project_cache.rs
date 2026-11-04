@@ -3142,6 +3142,54 @@ mod cache_tests {
         drop(held);
     }
 
+    /// Evictable provider interfaces do not stop the crawl (l4d-axsn): with
+    /// pins at their half, the index at its quarter and interfaces filling
+    /// the rest, the crawl still has room, and what it stores evicts them.
+    #[test]
+    fn evictable_provider_interfaces_leave_the_crawl_room() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        for name in ["A.pas", "B.pas"] {
+            fill(&cache, name, &ctx, 1, max / 4);
+        }
+        assert!(
+            cache
+                .pin_capped(
+                    &uri("Open.pas"),
+                    vec![(uri("A.pas"), fingerprint), (uri("B.pas"), fingerprint)],
+                    &[],
+                )
+                .is_empty()
+        );
+        assert_eq!(cache.stats().pinned_bytes, max / 2);
+        assert!(cache.charge_index(max / 4));
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(4_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        assert!(graphs > 0 && graphs <= max / 4, "{graphs}");
+        // Whatever the interface's overhead, the quarter is full.
+        let _filler = (graphs < max / 4)
+            .then(|| cache.reserve(ReservationKind::Scratch, max / 4 - graphs))
+            .flatten();
+        assert!(
+            cache.has_room(),
+            "the interfaces would give way: {:?}",
+            cache.stats()
+        );
+
+        fill(&cache, "C.pas", &ctx, 1, 1_000);
+        assert!(ready(&cache, "C.pas"), "the crawl's entry is kept");
+        assert_eq!(cache.provider_graph_count(), 0, "the interface gave way");
+        assert!(ready(&cache, "A.pas") && ready(&cache, "B.pas"), "pinned");
+    }
+
     #[test]
     fn reserved_bytes_count_in_eviction_and_room() {
         let cache = ProjectCache::new(20);
@@ -5901,13 +5949,16 @@ impl ProjectCache {
         )
     }
 
+    /// Whether the crawl may dispatch. Shared provider interfaces are not
+    /// counted: what the crawl stores evicts them (`evict_to_budget`,
+    /// l4d-4nbs review I2), so they never stop it (l4d-axsn).
     pub(crate) fn has_room(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
         state
             .pinned_bytes
             .saturating_add(state.outstanding_bytes)
-            .saturating_add(reserved_bytes(&state))
+            .saturating_add(reserved_bytes(&state).saturating_sub(state.provider_graphs.bytes))
             < state.max_bytes
     }
 

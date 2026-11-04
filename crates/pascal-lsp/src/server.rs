@@ -13449,6 +13449,11 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            // An item rendered eagerly has nothing left to resolve.
+            if item.data.is_none() {
+                send_ok(connection, id, item)?;
+                return Ok(());
+            }
             let resolve_request = match jobs.completion_resolution_request(&item) {
                 Ok(resolve_request) => resolve_request,
                 Err(error) => {

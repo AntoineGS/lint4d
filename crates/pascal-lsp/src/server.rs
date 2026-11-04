@@ -5773,9 +5773,9 @@ impl AnalysisJobs {
                             resolve_documentation,
                             resolve_detail,
                         } => {
-                            let deferred = resolve_documentation || resolve_detail;
-                            let eager_input = deferred.then(|| input.clone());
-                            let mut computed = queries::completion_from_input_with_options(
+                            // Too many dependencies to resolve items later:
+                            // the same computation renders them now.
+                            let computed = queries::completion_from_input_within(
                                 input,
                                 &uri,
                                 position,
@@ -5785,30 +5785,12 @@ impl AnalysisJobs {
                                     defer_detail: resolve_detail,
                                     snippet_support,
                                 },
+                                &completion_resolution_fits,
                                 &worker_cancellation,
                             );
-                            // Too many dependencies to resolve items later:
-                            // render them now instead of refusing.
-                            let (mut resolve_documentation, mut resolve_detail) =
-                                (resolve_documentation, resolve_detail);
-                            if let (Some(input), Ok(result)) = (eager_input, &computed.value)
-                                && !completion_resolution_fits(&computed.records, &result.demanded)
-                            {
-                                computed = queries::completion_from_input_with_options(
-                                    input,
-                                    &uri,
-                                    position,
-                                    CompletionOptions {
-                                        format: format.clone(),
-                                        defer_documentation: false,
-                                        defer_detail: false,
-                                        snippet_support,
-                                    },
-                                    &worker_cancellation,
-                                );
-                                resolve_documentation = false;
-                                resolve_detail = false;
-                            }
+                            let eager = computed.value.as_ref().is_ok_and(|result| result.eager);
+                            let resolve_documentation = resolve_documentation && !eager;
+                            let resolve_detail = resolve_detail && !eager;
                             AnalysisResult {
                                 id: worker_id,
                                 source_generation: computed.source_generation,
@@ -18222,6 +18204,7 @@ mod tests {
                 },
                 seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
                 demanded: Vec::new(),
+                eager: false,
             }),
         }
     }

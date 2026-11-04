@@ -758,3 +758,64 @@ fn a_demand_round_load_failure_is_noted() {
         "the failure is noted: {coverage:?}"
     );
 }
+
+/// l4d-4nbs final round: a completion whose observations would not fit a
+/// resolution context is rendered eagerly from the snapshot its demand
+/// rounds built: no second computation.
+#[test]
+fn an_eager_completion_reuses_its_snapshot() {
+    let (_temp, input, main, position) = ancestor_chain(3);
+    let cancel = AtomicBool::new(false);
+    let options = crate::navigation::CompletionOptions {
+        format: MarkupKind::Markdown,
+        defer_documentation: true,
+        defer_detail: true,
+        snippet_support: false,
+    };
+    let count = || super::TEST_ASSISTANCE_SNAPSHOTS.with(std::cell::Cell::get);
+    let before = count();
+    let deferred = super::completion_from_input_with_options(
+        input.clone(),
+        &main,
+        position,
+        options.clone(),
+        &cancel,
+    );
+    let rounds = count() - before;
+    // A fresh workspace: the first one's cached closure now holds the chain.
+    let (_temp, input, main, position) = ancestor_chain(3);
+    let before = count();
+    let eager = super::completion_from_input_within(
+        input,
+        &main,
+        position,
+        options,
+        &|_, _| false,
+        &cancel,
+    );
+    assert_eq!(count() - before, rounds, "one computation per request");
+    let deferred = deferred.value.expect("deferred completion");
+    let eager = eager.value.expect("eager completion");
+    assert!(eager.eager);
+    assert_eq!(
+        eager
+            .list
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>(),
+        deferred
+            .list
+            .items
+            .iter()
+            .map(|item| &item.label)
+            .collect::<Vec<_>>()
+    );
+    let m1 = eager
+        .list
+        .items
+        .iter()
+        .find(|item| item.label == "M1")
+        .expect("M1");
+    assert!(m1.documentation.is_some(), "rendered eagerly: {m1:?}");
+}

@@ -267,11 +267,38 @@ pub(crate) fn completion_from_input_with_format(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn completion_from_input_with_options(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
     options: CompletionOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
+    completion_from_input_within(input, uri, position, options, &|_, _| true, cancel)
+}
+
+/// Completion whose deferred documentation and detail are rendered from
+/// the answer's own snapshot when `fits` says its observations would not
+/// fit a resolution context (l4d-4nbs final round): one computation per
+/// request. `CompletionResult::eager` says so.
+pub(crate) fn completion_from_input_within(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    fits: &dyn Fn(&[super::rename::SourceRecord], &[Url]) -> bool,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
+    completion_from_input_rounds(input, uri, position, options, fits, cancel)
+}
+
+fn completion_from_input_rounds(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    fits: &dyn Fn(&[super::rename::SourceRecord], &[Url]) -> bool,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionResult> {
     let source_generation = input.source_generation;
@@ -297,7 +324,7 @@ pub(crate) fn completion_from_input_with_options(
     // then answer again (l4d-4nbs review), a few rounds at most.
     let mut demanded: Vec<Url> = Vec::new();
     let mut round = 0;
-    let (snapshot, value) = loop {
+    let (snapshot, mut value) = loop {
         let snapshot = match assistance_snapshot(&input, &uri, Some(position), &demanded, cancel) {
             Ok(snapshot) => snapshot,
             Err(error) => return failed(source_generation, configuration_generation, error),
@@ -334,6 +361,27 @@ pub(crate) fn completion_from_input_with_options(
         demanded.extend(fresh);
     };
     let records = snapshot_records(&snapshot);
+    // Too many observations to resolve items later: render them now from
+    // this same snapshot (l4d-4nbs final round).
+    let deferred = options.defer_documentation || options.defer_detail;
+    let mut eager = false;
+    if deferred && value.is_ok() && !fits(&records, &demanded) {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        value = snapshot.index.completion_with_cancel_and_options(
+            &uri,
+            position,
+            CompletionOptions {
+                defer_documentation: false,
+                defer_detail: false,
+                ..options
+            },
+            cancel,
+        );
+        let _ = snapshot.index.take_binding_demand();
+        eager = true;
+    }
     #[cfg(test)]
     TEST_COMPLETION_COVERAGE.with(|coverage| {
         *coverage.borrow_mut() = answer_coverage(&snapshot)
@@ -346,6 +394,7 @@ pub(crate) fn completion_from_input_with_options(
         // D16: candidates from unproven dependencies may be missing.
         result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
         result.demanded = demanded;
+        result.eager = eager;
         result
     });
     if is_cancelled(cancel) {
@@ -1518,6 +1567,13 @@ fn binding_snapshot_scoped(
 
 #[cfg(test)]
 thread_local! {
+    /// Assistance snapshots this thread built.
+    pub(crate) static TEST_ASSISTANCE_SNAPSHOTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     static TEST_COMPLETION_COVERAGE: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -1546,6 +1602,8 @@ fn assistance_snapshot(
         .collect::<Vec<_>>();
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
+    #[cfg(test)]
+    TEST_ASSISTANCE_SNAPSHOTS.with(|count| count.set(count.get() + 1));
     build_snapshot(
         input,
         std::slice::from_ref(uri),

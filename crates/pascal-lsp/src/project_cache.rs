@@ -43,6 +43,8 @@ const PIN_BUDGET_SHARE: usize = 2;
 const INDEX_BATCH_DISPATCH_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
+/// Paths `IndexStore::crawl_published` remembers; past it, it starts over.
+const MAX_CRAWL_PUBLISHED: usize = 65_536;
 const MAX_OWNERS: usize = 4_096;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -5115,6 +5117,7 @@ impl ProjectCache {
     }
 
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
+        self.index().crawl_published.remove(path);
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         crate::trace::trace!(
@@ -5558,6 +5561,10 @@ struct IndexStore {
     /// batch that has a store job (D40): eviction runs under the index lock,
     /// where no store call may.
     released: Vec<pascal_cache::SnapshotId>,
+    /// What the warm crawl published in this process: per path, the content
+    /// hash and context digest of each publication. Bounded by
+    /// `MAX_CRAWL_PUBLISHED` paths; an invalidated path is forgotten.
+    crawl_published: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
     /// The paths the warm crawl published, in publication order.
     #[cfg(test)]
     published_by_crawl: Vec<PathBuf>,
@@ -5572,6 +5579,7 @@ impl Default for IndexStore {
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
             released: Vec::new(),
+            crawl_published: HashMap::new(),
             #[cfg(test)]
             published_by_crawl: Vec::new(),
         }
@@ -5924,13 +5932,38 @@ impl ProjectCache {
     /// The warm crawl published `path`'s facts (R8-2/D42): every context
     /// index asks the store for them again before it extracts the member.
     /// Nothing enters an index here.
-    pub(crate) fn note_published(&self, path: &Path) {
+    /// `hash` and `context` (the context's cache digest) say what was
+    /// published, so the crawl does not publish it again in this process.
+    pub(crate) fn note_published(&self, path: &Path, hash: u64, context: pascal_cache::Digest) {
         let mut index = self.index();
         for stored in index.contexts.values_mut() {
             stored.index.clear_reuse_tried(path);
         }
+        if index.crawl_published.len() >= MAX_CRAWL_PUBLISHED
+            && !index.crawl_published.contains_key(path)
+        {
+            index.crawl_published.clear();
+        }
+        let published = index.crawl_published.entry(path.to_path_buf()).or_default();
+        if !published.contains(&(hash, context)) {
+            published.push((hash, context));
+        }
         #[cfg(test)]
         index.published_by_crawl.push(path.to_path_buf());
+    }
+
+    /// Whether the crawl published `path` from the bytes hashed `hash` under
+    /// `context` in this process.
+    pub(crate) fn crawl_published(
+        &self,
+        path: &Path,
+        hash: u64,
+        context: pascal_cache::Digest,
+    ) -> bool {
+        self.index()
+            .crawl_published
+            .get(path)
+            .is_some_and(|published| published.contains(&(hash, context)))
     }
 
     #[cfg(test)]

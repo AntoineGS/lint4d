@@ -1271,6 +1271,10 @@ impl Workspace {
         revision: &pascal_core::SourceRevision,
         cancel: &AtomicBool,
     ) {
+        // Considered once per job, before the proofs: a unit skipped for a
+        // transient reason (a refused reservation, a store bypass,
+        // cancellation) is not retried by the same crawl. The Full batch
+        // extracts it, or a later crawl job publishes it.
         if !self.crawl_persists
             || !self.persistent_cache().is_enabled()
             || !self.crawl_considered.insert(uri.clone())
@@ -1292,12 +1296,21 @@ impl Workspace {
         let Ok(path) = uri.to_file_path().map(absolute_path) else {
             return;
         };
-        // Already in the store: this process indexed it from the same bytes
-        // and proved its record.
-        if self
-            .indexed_content_hashes
-            .get(uri)
-            .is_some_and(|hash| self.project_cache.index_member_is_proven(&path, *hash))
+        let Some(hash) = self.indexed_content_hashes.get(uri).copied() else {
+            return;
+        };
+        let Some(context) = self
+            .contexts
+            .get(&key)
+            .map(|state| CacheContextKey::new(&state.context).digest())
+        else {
+            return;
+        };
+        // Already in the store: this process published it from the same
+        // bytes under the same context (an earlier crawl job), or indexed it
+        // so and proved its record.
+        if self.project_cache.crawl_published(&path, hash, context)
+            || self.project_cache.index_member_is_proven(&path, hash)
         {
             return;
         }
@@ -1310,7 +1323,7 @@ impl Workspace {
             _ => return,
         };
         match self.publish_extracted(&key, uri, source, cancel) {
-            Ok(_) => self.project_cache.note_published(&path),
+            Ok(_) => self.project_cache.note_published(&path, hash, context),
             Err(skip) => {
                 crate::trace::trace!("  crawl unit {} not persisted: {skip:?}", path.display());
             }
@@ -6362,6 +6375,109 @@ pub(in crate::workspace) mod tests {
                 "only what the crawl did not publish is loaded"
             );
             assert_eq!(recorded(&view, &key).len(), ROOT_UNITS + 2);
+            cache.shutdown();
+        }
+
+        /// Fix round 1: a crawl paused and dispatched again, in a new job
+        /// workspace, does not publish the units it published before.
+        #[test]
+        fn a_crawl_dispatched_again_publishes_each_unit_once() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, _key, _anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let mut paused = crawl_view(&session, &cache, true);
+            paused.set_dependency_hook(Arc::new(|_, done, _| {
+                if done >= 3 {
+                    Err(CANCELLATION_MESSAGE.to_owned())
+                } else {
+                    Ok(())
+                }
+            }));
+            assert!(
+                paused
+                    .warm_with_cancel(&open, &AtomicBool::new(false))
+                    .is_err()
+            );
+            assert_eq!(session.project_cache.published_by_crawl_for_test().len(), 3);
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                units(root, ROOT_UNITS),
+                "each unit is published once"
+            );
+            // An edit while open makes the unit publishable again.
+            let edited = root.join("lib/U0.pas");
+            named_unit(&edited, "Edited");
+            session.project_cache.invalidate_path(&edited);
+            crawl(&session, &cache, &open);
+            let published = session.project_cache.published_by_crawl_for_test();
+            assert_eq!(published.len(), ROOT_UNITS + 1, "{published:?}");
+            assert_eq!(published.last(), Some(&edited));
+            cache.shutdown();
+        }
+
+        /// Fix round 1 (depth 2): `X`'s compile-time expression reads
+        /// `Main`, whose own conditional reads the edited `Shapes` buffer.
+        #[test]
+        fn a_crawl_never_publishes_a_unit_two_providers_from_an_overlay() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let root_text = "unit Root;\ninterface\nuses X;\nimplementation\nend.\n";
+            write(&root.join("lib/Root.pas"), root_text);
+            write(
+                &root.join("lib/X.pas"),
+                "unit X;\ninterface\nuses Main;\n{$IF Declared(Wide)}\nconst XWide = 1;\n{$ENDIF}\nimplementation\nend.\n",
+            );
+            let (mut session, _key, _anchor) = provider_project_with(
+                root,
+                WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..WorkspaceOptions::default()
+                },
+            );
+            let open = Url::from_file_path(root.join("lib/Root.pas")).unwrap();
+            session
+                .open_document(open.clone(), root_text.to_owned(), 1)
+                .unwrap();
+            session
+                .open_document(
+                    Url::from_file_path(root.join("lib/Shapes.pas")).unwrap(),
+                    EDITED_SHAPES.to_owned(),
+                    1,
+                )
+                .unwrap();
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let crawled = crawl(&session, &cache, &open);
+            for name in ["X", "Main"] {
+                let uri = Url::from_file_path(root.join(format!("lib/{name}.pas"))).unwrap();
+                assert!(crawled.index.parsed_document(&uri).is_some(), "{name}");
+            }
+            let x = Url::from_file_path(root.join("lib/X.pas")).unwrap();
+            let facts = crawled
+                .source_facts(&x, &mut FactBudget::new(1 << 26), &AtomicBool::new(false))
+                .unwrap();
+            assert!(
+                facts.extracted.provider_dependent,
+                "X's facts depend on its providers"
+            );
+            assert!(
+                matches!(
+                    crawled.source_evidence(&x, &AtomicBool::new(false)),
+                    Err(crate::workspace::evidence::EvidenceGap::Overlay)
+                ),
+                "X's session read the Shapes buffer through Main"
+            );
+            let published = session.project_cache.published_by_crawl_for_test();
+            assert!(
+                !published.contains(&root.join("lib/X.pas"))
+                    && !published.contains(&root.join("lib/Main.pas")),
+                "{published:?}"
+            );
             cache.shutdown();
         }
 

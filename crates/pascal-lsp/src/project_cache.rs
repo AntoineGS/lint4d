@@ -2850,6 +2850,12 @@ mod cache_tests {
             warnings: Default::default(),
             dependencies: Default::default(),
             scanned: Default::default(),
+            children: Default::default(),
+            revision: pascal_core::SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            lookup: (0, 0),
             retained_bytes: bytes,
         })
     }

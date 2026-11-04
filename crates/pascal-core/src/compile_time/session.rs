@@ -69,6 +69,31 @@ impl ProviderDependency {
     }
 }
 
+/// The part of a compiled interface's observations and warnings a nested
+/// provider interface contributed: reusing the interface reports it only if
+/// the session has not reported that provider yet (l4d-4nbs D44). A
+/// provider the compilation found compiled already has an empty part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSegment {
+    pub key: ProviderGraphKey,
+    /// Where the importer's lookup of the provider reported.
+    pub lookup: (Range<usize>, Range<usize>),
+    pub observations: Range<usize>,
+    pub warnings: Range<usize>,
+}
+
+/// What looking a provider up reported in one session: where in the
+/// session's reports, and a copy. A session's resolver reports a lookup's
+/// candidates and payload only the first time, so the interface compiled
+/// from the provider carries them for sessions that reuse it.
+#[derive(Debug)]
+pub struct LookupReports {
+    session: u64,
+    observations: Range<usize>,
+    warnings: Range<usize>,
+    reported: (Vec<ResolutionObservation>, Vec<String>),
+}
+
 /// How far a provider compilation scanned one source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedExtent {
@@ -93,6 +118,14 @@ pub struct SharedProviderGraph {
     /// How far its compilation scanned each source, includes included: a
     /// reuse is credited as that scan was.
     pub scanned: Arc<Vec<ScannedExtent>>,
+    /// The nested provider interfaces it used, in observation order.
+    pub children: Arc<Vec<ChildSegment>>,
+    /// The provider source's revision, for the session identity a reuse
+    /// registers.
+    pub revision: crate::SourceRevision,
+    /// How many of the first observations and warnings are the lookup that
+    /// found the provider (l4d-4nbs D44).
+    pub lookup: (usize, usize),
     /// Bytes the graph retains, for the store's accounting.
     pub retained_bytes: usize,
 }
@@ -107,7 +140,21 @@ pub trait SharedProviderGraphs: Send + Sync {
 }
 
 fn provider_graph_key(provider: &ProviderSource) -> ProviderGraphKey {
-    let (content_hash, disk_stamp, overlay_version) = match &provider.unit.source.revision {
+    graph_key(
+        &provider.unit.source.id,
+        &provider.unit.source.revision,
+        &provider.context,
+        &provider.authorized_qualifiers,
+    )
+}
+
+fn graph_key(
+    source: &crate::SourceId,
+    revision: &crate::SourceRevision,
+    context: &ConditionalContext,
+    qualifiers: &[String],
+) -> ProviderGraphKey {
+    let (content_hash, disk_stamp, overlay_version) = match revision {
         crate::SourceRevision::Disk {
             stamp,
             content_hash,
@@ -119,16 +166,12 @@ fn provider_graph_key(provider: &ProviderSource) -> ProviderGraphKey {
         } => (*content_hash, None, Some(*version)),
     };
     ProviderGraphKey {
-        source: provider.unit.source.id.clone(),
+        source: source.clone(),
         content_hash,
         disk_stamp,
         overlay_version,
-        context: provider.context.clone(),
-        qualifiers: provider
-            .authorized_qualifiers
-            .iter()
-            .map(|q| q.to_ascii_lowercase())
-            .collect(),
+        context: context.clone(),
+        qualifiers: qualifiers.iter().map(|q| q.to_ascii_lowercase()).collect(),
     }
 }
 
@@ -740,9 +783,37 @@ struct ProviderGraph {
 
 struct SharedOrigin {
     key: ProviderGraphKey,
+    revision: crate::SourceRevision,
+    lookup: (usize, usize),
     observations: Arc<Vec<ResolutionObservation>>,
     warnings: Arc<Vec<String>>,
     scanned: Arc<Vec<ScannedExtent>>,
+    children: Arc<Vec<ChildSegment>>,
+}
+
+/// `segments` with ranges made relative to `observations` and `warnings`
+/// offsets.
+fn relative_segments(
+    segments: Vec<ChildSegment>,
+    observations: usize,
+    warnings: usize,
+) -> Vec<ChildSegment> {
+    segments
+        .into_iter()
+        .map(|segment| ChildSegment {
+            key: segment.key,
+            lookup: (
+                segment.lookup.0.start.saturating_sub(observations)
+                    ..segment.lookup.0.end.saturating_sub(observations),
+                segment.lookup.1.start.saturating_sub(warnings)
+                    ..segment.lookup.1.end.saturating_sub(warnings),
+            ),
+            observations: segment.observations.start.saturating_sub(observations)
+                ..segment.observations.end.saturating_sub(observations),
+            warnings: segment.warnings.start.saturating_sub(warnings)
+                ..segment.warnings.end.saturating_sub(warnings),
+        })
+        .collect()
 }
 
 /// An address in the caller's stack frame: the stack grows down on every
@@ -846,10 +917,15 @@ struct ProviderSession {
     /// The dependencies each provider compilation in progress has used so
     /// far (innermost last).
     collecting: Vec<Vec<ProviderDependency>>,
+    /// The nested provider interfaces each shared compilation in progress
+    /// has used so far, with absolute observation and warning ranges.
+    segments: Vec<Vec<ChildSegment>>,
     queries: usize,
     next_occurrence: u64,
     /// Where the stack was when the session started (l4d-4nbs D29).
     stack_base: usize,
+    /// Distinguishes the session's lookup ranges from another's.
+    session: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
 }
 
@@ -972,10 +1048,12 @@ impl ProviderSession {
             identities,
             graphs,
             collecting: Vec::new(),
+            segments: Vec::new(),
             declarations,
             queries: 0,
             next_occurrence: 1,
             stack_base: stack_position(),
+            session: 0,
         })
     }
 
@@ -987,6 +1065,7 @@ impl ProviderSession {
         if resolver.shared_provider_graphs().is_some() {
             let range = NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.next_occurrence = range.saturating_mul(1 << 32).max(1);
+            self.session = range;
         }
     }
 
@@ -2173,7 +2252,24 @@ impl ProviderEngine<'_, '_> {
                     )
                 })?;
                 let (result, reports) = outcome.into_parts();
+                let before = (self.observations.len(), self.warnings.len());
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
+                if !self.providers.segments.is_empty() {
+                    let observations = before.0..self.observations.len();
+                    let warnings = before.1..self.warnings.len();
+                    self.budget
+                        .charge(observations.len() + warnings.len() + 1, 0, 0)
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                    state.interfaces[index].lookup = Some(Arc::new(LookupReports {
+                        session: self.providers.session,
+                        reported: (
+                            self.observations[observations.clone()].to_vec(),
+                            self.warnings[warnings.clone()].to_vec(),
+                        ),
+                        observations,
+                        warnings,
+                    }));
+                }
                 state.interfaces[index].attempted = true;
                 if result.owns_candidates() {
                     let failure = if matches!(result.result(), Resolution::Ambiguous { .. }) {
@@ -2272,7 +2368,14 @@ impl ProviderEngine<'_, '_> {
                 continue;
             }
             if let Some(provider) = state.interfaces[index].provided.take() {
-                match self.compile_provider_interface(provider, suffix, pointers, depth + 1)? {
+                let lookup = state.interfaces[index].lookup.take();
+                match self.compile_provider_interface(
+                    provider,
+                    suffix,
+                    pointers,
+                    depth + 1,
+                    lookup.as_deref(),
+                )? {
                     Fact::Known(graph) => {
                         state.interfaces[index].occurrence =
                             self.providers.graphs.iter().find_map(|entry| {
@@ -2334,6 +2437,7 @@ impl ProviderEngine<'_, '_> {
                 .snapshot(budget)
                 .map_err(|r| resolver_error(r, budget))
         })?;
+
         copy.with_budget_mut(self.budget, |copy, budget| {
             let captured = copy.site();
             let mut engine = ProviderEngine {
@@ -2493,12 +2597,47 @@ impl ProviderEngine<'_, '_> {
         }
     }
 
+    /// Compile (or reuse) a provider interface. Inside a shared compilation
+    /// the observations and warnings it adds are recorded as the part that
+    /// provider contributed (l4d-4nbs D44).
     fn compile_provider_interface(
         &mut self,
         provider: AdmittedProviderSource,
         name: &str,
         pointers: bool,
         depth: usize,
+        lookup: Option<&LookupReports>,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        if self.providers.segments.is_empty() {
+            return self.compile_provider_interface_inner(provider, name, pointers, depth, lookup);
+        }
+        admit_provider_context(&provider.context, self.budget, false)?;
+        let key = provider_graph_key(&provider);
+        let (observations, warnings) = (self.observations.len(), self.warnings.len());
+        let result = self.compile_provider_interface_inner(provider, name, pointers, depth, lookup);
+        let session = self.providers.session;
+        if let Some(frame) = self.providers.segments.last_mut() {
+            frame.push(ChildSegment {
+                key,
+                lookup: lookup
+                    .filter(|lookup| lookup.session == session)
+                    .map_or((0..0, 0..0), |lookup| {
+                        (lookup.observations.clone(), lookup.warnings.clone())
+                    }),
+                observations: observations..self.observations.len(),
+                warnings: warnings..self.warnings.len(),
+            });
+        }
+        result
+    }
+
+    fn compile_provider_interface_inner(
+        &mut self,
+        provider: AdmittedProviderSource,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+        lookup: Option<&LookupReports>,
     ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
         self.budget
             .charge(
@@ -2628,10 +2767,15 @@ impl ProviderEngine<'_, '_> {
         if let (Some(store), Some(key)) = (&shared, &shared_key)
             && let Some(hit) = store.get(key)
         {
+            // This session's lookup already reported how the provider was
+            // found; the reused interface's copy of a lookup is not repeated.
+            let found = lookup.is_some_and(|lookup| {
+                lookup.session == self.providers.session && !lookup.reported.0.is_empty()
+            });
             return self.reuse_shared_graph(
                 provider,
                 metadata,
-                (&hit, key.clone()),
+                (&hit, key.clone(), found),
                 name,
                 pointers,
                 depth,
@@ -2666,6 +2810,9 @@ impl ProviderEngine<'_, '_> {
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.active, key, self.budget)?;
         self.providers.collecting.push(Vec::new());
+        if shared.is_some() {
+            self.providers.segments.push(Vec::new());
+        }
         let result = analyze_source_with_providers(
             &provider.unit.source,
             &provider.context,
@@ -2712,6 +2859,11 @@ impl ProviderEngine<'_, '_> {
             .pop()
             .expect("active provider identity");
         let mut dependencies = self.providers.collecting.pop().unwrap_or_default();
+        let children = if shared.is_some() {
+            self.providers.segments.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         dependencies.push(ProviderDependency::of(&provider.unit.source));
         dependencies.sort_by(|a, b| {
             (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
@@ -2739,11 +2891,27 @@ impl ProviderEngine<'_, '_> {
         move_report_vector(self.observations, observations, self.budget)?;
         move_report_vector(self.warnings, warnings, self.budget)?;
         let origin = shared_key.map(|key| {
+            // The lookup's reports come first, so a session that reuses the
+            // interface reports how the provider was found.
+            let (found, warned) = lookup
+                .map(|lookup| (&lookup.reported.0[..], &lookup.reported.1[..]))
+                .unwrap_or_default();
+            let mut observations = found.to_vec();
+            observations.extend_from_slice(&self.observations[observations_before..]);
+            let mut warnings = warned.to_vec();
+            warnings.extend_from_slice(&self.warnings[warnings_before..]);
             Arc::new(SharedOrigin {
                 key,
-                observations: Arc::new(self.observations[observations_before..].to_vec()),
-                warnings: Arc::new(self.warnings[warnings_before..].to_vec()),
+                revision: provider.unit.source.revision.clone(),
+                lookup: (found.len(), warned.len()),
+                observations: Arc::new(observations),
+                warnings: Arc::new(warnings),
                 scanned: Arc::new(self.providers.scanned_since(&scan_before)),
+                children: Arc::new(relative_segments(
+                    children,
+                    observations_before.saturating_sub(found.len()),
+                    warnings_before.saturating_sub(warned.len()),
+                )),
             })
         });
         if !analysis.facts().interface_complete {
@@ -2758,6 +2926,9 @@ impl ProviderEngine<'_, '_> {
                         warnings: origin.warnings.clone(),
                         dependencies: dependencies.clone(),
                         scanned: origin.scanned.clone(),
+                        children: origin.children.clone(),
+                        revision: origin.revision.clone(),
+                        lookup: origin.lookup,
                         retained_bytes: 0,
                     }),
                 );
@@ -2824,6 +2995,9 @@ impl ProviderEngine<'_, '_> {
                     warnings: origin.warnings.clone(),
                     dependencies: dependencies.clone(),
                     scanned: origin.scanned.clone(),
+                    children: origin.children.clone(),
+                    revision: origin.revision.clone(),
+                    lookup: origin.lookup,
                     retained_bytes: shared_retained_bytes(&graph, &origin.observations),
                 }),
             );
@@ -2889,44 +3063,51 @@ impl ProviderEngine<'_, '_> {
         &mut self,
         provider: AdmittedProviderSource,
         metadata: usize,
-        (hit, shared_key): (&SharedProviderGraph, ProviderGraphKey),
+        (hit, shared_key, found): (&SharedProviderGraph, ProviderGraphKey, bool),
         name: &str,
         pointers: bool,
         depth: usize,
     ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
-        let occurrence = hit.occurrence;
+        let identity = ProviderKey {
+            source: provider.unit.source.id.clone(),
+            revision: provider.unit.source.revision.clone(),
+            context: provider.context.clone(),
+            qualifiers: provider.authorized_qualifiers.clone(),
+            occurrence: hit.occurrence,
+        };
+        drop(provider);
+        let index = self.register_shared(identity, metadata, hit, shared_key, found)?;
+        self.prepare_memoized(index, name, pointers, depth)
+    }
+
+    /// Make a shared interface this session's graph for its identity:
+    /// register the identity, report what its compilation observed (each
+    /// nested provider only once a session), its dependencies and its scans.
+    /// Returns its memo index.
+    fn register_shared(
+        &mut self,
+        identity: ProviderKey,
+        metadata: usize,
+        hit: &SharedProviderGraph,
+        shared_key: ProviderGraphKey,
+        found: bool,
+    ) -> Result<usize, ResolverError> {
+        let stack = self.providers.stack_base.saturating_sub(stack_position());
+        let maximum = self.budget.limits().max_provider_stack_bytes;
+        if stack > maximum {
+            return Err(ResolverError::LimitExceeded {
+                limit: "max_provider_stack_bytes",
+                observed: stack,
+                maximum,
+            });
+        }
+        let occurrence = identity.occurrence;
         let key = self
             .budget
-            .admit_owned(1, metadata, metadata, || ProviderKey {
-                source: provider.unit.source.id.clone(),
-                revision: provider.unit.source.revision.clone(),
-                context: provider.context.clone(),
-                qualifiers: provider.authorized_qualifiers.clone(),
-                occurrence,
-            })
+            .admit_owned(1, metadata, metadata, || identity)
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.identities, key, self.budget)?;
-        drop(provider);
-        let bytes = observations_payload(&hit.observations);
-        let observations = self
-            .budget
-            .admit_owned(hit.observations.len(), bytes, bytes, || {
-                hit.observations.as_ref().clone()
-            })
-            .map_err(|r| resolver_error(r, self.budget))?;
-        move_report_vector(self.observations, observations, self.budget)?;
-        let bytes = hit
-            .warnings
-            .iter()
-            .map(|w| w.len() + size_of::<String>())
-            .sum();
-        let warnings = self
-            .budget
-            .admit_owned(hit.warnings.len(), bytes, bytes, || {
-                hit.warnings.as_ref().clone()
-            })
-            .map_err(|r| resolver_error(r, self.budget))?;
-        move_report_vector(self.warnings, warnings, self.budget)?;
+        self.replay_shared(hit, found)?;
         self.note_dependencies(&hit.dependencies)?;
         self.credit_reused_scan(&hit.scanned)?;
         let entry = self
@@ -2937,15 +3118,166 @@ impl ProviderEngine<'_, '_> {
                 dependencies: hit.dependencies.clone(),
                 shared: Some(Arc::new(SharedOrigin {
                     key: shared_key,
+                    revision: hit.revision.clone(),
+                    lookup: hit.lookup,
                     observations: hit.observations.clone(),
                     warnings: hit.warnings.clone(),
                     scanned: hit.scanned.clone(),
+                    children: hit.children.clone(),
                 })),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
-        let index = self.providers.graphs.len() - 1;
-        self.prepare_memoized(index, name, pointers, depth)
+        Ok(self.providers.graphs.len() - 1)
+    }
+
+    /// Report what a shared interface's compilation observed and warned.
+    /// A nested provider's parts (its lookup and its compilation) are
+    /// reported by registering that provider, once a session, or copied
+    /// when the store no longer has it (l4d-4nbs D44).
+    fn replay_shared(
+        &mut self,
+        hit: &SharedProviderGraph,
+        found: bool,
+    ) -> Result<(), ResolverError> {
+        enum Action {
+            Skip,
+            Register(Arc<SharedProviderGraph>),
+            Copy,
+        }
+        // Each part: its observation and warning ranges, the child, and
+        // whether it is the compilation (where a registration happens).
+        let mut parts = Vec::new();
+        for (index, child) in hit.children.iter().enumerate() {
+            if !child.lookup.0.is_empty() || !child.lookup.1.is_empty() {
+                parts.push((child.lookup.0.clone(), child.lookup.1.clone(), index, false));
+            }
+            parts.push((
+                child.observations.clone(),
+                child.warnings.clone(),
+                index,
+                true,
+            ));
+        }
+        parts.sort_by_key(|part| (part.0.start, part.1.start, part.3));
+        self.budget
+            .charge(parts.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let mut actions: Vec<Option<Action>> = hit.children.iter().map(|_| None).collect();
+        let (mut observed, mut warned) = if found { hit.lookup } else { (0, 0) };
+        for (observations, warnings, index, compilation) in parts {
+            if observations.start < observed || warnings.start < warned {
+                // Overlapping parts cannot be told apart: report them whole.
+                continue;
+            }
+            self.replay_part(hit, observed..observations.start, warned..warnings.start)?;
+            observed = observations.end;
+            warned = warnings.end;
+            let child = &hit.children[index];
+            if actions[index].is_none() {
+                let action = if self.has_identity(&child.key)? {
+                    Action::Skip
+                } else {
+                    match self
+                        .resolver
+                        .shared_provider_graphs()
+                        .and_then(|store| store.get(&child.key))
+                    {
+                        Some(nested) => Action::Register(nested),
+                        None => Action::Copy,
+                    }
+                };
+                actions[index] = Some(action);
+            }
+            match actions[index].as_ref() {
+                Some(Action::Copy) => self.replay_part(hit, observations, warnings)?,
+                Some(Action::Register(nested)) if compilation => {
+                    let nested = nested.clone();
+                    let metadata = child.key.source.as_str().len()
+                        + child.key.qualifiers.iter().map(String::len).sum::<usize>();
+                    let identity = ProviderKey {
+                        source: child.key.source.clone(),
+                        revision: nested.revision.clone(),
+                        context: child.key.context.clone(),
+                        qualifiers: child.key.qualifiers.clone(),
+                        occurrence: nested.occurrence,
+                    };
+                    let key = child.key.clone();
+                    if !self.has_identity(&key)? {
+                        // Its lookup part was skipped: the registration
+                        // reports the copy the nested interface carries.
+                        self.register_shared(identity, metadata, &nested, key, false)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A child registered only by its lookup part (its compilation was
+        // not reached) still reports itself.
+        for (index, action) in actions.into_iter().enumerate() {
+            if let Some(Action::Register(nested)) = action {
+                let child = &hit.children[index];
+                if !self.has_identity(&child.key)? {
+                    let metadata = child.key.source.as_str().len();
+                    let identity = ProviderKey {
+                        source: child.key.source.clone(),
+                        revision: nested.revision.clone(),
+                        context: child.key.context.clone(),
+                        qualifiers: child.key.qualifiers.clone(),
+                        occurrence: nested.occurrence,
+                    };
+                    self.register_shared(identity, metadata, &nested, child.key.clone(), false)?;
+                }
+            }
+        }
+        self.replay_part(
+            hit,
+            observed..hit.observations.len(),
+            warned..hit.warnings.len(),
+        )
+    }
+
+    fn replay_part(
+        &mut self,
+        hit: &SharedProviderGraph,
+        observations: Range<usize>,
+        warnings: Range<usize>,
+    ) -> Result<(), ResolverError> {
+        let observations = hit.observations.get(observations).unwrap_or_default();
+        if !observations.is_empty() {
+            let bytes = observations_payload(observations);
+            let owned = self
+                .budget
+                .admit_owned(observations.len(), bytes, bytes, || observations.to_vec())
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.observations, owned, self.budget)?;
+        }
+        let warnings = hit.warnings.get(warnings).unwrap_or_default();
+        if !warnings.is_empty() {
+            let bytes = warnings.iter().map(|w| w.len() + size_of::<String>()).sum();
+            let owned = self
+                .budget
+                .admit_owned(warnings.len(), bytes, bytes, || warnings.to_vec())
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.warnings, owned, self.budget)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the session already has the provider identity `key` names.
+    fn has_identity(&mut self, key: &ProviderGraphKey) -> Result<bool, ResolverError> {
+        self.budget
+            .charge(self.providers.identities.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        Ok(self.providers.identities.iter().any(|identity| {
+            identity.source == key.source
+                && graph_key(
+                    &identity.source,
+                    &identity.revision,
+                    &identity.context,
+                    &identity.qualifiers,
+                ) == *key
+        }))
     }
 
     /// Prepare `name` on the session's graph at `index`. A copy with the
@@ -2968,9 +3300,18 @@ impl ProviderEngine<'_, '_> {
             .charge(self.providers.credits.len() + 1, 0, 0)
             .map_err(|r| resolver_error(r, self.budget))?;
         let scan_before = self.providers.scan_positions();
+        let sharing = self.providers.graphs[index].shared.is_some();
         self.providers.collecting.push(Vec::new());
+        if sharing {
+            self.providers.segments.push(Vec::new());
+        }
         let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1);
         let added = Arc::new(self.providers.collecting.pop().unwrap_or_default());
+        let children = if sharing {
+            self.providers.segments.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let prepared = prepared?;
         self.note_dependencies(&added)?;
         if Arc::ptr_eq(&prepared, &graph) {
@@ -2993,14 +3334,41 @@ impl ProviderEngine<'_, '_> {
         else {
             return Ok(Fact::Known(prepared));
         };
+        // Parts nested providers add while preparing follow what the
+        // shared graph already reports.
+        let children = if children.is_empty() {
+            origin.children.clone()
+        } else {
+            let mut all = origin.children.as_ref().clone();
+            let shift = |range: &Range<usize>, before: usize, base: usize| {
+                if range.is_empty() && range.start == 0 {
+                    return 0..0;
+                }
+                range.start - before + base..range.end - before + base
+            };
+            let (observed, warned) = (origin.observations.len(), origin.warnings.len());
+            all.extend(children.into_iter().map(|segment| ChildSegment {
+                lookup: (
+                    shift(&segment.lookup.0, observations_before, observed),
+                    shift(&segment.lookup.1, warnings_before, warned),
+                ),
+                observations: shift(&segment.observations, observations_before, observed),
+                warnings: shift(&segment.warnings, warnings_before, warned),
+                key: segment.key,
+            }));
+            Arc::new(all)
+        };
         let origin = Arc::new(SharedOrigin {
             key: origin.key.clone(),
+            revision: origin.revision.clone(),
+            lookup: origin.lookup,
             observations: extended(
                 &origin.observations,
                 &self.observations[observations_before..],
             ),
             warnings: extended(&origin.warnings, &self.warnings[warnings_before..]),
             scanned: merged_extents(&origin.scanned, self.providers.scanned_since(&scan_before)),
+            children,
         });
         let entry = self.providers.graphs.value_mut()[index].value_mut();
         entry.shared = Some(origin.clone());
@@ -3011,6 +3379,9 @@ impl ProviderEngine<'_, '_> {
             warnings: origin.warnings.clone(),
             dependencies: entry.dependencies.clone(),
             scanned: origin.scanned.clone(),
+            children: origin.children.clone(),
+            revision: origin.revision.clone(),
+            lookup: origin.lookup,
             retained_bytes: shared_retained_bytes(&prepared, &origin.observations),
         };
         store.put(origin.key.clone(), Arc::new(shared));
@@ -3065,6 +3436,7 @@ impl RootSession<'_, '_> {
                                 site,
                                 graph: None,
                                 occurrence: None,
+                                lookup: None,
                                 pending,
                                 attempted: activity != Truth::True,
                                 provided: None,

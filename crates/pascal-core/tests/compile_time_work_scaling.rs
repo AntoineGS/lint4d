@@ -693,3 +693,91 @@ fn a_reused_provider_interface_is_credited_as_scanned_once() {
         "{first:?} then {second:?}"
     );
 }
+
+fn shared_nested_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let files = [
+        (
+            "A.pas",
+            "unit A; interface uses W; type TA = W.TW; implementation end.",
+        ),
+        (
+            "B.pas",
+            "unit B; interface uses W; type TB = W.TW; implementation end.",
+        ),
+        (
+            "W.pas",
+            "unit W; interface type TW = Int64; implementation end.",
+        ),
+    ];
+    let (dir, path, _) = resolver_with("unit T; interface implementation end.", &files);
+    (dir, path)
+}
+
+/// One request against `store` for a root that queries `units`: its
+/// observations of unit payloads, and its usage.
+fn nested_request(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    store: &std::sync::Arc<KeepAll>,
+    units: &[&str],
+) -> (
+    Vec<std::path::PathBuf>,
+    pascal_core::compile_time::BudgetSnapshot,
+) {
+    let queries = units
+        .iter()
+        .map(|unit| format!("{{$IF SizeOf({unit}.T{unit})=8}}{{$DEFINE H{unit}}}{{$ENDIF}}"))
+        .collect::<String>();
+    let root = format!(
+        "unit T; interface uses {}; {queries} implementation end.",
+        units.join(", ")
+    );
+    let mut source = support::loaded("T.pas", &root);
+    source.path = path.to_path_buf();
+    let mut resolver =
+        resolver_in(dir, path, 64 * 1024 * 1024).with_shared_provider_graphs(store.clone());
+    let analysis = resolver
+        .analyze_compile_time(&source, &NoCancellation)
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    let mut payloads = analysis
+        .observations
+        .iter()
+        .filter_map(|o| match o {
+            pascal_core::ResolutionObservation::Payload { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    payloads.sort();
+    let mut distinct = payloads.clone();
+    distinct.dedup();
+    assert_eq!(distinct, payloads, "each payload is reported once");
+    (payloads, resolver.compile_time_usage())
+}
+
+/// l4d-4nbs D44: a reused interface reports what its nested providers'
+/// compilation observed even when its session found them compiled already,
+/// and two reused interfaces sharing a nested provider report it once, as
+/// compiling them did, and pay for it once: replaying the nested provider
+/// for each overshot max_work on GIFImg.pas.
+#[test]
+fn reused_interfaces_report_a_shared_nested_provider_once() {
+    let (dir, path) = shared_nested_fixture();
+    let fresh = std::sync::Arc::new(KeepAll::default());
+    let (both_compiled, first) = nested_request(dir.path(), &path, &fresh, &["A", "B"]);
+    let (b_alone, _) = nested_request(
+        dir.path(),
+        &path,
+        &std::sync::Arc::new(KeepAll::default()),
+        &["B"],
+    );
+    let (b_reused, _) = nested_request(dir.path(), &path, &fresh, &["B"]);
+    assert_eq!(b_reused, b_alone, "B reused reports W as compiling B did");
+
+    let separately = std::sync::Arc::new(KeepAll::default());
+    nested_request(dir.path(), &path, &separately, &["A"]);
+    nested_request(dir.path(), &path, &separately, &["B"]);
+    let (both_reused, second) = nested_request(dir.path(), &path, &separately, &["A", "B"]);
+    assert_eq!(both_reused, both_compiled, "W is reported once");
+    assert!(second.work <= first.work, "{first:?} then {second:?}");
+}

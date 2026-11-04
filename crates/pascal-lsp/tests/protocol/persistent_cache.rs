@@ -15,7 +15,7 @@ const UNSAVED_MAIN: &str = "unit Main;\ninterface\nuses Provider;\nprocedure Uns
 
 /// The store lands in `environment/cache`, which must not be inside the
 /// workspace root.
-fn launch(environment: &Path) -> TestServer {
+pub(super) fn launch(environment: &Path) -> TestServer {
     let cache_home = environment.join("cache");
     TestServer::launch_test_server_with_environment_path_and_variables(
         environment,
@@ -32,7 +32,7 @@ fn rand_suffix() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn settle(server: &mut TestServer, step: bool) -> Value {
+pub(super) fn settle(server: &mut TestServer, step: bool) -> Value {
     let id = RequestId::from(format!("settle-{step}-{}", rand_suffix()));
     server.send_request(id.clone(), "pascal/testCacheSettle", json!({"step": step}));
     let response = server.response(&id);
@@ -47,7 +47,7 @@ fn configure(server: &mut TestServer, settings: Value) {
     );
 }
 
-fn request(server: &mut TestServer, method: &str, params: Value) -> Value {
+pub(super) fn request(server: &mut TestServer, method: &str, params: Value) -> Value {
     let id = RequestId::from(format!("{method}-{}", rand_suffix()));
     server.send_request(id.clone(), method, params);
     let response = server.response(&id);
@@ -271,14 +271,28 @@ fn a_non_private_cache_directory_is_bypassed_and_left_untouched() {
 
 #[test]
 fn runtime_disable_is_acknowledged_then_performs_no_cache_io() {
-    let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
+    let (_temp, _main, _provider, main_source, provider_source) = standard_workspace();
     let environment = tempfile::tempdir().unwrap();
     let directory = store_directory(environment.path());
+    // The 300-unit project, so that an index batch runs when the disable
+    // arrives; `Main` and `Provider` are members too.
+    let root = super::persistent_index::fixture(environment.path(), super::persistent_index::UNITS);
+    let main = root.join("lib/Main.pas");
+    let provider = root.join("lib/Provider.pas");
+    let app = root.join("App.dpr");
+    write_file(&main, &main_source);
+    write_file(&provider, &provider_source);
+    pascal_project::backdate_tree_for_test(&root);
     let mut server = launch(environment.path());
-    server.initialize(main.parent().unwrap(), Value::Null);
+    server.initialize(&root, Value::Null);
+    open(&mut server, &app, 1, &fs::read_to_string(&app).unwrap());
     open(&mut server, &main, 1, &main_source);
     change(&mut server, &main, 2, UNSAVED_MAIN);
     assert_eq!(settle(&mut server, false)["status"]["state"], "enabled");
+    let running = super::persistent_index::wait_index(&mut server, |context| {
+        context["members"].as_u64().unwrap() > 0
+    });
+    assert_eq!(running["complete"], false, "{running}");
     let hover_before = hover(&mut server, &main, UNSAVED_MAIN, "UnsavedRoutine");
 
     configure(&mut server, json!({"persistentCacheEnabled": false}));
@@ -295,6 +309,19 @@ fn runtime_disable_is_acknowledged_then_performs_no_cache_io() {
     assert_eq!(
         hover(&mut server, &main, UNSAVED_MAIN, "UnsavedRoutine"),
         hover_before
+    );
+    // The batch that was running completes memory-only.
+    let done =
+        super::persistent_index::wait_index(&mut server, |context| context["complete"] == true);
+    assert_eq!(done["reused"], 0, "{done}");
+    assert_eq!(
+        done["members"].as_u64().unwrap(),
+        super::persistent_index::MEMBERS + 2,
+        "{done}"
+    );
+    assert_eq!(
+        settle(&mut server, false)["operations"].as_u64().unwrap(),
+        operations
     );
     definition(&mut server, &main, UNSAVED_MAIN, "PublicRoutine");
     request(

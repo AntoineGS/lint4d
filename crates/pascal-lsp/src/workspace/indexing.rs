@@ -1194,6 +1194,19 @@ impl Workspace {
         if !self.may_publish(key) || !self.persistent_cache().is_enabled() {
             return Err(PersistSkip::Unavailable);
         }
+        self.publish_extracted(key, uri, source, cancel)
+    }
+
+    /// `persist_extracted` once the caller proved its view may publish
+    /// `key`'s facts: a baseline view (`may_publish`), or the warm crawl's
+    /// per-unit disk proof (`publish_crawled_unit`).
+    fn publish_extracted(
+        &self,
+        key: &ContextKey,
+        uri: &Url,
+        source: SourceFacts,
+        cancel: &AtomicBool,
+    ) -> Result<ProvenRecord, PersistSkip> {
         let path = uri
             .to_file_path()
             .map_err(|()| PersistSkip::Prepare(super::persist::PersistError::NotIndexed))?;
@@ -1242,6 +1255,75 @@ impl Workspace {
             job.observe(&bypass);
             PersistSkip::Store(bypass)
         })
+    }
+
+    /// R8-2/D42: publish a unit the warm crawl just indexed in the session
+    /// view, so a first run need not wait for the crawl before it persists.
+    /// Only a unit proven disk-only is published: read from disk and no
+    /// open, overlaid or deleted root (1); facts with no buffer root or
+    /// include (2); evidence and keys `prepare_from_facts` accepts (3); a
+    /// context built from saved project files (4). The facts come from the
+    /// crawl's own parse. Nothing enters the index; a failure leaves the
+    /// unit unpublished and is never an error to the crawl.
+    pub(super) fn publish_crawled_unit(
+        &mut self,
+        uri: &Url,
+        revision: &pascal_core::SourceRevision,
+        cancel: &AtomicBool,
+    ) {
+        if !self.crawl_persists
+            || !self.persistent_cache().is_enabled()
+            || !self.crawl_considered.insert(uri.clone())
+        {
+            return;
+        }
+        let Some(key) = self.document_contexts.get(uri).cloned() else {
+            return;
+        };
+        if !self.crawl_context_is_disk_only(&key) {
+            self.crawl_private.store(true, Ordering::Relaxed);
+            return;
+        }
+        if !matches!(revision, pascal_core::SourceRevision::Disk { .. })
+            || self.root_is_session_private(uri)
+        {
+            return;
+        }
+        let Ok(path) = uri.to_file_path().map(absolute_path) else {
+            return;
+        };
+        // Already in the store: this process indexed it from the same bytes
+        // and proved its record.
+        if self
+            .indexed_content_hashes
+            .get(uri)
+            .is_some_and(|hash| self.project_cache.index_member_is_proven(&path, *hash))
+        {
+            return;
+        }
+        let source = match self.source_facts(
+            uri,
+            &mut FactBudget::new(pascal_cache::MAX_ARTIFACT_CONTENT_BYTES),
+            cancel,
+        ) {
+            Ok(source) if source.extracted.persistable.is_ok() => source,
+            _ => return,
+        };
+        match self.publish_extracted(&key, uri, source, cancel) {
+            Ok(_) => self.project_cache.note_published(&path),
+            Err(skip) => {
+                crate::trace::trace!("  crawl unit {} not persisted: {skip:?}", path.display());
+            }
+        }
+    }
+
+    fn crawl_context_is_disk_only(&mut self, key: &ContextKey) -> bool {
+        if let Some(known) = self.crawl_disk_contexts.get(key) {
+            return *known;
+        }
+        let disk_only = self.context_inputs_are_disk_only(key);
+        self.crawl_disk_contexts.insert(key.clone(), disk_only);
+        disk_only
     }
 
     /// Prove the record `inputs` derive for a member the index holds: found
@@ -5500,6 +5582,13 @@ pub(in crate::workspace) mod tests {
         const EDITED_SHAPES: &str = "unit Shapes;\ninterface\ntype TPair = record A, B, C: Integer; end;\nimplementation\nend.\n";
 
         fn provider_project(root: &Path) -> (Workspace, ContextKey, IndexAnchor) {
+            provider_project_with(root, WorkspaceOptions::default())
+        }
+
+        fn provider_project_with(
+            root: &Path,
+            options: WorkspaceOptions,
+        ) -> (Workspace, ContextKey, IndexAnchor) {
             write(
                 &root.join("lib/Main.pas"),
                 std::str::from_utf8(PROVIDER_MAIN).unwrap(),
@@ -5512,7 +5601,7 @@ pub(in crate::workspace) mod tests {
                 root,
                 "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
                 "",
-                WorkspaceOptions::default(),
+                options,
             );
             (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
         }
@@ -6003,6 +6092,342 @@ pub(in crate::workspace) mod tests {
             );
             assert_eq!(crate::navigation::test_document_parse_count(), 0);
             assert!(progress.complete && progress.reused == 12, "{progress:?}");
+            cache.shutdown();
+        }
+
+        /// The open-file crawl of `open` in `session`'s own view, with its
+        /// overlays, under `cache`, as the warmer runs it (R8-2/D42).
+        fn crawl_view(session: &Workspace, cache: &PersistentCache, persists: bool) -> Workspace {
+            let mut input = session.analysis_input();
+            input.persistent_cache = cache.clone();
+            let mut crawl = Workspace::from_analysis_input(&input);
+            crawl.set_crawl_persists(persists);
+            crawl
+        }
+
+        fn crawl(session: &Workspace, cache: &PersistentCache, open: &Url) -> Workspace {
+            let mut crawl = crawl_view(session, cache, true);
+            crawl
+                .warm_with_cancel(open, &AtomicBool::new(false))
+                .expect("crawl");
+            crawl
+        }
+
+        const ROOT_UNITS: usize = 6;
+
+        /// `lib/Root.pas`, whose interface uses `U0..U5`, in the project of
+        /// `indexed_project`, configured; `Root` is open, as saved.
+        fn crawled_project(root: &Path) -> (Workspace, ContextKey, IndexAnchor, Url) {
+            let uses = (0..ROOT_UNITS)
+                .map(|index| format!("U{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!("unit Root;\ninterface\nuses {uses};\nimplementation\nend.\n");
+            write(&root.join("lib/Root.pas"), &text);
+            let (mut session, key, anchor) = indexed_project(
+                root,
+                ROOT_UNITS + 1,
+                WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..WorkspaceOptions::default()
+                },
+            );
+            let open = Url::from_file_path(root.join("lib/Root.pas")).unwrap();
+            session.open_document(open.clone(), text, 1).unwrap();
+            (session, key, anchor, open)
+        }
+
+        fn units(root: &Path, count: usize) -> Vec<PathBuf> {
+            (0..count)
+                .map(|index| root.join(format!("lib/U{index}.pas")))
+                .collect()
+        }
+
+        fn fresh(workspace: &Workspace, key: &ContextKey) -> Vec<PathBuf> {
+            let mut fresh = members(workspace, key)
+                .into_iter()
+                .filter(|path| state(workspace, key, path) == Some(MemberState::Fresh))
+                .collect::<Vec<_>>();
+            fresh.sort();
+            fresh
+        }
+
+        fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+            paths.sort();
+            paths
+        }
+
+        #[test]
+        fn a_crawl_publishes_the_disk_units_it_analyses_for_a_restart() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let crawled = crawl(&session, &cache, &open);
+            assert!(crawled.index.parsed_document(&open).is_some());
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                units(root, ROOT_UNITS),
+                "every disk unit, never the open root"
+            );
+            cache.shutdown();
+
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert_eq!(progress.reused, ROOT_UNITS, "{progress:?}");
+            assert_eq!(fresh(&restarted, &key), units(root, ROOT_UNITS));
+            assert_eq!(recorded(&restarted, &key).len(), ROOT_UNITS);
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_crawl_without_persistence_publishes_nothing() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, _key, anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let mut crawled = crawl_view(&session, &cache, false);
+            crawled
+                .warm_with_cancel(&open, &AtomicBool::new(false))
+                .expect("crawl");
+            assert!(
+                session
+                    .project_cache
+                    .published_by_crawl_for_test()
+                    .is_empty()
+            );
+            assert!(!crawled.crawl_private_signal().load(Ordering::Relaxed));
+            cache.shutdown();
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 0, "{progress:?}");
+            cache.shutdown();
+
+            // A disabled store: the crawl flag alone publishes nothing.
+            let other_root = tempfile::tempdir().unwrap();
+            let other_store = private_dir();
+            let (other, _, _, other_open) = crawled_project(other_root.path());
+            let disabled = start(&other, other_store.path(), false);
+            let crawled = crawl(&other, &disabled, &other_open);
+            assert!(crawled.index.parsed_document(&other_open).is_some());
+            assert!(other.project_cache.published_by_crawl_for_test().is_empty());
+        }
+
+        #[test]
+        fn a_crawl_never_publishes_an_open_or_overlay_dependent_unit() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let root_text = "unit Root;\ninterface\nuses Main, Other;\nimplementation\nend.\n";
+            write(&root.join("lib/Root.pas"), root_text);
+            named_unit(&root.join("lib/Other.pas"), "FromOther");
+            let (mut session, key, anchor) = provider_project_with(
+                root,
+                WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..WorkspaceOptions::default()
+                },
+            );
+            let (shapes, main, other) = (
+                root.join("lib/Shapes.pas"),
+                root.join("lib/Main.pas"),
+                root.join("lib/Other.pas"),
+            );
+            let open = Url::from_file_path(root.join("lib/Root.pas")).unwrap();
+            session
+                .open_document(open.clone(), root_text.to_owned(), 1)
+                .unwrap();
+            session
+                .open_document(
+                    Url::from_file_path(&shapes).unwrap(),
+                    EDITED_SHAPES.to_owned(),
+                    1,
+                )
+                .unwrap();
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let crawled = crawl(&session, &cache, &open);
+            for path in [&main, &shapes, &other] {
+                let uri = Url::from_file_path(path).unwrap();
+                assert!(
+                    crawled.index.parsed_document(&uri).is_some(),
+                    "{} was analysed",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                session.project_cache.published_by_crawl_for_test(),
+                vec![other.clone()],
+                "only the unit that reads nothing from a buffer"
+            );
+            cache.shutdown();
+
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 1, "{progress:?}");
+            assert_eq!(fresh(&restarted, &key), vec![other]);
+            for path in [&main, &shapes, &root.join("lib/Root.pas")] {
+                assert!(
+                    !restarted.project_cache.index_member_has_record(&key, path),
+                    "{} has no record",
+                    path.display()
+                );
+            }
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_crawl_under_an_overlaid_project_file_publishes_nothing() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (mut session, key, anchor, open) = crawled_project(root);
+            // `.dproj` buffers are not held; the main source is metadata.
+            session
+                .open_document(
+                    Url::from_file_path(root.join("App.dpr")).unwrap(),
+                    "program App; { unsaved } begin end.\n".to_owned(),
+                    1,
+                )
+                .unwrap();
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let crawled = crawl(&session, &cache, &open);
+            assert!(!crawled.context_inputs_are_disk_only(&key));
+            assert!(crawled.crawl_private_signal().load(Ordering::Relaxed));
+            assert!(
+                session
+                    .project_cache
+                    .published_by_crawl_for_test()
+                    .is_empty()
+            );
+            cache.shutdown();
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 0, "{progress:?}");
+            cache.shutdown();
+        }
+
+        #[test]
+        fn extraction_after_the_crawl_reuses_what_the_crawl_published() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let progress = advance(
+                &mut view,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 0, "a cold store: {progress:?}");
+            assert_eq!(progress.reuse_pending, 0, "every member was tried");
+
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                units(root, ROOT_UNITS)
+            );
+
+            let loaded = record_loads();
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.reused, ROOT_UNITS, "{progress:?}");
+            assert_eq!(
+                sorted(loaded.borrow().clone()),
+                vec![root.join("App.dpr"), root.join("lib/Root.pas")],
+                "only what the crawl did not publish is loaded"
+            );
+            assert_eq!(recorded(&view, &key).len(), ROOT_UNITS + 2);
+            cache.shutdown();
+        }
+
+        /// A unit this process already indexed from the same bytes, with a
+        /// proven record, is in the store: the crawl does not publish it
+        /// again.
+        #[test]
+        fn a_crawl_skips_units_the_index_already_proved() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let (mut view, cache) = persisting_view(&session, store.path());
+            assert!(advance(&mut view, &anchor, IndexBound::all()).complete);
+            assert_eq!(recorded(&view, &key).len(), ROOT_UNITS + 2);
+            let crawled = crawl(&session, &cache, &open);
+            assert!(crawled.index.parsed_document(&open).is_some());
+            assert!(
+                session
+                    .project_cache
+                    .published_by_crawl_for_test()
+                    .is_empty(),
+                "every unit was proven by the index"
+            );
+            cache.shutdown();
+        }
+
+        #[test]
+        fn a_crawl_cancelled_after_n_units_resumes_from_them() {
+            const DONE: usize = 3;
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let mut crawled = crawl_view(&session, &cache, true);
+            crawled.set_dependency_hook(Arc::new(|_, done, _| {
+                if done >= DONE {
+                    Err(CANCELLATION_MESSAGE.to_owned())
+                } else {
+                    Ok(())
+                }
+            }));
+            assert!(
+                crawled
+                    .warm_with_cancel(&open, &AtomicBool::new(false))
+                    .is_err()
+            );
+            let published = sorted(session.project_cache.published_by_crawl_for_test());
+            assert_eq!(published.len(), DONE, "{published:?}");
+            assert!(
+                published
+                    .iter()
+                    .all(|path| units(root, ROOT_UNITS).contains(path))
+            );
+            cache.shutdown();
+
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, DONE, "{progress:?}");
+            assert_eq!(fresh(&restarted, &key), published);
             cache.shutdown();
         }
     }

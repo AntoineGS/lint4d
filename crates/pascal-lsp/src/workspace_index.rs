@@ -677,6 +677,24 @@ impl ContextIndex {
         }
     }
 
+    /// The store gained `path`'s facts since it was asked: ask again.
+    pub(crate) fn clear_reuse_tried(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            self.members[id.0 as usize].reuse_tried = false;
+        }
+    }
+
+    /// Whether `path` is Fresh from the bytes hashed `hash`, with a proven
+    /// record.
+    pub(crate) fn proven_with_hash(&self, path: &Path, hash: u64) -> bool {
+        self.id_of(path).is_some_and(|id| {
+            let member = &self.members[id.0 as usize];
+            matches!(member.state(), MemberState::Fresh)
+                && member.record.is_some()
+                && member.hash == Some(hash)
+        })
+    }
+
     /// The facts just inserted came from the store.
     pub(crate) fn mark_reused(&mut self, path: &Path) {
         if let Some(id) = self.id_of(path) {

@@ -5558,6 +5558,9 @@ struct IndexStore {
     /// batch that has a store job (D40): eviction runs under the index lock,
     /// where no store call may.
     released: Vec<pascal_cache::SnapshotId>,
+    /// The paths the warm crawl published, in publication order.
+    #[cfg(test)]
+    published_by_crawl: Vec<PathBuf>,
 }
 
 impl Default for IndexStore {
@@ -5569,6 +5572,8 @@ impl Default for IndexStore {
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
             released: Vec::new(),
+            #[cfg(test)]
+            published_by_crawl: Vec::new(),
         }
     }
 }
@@ -5914,6 +5919,33 @@ impl ProjectCache {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_reuse_tried(path);
         }
+    }
+
+    /// The warm crawl published `path`'s facts (R8-2/D42): every context
+    /// index asks the store for them again before it extracts the member.
+    /// Nothing enters an index here.
+    pub(crate) fn note_published(&self, path: &Path) {
+        let mut index = self.index();
+        for stored in index.contexts.values_mut() {
+            stored.index.clear_reuse_tried(path);
+        }
+        #[cfg(test)]
+        index.published_by_crawl.push(path.to_path_buf());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published_by_crawl_for_test(&self) -> Vec<PathBuf> {
+        self.index().published_by_crawl.clone()
+    }
+
+    /// Whether some context index holds `path` indexed from the bytes
+    /// hashed `hash`, with a record this process proved: its facts are in
+    /// the store already.
+    pub(crate) fn index_member_is_proven(&self, path: &Path, hash: u64) -> bool {
+        self.index()
+            .contexts
+            .values()
+            .any(|stored| stored.index.proven_with_hash(path, hash))
     }
 
     pub(crate) fn mark_index_reused(&self, key: &ContextKey, path: &Path) {

@@ -3092,6 +3092,17 @@ pub struct Workspace {
     baseline: bool,
     /// `WorkspaceInput::session_private_paths`.
     session_private_paths: Arc<HashSet<String>>,
+    /// The warm crawl publishes the disk-proven units it analyses
+    /// (R8-2/D42). Only the warmer sets it, while the store is enabled.
+    crawl_persists: bool,
+    /// Set when the crawl met a context built from unsaved project input:
+    /// it publishes nothing, and the warmer interleaves extraction.
+    crawl_private: Arc<AtomicBool>,
+    /// Whether each context the crawl met came from saved project files.
+    /// A job's input does not change, so one answer per context holds.
+    crawl_disk_contexts: HashMap<ContextKey, bool>,
+    /// The units the crawl considered for publication.
+    crawl_considered: HashSet<Url>,
     /// Project contexts discovered by this workspace and the request
     /// workspaces derived from it.
     shared_discoveries: SharedDiscoveries,
@@ -7801,6 +7812,11 @@ impl Workspace {
                     if !dependencies.contains(&dependency_uri) {
                         dependencies.push(dependency_uri.clone());
                     }
+                    self.publish_crawled_unit(
+                        &dependency_uri,
+                        &dependency.source.revision,
+                        cancel.unwrap_or(&no_cancel),
+                    );
                 }
             }
             if let Some(hook) = &self.dependency_hook {
@@ -7949,6 +7965,16 @@ impl Workspace {
 
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
         self.dependency_hook = Some(hook);
+    }
+
+    /// The warm crawl publishes the disk-proven units it analyses (R8-2/D42).
+    pub(crate) fn set_crawl_persists(&mut self, persists: bool) {
+        self.crawl_persists = persists;
+    }
+
+    /// Set once the crawl meets a context built from unsaved project input.
+    pub(crate) fn crawl_private_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.crawl_private)
     }
 
     /// Loads `uri` and every direct import into the shared cache.

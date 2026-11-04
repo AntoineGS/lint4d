@@ -1,6 +1,9 @@
 //! D45: a switch the project, its option sets, its configurations and the
 //! installation leave unset takes dcc's default for the selected installation
 //! and platform; only a switch whose value cannot be determined stays unknown.
+//! Library code takes a switch only where the project's value is that
+//! default, because dcc compiles search-path sources with the project's
+//! switches and the switches of shipped DCUs are not known.
 
 use std::{fs, path::Path};
 
@@ -15,8 +18,9 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
-/// The `dcc32 --no-config --help` defaults of Delphi 2010 (21.0), XE3 (24.0)
-/// and the Delphi 13 (37.0) dcc64, for the switches `IFOPT` evaluates.
+/// What `{$IFOPT X+}` answers under `dcc --no-config` with no switch given,
+/// observed by compiling a probe program with dcc32 21.0, 24.0 and 37.0 and
+/// dcc64 24.0 and 37.0.
 const DCC_DEFAULTS: &[(&str, F)] = &[
     ("B", F::False),
     ("C", F::True),
@@ -36,13 +40,46 @@ struct Workspace {
     root: std::path::PathBuf,
 }
 
+struct Setup<'a> {
+    installation: &'a str,
+    platform: &'a str,
+    /// Project groups after the configuration groups.
+    groups: &'a str,
+    /// Extra lines for `.delphi-tools.local.toml`; `None` selects
+    /// `installation` for the project.
+    selector: Option<&'a str>,
+    /// `environment.proj` of the installation's APPDATA, if any.
+    environment: Option<&'a str>,
+}
+
+impl Default for Setup<'_> {
+    fn default() -> Self {
+        Self {
+            installation: "7.0",
+            platform: "Win32",
+            groups: "",
+            selector: None,
+            environment: None,
+        }
+    }
+}
+
 impl Workspace {
-    /// A Delphi 2010-shaped project (Base/Debug configurations and the
-    /// standard targets import) selecting installation 7.0 for Win32.
-    /// `groups` is inserted after the configuration groups.
+    /// A Delphi 2010-shaped project for installation 7.0 on Win32.
     fn new(groups: &str) -> Self {
+        Self::with(Setup {
+            groups,
+            ..Setup::default()
+        })
+    }
+
+    /// A RAD Studio template-shaped project: Base, per-platform Base and
+    /// per-configuration groups, the standard targets import and the
+    /// platform list.
+    fn with(setup: Setup<'_>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
+        let groups = setup.groups;
         write(&root.join("project/App.dpr"), "program App; begin end.");
         write(
             &root.join("library/External.pas"),
@@ -53,17 +90,33 @@ impl Workspace {
             &format!(
                 r#"<Project>
   <PropertyGroup>
-    <ProjectVersion>12.0</ProjectVersion>
     <MainSource>App.dpr</MainSource>
     <Config Condition="'$(Config)'==''">Debug</Config>
-    <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+    <Base>True</Base>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''">
+    <Base_Win32>true</Base_Win32>
+    <CfgParent>Base</CfgParent>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win64' and '$(Base)'=='true') or '$(Base_Win64)'!=''">
+    <Base_Win64>true</Base_Win64>
+    <CfgParent>Base</CfgParent>
     <Base>true</Base>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_1)'!=''">
     <Cfg_1>true</Cfg_1>
     <CfgParent>Base</CfgParent>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win64' and '$(Cfg_1)'=='true') or '$(Cfg_1_Win64)'!=''">
+    <Cfg_1_Win64>true</Cfg_1_Win64>
+    <CfgParent>Cfg_1</CfgParent>
+    <Cfg_1>true</Cfg_1>
     <Base>true</Base>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Base)'!=''">
@@ -74,42 +127,62 @@ impl Workspace {
   </PropertyGroup>
   {groups}
   <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
+  <ProjectExtensions><BorlandProject><Platforms>
+    <Platform value="Win32">True</Platform><Platform value="Win64">True</Platform>
+  </Platforms></BorlandProject></ProjectExtensions>
 </Project>"#
             ),
         );
-        write(&root.join("sdk/bin/CodeGear.Delphi.Targets"), "<Project/>");
+        let installation = setup.installation;
+        let sdk = root.join(format!("sdk/{installation}"));
+        let appdata = root.join(format!("appdata/{installation}"));
+        write(&sdk.join("bin/CodeGear.Delphi.Targets"), "<Project/>");
+        if let Some(environment) = setup.environment {
+            write(&appdata.join("environment.proj"), environment);
+        }
+        let selector = setup.selector.map_or_else(
+            || format!("[projects.'project/App.dproj']\ninstallation = '{installation}'\n"),
+            str::to_owned,
+        );
         write(
             &root.join(".delphi-tools.local.toml"),
             &format!(
-                "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n\
-                 [projects.'project/App.dproj']\ninstallation = '7.0'\n",
-                root.join("sdk").display()
+                "[installations.\"{installation}\".properties]\nBDS = '{}'\nAPPDATA = '{}'\nPlatform = '{}'\n{selector}",
+                sdk.display(),
+                appdata.display(),
+                setup.platform,
             ),
         );
         Self { _temp: temp, root }
     }
 
-    fn context(&self) -> ProjectContext {
+    fn discover(&self, conditional_context: ConditionalContext) -> ProjectContext {
         let context = ProjectContext::discover_with_overrides(
             &self.root.join("project/App.dpr"),
             std::slice::from_ref(&self.root),
             &ProjectOptions {
                 project_file: Some(self.root.join("project/App.dproj")),
+                conditional_context,
                 ..ProjectOptions::default()
             },
             &OverrideSession::new(None),
         )
         .unwrap()
         .context;
+        std::sync::Arc::unwrap_or_clone(context)
+    }
+
+    fn context(&self) -> ProjectContext {
+        let context = self.discover(ConditionalContext::default());
         assert!(
             matches!(
                 context.installation_selection(),
-                Some(InstallationSelection::Selected { id, .. }) if id == "7.0"
+                Some(InstallationSelection::Selected { .. })
             ),
             "{:?}",
             context.installation_selection()
         );
-        std::sync::Arc::unwrap_or_clone(context)
+        context
     }
 
     fn library(&self) -> std::path::PathBuf {
@@ -122,6 +195,17 @@ fn assert_defaults(context: &ConditionalContext, which: &str) {
         assert_eq!(
             context.option(option),
             *expected,
+            "{which} context, ${option}: {:?}",
+            context.options
+        );
+    }
+}
+
+fn assert_all_unknown(context: &ConditionalContext, which: &str) {
+    for (option, _) in DCC_DEFAULTS {
+        assert_eq!(
+            context.option(option),
+            F::Unknown,
             "{which} context, ${option}: {:?}",
             context.options
         );
@@ -160,11 +244,12 @@ fn compiler_version_is_known_in_both_contexts_for_a_configured_installation() {
 }
 
 #[test]
-fn a_project_setting_wins_over_the_default_in_project_code_only() {
+fn a_project_setting_wins_in_project_code_and_leaves_library_code_unknown() {
     let workspace = Workspace::new(
         "<PropertyGroup Condition=\"'$(Base)'!=''\">\
            <DCC_RangeChecking>true</DCC_RangeChecking>\
            <DCC_IntegerOverflowCheck>true</DCC_IntegerOverflowCheck>\
+           <DCC_IOChecking>true</DCC_IOChecking>\
          </PropertyGroup>\
          <PropertyGroup Condition=\"'$(Cfg_1)'!=''\">\
            <DCC_Optimize>false</DCC_Optimize>\
@@ -178,9 +263,67 @@ fn a_project_setting_wins_over_the_default_in_project_code_only() {
     assert_eq!(project.option("O"), F::False);
     assert_eq!(project.option("C"), F::False);
     assert_eq!(project.option("I"), F::True);
-    // Library code is compiled with the compiler's defaults, not the
-    // project's switches (as it is with the project's defines).
-    assert_defaults(context.library_conditional_context(), "library");
+    // Library code is compiled with the project's switches when its source
+    // is on the search path, and with unknown ones when a DCU ships: only a
+    // project value equal to the default gives it a definite answer.
+    let library = context.library_conditional_context();
+    for option in ["R", "Q", "O", "C"] {
+        assert_eq!(library.option(option), F::Unknown, "${option}");
+    }
+    assert_eq!(library.option("I"), F::True);
+    assert_eq!(library.option("B"), F::False);
+}
+
+#[test]
+fn a_template_shaped_project_keeps_library_code_unknown_where_it_differs() {
+    let workspace = Workspace::new(
+        "<PropertyGroup Condition=\"'$(Base_Win32)'!=''\">\
+           <DCC_RangeChecking>true</DCC_RangeChecking>\
+         </PropertyGroup>\
+         <PropertyGroup Condition=\"'$(Cfg_1)'!=''\">\
+           <DCC_Optimize>False</DCC_Optimize>\
+         </PropertyGroup>",
+    );
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("O"), F::False);
+    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(
+        context.library_conditional_context().option("O"),
+        F::Unknown
+    );
+    assert_eq!(
+        context.library_conditional_context().option("R"),
+        F::Unknown
+    );
+    assert_eq!(context.library_conditional_context().option("Q"), F::False);
+}
+
+#[test]
+fn per_platform_groups_select_the_win64_values() {
+    let workspace = Workspace::with(Setup {
+        installation: "37.0",
+        platform: "Win64",
+        groups: "<PropertyGroup Condition=\"'$(Base_Win32)'!=''\">\
+                   <DCC_RangeChecking>true</DCC_RangeChecking>\
+                 </PropertyGroup>\
+                 <PropertyGroup Condition=\"'$(Cfg_1_Win64)'!=''\">\
+                   <DCC_IntegerOverflowCheck>true</DCC_IntegerOverflowCheck>\
+                 </PropertyGroup>",
+        ..Setup::default()
+    });
+    let context = workspace.context();
+    assert_eq!(context.platform(), Some("Win64"));
+    assert_eq!(
+        context.conditional_context().compiler_version,
+        Some(CompilerVersion::new(37, 0))
+    );
+    assert_eq!(context.conditional_context().option("R"), F::False);
+    assert_eq!(context.conditional_context().option("Q"), F::True);
+    assert_eq!(context.library_conditional_context().option("R"), F::False);
+    assert_eq!(
+        context.library_conditional_context().option("Q"),
+        F::Unknown
+    );
 }
 
 #[test]
@@ -193,25 +336,24 @@ fn an_option_set_setting_wins_over_the_default() {
     let context = workspace.context();
     assert_eq!(context.conditional_context().option("R"), F::True);
     assert_eq!(context.conditional_context().option("Q"), F::False);
+    assert_eq!(
+        context.library_conditional_context().option("R"),
+        F::Unknown
+    );
 }
 
 #[test]
 fn an_unknown_import_leaves_the_switches_it_could_set_unknown() {
     let workspace = Workspace::new("<Import Project=\"Missing.optset\"/>");
     let context = workspace.context();
-    for (option, _) in DCC_DEFAULTS {
-        assert_eq!(
-            context.conditional_context().option(option),
-            F::Unknown,
-            "${option}"
-        );
-    }
-    // The project's own metadata does not reach library code.
-    assert_defaults(context.library_conditional_context(), "library");
+    assert_all_unknown(context.conditional_context(), "project");
+    assert_all_unknown(context.library_conditional_context(), "library");
 }
 
+/// An unknown import may set `GlobalOptionFile`, which CodeGear.Common.Targets
+/// imports after every project group, so even a later setting is not final.
 #[test]
-fn an_unknown_import_after_a_setting_makes_it_unknown_and_a_later_setting_wins() {
+fn an_unknown_import_leaves_even_later_settings_unknown() {
     let after = Workspace::new(
         "<PropertyGroup><DCC_RangeChecking>true</DCC_RangeChecking></PropertyGroup>\
          <Import Project=\"Missing.optset\"/>",
@@ -226,12 +368,115 @@ fn an_unknown_import_after_a_setting_makes_it_unknown_and_a_later_setting_wins()
          <PropertyGroup><DCC_RangeChecking>true</DCC_RangeChecking></PropertyGroup>",
     );
     let context = before.context();
-    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(context.conditional_context().option("R"), F::Unknown);
     assert_eq!(context.conditional_context().option("Q"), F::Unknown);
 }
 
 #[test]
-fn an_unresolved_or_unknown_conditioned_setting_stays_unknown() {
+fn a_global_option_file_leaves_every_switch_unknown() {
+    for value in ["Opts.proj", "$(Missing)Opts.proj"] {
+        let workspace = Workspace::new(&format!(
+            "<PropertyGroup>\
+               <GlobalOptionFile>{value}</GlobalOptionFile>\
+               <DCC_RangeChecking>true</DCC_RangeChecking>\
+             </PropertyGroup>"
+        ));
+        let context = workspace.context();
+        assert_all_unknown(context.conditional_context(), "project");
+        assert_all_unknown(context.library_conditional_context(), "library");
+    }
+    let environment = Workspace::with(Setup {
+        environment: Some(
+            "<Project><PropertyGroup><GlobalOptionFile>C:\\Opts.proj</GlobalOptionFile></PropertyGroup></Project>",
+        ),
+        ..Setup::default()
+    });
+    let context = environment.context();
+    assert_all_unknown(context.conditional_context(), "project");
+    assert_all_unknown(context.library_conditional_context(), "library");
+}
+
+#[test]
+fn an_installation_setting_applies_to_both_contexts_unless_the_project_differs() {
+    let environment = Some(
+        "<Project><PropertyGroup><DCC_RangeChecking>true</DCC_RangeChecking></PropertyGroup></Project>",
+    );
+    let workspace = Workspace::with(Setup {
+        environment,
+        ..Setup::default()
+    });
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(context.library_conditional_context().option("R"), F::True);
+    assert_eq!(context.library_conditional_context().option("Q"), F::False);
+
+    // environment.proj is imported after the project's groups, so it may
+    // override a different project value.
+    let differing = Workspace::with(Setup {
+        environment,
+        groups: "<PropertyGroup><DCC_RangeChecking>false</DCC_RangeChecking></PropertyGroup>",
+        ..Setup::default()
+    });
+    let context = differing.context();
+    assert_eq!(context.conditional_context().option("R"), F::Unknown);
+    assert_eq!(
+        context.library_conditional_context().option("R"),
+        F::Unknown
+    );
+}
+
+#[test]
+fn debug_and_symbol_information_levels_follow_the_dcc_task() {
+    for (raw, debug, symbols) in [
+        ("0", F::False, F::False),
+        ("1", F::True, F::True),
+        ("2", F::True, F::True),
+        ("true", F::True, F::Unknown),
+        ("false", F::False, F::Unknown),
+        ("3", F::Unknown, F::Unknown),
+    ] {
+        let workspace = Workspace::new(&format!(
+            "<PropertyGroup>\
+               <DCC_DebugInformation>{raw}</DCC_DebugInformation>\
+               <DCC_SymbolReferenceInfo>{raw}</DCC_SymbolReferenceInfo>\
+             </PropertyGroup>"
+        ));
+        let context = workspace.context();
+        assert_eq!(context.conditional_context().option("D"), debug, "D {raw}");
+        assert_eq!(
+            context.conditional_context().option("Y"),
+            symbols,
+            "Y {raw}"
+        );
+    }
+}
+
+#[test]
+fn boolean_switches_accept_msbuild_booleans_only() {
+    for (raw, expected) in [
+        ("True", F::True),
+        ("on", F::True),
+        ("Yes", F::True),
+        ("!false", F::True),
+        ("FALSE", F::False),
+        ("off", F::False),
+        ("1", F::Unknown),
+        ("+", F::Unknown),
+        ("maybe", F::Unknown),
+    ] {
+        let workspace = Workspace::new(&format!(
+            "<PropertyGroup><DCC_RangeChecking>{raw}</DCC_RangeChecking></PropertyGroup>"
+        ));
+        assert_eq!(
+            workspace.context().conditional_context().option("R"),
+            expected,
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn an_unresolved_setting_stays_unknown() {
     let unresolved = Workspace::new(
         "<PropertyGroup><DCC_RangeChecking>$(Missing)x</DCC_RangeChecking></PropertyGroup>",
     );
@@ -239,13 +484,58 @@ fn an_unresolved_or_unknown_conditioned_setting_stays_unknown() {
         unresolved.context().conditional_context().option("R"),
         F::Unknown
     );
-    let malformed = Workspace::new(
-        "<PropertyGroup><DCC_RangeChecking>maybe</DCC_RangeChecking></PropertyGroup>",
+}
+
+#[test]
+fn incomplete_metadata_keeps_unset_switches_unknown() {
+    // A group whose condition cannot be evaluated may set anything.
+    let workspace = Workspace::new(
+        "<PropertyGroup Condition=\"'$(Config)' &gt; 'Debug'\"><Other>1</Other></PropertyGroup>\
+         <PropertyGroup><DCC_RangeChecking>true</DCC_RangeChecking></PropertyGroup>",
     );
+    let context = workspace.context();
+    assert!(!context.discovery_complete());
+    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(context.conditional_context().option("Q"), F::Unknown);
     assert_eq!(
-        malformed.context().conditional_context().option("R"),
+        context.library_conditional_context().option("Q"),
         F::Unknown
     );
+}
+
+#[test]
+fn an_unselected_or_invalid_installation_keeps_switches_unknown() {
+    let needs_choice = Workspace::with(Setup {
+        selector: Some("[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n"),
+        ..Setup::default()
+    });
+    let context = needs_choice.discover(ConditionalContext::default());
+    assert!(
+        matches!(
+            context.installation_selection(),
+            Some(InstallationSelection::NeedsChoice { .. })
+        ),
+        "{:?}",
+        context.installation_selection()
+    );
+    assert_all_unknown(context.conditional_context(), "project");
+    assert_all_unknown(context.library_conditional_context(), "library");
+
+    let invalid = Workspace::with(Setup {
+        selector: Some("[projects.'project/App.dproj']\ninstallation = '99.0'\n"),
+        ..Setup::default()
+    });
+    let context = invalid.discover(ConditionalContext::default());
+    assert!(
+        matches!(
+            context.installation_selection(),
+            Some(InstallationSelection::Invalid { .. })
+        ),
+        "{:?}",
+        context.installation_selection()
+    );
+    assert_all_unknown(context.conditional_context(), "project");
+    assert_all_unknown(context.library_conditional_context(), "library");
 }
 
 #[test]
@@ -253,18 +543,24 @@ fn an_unknown_platform_or_compiler_keeps_unset_switches_unknown() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write(&root.join("App.dpr"), "program App; begin end.");
-    write(
-        &root.join("App.dproj"),
-        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
-    );
-    let context = ProjectContext::discover_with_overrides(
-        &root.join("App.dpr"),
-        &[root.to_path_buf()],
-        &ProjectOptions::default(),
-        &OverrideSession::new(None),
-    )
-    .unwrap()
-    .context;
+    let discover = |dproj: &str| {
+        write(&root.join("App.dproj"), dproj);
+        ProjectContext::discover_with_overrides(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .unwrap()
+        .context
+    };
+    let project = |properties: &str| {
+        format!(
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config>{properties}</PropertyGroup></Project>"
+        )
+    };
+
+    let context = discover(&project("<Platform>Win32</Platform>"));
     assert_eq!(context.conditional_context().compiler_version, None);
     assert_eq!(context.conditional_context().option("R"), F::Unknown);
     assert_eq!(
@@ -272,40 +568,42 @@ fn an_unknown_platform_or_compiler_keeps_unset_switches_unknown() {
         F::Unknown
     );
 
-    write(
-        &root.join("App.dproj"),
-        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform><CompilerVersion>37.0</CompilerVersion></PropertyGroup></Project>",
-    );
-    let context = ProjectContext::discover_with_overrides(
-        &root.join("App.dpr"),
-        &[root.to_path_buf()],
-        &ProjectOptions::default(),
-        &OverrideSession::new(None),
-    )
-    .unwrap()
-    .context;
+    let context = discover(&project(
+        "<Platform>Linux64</Platform><CompilerVersion>37.0</CompilerVersion>",
+    ));
     assert_eq!(context.conditional_context().option("R"), F::Unknown);
     assert_eq!(
         context.library_conditional_context().option("R"),
         F::Unknown
     );
+
+    // dcc 36.0 (installation 23.0) was not available to probe.
+    let context = discover(&project(
+        "<Platform>Win32</Platform><CompilerVersion>36.0</CompilerVersion>",
+    ));
+    assert_eq!(context.conditional_context().option("R"), F::Unknown);
+    assert_eq!(
+        context.library_conditional_context().option("R"),
+        F::Unknown
+    );
+
+    // dcc 21.0 has no Win64 compiler.
+    let context = discover(&project(
+        "<Platform>Win64</Platform><CompilerVersion>21.0</CompilerVersion>",
+    ));
+    assert_eq!(context.conditional_context().option("R"), F::Unknown);
+
+    let context = discover(&project(
+        "<Platform>Win64</Platform><CompilerVersion>24.0</CompilerVersion>",
+    ));
+    assert_eq!(context.conditional_context().option("R"), F::False);
+    assert_eq!(context.library_conditional_context().option("R"), F::False);
 }
 
 #[test]
 fn explicit_caller_options_win_over_the_defaults() {
     let workspace = Workspace::new("");
-    let context = ProjectContext::discover_with_overrides(
-        &workspace.root.join("project/App.dpr"),
-        std::slice::from_ref(&workspace.root),
-        &ProjectOptions {
-            project_file: Some(workspace.root.join("project/App.dproj")),
-            conditional_context: ConditionalContext::default().with_option("R", F::True),
-            ..ProjectOptions::default()
-        },
-        &OverrideSession::new(None),
-    )
-    .unwrap()
-    .context;
+    let context = workspace.discover(ConditionalContext::default().with_option("R", F::True));
     assert_eq!(context.conditional_context().option("R"), F::True);
     assert_eq!(context.library_conditional_context().option("R"), F::True);
     assert_eq!(context.library_conditional_context().option("Q"), F::False);

@@ -14,6 +14,7 @@ use super::msbuild_eval::{
 };
 use super::packages::parse_explicit_unit_paths;
 use super::selection::{is_deleted_path, relevant_workspace_root, standalone_overrides};
+use super::switches::SwitchFacts;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -848,21 +849,28 @@ pub(super) fn build_project_context(
         ConditionalFact::Unknown
     };
     let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
-    let switch_defaults_known = switch_defaults_known(
-        installation_selection.as_ref(),
-        installation_failed,
-        target_platform.as_ref(),
-        builder.unknown_properties.contains("platform"),
-    );
     let mut conditional_warnings = Vec::new();
     let mut conditional_context = merge_project_conditional_context(
         &evaluation_options,
         &builder,
         &project_defines,
-        switch_defaults_known,
         &mut conditional_warnings,
     );
     builder.warnings.extend(conditional_warnings);
+    let switch_facts = SwitchFacts::evaluate(
+        &builder,
+        installation_environment
+            .as_ref()
+            .map(|environment| &environment.properties),
+        crate::switches::defaults_known(
+            installation_selection.as_ref(),
+            installation_failed,
+            target_platform.as_ref(),
+            builder.unknown_properties.contains("platform"),
+            conditional_context.compiler_version,
+        ),
+    );
+    switch_facts.apply_project(&mut conditional_context);
 
     let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
@@ -909,13 +917,7 @@ pub(super) fn build_project_context(
         rtl_constants.as_deref(),
     );
     library_conditional_context.absent_define = ConditionalFact::Unknown;
-    apply_library_switch_defaults(
-        &mut library_conditional_context,
-        installation_environment
-            .as_ref()
-            .map(|environment| &environment.properties),
-        switch_defaults_known,
-    );
+    switch_facts.apply_library(&mut library_conditional_context);
 
     let metadata_observations = complete_metadata_observations(
         &metadata_files,
@@ -1488,7 +1490,6 @@ fn merge_project_conditional_context(
     options: &ProjectOptions,
     builder: &ProjectBuilder,
     project_defines: &[String],
-    switch_defaults_known: bool,
     warnings: &mut Vec<String>,
 ) -> ConditionalContext {
     let mut context = options.conditional_context.clone();
@@ -1531,110 +1532,7 @@ fn merge_project_conditional_context(
         let value = parse_conditional_fact(&raw).unwrap_or(ConditionalFact::Unknown);
         context.set_option("RUNTIME_CHECKS", value);
     }
-    // D45: a switch the evaluated metadata leaves unset is the compiler's
-    // default, unless an unevaluated import or incomplete metadata could
-    // have set it.
-    let unset_is_default = switch_defaults_known
-        && context.compiler_version.is_some()
-        && !builder.incomplete
-        && builder.undefined_is_empty();
-    for (property, canonical, default) in DCC_SWITCHES {
-        if context.options.contains_key(*canonical) {
-            continue;
-        }
-        let value = if builder.unknown_properties.contains(*property) {
-            ConditionalFact::Unknown
-        } else {
-            match builder.property(property) {
-                Some(raw) if !raw.trim().is_empty() => switch_property_fact(canonical, &raw),
-                _ if unset_is_default => *default,
-                _ => continue,
-            }
-        };
-        context.set_option(canonical, value);
-    }
     context
-}
-
-/// The MSBuild properties CodeGear.Delphi.Targets passes to the DCC task for
-/// the switches `IFOPT` evaluates, with dcc's built-in default for each. The
-/// defaults are those `dcc32 --no-config --help` lists ("defaults are shown
-/// below") for Delphi 2010 (21.0) and XE3 (24.0), and `dcc64 --no-config
-/// --help` for Delphi 13 (37.0); all three list the same values. The targets
-/// build with `NoConfig="true"`, so dcc32.cfg does not change them, and
-/// neither CodeGear.Delphi.Targets nor CodeGear.Common.Targets assigns these
-/// properties.
-const DCC_SWITCHES: &[(&str, &str, ConditionalFact)] = &[
-    ("dcc_fullbooleanevaluations", "B", ConditionalFact::False),
-    ("dcc_assertionsatruntime", "C", ConditionalFact::True),
-    ("dcc_debuginformation", "D", ConditionalFact::True),
-    ("dcc_longstrings", "H", ConditionalFact::True),
-    ("dcc_iochecking", "I", ConditionalFact::True),
-    ("dcc_optimize", "O", ConditionalFact::True),
-    ("dcc_integeroverflowcheck", "Q", ConditionalFact::False),
-    ("dcc_rangechecking", "R", ConditionalFact::False),
-    ("dcc_typedatparameter", "T", ConditionalFact::False),
-    ("dcc_extendedsyntax", "X", ConditionalFact::True),
-    ("dcc_symbolreferenceinfo", "Y", ConditionalFact::True),
-];
-
-/// Whether unset switches take [`DCC_SWITCHES`]' defaults: the compiler is a
-/// known installation's (or the selection is legacy) and the target is a
-/// Windows platform whose dcc defaults were verified.
-fn switch_defaults_known(
-    selection: Option<&InstallationSelection>,
-    installation_failed: bool,
-    platform: Option<&TargetPlatform>,
-    platform_unknown: bool,
-) -> bool {
-    !installation_failed
-        && !platform_unknown
-        && matches!(
-            selection,
-            None | Some(InstallationSelection::Legacy | InstallationSelection::Selected { .. })
-        )
-        && matches!(
-            platform,
-            Some(TargetPlatform::Win32 | TargetPlatform::Win64)
-        )
-}
-
-/// `DCC_DebugInformation` and `DCC_SymbolReferenceInfo` also take `0`/`1`/`2`
-/// (off, limited or definitions only, full); the middle level is not a known
-/// `IFOPT` answer.
-fn switch_property_fact(canonical: &str, raw: &str) -> ConditionalFact {
-    match (canonical, raw.trim()) {
-        ("D" | "Y", "1") => ConditionalFact::Unknown,
-        ("D" | "Y", "2") => ConditionalFact::True,
-        _ => parse_conditional_fact(raw).unwrap_or(ConditionalFact::Unknown),
-    }
-}
-
-/// Library code takes the compiler's defaults and the installation's own
-/// switch properties, never the project's.
-fn apply_library_switch_defaults(
-    context: &mut ConditionalContext,
-    installation_properties: Option<&BTreeMap<String, String>>,
-    defaults_known: bool,
-) {
-    if !defaults_known || context.compiler_version.is_none() {
-        return;
-    }
-    for (property, canonical, default) in DCC_SWITCHES {
-        if context.options.contains_key(*canonical) {
-            continue;
-        }
-        let installed = installation_properties.and_then(|properties| {
-            properties
-                .iter()
-                .find(|(name, value)| {
-                    name.eq_ignore_ascii_case(property) && !value.trim().is_empty()
-                })
-                .map(|(_, value)| value)
-        });
-        let value = installed.map_or(*default, |raw| switch_property_fact(canonical, raw));
-        context.set_option(canonical, value);
-    }
 }
 
 fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {

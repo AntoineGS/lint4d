@@ -2273,3 +2273,44 @@ fn a_deep_interface_uses_chain_reports_the_stack_limit() {
     };
     assert!(limited, "{:?}", analysis.as_ref().map(|a| &a.reasons));
 }
+
+/// l4d-4nbs review I1: a shared interface is charged everything it keeps:
+/// its provider sources' bytes and decoded text, its reports, dependencies,
+/// scans, nested parts, lookup trace and key context.
+#[test]
+fn a_shared_interface_is_charged_what_it_retains() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    // Mostly a comment: few declarations, many retained source bytes.
+    let w_source = format!(
+        "unit W; interface {{{}}} type TW = Int64; implementation end.",
+        "x".repeat(1_000_000)
+    );
+    let mut f = Fixture::new(SHARED_ROOT, context(LayoutPlatform::Win32));
+    f.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit("W", &w_source, context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f.shared = Some(store.clone());
+    f.analyze().unwrap();
+    let graphs = store.graphs.lock().unwrap();
+    let (key, w) = graphs
+        .iter()
+        .find(|(key, _)| key.source.as_str().ends_with("W.pas"))
+        .expect("W is shared");
+    let source = w_source.len();
+    let reports = w.observations.len() * std::mem::size_of::<pascal_core::ResolutionObservation>()
+        + w.warnings.iter().map(|w| w.len()).sum::<usize>()
+        + w.dependencies.len()
+            * std::mem::size_of::<pascal_core::compile_time::ProviderDependency>()
+        + w.scanned.len() * std::mem::size_of::<pascal_core::compile_time::ScannedExtent>()
+        + w.children.len() * std::mem::size_of::<pascal_core::compile_time::ChildSegment>()
+        + w.trace.len() * std::mem::size_of::<pascal_core::ResolutionObservation>();
+    assert!(
+        w.retained_bytes >= source + reports + key.source.as_str().len(),
+        "{} bytes charged for a {source} byte provider",
+        w.retained_bytes
+    );
+}

@@ -869,16 +869,67 @@ fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
     Arc::new(all)
 }
 
+/// What a shared interface keeps besides what other store entries charge
+/// (the nested providers' graphs it references): its declaration state, its
+/// provider sources' bytes and decoded text, its reports, dependencies,
+/// scans, nested parts, lookup trace and key (l4d-4nbs review I1).
 fn shared_retained_bytes(
-    graph: &AdmittedInterfaceGraph,
-    observations: &[ResolutionObservation],
+    graph: Option<&AdmittedInterfaceGraph>,
+    key: &ProviderGraphKey,
+    origin: &SharedOrigin,
+    dependencies: &[ProviderDependency],
 ) -> usize {
-    let mut retained_bytes = 0usize;
-    let _ = graph.visit_snapshot_payload(&mut |n| {
-        retained_bytes = retained_bytes.saturating_add(n);
+    let mut retained_bytes = size_of::<SharedProviderGraph>();
+    let mut add = |n: usize| retained_bytes = retained_bytes.saturating_add(n);
+    if let Some(graph) = graph {
+        let mut state = 0usize;
+        let _ = graph.visit_snapshot_payload(&mut |n| {
+            state = state.saturating_add(n);
+            Ok(())
+        });
+        add(state);
+        // The occurrence sources share their backings' bytes.
+        for source in graph.provider_backings.iter().map(|backing| &***backing) {
+            add(source.bytes.len());
+            add(source.decoded_text.as_ref().map_or(0, |text| text.len()));
+        }
+    }
+    add(observations_payload(&origin.observations));
+    add(observations_payload(&origin.trace));
+    add(origin
+        .warnings
+        .iter()
+        .map(|w| size_of::<String>() + w.len())
+        .sum());
+    add(dependencies
+        .iter()
+        .map(|d| {
+            size_of::<ProviderDependency>() + d.source.as_str().len() + d.path.as_os_str().len()
+        })
+        .sum());
+    add(origin
+        .scanned
+        .iter()
+        .map(|e| size_of::<ScannedExtent>() + e.source.as_str().len())
+        .sum());
+    add(origin
+        .children
+        .iter()
+        .map(|c| size_of::<ChildSegment>() + c.key.source.as_str().len())
+        .sum());
+    add(key.source.as_str().len()
+        + key
+            .qualifiers
+            .iter()
+            .map(|q| size_of::<String>() + q.len())
+            .sum::<usize>());
+    let mut context = 0usize;
+    let _ = key.context.visit_recovery_payload(&mut |n| {
+        context = context.saturating_add(n);
         Ok(())
     });
-    retained_bytes.saturating_add(observations_payload(observations))
+    add(context);
+    retained_bytes
 }
 
 /// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
@@ -3030,7 +3081,12 @@ impl ProviderEngine<'_, '_> {
                         revision: origin.revision.clone(),
                         lookup: origin.lookup,
                         trace: origin.trace.clone(),
-                        retained_bytes: 0,
+                        retained_bytes: shared_retained_bytes(
+                            None,
+                            &origin.key,
+                            origin,
+                            &dependencies,
+                        ),
                     }),
                 );
             }
@@ -3100,7 +3156,12 @@ impl ProviderEngine<'_, '_> {
                     revision: origin.revision.clone(),
                     lookup: origin.lookup,
                     trace: origin.trace.clone(),
-                    retained_bytes: shared_retained_bytes(&graph, &origin.observations),
+                    retained_bytes: shared_retained_bytes(
+                        Some(&graph),
+                        &origin.key,
+                        origin,
+                        &dependencies,
+                    ),
                 }),
             );
         }
@@ -3513,7 +3574,12 @@ impl ProviderEngine<'_, '_> {
             revision: origin.revision.clone(),
             lookup: origin.lookup,
             trace: origin.trace.clone(),
-            retained_bytes: shared_retained_bytes(&prepared, &origin.observations),
+            retained_bytes: shared_retained_bytes(
+                Some(&prepared),
+                &origin.key,
+                &origin,
+                &entry.dependencies,
+            ),
         };
         store.put(origin.key.clone(), Arc::new(shared));
         Ok(Fact::Known(prepared))

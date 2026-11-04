@@ -1374,8 +1374,9 @@ The workspace index (which unit is declared where, and the facts the other
 features need from each member) is built in the background and its per-member
 facts are stored. After a restart, members whose content and project context
 are unchanged are reused without parsing. The last index of a project is also
-kept as a snapshot, used as a hint for which members to try first, never as
-proof.
+kept as a snapshot. It lets a later process find each member's stored record
+directly instead of searching for candidates; the member's content is still
+validated, so the snapshot is never proof.
 
 - **What is still read at startup.** Every member is read and hashed again on
   each start. A stored stamp (size, modification time) is never proof that a
@@ -1390,14 +1391,14 @@ proof.
   so a first run that is killed keeps what the crawl finished. When the crawl
   cannot prove its inputs are on disk (an unsaved project file), index
   batches are interleaved with it instead. The crawl pins at most half of
-  `maxCacheBytes`; an entry over that cap is not pinned and may be evicted, so
-  a very large open closure can be parsed again when you return to it.
-- **Scheduling.** On a second start the reuse passes run before the crawl,
-  even while the store is still opening; the crawl goes first only while bulk
-  work (such as workspace-wide requests) runs. Index batches run behind
-  interactive and bulk work and are bounded: a reuse batch is 512 members or
-  200 ms, an extraction batch 64 members or 2 s. A write refused because the
-  WAL is full is retried after maintenance has checkpointed it.
+  `maxCacheBytes`; entries over that are evictable and may be parsed again.
+- **Scheduling.** On every start with a populated store, the reuse passes run
+  before the crawl, waiting for the store to open (within its open bound); the
+  crawl goes first only while bulk work (such as workspace-wide requests)
+  runs. Index batches run behind interactive and bulk work and are bounded: a
+  reuse batch is 512 members or 200 ms, an extraction batch 64 members or 2 s.
+  A member whose write the store refuses under WAL pressure stays pending and
+  is retried later.
 - **Refusals.** A member that was refused or exceeded the index limits is not
   stored as a refusal. It is retried last in the background and reported as a
   `retrying` gap rather than as an incomplete index.
@@ -1422,9 +1423,9 @@ Each context has:
 | --- | --- |
 | `anchor` | `{"document": uri}` or `{"project": uri}`, at most 512 bytes; `anchorTruncated` says if it was cut |
 | `members`, `fresh` | Members of the project and those whose index entry is current |
-| `reused`, `extracted`, `persisted` | Members reused from the store, parsed in this process, and with a record proven by this process |
+| `reused`, `extracted`, `persisted` | Members reused from the store, parsed in this process, and with a record proven by this process (includes reused members) |
 | `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
-| `refused`, `limited`, `deferred`, `retrying` | Members refused, over the limits, failed to load (retried later), and retried after a previous refusal |
+| `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
 | `membershipComplete` | The member list is complete and current |
 | `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
 | `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |

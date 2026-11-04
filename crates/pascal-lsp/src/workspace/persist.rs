@@ -74,6 +74,21 @@ impl PreparedArtifact {
         facts.saturating_add(observations)
     }
 
+    /// The paths the evidence names besides the root: what a change to
+    /// makes this artifact stale. A local artifact names none.
+    pub(crate) fn input_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.expanded.as_ref().map_or_else(Vec::new, |expanded| {
+            expanded
+                .observations
+                .iter()
+                .map(|observation| super::absolute_path(observation.path().to_path_buf()))
+                .collect()
+        });
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// The ID `Store::publish_facts_with_evidence` gives this artifact's
     /// evidence; `None` for a local artifact, which is its own proof.
     pub(crate) fn member_evidence_id(&self) -> Option<Digest> {

@@ -44,7 +44,13 @@ const INDEX_BATCH_DISPATCH_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
 /// Paths `IndexStore::crawl_published` remembers; past it, it starts over.
-const MAX_CRAWL_PUBLISHED: usize = 65_536;
+/// Several large closures fit (multidev: about 7,000 units per context). An
+/// entry is about 250 bytes (path, a few pairs, map overhead), so the map
+/// stays under about 8 MiB, plus the reverse input links of the same units.
+const MAX_CRAWL_PUBLISHED: usize = 32_768;
+/// Publications remembered per path, newest last (contexts or contents a
+/// path alternates between).
+const MAX_CRAWL_PUBLICATIONS_PER_PATH: usize = 4;
 const MAX_OWNERS: usize = 4_096;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -600,6 +606,41 @@ mod cache_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn crawl_publications_keep_the_newest_per_path_and_forget_dependents() {
+        let cache = ProjectCache::default();
+        let unit = Path::new("/p/lib/U.pas");
+        let include = PathBuf::from("/p/inc/Part.inc");
+        let context = pascal_cache::Digest::from_bytes([1; 32]);
+        for hash in 0..=MAX_CRAWL_PUBLICATIONS_PER_PATH as u64 {
+            cache.note_published(unit, hash, context, std::slice::from_ref(&include));
+        }
+        assert!(
+            !cache.crawl_published(unit, 0, context),
+            "the oldest is dropped"
+        );
+        for hash in 1..=MAX_CRAWL_PUBLICATIONS_PER_PATH as u64 {
+            assert!(cache.crawl_published(unit, hash, context), "{hash}");
+        }
+        assert!(!cache.crawl_published(unit, 1, pascal_cache::Digest::from_bytes([2; 32])));
+        // A bytes-only change of the include drops its dependent.
+        cache.invalidate_file_contents(&include);
+        assert!(!cache.crawl_published(unit, 1, context));
+        // A new file in a directory a publication listed drops it too.
+        cache.note_published(unit, 1, context, &[PathBuf::from("/p/lib")]);
+        cache.invalidate_file_contents(Path::new("/p/lib/New.pas"));
+        assert!(
+            cache.crawl_published(unit, 1, context),
+            "no listing changed"
+        );
+        cache.invalidate_path(Path::new("/p/lib/New.pas"));
+        assert!(!cache.crawl_published(unit, 1, context));
+        // An overflow forgets everything.
+        cache.note_published(unit, 1, context, &[]);
+        cache.invalidate_after_overflow();
+        assert!(!cache.crawl_published(unit, 1, context));
+    }
 
     fn context(name: &str) -> ProjectContext {
         ProjectContext::from_parts(pascal_project::ProjectContextParts {
@@ -5117,7 +5158,7 @@ impl ProjectCache {
     }
 
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
-        self.index().crawl_published.remove(path);
+        self.forget_crawl_published(path, include_parent);
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         crate::trace::trace!(
@@ -5565,6 +5606,9 @@ struct IndexStore {
     /// hash and context digest of each publication. Bounded by
     /// `MAX_CRAWL_PUBLISHED` paths; an invalidated path is forgotten.
     crawl_published: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+    /// For each path a crawl publication's evidence names, the published
+    /// units that read it: a change to it makes them publishable again.
+    crawl_dependents: HashMap<PathBuf, HashSet<PathBuf>>,
     /// The paths the warm crawl published, in publication order.
     #[cfg(test)]
     published_by_crawl: Vec<PathBuf>,
@@ -5580,6 +5624,7 @@ impl Default for IndexStore {
             unit_limit: MAX_WORKSPACE_UNITS,
             released: Vec::new(),
             crawl_published: HashMap::new(),
+            crawl_dependents: HashMap::new(),
             #[cfg(test)]
             published_by_crawl: Vec::new(),
         }
@@ -5933,8 +5978,16 @@ impl ProjectCache {
     /// index asks the store for them again before it extracts the member.
     /// Nothing enters an index here.
     /// `hash` and `context` (the context's cache digest) say what was
-    /// published, so the crawl does not publish it again in this process.
-    pub(crate) fn note_published(&self, path: &Path, hash: u64, context: pascal_cache::Digest) {
+    /// published, so the crawl does not publish it again in this process;
+    /// `inputs` are the other paths its evidence names, whose change makes
+    /// it publishable again.
+    pub(crate) fn note_published(
+        &self,
+        path: &Path,
+        hash: u64,
+        context: pascal_cache::Digest,
+        inputs: &[PathBuf],
+    ) {
         let mut index = self.index();
         for stored in index.contexts.values_mut() {
             stored.index.clear_reuse_tried(path);
@@ -5943,10 +5996,21 @@ impl ProjectCache {
             && !index.crawl_published.contains_key(path)
         {
             index.crawl_published.clear();
+            index.crawl_dependents.clear();
         }
         let published = index.crawl_published.entry(path.to_path_buf()).or_default();
         if !published.contains(&(hash, context)) {
+            if published.len() >= MAX_CRAWL_PUBLICATIONS_PER_PATH {
+                published.remove(0);
+            }
             published.push((hash, context));
+        }
+        for input in inputs {
+            index
+                .crawl_dependents
+                .entry(input.clone())
+                .or_default()
+                .insert(path.to_path_buf());
         }
         #[cfg(test)]
         index.published_by_crawl.push(path.to_path_buf());
@@ -6219,8 +6283,26 @@ impl ProjectCache {
         }
     }
 
+    /// `path` changed: neither it nor a crawl publication whose evidence
+    /// names it (or, for a listing change, its directory) is known
+    /// published any more.
+    fn forget_crawl_published(&self, path: &Path, include_parent: bool) {
+        let mut store = self.index();
+        let store = &mut *store;
+        store.crawl_published.remove(path);
+        let changed = std::iter::once(path).chain(path.parent().filter(|_| include_parent));
+        for changed in changed {
+            for dependent in store.crawl_dependents.remove(changed).unwrap_or_default() {
+                store.crawl_published.remove(&dependent);
+            }
+        }
+    }
+
     fn invalidate_index_all(&self) {
         let mut store = self.index();
+        // Overflow lost which paths changed: nothing is known published.
+        store.crawl_published.clear();
+        store.crawl_dependents.clear();
         let mut anchors = Vec::new();
         for stored in store.contexts.values_mut() {
             stored.index.mark_all_stale();

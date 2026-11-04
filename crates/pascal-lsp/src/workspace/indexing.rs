@@ -1195,18 +1195,20 @@ impl Workspace {
             return Err(PersistSkip::Unavailable);
         }
         self.publish_extracted(key, uri, source, cancel)
+            .map(|(proof, _)| proof)
     }
 
     /// `persist_extracted` once the caller proved its view may publish
     /// `key`'s facts: a baseline view (`may_publish`), or the warm crawl's
-    /// per-unit disk proof (`publish_crawled_unit`).
+    /// per-unit disk proof (`publish_crawled_unit`). Also returns the
+    /// paths the published evidence names (`PreparedArtifact::input_paths`).
     fn publish_extracted(
         &self,
         key: &ContextKey,
         uri: &Url,
         source: SourceFacts,
         cancel: &AtomicBool,
-    ) -> Result<ProvenRecord, PersistSkip> {
+    ) -> Result<(ProvenRecord, Vec<PathBuf>), PersistSkip> {
         let path = uri
             .to_file_path()
             .map_err(|()| PersistSkip::Prepare(super::persist::PersistError::NotIndexed))?;
@@ -1226,6 +1228,7 @@ impl Workspace {
                 },
             )
             .map_err(PersistSkip::Ineligible)?;
+        let inputs = prepared.input_paths();
         let _transient = self
             .project_cache
             .reserve(ReservationKind::Scratch, prepared.transient_bytes())
@@ -1251,10 +1254,12 @@ impl Workspace {
         if stopped() {
             return Err(PersistSkip::Unavailable);
         }
-        publish_proven(job.store(), &eligible).map_err(|bypass| {
-            job.observe(&bypass);
-            PersistSkip::Store(bypass)
-        })
+        publish_proven(job.store(), &eligible)
+            .map(|proof| (proof, inputs))
+            .map_err(|bypass| {
+                job.observe(&bypass);
+                PersistSkip::Store(bypass)
+            })
     }
 
     /// R8-2/D42: publish a unit the warm crawl just indexed in the session
@@ -1323,7 +1328,9 @@ impl Workspace {
             _ => return,
         };
         match self.publish_extracted(&key, uri, source, cancel) {
-            Ok(_) => self.project_cache.note_published(&path, hash, context),
+            Ok((_, inputs)) => self
+                .project_cache
+                .note_published(&path, hash, context, &inputs),
             Err(skip) => {
                 crate::trace::trace!("  crawl unit {} not persisted: {skip:?}", path.display());
             }
@@ -6416,6 +6423,118 @@ pub(in crate::workspace) mod tests {
             let published = session.project_cache.published_by_crawl_for_test();
             assert_eq!(published.len(), ROOT_UNITS + 1, "{published:?}");
             assert_eq!(published.last(), Some(&edited));
+            cache.shutdown();
+        }
+
+        /// Fix round 2: a watcher overflow loses which paths changed, so the
+        /// crawl publishes every unit again.
+        #[test]
+        fn a_crawl_after_a_watcher_overflow_publishes_again() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, _key, _anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                session.project_cache.published_by_crawl_for_test().len(),
+                ROOT_UNITS
+            );
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                session.project_cache.published_by_crawl_for_test().len(),
+                ROOT_UNITS,
+                "nothing again before the overflow"
+            );
+            session.project_cache.invalidate_after_overflow();
+            crawl(&session, &cache, &open);
+            let published = session.project_cache.published_by_crawl_for_test();
+            assert_eq!(published.len(), 2 * ROOT_UNITS, "{published:?}");
+            assert_eq!(
+                sorted(published[ROOT_UNITS..].to_vec()),
+                units(root, ROOT_UNITS)
+            );
+            cache.shutdown();
+        }
+
+        /// Fix round 2: editing a file a published unit's evidence names (an
+        /// include, a provider) makes that unit publishable again too.
+        #[test]
+        fn a_crawl_publishes_again_the_dependents_of_a_changed_input() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let root_text =
+                "unit Root;\ninterface\nuses Main, IncUnit, Other;\nimplementation\nend.\n";
+            write(&root.join("lib/Root.pas"), root_text);
+            write(
+                &root.join("lib/IncUnit.pas"),
+                "unit IncUnit;\ninterface\n{$I Part.inc}\nimplementation\nend.\n",
+            );
+            write(&root.join("lib/Part.inc"), "const FromPart = 1;\n");
+            named_unit(&root.join("lib/Other.pas"), "FromOther");
+            let (mut session, _key, _anchor) = provider_project_with(
+                root,
+                WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..WorkspaceOptions::default()
+                },
+            );
+            let open = Url::from_file_path(root.join("lib/Root.pas")).unwrap();
+            session
+                .open_document(open.clone(), root_text.to_owned(), 1)
+                .unwrap();
+            let lib = root.join("lib");
+            let (main, shapes, inc_unit, part, other) = (
+                lib.join("Main.pas"),
+                lib.join("Shapes.pas"),
+                lib.join("IncUnit.pas"),
+                lib.join("Part.inc"),
+                lib.join("Other.pas"),
+            );
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                sorted(vec![
+                    main.clone(),
+                    shapes.clone(),
+                    inc_unit.clone(),
+                    other.clone()
+                ])
+            );
+
+            // The include's bytes change (no listing does): its unit is
+            // published again, nothing else.
+            write(&part, "const FromPart = 2;\n");
+            session.project_cache.invalidate_file_contents(&part);
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                session.project_cache.published_by_crawl_for_test()[4..],
+                *std::slice::from_ref(&inc_unit)
+            );
+
+            // The provider changes: it and the unit whose facts read it are
+            // published again; `Other` is not.
+            write(&shapes, EDITED_SHAPES);
+            session.project_cache.invalidate_file_contents(&shapes);
+            crawl(&session, &cache, &open);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()[5..].to_vec()),
+                sorted(vec![main.clone(), shapes])
+            );
+
+            // A new file changes `lib`'s listing, which Main's provider
+            // search read: Main is published again; `Other`, which read no
+            // listing, is not.
+            named_unit(&lib.join("New.pas"), "FromNew");
+            session.project_cache.invalidate_path(&lib.join("New.pas"));
+            crawl(&session, &cache, &open);
+            let again = session.project_cache.published_by_crawl_for_test()[7..].to_vec();
+            assert!(again.contains(&main), "{again:?}");
+            assert!(!again.contains(&other), "{again:?}");
             cache.shutdown();
         }
 

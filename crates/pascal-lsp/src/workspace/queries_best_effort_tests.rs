@@ -544,3 +544,21 @@ fn completion_withholds_globals_when_the_owner_member_lookup_runs_out() {
         "{completion:?}"
     );
 }
+
+/// l4d-4nbs review C2: `Broken` asks a constant of `Forky`, whose interface
+/// exceeds the branch-state limit. The provider's interface is unknown, so
+/// `Broken`'s condition is unknown and its analysis incomplete; `Broken`
+/// stays imported, and read-only features answer with a note instead of
+/// refusing the whole dependency scan.
+#[test]
+fn a_provider_past_the_branch_state_limit_leaves_its_importer_bound() {
+    let fixture = broken_fixture("uses Forky;\n{$IF Forky.FValue = 1}{$DEFINE ONE}{$ENDIF}\n");
+    let root = fixture._temp.path();
+    fs::write(
+        root.join("Forky.pas"),
+        format!("unit Forky;\ninterface\n{FORKS}const FValue = 1;\nimplementation\nend.\n"),
+    )
+    .expect("forking provider");
+    assert_read_only_features_answer(&fixture);
+    assert_strict_features_keep_the_proof(&fixture);
+}

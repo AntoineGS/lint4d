@@ -883,6 +883,21 @@ fn shared_retained_bytes(
 
 /// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
 /// unit and authorize one provider identity (l4d-4nbs D19).
+/// Ends the warning a session reports for a provider whose interface is
+/// unknown because its conditionals exceed `max_branch_states` (l4d-4nbs
+/// review C2).
+pub const BRANCH_LIMITED_PROVIDER: &str = "its conditionals exceed max_branch_states";
+
+fn is_branch_state_limit(reason: &IncompleteReason) -> bool {
+    matches!(
+        reason,
+        IncompleteReason::Limit {
+            name: "max_branch_states",
+            ..
+        }
+    )
+}
+
 fn same_qualifiers(left: &[String], right: &[String]) -> bool {
     left.len() == right.len()
         && left
@@ -2886,14 +2901,24 @@ impl ProviderEngine<'_, '_> {
             true,
             occurrence,
         );
+        // A provider whose conditionals exceed the branch-state limit has an
+        // unknown interface, as one whose interface is incomplete: its
+        // importer's conditions on it are unknown, not refused (l4d-4nbs
+        // review C2). Other limits and cancellation still end the request.
+        let mut branch_limited = false;
         let result = result.and_then(|mut analysis| {
+            branch_limited = analysis.reasons.iter().any(is_branch_state_limit);
             if let Some(reason) = analysis.reasons.iter().find(|r| {
-                matches!(
-                    r,
-                    IncompleteReason::Limit { .. } | IncompleteReason::Cancelled
-                )
+                !is_branch_state_limit(r)
+                    && matches!(
+                        r,
+                        IncompleteReason::Limit { .. } | IncompleteReason::Cancelled
+                    )
             }) {
                 return Err(resolver_error(reason.clone(), self.budget));
+            }
+            if branch_limited {
+                return Ok(analysis);
             }
             let result = analysis
                 .value_mut()
@@ -2954,6 +2979,16 @@ impl ProviderEngine<'_, '_> {
         let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
         move_report_vector(self.observations, observations, self.budget)?;
         move_report_vector(self.warnings, warnings, self.budget)?;
+        if branch_limited {
+            let path = provider.unit.source.path.display().to_string();
+            let warning = format!("the interface of {path} is unknown: {BRANCH_LIMITED_PROVIDER}");
+            let bytes = warning.len() + size_of::<String>();
+            let owned = self
+                .budget
+                .admit_owned(1, bytes, bytes, || vec![warning])
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.warnings, owned, self.budget)?;
+        }
         let origin = shared_key.map(|key| {
             // The lookup's reports come first, so a session that reuses the
             // interface reports how the provider was found.
@@ -2979,7 +3014,7 @@ impl ProviderEngine<'_, '_> {
                 )),
             })
         });
-        if !analysis.facts().interface_complete {
+        if branch_limited || !analysis.facts().interface_complete {
             drop(analysis);
             if let (Some(store), Some(origin)) = (&shared, &origin) {
                 store.put(

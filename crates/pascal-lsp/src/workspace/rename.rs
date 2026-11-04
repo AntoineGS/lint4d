@@ -8923,6 +8923,24 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
+        // A provider interface past the branch-state limit leaves the
+        // conditions on it unknown (l4d-4nbs review C2): the unit stays
+        // bound, best effort notes it, strict features refuse.
+        if let Some(warning) = session
+            .warnings
+            .iter()
+            .find(|warning| warning.ends_with(pascal_core::compile_time::BRANCH_LIMITED_PROVIDER))
+        {
+            if auditor.dependency_relaxed() {
+                auditor.note_gap(format!(
+                    "conditional analysis of {uri} is incomplete: {warning}"
+                ));
+            } else {
+                auditor.result.incomplete_reason.get_or_insert_with(|| {
+                    format!("conditional analysis is incomplete for {uri}: {warning}")
+                });
+            }
+        }
         if !conditional.complete {
             if auditor.dependency_relaxed() {
                 // Declarations in the unanalysed tail of the unit may shadow

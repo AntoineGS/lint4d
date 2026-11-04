@@ -5649,6 +5649,9 @@ struct IndexStore {
     owners: HashMap<PathBuf, ContextKey>,
     /// Owners that are D43 claims or projectless (see `remember_owner_claimable`).
     claimable_owners: HashSet<PathBuf>,
+    /// The main workspace's D43 claim generation: claimable owners decided
+    /// against another generation are not recorded.
+    claim_generation: u64,
     requests: Vec<IndexAnchor>,
     unit_limit: usize,
 }
@@ -5660,6 +5663,7 @@ impl Default for IndexStore {
             clock: 0,
             owners: HashMap::new(),
             claimable_owners: HashSet::new(),
+            claim_generation: 0,
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
         }
@@ -6058,6 +6062,16 @@ impl ProjectCache {
             store.claimable_owners.remove(&directory);
         }
         store.owners.insert(directory, key);
+    }
+
+    /// The main workspace's current D43 claim generation.
+    pub(crate) fn claim_generation(&self) -> u64 {
+        self.index().claim_generation
+    }
+
+    /// Record the main workspace's new D43 claim generation.
+    pub(crate) fn set_claim_generation(&self, generation: u64) {
+        self.index().claim_generation = generation;
     }
 
     /// D43: a new claimant list: forget the directory owners that were

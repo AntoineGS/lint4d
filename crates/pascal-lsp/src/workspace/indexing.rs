@@ -1061,11 +1061,18 @@ impl Workspace {
                         .contexts
                         .get(&owner)
                         .is_some_and(|state| state.context.project_file().is_none());
-                self.project_cache.remember_owner_claimable(
-                    directory.to_path_buf(),
-                    owner.clone(),
-                    claimable,
-                );
+                // N4: a claim decided against an older claimant list (a
+                // request built before a close or a selection) is not
+                // recorded over the owners the main workspace reassigned.
+                if !claimable
+                    || self.claimant_list.generation == self.project_cache.claim_generation()
+                {
+                    self.project_cache.remember_owner_claimable(
+                        directory.to_path_buf(),
+                        owner.clone(),
+                        claimable,
+                    );
+                }
                 discovery.fresh.insert(owner.clone(), true);
                 Ok(Some(owner))
             }

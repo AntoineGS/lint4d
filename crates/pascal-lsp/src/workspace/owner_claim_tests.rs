@@ -671,3 +671,126 @@ fn a_stale_project_context_preparation_does_not_undo_a_claim() {
 
     assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
 }
+
+// Fix round 3: a claimant whose context is rebuilt starts a new claim
+// generation.
+
+fn save_claimant_unchanged(fixture: &Fixture) {
+    // Delphi rewrites the .dproj on every project save.
+    let text = fs::read_to_string(&fixture.app_project).unwrap();
+    write(&fixture.app_project, &format!("{text}\n"));
+}
+
+#[test]
+fn saving_an_open_claimants_project_keeps_its_claim() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    save_claimant_unchanged(&fixture);
+
+    workspace.file_event(&uri(&fixture.app_project), FileChange::Changed);
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+#[test]
+fn saving_a_selected_claimants_project_keeps_its_claim() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    save_claimant_unchanged(&fixture);
+
+    workspace.file_event(&uri(&fixture.app_project), FileChange::Changed);
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+#[test]
+fn an_undeclared_claimant_edit_agrees_after_the_claimant_resolves_again() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    save_claimant_unchanged(&fixture);
+
+    assert_eq!(
+        project_of(&mut workspace, &fixture.app),
+        Some(uri(&fixture.app_project))
+    );
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+/// N3: recovery from a watcher overflow starts a new claim generation.
+#[test]
+fn a_watcher_overflow_after_a_claimant_change_keeps_the_claim() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    save_claimant_unchanged(&fixture);
+
+    workspace.invalidate_all_for_file_notification_overflow_bounded();
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+/// N4: a request built before a close must not record a directory owner
+/// the close already reassigned.
+#[test]
+fn a_request_from_before_a_close_records_no_stale_directory_owner() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    open(&mut workspace, &fixture.app);
+    let input = workspace.analysis_input();
+    assert!(workspace.close_document(&uri(&fixture.app)));
+
+    let mut request = Workspace::from_analysis_input(&input);
+    request
+        .index_targets(
+            &input,
+            None,
+            TargetPurpose::References,
+            &AtomicBool::new(false),
+        )
+        .expect("targets");
+
+    assert_eq!(
+        workspace
+            .project_cache
+            .owner_of(fixture.users.parent().unwrap()),
+        None
+    );
+}
+
+/// N5: a projectContext preparation from an older claim generation does
+/// not bring back its claim.
+#[test]
+fn a_project_context_preparation_from_before_a_close_does_not_restore_the_claim() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    let mut snapshot = workspace.project_operation_snapshot(None);
+    let prepared = snapshot
+        .workspace_mut()
+        .prepare_project_context_with_control(&uri(&fixture.users), None, None)
+        .expect("prepared");
+    assert!(workspace.close_document(&uri(&fixture.app)));
+
+    workspace.apply_project_context_preparation(prepared);
+
+    assert_owner(&mut workspace, &fixture, None);
+}
+
+/// N8: a selection that was applied is reported even when only the claim
+/// revisit after it failed.
+#[test]
+fn a_failed_claim_revisit_does_not_fail_an_applied_selection() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    open(&mut workspace, &fixture.app);
+    super::TEST_FAIL_CLAIM_REVISIT.with(|fail| fail.set(true));
+    let selected = workspace.select_project(&uri(&fixture.app), Some(&uri(&fixture.app_project)));
+    super::TEST_FAIL_CLAIM_REVISIT.with(|fail| fail.set(false));
+
+    assert!(selected.is_ok(), "{selected:?}");
+    assert!(!workspace.project_selections.is_empty());
+}

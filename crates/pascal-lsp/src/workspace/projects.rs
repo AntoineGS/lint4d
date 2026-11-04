@@ -91,7 +91,7 @@ pub struct RtlConstantsInfo {
 
 /// Admission-time immutable authority for project protocol workers.
 pub(crate) struct ProjectOperationSnapshot {
-    workspace: Workspace,
+    pub(super) workspace: Workspace,
     source_generation: u64,
     configuration_generation: u64,
     expected_installation: Option<String>,
@@ -144,6 +144,8 @@ pub(crate) struct ProjectContextPreparation {
     state: super::ContextState,
     owner: Option<super::KnownDocumentOwner>,
     pub(crate) info: ProjectContextInfo,
+    /// The D43 claim generation the preparation was decided against.
+    claim_generation: u64,
 }
 
 impl ProjectContextPreparation {
@@ -422,8 +424,12 @@ impl Workspace {
         uri: &Url,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ProjectContextInfo, String> {
-        self.prepare_project_context_with_control(uri, cancel, None)
-            .map(|prepared| prepared.info)
+        let info = self
+            .prepare_project_context_with_control(uri, cancel, None)
+            .map(|prepared| prepared.info)?;
+        // Resolving the document may have rebuilt a claimant (D43).
+        self.revisit_claims_if_replaced_logged("a project context request");
+        Ok(info)
     }
 
     pub(crate) fn prepare_project_context_with_control(
@@ -569,6 +575,7 @@ impl Workspace {
             state,
             owner,
             info,
+            claim_generation: self.claimant_list.generation,
         })
     }
 
@@ -582,15 +589,30 @@ impl Workspace {
             state,
             owner,
             info: _,
+            claim_generation,
         } = prepared;
+        // D43: a preparation decided against an older claimant list must not
+        // bring back the binding of a unit that list claimed or left
+        // projectless.
+        let stale_claim = claim_generation != self.claimant_list.generation
+            && (owner
+                .as_ref()
+                .is_some_and(|owner| super::owner_is_claim_eligible(&uri, owner))
+                || self
+                    .document_owners
+                    .get(&uri)
+                    .is_some_and(|owner| super::owner_is_claim_eligible(&uri, owner)));
         let watched_paths = state.watched_paths.keys().cloned().collect::<Vec<_>>();
         self.contexts.entry(key.clone()).or_insert(state);
-        self.document_contexts.insert(uri.clone(), key.clone());
-        if let Some(owner) = owner {
-            self.document_owners.insert(uri.clone(), owner);
+        if !stale_claim {
+            self.document_contexts.insert(uri.clone(), key.clone());
+            if let Some(owner) = owner {
+                self.document_owners.insert(uri.clone(), owner);
+            }
         }
         self.watch_context_paths(&key, watched_paths);
         self.refresh_known_owners_for_context(&key);
+        self.revisit_claims_if_replaced_logged("a project context request");
     }
 
     pub fn installation_context(
@@ -1233,7 +1255,9 @@ impl Workspace {
         self.bump_configuration_generation();
         self.invalidate_project_selection_uris(&affected_uris, None, None)?;
         let info = self.project_context(&uri)?;
-        self.revisit_claims(None, None)?;
+        // The selection is applied: a failed revisit is reported, not
+        // returned as a failed selection.
+        self.revisit_claims_logged("a project selection");
         Ok(info)
     }
 
@@ -1406,7 +1430,7 @@ impl Workspace {
         }
         let info = context.info.clone();
         self.apply_project_context_preparation(context);
-        self.revisit_claims(None, Some(budget))?;
+        self.revisit_claims_logged("a project selection");
         Ok(info)
     }
 

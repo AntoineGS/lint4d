@@ -893,3 +893,27 @@ fn a_demanded_unit_without_a_document_context_is_noted() {
         "the missing context is noted: {coverage:?}"
     );
 }
+
+/// l4d-4nbs final round (3): the units a completion's demand rounds name
+/// are capped like the definition walk; past the cap it is incomplete.
+#[test]
+fn the_demanded_unit_list_is_capped() {
+    super::TEST_ASSISTANCE_DEMAND_CAP.with(|cap| cap.set(Some(1)));
+    let (_temp, input, main, position) = ancestor_chain(4);
+    let completion = super::completion_from_input_with_options(
+        input,
+        &main,
+        position,
+        crate::navigation::CompletionOptions {
+            format: MarkupKind::Markdown,
+            defer_documentation: true,
+            defer_detail: true,
+            snippet_support: false,
+        },
+        &AtomicBool::new(false),
+    );
+    super::TEST_ASSISTANCE_DEMAND_CAP.with(|cap| cap.set(None));
+    let result = completion.value.expect("completion answers");
+    assert!(result.demanded.len() <= 1, "{:?}", result.demanded);
+    assert!(result.list.is_incomplete);
+}

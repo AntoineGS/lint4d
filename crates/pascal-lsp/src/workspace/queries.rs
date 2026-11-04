@@ -324,6 +324,8 @@ fn completion_from_input_rounds(
     // then answer again (l4d-4nbs review), a few rounds at most.
     let mut demanded: Vec<Url> = Vec::new();
     let mut round = 0;
+    let demand_cap = assistance_demand_cap();
+    let mut demand_capped = false;
     let (snapshot, mut value) = loop {
         let snapshot = match assistance_snapshot(&input, &uri, Some(position), &demanded, cancel) {
             Ok(snapshot) => snapshot,
@@ -355,10 +357,12 @@ fn completion_from_input_rounds(
             .filter(|demand| demand != &uri && !demanded.contains(demand))
             .collect::<Vec<_>>();
         round += 1;
-        if fresh.is_empty() || round >= MAX_ASSISTANCE_DEMAND_ROUNDS {
+        let room = demand_cap.saturating_sub(demanded.len());
+        demand_capped |= fresh.len() > room;
+        if fresh.is_empty() || room == 0 || round >= MAX_ASSISTANCE_DEMAND_ROUNDS {
             break (snapshot, value);
         }
-        demanded.extend(fresh);
+        demanded.extend(fresh.into_iter().take(room));
     };
     let records = snapshot_records(&snapshot);
     // Too many observations to resolve items later: render them now from
@@ -392,7 +396,7 @@ fn completion_from_input_rounds(
     });
     let value = value.map(|mut result| {
         // D16: candidates from unproven dependencies may be missing.
-        result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
+        result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete() || demand_capped;
         result.demanded = demanded;
         result.eager = eager;
         result
@@ -1563,6 +1567,23 @@ fn binding_snapshot_scoped(
         scope,
         cancel,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides how many units a completion's demand rounds may name.
+    pub(crate) static TEST_ASSISTANCE_DEMAND_CAP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How many units a completion's demand rounds may name in all: the
+/// definition walk's unit limit (l4d-4nbs final round).
+fn assistance_demand_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_ASSISTANCE_DEMAND_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    super::MAX_NAVIGATION_WALK_WORK
 }
 
 #[cfg(test)]

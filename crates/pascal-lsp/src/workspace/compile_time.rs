@@ -1670,6 +1670,69 @@ mod tests {
         assert_eq!(fresh_ws.project_cache.provider_graph_count(), 1);
     }
 
+    /// l4d-4nbs review I4: nested providers up to the session's stack limit,
+    /// each resolving a 250-level type alias chain, run on an analysis thread
+    /// without overflowing it.
+    fn deep_nesting_on(builder: std::thread::Builder, levels: usize) -> bool {
+        builder
+            .spawn(move || {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                for n in 0..levels {
+                    let mut text = format!("unit U{n};\ninterface\n");
+                    let leaf = n + 1 == levels;
+                    let base = if leaf {
+                        "Int64".to_string()
+                    } else {
+                        text.push_str(&format!("uses U{};\n", n + 1));
+                        format!("U{}.T{}", n + 1, n + 1)
+                    };
+                    // The innermost provider prepares a chain at max_type_depth.
+                    let chain = if leaf { 250 } else { 1 };
+                    text.push_str(&format!("type\n  T{n}_0 = {base};\n"));
+                    for k in 1..chain {
+                        text.push_str(&format!("  T{n}_{k} = T{n}_{};\n", k - 1));
+                    }
+                    text.push_str(&format!("  T{n} = T{n}_{};\nimplementation\nend.\n", chain - 1));
+                    std::fs::write(root.join(format!("U{n}.pas")), text).unwrap();
+                }
+                let source = "unit Main; interface uses U0; {$IF SizeOf(U0.T0)=8}{$DEFINE DEEP}{$ENDIF} implementation end.";
+                std::fs::write(root.join("Main.pas"), source).unwrap();
+                let mut workspace = Workspace::with_override_session(
+                    vec![root.into()],
+                    Default::default(),
+                    OverrideSession::new(None),
+                );
+                let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                let cancel = AtomicBool::new(false);
+                let _ = expand(
+                    &workspace,
+                    &uri,
+                    source,
+                    &key,
+                    workspace.include_expansion_limits(),
+                    &cancel,
+                    None,
+                );
+            })
+            .unwrap()
+            .join()
+            .is_ok()
+    }
+
+    #[test]
+    fn deep_provider_and_type_nesting_fit_an_analysis_thread() {
+        // A debug build stops nesting at about 17 such providers; release
+        // goes past 40. Measured peaks: 1.24 MiB debug, 0.71 MiB release.
+        for levels in [16, 40] {
+            assert!(deep_nesting_on(
+                crate::server::analysis_thread("PascalLspTestAnalysis"),
+                levels
+            ));
+        }
+    }
+
     /// An interface larger than its share of `maxCacheBytes` is not kept.
     #[test]
     fn a_provider_interface_past_its_share_is_not_kept() {

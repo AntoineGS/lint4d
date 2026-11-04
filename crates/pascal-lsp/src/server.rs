@@ -3392,8 +3392,7 @@ impl ConfigurationPreparationJobs {
         let root_paths = request.root_paths;
         let worker_options = options.clone();
         let worker_root_paths = root_paths.clone();
-        let handle = thread::Builder::new()
-            .name("PascalLspConfiguration".to_string())
+        let handle = analysis_thread("PascalLspConfiguration")
             .spawn(move || {
                 let prepared = Workspace::prepare_runtime_options_for_roots(
                     worker_root_paths.clone(),
@@ -4090,8 +4089,7 @@ impl PartialDeliveryValidation {
         let test_barriers = self.test_barriers.clone();
         #[cfg(test)]
         let runs = Arc::clone(&self.runs);
-        let handle = thread::Builder::new()
-            .name("PascalLspPartialValidation".to_string())
+        let handle = analysis_thread("PascalLspPartialValidation")
             .spawn(move || {
                 #[cfg(test)]
                 runs.fetch_add(1, Ordering::Relaxed);
@@ -5443,8 +5441,7 @@ impl AnalysisJobs {
             let test_barriers = self.test_barriers.clone();
             let worker_id = id;
             let panic_symbols = symbols.clone();
-            let handle = thread::Builder::new()
-                .name("PascalLspCompiledContent".to_string())
+            let handle = analysis_thread("PascalLspCompiledContent")
                 .spawn(move || {
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let result = wait_at_test_barrier(
@@ -5685,8 +5682,7 @@ impl AnalysisJobs {
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
-        let handle = thread::Builder::new()
-            .name("PascalLspAnalysis".to_string())
+        let handle = analysis_thread("PascalLspAnalysis")
             .spawn(move || {
                 let _span = crate::trace::Span::new(|| {
                     format!(
@@ -6684,8 +6680,7 @@ impl AnalysisJobs {
             | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
             _ => unreachable!("only project protocol requests use this worker"),
         };
-        let handle = thread::Builder::new()
-                .name("PascalLspProjectOperation".to_string())
+        let handle = analysis_thread("PascalLspProjectOperation")
                 .spawn(move || {
                 let mut request = request;
                 let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
@@ -10312,6 +10307,24 @@ fn send_diagnostic_server_cancelled(
 }
 
 /// Run one native LSP session over stdin/stdout.
+/// Stack of every thread that runs analysis (l4d-4nbs review I4). A
+/// compile-time session stops nesting providers at 1 MiB of stack
+/// (`max_provider_stack_bytes`, about 52 KB a provider in a debug build and
+/// 11 KB in release); within one provider, type preparation recurses up to
+/// `max_type_depth` (256) levels at about 2.7 KB a level in debug (0.4 KB in
+/// release). Measured peaks with nesting at the limit and a 250-level chain
+/// in the innermost provider: 1.24 MiB debug, 0.71 MiB release, plus the
+/// request's own frames above the session. 16 MiB leaves a wide margin and
+/// costs only address space until touched.
+pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// A builder for a thread that runs analysis, with its explicit stack.
+pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(ANALYSIS_THREAD_STACK_BYTES)
+}
+
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
     run_stdio_with_config(TestBarrierConfig::disabled())
 }
@@ -11043,8 +11056,7 @@ fn spawn_workspace_file_notification(
         ..revision
     };
     let owned_workspace = std::mem::take(workspace);
-    let join = thread::Builder::new()
-        .name("PascalLspWorkspaceMutation".to_string())
+    let join = analysis_thread("PascalLspWorkspaceMutation")
         .spawn(move || {
             let mut workspace = owned_workspace;
             let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));

@@ -42,7 +42,18 @@ fn main() {
 
 fn run_server() {
     let profiling = pascal_lsp::analysis_metrics::initialize_profiling();
-    let result = pascal_lsp::server::run_stdio();
+    // The main loop also analyses (opening a document warms it), so it runs
+    // with the analysis threads' stack (l4d-4nbs review I4).
+    let result = std::thread::Builder::new()
+        .name("PascalLspMain".to_string())
+        .stack_size(pascal_lsp::server::ANALYSIS_THREAD_STACK_BYTES)
+        .spawn(pascal_lsp::server::run_stdio)
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+        .and_then(|server| {
+            server
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
     pascal_lsp::analysis_metrics::finish_profiling(profiling, matches!(&result, Ok(true)));
     match result {
         Ok(true) => {}

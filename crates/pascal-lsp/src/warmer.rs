@@ -551,8 +551,7 @@ impl Warmer {
     pub(crate) fn start(gate: Arc<InteractiveGate>) -> Self {
         let (jobs, job_receiver) = crossbeam_channel::unbounded::<WarmJob>();
         let (event_sender, events) = crossbeam_channel::unbounded();
-        let thread = std::thread::Builder::new()
-            .name("PascalLspWarmer".to_string())
+        let thread = crate::server::analysis_thread("PascalLspWarmer")
             .spawn(move || {
                 lower_thread_priority();
                 for job in job_receiver {

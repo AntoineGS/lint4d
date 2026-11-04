@@ -91,6 +91,8 @@ mod inlay;
 mod overload;
 mod rename;
 pub(crate) use rename::BindingWorkBudget;
+#[cfg(test)]
+pub(crate) use rename::test_set_occurrence_prefilter;
 mod selection;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::PhysicalProjection;
@@ -20387,6 +20389,26 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 
 pub(crate) fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
+}
+
+/// Whether `name` (a `canonical_name`) occurs in `text`, ASCII
+/// case-insensitively and regardless of token boundaries: every identifier
+/// whose `canonical_name` is `name` is such an occurrence, `&`-escaped ones
+/// included, so `false` proves `text` spells no such identifier.
+pub(crate) fn text_mentions_name(text: &[u8], name: &str) -> bool {
+    let needle = name.as_bytes();
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    let (lower, upper) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+    let Some(last_start) = text.len().checked_sub(needle.len()) else {
+        return false;
+    };
+    text[..=last_start]
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == lower || **byte == upper)
+        .any(|(start, _)| text[start + 1..start + needle.len()].eq_ignore_ascii_case(rest))
 }
 
 fn canonical_identifier_eq(left: &str, right: &str) -> bool {

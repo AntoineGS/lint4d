@@ -167,6 +167,14 @@ pub(super) fn test_header_revalidation_hook(hook: Option<Box<dyn FnMut()>>) {
     TEST_HEADER_REVALIDATION_HOOK.with(|value| *value.borrow_mut() = hook);
 }
 #[cfg(test)]
+thread_local! { static TEST_EXPANSION_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+/// Makes every expansion of a document whose URI ends with `suffix` fail
+/// as an exhausted resolver limit does.
+#[cfg(test)]
+pub(crate) fn test_fail_expansion_of(suffix: Option<&str>) {
+    TEST_EXPANSION_FAILURE.with(|value| *value.borrow_mut() = suffix.map(str::to_owned));
+}
+#[cfg(test)]
 pub(super) fn take_body_analyses() -> usize {
     TEST_BODY_ANALYSES.with(|count| count.replace(0))
 }
@@ -879,6 +887,15 @@ pub(super) fn expand_with_limits(
     let limits = limits.expansion;
     let control = Control { cancel, budget };
     control.check()?;
+    #[cfg(test)]
+    if TEST_EXPANSION_FAILURE.with(|value| {
+        value
+            .borrow()
+            .as_deref()
+            .is_some_and(|suffix| uri.as_str().ends_with(suffix))
+    }) {
+        return Err("resolver limit max_byte_work exceeded: 2 > 1".into());
+    }
     if !requires_session(source) {
         if source.len() > limits.max_expanded_bytes
             || source.len() > limits.max_work

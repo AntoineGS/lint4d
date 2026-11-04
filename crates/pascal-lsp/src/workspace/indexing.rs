@@ -24,10 +24,10 @@ use super::{
 };
 use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
 use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
+pub(crate) use crate::workspace_index::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
 use crate::workspace_index::{
-    CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol,
-    MAX_UNVERIFIED_CANDIDATES, MAX_UNVERIFIED_SYMBOL_CANDIDATES, MemberFacts, MemberStamp,
-    MemberState, SymbolKey,
+    CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol, MemberFacts,
+    MemberStamp, MemberState, SymbolKey,
 };
 
 /// Directories whose owner one call may discover; the rest stay pending and
@@ -233,7 +233,7 @@ fn max_unverified_candidates() -> usize {
     if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified) {
         return cap;
     }
-    MAX_UNVERIFIED_CANDIDATES
+    MAX_INTERACTIVE_UNVERIFIED_CANDIDATES
 }
 
 fn max_unverified_symbol_candidates() -> usize {
@@ -241,7 +241,7 @@ fn max_unverified_symbol_candidates() -> usize {
     if let Some(cap) = CAP_OVERRIDES.with(|caps| caps.get().unverified_symbols) {
         return cap;
     }
-    MAX_UNVERIFIED_SYMBOL_CANDIDATES
+    MAX_INTERACTIVE_UNVERIFIED_CANDIDATES
 }
 
 /// How many pending members one `advance_workspace_index` call takes.
@@ -1468,6 +1468,10 @@ impl Workspace {
             Selection::Symbols { direct: true, .. } => max_unverified_symbol_candidates(),
             Selection::Candidates(_) => max_unverified_candidates(),
         };
+        let mut ranking = match selection {
+            Selection::Candidates(Some(query)) => Some(UnverifiedRanking::new(query)),
+            _ => None,
+        };
         let mut refused = 0usize;
         let mut first_refusal = None::<Box<str>>;
         let mut memory = false;
@@ -1651,6 +1655,17 @@ impl Workspace {
                 let mut paths = membership.paths;
                 let outside = drop_outside(self, key, &mut paths);
                 outside_gap(&mut result.gaps, outside, &display);
+                if let Some(ranking) = ranking.as_mut() {
+                    ranking.rank(
+                        &mut paths,
+                        unverified_left,
+                        &|path: &Path| {
+                            let key = path_key(path);
+                            open.contains(&key) || taken.contains(&key) || deleted(path)
+                        },
+                        cancel,
+                    );
+                }
                 let (skipped, searched) = take_unverified(
                     paths,
                     key,
@@ -1728,6 +1743,17 @@ impl Workspace {
             let outside =
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
             outside_gap(&mut result.gaps, outside, &display);
+            if searched && let Some(ranking) = ranking.as_mut() {
+                ranking.rank(
+                    &mut unverified,
+                    unverified_left,
+                    &|path: &Path| {
+                        let key = path_key(path);
+                        open.contains(&key) || taken.contains(&key) || deleted(path)
+                    },
+                    cancel,
+                );
+            }
 
             for path in selected {
                 if !deleted(&path) && taken.insert(path_key(&path)) {
@@ -2033,6 +2059,134 @@ fn take_unverified(
     (skipped, searched)
 }
 
+/// The bytes one references request may read to rank its unverified
+/// members (l4d-jeh4); members past it keep path order behind the ranked.
+const MAX_UNVERIFIED_RANKING_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_UNVERIFIED_RANKING_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What one request has left for ranking unverified members.
+struct UnverifiedRanking {
+    names: Vec<String>,
+    units: Vec<String>,
+    bytes_left: u64,
+}
+
+impl UnverifiedRanking {
+    fn new(query: &CandidateQuery) -> Self {
+        let tail = |name: &str| {
+            crate::navigation::canonical_name(name)
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let mut names = query
+            .names
+            .iter()
+            .map(|name| tail(name))
+            .collect::<Vec<_>>();
+        let mut units = query
+            .top_level_units
+            .iter()
+            .flatten()
+            .flat_map(|unit| crate::workspace_index::import_names_for(unit, &query.aliases))
+            .map(|name| tail(&name))
+            .collect::<Vec<_>>();
+        for list in [&mut names, &mut units] {
+            list.retain(|name| !name.is_empty());
+            list.sort();
+            list.dedup();
+        }
+        Self {
+            names,
+            units,
+            bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
+        }
+    }
+
+    /// Orders `paths` (in path order) so the members likely to hold an
+    /// occurrence come first: those whose text spells a name and, for
+    /// top-level members, a name of a declaring unit (an importer); then
+    /// those spelling a name; then the unread; then the rest. Only the
+    /// order changes, never the set, so the bound alone decides what is
+    /// left out. Nothing is read when `left` already covers every path.
+    /// Paths `unread` selects (open, deleted or already taken) do not use
+    /// the bound, so they are neither read nor counted.
+    ///
+    /// The scan is a byte search over the raw file: a UTF-16 file, or an
+    /// importer spelling the name only through an include, ranks last.
+    fn rank(
+        &mut self,
+        paths: &mut Vec<PathBuf>,
+        left: usize,
+        unread: &dyn Fn(&Path) -> bool,
+        cancel: &AtomicBool,
+    ) {
+        if self.names.is_empty() || paths.iter().filter(|path| !unread(path)).count() <= left {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut likely = 0usize;
+        let mut tiers = Vec::with_capacity(paths.len());
+        for path in paths.iter() {
+            let tier = if unread(path)
+                || likely >= left
+                || cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                2
+            } else {
+                match self.read(path) {
+                    None => 2,
+                    Some(text) => {
+                        let named = self
+                            .names
+                            .iter()
+                            .any(|name| crate::navigation::text_mentions_name(&text, name));
+                        let imports = self.units.is_empty()
+                            || self
+                                .units
+                                .iter()
+                                .any(|unit| crate::navigation::text_mentions_name(&text, unit));
+                        match (named, imports) {
+                            (true, true) => 0,
+                            (true, false) => 1,
+                            (false, _) => 3,
+                        }
+                    }
+                }
+            };
+            if tier == 0 {
+                likely += 1;
+            }
+            tiers.push(tier);
+        }
+        let mut ranked = std::mem::take(paths)
+            .into_iter()
+            .zip(tiers)
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(_, tier)| *tier);
+        crate::trace::trace!(
+            "  unverified ranking: {} members, {likely} likely, bound {left}, {:.1} ms",
+            ranked.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        paths.extend(ranked.into_iter().map(|(path, _)| path));
+    }
+
+    fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > MAX_UNVERIFIED_RANKING_FILE_BYTES || len > self.bytes_left {
+            return None;
+        }
+        self.bytes_left -= len;
+        let mut text = Vec::with_capacity(len as usize);
+        file.take(len).read_to_end(&mut text).ok()?;
+        Some(text)
+    }
+}
+
 fn outside_gap(gaps: &mut Vec<String>, outside: usize, display: &str) {
     if outside > 0 {
         gaps.push(format!(
@@ -2108,6 +2262,51 @@ mod tests {
 
     fn unit(path: &Path) {
         write(path, "unit X; interface implementation end.\n");
+    }
+
+    /// l4d-jeh4 fix round 1: a path the bound will not read (taken, open
+    /// or deleted) is neither read nor counted as a likely member, so the
+    /// ranking does not stop before the bound holds a likely member.
+    #[test]
+    fn unverified_ranking_ignores_paths_the_bound_does_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let named =
+            "unit X;\ninterface\nuses Shared;\nconst Y = SharedValue;\nimplementation\nend.\n";
+        let a = temp.path().join("A.pas");
+        let b = temp.path().join("B.pas");
+        let c = temp.path().join("C.pas");
+        write(&a, named);
+        write(&b, "unit B;\ninterface\nimplementation\nend.\n");
+        write(&c, named);
+        let mut ranking = UnverifiedRanking::new(&CandidateQuery {
+            names: vec!["sharedvalue".to_owned()],
+            top_level_units: Some(vec!["shared".to_owned()]),
+            aliases: Vec::new(),
+        });
+        let mut paths = vec![a.clone(), b.clone(), c.clone()];
+        let taken = path_key(&a);
+        ranking.rank(
+            &mut paths,
+            1,
+            &|path: &Path| path_key(path) == taken,
+            &AtomicBool::new(false),
+        );
+        let c_at = paths.iter().position(|path| *path == c).unwrap();
+        let b_at = paths.iter().position(|path| *path == b).unwrap();
+        assert!(c_at < b_at, "{paths:?}");
+    }
+
+    #[test]
+    fn text_mentions_name_edges() {
+        use crate::navigation::text_mentions_name;
+        assert!(text_mentions_name(b"", ""));
+        assert!(text_mentions_name(b"abc", ""));
+        assert!(!text_mentions_name(b"foo", "foobar"));
+        assert!(!text_mentions_name(b"", "a"));
+        assert!(text_mentions_name(b"x := FOO", "foo"));
+        assert!(text_mentions_name(b"Foo", "foo"));
+        assert!(text_mentions_name(b"&fOo;", "foo"));
+        assert!(!text_mentions_name(b"x := FO", "foo"));
     }
 
     fn project(root: &Path, properties: &str, items: &str) -> PathBuf {
@@ -4208,7 +4407,7 @@ mod tests {
 
     #[test]
     fn workspace_symbols_read_at_most_the_interactive_unverified_bound() {
-        assert_eq!(MAX_UNVERIFIED_SYMBOL_CANDIDATES, 256);
+        assert_eq!(MAX_INTERACTIVE_UNVERIFIED_CANDIDATES, 256);
         let temp = tempfile::tempdir().unwrap();
         let (mut workspace, key, anchor) =
             indexed_project(temp.path(), 5, WorkspaceOptions::default());

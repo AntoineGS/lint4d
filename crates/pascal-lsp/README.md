@@ -1358,15 +1358,81 @@ default and never required: when it is off or unusable, every feature works
 from memory.
 
 **Current state.** The store is opened, kept within its disk budget and closed
-by this server. Nothing reads facts from it or writes facts to it yet; that
-arrives with `l4d-zf1b.8` and `l4d-zf1b.9`. Until then analysis results come
-only from memory and the cache makes no request faster.
+by this server, and the workspace index is persisted in it (see
+[Persistent indexing](#persistent-indexing)). Other features still read facts
+only from memory (`l4d-zf1b.9`).
 
 **Location.** One store per process, in `$XDG_CACHE_HOME/lint4d/analysis`
 (`~/.cache/lint4d/analysis` when `XDG_CACHE_HOME` is unset or not absolute) on
 Linux and `~/Library/Caches/lint4d/analysis` on macOS. On Windows persistence
 is bypassed until `l4d-x2ft`. Entries are keyed by content. Editor buffers are
 never stored.
+
+#### Persistent indexing
+
+The workspace index (which unit is declared where, and the facts the other
+features need from each member) is built in the background and its per-member
+facts are stored. After a restart, members whose content and project context
+are unchanged are reused without parsing. The last index of a project is also
+kept as a snapshot, used as a hint for which members to try first, never as
+proof.
+
+- **What is still read at startup.** Every member is read and hashed again on
+  each start. A stored stamp (size, modification time) is never proof that a
+  file is unchanged; only the content is. A reused member costs a read and a
+  hash, not a parse.
+- **Unsaved buffers.** They are never persisted. Open documents are indexed
+  from the files on disk. An open file byte-identical to disk does not block
+  its project's publication; open member files themselves are never published
+  from the session, and a project file (`.dproj`, ...) or other context input
+  that differs from disk keeps that context from being published.
+- **Crawl.** The open-file warm crawl publishes the facts it proves from disk,
+  so a first run that is killed keeps what the crawl finished. When the crawl
+  cannot prove its inputs are on disk (an unsaved project file), index
+  batches are interleaved with it instead. The crawl pins at most half of
+  `maxCacheBytes`; an entry over that cap is not pinned and may be evicted, so
+  a very large open closure can be parsed again when you return to it.
+- **Scheduling.** On a second start the reuse passes run before the crawl,
+  even while the store is still opening; the crawl goes first only while bulk
+  work (such as workspace-wide requests) runs. Index batches run behind
+  interactive and bulk work and are bounded: a reuse batch is 512 members or
+  200 ms, an extraction batch 64 members or 2 s. A write refused because the
+  WAL is full is retried after maintenance has checkpointed it.
+- **Refusals.** A member that was refused or exceeded the index limits is not
+  stored as a refusal. It is retried last in the background and reported as a
+  `retrying` gap rather than as an incomplete index.
+- **Persistence off.** The memory-only index is kept with the same results;
+  only the scheduling differs.
+
+Known limitations: an unsaved open `.dproj` gives the index a different
+context key, so its facts are not shared with the saved project; a relative
+`projectFile` gets no project anchor.
+
+`pascal/indexStatus` takes no parameters, performs no IO and returns at most
+8 KiB. It never contains member paths.
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `1` |
+| `contexts` | Up to 8 contexts, most recently used first |
+
+Each context has:
+
+| Field | Meaning |
+| --- | --- |
+| `anchor` | `{"document": uri}` or `{"project": uri}`, at most 512 bytes; `anchorTruncated` says if it was cut |
+| `members`, `fresh` | Members of the project and those whose index entry is current |
+| `reused`, `extracted`, `persisted` | Members reused from the store, parsed in this process, and with a record proven by this process |
+| `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
+| `refused`, `limited`, `deferred`, `retrying` | Members refused, over the limits, failed to load (retried later), and retried after a previous refusal |
+| `membershipComplete` | The member list is complete and current |
+| `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
+| `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |
+| `validationReads` | Files read and hashed to validate the baseline |
+| `gaps` | At most 4 texts of at most 160 bytes explaining what is not indexed |
+
+When the document would exceed 8 KiB, gaps of the least recently used contexts
+are dropped first, then anchors are cut.
 
 #### Options
 
@@ -1530,14 +1596,15 @@ A directory that fails the location checks is left untouched.
 - A cache directory inside a workspace root currently makes requests fail with
   `-32803` and a `retry` message. Choose `persistentCacheDirectory` outside the
   workspace, or set `persistentCacheEnabled` to `false`.
-- Processes do not share cold work: two servers indexing the same project both
-  read and parse every source until facts are reused (`l4d-zf1b.8`).
+- Processes do not share cold work in flight: two servers indexing the same
+  project at once both parse what neither has published yet.
 - It does not bound process memory. Only the pages, scratch and decoded facts
   are charged to `maxCacheBytes`; see the unaccounted list in
   `docs/shared-resolver-architecture.md`.
-- No speedup before `l4d-zf1b.8` and `l4d-zf1b.9`, no network or team-shared
-  cache, and no Windows support yet.
-- Cold indexing still reads every source file.
+- Only the workspace index is persisted; other features gain nothing before
+  `l4d-zf1b.9`. There is no network or team-shared cache and no Windows
+  support yet.
+- Every start still reads and hashes every member of an indexed project.
 
 ## Symbols, References and Highlights
 

@@ -97,6 +97,12 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
                     } => probe(path, *content_hash, None, Some(*version)),
                 }
             });
+        // Every directory a unit lookup of the interface or of a nested
+        // provider consulted, which the session's report may have
+        // deduplicated away (l4d-4nbs review C1): a unit created there may
+        // shadow what the lookup found.
+        let (traced, _) = crate::project_cache::observation_probes(&graph.trace, &mut |_, _| None);
+        probes.extend(traced);
         // The provider sources themselves, nested ones included: a session
         // loads a provider before compiling it, so its observations may not
         // name it.
@@ -1566,6 +1572,102 @@ mod tests {
             .invalidate_file_contents(&temp.path().join("A.pas"));
         assert_eq!(workspace.project_cache.provider_graph_count(), 0);
         assert_eq!(workspace.project_cache.provider_graph_bytes(), 0);
+    }
+
+    /// l4d-4nbs review C1 (the reviewer's probe): P in c/ uses W in b/;
+    /// creating a/W.pas, earlier in the search path, shadows it. The stored
+    /// P interface carries the directories its lookup of W consulted, so the
+    /// same workspace computes P.Flag from the new W, as a fresh one does.
+    #[test]
+    fn a_unit_shadowing_a_nested_lookup_invalidates_the_shared_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let c = temp.path().join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let source = "unit Main; interface uses W, P; {$IF W.Flag = 1} const WOne = 1; {$ENDIF} {$IF P.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
+        std::fs::write(a.join("Main.pas"), source).unwrap();
+        std::fs::write(
+            b.join("W.pas"),
+            "unit W; interface const Flag = 1; implementation end.",
+        )
+        .unwrap();
+        std::fs::write(
+            c.join("P.pas"),
+            "unit P; interface uses W; const Flag = W.Flag * 8; implementation end.",
+        )
+        .unwrap();
+        let make = || {
+            let mut ws = Workspace::with_override_session(
+                vec![a.clone(), b.clone(), c.clone()],
+                Default::default(),
+                OverrideSession::new(None),
+            );
+            let uri = Url::from_file_path(a.join("Main.pas")).unwrap();
+            let key = ws.context_for_uri_with_cancel(&uri, None).unwrap();
+            let _ = &mut ws;
+            (ws, uri, key)
+        };
+        let inactive = |result: &ExpansionResult| {
+            let c = result.expanded.conditionals.as_ref().unwrap();
+            c.inactive_spans
+                .iter()
+                .map(|s| source[s.clone()].to_string())
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        let (ws, uri, key) = make();
+        let first = expand(
+            &ws,
+            &uri,
+            source,
+            &key,
+            ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert!(inactive(&first).contains("Other"), "{}", inactive(&first));
+        assert_eq!(ws.project_cache.provider_graph_count(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(
+            a.join("W.pas"),
+            "unit W; interface const Flag = 2; implementation end.",
+        )
+        .unwrap();
+        let second = expand(
+            &ws,
+            &uri,
+            source,
+            &key,
+            ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let (fresh_ws, fresh_uri, fresh_key) = make();
+        let fresh = expand(
+            &fresh_ws,
+            &fresh_uri,
+            source,
+            &fresh_key,
+            fresh_ws.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inactive(&second),
+            inactive(&fresh),
+            "reused workspace disagrees with a fresh one"
+        );
+        // A watched creation in a directory P's lookup consulted drops P,
+        // not W, which no lookup of its own depends on.
+        assert_eq!(fresh_ws.project_cache.provider_graph_count(), 2);
+        fresh_ws.project_cache.invalidate_path(&a.join("X.pas"));
+        assert_eq!(fresh_ws.project_cache.provider_graph_count(), 1);
     }
 
     /// An interface larger than its share of `maxCacheBytes` is not kept.

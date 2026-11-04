@@ -1506,6 +1506,9 @@ pub struct UnitResolver<S> {
     /// Compiled provider interfaces shared beyond this resolver's sessions
     /// (l4d-4nbs D29), bound to this resolver's configuration.
     shared_provider_graphs: Option<Arc<dyn crate::compile_time::SharedProviderGraphs>>,
+    /// Directories unit lookups consulted while a session traces them
+    /// (l4d-4nbs review C1), with their stamps when consulted.
+    lookup_trace: Option<Vec<(PathBuf, ProjectPathEntry, Option<ProjectReadStamp>)>>,
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
@@ -3023,6 +3026,7 @@ impl<S: SourceStore> UnitResolver<S> {
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
             shared_provider_graphs: None,
+            lookup_trace: None,
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
@@ -4342,6 +4346,19 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
+    /// Record that a unit lookup consulted `directory`, stamped now: a
+    /// change after this proves nothing about the lookup any more.
+    fn trace_lookup(&mut self, directory: &Path, entry: &ProjectPathEntry) {
+        let Some(trace) = self.lookup_trace.as_mut() else {
+            return;
+        };
+        if trace.iter().any(|(path, _, _)| path == directory) {
+            return;
+        }
+        let stamp = pascal_project::path_stamp_result(directory).ok().flatten();
+        trace.push((directory.to_path_buf(), entry.clone(), stamp));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_directory(
         &mut self,
@@ -4359,6 +4376,7 @@ impl<S: SourceStore> UnitResolver<S> {
             && let Some(provided) = provided_entry
             && self.indexed_absent(directory, provided, unit_name, namespaces, cancel)?
         {
+            self.trace_lookup(directory, provided);
             return Ok(None);
         }
         let indexed = provided_entry.map(|provided| (directory.to_path_buf(), provided.clone()));
@@ -4376,6 +4394,7 @@ impl<S: SourceStore> UnitResolver<S> {
             path: directory.clone(),
             provenance: entry.provenance,
         };
+        self.trace_lookup(&directory, &entry);
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
         if self.compile_time_store.is_some()
             && let Some((path, provided)) = &indexed
@@ -8386,6 +8405,24 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     }
     fn note_reused_scan(&mut self, source: &SourceId, revision: &SourceRevision, end: usize) {
         self.credit_compile_time_scan_of(source, revision, end);
+    }
+    fn trace_unit_lookups(&mut self, start: bool) -> Vec<ResolutionObservation> {
+        if start {
+            self.lookup_trace = Some(Vec::new());
+            return Vec::new();
+        }
+        self.lookup_trace
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, entry, stamp)| ResolutionObservation::Directory {
+                path,
+                entry,
+                complete: true,
+                listed: true,
+                stamp,
+            })
+            .collect()
     }
     fn include_capability(
         &mut self,

@@ -2851,6 +2851,7 @@ mod cache_tests {
             dependencies: Default::default(),
             scanned: Default::default(),
             children: Default::default(),
+            trace: Default::default(),
             revision: pascal_core::SourceRevision::Overlay {
                 version: 1,
                 content_hash: 1,

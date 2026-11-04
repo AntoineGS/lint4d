@@ -120,6 +120,10 @@ pub struct SharedProviderGraph {
     pub scanned: Arc<Vec<ScannedExtent>>,
     /// The nested provider interfaces it used, in observation order.
     pub children: Arc<Vec<ChildSegment>>,
+    /// Every directory its unit lookups consulted, nested providers'
+    /// included, however the session's report deduplicated them: the store
+    /// validates them and watches them (l4d-4nbs review C1).
+    pub trace: Arc<Vec<ResolutionObservation>>,
     /// The provider source's revision, for the session identity a reuse
     /// registers.
     pub revision: crate::SourceRevision,
@@ -381,6 +385,15 @@ pub trait CompileTimeResolver {
         _revision: &crate::SourceRevision,
         _end: usize,
     ) {
+    }
+    /// Start (`true`) or stop (`false`) recording every directory unit
+    /// lookups consult, deduplicated reports and name-index skips included;
+    /// stopping returns them as directory observations stamped when
+    /// consulted. A shared provider interface keeps them so a unit created
+    /// in a directory a nested lookup consulted invalidates it (l4d-4nbs
+    /// review C1). The default records nothing.
+    fn trace_unit_lookups(&mut self, _start: bool) -> Vec<ResolutionObservation> {
+        Vec::new()
     }
     /// Compiled provider interfaces shared beyond this session (l4d-4nbs
     /// D29). The default shares nothing.
@@ -785,6 +798,7 @@ struct SharedOrigin {
     key: ProviderGraphKey,
     revision: crate::SourceRevision,
     lookup: (usize, usize),
+    trace: Arc<Vec<ResolutionObservation>>,
     observations: Arc<Vec<ResolutionObservation>>,
     warnings: Arc<Vec<String>>,
     scanned: Arc<Vec<ScannedExtent>>,
@@ -920,6 +934,9 @@ struct ProviderSession {
     /// The nested provider interfaces each shared compilation in progress
     /// has used so far, with absolute observation and warning ranges.
     segments: Vec<Vec<ChildSegment>>,
+    /// The directories each shared compilation in progress has looked units
+    /// up in, parallel to `segments`.
+    traces: Vec<Vec<ResolutionObservation>>,
     queries: usize,
     next_occurrence: u64,
     /// Where the stack was when the session started (l4d-4nbs D29).
@@ -1049,6 +1066,7 @@ impl ProviderSession {
             graphs,
             collecting: Vec::new(),
             segments: Vec::new(),
+            traces: Vec::new(),
             declarations,
             queries: 0,
             next_occurrence: 1,
@@ -1111,6 +1129,35 @@ impl ProviderSession {
             }
         };
         Ok(self.credits.value_mut()[index].value_mut())
+    }
+
+    fn push_frame(&mut self) {
+        self.segments.push(Vec::new());
+        self.traces.push(Vec::new());
+    }
+
+    fn pop_frame(&mut self) -> (Vec<ChildSegment>, Vec<ResolutionObservation>) {
+        (
+            self.segments.pop().unwrap_or_default(),
+            self.traces.pop().unwrap_or_default(),
+        )
+    }
+
+    /// Add consulted directories to the innermost shared compilation.
+    fn note_trace(&mut self, trace: &[ResolutionObservation]) {
+        let Some(frame) = self.traces.last_mut() else {
+            return;
+        };
+        for observation in trace {
+            let ResolutionObservation::Directory { path, .. } = observation else {
+                continue;
+            };
+            if !frame.iter().any(|known| {
+                matches!(known, ResolutionObservation::Directory { path: known, .. } if known == path)
+            }) {
+                frame.push(observation.clone());
+            }
+        }
     }
 
     /// How far the session has scanned each source, to compare after a
@@ -2239,6 +2286,12 @@ impl ProviderEngine<'_, '_> {
                 )
                 .map_err(|r| resolver_error(r, self.budget))?;
                 self.providers.queries += 1;
+                // Inside a shared compilation, record every directory the
+                // lookup consults, whatever the session already reported.
+                let tracing = !self.providers.segments.is_empty();
+                if tracing {
+                    self.resolver.trace_unit_lookups(true);
+                }
                 let pending = &state.interfaces[index].pending;
                 let outcome = self.budget.external(|budget| {
                     self.resolver.unit_report_capability(
@@ -2254,6 +2307,13 @@ impl ProviderEngine<'_, '_> {
                 let (result, reports) = outcome.into_parts();
                 let before = (self.observations.len(), self.warnings.len());
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
+                if tracing {
+                    let trace = self.resolver.trace_unit_lookups(false);
+                    self.budget
+                        .charge(trace.len() + 1, observations_payload(&trace), 0)
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                    self.providers.note_trace(&trace);
+                }
                 if !self.providers.segments.is_empty() {
                     let observations = before.0..self.observations.len();
                     let warnings = before.1..self.warnings.len();
@@ -2747,6 +2807,9 @@ impl ProviderEngine<'_, '_> {
                 drop(provider);
                 let dependencies = self.providers.graphs[index].dependencies.clone();
                 self.note_dependencies(&dependencies)?;
+                if let Some(origin) = self.providers.graphs[index].shared.clone() {
+                    self.providers.note_trace(&origin.trace);
+                }
                 return self.prepare_memoized(index, name, pointers, depth);
             }
         }
@@ -2811,7 +2874,7 @@ impl ProviderEngine<'_, '_> {
         push_owner(&mut self.providers.active, key, self.budget)?;
         self.providers.collecting.push(Vec::new());
         if shared.is_some() {
-            self.providers.segments.push(Vec::new());
+            self.providers.push_frame();
         }
         let result = analyze_source_with_providers(
             &provider.unit.source,
@@ -2859,11 +2922,12 @@ impl ProviderEngine<'_, '_> {
             .pop()
             .expect("active provider identity");
         let mut dependencies = self.providers.collecting.pop().unwrap_or_default();
-        let children = if shared.is_some() {
-            self.providers.segments.pop().unwrap_or_default()
+        let (children, trace) = if shared.is_some() {
+            self.providers.pop_frame()
         } else {
-            Vec::new()
+            Default::default()
         };
+        self.providers.note_trace(&trace);
         dependencies.push(ProviderDependency::of(&provider.unit.source));
         dependencies.sort_by(|a, b| {
             (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
@@ -2904,6 +2968,7 @@ impl ProviderEngine<'_, '_> {
                 key,
                 revision: provider.unit.source.revision.clone(),
                 lookup: (found.len(), warned.len()),
+                trace: Arc::new(trace),
                 observations: Arc::new(observations),
                 warnings: Arc::new(warnings),
                 scanned: Arc::new(self.providers.scanned_since(&scan_before)),
@@ -2929,6 +2994,7 @@ impl ProviderEngine<'_, '_> {
                         children: origin.children.clone(),
                         revision: origin.revision.clone(),
                         lookup: origin.lookup,
+                        trace: origin.trace.clone(),
                         retained_bytes: 0,
                     }),
                 );
@@ -2998,6 +3064,7 @@ impl ProviderEngine<'_, '_> {
                     children: origin.children.clone(),
                     revision: origin.revision.clone(),
                     lookup: origin.lookup,
+                    trace: origin.trace.clone(),
                     retained_bytes: shared_retained_bytes(&graph, &origin.observations),
                 }),
             );
@@ -3108,6 +3175,8 @@ impl ProviderEngine<'_, '_> {
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.identities, key, self.budget)?;
         self.replay_shared(hit, found)?;
+        // A session or interface that reuses it depends on its lookups too.
+        self.replay_trace(&hit.trace)?;
         self.note_dependencies(&hit.dependencies)?;
         self.credit_reused_scan(&hit.scanned)?;
         let entry = self
@@ -3120,6 +3189,7 @@ impl ProviderEngine<'_, '_> {
                     key: shared_key,
                     revision: hit.revision.clone(),
                     lookup: hit.lookup,
+                    trace: hit.trace.clone(),
                     observations: hit.observations.clone(),
                     warnings: hit.warnings.clone(),
                     scanned: hit.scanned.clone(),
@@ -3237,6 +3307,22 @@ impl ProviderEngine<'_, '_> {
         )
     }
 
+    fn replay_trace(
+        &mut self,
+        trace: &Arc<Vec<ResolutionObservation>>,
+    ) -> Result<(), ResolverError> {
+        self.providers.note_trace(trace);
+        if trace.is_empty() {
+            return Ok(());
+        }
+        let bytes = observations_payload(trace);
+        let owned = self
+            .budget
+            .admit_owned(trace.len(), bytes, bytes, || trace.as_ref().clone())
+            .map_err(|r| resolver_error(r, self.budget))?;
+        move_report_vector(self.observations, owned, self.budget)
+    }
+
     fn replay_part(
         &mut self,
         hit: &SharedProviderGraph,
@@ -3303,15 +3389,16 @@ impl ProviderEngine<'_, '_> {
         let sharing = self.providers.graphs[index].shared.is_some();
         self.providers.collecting.push(Vec::new());
         if sharing {
-            self.providers.segments.push(Vec::new());
+            self.providers.push_frame();
         }
         let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1);
         let added = Arc::new(self.providers.collecting.pop().unwrap_or_default());
-        let children = if sharing {
-            self.providers.segments.pop().unwrap_or_default()
+        let (children, trace) = if sharing {
+            self.providers.pop_frame()
         } else {
-            Vec::new()
+            Default::default()
         };
+        self.providers.note_trace(&trace);
         let prepared = prepared?;
         self.note_dependencies(&added)?;
         if Arc::ptr_eq(&prepared, &graph) {
@@ -3358,10 +3445,18 @@ impl ProviderEngine<'_, '_> {
             }));
             Arc::new(all)
         };
+        let trace = if trace.is_empty() {
+            origin.trace.clone()
+        } else {
+            let mut all = origin.trace.as_ref().clone();
+            all.extend(trace);
+            Arc::new(all)
+        };
         let origin = Arc::new(SharedOrigin {
             key: origin.key.clone(),
             revision: origin.revision.clone(),
             lookup: origin.lookup,
+            trace,
             observations: extended(
                 &origin.observations,
                 &self.observations[observations_before..],
@@ -3382,6 +3477,7 @@ impl ProviderEngine<'_, '_> {
             children: origin.children.clone(),
             revision: origin.revision.clone(),
             lookup: origin.lookup,
+            trace: origin.trace.clone(),
             retained_bytes: shared_retained_bytes(&prepared, &origin.observations),
         };
         store.put(origin.key.clone(), Arc::new(shared));

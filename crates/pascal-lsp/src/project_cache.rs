@@ -1787,10 +1787,12 @@ mod cache_tests {
     fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
         let cache = ProjectCache::new(20);
         let ctx = context("A.dproj");
-        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
-        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
+        // Pinned once ready: an entry stored after its pin is held to the
+        // pin cap (half the budget), which A's two layers exceed.
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill_unit(&cache, "A.pas", &ctx, 1, vec![]);
+        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
+        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
         fill(&cache, "B.pas", &ctx, 1, 9);
 
         cache.unpin(&uri("Open1.pas"));
@@ -2351,11 +2353,11 @@ mod cache_tests {
     fn pinned_entries_at_budget_report_no_room() {
         let cache = ProjectCache::new(10);
         let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
             &uri("Open.pas"),
             vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
         );
-        fill(&cache, "A.pas", &ctx, 1, 10);
 
         assert_eq!(cache.stats().bytes, 10);
         assert!(!cache.has_room());
@@ -2411,14 +2413,56 @@ mod cache_tests {
     }
 
     #[test]
-    fn pinned_entries_over_budget_report_no_room() {
-        let cache = ProjectCache::new(5);
+    fn pinned_entries_stored_after_their_pin_stay_within_the_cap() {
+        let cache = ProjectCache::new(40);
         let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        let names = ["A.pas", "B.pas", "C.pas", "D.pas"];
+        // Nothing is stored yet: every key is admitted at no cost.
+        assert!(
+            cache
+                .pin_capped(
+                    &uri("Open.pas"),
+                    names.iter().map(|name| (uri(name), fingerprint)).collect(),
+                    &[],
+                )
+                .is_empty()
+        );
+        for name in names {
+            fill(&cache, name, &ctx, 1, 8);
+            assert!(
+                cache.stats().pinned_bytes <= cache.max_bytes() / 2,
+                "after {name}: {:?}",
+                cache.stats()
+            );
+        }
+        assert_eq!(
+            cache.stats().pinned_bytes,
+            16,
+            "A and B fit, C and D do not"
+        );
+        fill(&cache, "E.pas", &ctx, 1, 16);
+        assert!(
+            ready(&cache, "A.pas") && ready(&cache, "B.pas"),
+            "still pinned"
+        );
+        assert!(
+            !ready(&cache, "C.pas"),
+            "C was left unpinned and evicted first"
+        );
+    }
+
+    #[test]
+    fn pinned_entries_over_budget_report_no_room() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
             &uri("Open.pas"),
             vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
         );
-        fill(&cache, "A.pas", &ctx, 1, 10);
+        // A smaller budget cannot evict the pinned entry.
+        cache.set_max_bytes(5);
         assert!(!cache.has_room());
         assert!(cache.stats().pinned_over_budget);
         cache.unpin(&uri("Open.pas"));
@@ -4433,6 +4477,18 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
 
 const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
 
+/// Removes `pin` from every owner's set, and drops owners left empty.
+fn unpin_key(state: &mut State, pin: &(Url, u64)) {
+    let mut removed = 0usize;
+    state.pins.retain(|_, keys| {
+        removed += usize::from(keys.remove(pin));
+        !keys.is_empty()
+    });
+    for _ in 0..removed {
+        remove_pin(state, pin);
+    }
+}
+
 /// Whether some owner pins `(uri, fingerprint)`.
 fn pin_counted(state: &State, (uri, fingerprint): &(Url, u64)) -> bool {
     state
@@ -4515,6 +4571,13 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     state.bytes = state.bytes.saturating_add(entry.bytes);
     if let Some(address) = parse_address(&entry.value) {
         hold_parse(state, address, entry.bytes);
+    }
+    // A pinned key whose entry arrives after its pin keeps the pins within
+    // their cap (l4d-axsn): over it, the key is unpinned for every owner.
+    if is_pinned(state, &key)
+        && state.pinned_bytes.saturating_add(entry.bytes) > state.max_bytes / PIN_BUDGET_SHARE
+    {
+        unpin_key(state, &(key.uri.clone(), key.fingerprint));
     }
     if is_pinned(state, &key) {
         state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);

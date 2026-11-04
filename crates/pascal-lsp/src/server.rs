@@ -866,11 +866,13 @@ impl ProtocolConnection {
     /// ordinary lane alone would never wake for it. A ready warmer event
     /// returns `Timeout`, leaving the event for the warmer's poll (l4d-axsn:
     /// a crawl's end waited for the next client message). A disconnected
-    /// priority or warmer lane stops waking the receive.
+    /// priority lane, or a warmer lane once `warm_running` is false, stops
+    /// waking the receive; a spurious wake-up only selects again.
     fn recv_timeout_or_warm(
         &self,
         timeout: Duration,
         warm: &Receiver<crate::warmer::WarmEvent>,
+        warm_running: &dyn Fn() -> bool,
     ) -> Result<Message, RecvTimeoutError> {
         if !warm.is_empty() {
             return Err(RecvTimeoutError::Timeout);
@@ -902,13 +904,13 @@ impl ProtocolConnection {
                     Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
                     Err(TryRecvError::Empty) => {}
                 }
-            } else if Some(ready) == warm_index {
-                // Ready but empty: the warmer is gone.
-                match warm {
-                    Some(receiver) if !receiver.is_empty() => {
-                        return Err(RecvTimeoutError::Timeout);
-                    }
-                    _ => warm = None,
+            } else if Some(ready) == warm_index
+                && let Some(receiver) = warm
+            {
+                match warm_lane_on_wake(!receiver.is_empty(), warm_running()) {
+                    WarmLane::Wake => return Err(RecvTimeoutError::Timeout),
+                    WarmLane::Keep => {}
+                    WarmLane::Drop => warm = None,
                 }
             }
         }
@@ -931,6 +933,28 @@ impl ProtocolConnection {
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
         self.flush()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WarmLane {
+    /// An event is ready: the loop's tick handles it.
+    Wake,
+    /// A spurious wake-up: select again with the lane.
+    Keep,
+    /// Ready but empty after the warmer thread ended: disconnected.
+    Drop,
+}
+
+/// What a ready warmer lane means: `select` may wake spuriously, so an
+/// empty lane is only dropped once the warmer thread has ended.
+fn warm_lane_on_wake(has_event: bool, warm_running: bool) -> WarmLane {
+    if has_event {
+        WarmLane::Wake
+    } else if warm_running {
+        WarmLane::Keep
+    } else {
+        WarmLane::Drop
     }
 }
 
@@ -11536,7 +11560,9 @@ fn event_loop(
                 Some(DeferredConfigurationMessage::Notification(notification)) => {
                     Message::Notification(notification)
                 }
-                None => match connection.recv_timeout_or_warm(timeout, warmer.events()) {
+                None => match connection
+                    .recv_timeout_or_warm(timeout, warmer.events(), &|| warmer.is_running())
+                {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         drain_watch_events(workspace, &watch_events, &mut rewarm);
@@ -11592,7 +11618,8 @@ fn event_loop(
                 },
             }
         } else {
-            match connection.recv_timeout_or_warm(timeout, warmer.events()) {
+            match connection.recv_timeout_or_warm(timeout, warmer.events(), &|| warmer.is_running())
+            {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     drain_watch_events(workspace, &watch_events, &mut rewarm);
@@ -17792,7 +17819,8 @@ mod tests {
 
         let (_warm_sender, warm_events) = crossbeam_channel::unbounded();
         let started = Instant::now();
-        let received = protocol.recv_timeout_or_warm(Duration::from_secs(2), &warm_events);
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(2), &warm_events, &|| true);
 
         assert!(
             matches!(&received, Ok(Message::Request(request)) if request.method == "shutdown"),
@@ -17822,7 +17850,8 @@ mod tests {
             })
             .unwrap();
 
-        let received = protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events);
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events, &|| true);
 
         assert!(
             matches!(received, Err(RecvTimeoutError::Timeout)),
@@ -17851,12 +17880,26 @@ mod tests {
             )))
             .unwrap();
 
-        let received = protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events);
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events, &|| false);
 
         assert!(
             matches!(&received, Ok(Message::Notification(notification)) if notification.method == "initialized"),
             "{received:?}"
         );
+    }
+
+    #[test]
+    fn a_spurious_warmer_wake_up_keeps_the_lane() {
+        use super::WarmLane;
+        assert_eq!(super::warm_lane_on_wake(true, true), WarmLane::Wake);
+        assert_eq!(super::warm_lane_on_wake(true, false), WarmLane::Wake);
+        assert_eq!(
+            super::warm_lane_on_wake(false, true),
+            WarmLane::Keep,
+            "ready but empty while the warmer runs: select again"
+        );
+        assert_eq!(super::warm_lane_on_wake(false, false), WarmLane::Drop);
     }
 
     #[test]

@@ -346,6 +346,10 @@ pub(crate) struct IndexProgress {
     pub(crate) reused: usize,
     /// Members the store had nothing for (now tried for reuse).
     pub(crate) reuse_missed: usize,
+    /// Of `reuse_missed`, members the store held nothing for.
+    pub(crate) reuse_absent: usize,
+    /// The context had an adopted baseline hint after the batch.
+    pub(crate) hinted: bool,
     /// Pending closed members not tried for reuse since they last changed.
     pub(crate) reuse_pending: usize,
     /// Retryable reuse misses this batch (left untried for reuse).
@@ -379,6 +383,8 @@ impl IndexProgress {
             untried: 0,
             reused: 0,
             reuse_missed: 0,
+            reuse_absent: 0,
+            hinted: false,
             reuse_pending: 0,
             reuse_deferred: 0,
             persisted: 0,
@@ -410,6 +416,18 @@ impl IndexProgress {
         settled
             || (self.deferred > 0 && self.untried > 0)
             || (self.mode == IndexMode::Reuse && self.reuse_pending > 0 && self.reuse_missed > 0)
+    }
+
+    /// A reuse batch that found a cold store: it reused nothing, the store
+    /// held nothing for any member it missed, and no baseline hint was
+    /// adopted. Its pass ends there; the untried members keep their reuse
+    /// attempt for the extraction batches, which try reuse first.
+    pub(crate) fn found_a_cold_store(&self) -> bool {
+        self.mode == IndexMode::Reuse
+            && self.reused == 0
+            && self.reuse_missed > 0
+            && self.reuse_absent == self.reuse_missed
+            && !self.hinted
     }
 }
 
@@ -547,7 +565,8 @@ enum ReuseOutcome {
     /// Indexed from the store.
     Reused,
     /// The store cannot prove facts for the current inputs: extract.
-    Missed,
+    /// `absent` when it held nothing for the member.
+    Missed { absent: bool },
     /// A miss that may pass (budget, cancellation, a store bypass): the
     /// member stays untried for reuse.
     Retry,
@@ -749,9 +768,10 @@ impl Workspace {
                     progress.reused += 1;
                     continue;
                 }
-                ReuseOutcome::Missed => {
+                ReuseOutcome::Missed { absent } => {
                     self.project_cache.mark_index_reuse_tried(&key, &path);
                     progress.reuse_missed += 1;
+                    progress.reuse_absent += usize::from(absent);
                 }
                 ReuseOutcome::Retry => progress.reuse_deferred += 1,
                 // A previous refusal is retried after every other member: a
@@ -857,6 +877,7 @@ impl Workspace {
             .filter(|path| !self.is_open_member(path))
             .count();
         progress.complete = progress.pending == progress.retrying && !progress.memory;
+        progress.hinted = self.project_cache.baseline_hint(&key).is_some();
         Ok(progress)
     }
 
@@ -1314,7 +1335,7 @@ impl Workspace {
             return ReuseOutcome::NoStore;
         }
         let Ok(uri) = Url::from_file_path(path) else {
-            return ReuseOutcome::Missed;
+            return ReuseOutcome::Missed { absent: false };
         };
         let Some(job) = self.persistent_cache().job() else {
             return ReuseOutcome::NoStore;
@@ -1378,12 +1399,15 @@ impl Workspace {
                 ..
             }) => (facts, reads, artifact, evidence, include_stamps, root_hash),
             Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => return ReuseOutcome::Retry,
+            Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => {
+                return ReuseOutcome::Missed { absent: true };
+            }
             Ok(Reuse::Miss(ReuseMiss::Stale(_) | ReuseMiss::Store(_) | ReuseMiss::Open)) => {
-                return ReuseOutcome::Missed;
+                return ReuseOutcome::Missed { absent: false };
             }
             // `record_reuse` observed the bypass.
             Err(super::persist::PersistError::Store(_)) => return ReuseOutcome::Retry,
-            Err(_) => return ReuseOutcome::Missed,
+            Err(_) => return ReuseOutcome::Missed { absent: false },
         };
         job.store().hint_used(match evidence {
             Some(id) => Hint::Evidence(id),
@@ -1417,7 +1441,7 @@ impl Workspace {
                 ReuseOutcome::Reused
             }
             PublishOutcome::Memory => ReuseOutcome::Memory,
-            PublishOutcome::NotAMember => ReuseOutcome::Missed,
+            PublishOutcome::NotAMember => ReuseOutcome::Missed { absent: false },
         };
         drop(facts);
         outcome

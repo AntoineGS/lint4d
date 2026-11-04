@@ -24660,10 +24660,14 @@ BDS = '/fake/37'
         assert_eq!(options.limits.max_cache_bytes, 1_048_576);
 
         let workspace = test_workspace(vec![temp.path().to_path_buf()], options);
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
         store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[test]
@@ -24750,10 +24754,14 @@ BDS = '/fake/37'
         .expect("prepared runtime options");
 
         assert!(workspace.apply_prepared_runtime_options(prepared));
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
         store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[cfg(unix)]

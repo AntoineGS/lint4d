@@ -1620,6 +1620,22 @@ struct ClientFeatures {
     folding_range_kind_value_set: Option<u8>,
 }
 
+/// Whether a completion's dependency observations fit what resolving its
+/// items may retain (l4d-4nbs re-review): past it the completion renders
+/// documentation and detail eagerly instead of refusing.
+fn completion_resolution_fits(records: &[SourceRecord], demanded: &[Url]) -> bool {
+    let Ok((compact, bytes)) = compact_completion_records(records) else {
+        return false;
+    };
+    let bytes = demanded.iter().fold(bytes, |total, uri| {
+        total
+            .saturating_add(size_of::<Url>())
+            .saturating_add(uri.as_str().len())
+    });
+    compact.len() <= MAX_COMPLETION_RESOLUTION_RECORDS
+        && bytes <= MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES
+}
+
 #[derive(Debug, Clone)]
 struct CompletionResolutionContext {
     source_uri: Url,
@@ -1631,6 +1647,8 @@ struct CompletionResolutionContext {
     resolve_documentation: bool,
     resolve_detail: bool,
     records: Vec<SourceRecord>,
+    /// Units the completion's demand rounds loaded (l4d-4nbs re-review).
+    demanded: Vec<Url>,
 }
 
 #[derive(Debug, Clone)]
@@ -1760,6 +1778,11 @@ impl CompletionResolutionStore {
         }
 
         let (compact_records, context_bytes) = compact_completion_records(records)?;
+        let context_bytes = result.demanded.iter().fold(context_bytes, |total, uri| {
+            total
+                .saturating_add(size_of::<Url>())
+                .saturating_add(uri.as_str().len())
+        });
         if compact_records.len() > MAX_COMPLETION_RESOLUTION_RECORDS {
             return Err("completion dependency observations exceed the bounded limit".to_string());
         }
@@ -1782,6 +1805,7 @@ impl CompletionResolutionStore {
             resolve_documentation,
             resolve_detail,
             records: compact_records,
+            demanded: result.demanded.clone(),
         });
 
         let mut pending = Vec::with_capacity(result.list.items.len());
@@ -3392,8 +3416,7 @@ impl ConfigurationPreparationJobs {
         let root_paths = request.root_paths;
         let worker_options = options.clone();
         let worker_root_paths = root_paths.clone();
-        let handle = thread::Builder::new()
-            .name("PascalLspConfiguration".to_string())
+        let handle = analysis_thread("PascalLspConfiguration")
             .spawn(move || {
                 let prepared = Workspace::prepare_runtime_options_for_roots(
                     worker_root_paths.clone(),
@@ -4090,8 +4113,7 @@ impl PartialDeliveryValidation {
         let test_barriers = self.test_barriers.clone();
         #[cfg(test)]
         let runs = Arc::clone(&self.runs);
-        let handle = thread::Builder::new()
-            .name("PascalLspPartialValidation".to_string())
+        let handle = analysis_thread("PascalLspPartialValidation")
             .spawn(move || {
                 #[cfg(test)]
                 runs.fetch_add(1, Ordering::Relaxed);
@@ -5443,8 +5465,7 @@ impl AnalysisJobs {
             let test_barriers = self.test_barriers.clone();
             let worker_id = id;
             let panic_symbols = symbols.clone();
-            let handle = thread::Builder::new()
-                .name("PascalLspCompiledContent".to_string())
+            let handle = analysis_thread("PascalLspCompiledContent")
                 .spawn(move || {
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let result = wait_at_test_barrier(
@@ -5685,8 +5706,7 @@ impl AnalysisJobs {
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
-        let handle = thread::Builder::new()
-            .name("PascalLspAnalysis".to_string())
+        let handle = analysis_thread("PascalLspAnalysis")
             .spawn(move || {
                 let _span = crate::trace::Span::new(|| {
                     format!(
@@ -5753,7 +5773,9 @@ impl AnalysisJobs {
                             resolve_documentation,
                             resolve_detail,
                         } => {
-                            let computed = queries::completion_from_input_with_options(
+                            // Too many dependencies to resolve items later:
+                            // the same computation renders them now.
+                            let computed = queries::completion_from_input_within(
                                 input,
                                 &uri,
                                 position,
@@ -5763,8 +5785,12 @@ impl AnalysisJobs {
                                     defer_detail: resolve_detail,
                                     snippet_support,
                                 },
+                                &completion_resolution_fits,
                                 &worker_cancellation,
                             );
+                            let eager = computed.value.as_ref().is_ok_and(|result| result.eager);
+                            let resolve_documentation = resolve_documentation && !eager;
+                            let resolve_detail = resolve_detail && !eager;
                             AnalysisResult {
                                 id: worker_id,
                                 source_generation: computed.source_generation,
@@ -6320,6 +6346,7 @@ impl AnalysisJobs {
                                     context.resolve_detail,
                                     context.snippet_support,
                                     &context.records,
+                                    &context.demanded,
                                     &worker_cancellation,
                                 );
                                 // Keep the identity's original generation as the
@@ -6684,8 +6711,7 @@ impl AnalysisJobs {
             | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
             _ => unreachable!("only project protocol requests use this worker"),
         };
-        let handle = thread::Builder::new()
-                .name("PascalLspProjectOperation".to_string())
+        let handle = analysis_thread("PascalLspProjectOperation")
                 .spawn(move || {
                 let mut request = request;
                 let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
@@ -10313,6 +10339,24 @@ fn send_diagnostic_server_cancelled(
     Ok(())
 }
 
+/// Stack of every thread that runs analysis (l4d-4nbs review I4). A
+/// compile-time session stops nesting providers at 1 MiB of stack
+/// (`max_provider_stack_bytes`, about 52 KB a provider in a debug build and
+/// 11 KB in release); within one provider, type preparation recurses up to
+/// `max_type_depth` (256) levels at about 2.7 KB a level in debug (0.4 KB in
+/// release). Measured peaks with nesting at the limit and a 250-level chain
+/// in the innermost provider: 1.24 MiB debug, 0.71 MiB release, plus the
+/// request's own frames above the session. 16 MiB leaves a wide margin and
+/// costs only address space until touched.
+pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// A builder for a thread that runs analysis, with its explicit stack.
+pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(ANALYSIS_THREAD_STACK_BYTES)
+}
+
 /// Run one native LSP session over stdin/stdout.
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
     run_stdio_with_config(TestBarrierConfig::disabled())
@@ -11045,8 +11089,7 @@ fn spawn_workspace_file_notification(
         ..revision
     };
     let owned_workspace = std::mem::take(workspace);
-    let join = thread::Builder::new()
-        .name("PascalLspWorkspaceMutation".to_string())
+    let join = analysis_thread("PascalLspWorkspaceMutation")
         .spawn(move || {
             let mut workspace = owned_workspace;
             let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
@@ -13388,6 +13431,11 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            // An item rendered eagerly has nothing left to resolve.
+            if item.data.is_none() {
+                send_ok(connection, id, item)?;
+                return Ok(());
+            }
             let resolve_request = match jobs.completion_resolution_request(&item) {
                 Ok(resolve_request) => resolve_request,
                 Err(error) => {
@@ -18155,6 +18203,8 @@ mod tests {
                     }],
                 },
                 seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
+                demanded: Vec::new(),
+                eager: false,
             }),
         }
     }
@@ -18766,6 +18816,24 @@ mod tests {
                 .expect_err("diagnostic count is checked before projecting records"),
             "diagnostic validation evidence exceeds the 32768-record limit"
         );
+    }
+
+    /// l4d-4nbs re-review: a completion whose dependency observations do not
+    /// fit the resolution bounds is answered eagerly instead of refused.
+    #[test]
+    fn completion_resolution_fit_follows_the_record_bound() {
+        let records = |count: usize| {
+            (0..count)
+                .map(|n| {
+                    test_completion_record(
+                        Url::parse(&format!("file:///completion-fit-{n}.pas")).expect("fit URI"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(super::completion_resolution_fits(&records(16), &[]));
+        let over = records(super::MAX_COMPLETION_RESOLUTION_RECORDS + 1);
+        assert!(!super::completion_resolution_fits(&over, &[]));
     }
 
     #[test]

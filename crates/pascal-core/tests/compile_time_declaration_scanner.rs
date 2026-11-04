@@ -381,3 +381,141 @@ fn anonymous_methods_in_initialization_and_finalization() {
     assert_eq!(activity(&analysis, "DEFINE INIT"), Truth::True);
     assert_eq!(activity(&analysis, "DEFINE FINAL"), Truth::True);
 }
+
+/// l4d-4nbs R11: SysUtils.FloatToTextFmt has a `var` section and an `asm`
+/// body whose labels (`@@1:`) looked like the type of a variable, so its
+/// `end` was skipped and every later routine nested one scope deeper.
+#[test]
+fn assembler_routine_with_local_variables_and_labels() {
+    assert_scans_completely(
+        "function Low: Integer; var Count: Integer; \
+         asm \
+         @@1: MOV EAX, Count \
+         DEC EAX \
+         JNZ @@1 \
+         end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
+/// An `asm` statement inside a `begin` block ends with its own `end`.
+#[test]
+fn assembler_statement_inside_a_routine_body() {
+    assert_scans_completely(
+        "procedure Wait; var Count: Integer; \
+         begin \
+           asm @@1: PAUSE \
+           DEC Count \
+           JNZ @@1 end; \
+           if Count = 0 then asm NOP end; \
+         end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
+/// l4d-4nbs R11: TypInfo.SortPropList's assembler labels `@@repeat` and
+/// `@@endRepeat` are labels, not `repeat`; likewise `&`-escaped identifiers
+/// such as `&begin` are not keywords.
+#[test]
+fn assembler_labels_and_escaped_identifiers_are_not_keywords() {
+    assert_scans_completely(
+        "procedure Sort; assembler; \
+         asm \
+         @@repeat: DEC EAX \
+         JNZ @@repeat \
+         @@case: JMP @@begin \
+         @@begin: \
+         end; \
+         procedure Escaped; var &begin: Integer; begin &begin := 1; end; \
+         procedure TFoo.Bar; begin end;",
+    );
+}
+
+/// l4d-4nbs R11: ZLib.pas declares `EZLibError = class(Exception);`, a
+/// class with a heritage list and no body, which left its scope open.
+#[test]
+fn bodiless_classes_with_a_heritage_list_close_their_scope() {
+    let source = "unit T; interface \
+         type \
+           EBase = class(Exception); \
+           EDerived = class(EBase); \
+           TImpl = class(TInterfacedObject, IUnknown); \
+           TFull = class(TObject) procedure Run; end; \
+         const After = 1; \
+         {$IF Declared(After) and Declared(EDerived) and Declared(TFull)}{$DEFINE SEEN}{$ENDIF} \
+         implementation end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE SEEN"), Truth::True);
+}
+
+/// Test-only harness (l4d-4nbs R11): analyse the real units listed in
+/// `L4D_SCAN_FILES` (separated by `;`) and report every incomplete reason.
+/// Includes are served from the unit's directory and `L4D_SCAN_INCLUDES`.
+#[test]
+#[ignore = "reads local Delphi sources named by L4D_SCAN_FILES"]
+fn scan_real_units_from_the_environment() {
+    let files = std::env::var("L4D_SCAN_FILES").unwrap_or_default();
+    let extra = std::env::var("L4D_SCAN_INCLUDES").unwrap_or_default();
+    let mut failures = Vec::new();
+    for file in files.split(';').filter(|f| !f.is_empty()) {
+        let path = std::path::Path::new(file);
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        let mut ctx = context(LayoutPlatform::Win32)
+            .with_compiler_version(pascal_project::CompilerVersion::new(21, 0));
+        for define in [
+            "MSWINDOWS",
+            "WIN32",
+            "CPU386",
+            "VER210",
+            "CONDITIONALEXPRESSIONS",
+        ] {
+            ctx.set_define(define, pascal_project::ConditionalFact::True);
+        }
+        ctx = ctx.with_absent_define(pascal_project::ConditionalFact::False);
+        let mut f = Fixture::new(&text, ctx);
+        f.limits.max_retained_bytes = 256 * 1024 * 1024;
+        let dirs = std::iter::once(path.parent().unwrap().to_path_buf())
+            .chain(extra.split(';').filter(|d| !d.is_empty()).map(Into::into));
+        for dir in dirs {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.to_ascii_lowercase().ends_with(".inc") {
+                    let body =
+                        String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).into_owned();
+                    // The fixture matches spellings exactly (`GETMEM.INC`).
+                    let stem = &name[..name.len() - 4];
+                    for spelling in [
+                        name.clone(),
+                        name.to_ascii_lowercase(),
+                        name.to_ascii_uppercase(),
+                        format!("{stem}.INC"),
+                        format!("{stem}.inc"),
+                    ] {
+                        f.include(&spelling, &body);
+                    }
+                }
+            }
+        }
+        match f.analyze() {
+            Ok(analysis) => {
+                eprintln!(
+                    "{file}: complete={} {:?} {:?}",
+                    analysis.root.complete,
+                    analysis.reasons,
+                    analysis.budget.budget_snapshot()
+                );
+                if !analysis.reasons.is_empty() {
+                    failures.push(file.to_owned());
+                }
+            }
+            Err(error) => {
+                eprintln!("{file}: error {error}");
+                failures.push(file.to_owned());
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}

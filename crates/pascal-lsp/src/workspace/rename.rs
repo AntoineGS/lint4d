@@ -563,6 +563,10 @@ pub(crate) struct SnapshotSeed {
     /// (D16): a dependency whose include audit cannot be proven becomes a
     /// coverage gap instead of refusing the request.
     pub(crate) best_effort: bool,
+    /// Units whose imports a previous answer looked through while they were
+    /// fenced (l4d-4nbs review): their imports are loaded, not left to the
+    /// cache-only closure walk.
+    pub(crate) demanded: Vec<Url>,
 }
 
 impl SnapshotSeed {
@@ -572,7 +576,13 @@ impl SnapshotSeed {
             consumed_configuration: Vec::new(),
             completion_position: None,
             best_effort: false,
+            demanded: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_demanded(mut self, demanded: &[Url]) -> Self {
+        self.demanded = demanded.to_vec();
+        self
     }
 
     pub(crate) fn best_effort(mut self) -> Self {
@@ -6451,6 +6461,7 @@ fn build_snapshot_with_policy(
     let mut other_include_errors = false;
     let mut include_error_owners = Vec::new();
     let mut dependency_coverage = Coverage::default();
+    let mut demand_gaps: Vec<(Option<Url>, String)> = Vec::new();
     let best_effort = priority_seed.as_ref().is_some_and(|seed| seed.best_effort)
         && matches!(
             mode,
@@ -7025,6 +7036,86 @@ fn build_snapshot_with_policy(
             closure.providers.len(),
             closure.missed.len()
         );
+        let mut closure = closure;
+        // Load the imports a previous answer needed through fenced units,
+        // and walk the cached closure past them.
+        // Bounded like the definition walk (l4d-4nbs re-review): at most
+        // its unit and byte limits in all, past which the answer is
+        // incomplete; a demanded unit that fails to load is a gap.
+        let demanded = priority_seed
+            .as_ref()
+            .map(|seed| seed.demanded.clone())
+            .unwrap_or_default();
+        let byte_limit = super::navigation_walk_byte_limit();
+        let (mut demand_units, mut demand_bytes) = (0usize, 0usize);
+        let mut counted_sources = HashSet::new();
+        for demanded in demanded {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if owned_sources.contains(&demanded) {
+                continue;
+            }
+            if demand_units >= super::MAX_NAVIGATION_WALK_WORK || demand_bytes >= byte_limit {
+                demand_gaps.push((
+                    None,
+                    format!(
+                        "completion stopped loading the units its answer needs at the walk limit ({} units or {byte_limit} source bytes)",
+                        super::MAX_NAVIGATION_WALK_WORK
+                    ),
+                ));
+                break;
+            }
+            demand_units += 1;
+            let context_key = loader.document_contexts.get(&demanded).cloned();
+            #[cfg(test)]
+            let context_key = context_key.filter(|_| {
+                !super::TEST_NO_DOCUMENT_CONTEXT_OF.with(|name| {
+                    name.borrow()
+                        .as_ref()
+                        .is_some_and(|name| demanded.path().ends_with(name.as_str()))
+                })
+            });
+            let Some(context_key) = context_key else {
+                demand_gaps.push((
+                    Some(demanded.clone()),
+                    format!(
+                        "the imports of {demanded} were not loaded: it has no document context"
+                    ),
+                ));
+                continue;
+            };
+            let direct = match loader.load_imports_with_cancel(
+                &demanded,
+                &context_key,
+                &mut pins,
+                Some(cancel),
+            ) {
+                Ok(direct) => direct,
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    demand_gaps.push((
+                        Some(demanded.clone()),
+                        format!("the imports of {demanded} could not be loaded: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            // A source several demanded units import is counted once.
+            for dependency in &direct {
+                if counted_sources.insert(dependency.clone()) {
+                    demand_bytes = demand_bytes
+                        .saturating_add(loader.index.source_text(dependency).map_or(0, str::len));
+                }
+            }
+            let mut fenced = owned_sources.clone();
+            fenced.insert(demanded.clone());
+            let more =
+                super::closure::walk_interface_closure(&mut loader, &direct, &fenced, cancel)?;
+            closure.providers.extend(direct);
+            closure.providers.extend(more.providers);
+            closure.missed.extend(more.missed);
+        }
         for root in &priority {
             loader
                 .project_cache
@@ -7313,6 +7404,9 @@ fn build_snapshot_with_policy(
             complete = false;
             incomplete_reason.get_or_insert(reason);
         }
+    }
+    for (uri, reason) in &demand_gaps {
+        dependency_coverage.note(uri.as_ref(), reason.clone());
     }
     if let Some(analysis_records) = loader.analysis_records.take() {
         for (uri, record) in analysis_records {
@@ -8930,6 +9024,24 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         let conditional = preliminary;
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        // A provider interface past the branch-state limit leaves the
+        // conditions on it unknown (l4d-4nbs review C2): the unit stays
+        // bound, best effort notes it, strict features refuse.
+        if let Some(warning) = session
+            .warnings
+            .iter()
+            .find(|warning| warning.ends_with(pascal_core::compile_time::BRANCH_LIMITED_PROVIDER))
+        {
+            if auditor.dependency_relaxed() {
+                auditor.note_gap(format!(
+                    "conditional analysis of {uri} is incomplete: {warning}"
+                ));
+            } else {
+                auditor.result.incomplete_reason.get_or_insert_with(|| {
+                    format!("conditional analysis is incomplete for {uri}: {warning}")
+                });
+            }
         }
         if !conditional.complete {
             if auditor.dependency_relaxed() {
@@ -13830,6 +13942,15 @@ mod tests {
         }
         for body in ["SCOPEDENUMS ON", "POINTERMATH ON"] {
             assert_eq!(directive_kind(body), DirectiveKind::Other, "{body}");
+        }
+    }
+
+    /// l4d-4nbs R12: Controls.pas and Forms.pas open with
+    /// `{$P+,S-,W-,R-,T-,H+,X+}` and `{$C PRELOAD}`.
+    #[test]
+    fn legacy_vcl_switches_are_harmless() {
+        for body in ["P+,S-,W-,R-,T-,H+,X+", "C PRELOAD", "P-", "S+", "W+", "C-"] {
+            assert_eq!(directive_kind(body), DirectiveKind::Harmless, "{body}");
         }
     }
 

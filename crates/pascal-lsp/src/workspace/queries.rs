@@ -267,11 +267,38 @@ pub(crate) fn completion_from_input_with_format(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn completion_from_input_with_options(
     input: WorkspaceInput,
     uri: &Url,
     position: Position,
     options: CompletionOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
+    completion_from_input_within(input, uri, position, options, &|_, _| true, cancel)
+}
+
+/// Completion whose deferred documentation and detail are rendered from
+/// the answer's own snapshot when `fits` says its observations would not
+/// fit a resolution context (l4d-4nbs final round): one computation per
+/// request. `CompletionResult::eager` says so.
+pub(crate) fn completion_from_input_within(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    fits: &dyn Fn(&[super::rename::SourceRecord], &[Url]) -> bool,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<CompletionResult> {
+    completion_from_input_rounds(input, uri, position, options, fits, cancel)
+}
+
+fn completion_from_input_rounds(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    options: CompletionOptions,
+    fits: &dyn Fn(&[super::rename::SourceRecord], &[Url]) -> bool,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionResult> {
     let source_generation = input.source_generation;
@@ -292,30 +319,88 @@ pub(crate) fn completion_from_input_with_options(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return failed(source_generation, configuration_generation, error),
+    // The cached closure may not hold the units a member's ancestors are
+    // declared in: load the imports the answer looked through while fenced,
+    // then answer again (l4d-4nbs review), a few rounds at most.
+    let mut demanded: Vec<Url> = Vec::new();
+    let mut round = 0;
+    let demand_cap = assistance_demand_cap();
+    let mut demand_capped = false;
+    let (snapshot, mut value) = loop {
+        let snapshot = match assistance_snapshot(&input, &uri, Some(position), &demanded, cancel) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+        if let Err(error) = ensure_assistance_ready(&snapshot, &uri) {
+            let records = snapshot_records(&snapshot);
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                records,
+            );
+        }
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let _ = snapshot.index.take_binding_demand();
+        let value = snapshot.index.completion_with_cancel_and_options(
+            &uri,
+            position,
+            options.clone(),
+            cancel,
+        );
+        let fresh = snapshot
+            .index
+            .take_binding_demand()
+            .into_iter()
+            .filter(|demand| demand != &uri && !demanded.contains(demand))
+            .collect::<Vec<_>>();
+        round += 1;
+        let room = demand_cap.saturating_sub(demanded.len());
+        demand_capped |= fresh.len() > room;
+        if fresh.is_empty() || room == 0 || round >= MAX_ASSISTANCE_DEMAND_ROUNDS {
+            break (snapshot, value);
+        }
+        demanded.extend(fresh.into_iter().take(room));
     };
     let records = snapshot_records(&snapshot);
-    if let Err(error) = ensure_assistance_ready(&snapshot, &uri) {
-        return with_records(
-            source_generation,
-            configuration_generation,
-            Err(error),
-            records,
+    // Too many observations to resolve items later: render them now from
+    // this same snapshot (l4d-4nbs final round).
+    let deferred = options.defer_documentation || options.defer_detail;
+    let mut eager = false;
+    if deferred && value.is_ok() && !fits(&records, &demanded) {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        value = snapshot.index.completion_with_cancel_and_options(
+            &uri,
+            position,
+            CompletionOptions {
+                defer_documentation: false,
+                defer_detail: false,
+                ..options
+            },
+            cancel,
         );
+        let _ = snapshot.index.take_binding_demand();
+        eager = true;
     }
-    if is_cancelled(cancel) {
-        return cancelled(source_generation, configuration_generation);
-    }
-    let value = snapshot
-        .index
-        .completion_with_cancel_and_options(&uri, position, options, cancel)
-        .map(|mut result| {
-            // D16: candidates from unproven dependencies may be missing.
-            result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
-            result
-        });
+    #[cfg(test)]
+    TEST_COMPLETION_COVERAGE.with(|coverage| {
+        *coverage.borrow_mut() = answer_coverage(&snapshot)
+            .gaps
+            .iter()
+            .map(|gap| format!("{:?}: {}", gap.uri.as_ref().map(Url::as_str), gap.reason))
+            .collect();
+    });
+    let value = value.map(|mut result| {
+        // D16: candidates from unproven dependencies may be missing.
+        result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete() || demand_capped;
+        result.demanded = demanded;
+        result.eager = eager;
+        result
+    });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -336,6 +421,7 @@ pub(crate) fn completion_metadata_from_input(
     resolve_detail: bool,
     snippet_support: bool,
     original_records: &[super::rename::SourceRecord],
+    demanded: &[Url],
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionMetadata> {
     let source_generation = input.source_generation;
@@ -358,7 +444,10 @@ pub(crate) fn completion_metadata_from_input(
     }
     let source_uri = super::canonical_file_uri(source_uri);
     let candidate_uri = super::canonical_file_uri(candidate_uri);
-    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), cancel) {
+    // Rebuild the snapshot the completion answered from, demand rounds
+    // included, so its observations match (l4d-4nbs re-review).
+    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), demanded, cancel)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -483,7 +572,7 @@ pub(crate) fn signature_help_from_input_with_format(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -532,7 +621,7 @@ pub(crate) fn semantic_tokens_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -675,7 +764,7 @@ pub(crate) fn inlay_hints_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -715,7 +804,7 @@ pub(crate) fn prepare_call_hierarchy_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -753,7 +842,7 @@ pub(crate) fn prepare_type_hierarchy_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -1480,10 +1569,51 @@ fn binding_snapshot_scoped(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Overrides how many units a completion's demand rounds may name.
+    pub(crate) static TEST_ASSISTANCE_DEMAND_CAP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How many units a completion's demand rounds may name in all: the
+/// definition walk's unit limit (l4d-4nbs final round).
+fn assistance_demand_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_ASSISTANCE_DEMAND_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    super::MAX_NAVIGATION_WALK_WORK
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Assistance snapshots this thread built.
+    pub(crate) static TEST_ASSISTANCE_SNAPSHOTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETION_COVERAGE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The coverage gaps of this thread's last completion.
+#[cfg(test)]
+pub(crate) fn completion_coverage_for_test() -> Vec<String> {
+    TEST_COMPLETION_COVERAGE.with(|coverage| coverage.borrow().clone())
+}
+
+/// Completion loads the imports its answer looked through at most this many
+/// times (an ancestor chain is loaded a level a round).
+const MAX_ASSISTANCE_DEMAND_ROUNDS: usize = 6;
+
 fn assistance_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
     completion_position: Option<Position>,
+    demanded: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
@@ -1493,6 +1623,8 @@ fn assistance_snapshot(
         .collect::<Vec<_>>();
     let (_context, consumed_configuration) =
         project_context_and_metadata_for_input(input, uri, cancel)?;
+    #[cfg(test)]
+    TEST_ASSISTANCE_SNAPSHOTS.with(|count| count.set(count.get() + 1));
     build_snapshot(
         input,
         std::slice::from_ref(uri),
@@ -1502,6 +1634,7 @@ fn assistance_snapshot(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
                 .with_completion_position(completion_position)
+                .with_demanded(demanded)
                 .best_effort(),
         ),
         &[],
@@ -5840,6 +5973,7 @@ mod tests {
                 true,
                 false,
                 &original_records,
+                &[],
                 &cancel,
             )
         });

@@ -276,6 +276,12 @@ pub(crate) struct CompletionOptions {
 pub(crate) struct CompletionResult {
     pub(crate) list: CompletionList,
     pub(crate) seeds: Vec<CompletionResolutionSeed>,
+    /// Units whose imports demand rounds loaded for this answer (l4d-4nbs
+    /// re-review): resolving an item rebuilds the snapshot with them.
+    pub(crate) demanded: Vec<Url>,
+    /// Documentation and detail were rendered, not deferred: the answer
+    /// would not fit a resolution context (l4d-4nbs final round).
+    pub(crate) eager: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +373,8 @@ fn empty_completion_result() -> CompletionResult {
     CompletionResult {
         list: CompletionList::default(),
         seeds: Vec::new(),
+        demanded: Vec::new(),
+        eager: false,
     }
 }
 
@@ -427,6 +435,8 @@ impl NavigationIndex {
                     items: Vec::new(),
                 },
                 seeds: Vec::new(),
+                demanded: Vec::new(),
+                eager: false,
             });
         }
         if completion_position_is_ignored_with_budget(
@@ -524,6 +534,8 @@ impl NavigationIndex {
                         items: Vec::new(),
                     },
                     seeds: Vec::new(),
+                    demanded: Vec::new(),
+                    eager: false,
                 });
             }
             Err(error) => return Err(error),
@@ -647,6 +659,8 @@ impl NavigationIndex {
                 items,
             },
             seeds,
+            demanded: Vec::new(),
+            eager: false,
         })
     }
 

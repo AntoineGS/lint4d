@@ -2,7 +2,9 @@
 //! store saw it (spec §7). `workspace::evidence` builds evidence from it.
 
 use pascal_cache::{Digest, SourceContent, listing_digest};
-use pascal_core::resolver::{DirectoryListing, LoadedSource, SourceRevision};
+use pascal_core::resolver::{
+    DirectoryListing, LoadedSource, ResolutionObservation, SourceRevision,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -73,6 +75,46 @@ impl CapturedReads {
             .map(|payload| &payload.content)
     }
 
+    /// The listings and payloads `observations` name, for a compilation
+    /// another session reuses (l4d-4nbs D29). Editor state and overflow carry
+    /// over: they make evidence from the reuse refused as from the original.
+    pub(crate) fn restricted_to(&self, observations: &[ResolutionObservation]) -> Self {
+        let mut restricted = Self {
+            overflowed: self.overflowed,
+            editor_state: self.editor_state,
+            ..Self::default()
+        };
+        for observation in observations {
+            match observation {
+                ResolutionObservation::Directory { path, .. } => restricted.listings.extend(
+                    self.listings
+                        .iter()
+                        .filter(|listing| {
+                            super::resolver::path_equivalent(&listing.directory, path)
+                        })
+                        .cloned(),
+                ),
+                ResolutionObservation::Payload {
+                    path,
+                    revision: SourceRevision::Disk { content_hash, .. },
+                    ..
+                } => restricted.payloads.extend(
+                    self.payloads
+                        .iter()
+                        .filter(|payload| {
+                            payload.content_hash == *content_hash
+                                && super::resolver::path_equivalent(&payload.path, path)
+                        })
+                        .cloned(),
+                ),
+                _ => {}
+            }
+        }
+        restricted.listings.dedup();
+        restricted.payloads.dedup();
+        restricted
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let listings = self.listings.iter().fold(
             std::mem::size_of_val(self.listings.as_slice()),
@@ -129,6 +171,28 @@ impl ReadCapture {
             return;
         }
         record(&mut reads);
+    }
+
+    /// Record what a reused compilation read, as if this session had read
+    /// it (l4d-4nbs D29).
+    pub(crate) fn replay(&self, reads: &CapturedReads) {
+        let mut target = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.editor_state |= reads.editor_state;
+        target.overflowed |= reads.overflowed;
+        for listing in &reads.listings {
+            if target.listings.len() + target.payloads.len() >= MAX_CAPTURED_READS {
+                target.overflowed = true;
+                return;
+            }
+            target.listings.push(listing.clone());
+        }
+        for payload in &reads.payloads {
+            if target.listings.len() + target.payloads.len() >= MAX_CAPTURED_READS {
+                target.overflowed = true;
+                return;
+            }
+            target.payloads.push(payload.clone());
+        }
     }
 
     pub(crate) fn snapshot(&self) -> CapturedReads {

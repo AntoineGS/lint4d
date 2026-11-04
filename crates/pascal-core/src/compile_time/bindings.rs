@@ -68,6 +68,12 @@ pub(super) struct InterfaceFacts {
     pub qualifiers: Vec<String>,
     pub site: BindingSite,
     pub graph: Option<super::session::AdmittedInterfaceGraph>,
+    /// The session's occurrence of `graph`, whose memoized graph has the
+    /// most names prepared (l4d-4nbs D29).
+    pub occurrence: Option<super::OccurrenceId>,
+    /// What looking the provider up reported, for the interface compiled
+    /// from it to carry (l4d-4nbs D44).
+    pub lookup: Option<std::sync::Arc<super::session::LookupReports>>,
     pub pending: PendingProvider,
     pub attempted: bool,
     pub provided: Option<super::session::AdmittedProviderSource>,

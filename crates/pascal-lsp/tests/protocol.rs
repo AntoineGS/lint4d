@@ -45592,3 +45592,19 @@ fn discard_re_reads_captured_override_files() {
         server.shutdown();
     }
 }
+
+/// l4d-4nbs re-review: an item a completion rendered eagerly carries no
+/// resolve data; resolving it returns it unchanged instead of failing.
+#[test]
+fn resolving_an_item_without_resolve_data_returns_it_unchanged() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("resolve-without-data".to_string());
+    let item = json!({"label": "Eager", "documentation": "rendered already"});
+    server.send_request(id.clone(), "completionItem/resolve", item.clone());
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(response.result.expect("resolved item"), item);
+    server.shutdown();
+}

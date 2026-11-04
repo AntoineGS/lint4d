@@ -1691,3 +1691,673 @@ fn by_value_provider_cycle_has_explicit_provenance_and_does_not_poison_pointer()
         "{fact:?}"
     );
 }
+
+/// l4d-4nbs R9: a provider imported by two units of one session (guiutils
+/// pulls Windows.pas through RzCommon and again through Classes) is analysed
+/// once; later imports prepare their names on a copy of the session's
+/// interface graph. Re-analysing it (1.3 MB) had no matching grant, since
+/// the session credits each byte once, and exceeded `max_byte_work`.
+fn big_provider() -> String {
+    let comment = "documentation of a provider constant ".repeat(6);
+    let mut big = String::from("unit W; interface type TW = Int64;\nconst\n");
+    let mut n = 0;
+    while big.len() < 2_000_000 {
+        big.push_str(&format!("  C{n} = {n}; {{ {comment} }}\n"));
+        n += 1;
+    }
+    big.push_str("implementation end.");
+    big
+}
+
+fn provider_fixture(root: &str, units: &[(&str, &str)]) -> Fixture {
+    let mut f = Fixture::new(root, context(LayoutPlatform::Win32));
+    for (name, text) in units {
+        f.unit(name, text, context(LayoutPlatform::Win32));
+    }
+    f.unit("W", &big_provider(), context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f
+}
+
+#[test]
+fn a_provider_imported_twice_in_one_session_is_analysed_once() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let alone = alone.analyze().unwrap();
+    assert_eq!(activity(&alone, "DEFINE HW"), Truth::True);
+    let one_analysis = alone.budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    // One scan of W plus copies of its graph, not a second scan.
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}
+
+/// l4d-4nbs R9: in the LSP the same Windows.pas is found through different
+/// search entries by different importers: its revisions differ (a distinct
+/// provider identity) while its content does not. The session credited its
+/// bytes once per content, so the second analysis had no grant and Log.pas
+/// failed at `max_byte_work`; each distinct revision is funded once.
+#[test]
+fn a_provider_found_through_different_entries_is_funded_once_per_revision() {
+    let tight = |f: &mut Fixture| {
+        // Close to the scan's real cost, so an unfunded repeat cannot fit.
+        f.limits.max_byte_work = 4 * 1024 * 1024;
+        f.limits.byte_work_per_source_byte = 16;
+    };
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    tight(&mut alone);
+    let alone = alone.analyze().unwrap();
+    assert_eq!(
+        activity(&alone, "DEFINE HW"),
+        Truth::True,
+        "{:?}",
+        alone.reasons
+    );
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    tight(&mut twice);
+    twice.importer_revisions = true;
+    let analysis = twice.analyze();
+    let analysis = analysis
+        .as_ref()
+        .map(|a| (&a.reasons, a.budget.budget_snapshot()));
+    assert!(
+        analysis
+            .as_ref()
+            .is_ok_and(|(reasons, _)| reasons.is_empty()),
+        "{analysis:?}"
+    );
+}
+
+/// l4d-4nbs R13: a later import of a provider whose session graph already
+/// prepared the same name shares that graph instead of copying it. Each
+/// copy of Windows.pas's graph cost 12.5M of byte work (75M per Log.pas
+/// session).
+#[test]
+fn a_provider_graph_prepared_for_the_same_name_is_shared_not_copied() {
+    let query = "{$IF Declared(Missing)}{$DEFINE HIT}{$ENDIF}";
+    let mut one = provider_fixture(
+        &format!("unit Main; interface uses A; {query} implementation end."),
+        &[("A", "unit A; interface uses W; implementation end.")],
+    );
+    let one = one.analyze().unwrap().budget.budget_snapshot().byte_work;
+    let units = ["A", "B", "C", "D"];
+    let texts = units
+        .iter()
+        .map(|u| format!("unit {u}; interface uses W; implementation end."))
+        .collect::<Vec<_>>();
+    let mut four = provider_fixture(
+        &format!("unit Main; interface uses A, B, C, D; {query} implementation end."),
+        &units
+            .iter()
+            .zip(&texts)
+            .map(|(u, t)| (*u, t.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let analysis = four.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    let four = analysis.budget.budget_snapshot().byte_work;
+    assert!(
+        four < one + one / 4,
+        "{four} byte work for four importers of W, {one} for one"
+    );
+}
+
+/// l4d-4nbs R13: one file state reached through different search entries
+/// (Windows.pas was analysed three times in one Log.pas session and its
+/// declarations exceeded `max_definitions`) is one provider identity.
+#[test]
+fn a_disk_provider_reached_through_different_entries_is_one_identity() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let one_analysis = alone.analyze().unwrap().budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses W; type TB = W.TW; implementation end.",
+            ),
+        ],
+    );
+    twice.importer_entries = true;
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}
+
+/// l4d-4nbs R13: SysUtils' 25 `{$IF CompilerVersion …}` each copied the
+/// Windows.pas graph to prepare the same name again (65M of byte work).
+/// A graph already prepared for a name is shared.
+#[test]
+fn repeated_queries_of_one_name_do_not_copy_provider_graphs() {
+    let usage = |queries: usize| {
+        let text = (0..queries)
+            .map(|n| format!("{{$IF CompilerVersion > {n}}}{{$DEFINE Q{n}}}{{$IFEND}}\n"))
+            .collect::<String>();
+        let mut f = provider_fixture(
+            &format!("unit Main; interface uses W; {text} implementation end."),
+            &[],
+        );
+        let analysis = f.analyze().unwrap();
+        assert!(analysis.root.complete, "{:?}", analysis.reasons);
+        analysis.budget.budget_snapshot().byte_work
+    };
+    let (one, many) = (usage(1), usage(25));
+    assert!(
+        many < one + one / 4,
+        "{many} byte work for 25 queries, {one} for one"
+    );
+}
+
+/// l4d-4nbs D19: `uses classes` and `uses Classes` name one unit: one
+/// provider identity, analysed once (Classes.pas was analysed for each
+/// spelling in BaseRECORDLOCK's session).
+#[test]
+fn qualifier_spellings_of_one_provider_are_one_identity() {
+    let mut alone = provider_fixture(
+        "unit Main; interface uses W; {$IF SizeOf(W.TW)=8}{$DEFINE HW}{$ENDIF} implementation end.",
+        &[],
+    );
+    let one_analysis = alone.analyze().unwrap().budget.budget_snapshot().work;
+    let mut twice = provider_fixture(
+        "unit Main; interface uses A, B; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF}{$IF SizeOf(B.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface uses w; type TB = w.TW; implementation end.",
+            ),
+        ],
+    );
+    twice.spelled_units = true;
+    let analysis = twice.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    let work = analysis.budget.budget_snapshot().work;
+    assert!(
+        work < one_analysis * 3 / 2,
+        "{work} steps; one analysis of W takes {one_analysis}"
+    );
+}
+
+/// l4d-4nbs D19: a provider whose interface cannot be completed is
+/// analysed once per session, not again for every importer (Classes.pas:
+/// 14 analyses, 120M of byte work, in BaseRECORDLOCK's session).
+#[test]
+fn an_incomplete_provider_interface_is_analysed_once() {
+    let usage = |importers: usize| {
+        let mut big = String::from("unit W; interface {$I missing.inc}\nconst\n");
+        let comment = "documentation of a provider constant ".repeat(6);
+        let mut n = 0;
+        while big.len() < 2_000_000 {
+            big.push_str(&format!("  C{n} = {n}; {{ {comment} }}\n"));
+            n += 1;
+        }
+        big.push_str("implementation end.");
+        let names = (0..importers).map(|i| format!("A{i}")).collect::<Vec<_>>();
+        let texts = names
+            .iter()
+            .map(|n| format!("unit {n}; interface uses W; implementation end."))
+            .collect::<Vec<_>>();
+        let mut f = Fixture::new(
+            &format!(
+                "unit Main; interface uses {}; {{$IF Declared(Missing)}}{{$DEFINE HIT}}{{$ENDIF}} implementation end.",
+                names.join(", ")
+            ),
+            context(LayoutPlatform::Win32),
+        );
+        for (n, t) in names.iter().zip(&texts) {
+            f.unit(n, t, context(LayoutPlatform::Win32));
+        }
+        f.unit("W", &big, context(LayoutPlatform::Win32));
+        f.limits.max_retained_bytes = 64 * 1024 * 1024;
+        let analysis = f.analyze().unwrap();
+        analysis.budget.budget_snapshot().work
+    };
+    let (one, four) = (usage(1), usage(4));
+    assert!(
+        four < one * 3 / 2,
+        "{four} steps for four importers, {one} for one"
+    );
+}
+
+/// l4d-4nbs D19: a unit closure can declare more than 32,768 names
+/// (SFClient2's BOSFBase units: 41,838 across RTL, VCL, DB, IBX, InfoPower
+/// and business objects). The count fuse is a multiple of that; memory
+/// stays bounded by the retained-bytes limit.
+#[test]
+fn a_closure_with_forty_thousand_declarations_is_analysed() {
+    let mut big = String::from("unit W; interface\nconst\n");
+    for n in 0..40_000 {
+        big.push_str(&format!("  C{n} = {n};\n"));
+    }
+    big.push_str("implementation end.");
+    let mut f = Fixture::new(
+        "unit Main; interface uses W; {$IF Declared(Missing)}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit("W", &big, context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 256 * 1024 * 1024;
+    let analysis = f.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+}
+
+/// l4d-4nbs D19: measured on SFClient2 (RAD Studio 7.0 RTL/VCL/DB/IBX and
+/// InfoPower closures), a session's byte work needs about 46 per scanned
+/// source byte beyond the fixed budget; the grant keeps a margin of more
+/// than a third over that.
+#[test]
+fn the_byte_grant_covers_the_measured_closure_cost_with_margin() {
+    let grant =
+        pascal_core::compile_time::CompileTimeLimits::default().byte_work_per_source_byte as f64;
+    assert!(grant >= 46.0 * 1.35, "{grant} byte work per source byte");
+}
+
+/// A shared store of compiled provider interfaces that counts compilations
+/// (puts of a key it holds no valid graph for) and reuses (hits).
+#[derive(Default)]
+struct CountingStore {
+    graphs: std::sync::Mutex<
+        std::collections::HashMap<
+            pascal_core::compile_time::ProviderGraphKey,
+            std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+        >,
+    >,
+    puts: std::sync::atomic::AtomicUsize,
+    hits: std::sync::atomic::AtomicUsize,
+    /// Overlay versions sources have now, as a real store's probes see them.
+    current: std::sync::Mutex<std::collections::HashMap<String, i32>>,
+}
+
+impl pascal_core::compile_time::SharedProviderGraphs for CountingStore {
+    fn get(
+        &self,
+        key: &pascal_core::compile_time::ProviderGraphKey,
+    ) -> Option<std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        let hit = self
+            .graphs
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .filter(|graph| self.valid(graph));
+        if hit.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit
+    }
+    fn put(
+        &self,
+        key: pascal_core::compile_time::ProviderGraphKey,
+        graph: std::sync::Arc<pascal_core::compile_time::SharedProviderGraph>,
+    ) {
+        let mut graphs = self.graphs.lock().unwrap();
+        // A graph with more names prepared replaces a valid one: that is no
+        // compilation.
+        if !graphs.get(&key).is_some_and(|old| self.valid(old)) {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        graphs.insert(key, graph);
+    }
+}
+
+impl CountingStore {
+    fn valid(&self, graph: &pascal_core::compile_time::SharedProviderGraph) -> bool {
+        let current = self.current.lock().unwrap();
+        graph.dependencies.iter().all(|d| {
+            current
+                .get(d.source.as_str())
+                .is_none_or(|version| d.overlay_version == Some(*version))
+        })
+    }
+    fn puts(&self) -> usize {
+        self.puts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+const SHARED_ROOT: &str =
+    "unit Main; interface uses A; {$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.";
+
+fn shared_fixture(store: &std::sync::Arc<CountingStore>) -> Fixture {
+    let mut f = provider_fixture(
+        SHARED_ROOT,
+        &[(
+            "A",
+            "unit A; interface uses W; type TA = W.TW; implementation end.",
+        )],
+    );
+    f.shared = Some(store.clone());
+    f
+}
+
+/// l4d-4nbs D29: a second request compiles no provider again: it reuses
+/// the interfaces the first compiled, reports the same dependencies, and
+/// pays only for preparing names, not for scanning (nothing is granted).
+#[test]
+fn consecutive_requests_compile_each_provider_once() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let first = shared_fixture(&store).analyze().unwrap();
+    assert_eq!(activity(&first, "DEFINE HA"), Truth::True);
+    let compiled = store.puts();
+    assert_eq!(compiled, 2, "A and W");
+    let second = shared_fixture(&store).analyze().unwrap();
+    assert!(second.root.complete, "{:?}", second.reasons);
+    assert_eq!(activity(&second, "DEFINE HA"), Truth::True);
+    assert_eq!(store.puts(), compiled, "no provider compiled again");
+    assert!(store.hits() >= 1);
+    assert_eq!(
+        first.observations, second.observations,
+        "same dependencies reported"
+    );
+    let (one, two) = (
+        first.budget.budget_snapshot(),
+        second.budget.budget_snapshot(),
+    );
+    assert!(two.work * 4 < one.work, "{one:?} then {two:?}");
+}
+
+/// A changed provider source or define is a different key and compiles
+/// again; differing environments do not share.
+#[test]
+fn a_changed_provider_or_environment_compiles_again() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    shared_fixture(&store).analyze().unwrap();
+    let compiled = store.puts();
+    let mut changed = shared_fixture(&store);
+    changed.unit_revision("W", 7);
+    store
+        .current
+        .lock()
+        .unwrap()
+        .insert("/fixture/W.pas".into(), 7);
+    changed.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 2,
+        "W compiled again for its new revision, and A, which depends on it"
+    );
+    // The next fixtures read W at its first revision again.
+    store.current.lock().unwrap().remove("/fixture/W.pas");
+    let mut defined = shared_fixture(&store);
+    let mut extra = context(LayoutPlatform::Win32);
+    extra.set_define("EXTRA", pascal_project::ConditionalFact::True);
+    defined.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        extra,
+    );
+    defined.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 3,
+        "A compiled again under its new define"
+    );
+    let mut other = shared_fixture(&store);
+    other.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    other.analyze().unwrap();
+    assert_eq!(
+        store.puts(),
+        compiled + 4,
+        "a Win64 A does not reuse the Win32 one"
+    );
+}
+
+/// Occurrence ids are numbered per session, so a graph reused from another
+/// session must not share ids with the graphs this session compiles: the
+/// memo of compiled interfaces and declaration anchors tell them apart by
+/// occurrence.
+#[test]
+fn shared_graphs_never_share_occurrence_ids() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    shared_fixture(&store).analyze().unwrap();
+    let mut both = provider_fixture(
+        "unit Main; interface uses B, A; {$IF SizeOf(B.TB)=4}{$DEFINE HB}{$ENDIF}{$IF SizeOf(A.TA)=8}{$DEFINE HA}{$ENDIF} implementation end.",
+        &[
+            (
+                "A",
+                "unit A; interface uses W; type TA = W.TW; implementation end.",
+            ),
+            (
+                "B",
+                "unit B; interface type TB = Integer; implementation end.",
+            ),
+        ],
+    );
+    both.shared = Some(store.clone());
+    let analysis = both.analyze().unwrap();
+    assert_eq!(activity(&analysis, "DEFINE HB"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    assert!(store.hits() >= 1, "A is reused");
+    let graphs = store.graphs.lock().unwrap();
+    let mut occurrences = graphs.values().map(|g| g.occurrence).collect::<Vec<_>>();
+    occurrences.sort_by_key(|o| o.0);
+    let count = occurrences.len();
+    occurrences.dedup();
+    assert_eq!(occurrences.len(), count, "{occurrences:?}");
+}
+
+/// A name a reusing session prepares on a shared interface is shared too:
+/// the next session that asks for it copies and prepares nothing.
+#[test]
+fn names_prepared_on_a_shared_interface_are_shared() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let a = "unit A; interface uses W; type TA = W.TW; TB = W.TW; implementation end.";
+    let session = |root: &str| {
+        let mut f = provider_fixture(root, &[("A", a)]);
+        f.shared = Some(store.clone());
+        f.analyze().unwrap()
+    };
+    session(SHARED_ROOT);
+    let tb =
+        "unit Main; interface uses A; {$IF SizeOf(A.TB)=8}{$DEFINE HB}{$ENDIF} implementation end.";
+    let preparing = session(tb);
+    assert_eq!(activity(&preparing, "DEFINE HB"), Truth::True);
+    let puts = store.puts();
+    let prepared = session(tb);
+    assert_eq!(activity(&prepared, "DEFINE HB"), Truth::True);
+    assert_eq!(store.puts(), puts, "nothing new is prepared");
+    let (one, two) = (
+        preparing.budget.budget_snapshot(),
+        prepared.budget.budget_snapshot(),
+    );
+    assert!(
+        two.retained_bytes < one.retained_bytes,
+        "{one:?} then {two:?}"
+    );
+}
+
+fn provider_chain(levels: usize) -> Fixture {
+    let mut f = Fixture::new(
+        "unit Main; interface uses U0; {$IF SizeOf(U0.T0)=8}{$DEFINE DEEP}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    for n in 0..levels {
+        let text = if n + 1 == levels {
+            format!("unit U{n}; interface type T{n} = Int64; implementation end.")
+        } else {
+            let m = n + 1;
+            format!("unit U{n}; interface uses U{m}; type T{n} = U{m}.T{m}; implementation end.")
+        };
+        f.unit(&format!("U{n}"), &text, context(LayoutPlatform::Win32));
+    }
+    f.limits.max_retained_bytes = 512 * 1024 * 1024;
+    f
+}
+
+/// l4d-4nbs D29: each nested provider interface costs about 50 KiB of stack
+/// in a debug build (11 KiB in release), so a deep interface `uses` chain
+/// overflowed a default 2 MiB thread at about 40 levels and aborted the
+/// process. The nesting now stops at a stack budget and reports the limit.
+#[test]
+fn a_deep_interface_uses_chain_reports_the_stack_limit() {
+    let analysis = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut f = provider_chain(300);
+            f.analyze()
+        })
+        .unwrap()
+        .join()
+        .expect("no overflow");
+    let limited = match &analysis {
+        Ok(analysis) => analysis.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                pascal_core::compile_time::IncompleteReason::Limit {
+                    name: "max_provider_stack_bytes",
+                    ..
+                }
+            )
+        }),
+        Err(pascal_core::ResolverError::LimitExceeded { limit, .. }) => {
+            *limit == "max_provider_stack_bytes"
+        }
+        Err(_) => false,
+    };
+    assert!(limited, "{:?}", analysis.as_ref().map(|a| &a.reasons));
+}
+
+/// l4d-4nbs review I1: a shared interface is charged everything it keeps:
+/// its provider sources' bytes and decoded text, its reports, dependencies,
+/// scans, nested parts, lookup trace and key context.
+#[test]
+fn a_shared_interface_is_charged_what_it_retains() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    // Mostly a comment: few declarations, many retained source bytes.
+    let w_source = format!(
+        "unit W; interface {{{}}} type TW = Int64; implementation end.",
+        "x".repeat(1_000_000)
+    );
+    let mut f = Fixture::new(SHARED_ROOT, context(LayoutPlatform::Win32));
+    f.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit("W", &w_source, context(LayoutPlatform::Win32));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f.shared = Some(store.clone());
+    f.analyze().unwrap();
+    let graphs = store.graphs.lock().unwrap();
+    let (key, w) = graphs
+        .iter()
+        .find(|(key, _)| key.source.as_str().ends_with("W.pas"))
+        .expect("W is shared");
+    let source = w_source.len();
+    let reports = w.observations.len() * std::mem::size_of::<pascal_core::ResolutionObservation>()
+        + w.warnings.iter().map(|w| w.len()).sum::<usize>()
+        + w.dependencies.len()
+            * std::mem::size_of::<pascal_core::compile_time::ProviderDependency>()
+        + w.scanned.len() * std::mem::size_of::<pascal_core::compile_time::ScannedExtent>()
+        + w.children.len() * std::mem::size_of::<pascal_core::compile_time::ChildSegment>()
+        + w.trace.len() * std::mem::size_of::<pascal_core::ResolutionObservation>();
+    assert!(
+        w.retained_bytes >= source + reports + key.source.as_str().len(),
+        "{} bytes charged for a {source} byte provider",
+        w.retained_bytes
+    );
+}
+
+/// l4d-4nbs re-review I1: an interface whose provider includes a 1 MB file
+/// keeps no more source text than it is charged for.
+#[test]
+fn a_shared_interface_keeps_no_uncharged_include_text() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let mut f = Fixture::new(SHARED_ROOT, context(LayoutPlatform::Win32));
+    f.unit(
+        "A",
+        "unit A; interface uses W; type TA = W.TW; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "W",
+        "unit W; interface {$I big.inc} type TW = Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("big.inc", &format!("{{{}}}", "x".repeat(1_000_000)));
+    f.limits.max_retained_bytes = 64 * 1024 * 1024;
+    f.shared = Some(store.clone());
+    let analysis = f.analyze().unwrap();
+    assert_eq!(activity(&analysis, "DEFINE HA"), Truth::True);
+    let graphs = store.graphs.lock().unwrap();
+    for (key, graph) in graphs.iter() {
+        let kept = graph
+            .graph
+            .as_ref()
+            .map_or(0, |graph| graph.retained_source_bytes());
+        assert!(
+            kept <= graph.retained_bytes,
+            "{} keeps {kept} source bytes, charged {}",
+            key.source.as_str(),
+            graph.retained_bytes
+        );
+    }
+}
+
+/// l4d-4nbs re-review minor: a nested lookup that fails does not leave the
+/// resolver tracing consulted directories.
+#[test]
+fn a_failed_nested_lookup_stops_lookup_tracing() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let mut f = shared_fixture(&store);
+    f.fail_unit_lookup = Some("W".into());
+    assert!(f.analyze().is_err());
+    assert!(!f.tracing, "tracing was left on");
+}

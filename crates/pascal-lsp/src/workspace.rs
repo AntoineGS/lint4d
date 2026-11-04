@@ -430,6 +430,12 @@ thread_local! {
     /// Loading the imports of a unit whose file name this is fails.
     static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// A demanded unit whose file name this is has no document context.
+    static TEST_NO_DOCUMENT_CONTEXT_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Expanding a unit whose file name this is fails.
+    static TEST_FAIL_EXPANSION_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn navigation_walk_byte_limit() -> usize {
@@ -7422,16 +7428,39 @@ impl Workspace {
 
         loop {
             check_workspace_cancel(cancel)?;
+            let _ = self.index.take_binding_demand();
             let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
             if !locations.is_empty() {
                 self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
+            // Load the imports the failed query looked through, not those of
+            // every unit loaded so far (l4d-4nbs D44): a name binds only
+            // through its document's own imports, so the units along a type's
+            // ancestor chain are what it needs. Without such a demand the walk
+            // widens level by level as before. Strict navigation (the
+            // implementation lens) keeps the whole walk, so a dependency that
+            // fails to load still fails it.
+            let demand = self
+                .index
+                .take_binding_demand()
+                .into_iter()
+                .filter(|dependency| self.best_effort_navigation && !visited.contains(dependency))
+                .collect::<Vec<_>>();
+            let mut deferred = Vec::new();
+            if !demand.is_empty() {
+                let mut demand = demand;
+                demand.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                // The rest of the level waits until the demand is resolved.
+                deferred = std::mem::take(&mut frontier);
+                deferred.retain(|dependency| !demand.contains(dependency));
+                frontier = demand;
+            }
             if frontier.is_empty() || walk_exhausted {
                 break;
             }
 
-            let mut next = Vec::new();
+            let mut next = deferred;
             for current in frontier.drain(..) {
                 check_workspace_cancel(cancel)?;
                 if visited.contains(&current) {
@@ -9000,6 +9029,14 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<crate::include_expansion::ExpansionResult, String> {
+        #[cfg(test)]
+        if TEST_FAIL_EXPANSION_OF.with(|name| {
+            name.borrow()
+                .as_ref()
+                .is_some_and(|name| uri.path().ends_with(name.as_str()))
+        }) {
+            return Err(format!("injected expansion failure for {uri}"));
+        }
         let fallback = AtomicBool::new(false);
         let cancel = cancel.unwrap_or(&fallback);
         rename::expand_source_with_workspace(
@@ -26165,6 +26202,74 @@ BDS = '/fake/37'
             "identifier still resolves: {locations:?}"
         );
         assert_eq!(locations[0].uri, provider_uri);
+    }
+
+    /// l4d-4nbs D44: a member reached through a three-level ancestor chain
+    /// loads the units along the chain and their imports, not the 300-unit
+    /// closure of the document's other imports.
+    #[test]
+    fn an_inherited_member_lookup_loads_its_ancestor_chain_not_the_closure() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let unit = |name: &str, uses: &[String], body: &str| {
+            let uses = if uses.is_empty() {
+                String::new()
+            } else {
+                format!("uses {};\n", uses.join(", "))
+            };
+            fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name};\ninterface\n{uses}{body}implementation\nend.\n"),
+            )
+            .expect("unit source");
+        };
+        let fillers = (0..30).map(|i| format!("F{i}")).collect::<Vec<_>>();
+        for (i, filler) in fillers.iter().enumerate() {
+            let deep = (0..9)
+                .map(|j| format!("G{}", i * 9 + j))
+                .collect::<Vec<_>>();
+            for name in &deep {
+                unit(name, &[], &format!("const {name}Value = 1;\n"));
+            }
+            unit(filler, &deep, &format!("const {filler}Value = 1;\n"));
+        }
+        unit(
+            "UA",
+            &[],
+            "type\n  TA = class\n    Member: Integer;\n  end;\n",
+        );
+        unit("UB", &["UA".into()], "type\n  TB = class(TA)\n  end;\n");
+        unit("UC", &["UB".into()], "type\n  TC = class(TB)\n  end;\n");
+        let mut uses = vec!["UC".to_string()];
+        uses.extend(fillers.iter().cloned());
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            format!(
+                "unit Main;\ninterface\nuses {};\nimplementation\nprocedure Run;\nvar X: TC;\nbegin\n  X.Member := 1;\nend;\nend.\n",
+                uses.join(", ")
+            ),
+        )
+        .expect("main source");
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        // Definition answers best effort (D16), as the server asks it.
+        workspace.set_best_effort_navigation(true);
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let locations =
+            workspace.navigate(&main_uri, Position::new(7, 5), NavigationTarget::Definition);
+        let ua = Url::from_file_path(root.join("UA.pas")).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| &l.uri).collect::<Vec<_>>(),
+            vec![&ua],
+            "the inherited member resolves"
+        );
+        let loaded = workspace.index.document_count();
+        assert!(
+            loaded <= 1 + uses.len() + 3,
+            "{loaded} units loaded for a chain of three through {} imports",
+            uses.len()
+        );
     }
 
     #[test]

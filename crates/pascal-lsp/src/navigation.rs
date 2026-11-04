@@ -529,6 +529,40 @@ pub struct NavigationIndex {
     best_effort_bindings: bool,
     /// What best-effort binding decided that the strict rule would not.
     relaxed_bindings: RelaxedBindings,
+    /// Fenced documents queries looked up imports through (l4d-4nbs D44).
+    binding_demand: BindingDemand,
+}
+
+/// Documents whose unresolved imports a query consulted. A clone starts
+/// empty, like `RelaxedBindings`.
+#[derive(Default)]
+struct BindingDemand(std::sync::Mutex<Vec<Url>>);
+
+impl Clone for BindingDemand {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl BindingDemand {
+    fn record(&self, uri: &Url) {
+        let mut demand = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !demand.contains(uri) {
+            demand.push(uri.clone());
+        }
+    }
+
+    fn take(&self) -> Vec<Url> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 /// Distinct relaxed binding decisions retained for one answer.
@@ -1162,6 +1196,7 @@ impl NavigationIndex {
                 parsed,
                 import_bindings: None,
                 import_binding_fingerprint: None,
+                unbound: None,
             },
         );
         let urls = self.units.entry(unit).or_default();
@@ -1218,6 +1253,7 @@ impl NavigationIndex {
             compiled_unit_bytes: self.compiled_unit_bytes,
             best_effort_bindings: false,
             relaxed_bindings: RelaxedBindings::default(),
+            binding_demand: BindingDemand::default(),
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
@@ -1234,6 +1270,7 @@ impl NavigationIndex {
                     parsed: document.parsed.clone(),
                     import_bindings,
                     import_binding_fingerprint: document.import_binding_fingerprint,
+                    unbound: document.unbound.clone(),
                 },
             );
         }
@@ -2112,6 +2149,7 @@ impl NavigationIndex {
                 &bindings,
             ));
             document.import_bindings = Some(bindings);
+            document.unbound = None;
         }
     }
 
@@ -2124,6 +2162,22 @@ impl NavigationIndex {
                 &HashMap::new(),
             ));
             document.import_bindings = Some(HashMap::new());
+            document.unbound = (!document.interface_uses.is_empty()
+                || !document.implementation_uses.is_empty())
+            .then(|| uri.clone());
+        }
+    }
+
+    /// The documents whose fenced imports a query looked through since the
+    /// last call: resolving their imports is what could change its answer
+    /// (l4d-4nbs D44).
+    pub(crate) fn take_binding_demand(&self) -> Vec<Url> {
+        self.binding_demand.take()
+    }
+
+    fn demand_bindings(&self, document: &Document) {
+        if let Some(uri) = &document.unbound {
+            self.binding_demand.record(uri);
         }
     }
 
@@ -6503,6 +6557,7 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(true);
             };
+            self.demand_bindings(document);
             let Some(bindings) = document.import_bindings.as_ref() else {
                 return Ok(true);
             };
@@ -8106,6 +8161,7 @@ impl NavigationIndex {
         if current_document.unknown_imports.contains(name) {
             return Vec::new();
         }
+        self.demand_bindings(current_document);
         if let Some(bindings) = &current_document.import_bindings {
             return bindings.get(name).cloned().into_iter().collect();
         }
@@ -8122,6 +8178,7 @@ impl NavigationIndex {
         if current_document.unknown_imports.contains(name) {
             return Ok(Vec::new());
         }
+        self.demand_bindings(current_document);
         if let Some(bindings) = &current_document.import_bindings {
             let Some(uri) = bindings.get(name) else {
                 return Ok(Vec::new());
@@ -12410,10 +12467,12 @@ impl NavigationIndex {
         substitution: &GenericSubstitution,
         member_key: Option<&str>,
         allow_implementation: bool,
+        proven_prefix: bool,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
         let mut ancestry_state = AncestryResolutionState::new();
+        ancestry_state.proven_prefix = proven_prefix;
         let ordinary = self.member_candidates_for_type_with_state_and_budget(
             type_uri,
             type_key,
@@ -12736,6 +12795,7 @@ impl NavigationIndex {
             substitution,
             Some(member_key),
             allow_implementation,
+            false,
             cancel,
             budget,
         )
@@ -12885,6 +12945,7 @@ impl NavigationIndex {
                 substitution,
                 None,
                 allow_implementation,
+                true,
                 cancel,
                 budget,
             )
@@ -13020,7 +13081,34 @@ impl NavigationIndex {
                 complete_ancestry(Vec::new())
             };
             if ancestry.status != AncestryStatus::Complete {
-                return Ok(MemberLookup::unknown(direct)
+                // An ancestor further out is unknown, but the parents this
+                // type names may still resolve: the proven prefix of the
+                // ancestry supplies its members, and the lookup stays
+                // unknown (l4d-4nbs re-review).
+                let parents = if state.proven_prefix {
+                    self.immediate_type_parents_with_budget(type_uri, type_key, cancel, budget)?
+                } else {
+                    Vec::new()
+                };
+                if parents.is_empty() {
+                    return Ok(MemberLookup::unknown(direct)
+                        .with_implicit_member_known(implicit_root_member_known));
+                }
+                let mut parent_lookups = Vec::with_capacity(parents.len());
+                for (parent_uri, parent_key) in parents {
+                    parent_lookups.push(self.member_candidates_for_type_with_state_and_budget(
+                        &parent_uri,
+                        &parent_key,
+                        ROOT_SCOPE,
+                        member_key,
+                        allow_implementation,
+                        state,
+                        cancel,
+                        budget,
+                    )?);
+                }
+                let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
+                return Ok(MemberLookup::unknown(merged.candidates)
                     .with_implicit_member_known(implicit_root_member_known));
             }
 
@@ -13039,6 +13127,9 @@ impl NavigationIndex {
                 )?;
                 if !lookup.ancestry_known {
                     ancestry_known = false;
+                    if state.proven_prefix {
+                        parent_lookups.push(lookup);
+                    }
                     break;
                 }
                 parent_lookups.push(lookup);
@@ -13047,7 +13138,12 @@ impl NavigationIndex {
                 self.merge_member_candidates(direct, parent_lookups, member_key)
                     .with_implicit_member_known(implicit_root_member_known)
             } else {
-                MemberLookup::unknown(direct).with_implicit_member_known(implicit_root_member_known)
+                // The proven prefix of the ancestry still supplies its members:
+                // an unknown ancestor further out cannot hide a nearer one's
+                // (l4d-4nbs re-review). The lookup stays unknown.
+                let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
+                MemberLookup::unknown(merged.candidates)
+                    .with_implicit_member_known(implicit_root_member_known)
             })
         })();
         state.active_members.remove(&identity);
@@ -13509,6 +13605,36 @@ impl NavigationIndex {
         budget.require_owned_bytes(ancestry_resolution_owned_bytes(&result), cancel)?;
         state.resolved_types.insert(identity, result.clone());
         Ok(result)
+    }
+
+    /// The parents `type_key` names that resolve, without requiring their
+    /// own ancestry to be known.
+    fn immediate_type_parents_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<(Url, String)>, String> {
+        let Some(document) = self.documents.get(type_uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(entries) = document.type_ancestry.get(type_key) else {
+            return Ok(Vec::new());
+        };
+        if entries.len() != 1 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .resolve_type_ancestry_entry_with_budget(
+                type_uri,
+                type_key,
+                &entries[0],
+                document,
+                cancel,
+                budget,
+            )?
+            .parents)
     }
 
     fn resolve_type_ancestry_entry_with_budget(
@@ -15660,6 +15786,10 @@ impl MemberLookup {
 
 struct AncestryResolutionState {
     remaining_work: usize,
+    /// Completion lists what the proven prefix of an unknown ancestry
+    /// declares (l4d-4nbs re-review); every other consumer gets only the
+    /// type's own members from an unknown ancestry.
+    proven_prefix: bool,
     active_types: HashSet<(Url, String)>,
     resolved_types: HashMap<(Url, String), TypeAncestryResolution>,
     active_members: HashSet<(Url, String, usize, Option<String>, bool)>,
@@ -15671,6 +15801,7 @@ impl AncestryResolutionState {
     fn new() -> Self {
         Self {
             remaining_work: MAX_ANCESTRY_WORK,
+            proven_prefix: false,
             active_types: HashSet::new(),
             resolved_types: HashMap::new(),
             active_members: HashSet::new(),
@@ -16343,6 +16474,10 @@ struct Document {
     parsed: Arc<ParsedDocument>,
     import_bindings: Option<HashMap<String, Url>>,
     import_binding_fingerprint: Option<u64>,
+    /// Set while the workspace has fenced this document's imports with an
+    /// empty map without resolving them: a lookup through them records the
+    /// document as a binding demand (l4d-4nbs D44).
+    unbound: Option<Url>,
 }
 
 impl Deref for Document {
@@ -16395,6 +16530,7 @@ impl Document {
                 parsed: previous.clone(),
                 import_bindings: None,
                 import_binding_fingerprint: None,
+                unbound: None,
             });
         }
         #[cfg(test)]
@@ -16854,6 +16990,7 @@ impl Document {
             parsed,
             import_bindings: None,
             import_binding_fingerprint: None,
+            unbound: None,
         })
     }
 

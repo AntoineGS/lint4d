@@ -94,7 +94,7 @@ impl<'a> Validator<'a> {
         // The session listed through `list_directory_admitted`, which bounds
         // entries but not the bytes of the files listed; an unbounded byte
         // scan here lists the same names (the budget bounds the work).
-        let disk = FilesystemSourceStore::with_limits(inputs.directory_entries, usize::MAX);
+        let disk = FilesystemSourceStore::with_limits(inputs.directory_entries);
         Self {
             inputs,
             budget,

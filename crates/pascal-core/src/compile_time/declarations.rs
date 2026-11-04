@@ -95,10 +95,17 @@ pub struct CompileTimeState {
     word_backing: usize,
     lex: Lex,
     discarding_trivia_comment: bool,
+    /// The current word follows `@` or `&`: an assembler label (`@@repeat`),
+    /// an address (`@Proc`) or an escaped identifier (`&begin`), never a
+    /// keyword.
+    escaped_word: bool,
     section: Section,
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// A composite header's heritage list opened at this paren level
+    /// (`class(Exception)`): a `;` right after it ends a bodiless class.
+    class_heritage: Option<usize>,
     parens: usize,
     implementation: bool,
     finished: bool,
@@ -121,6 +128,10 @@ pub struct CompileTimeState {
     pub(super) provider_sources: Vec<LoadedSource>,
     pub(super) provider_backings: Vec<super::session::AdmittedSourceBacking>,
     in_interface: bool,
+    /// Names (and pointer mode) already prepared in this state as a provider
+    /// interface graph. Preparing one again changes nothing, so the graph is
+    /// shared instead of copied (l4d-4nbs R13).
+    pub(super) prepared: Vec<(String, bool)>,
 }
 
 pub(super) fn limit(
@@ -238,10 +249,12 @@ impl CompileTimeState {
             word_backing: 0,
             lex: Lex::Normal,
             discarding_trivia_comment: false,
+            escaped_word: false,
             section: Section::None,
             composite_depth: 0,
             rhs: false,
             pending_class: false,
+            class_heritage: None,
             parens: 0,
             implementation: false,
             finished: false,
@@ -261,6 +274,7 @@ impl CompileTimeState {
             provider_sources: Vec::new(),
             provider_backings: Vec::new(),
             in_interface: false,
+            prepared: Vec::new(),
         })
     }
 
@@ -448,6 +462,7 @@ impl CompileTimeState {
         self.pending_start = self.logical;
         self.rhs = false;
         self.pending_class = false;
+        self.class_heritage = None;
     }
 
     fn lex_char(
@@ -529,6 +544,7 @@ impl CompileTimeState {
             return Ok(());
         }
         self.flush_word(budget)?;
+        self.escaped_word = matches!(ch, '@' | '&');
         if ch == ';'
             && let Some(header) = &mut self.anonymous_header
             && self.parens <= header.parens
@@ -542,6 +558,12 @@ impl CompileTimeState {
                 header.pending_composite = false;
                 header.composites -= 1;
             }
+        }
+        if ch == ';' && self.class_heritage == Some(self.parens) {
+            // `EBase = class(Exception);` declares no members.
+            self.class_heritage = None;
+            self.composite_depth = self.composite_depth.saturating_sub(1);
+            self.stack.pop();
         }
         if ch == ';' && self.pending_class {
             // A bare composite header is retained as unsupported, not treated
@@ -563,6 +585,9 @@ impl CompileTimeState {
             '/' => self.lex = Lex::Slash,
             '(' => {
                 self.lex = Lex::Paren;
+                if self.pending_class {
+                    self.class_heritage = Some(self.parens);
+                }
                 self.pending_class = false;
             }
             ')' => self.parens = self.parens.saturating_sub(1),
@@ -697,9 +722,17 @@ impl CompileTimeState {
             return Ok(());
         }
         budget.charge(1, self.word.len(), 0)?;
+        if self.class_heritage == Some(self.parens) {
+            // A member or `end` follows the heritage list: the class has a body.
+            self.class_heritage = None;
+        }
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
-        let result = self.process_word(&word, budget);
+        let result = if std::mem::take(&mut self.escaped_word) {
+            Ok(())
+        } else {
+            self.process_word(&word, budget)
+        };
         drop(word);
         budget.release(std::mem::replace(&mut self.word_backing, 0));
         result
@@ -753,10 +786,13 @@ impl CompileTimeState {
             self.hide_scope_declarations();
             return Ok(());
         }
+        // `asm` is reserved: it never continues a declaration, even when an
+        // assembler label's `:` follows a `var` section.
         if matches!(
             self.section,
             Section::Types | Section::Vars | Section::Consts
         ) && self.rhs
+            && word != "asm"
         {
             if self.pending_class {
                 if matches!(word, "abstract" | "sealed") {
@@ -841,8 +877,10 @@ impl CompileTimeState {
                     self.pending_start += start;
                 }
             }
-            "begin" | "try" | "case" | "repeat" => {
-                let kind = if word == "begin"
+            // An `asm` block is closed by `end` like `begin`: a routine's
+            // assembler body, or an assembler statement.
+            "begin" | "asm" | "try" | "case" | "repeat" => {
+                let kind = if matches!(word, "begin" | "asm")
                     && self.scopes[self.site().scope.0 as usize].kind == ScopeKind::Routine
                 {
                     ScopeKind::Body
@@ -1507,6 +1545,7 @@ impl CompileTimeState {
         self.pending.hash(&mut h);
         self.word.hash(&mut h);
         self.lex.hash(&mut h);
+        self.escaped_word.hash(&mut h);
         self.section.hash(&mut h);
         self.composite_depth.hash(&mut h);
         self.parens.hash(&mut h);
@@ -1520,6 +1559,7 @@ impl CompileTimeState {
         self.unknown.hash(&mut h);
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
+        self.class_heritage.hash(&mut h);
         self.failure.hash(&mut h);
         self.option_stack.len().hash(&mut h);
         for saved in &self.option_stack {
@@ -1559,6 +1599,18 @@ impl CompileTimeState {
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         self.visit_payload(visit, true)
+    }
+
+    /// Source bytes and decoded text this state keeps alive through its
+    /// provider sources and backings (l4d-4nbs re-review I1).
+    pub fn retained_source_bytes(&self) -> usize {
+        self.provider_sources
+            .iter()
+            .chain(self.provider_backings.iter().map(|backing| &***backing))
+            .map(|source| {
+                source.bytes.len() + source.decoded_text.as_ref().map_or(0, |text| text.len())
+            })
+            .sum()
     }
 
     pub(crate) fn visit_snapshot_payload(
@@ -1643,6 +1695,9 @@ impl CompileTimeState {
         for s in &self.spans {
             visit(size_of::<Span>())?;
             visit(s.anchor.source.as_str().len())?;
+        }
+        for (name, _) in &self.prepared {
+            visit(size_of::<(String, bool)>() + name.len())?;
         }
         for d in &self.declarations {
             visit(size_of::<Declaration>())?;

@@ -20,11 +20,15 @@ pub const WORK_PER_SOURCE_BYTE: usize = 8;
 
 /// Byte work each source byte entering a session adds to `max_byte_work`,
 /// for the same reason: scanning, fragment, snapshot and mapping copies cost
-/// 12 to 15 bytes of byte work per source byte on synthetic library code
-/// (tests/compile_time_work_scaling.rs), and SysUtils.pas with its providers
-/// (about 2 MB) needs more than the fixed 64 MiB. The grant is about twice
-/// the synthetic cost.
-pub const BYTE_WORK_PER_SOURCE_BYTE: usize = 32;
+/// 12 to 18 bytes of byte work per source byte on synthetic library code
+/// (tests/compile_time_work_scaling.rs). Real unit closures cost more per
+/// byte: measured on SFClient2 (l4d-4nbs D19), whose BOSFBase units import
+/// the RAD Studio 7.0 RTL, VCL, DB, IBX and InfoPower interfaces (117
+/// providers, 709 lookups per session), a complete session spent at most
+/// 0.72 of the allowance a grant of 64 gives beyond the fixed budget, that
+/// is about 46 per scanned byte. 64 keeps a margin of about 1.4 over that;
+/// work that grows faster than the input still exhausts it.
+pub const BYTE_WORK_PER_SOURCE_BYTE: usize = 64;
 
 /// Work and byte work granted by source bytes entering a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,6 +51,12 @@ pub struct CompileTimeLimits {
     pub max_array_dimensions: usize,
     pub max_branch_states: usize,
     pub max_provider_queries: usize,
+    /// Stack bytes nested provider interface compilations may use below the
+    /// session's entry (l4d-4nbs D29). Each level costs about 50 KiB in a
+    /// debug build and 11 KiB in release; the default keeps a 2 MiB thread
+    /// clear of overflow with half of it left for the caller and the
+    /// innermost level.
+    pub max_provider_stack_bytes: usize,
     pub max_work: usize,
     /// Steps each source byte entering the session adds to `max_work`.
     pub work_per_source_byte: usize,
@@ -59,7 +69,11 @@ pub struct CompileTimeLimits {
 impl Default for CompileTimeLimits {
     fn default() -> Self {
         Self {
-            max_definitions: 32_768,
+            // Declarations admitted in one session, providers included. A
+            // unit closure can declare more than 32,768 names (SFClient2's
+            // BOSFBase units: 41,838); this is a count fuse, and memory stays
+            // bounded by `max_retained_bytes`.
+            max_definitions: 131_072,
             max_fields: 32_768,
             max_variant_alternatives: 32_768,
             max_pending_bytes: 1_048_576,
@@ -67,7 +81,12 @@ impl Default for CompileTimeLimits {
             max_type_depth: 256,
             max_array_dimensions: 256,
             max_branch_states: 64,
-            max_provider_queries: 256,
+            // Unit lookups by import site in one session. A unit's closure
+            // can exceed 256 import sites (SFClient2's BOSFBase units import
+            // RTL, VCL, DB, IBX and business objects; Log.pas needed 237). A
+            // count fuse only: work, byte work and retention bound the cost.
+            max_provider_queries: 4_096,
+            max_provider_stack_bytes: 1024 * 1024,
             // Finite normal-body work headroom. Header selection/reproof
             // inherit this operation policy, with their distinct state fuse.
             max_work: 2_000_000,
@@ -262,6 +281,29 @@ impl<'a> CompileTimeBudget<'a> {
         } else {
             self.charge(work, byte_work, 0)
         }
+    }
+
+    /// Grant `work` and `byte_work` already charged for input the session had
+    /// to consume whole (a funded read), leaving nothing for other work.
+    /// Limits without per-byte grants (factor 0) fund nothing.
+    pub(crate) fn fund_charged(
+        &mut self,
+        work: usize,
+        byte_work: usize,
+    ) -> Result<(), IncompleteReason> {
+        let grant = Allowance {
+            work: if self.limits.work_per_source_byte > 0 {
+                work
+            } else {
+                0
+            },
+            byte_work: if self.limits.byte_work_per_source_byte > 0 {
+                byte_work
+            } else {
+                0
+            },
+        };
+        self.charge_granted(grant, 0, 0)
     }
 
     fn charge_granted(

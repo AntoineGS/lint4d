@@ -18,6 +18,186 @@ pub type AdmittedProviderSource = Arc<AdmittedShared<ProviderSource>>;
 pub type AdmittedSourceBacking = Arc<AdmittedShared<LoadedSource>>;
 pub type AdmittedInterfaceGraph = Arc<AdmittedShared<CompileTimeState>>;
 
+/// What a compiled provider interface depends on besides the resolver
+/// configuration, which the store that holds it fixes (l4d-4nbs D29): the
+/// source, the state of its file, the conditional context it was compiled
+/// under and the qualifiers that authorize it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderGraphKey {
+    pub source: crate::SourceId,
+    pub content_hash: u64,
+    /// The disk stamp (equality ignores whether it was settled), or none for
+    /// an overlay.
+    pub disk_stamp: Option<pascal_project::ProjectReadStamp>,
+    pub overlay_version: Option<i32>,
+    pub context: ConditionalContext,
+    /// Lowercased: unit qualifiers are Pascal identifiers.
+    pub qualifiers: Vec<String>,
+}
+
+/// One source a compiled provider interface depends on: the provider
+/// itself or one it compiled or reused, at the state it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDependency {
+    pub source: crate::SourceId,
+    pub path: std::path::PathBuf,
+    pub content_hash: u64,
+    pub disk_stamp: Option<pascal_project::ProjectReadStamp>,
+    pub overlay_version: Option<i32>,
+}
+
+impl ProviderDependency {
+    fn of(source: &LoadedSource) -> Self {
+        let (content_hash, disk_stamp, overlay_version) = match &source.revision {
+            crate::SourceRevision::Disk {
+                stamp,
+                content_hash,
+                ..
+            } => (*content_hash, Some(stamp.clone()), None),
+            crate::SourceRevision::Overlay {
+                version,
+                content_hash,
+            } => (*content_hash, None, Some(*version)),
+        };
+        Self {
+            source: source.id.clone(),
+            path: source.path.clone(),
+            content_hash,
+            disk_stamp,
+            overlay_version,
+        }
+    }
+}
+
+/// The part of a compiled interface's observations and warnings a nested
+/// provider interface contributed: reusing the interface reports it only if
+/// the session has not reported that provider yet (l4d-4nbs D44). A
+/// provider the compilation found compiled already has an empty part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSegment {
+    pub key: ProviderGraphKey,
+    /// Where the importer's lookup of the provider reported.
+    pub lookup: (Range<usize>, Range<usize>),
+    pub observations: Range<usize>,
+    pub warnings: Range<usize>,
+}
+
+/// What looking a provider up reported in one session: where in the
+/// session's reports, and a copy. A session's resolver reports a lookup's
+/// candidates and payload only the first time, so the interface compiled
+/// from the provider carries them for sessions that reuse it.
+#[derive(Debug)]
+pub struct LookupReports {
+    session: u64,
+    observations: Range<usize>,
+    warnings: Range<usize>,
+    reported: (Vec<ResolutionObservation>, Vec<String>),
+}
+
+/// How far a provider compilation scanned one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedExtent {
+    pub source: crate::SourceId,
+    pub revision: crate::SourceRevision,
+    pub end: usize,
+}
+
+/// A provider interface compiled by one session, with the observations and
+/// warnings its compilation recorded (including those of the providers it
+/// compiled), so a session that reuses it reports the same dependencies.
+#[derive(Debug)]
+pub struct SharedProviderGraph {
+    pub occurrence: OccurrenceId,
+    /// `None`: the interface could not be completed.
+    pub graph: Option<AdmittedInterfaceGraph>,
+    pub observations: Arc<Vec<ResolutionObservation>>,
+    pub warnings: Arc<Vec<String>>,
+    /// Every provider source the graph was compiled from, nested ones
+    /// included: a store must validate them before reuse.
+    pub dependencies: Arc<Vec<ProviderDependency>>,
+    /// How far its compilation scanned each source, includes included: a
+    /// reuse is credited as that scan was.
+    pub scanned: Arc<Vec<ScannedExtent>>,
+    /// The nested provider interfaces it used, in observation order.
+    pub children: Arc<Vec<ChildSegment>>,
+    /// Every directory its unit lookups consulted, nested providers'
+    /// included, however the session's report deduplicated them: the store
+    /// validates them and watches them (l4d-4nbs review C1).
+    pub trace: Arc<Vec<ResolutionObservation>>,
+    /// The provider source's revision, for the session identity a reuse
+    /// registers.
+    pub revision: crate::SourceRevision,
+    /// How many of the first observations and warnings are the lookup that
+    /// found the provider (l4d-4nbs D44).
+    pub lookup: (usize, usize),
+    /// Bytes the graph retains, for the store's accounting.
+    pub retained_bytes: usize,
+}
+
+/// Compiled provider interfaces shared across sessions and requests
+/// (l4d-4nbs D29). A store is bound to one resolver configuration (search
+/// paths, namespaces, read policy) and validates an entry's observations
+/// before returning it; it is never required for correctness.
+pub trait SharedProviderGraphs: Send + Sync {
+    fn get(&self, key: &ProviderGraphKey) -> Option<Arc<SharedProviderGraph>>;
+    fn put(&self, key: ProviderGraphKey, graph: Arc<SharedProviderGraph>);
+}
+
+fn provider_graph_key(provider: &ProviderSource) -> ProviderGraphKey {
+    graph_key(
+        &provider.unit.source.id,
+        &provider.unit.source.revision,
+        &provider.context,
+        &provider.authorized_qualifiers,
+    )
+}
+
+fn graph_key(
+    source: &crate::SourceId,
+    revision: &crate::SourceRevision,
+    context: &ConditionalContext,
+    qualifiers: &[String],
+) -> ProviderGraphKey {
+    let (content_hash, disk_stamp, overlay_version) = match revision {
+        crate::SourceRevision::Disk {
+            stamp,
+            content_hash,
+            ..
+        } => (*content_hash, Some(stamp.clone()), None),
+        crate::SourceRevision::Overlay {
+            version,
+            content_hash,
+        } => (*content_hash, None, Some(*version)),
+    };
+    ProviderGraphKey {
+        source: source.clone(),
+        content_hash,
+        disk_stamp,
+        overlay_version,
+        context: context.clone(),
+        qualifiers: qualifiers.iter().map(|q| q.to_ascii_lowercase()).collect(),
+    }
+}
+
+fn observations_payload(observations: &[ResolutionObservation]) -> usize {
+    observations
+        .iter()
+        .map(|o| {
+            size_of::<ResolutionObservation>()
+                + match o {
+                    ResolutionObservation::Directory { path, entry, .. } => {
+                        path.as_os_str().len() + entry.path.as_os_str().len()
+                    }
+                    ResolutionObservation::Candidate { path, .. } => 2 * path.as_os_str().len(),
+                    ResolutionObservation::Payload {
+                        source_id, path, ..
+                    } => source_id.as_str().len() + path.as_os_str().len(),
+                    _ => 256,
+                }
+        })
+        .sum()
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderSource {
     pub unit: ResolvedUnit,
@@ -187,6 +367,39 @@ pub trait CompileTimeResolver {
     /// The session's scanner has read `source` up to offset `end`. A request
     /// credits each distinct source's bytes once, up to the furthest offset.
     fn note_scanned(&mut self, _source: &LoadedSource, _end: usize) {}
+    /// The offset of a source a reused provider interface scanned that the
+    /// request already credited (l4d-4nbs D29). The default credits nothing
+    /// request-wide, like `scan_credit_floor`.
+    fn reused_credit_floor(
+        &mut self,
+        _source: &crate::SourceId,
+        _revision: &crate::SourceRevision,
+    ) -> usize {
+        0
+    }
+    /// A reused provider interface had scanned `source` to `end`: the
+    /// request credits it as if the session had read it.
+    fn note_reused_scan(
+        &mut self,
+        _source: &crate::SourceId,
+        _revision: &crate::SourceRevision,
+        _end: usize,
+    ) {
+    }
+    /// Start (`true`) or stop (`false`) recording every directory unit
+    /// lookups consult, deduplicated reports and name-index skips included;
+    /// stopping returns them as directory observations stamped when
+    /// consulted. A shared provider interface keeps them so a unit created
+    /// in a directory a nested lookup consulted invalidates it (l4d-4nbs
+    /// review C1). The default records nothing.
+    fn trace_unit_lookups(&mut self, _start: bool) -> Vec<ResolutionObservation> {
+        Vec::new()
+    }
+    /// Compiled provider interfaces shared beyond this session (l4d-4nbs
+    /// D29). The default shares nothing.
+    fn shared_provider_graphs(&self) -> Option<Arc<dyn SharedProviderGraphs>> {
+        None
+    }
     /// Whether raw UTF-8 validation of `source` is funded. A request funds
     /// it once per distinct source; repeated validation is paid.
     fn fund_validation(&mut self, _source: &LoadedSource) -> bool {
@@ -334,7 +547,108 @@ pub struct CompileTimeOutput {
 
 pub type CompileTimeAnalysis = AdmittedOwned<CompileTimeOutput>;
 
+impl CompileTimeOutput {
+    /// Heap bytes this output keeps besides its declaration state: the
+    /// projections, occurrence sources, include topology and reports. With
+    /// the declarations released this is what a cached expansion retains
+    /// (l4d-4nbs D44); the budget ledger also counts storage other owners
+    /// (a shared provider graph store) keep alive.
+    pub fn projection_bytes(&self) -> usize {
+        fn analysis(analysis: &ConditionalAnalysis) -> usize {
+            analysis.projected_source.len()
+                + size_of_val(analysis.inactive_spans.as_slice())
+                + size_of_val(analysis.unknown_spans.as_slice())
+                + size_of_val(analysis.directives.as_slice())
+                + analysis
+                    .directives
+                    .iter()
+                    .map(|d| d.body.len())
+                    .sum::<usize>()
+        }
+        fn source(source: &LoadedSource) -> usize {
+            crate::resolver::loaded_source_metadata_retained(source)
+                + source.bytes.len()
+                + source.decoded_text.as_ref().map_or(0, |t| t.len())
+        }
+        fn anchors(anchors: &[SourceAnchor]) -> usize {
+            size_of_val(anchors)
+                + anchors
+                    .iter()
+                    .map(|a| a.source.as_str().len())
+                    .sum::<usize>()
+        }
+        let occurrences = self
+            .occurrences
+            .iter()
+            .map(|o| size_of::<OccurrenceAnalysis>() + source(&o.source) + analysis(&o.analysis))
+            .sum::<usize>();
+        let includes = self
+            .includes
+            .iter()
+            .map(|i| {
+                size_of::<IncludeOccurrence>()
+                    + i.directive.source.as_str().len()
+                    + anchors(&i.fragments)
+                    + match &i.target {
+                        Resolution::Found(found) => source(found),
+                        _ => 0,
+                    }
+            })
+            .sum::<usize>();
+        let fragments = self
+            .directive_fragments
+            .iter()
+            .map(|f| {
+                size_of::<DirectiveFragments>()
+                    + f.directive.body.len()
+                    + anchors(&f.fragments)
+                    + anchors(&f.body_fragments)
+            })
+            .sum::<usize>();
+        let header = match &self.header {
+            Fact::Known(h) => h.name.len() + anchors(&h.name_parts),
+            _ => 0,
+        };
+        size_of::<Self>()
+            + analysis(&self.root)
+            + occurrences
+            + includes
+            + fragments
+            + header
+            + size_of_val(self.reasons.as_slice())
+            + observations_payload(&self.observations)
+            + self
+                .warnings
+                .iter()
+                .map(|w| size_of::<String>() + w.len())
+                .sum::<usize>()
+    }
+}
+
 impl AdmittedOwned<CompileTimeOutput> {
+    /// Drop the declaration state the session built (the root's
+    /// declarations, environments and the provider interfaces it compiled
+    /// or copied), keeping the conditional projection, occurrences, includes,
+    /// header, observations and reports. A cached expansion needs only those
+    /// (l4d-4nbs D44); `facts` is left an empty state of the root.
+    pub fn release_declarations(
+        &mut self,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        let Some(root) = self.occurrences.first().map(|o| o.source.clone()) else {
+            return Ok(());
+        };
+        let view = self.budget.clone();
+        let mut budget = view.store_budget(self.root_limits, cancel);
+        let empty =
+            CompileTimeState::admitted_new(&ConditionalContext::default(), &root, &mut budget)?
+                .into_shared(&mut budget)
+                .map_err(|r| resolver_error(r, &budget))?;
+        let released = std::mem::replace(&mut self.value_mut().facts, empty);
+        drop(released);
+        Ok(())
+    }
+
     // Resolver integration remains gated on the callback/cache ownership split.
     #[allow(dead_code)]
     pub(crate) fn into_root_projection(
@@ -412,6 +726,7 @@ pub(crate) fn analyze_source_in_session(
         .map_err(|r| resolver_error(r, budget))?;
     let analysis = budget.admit_compilation(metadata.saturating_mul(2), |budget| {
         let mut providers = ProviderSession::new(budget)?;
+        providers.isolate_occurrences(resolver);
         analyze_source_with_providers_inner(
             root,
             context,
@@ -430,20 +745,241 @@ pub(crate) fn analyze_source_in_session(
 }
 
 /// What one session has credited for one distinct source (identity and
-/// content): every adapter credits each byte at most once per session and
-/// funds validation once, whatever its resolver hooks do.
+/// revision, as the request credits): every adapter credits each byte at most
+/// once per session and funds validation once, whatever its resolver hooks
+/// do. A revision found through another search entry (same content) is a
+/// distinct provider identity that is analysed again, so it is funded again;
+/// the number of such revisions is bounded by the search entries.
 struct ScanCredit {
     source: crate::SourceId,
-    content: u64,
+    revision: crate::SourceRevision,
     scanned: usize,
     validated: bool,
 }
 
-fn source_content(source: &LoadedSource) -> u64 {
-    match &source.revision {
-        crate::SourceRevision::Disk { content_hash, .. }
-        | crate::SourceRevision::Overlay { content_hash, .. } => *content_hash,
+/// Whether two revisions are one state of one file: equal, or disk reads of
+/// the same stamp and content through different search entries or read
+/// policies. One file state is one provider identity, however a session's
+/// importers reached it (l4d-4nbs R13); an overlay version stays distinct.
+fn same_file_state(left: &crate::SourceRevision, right: &crate::SourceRevision) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (
+                crate::SourceRevision::Disk {
+                    stamp: left_stamp,
+                    content_hash: left_hash,
+                    ..
+                },
+                crate::SourceRevision::Disk {
+                    stamp: right_stamp,
+                    content_hash: right_hash,
+                    ..
+                },
+            ) if left_stamp == right_stamp && left_hash == right_hash
+        )
+}
+
+/// A provider identity's compiled interface graph, with the most names
+/// prepared so far.
+struct ProviderGraph {
+    occurrence: OccurrenceId,
+    /// `None`: the interface could not be completed (an Unknown fact), which
+    /// a repeated analysis of the same identity would find again.
+    graph: Option<AdmittedInterfaceGraph>,
+    /// The provider sources the graph depends on, itself included.
+    dependencies: Arc<Vec<ProviderDependency>>,
+    /// Where the graph is shared beyond the session, with what its
+    /// compilation reported: a graph with more names prepared replaces it.
+    shared: Option<Arc<SharedOrigin>>,
+}
+
+struct SharedOrigin {
+    key: ProviderGraphKey,
+    revision: crate::SourceRevision,
+    lookup: (usize, usize),
+    trace: Arc<Vec<ResolutionObservation>>,
+    observations: Arc<Vec<ResolutionObservation>>,
+    warnings: Arc<Vec<String>>,
+    scanned: Arc<Vec<ScannedExtent>>,
+    children: Arc<Vec<ChildSegment>>,
+}
+
+/// `segments` with ranges made relative to `observations` and `warnings`
+/// offsets.
+fn relative_segments(
+    segments: Vec<ChildSegment>,
+    observations: usize,
+    warnings: usize,
+) -> Vec<ChildSegment> {
+    segments
+        .into_iter()
+        .map(|segment| ChildSegment {
+            key: segment.key,
+            lookup: (
+                segment.lookup.0.start.saturating_sub(observations)
+                    ..segment.lookup.0.end.saturating_sub(observations),
+                segment.lookup.1.start.saturating_sub(warnings)
+                    ..segment.lookup.1.end.saturating_sub(warnings),
+            ),
+            observations: segment.observations.start.saturating_sub(observations)
+                ..segment.observations.end.saturating_sub(observations),
+            warnings: segment.warnings.start.saturating_sub(warnings)
+                ..segment.warnings.end.saturating_sub(warnings),
+        })
+        .collect()
+}
+
+/// An address in the caller's stack frame: the stack grows down on every
+/// supported target, so the distance from an earlier position is what the
+/// frames in between use.
+#[inline(never)]
+fn stack_position() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// `base` with `more`, each source at its furthest extent.
+fn merged_extents(
+    base: &Arc<Vec<ScannedExtent>>,
+    more: Vec<ScannedExtent>,
+) -> Arc<Vec<ScannedExtent>> {
+    if more.is_empty() {
+        return base.clone();
     }
+    let mut all = base.as_ref().clone();
+    for extent in more {
+        match all
+            .iter_mut()
+            .find(|e| e.source == extent.source && e.revision == extent.revision)
+        {
+            Some(existing) => existing.end = existing.end.max(extent.end),
+            None => all.push(extent),
+        }
+    }
+    Arc::new(all)
+}
+
+fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
+    if more.is_empty() {
+        return base.clone();
+    }
+    let mut all = base.as_ref().clone();
+    all.extend_from_slice(more);
+    Arc::new(all)
+}
+
+/// What a shared interface keeps besides what other store entries charge
+/// (the nested providers' graphs it references): its declaration state, its
+/// provider sources' bytes and decoded text, its reports, dependencies,
+/// scans, nested parts, lookup trace and key (l4d-4nbs review I1).
+fn shared_retained_bytes(
+    graph: Option<&AdmittedInterfaceGraph>,
+    key: &ProviderGraphKey,
+    origin: &SharedOrigin,
+    dependencies: &[ProviderDependency],
+) -> usize {
+    let mut retained_bytes = size_of::<SharedProviderGraph>();
+    let mut add = |n: usize| retained_bytes = retained_bytes.saturating_add(n);
+    if let Some(graph) = graph {
+        let mut state = 0usize;
+        let _ = graph.visit_snapshot_payload(&mut |n| {
+            state = state.saturating_add(n);
+            Ok(())
+        });
+        add(state);
+        // The occurrence sources share their backings' bytes.
+        for source in graph.provider_backings.iter().map(|backing| &***backing) {
+            add(source.bytes.len());
+            add(source.decoded_text.as_ref().map_or(0, |text| text.len()));
+        }
+    }
+    add(observations_payload(&origin.observations));
+    add(observations_payload(&origin.trace));
+    add(origin
+        .warnings
+        .iter()
+        .map(|w| size_of::<String>() + w.len())
+        .sum());
+    add(dependencies
+        .iter()
+        .map(|d| {
+            size_of::<ProviderDependency>() + d.source.as_str().len() + d.path.as_os_str().len()
+        })
+        .sum());
+    add(origin
+        .scanned
+        .iter()
+        .map(|e| size_of::<ScannedExtent>() + e.source.as_str().len())
+        .sum());
+    add(origin
+        .children
+        .iter()
+        .map(|c| size_of::<ChildSegment>() + c.key.source.as_str().len())
+        .sum());
+    add(key.source.as_str().len()
+        + key
+            .qualifiers
+            .iter()
+            .map(|q| size_of::<String>() + q.len())
+            .sum::<usize>());
+    let mut context = 0usize;
+    let _ = key.context.visit_recovery_payload(&mut |n| {
+        context = context.saturating_add(n);
+        Ok(())
+    });
+    add(context);
+    retained_bytes
+}
+
+/// Unit qualifiers are Pascal identifiers: `classes` and `Classes` name one
+/// unit and authorize one provider identity (l4d-4nbs D19).
+/// Ends the warning a session reports for a provider whose interface is
+/// unknown because its conditionals exceed `max_branch_states` (l4d-4nbs
+/// review C2).
+pub const BRANCH_LIMITED_PROVIDER: &str = "its conditionals exceed max_branch_states";
+
+fn is_branch_state_limit(reason: &IncompleteReason) -> bool {
+    matches!(
+        reason,
+        IncompleteReason::Limit {
+            name: "max_branch_states",
+            ..
+        }
+    )
+}
+
+fn same_qualifiers(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+/// Whether `name` (in `pointers` mode) is prepared in a provider graph:
+/// preparing it again changes nothing, so the graph is shared, not copied.
+fn is_prepared(prepared: &[(String, bool)], name: &str, pointers: bool) -> bool {
+    prepared
+        .iter()
+        .any(|(prepared, p)| *p == pointers && prepared.eq_ignore_ascii_case(name))
+}
+
+/// Record that `name` is prepared in `state`, admitting the entry.
+fn mark_prepared(
+    state: &mut CompileTimeState,
+    name: &str,
+    pointers: bool,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    if is_prepared(&state.prepared, name, pointers) {
+        return Ok(());
+    }
+    budget
+        .charge(1, name.len(), name.len() + size_of::<(String, bool)>())
+        .map_err(|r| resolver_error(r, budget))?;
+    state.prepared.push((name.to_owned(), pointers));
+    Ok(())
 }
 
 struct ProviderSession {
@@ -452,8 +988,27 @@ struct ProviderSession {
     credits: AdmittedOwned<Vec<AdmittedOwned<ScanCredit>>>,
     active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     identities: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
+    /// Compiled interface graph of each provider identity (by occurrence).
+    /// A provider imported by several units of one session is analysed
+    /// once: later imports prepare their names on a copy of this graph. A
+    /// repeated analysis would be real work with no grant, since the session
+    /// credits each source byte once.
+    graphs: AdmittedOwned<Vec<AdmittedOwned<ProviderGraph>>>,
+    /// The dependencies each provider compilation in progress has used so
+    /// far (innermost last).
+    collecting: Vec<Vec<ProviderDependency>>,
+    /// The nested provider interfaces each shared compilation in progress
+    /// has used so far, with absolute observation and warning ranges.
+    segments: Vec<Vec<ChildSegment>>,
+    /// The directories each shared compilation in progress has looked units
+    /// up in, parallel to `segments`.
+    traces: Vec<Vec<ResolutionObservation>>,
     queries: usize,
     next_occurrence: u64,
+    /// Where the stack was when the session started (l4d-4nbs D29).
+    stack_base: usize,
+    /// Distinguishes the session's lookup ranges from another's.
+    session: u64,
     declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
 }
 
@@ -532,6 +1087,7 @@ pub(crate) fn header_with_coordinates_in_session(
 ) -> Result<AdmittedOwned<Fact<VerifiedUnitHeader>>, ResolverError> {
     let mut output = budget.admit_compilation(0, |budget| {
         let mut providers = ProviderSession::new(budget)?;
+        providers.isolate_occurrences(resolver);
         analyze_source_with_providers_inner(
             root,
             context,
@@ -566,22 +1122,42 @@ impl ProviderSession {
         let credits = budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?;
+        let graphs = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
         Ok(Self {
             credits,
             active,
             identities,
+            graphs,
+            collecting: Vec::new(),
+            segments: Vec::new(),
+            traces: Vec::new(),
             declarations,
             queries: 0,
             next_occurrence: 1,
+            stack_base: stack_position(),
+            session: 0,
         })
     }
 
+    /// A session that shares compiled provider interfaces numbers its
+    /// occurrences in a range of its own, so a graph another session compiled
+    /// never shares an id with one of this session (l4d-4nbs D29).
+    fn isolate_occurrences(&mut self, resolver: &dyn CompileTimeResolver) {
+        static NEXT_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if resolver.shared_provider_graphs().is_some() {
+            let range = NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.next_occurrence = range.saturating_mul(1 << 32).max(1);
+            self.session = range;
+        }
+    }
+
     fn credit(&self, source: &LoadedSource) -> Option<&ScanCredit> {
-        let content = source_content(source);
         self.credits
             .iter()
             .map(|credit| &**credit)
-            .find(|credit| credit.content == content && credit.source == source.id)
+            .find(|credit| credit.source == source.id && credit.revision == source.revision)
     }
 
     /// Offset of `source` this session has already credited.
@@ -594,19 +1170,22 @@ impl ProviderSession {
         source: &LoadedSource,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<&mut ScanCredit, ResolverError> {
-        let content = source_content(source);
         let index = match self
             .credits
             .iter()
-            .position(|credit| credit.content == content && credit.source == source.id)
+            .position(|credit| credit.source == source.id && credit.revision == source.revision)
         {
             Some(index) => index,
             None => {
-                let bytes = source.id.as_str().len();
+                // The source id, plus the authorization a disk revision
+                // carries (an overlay revision is inline).
+                let bytes = crate::resolver::loaded_source_metadata_retained(source)
+                    - size_of::<LoadedSource>()
+                    - source.path.as_os_str().len();
                 let credit = budget
                     .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
                         source: source.id.clone(),
-                        content,
+                        revision: source.revision.clone(),
                         scanned: 0,
                         validated: false,
                     })
@@ -616,6 +1195,90 @@ impl ProviderSession {
             }
         };
         Ok(self.credits.value_mut()[index].value_mut())
+    }
+
+    fn push_frame(&mut self) {
+        self.segments.push(Vec::new());
+        self.traces.push(Vec::new());
+    }
+
+    fn pop_frame(&mut self) -> (Vec<ChildSegment>, Vec<ResolutionObservation>) {
+        (
+            self.segments.pop().unwrap_or_default(),
+            self.traces.pop().unwrap_or_default(),
+        )
+    }
+
+    /// Add consulted directories to the innermost shared compilation.
+    fn note_trace(&mut self, trace: &[ResolutionObservation]) {
+        let Some(frame) = self.traces.last_mut() else {
+            return;
+        };
+        for observation in trace {
+            let ResolutionObservation::Directory { path, .. } = observation else {
+                continue;
+            };
+            if !frame.iter().any(|known| {
+                matches!(known, ResolutionObservation::Directory { path: known, .. } if known == path)
+            }) {
+                frame.push(observation.clone());
+            }
+        }
+    }
+
+    /// How far the session has scanned each source, to compare after a
+    /// provider compilation.
+    fn scan_positions(&self) -> Vec<usize> {
+        self.credits.iter().map(|credit| credit.scanned).collect()
+    }
+
+    /// The sources scanned further than `before` says.
+    fn scanned_since(&self, before: &[usize]) -> Vec<ScannedExtent> {
+        self.credits
+            .iter()
+            .enumerate()
+            .filter(|(index, credit)| before.get(*index).is_none_or(|end| credit.scanned > *end))
+            .map(|(_, credit)| ScannedExtent {
+                source: credit.source.clone(),
+                revision: credit.revision.clone(),
+                end: credit.scanned,
+            })
+            .collect()
+    }
+
+    fn extent_floor(&self, extent: &ScannedExtent) -> usize {
+        self.credits
+            .iter()
+            .find(|credit| credit.source == extent.source && credit.revision == extent.revision)
+            .map_or(0, |credit| credit.scanned)
+    }
+
+    /// A reused interface had scanned `extent`: the session credits it once.
+    fn note_extent(
+        &mut self,
+        extent: &ScannedExtent,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if let Some(credit) = self
+            .credits
+            .value_mut()
+            .iter_mut()
+            .find(|credit| credit.source == extent.source && credit.revision == extent.revision)
+        {
+            let credit = credit.value_mut();
+            credit.scanned = credit.scanned.max(extent.end);
+            return Ok(());
+        }
+        let bytes = extent.source.as_str().len();
+        let credit = budget
+            .admit_owned(1, bytes, bytes + size_of::<ScanCredit>(), || ScanCredit {
+                source: extent.source.clone(),
+                revision: extent.revision.clone(),
+                scanned: extent.end,
+                validated: false,
+            })
+            .map_err(|r| resolver_error(r, budget))?;
+        push_owner(&mut self.credits, credit, budget)
     }
 
     /// The session read `source` to `end`.
@@ -1689,6 +2352,12 @@ impl ProviderEngine<'_, '_> {
                 )
                 .map_err(|r| resolver_error(r, self.budget))?;
                 self.providers.queries += 1;
+                // Inside a shared compilation, record every directory the
+                // lookup consults, whatever the session already reported.
+                let tracing = !self.providers.segments.is_empty();
+                if tracing {
+                    self.resolver.trace_unit_lookups(true);
+                }
                 let pending = &state.interfaces[index].pending;
                 let outcome = self.budget.external(|budget| {
                     self.resolver.unit_report_capability(
@@ -1700,9 +2369,38 @@ impl ProviderEngine<'_, '_> {
                         budget,
                         self.cancel,
                     )
-                })?;
-                let (result, reports) = outcome.into_parts();
+                });
+                // Stop tracing before any exit: only the lookup is traced.
+                let trace = if tracing {
+                    self.resolver.trace_unit_lookups(false)
+                } else {
+                    Vec::new()
+                };
+                let (result, reports) = outcome?.into_parts();
+                let before = (self.observations.len(), self.warnings.len());
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
+                if tracing {
+                    self.budget
+                        .charge(trace.len() + 1, observations_payload(&trace), 0)
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                    self.providers.note_trace(&trace);
+                }
+                if !self.providers.segments.is_empty() {
+                    let observations = before.0..self.observations.len();
+                    let warnings = before.1..self.warnings.len();
+                    self.budget
+                        .charge(observations.len() + warnings.len() + 1, 0, 0)
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                    state.interfaces[index].lookup = Some(Arc::new(LookupReports {
+                        session: self.providers.session,
+                        reported: (
+                            self.observations[observations.clone()].to_vec(),
+                            self.warnings[warnings.clone()].to_vec(),
+                        ),
+                        observations,
+                        warnings,
+                    }));
+                }
                 state.interfaces[index].attempted = true;
                 if result.owns_candidates() {
                     let failure = if matches!(result.result(), Resolution::Ambiguous { .. }) {
@@ -1801,14 +2499,49 @@ impl ProviderEngine<'_, '_> {
                 continue;
             }
             if let Some(provider) = state.interfaces[index].provided.take() {
-                match self.compile_provider_interface(provider, suffix, pointers, depth + 1)? {
-                    Fact::Known(graph) => state.interfaces[index].graph = Some(graph),
+                let lookup = state.interfaces[index].lookup.take();
+                match self.compile_provider_interface(
+                    provider,
+                    suffix,
+                    pointers,
+                    depth + 1,
+                    lookup.as_deref(),
+                )? {
+                    Fact::Known(graph) => {
+                        state.interfaces[index].occurrence =
+                            self.providers.graphs.iter().find_map(|entry| {
+                                entry
+                                    .graph
+                                    .as_ref()
+                                    .is_some_and(|memo| Arc::ptr_eq(memo, &graph))
+                                    .then_some(entry.occurrence)
+                            });
+                        state.interfaces[index].graph = Some(graph);
+                    }
                     Fact::Unknown(reason) => state.interfaces[index].failure = Some(reason),
                     Fact::Incomplete(reason) => return Err(resolver_error(reason, self.budget)),
                 }
             } else if let Some(graph) = &state.interfaces[index].graph {
-                state.interfaces[index].graph =
-                    Some(self.replace_interface_graph(graph, suffix, pointers, depth + 1)?);
+                // Prepare on the session's graph with the most names
+                // prepared, which a shared graph follows; a graph of
+                // another session's numbering is prepared on its own.
+                let memo = state.interfaces[index].occurrence.and_then(|occurrence| {
+                    self.providers
+                        .graphs
+                        .iter()
+                        .position(|entry| entry.occurrence == occurrence && entry.graph.is_some())
+                });
+                self.budget
+                    .charge(self.providers.graphs.len() + 1, 0, 0)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                let prepared = match memo {
+                    Some(memo) => match self.prepare_memoized(memo, suffix, pointers, depth)? {
+                        Fact::Known(prepared) => prepared,
+                        _ => self.replace_interface_graph(graph, suffix, pointers, depth + 1)?,
+                    },
+                    None => self.replace_interface_graph(graph, suffix, pointers, depth + 1)?,
+                };
+                state.interfaces[index].graph = Some(prepared);
             }
         }
         Ok(())
@@ -1821,6 +2554,13 @@ impl ProviderEngine<'_, '_> {
         pointers: bool,
         depth: usize,
     ) -> Result<AdmittedInterfaceGraph, ResolverError> {
+        // A name this graph already prepared needs nothing more: share it.
+        self.budget
+            .charge(graph.prepared.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        if is_prepared(&graph.prepared, suffix, pointers) {
+            return Ok(graph.clone());
+        }
         // An independent mutable copy is required; attach its construction
         // credits before traversing/copying, not after preparation completes.
         let mut copy = self.budget.admit_compilation(0, |budget| {
@@ -1828,6 +2568,7 @@ impl ProviderEngine<'_, '_> {
                 .snapshot(budget)
                 .map_err(|r| resolver_error(r, budget))
         })?;
+
         copy.with_budget_mut(self.budget, |copy, budget| {
             let captured = copy.site();
             let mut engine = ProviderEngine {
@@ -1838,7 +2579,8 @@ impl ProviderEngine<'_, '_> {
                 observations: self.observations,
                 warnings: self.warnings,
             };
-            engine.prepare_name(copy, &captured, suffix, pointers, depth)
+            engine.prepare_name(copy, &captured, suffix, pointers, depth)?;
+            mark_prepared(copy, suffix, pointers, budget)
         })
         .map_err(|r| resolver_error(r, self.budget))??;
         // Move the now-prepared graph AND its existing credits into shared
@@ -1986,12 +2728,47 @@ impl ProviderEngine<'_, '_> {
         }
     }
 
+    /// Compile (or reuse) a provider interface. Inside a shared compilation
+    /// the observations and warnings it adds are recorded as the part that
+    /// provider contributed (l4d-4nbs D44).
     fn compile_provider_interface(
         &mut self,
         provider: AdmittedProviderSource,
         name: &str,
         pointers: bool,
         depth: usize,
+        lookup: Option<&LookupReports>,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        if self.providers.segments.is_empty() {
+            return self.compile_provider_interface_inner(provider, name, pointers, depth, lookup);
+        }
+        admit_provider_context(&provider.context, self.budget, false)?;
+        let key = provider_graph_key(&provider);
+        let (observations, warnings) = (self.observations.len(), self.warnings.len());
+        let result = self.compile_provider_interface_inner(provider, name, pointers, depth, lookup);
+        let session = self.providers.session;
+        if let Some(frame) = self.providers.segments.last_mut() {
+            frame.push(ChildSegment {
+                key,
+                lookup: lookup
+                    .filter(|lookup| lookup.session == session)
+                    .map_or((0..0, 0..0), |lookup| {
+                        (lookup.observations.clone(), lookup.warnings.clone())
+                    }),
+                observations: observations..self.observations.len(),
+                warnings: warnings..self.warnings.len(),
+            });
+        }
+        result
+    }
+
+    fn compile_provider_interface_inner(
+        &mut self,
+        provider: AdmittedProviderSource,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+        lookup: Option<&LookupReports>,
     ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
         self.budget
             .charge(
@@ -2006,6 +2783,14 @@ impl ProviderEngine<'_, '_> {
             .iter()
             .chain(self.providers.identities.iter())
         {
+            // The identity checks below stop at a different source; only a
+            // same-source key compares contexts, revisions and qualifiers.
+            self.budget
+                .charge(1, key.source.as_str().len(), 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if key.source != provider.unit.source.id {
+                continue;
+            }
             admit_provider_context(&provider.context, self.budget, false)?;
             admit_provider_context(&key.context, self.budget, false)?;
             let n = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
@@ -2045,9 +2830,9 @@ impl ProviderEngine<'_, '_> {
         }
         if self.providers.active.iter().any(|key| {
             key.source == provider.unit.source.id
-                && key.revision == provider.unit.source.revision
+                && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
-                && key.qualifiers == provider.authorized_qualifiers
+                && same_qualifiers(&key.qualifiers, &provider.authorized_qualifiers)
         }) {
             return Ok(Fact::Unknown(UnknownReason::CyclicProvider));
         }
@@ -2057,6 +2842,15 @@ impl ProviderEngine<'_, '_> {
             "max_type_depth",
         )
         .map_err(|r| resolver_error(r, self.budget))?;
+        let stack = self.providers.stack_base.saturating_sub(stack_position());
+        let maximum = self.budget.limits().max_provider_stack_bytes;
+        if stack > maximum {
+            return Err(ResolverError::LimitExceeded {
+                limit: "max_provider_stack_bytes",
+                observed: stack,
+                maximum,
+            });
+        }
         let metadata = provider_owned_payload(&provider)?;
         // Separately compiled unit roots have one nominal identity per proven
         // source/revision/context/qualifier capability in this session. Repeating
@@ -2065,11 +2859,68 @@ impl ProviderEngine<'_, '_> {
         // fragments still receive their own physical occurrences normally.
         let previous = self.providers.identities.iter().find(|key| {
             key.source == provider.unit.source.id
-                && key.revision == provider.unit.source.revision
+                && same_file_state(&key.revision, &provider.unit.source.revision)
                 && key.context == provider.context
-                && key.qualifiers == provider.authorized_qualifiers
+                && same_qualifiers(&key.qualifiers, &provider.authorized_qualifiers)
         });
         let new_identity = previous.is_none();
+        if let Some(key) = previous {
+            let occurrence = key.occurrence;
+            self.budget
+                .charge(self.providers.graphs.len() + 1, 0, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if let Some(index) = self
+                .providers
+                .graphs
+                .iter()
+                .position(|entry| entry.occurrence == occurrence)
+            {
+                drop(provider);
+                let dependencies = self.providers.graphs[index].dependencies.clone();
+                self.note_dependencies(&dependencies)?;
+                if let Some(origin) = self.providers.graphs[index].shared.clone() {
+                    self.providers.note_trace(&origin.trace);
+                }
+                return self.prepare_memoized(index, name, pointers, depth);
+            }
+        }
+        let shared = if new_identity {
+            self.resolver.shared_provider_graphs()
+        } else {
+            None
+        };
+        let shared_key = if shared.is_some() {
+            admit_provider_context(&provider.context, self.budget, false)?;
+            self.budget
+                .charge(1, metadata, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            Some(provider_graph_key(&provider))
+        } else {
+            None
+        };
+        if let (Some(store), Some(key)) = (&shared, &shared_key)
+            && let Some(hit) = store.get(key)
+        {
+            // This session's lookup already reported how the provider was
+            // found; the reused interface's copy of a lookup is not repeated.
+            let found = lookup.is_some_and(|lookup| {
+                lookup.session == self.providers.session && !lookup.reported.0.is_empty()
+            });
+            return self.reuse_shared_graph(
+                provider,
+                metadata,
+                (&hit, key.clone(), found),
+                name,
+                pointers,
+                depth,
+            );
+        }
+        let observations_before = self.observations.len();
+        let warnings_before = self.warnings.len();
+        self.budget
+            .charge(self.providers.credits.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let scan_before = self.providers.scan_positions();
         let occurrence = if let Some(key) = previous {
             key.occurrence
         } else {
@@ -2092,6 +2943,10 @@ impl ProviderEngine<'_, '_> {
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.active, key, self.budget)?;
+        self.providers.collecting.push(Vec::new());
+        if shared.is_some() {
+            self.providers.push_frame();
+        }
         let result = analyze_source_with_providers(
             &provider.unit.source,
             &provider.context,
@@ -2102,14 +2957,24 @@ impl ProviderEngine<'_, '_> {
             true,
             occurrence,
         );
+        // A provider whose conditionals exceed the branch-state limit has an
+        // unknown interface, as one whose interface is incomplete: its
+        // importer's conditions on it are unknown, not refused (l4d-4nbs
+        // review C2). Other limits and cancellation still end the request.
+        let mut branch_limited = false;
         let result = result.and_then(|mut analysis| {
+            branch_limited = analysis.reasons.iter().any(is_branch_state_limit);
             if let Some(reason) = analysis.reasons.iter().find(|r| {
-                matches!(
-                    r,
-                    IncompleteReason::Limit { .. } | IncompleteReason::Cancelled
-                )
+                !is_branch_state_limit(r)
+                    && matches!(
+                        r,
+                        IncompleteReason::Limit { .. } | IncompleteReason::Cancelled
+                    )
             }) {
                 return Err(resolver_error(reason.clone(), self.budget));
+            }
+            if branch_limited {
+                return Ok(analysis);
             }
             let result = analysis
                 .value_mut()
@@ -2124,7 +2989,8 @@ impl ProviderEngine<'_, '_> {
                         observations: self.observations,
                         warnings: self.warnings,
                     };
-                    engine.prepare_name(facts, &site, name, pointers, depth + 1)
+                    engine.prepare_name(facts, &site, name, pointers, depth + 1)?;
+                    mark_prepared(facts, name, pointers, budget)
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             result?;
@@ -2136,6 +3002,20 @@ impl ProviderEngine<'_, '_> {
             .value_mut()
             .pop()
             .expect("active provider identity");
+        let mut dependencies = self.providers.collecting.pop().unwrap_or_default();
+        let (children, trace) = if shared.is_some() {
+            self.providers.pop_frame()
+        } else {
+            Default::default()
+        };
+        self.providers.note_trace(&trace);
+        dependencies.push(ProviderDependency::of(&provider.unit.source));
+        dependencies.sort_by(|a, b| {
+            (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
+        });
+        dependencies.dedup();
+        let dependencies = Arc::new(dependencies);
+        self.note_dependencies(&dependencies)?;
         let mut analysis = result?;
         if new_identity {
             // Transfer the already admitted identity owner, not an interval of
@@ -2155,7 +3035,76 @@ impl ProviderEngine<'_, '_> {
         let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
         move_report_vector(self.observations, observations, self.budget)?;
         move_report_vector(self.warnings, warnings, self.budget)?;
-        if !analysis.facts().interface_complete {
+        if branch_limited {
+            let path = provider.unit.source.path.display().to_string();
+            let warning = format!("the interface of {path} is unknown: {BRANCH_LIMITED_PROVIDER}");
+            let bytes = warning.len() + size_of::<String>();
+            let owned = self
+                .budget
+                .admit_owned(1, bytes, bytes, || vec![warning])
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.warnings, owned, self.budget)?;
+        }
+        let origin = shared_key.map(|key| {
+            // The lookup's reports come first, so a session that reuses the
+            // interface reports how the provider was found.
+            let (found, warned) = lookup
+                .map(|lookup| (&lookup.reported.0[..], &lookup.reported.1[..]))
+                .unwrap_or_default();
+            let mut observations = found.to_vec();
+            observations.extend_from_slice(&self.observations[observations_before..]);
+            let mut warnings = warned.to_vec();
+            warnings.extend_from_slice(&self.warnings[warnings_before..]);
+            Arc::new(SharedOrigin {
+                key,
+                revision: provider.unit.source.revision.clone(),
+                lookup: (found.len(), warned.len()),
+                trace: Arc::new(trace),
+                observations: Arc::new(observations),
+                warnings: Arc::new(warnings),
+                scanned: Arc::new(self.providers.scanned_since(&scan_before)),
+                children: Arc::new(relative_segments(
+                    children,
+                    observations_before.saturating_sub(found.len()),
+                    warnings_before.saturating_sub(warned.len()),
+                )),
+            })
+        });
+        if branch_limited || !analysis.facts().interface_complete {
+            drop(analysis);
+            if let (Some(store), Some(origin)) = (&shared, &origin) {
+                store.put(
+                    origin.key.clone(),
+                    Arc::new(SharedProviderGraph {
+                        occurrence,
+                        graph: None,
+                        observations: origin.observations.clone(),
+                        warnings: origin.warnings.clone(),
+                        dependencies: dependencies.clone(),
+                        scanned: origin.scanned.clone(),
+                        children: origin.children.clone(),
+                        revision: origin.revision.clone(),
+                        lookup: origin.lookup,
+                        trace: origin.trace.clone(),
+                        retained_bytes: shared_retained_bytes(
+                            None,
+                            &origin.key,
+                            origin,
+                            &dependencies,
+                        ),
+                    }),
+                );
+            }
+            let entry = self
+                .budget
+                .admit_owned(1, 0, 0, || ProviderGraph {
+                    occurrence,
+                    graph: None,
+                    dependencies,
+                    shared: origin,
+                })
+                .map_err(|r| resolver_error(r, self.budget))?;
+            push_owner(&mut self.providers.graphs, entry, self.budget)?;
             return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
         let output = analysis.value_mut();
@@ -2178,7 +3127,18 @@ impl ProviderEngine<'_, '_> {
                             + occurrences.len() * size_of::<LoadedSource>(),
                     )
                     .map_err(|r| resolver_error(r, budget))?;
-                facts.provider_sources = occurrences.iter().map(|o| o.source.clone()).collect();
+                // Consumers read only each occurrence's identity, path and
+                // revision: the stored interface does not keep the include
+                // text alive (l4d-4nbs re-review I1).
+                facts.provider_sources = occurrences
+                    .iter()
+                    .map(|o| LoadedSource {
+                        bytes: Arc::from(&[][..]),
+                        decoded_text: None,
+                        compile_time_backing: None,
+                        ..o.source.clone()
+                    })
+                    .collect();
                 facts.provider_backings.push(
                     provider
                         .backing
@@ -2198,7 +3158,447 @@ impl ProviderEngine<'_, '_> {
             .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
         drop(analysis);
+        if let (Some(store), Some(origin)) = (&shared, &origin) {
+            store.put(
+                origin.key.clone(),
+                Arc::new(SharedProviderGraph {
+                    occurrence,
+                    graph: Some(graph.clone()),
+                    observations: origin.observations.clone(),
+                    warnings: origin.warnings.clone(),
+                    dependencies: dependencies.clone(),
+                    scanned: origin.scanned.clone(),
+                    children: origin.children.clone(),
+                    revision: origin.revision.clone(),
+                    lookup: origin.lookup,
+                    trace: origin.trace.clone(),
+                    retained_bytes: shared_retained_bytes(
+                        Some(&graph),
+                        &origin.key,
+                        origin,
+                        &dependencies,
+                    ),
+                }),
+            );
+        }
+        let entry = self
+            .budget
+            .admit_owned(1, 0, 0, || ProviderGraph {
+                occurrence,
+                graph: Some(graph.clone()),
+                dependencies,
+                shared: origin,
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.graphs, entry, self.budget)?;
         Ok(Fact::Known(graph))
+    }
+
+    /// Credit the scans a reused interface's compilation made as if this
+    /// session had made them: the session's budget is granted the bytes
+    /// neither it nor the request has credited yet, so budget accounting is
+    /// what compiling would have given, once per distinct source (l4d-4nbs
+    /// D29).
+    fn credit_reused_scan(&mut self, scanned: &[ScannedExtent]) -> Result<(), ResolverError> {
+        self.budget
+            .charge(scanned.len(), 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let mut granted = 0usize;
+        for extent in scanned {
+            let floor = self.providers.extent_floor(extent).max(
+                self.resolver
+                    .reused_credit_floor(&extent.source, &extent.revision),
+            );
+            granted = granted.saturating_add(extent.end.saturating_sub(floor));
+            self.resolver
+                .note_reused_scan(&extent.source, &extent.revision, extent.end);
+            self.providers.note_extent(extent, self.budget)?;
+        }
+        self.budget
+            .charge_scanned(granted, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))
+    }
+
+    /// Record that the compilation in progress used `dependencies`.
+    fn note_dependencies(
+        &mut self,
+        dependencies: &Arc<Vec<ProviderDependency>>,
+    ) -> Result<(), ResolverError> {
+        let Some(top) = self.providers.collecting.last_mut() else {
+            return Ok(());
+        };
+        self.budget
+            .charge(dependencies.len(), 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        top.extend(dependencies.iter().cloned());
+        Ok(())
+    }
+
+    /// Use a provider interface another session compiled: register its
+    /// identity, report the dependencies its compilation observed, and
+    /// prepare `name` on it as on a graph of this session. No source byte is
+    /// scanned, so nothing is granted (l4d-4nbs D29).
+    fn reuse_shared_graph(
+        &mut self,
+        provider: AdmittedProviderSource,
+        metadata: usize,
+        (hit, shared_key, found): (&SharedProviderGraph, ProviderGraphKey, bool),
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        let identity = ProviderKey {
+            source: provider.unit.source.id.clone(),
+            revision: provider.unit.source.revision.clone(),
+            context: provider.context.clone(),
+            qualifiers: provider.authorized_qualifiers.clone(),
+            occurrence: hit.occurrence,
+        };
+        drop(provider);
+        let index = self.register_shared(identity, metadata, hit, shared_key, found)?;
+        self.prepare_memoized(index, name, pointers, depth)
+    }
+
+    /// Make a shared interface this session's graph for its identity:
+    /// register the identity, report what its compilation observed (each
+    /// nested provider only once a session), its dependencies and its scans.
+    /// Returns its memo index.
+    fn register_shared(
+        &mut self,
+        identity: ProviderKey,
+        metadata: usize,
+        hit: &SharedProviderGraph,
+        shared_key: ProviderGraphKey,
+        found: bool,
+    ) -> Result<usize, ResolverError> {
+        let stack = self.providers.stack_base.saturating_sub(stack_position());
+        let maximum = self.budget.limits().max_provider_stack_bytes;
+        if stack > maximum {
+            return Err(ResolverError::LimitExceeded {
+                limit: "max_provider_stack_bytes",
+                observed: stack,
+                maximum,
+            });
+        }
+        let occurrence = identity.occurrence;
+        let key = self
+            .budget
+            .admit_owned(1, metadata, metadata, || identity)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.identities, key, self.budget)?;
+        self.replay_shared(hit, found)?;
+        // A session or interface that reuses it depends on its lookups too.
+        self.replay_trace(&hit.trace)?;
+        self.note_dependencies(&hit.dependencies)?;
+        self.credit_reused_scan(&hit.scanned)?;
+        let entry = self
+            .budget
+            .admit_owned(1, 0, 0, || ProviderGraph {
+                occurrence,
+                graph: hit.graph.clone(),
+                dependencies: hit.dependencies.clone(),
+                shared: Some(Arc::new(SharedOrigin {
+                    key: shared_key,
+                    revision: hit.revision.clone(),
+                    lookup: hit.lookup,
+                    trace: hit.trace.clone(),
+                    observations: hit.observations.clone(),
+                    warnings: hit.warnings.clone(),
+                    scanned: hit.scanned.clone(),
+                    children: hit.children.clone(),
+                })),
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.graphs, entry, self.budget)?;
+        Ok(self.providers.graphs.len() - 1)
+    }
+
+    /// Report what a shared interface's compilation observed and warned.
+    /// A nested provider's parts (its lookup and its compilation) are
+    /// reported by registering that provider, once a session, or copied
+    /// when the store no longer has it (l4d-4nbs D44).
+    fn replay_shared(
+        &mut self,
+        hit: &SharedProviderGraph,
+        found: bool,
+    ) -> Result<(), ResolverError> {
+        enum Action {
+            Skip,
+            Register(Arc<SharedProviderGraph>),
+            Copy,
+        }
+        // Each part: its observation and warning ranges, the child, and
+        // whether it is the compilation (where a registration happens).
+        let mut parts = Vec::new();
+        for (index, child) in hit.children.iter().enumerate() {
+            if !child.lookup.0.is_empty() || !child.lookup.1.is_empty() {
+                parts.push((child.lookup.0.clone(), child.lookup.1.clone(), index, false));
+            }
+            parts.push((
+                child.observations.clone(),
+                child.warnings.clone(),
+                index,
+                true,
+            ));
+        }
+        parts.sort_by_key(|part| (part.0.start, part.1.start, part.3));
+        self.budget
+            .charge(parts.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let mut actions: Vec<Option<Action>> = hit.children.iter().map(|_| None).collect();
+        let (mut observed, mut warned) = if found { hit.lookup } else { (0, 0) };
+        for (observations, warnings, index, compilation) in parts {
+            if observations.start < observed || warnings.start < warned {
+                // Overlapping parts cannot be told apart: report them whole.
+                continue;
+            }
+            self.replay_part(hit, observed..observations.start, warned..warnings.start)?;
+            observed = observations.end;
+            warned = warnings.end;
+            let child = &hit.children[index];
+            if actions[index].is_none() {
+                let action = if self.has_identity(&child.key)? {
+                    Action::Skip
+                } else {
+                    match self
+                        .resolver
+                        .shared_provider_graphs()
+                        .and_then(|store| store.get(&child.key))
+                    {
+                        Some(nested) => Action::Register(nested),
+                        None => Action::Copy,
+                    }
+                };
+                actions[index] = Some(action);
+            }
+            match actions[index].as_ref() {
+                Some(Action::Copy) => self.replay_part(hit, observations, warnings)?,
+                Some(Action::Register(nested)) if compilation => {
+                    let nested = nested.clone();
+                    let metadata = child.key.source.as_str().len()
+                        + child.key.qualifiers.iter().map(String::len).sum::<usize>();
+                    let identity = ProviderKey {
+                        source: child.key.source.clone(),
+                        revision: nested.revision.clone(),
+                        context: child.key.context.clone(),
+                        qualifiers: child.key.qualifiers.clone(),
+                        occurrence: nested.occurrence,
+                    };
+                    let key = child.key.clone();
+                    if !self.has_identity(&key)? {
+                        // Its lookup part was skipped: the registration
+                        // reports the copy the nested interface carries.
+                        self.register_shared(identity, metadata, &nested, key, false)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A child registered only by its lookup part (its compilation was
+        // not reached) still reports itself.
+        for (index, action) in actions.into_iter().enumerate() {
+            if let Some(Action::Register(nested)) = action {
+                let child = &hit.children[index];
+                if !self.has_identity(&child.key)? {
+                    let metadata = child.key.source.as_str().len();
+                    let identity = ProviderKey {
+                        source: child.key.source.clone(),
+                        revision: nested.revision.clone(),
+                        context: child.key.context.clone(),
+                        qualifiers: child.key.qualifiers.clone(),
+                        occurrence: nested.occurrence,
+                    };
+                    self.register_shared(identity, metadata, &nested, child.key.clone(), false)?;
+                }
+            }
+        }
+        self.replay_part(
+            hit,
+            observed..hit.observations.len(),
+            warned..hit.warnings.len(),
+        )
+    }
+
+    fn replay_trace(
+        &mut self,
+        trace: &Arc<Vec<ResolutionObservation>>,
+    ) -> Result<(), ResolverError> {
+        self.providers.note_trace(trace);
+        if trace.is_empty() {
+            return Ok(());
+        }
+        let bytes = observations_payload(trace);
+        let owned = self
+            .budget
+            .admit_owned(trace.len(), bytes, bytes, || trace.as_ref().clone())
+            .map_err(|r| resolver_error(r, self.budget))?;
+        move_report_vector(self.observations, owned, self.budget)
+    }
+
+    fn replay_part(
+        &mut self,
+        hit: &SharedProviderGraph,
+        observations: Range<usize>,
+        warnings: Range<usize>,
+    ) -> Result<(), ResolverError> {
+        let observations = hit.observations.get(observations).unwrap_or_default();
+        if !observations.is_empty() {
+            let bytes = observations_payload(observations);
+            let owned = self
+                .budget
+                .admit_owned(observations.len(), bytes, bytes, || observations.to_vec())
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.observations, owned, self.budget)?;
+        }
+        let warnings = hit.warnings.get(warnings).unwrap_or_default();
+        if !warnings.is_empty() {
+            let bytes = warnings.iter().map(|w| w.len() + size_of::<String>()).sum();
+            let owned = self
+                .budget
+                .admit_owned(warnings.len(), bytes, bytes, || warnings.to_vec())
+                .map_err(|r| resolver_error(r, self.budget))?;
+            move_report_vector(self.warnings, owned, self.budget)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the session already has the provider identity `key` names.
+    fn has_identity(&mut self, key: &ProviderGraphKey) -> Result<bool, ResolverError> {
+        self.budget
+            .charge(self.providers.identities.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        Ok(self.providers.identities.iter().any(|identity| {
+            identity.source == key.source
+                && graph_key(
+                    &identity.source,
+                    &identity.revision,
+                    &identity.context,
+                    &identity.qualifiers,
+                ) == *key
+        }))
+    }
+
+    /// Prepare `name` on the session's graph at `index`. A copy with the
+    /// name prepared replaces it, and replaces the shared graph too, so later
+    /// sessions find the name prepared (l4d-4nbs D29); what preparing
+    /// observed and depended on joins what the shared graph reports.
+    fn prepare_memoized(
+        &mut self,
+        index: usize,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+        let Some(graph) = self.providers.graphs[index].graph.clone() else {
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        };
+        let observations_before = self.observations.len();
+        let warnings_before = self.warnings.len();
+        self.budget
+            .charge(self.providers.credits.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let scan_before = self.providers.scan_positions();
+        let sharing = self.providers.graphs[index].shared.is_some();
+        self.providers.collecting.push(Vec::new());
+        if sharing {
+            self.providers.push_frame();
+        }
+        let prepared = self.replace_interface_graph(&graph, name, pointers, depth + 1);
+        let added = Arc::new(self.providers.collecting.pop().unwrap_or_default());
+        let (children, trace) = if sharing {
+            self.providers.pop_frame()
+        } else {
+            Default::default()
+        };
+        self.providers.note_trace(&trace);
+        let prepared = prepared?;
+        self.note_dependencies(&added)?;
+        if Arc::ptr_eq(&prepared, &graph) {
+            return Ok(Fact::Known(prepared));
+        }
+        let entry = self.providers.graphs.value_mut()[index].value_mut();
+        // Keep the graph with the most names prepared.
+        entry.graph = Some(prepared.clone());
+        if !added.is_empty() {
+            let mut dependencies = entry.dependencies.as_ref().clone();
+            dependencies.extend(added.iter().cloned());
+            dependencies.sort_by(|a, b| {
+                (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
+            });
+            dependencies.dedup();
+            entry.dependencies = Arc::new(dependencies);
+        }
+        let (Some(origin), Some(store)) =
+            (entry.shared.clone(), self.resolver.shared_provider_graphs())
+        else {
+            return Ok(Fact::Known(prepared));
+        };
+        // Parts nested providers add while preparing follow what the
+        // shared graph already reports.
+        let children = if children.is_empty() {
+            origin.children.clone()
+        } else {
+            let mut all = origin.children.as_ref().clone();
+            let shift = |range: &Range<usize>, before: usize, base: usize| {
+                if range.is_empty() && range.start == 0 {
+                    return 0..0;
+                }
+                range.start - before + base..range.end - before + base
+            };
+            let (observed, warned) = (origin.observations.len(), origin.warnings.len());
+            all.extend(children.into_iter().map(|segment| ChildSegment {
+                lookup: (
+                    shift(&segment.lookup.0, observations_before, observed),
+                    shift(&segment.lookup.1, warnings_before, warned),
+                ),
+                observations: shift(&segment.observations, observations_before, observed),
+                warnings: shift(&segment.warnings, warnings_before, warned),
+                key: segment.key,
+            }));
+            Arc::new(all)
+        };
+        let trace = if trace.is_empty() {
+            origin.trace.clone()
+        } else {
+            let mut all = origin.trace.as_ref().clone();
+            all.extend(trace);
+            Arc::new(all)
+        };
+        let origin = Arc::new(SharedOrigin {
+            key: origin.key.clone(),
+            revision: origin.revision.clone(),
+            lookup: origin.lookup,
+            trace,
+            observations: extended(
+                &origin.observations,
+                &self.observations[observations_before..],
+            ),
+            warnings: extended(&origin.warnings, &self.warnings[warnings_before..]),
+            scanned: merged_extents(&origin.scanned, self.providers.scanned_since(&scan_before)),
+            children,
+        });
+        let entry = self.providers.graphs.value_mut()[index].value_mut();
+        entry.shared = Some(origin.clone());
+        let shared = SharedProviderGraph {
+            occurrence: entry.occurrence,
+            graph: Some(prepared.clone()),
+            observations: origin.observations.clone(),
+            warnings: origin.warnings.clone(),
+            dependencies: entry.dependencies.clone(),
+            scanned: origin.scanned.clone(),
+            children: origin.children.clone(),
+            revision: origin.revision.clone(),
+            lookup: origin.lookup,
+            trace: origin.trace.clone(),
+            retained_bytes: shared_retained_bytes(
+                Some(&prepared),
+                &origin.key,
+                &origin,
+                &entry.dependencies,
+            ),
+        };
+        store.put(origin.key.clone(), Arc::new(shared));
+        Ok(Fact::Known(prepared))
     }
 }
 
@@ -2248,6 +3648,8 @@ impl RootSession<'_, '_> {
                                 qualifiers,
                                 site,
                                 graph: None,
+                                occurrence: None,
+                                lookup: None,
                                 pending,
                                 attempted: activity != Truth::True,
                                 provided: None,
@@ -5622,7 +7024,8 @@ mod tests {
         // This is the actual replacement boundary, not a primitive stand-in:
         // one mutable independent graph copy is required; sharing it performs
         // no second payload traversal/copy or payload-byte-work admission.
-        assert_eq!(after.byte_work - before.byte_work, payload);
+        // The copy records the prepared name (l4d-4nbs R13).
+        assert_eq!(after.byte_work - before.byte_work, payload + "R".len());
         assert!(!Arc::ptr_eq(&old, &replacement));
         assert_eq!(old.fingerprint(), replacement.fingerprint());
         assert!(

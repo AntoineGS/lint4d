@@ -376,8 +376,7 @@ impl LspSourceStore {
     }
 
     pub(super) fn with_directory_limit(mut self, limit: usize) -> Self {
-        self.disk =
-            FilesystemSourceStore::with_limits(limit, ResolverLimits::default().max_scanned_bytes);
+        self.disk = FilesystemSourceStore::with_limits(limit);
         self
     }
 

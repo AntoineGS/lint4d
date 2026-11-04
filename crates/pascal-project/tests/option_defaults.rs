@@ -532,6 +532,164 @@ fn an_unevaluated_element_setting_a_switch_keeps_only_that_switch_unknown() {
     );
 }
 
+fn group(properties: &str) -> String {
+    format!("<PropertyGroup>{properties}</PropertyGroup>")
+}
+
+fn choose(whens: &[(&str, &str)], otherwise: Option<&str>) -> String {
+    let mut text = String::from("<Choose>");
+    for (condition, properties) in whens {
+        text.push_str(&format!(
+            "<When Condition=\"{condition}\">{}</When>",
+            group(properties)
+        ));
+    }
+    if let Some(properties) = otherwise {
+        text.push_str(&format!("<Otherwise>{}</Otherwise>", group(properties)));
+    }
+    text.push_str("</Choose>");
+    text
+}
+
+const RANGE_ON: &str = "<DCC_RangeChecking>true</DCC_RangeChecking>";
+const RANGE_OFF: &str = "<DCC_RangeChecking>false</DCC_RangeChecking>";
+const OVERFLOW_ON: &str = "<DCC_IntegerOverflowCheck>true</DCC_IntegerOverflowCheck>";
+
+#[test]
+fn the_first_true_when_applies_and_later_branches_are_skipped() {
+    let workspace = Workspace::new(&choose(
+        &[
+            ("'$(Config)'=='Debug'", RANGE_ON),
+            ("'$(Config)'=='Debug'", OVERFLOW_ON),
+            ("'$(Config)'=='Release'", OVERFLOW_ON),
+        ],
+        Some(OVERFLOW_ON),
+    ));
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(context.conditional_context().option("Q"), F::False);
+}
+
+#[test]
+fn otherwise_applies_only_when_every_when_is_false() {
+    let workspace = Workspace::new(&choose(
+        &[
+            ("'$(Config)'=='Release'", RANGE_ON),
+            ("'$(Config)'=='Other'", OVERFLOW_ON),
+        ],
+        Some(RANGE_OFF),
+    ));
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("R"), F::False);
+    assert_eq!(context.conditional_context().option("Q"), F::False);
+    // A true When suppresses Otherwise.
+    let workspace = Workspace::new(&choose(
+        &[("'$(Config)'=='Debug'", RANGE_ON)],
+        Some(OVERFLOW_ON),
+    ));
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("R"), F::True);
+    assert_eq!(context.conditional_context().option("Q"), F::False);
+}
+
+#[test]
+fn an_unknown_when_leaves_every_switch_a_branch_could_set_unknown() {
+    let workspace = Workspace::new(&choose(
+        &[
+            ("'$(ProjectName)'=='Other'", RANGE_ON),
+            (
+                "'$(ProjectName)'=='Y'",
+                "<DCC_Optimize>false</DCC_Optimize>",
+            ),
+        ],
+        Some(OVERFLOW_ON),
+    ));
+    let context = workspace.context();
+    for which in [
+        context.conditional_context(),
+        context.library_conditional_context(),
+    ] {
+        for option in ["R", "O", "Q"] {
+            assert_eq!(which.option(option), F::Unknown, "${option}");
+        }
+        assert_eq!(which.option("I"), F::True);
+        assert_eq!(which.option("B"), F::False);
+    }
+}
+
+#[test]
+fn a_choose_cannot_clear_an_earlier_unevaluated_assignment() {
+    let workspace = Workspace::new(&format!(
+        "<PropertyGroup Condition=\"'$(ProjectName)'=='Other'\">{RANGE_ON}</PropertyGroup>{}",
+        choose(&[("'$(Config)'=='Release'", RANGE_OFF)], Some(RANGE_OFF)),
+    ));
+    // Otherwise applies here, so a definite assignment does clear it...
+    assert_eq!(
+        workspace.context().conditional_context().option("R"),
+        F::False
+    );
+    // ...but an unknown branch condition leaves the switch unknown.
+    let workspace = Workspace::new(&format!(
+        "<PropertyGroup Condition=\"'$(ProjectName)'=='Other'\">{RANGE_ON}</PropertyGroup>{}",
+        choose(&[("'$(ProjectName)'=='X'", RANGE_OFF)], Some(RANGE_OFF)),
+    ));
+    assert_eq!(
+        workspace.context().conditional_context().option("R"),
+        F::Unknown
+    );
+}
+
+#[test]
+fn a_later_assignment_clears_an_unevaluated_one_only_when_it_applies() {
+    let unknown = format!(
+        "<PropertyGroup Condition=\"'$(ProjectName)'=='Other'\">{RANGE_ON}</PropertyGroup>"
+    );
+    for (later, expected) in [
+        (group(RANGE_OFF), F::False),
+        (
+            format!(
+                "<PropertyGroup Condition=\"'$(Config)'=='Debug'\">{RANGE_OFF}</PropertyGroup>"
+            ),
+            F::False,
+        ),
+        (
+            format!(
+                "<PropertyGroup Condition=\"'$(Config)'=='Release'\">{RANGE_OFF}</PropertyGroup>"
+            ),
+            F::Unknown,
+        ),
+    ] {
+        let workspace = Workspace::new(&format!("{unknown}{later}"));
+        assert_eq!(
+            workspace.context().conditional_context().option("R"),
+            expected,
+            "{later}"
+        );
+    }
+}
+
+#[test]
+fn a_value_dropped_for_the_property_budget_is_unknown_for_its_dependents() {
+    // The fillers use up the 16 MiB budget (1000 KB each), so the last
+    // assignment of DCC_RangeChecking is dropped; its earlier value must
+    // not survive for `$(DCC_RangeChecking)` to read.
+    let mut groups = format!(
+        "<DCC_RangeChecking>true</DCC_RangeChecking><Seed>{}</Seed>",
+        "x".repeat(500 * 1000)
+    );
+    for index in 0..16 {
+        groups.push_str(&format!("<Filler{index}>$(Seed)$(Seed)</Filler{index}>"));
+    }
+    groups.push_str(
+        "<DCC_RangeChecking>$(Seed)$(Seed)</DCC_RangeChecking>\
+         <DCC_IntegerOverflowCheck>$(DCC_RangeChecking)</DCC_IntegerOverflowCheck>",
+    );
+    let workspace = Workspace::new(&format!("<PropertyGroup>{groups}</PropertyGroup>"));
+    let context = workspace.context();
+    assert_eq!(context.conditional_context().option("R"), F::Unknown);
+    assert_eq!(context.conditional_context().option("Q"), F::Unknown);
+}
+
 #[test]
 fn an_unselected_or_invalid_installation_keeps_switches_unknown() {
     let needs_choice = Workspace::with(Setup {

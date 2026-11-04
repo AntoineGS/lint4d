@@ -488,6 +488,53 @@ fn set_before_persist_hook(hook: Option<LoadHook>) {
     BEFORE_PERSIST.with(|slot| *slot.borrow_mut() = hook);
 }
 
+/// The phases of a member's reuse a test can time (R8-1).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ReusePhase {
+    /// The snapshot's member entry, record and evidence.
+    Lookup,
+    /// The saved root bytes, their hash and the local artifact key.
+    ReadHash,
+    Validation,
+    Decode,
+    /// The decoded facts into the index.
+    Insert,
+    /// The member's record, proven again for this snapshot.
+    Prove,
+}
+
+#[cfg(test)]
+const REUSE_PHASES: usize = 6;
+
+#[cfg(test)]
+thread_local! {
+    static REUSE_PHASE_TIMES: std::cell::RefCell<[(Duration, usize); REUSE_PHASES]> =
+        const { std::cell::RefCell::new([(Duration::ZERO, 0); REUSE_PHASES]) };
+}
+
+/// `run`, timed as `phase` on this thread in tests.
+#[cfg_attr(not(test), inline(always))]
+pub(super) fn timed<T>(phase: ReusePhase, run: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    let started = Instant::now();
+    let value = run();
+    #[cfg(test)]
+    REUSE_PHASE_TIMES.with(|times| {
+        let slot = &mut times.borrow_mut()[phase as usize];
+        slot.0 += started.elapsed();
+        slot.1 += 1;
+    });
+    #[cfg(not(test))]
+    let _ = phase;
+    value
+}
+
+/// The time and number of calls of each phase since the last take.
+#[cfg(test)]
+fn take_reuse_phases() -> [(Duration, usize); REUSE_PHASES] {
+    REUSE_PHASE_TIMES.with(|times| std::mem::take(&mut *times.borrow_mut()))
+}
+
 #[cfg(test)]
 fn run_hook(
     slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<LoadHook>>>,
@@ -1543,26 +1590,29 @@ impl Workspace {
         drop(job);
         self.project_cache
             .add_index_validation_reads(key, u64::try_from(reads).unwrap_or(u64::MAX));
-        let (slots, stamps) = reused_slots(path, own_stamp, &facts.facts, &include_stamps);
-        let member = MemberFacts::from_facts(path, &facts.facts, slots);
-        let outcome = match self
-            .project_cache
-            .publish_reused_index_member(key, path, member, stamps, root_hash)
-        {
+        let published = timed(ReusePhase::Insert, || {
+            let (slots, stamps) = reused_slots(path, own_stamp, &facts.facts, &include_stamps);
+            let member = MemberFacts::from_facts(path, &facts.facts, slots);
+            self.project_cache
+                .publish_reused_index_member(key, path, member, stamps, root_hash)
+        });
+        let outcome = match published {
             PublishOutcome::Indexed => {
                 if let Some(state) = self.contexts.get(key) {
-                    self.prove_member(
-                        key,
-                        &RecordInputs {
-                            path,
-                            facts: Some(&facts.facts),
-                            artifact: Some(artifact),
-                            member_evidence: evidence,
-                            origin: state.context.source_origin(path),
-                            unindexed: None,
-                        },
-                        cancel,
-                    );
+                    timed(ReusePhase::Prove, || {
+                        self.prove_member(
+                            key,
+                            &RecordInputs {
+                                path,
+                                facts: Some(&facts.facts),
+                                artifact: Some(artifact),
+                                member_evidence: evidence,
+                                origin: state.context.source_origin(path),
+                                unindexed: None,
+                            },
+                            cancel,
+                        );
+                    });
                 }
                 ReuseOutcome::Reused
             }
@@ -6844,6 +6894,406 @@ pub(in crate::workspace) mod tests {
             assert_eq!(progress.reused, DONE, "{progress:?}");
             assert_eq!(fresh(&restarted, &key), published);
             cache.shutdown();
+        }
+
+        /// Spec §12.2 amendment 2026-11-03: restart and resume over a
+        /// synthetic project.
+        mod synthetic {
+            use super::*;
+            use crate::workspace::baseline::SealOutcome;
+            use std::time::Instant;
+
+            const SHARED_INCLUDE: &str = "const\n  SharedA = 1;\n  SharedB = 2;\n  SharedC = 3;\n  SharedD = 4;\n  SharedE = 5;\n  SharedF = 6;\n  SharedG = 7;\n  SharedH = 8;\n  SharedI = 9;\n";
+
+            /// A unit of about 60 lines: three `uses` of its predecessors, a
+            /// record type, a constant block and two routines with bodies;
+            /// every tenth includes `Shared.inc`.
+            fn synthetic_unit(index: usize) -> String {
+                let name = format!("U{index:04}");
+                let uses = (1..=3)
+                    .filter_map(|back| index.checked_sub(back))
+                    .map(|other| format!("  U{other:04}"))
+                    .collect::<Vec<_>>();
+                let uses = if uses.is_empty() {
+                    String::new()
+                } else {
+                    format!("uses\n{};\n\n", uses.join(",\n"))
+                };
+                let include = if index.is_multiple_of(10) {
+                    "{$I Shared.inc}\n\n"
+                } else {
+                    ""
+                };
+                format!(
+                    "unit {name};
+
+interface
+
+{uses}{include}type
+  TRecord{index} = record
+    Id: Integer;
+    Name: string;
+    Left: Double;
+    Right: Double;
+    Next: Integer;
+  end;
+
+const
+  Base{index} = {index};
+  Step{index} = 3;
+  Label{index} = '{name}';
+
+function Compute{index}(Value: Integer): Integer;
+procedure Fill{index}(var Item: TRecord{index});
+
+implementation
+
+function Compute{index}(Value: Integer): Integer;
+var
+  Index: Integer;
+begin
+  Result := Base{index};
+  for Index := 0 to Value do
+  begin
+    if Index mod Step{index} = 0 then
+      Result := Result + Index
+    else
+      Result := Result - 1;
+  end;
+end;
+
+procedure Fill{index}(var Item: TRecord{index});
+begin
+  Item.Id := Compute{index}(Base{index});
+  Item.Name := Label{index};
+  Item.Left := Item.Id * 0.5;
+  Item.Right := Item.Left + Step{index};
+  Item.Next := Item.Id + 1;
+  if Item.Next > 100 then
+  begin
+    Item.Next := 0;
+  end;
+end;
+
+end.
+"
+                )
+            }
+
+            /// `App.dproj`, `App.dpr` and `units - 1` units under `lib`:
+            /// `units` members.
+            fn synthetic_project(
+                root: &Path,
+                units: usize,
+            ) -> (Workspace, ContextKey, IndexAnchor) {
+                write(&root.join("lib/Shared.inc"), SHARED_INCLUDE);
+                for index in 0..units - 1 {
+                    write(
+                        &root.join(format!("lib/U{index:04}.pas")),
+                        &synthetic_unit(index),
+                    );
+                }
+                let (workspace, key) = project_workspace(
+                    root,
+                    "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+                    "",
+                    WorkspaceOptions::default(),
+                );
+                (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
+            }
+
+            #[derive(Debug, Default)]
+            struct Totals {
+                batches: usize,
+                indexed: usize,
+                reused: usize,
+                persisted: usize,
+                refused: usize,
+                limited: usize,
+                deferred: usize,
+                maintenance: Duration,
+            }
+
+            /// Batches of `bound` until the index is complete; the first
+            /// `Err` (a cancellation) ends them. With `maintain`, a
+            /// maintenance step follows each batch, as the worker's would:
+            /// the test cache schedules none, and without its checkpoints
+            /// the WAL reaches its threshold after about 600 extracted
+            /// members, so later publications are refused.
+            fn batches(
+                view: &mut Workspace,
+                anchor: &IndexAnchor,
+                bound: IndexBound,
+                maintain: Option<&PersistentCache>,
+                before_io: &mut dyn FnMut() -> Result<(), String>,
+                totals: &mut Totals,
+            ) -> Result<(), String> {
+                loop {
+                    if let Some(cache) = maintain
+                        && totals.batches > 0
+                    {
+                        let started = Instant::now();
+                        let step = cache.step_now().expect("a maintenance step");
+                        assert!(step.is_ok(), "{step:?}");
+                        totals.maintenance += started.elapsed();
+                    }
+                    let progress = view.advance_workspace_index(
+                        anchor,
+                        bound,
+                        before_io,
+                        &AtomicBool::new(false),
+                    )?;
+                    totals.batches += 1;
+                    totals.indexed += progress.indexed;
+                    totals.reused += progress.reused;
+                    totals.persisted += progress.persisted;
+                    totals.refused += progress.refused;
+                    totals.limited += progress.limited;
+                    totals.deferred += progress.deferred;
+                    if progress.complete {
+                        return Ok(());
+                    }
+                    assert!(progress.worth_requeue(), "{progress:?}");
+                }
+            }
+
+            /// The database and its WAL under `directory`.
+            fn store_bytes(directory: &Path) -> (u64, u64) {
+                let (mut database, mut wal) = (0, 0);
+                let mut stack = vec![directory.to_path_buf()];
+                while let Some(directory) = stack.pop() {
+                    for entry in fs::read_dir(&directory).unwrap() {
+                        let entry = entry.unwrap();
+                        let metadata = entry.metadata().unwrap();
+                        if metadata.is_dir() {
+                            stack.push(entry.path());
+                        } else if entry.file_name() == "analysis.sqlite3" {
+                            database += metadata.len();
+                        } else if entry.file_name() == "analysis.sqlite3-wal" {
+                            wal += metadata.len();
+                        }
+                    }
+                }
+                (database, wal)
+            }
+
+            fn report_phases(session: &str, phases: [(Duration, usize); REUSE_PHASES]) {
+                let names = [
+                    "lookup",
+                    "read+hash",
+                    "evidence validation",
+                    "fact decode",
+                    "index insert",
+                    "record proof",
+                ];
+                for (name, (time, calls)) in names.iter().zip(phases) {
+                    eprintln!("{session}: {name}: {time:?} over {calls} calls");
+                }
+            }
+
+            /// Spec §12.2 amendment 2026-11-03: second session, unchanged
+            /// tree, zero parses. Ordinary test at 300 units; the
+            /// 5,000-unit measurement is below.
+            #[test]
+            fn an_unchanged_restart_parses_nothing() {
+                run(300, false);
+            }
+
+            /// Release measurement (run explicitly, numbers go into the
+            /// task report):
+            /// TMPDIR=$HOME/.cache/l4d-tmp cargo test -p pascal-lsp --release --lib synthetic_five_thousand -- --ignored --nocapture
+            #[test]
+            #[ignore = "release measurement, run explicitly"]
+            fn synthetic_five_thousand_unit_restart_and_resume() {
+                run(5_000, true);
+            }
+
+            fn run(units: usize, measure: bool) {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (session, key, anchor) = synthetic_project(root, units);
+
+                // 1. First session: extraction batches publish every member,
+                // then the baseline is sealed.
+                let (mut first, cache) = persisting_view(&session, store.path());
+                crate::navigation::test_reset_document_parse_count();
+                let started = Instant::now();
+                let mut one = Totals::default();
+                batches(
+                    &mut first,
+                    &anchor,
+                    IndexBound::extraction(),
+                    Some(&cache),
+                    &mut || Ok(()),
+                    &mut one,
+                )
+                .unwrap();
+                let indexing1 = started.elapsed();
+                let seal = first.seal_baseline_if_due(&key, &mut || Ok(()));
+                let t1 = started.elapsed();
+                let parses1 = crate::navigation::test_document_parse_count();
+                assert_eq!(
+                    seal,
+                    SealOutcome::Sealed,
+                    "{one:?} {:?}",
+                    cache.counters().unwrap().snapshot()
+                );
+                assert_eq!(
+                    (one.refused, one.limited, one.deferred),
+                    (0, 0, 0),
+                    "{one:?}"
+                );
+                assert_eq!((one.indexed, one.persisted, one.reused), (units, units, 0));
+                assert_eq!(parses1, units);
+                assert_eq!(recorded(&first, &key).len(), units);
+                let size1 = store_bytes(store.path());
+                let reserved1 = first.project_cache.stats().reserved_index_bytes;
+                cache.shutdown();
+                drop(first);
+                let _ = take_reuse_phases();
+
+                // 2. Second session: a fresh project cache adopts the
+                // snapshot, then reuse batches fill the index from the
+                // store; every member is still read and hashed (R8-1).
+                let (mut second, cache) = restarted_view(root, store.path());
+                crate::navigation::test_reset_document_parse_count();
+                let started = Instant::now();
+                let cancel = AtomicBool::new(false);
+                let resumed = second.index_context_for(&anchor, &cancel).unwrap();
+                assert_eq!(resumed, key);
+                second
+                    .ensure_index_membership(&key, &anchor, &cancel)
+                    .unwrap();
+                assert_eq!(second.adopt_baseline_hint(&key, &cancel), Some(()));
+                let adoption = started.elapsed();
+                let mut two = Totals::default();
+                batches(
+                    &mut second,
+                    &anchor,
+                    IndexBound::reuse_pass(),
+                    None,
+                    &mut || Ok(()),
+                    &mut two,
+                )
+                .unwrap();
+                let indexing2 = started.elapsed();
+                let seal = second.seal_baseline_if_due(&key, &mut || Ok(()));
+                let t2 = started.elapsed();
+                let parses2 = crate::navigation::test_document_parse_count();
+                let reads = second.project_cache.index_validation_reads(&key);
+                assert_eq!(parses2, 0, "no member is parsed again");
+                assert_eq!(
+                    (two.refused, two.limited, two.deferred),
+                    (0, 0, 0),
+                    "{two:?}"
+                );
+                assert_eq!((two.reused, two.indexed, two.persisted), (units, 0, 0));
+                assert_eq!(members(&second, &key).len(), units);
+                assert_eq!(seal, SealOutcome::Unchanged);
+                assert_eq!(cache.counters().unwrap().snapshot().hits, units as u64);
+                let size2 = store_bytes(store.path());
+                let reserved2 = second.project_cache.stats().reserved_index_bytes;
+                eprintln!(
+                    "synthetic {units}: t1 {t1:?} (indexing {indexing1:?}, {} batches, \
+                     maintenance steps {:?}), \
+                     parses1 {parses1}; t2 {t2:?} (adoption {adoption:?}, reuse to {indexing2:?}, \
+                     {} batches), parses2 {parses2}, ratio {:.4}",
+                    one.batches,
+                    one.maintenance,
+                    two.batches,
+                    t2.as_secs_f64() / t1.as_secs_f64(),
+                );
+                eprintln!(
+                    "synthetic {units}: validation reads {reads}; store after first \
+                     (db, wal) {size1:?}, after second {size2:?}; reserved index bytes \
+                     {reserved1} then {reserved2}"
+                );
+                let phases = take_reuse_phases();
+                assert_eq!(phases[ReusePhase::ReadHash as usize].1, units, "{phases:?}");
+                report_phases(&format!("synthetic {units} second session"), phases);
+                cache.shutdown();
+                drop(second);
+                if measure {
+                    assert!(
+                        t2.as_secs_f64() < 0.1 * t1.as_secs_f64(),
+                        "t1 {t1:?} t2 {t2:?}"
+                    );
+                }
+
+                // 3. Kill and resume: a fresh store; the first session is
+                // cancelled once 40% of the members are published, and the
+                // restart extracts only the others.
+                let target = units * 2 / 5;
+                let store = private_dir();
+                let (mut first, cache) =
+                    persisting_view(&workspace(root, WorkspaceOptions::default()), store.path());
+                // The hook runs after each member's reuse attempt, before its
+                // extraction: the attempt for member `target + 1` cancels.
+                let attempts = Rc::new(Cell::new(0));
+                let counter = Rc::clone(&attempts);
+                set_after_reuse_hook(Some(Box::new(move |_| counter.set(counter.get() + 1))));
+                let started = Instant::now();
+                let mut killed = Totals::default();
+                let result = batches(
+                    &mut first,
+                    &anchor,
+                    IndexBound::extraction(),
+                    Some(&cache),
+                    &mut || {
+                        if attempts.get() > target {
+                            Err(CANCELLATION_MESSAGE.to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut killed,
+                );
+                set_after_reuse_hook(None);
+                let cancelled_after = started.elapsed();
+                assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                let published = recorded(&first, &key);
+                assert_eq!(published.len(), target);
+                cache.shutdown();
+                drop(first);
+
+                let (mut resumed, cache) = restarted_view(root, store.path());
+                let loaded = record_loads();
+                crate::navigation::test_reset_document_parse_count();
+                let started = Instant::now();
+                let mut resume = Totals::default();
+                let result = batches(
+                    &mut resumed,
+                    &anchor,
+                    IndexBound::extraction(),
+                    Some(&cache),
+                    &mut || Ok(()),
+                    &mut resume,
+                );
+                set_after_load_hook(None);
+                result.unwrap();
+                let resumed_in = started.elapsed();
+                let parses = crate::navigation::test_document_parse_count();
+                assert_eq!((resume.refused, resume.limited), (0, 0), "{resume:?}");
+                assert_eq!(parses, units - target);
+                assert_eq!(
+                    (resume.reused, resume.indexed, resume.persisted),
+                    (target, units - target, units - target)
+                );
+                let loaded = loaded.borrow();
+                assert_eq!(loaded.len(), units - target);
+                assert!(
+                    loaded.iter().all(|path| !published.contains(path)),
+                    "no published member is extracted again"
+                );
+                assert_eq!(recorded(&resumed, &key).len(), units);
+                eprintln!(
+                    "synthetic {units}: kill at {target} published after {cancelled_after:?}; \
+                     resume reused {}, parsed {parses} in {resumed_in:?} ({} batches)",
+                    resume.reused, resume.batches,
+                );
+                cache.shutdown();
+            }
         }
     }
 }

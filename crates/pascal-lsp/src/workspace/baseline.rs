@@ -9,6 +9,7 @@ use super::authorize::authorize_record;
 use super::capture::ReadCapture;
 use super::eligible::{CapturedEvidence, Ineligible, SealFailure, capture_evidence, seal_baseline};
 use super::evidence::EvidenceGap;
+use super::indexing::{ReusePhase, timed};
 use super::persist::{PersistError, Reuse, ReuseMiss, ReuseVia, admitted, decoded};
 use super::validate::{CurrentInputs, EvidenceCheck, Validator, validate_evidence};
 use super::{ContextKey, PathStamp, Workspace};
@@ -670,12 +671,14 @@ impl Workspace {
         if self.root_is_session_private(uri) {
             return Ok(HintReuse::Fallback);
         }
-        let member = match store.find_member(&hint.header, path)? {
+        let member = match timed(ReusePhase::Lookup, || store.find_member(&hint.header, path))? {
             Lookup::Hit(member) => member,
             Lookup::Miss(Miss::Retired | Miss::Vanished) => return Ok(HintReuse::Gone),
             Lookup::Miss(_) => return Ok(HintReuse::Fallback),
         };
-        let record = match store.open_member_record(member.record_id)? {
+        let record = match timed(ReusePhase::Lookup, || {
+            store.open_member_record(member.record_id)
+        })? {
             Lookup::Hit(record) => record,
             Lookup::Miss(_) => return Ok(HintReuse::Fallback),
         };
@@ -686,21 +689,25 @@ impl Workspace {
         let Some(artifact) = header.artifact else {
             return Ok(HintReuse::Retrying);
         };
-        let Ok(bytes) = self.saved_root_bytes(uri, &state.context) else {
+        let Ok((root_hash, local)) = timed(ReusePhase::ReadHash, || {
+            self.saved_root_bytes(uri, &state.context).map(|bytes| {
+                (
+                    pascal_project::content_hash_bytes(&bytes),
+                    LocalArtifactKey::new(
+                        &SourceContent::from_bytes(&bytes),
+                        &super::conditional_context_for_uri(&state.context, uri),
+                        state.context.source_origin(path),
+                    ),
+                )
+            })
+        }) else {
             return Ok(HintReuse::Fallback);
         };
-        let root_hash = pascal_project::content_hash_bytes(&bytes);
-        let local = LocalArtifactKey::new(
-            &SourceContent::from_bytes(&bytes),
-            &super::conditional_context_for_uri(&state.context, uri),
-            state.context.source_origin(path),
-        );
-        drop(bytes);
         let (evidence, include_stamps, reads) = match header.member_evidence {
             None if local.digest() == artifact => (None, Vec::new(), 0),
             None => return Ok(HintReuse::Fallback),
             Some(id) => {
-                let evidence = match store.open_evidence(id)? {
+                let evidence = match timed(ReusePhase::Lookup, || store.open_evidence(id))? {
                     Lookup::Hit(evidence) => evidence,
                     Lookup::Miss(_) => return Ok(HintReuse::Fallback),
                 };
@@ -727,7 +734,9 @@ impl Workspace {
                     work,
                     cancel,
                 );
-                match validate_evidence(store, &evidence, &mut validator)? {
+                match timed(ReusePhase::Validation, || {
+                    validate_evidence(store, &evidence, &mut validator)
+                })? {
                     EvidenceCheck::Holds => {}
                     EvidenceCheck::Unproven(unproven) => {
                         return Ok(HintReuse::Done(Reuse::Miss(ReuseMiss::Unproven(unproven))));
@@ -754,7 +763,9 @@ impl Workspace {
             ))));
         };
         let mut budget = FactBudget::new(decode_limit);
-        let loaded = match decoded(store.load_facts_by_id(artifact, &mut budget)) {
+        let loaded = match decoded(timed(ReusePhase::Decode, || {
+            store.load_facts_by_id(artifact, &mut budget)
+        })) {
             Ok(loaded) => loaded,
             Err(PersistError::Store(bypass)) => return Err(bypass),
             Err(_) => return Ok(HintReuse::Fallback),

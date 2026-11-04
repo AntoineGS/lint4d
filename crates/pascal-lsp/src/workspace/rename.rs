@@ -297,6 +297,8 @@ pub(crate) struct WorkspaceInput {
     pub(crate) persistent_cache: crate::persistent_cache::PersistentCache,
     pub(crate) cache_exclusion: Option<crate::persistent_cache::CacheExclusion>,
     pub(crate) shared_discoveries: super::SharedDiscoveries,
+    /// The D43 claimants of the main workspace's claim generation.
+    pub(crate) claimant_list: Arc<super::ClaimantList>,
     pub(crate) cache_epoch: u64,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
@@ -1631,6 +1633,7 @@ impl Workspace {
             persistent_cache: self.persistent_cache.clone(),
             cache_exclusion: self.cache_exclusion.clone(),
             shared_discoveries: self.shared_discoveries.clone(),
+            claimant_list: self.claimant_list.clone(),
             cache_epoch: self
                 .cache_epoch
                 .unwrap_or_else(|| self.project_cache.invalidation_epoch()),
@@ -2787,6 +2790,10 @@ pub(crate) fn owner_for_input(
                 .then(|| owner.legacy_route.clone())
                 .flatten()
         }),
+        claimed: workspace
+            .document_owners
+            .get(&uri)
+            .is_some_and(|owner| owner.key == key && owner.claimed),
     })
 }
 
@@ -6203,6 +6210,7 @@ fn build_snapshot_with_policy(
     loader.deleted_overrides = input.deleted_overrides.clone();
     loader.project_cache = input.project_cache.clone();
     loader.shared_discoveries = input.shared_discoveries.clone();
+    loader.claimant_list = input.claimant_list.clone();
     loader.cache_epoch = Some(input.cache_epoch);
     loader.project_selections = input.project_selections.clone();
     loader.document_owners = input.document_owners.clone();
@@ -12426,6 +12434,7 @@ mod tests {
                 origin: super::super::OwnerOrigin::Inherited,
                 needs_revalidation: false,
                 follow_current_project_file: false,
+                claimed: false,
                 legacy_route: None,
             },
         );

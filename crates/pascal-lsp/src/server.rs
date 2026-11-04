@@ -9549,6 +9549,8 @@ fn deliver_analysis_result_with_store(
             let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             match workspace.commit_prepared_project_selection(prepared, &budget) {
                 Ok(context) => {
+                    // Reclaimed D43 units were scheduled with the selection.
+                    let _ = workspace.take_reclaimed_uris();
                     selection_committed = true;
                     send_ok(
                         connection,
@@ -14451,6 +14453,13 @@ fn handle_notification_with_control_inner(
                 mark_publication_root_stale(connection, workspace, &open_uri);
                 effect.refresh_uri(open_uri);
             }
+            // D43: the opened project may claim already-open units.
+            for reclaimed in workspace.take_reclaimed_uris() {
+                if workspace.open_document_uris().contains(&reclaimed) {
+                    mark_publication_root_stale(connection, workspace, &reclaimed);
+                    effect.refresh_uri(reclaimed);
+                }
+            }
             Ok(effect)
         }
         "textDocument/didChange" => {
@@ -14520,6 +14529,8 @@ fn handle_notification_with_control_inner(
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
+            // D43 units the close released are refreshed with every open root.
+            let _ = workspace.take_reclaimed_uris();
             if let Some(warmer) = warmer {
                 warmer.close(&uri, workspace.project_cache());
             }
@@ -15468,6 +15479,7 @@ fn commit_automatic_selection(
         })) => {
             let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             workspace.commit_prepared_project_selection(prepared.clone(), &budget)?;
+            let _ = workspace.take_reclaimed_uris();
             Ok(Some(source_uri.clone()))
         }
         AnalysisResultValue::ProjectOperation(Ok(

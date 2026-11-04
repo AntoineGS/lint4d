@@ -184,6 +184,15 @@ fn adopting_a_shared_discovery_into_an_installed_context_records_its_directories
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();
     fixture(root);
+    // The project names `b` as a unit directory, so it owns `b/Other.pas`.
+    fs::write(
+        root.join("App.dproj"),
+        PROJECT.replace(
+            "</PropertyGroup>",
+            "<DCC_UnitSearchPath>b</DCC_UnitSearchPath></PropertyGroup>",
+        ),
+    )
+    .expect("project with a unit directory");
     fs::create_dir_all(root.join("b")).expect("second source directory");
     fs::write(
         root.join("b/Other.pas"),

@@ -4822,6 +4822,12 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
     if left.project_source_roots() != right.project_source_roots() {
         fields.push("project_source_roots".to_string());
     }
+    if left.project_unit_directories() != right.project_unit_directories() {
+        fields.push("project_unit_directories".to_string());
+    }
+    if left.unit_directories_unknown() != right.unit_directories_unknown() {
+        fields.push("unit_directories_unknown".to_string());
+    }
     if left.config() != right.config() {
         fields.push("config".to_string());
     }
@@ -6084,6 +6090,11 @@ struct IndexStore {
     contexts: HashMap<ContextKey, StoredIndex>,
     clock: u64,
     owners: HashMap<PathBuf, ContextKey>,
+    /// Owners that are D43 claims or projectless (see `remember_owner_claimable`).
+    claimable_owners: HashSet<PathBuf>,
+    /// The main workspace's D43 claim generation: claimable owners decided
+    /// against another generation are not recorded.
+    claim_generation: u64,
     requests: Vec<IndexAnchor>,
     unit_limit: usize,
 }
@@ -6094,6 +6105,8 @@ impl Default for IndexStore {
             contexts: HashMap::new(),
             clock: 0,
             owners: HashMap::new(),
+            claimable_owners: HashSet::new(),
+            claim_generation: 0,
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
         }
@@ -6468,12 +6481,63 @@ impl ProjectCache {
         self.index().owners.get(directory).cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn remember_owner(&self, directory: PathBuf, key: ContextKey) {
+        self.remember_owner_claimable(directory, key, false);
+    }
+
+    /// Remember `directory`'s owner; `claimable` when the owner is a D43
+    /// claim or projectless, so a new claimant list reassigns it.
+    pub(crate) fn remember_owner_claimable(
+        &self,
+        directory: PathBuf,
+        key: ContextKey,
+        claimable: bool,
+    ) {
         let mut store = self.index();
         if store.owners.len() >= MAX_OWNERS && !store.owners.contains_key(&directory) {
             store.owners.clear();
+            store.claimable_owners.clear();
+        }
+        if claimable {
+            store.claimable_owners.insert(directory.clone());
+        } else {
+            store.claimable_owners.remove(&directory);
         }
         store.owners.insert(directory, key);
+    }
+
+    /// The main workspace's current D43 claim generation.
+    pub(crate) fn claim_generation(&self) -> u64 {
+        self.index().claim_generation
+    }
+
+    /// Record the main workspace's new D43 claim generation.
+    pub(crate) fn set_claim_generation(&self, generation: u64) {
+        self.index().claim_generation = generation;
+    }
+
+    /// D43: a new claimant list: forget the directory owners that were
+    /// claims or projectless, dirtying the memberships listing them.
+    pub(crate) fn reassign_claimable_owners(&self) {
+        let directories = {
+            let mut store = self.index();
+            std::mem::take(&mut store.claimable_owners)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        self.reassign_owners(&directories);
+    }
+
+    /// D43: the owners of `directories` changed because a claimant project
+    /// appeared or left. Forget them and dirty the memberships that list
+    /// them, as a change to an entry of each directory would.
+    pub(crate) fn reassign_owners(&self, directories: &[PathBuf]) {
+        for directory in directories {
+            // A child name no file has: only the listing and owner effects
+            // of `invalidate_index` apply.
+            self.invalidate_index(&directory.join("\u{0}d43-owner"), true);
+        }
     }
 
     /// `path` changed: mark the members it is (or includes into) stale, and

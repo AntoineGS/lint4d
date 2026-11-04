@@ -10317,7 +10317,6 @@ fn send_diagnostic_server_cancelled(
     Ok(())
 }
 
-/// Run one native LSP session over stdin/stdout.
 /// Stack of every thread that runs analysis (l4d-4nbs review I4). A
 /// compile-time session stops nesting providers at 1 MiB of stack
 /// (`max_provider_stack_bytes`, about 52 KB a provider in a debug build and
@@ -10336,6 +10335,7 @@ pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
         .stack_size(ANALYSIS_THREAD_STACK_BYTES)
 }
 
+/// Run one native LSP session over stdin/stdout.
 pub fn run_stdio() -> Result<bool, Box<dyn Error + Send + Sync>> {
     run_stdio_with_config(TestBarrierConfig::disabled())
 }

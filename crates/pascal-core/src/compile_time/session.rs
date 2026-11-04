@@ -2369,12 +2369,17 @@ impl ProviderEngine<'_, '_> {
                         budget,
                         self.cancel,
                     )
-                })?;
-                let (result, reports) = outcome.into_parts();
+                });
+                // Stop tracing before any exit: only the lookup is traced.
+                let trace = if tracing {
+                    self.resolver.trace_unit_lookups(false)
+                } else {
+                    Vec::new()
+                };
+                let (result, reports) = outcome?.into_parts();
                 let before = (self.observations.len(), self.warnings.len());
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
                 if tracing {
-                    let trace = self.resolver.trace_unit_lookups(false);
                     self.budget
                         .charge(trace.len() + 1, observations_payload(&trace), 0)
                         .map_err(|r| resolver_error(r, self.budget))?;

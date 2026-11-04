@@ -75,6 +75,10 @@ pub struct Fixture {
     pub spelled_units: bool,
     /// Compiled provider interfaces shared with other analyses.
     pub shared: Option<std::sync::Arc<dyn SharedProviderGraphs>>,
+    /// Whether unit lookup tracing is on, as the session last left it.
+    pub tracing: bool,
+    /// A lookup of this unit fails as cancelled.
+    pub fail_unit_lookup: Option<String>,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -99,6 +103,8 @@ impl Fixture {
             importer_entries: false,
             spelled_units: false,
             shared: None,
+            tracing: false,
+            fail_unit_lookup: None,
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -230,6 +236,10 @@ impl CompileTimeResolver for Fixture {
     fn shared_provider_graphs(&self) -> Option<std::sync::Arc<dyn SharedProviderGraphs>> {
         self.shared.clone()
     }
+    fn trace_unit_lookups(&mut self, start: bool) -> Vec<pascal_core::ResolutionObservation> {
+        self.tracing = start;
+        Vec::new()
+    }
     fn unit_report_capability(
         &mut self,
         request: UnitResolveRequest<'_>,
@@ -264,7 +274,12 @@ impl CompileTimeResolver for Fixture {
         budget: &mut CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<AdmittedProviderSource>, ResolverError> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled()
+            || self
+                .fail_unit_lookup
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(request.requested_name))
+        {
             return Err(ResolverError::Cancelled);
         }
         let log_bytes = request.importer_path.as_os_str().len()

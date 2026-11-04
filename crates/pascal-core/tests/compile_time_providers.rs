@@ -2350,3 +2350,14 @@ fn a_shared_interface_keeps_no_uncharged_include_text() {
         );
     }
 }
+
+/// l4d-4nbs re-review minor: a nested lookup that fails does not leave the
+/// resolver tracing consulted directories.
+#[test]
+fn a_failed_nested_lookup_stops_lookup_tracing() {
+    let store = std::sync::Arc::new(CountingStore::default());
+    let mut f = shared_fixture(&store);
+    f.fail_unit_lookup = Some("W".into());
+    assert!(f.analyze().is_err());
+    assert!(!f.tracing, "tracing was left on");
+}

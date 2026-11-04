@@ -4346,16 +4346,21 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
-    /// Record that a unit lookup consulted `directory`, stamped now: a
-    /// change after this proves nothing about the lookup any more.
-    fn trace_lookup(&mut self, directory: &Path, entry: &ProjectPathEntry) {
+    /// Record that a unit lookup consulted `directory`, with its stamp taken
+    /// before the lookup decided: a change after it proves nothing about the
+    /// lookup any more.
+    fn trace_lookup(
+        &mut self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        stamp: Option<ProjectReadStamp>,
+    ) {
         let Some(trace) = self.lookup_trace.as_mut() else {
             return;
         };
         if trace.iter().any(|(path, _, _)| path == directory) {
             return;
         }
-        let stamp = pascal_project::path_stamp_result(directory).ok().flatten();
         trace.push((directory.to_path_buf(), entry.clone(), stamp));
     }
 
@@ -4372,11 +4377,16 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
         // A search entry the session's name index proves cannot hold the
         // unit is skipped before any per-directory scratch (l4d-4nbs D19).
+        // Stamp before the index decides, as a listing stamps before it lists.
+        let stamp = self
+            .lookup_trace
+            .is_some()
+            .then(|| pascal_project::path_stamp_result(directory).ok().flatten());
         if self.compile_time_store.is_some()
             && let Some(provided) = provided_entry
             && self.indexed_absent(directory, provided, unit_name, namespaces, cancel)?
         {
-            self.trace_lookup(directory, provided);
+            self.trace_lookup(directory, provided, stamp.flatten());
             return Ok(None);
         }
         let indexed = provided_entry.map(|provided| (directory.to_path_buf(), provided.clone()));
@@ -4394,7 +4404,12 @@ impl<S: SourceStore> UnitResolver<S> {
             path: directory.clone(),
             provenance: entry.provenance,
         };
-        self.trace_lookup(&directory, &entry);
+        let stamp = self
+            .lookup_trace
+            .is_some()
+            .then(|| pascal_project::path_stamp_result(&directory).ok().flatten())
+            .flatten();
+        self.trace_lookup(&directory, &entry, stamp);
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
         if self.compile_time_store.is_some()
             && let Some((path, provided)) = &indexed

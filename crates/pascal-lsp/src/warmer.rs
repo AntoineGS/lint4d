@@ -19,6 +19,8 @@ use crate::workspace::rename::WorkspaceInput;
 const INDEX_BATCH_UNITS: usize = crate::workspace::indexing::EXTRACTION_BATCH_UNITS;
 /// Index anchors the warmer holds; further requests are dropped.
 const MAX_INDEX_ANCHORS: usize = 16;
+/// Seals a store bypass retired that an anchor tries again in a row.
+const MAX_SEAL_RETRIES: usize = 3;
 
 #[derive(Default)]
 pub(crate) struct InteractiveGate {
@@ -41,9 +43,16 @@ pub(crate) struct InteractiveGate {
     /// Test seam: as `busy_after_checks`, but a client request queues.
     #[cfg(test)]
     waiting_after_checks: Mutex<Option<usize>>,
+    /// Test seam: as `busy_after_checks`, but running Bulk work ends.
+    #[cfg(test)]
+    bulk_ends_after_checks: Mutex<Option<usize>>,
     /// Test seam: the next seal after a complete batch finds the gate busy.
     #[cfg(test)]
     busy_before_seal: AtomicBool,
+    /// Test seam: the next seal after a complete batch finds the store
+    /// `Busy`.
+    #[cfg(test)]
+    busy_store_before_seal: AtomicBool,
     #[cfg(test)]
     index_turn_waiters: std::sync::atomic::AtomicUsize,
     /// Test seam: `wait_index_turn` waits as if the gate did not pass.
@@ -113,6 +122,12 @@ impl InteractiveGate {
         }
     }
 
+    /// Whether a Bulk client request runs: index batches wait for it, and
+    /// the crawl goes first meanwhile.
+    pub(crate) fn bulk_runs(&self) -> bool {
+        self.running_bulk.load(Ordering::Relaxed) > 0
+    }
+
     fn index_may_run_with(&self, busy: usize) -> bool {
         self.background_may_run(busy) && self.running_bulk.load(Ordering::Relaxed) == 0
     }
@@ -139,8 +154,9 @@ impl InteractiveGate {
     /// Waits, without a time limit, until `index_may_run` would pass. The
     /// warmer has one thread, so a batch does not wait while a crawl is
     /// queued: it yields instead, and the crawl runs under its own gate. A
-    /// `Full` batch yields to a queued crawl at once, a `Reuse` one only when
-    /// it cannot run (D33).
+    /// `Full` batch yields to a queued crawl at once, a `Reuse` one only
+    /// while Bulk work holds it back (D33). Interactive work pauses the crawl
+    /// too, so a reuse batch waits for it in front of the crawl.
     pub(crate) fn wait_index_turn(
         &self,
         cancel: &AtomicBool,
@@ -165,7 +181,7 @@ impl InteractiveGate {
             if !held && self.index_may_run_with(*busy) {
                 break IndexTurn::Go;
             }
-            if crawl_queued {
+            if crawl_queued && self.bulk_runs() {
                 break IndexTurn::Yield;
             }
             busy = self
@@ -207,6 +223,9 @@ impl InteractiveGate {
             }
             if tick(&self.waiting_after_checks) {
                 self.set_waiting_clients(1);
+            }
+            if tick(&self.bulk_ends_after_checks) {
+                self.set_running_bulk(0);
             }
         }
     }
@@ -379,14 +398,17 @@ pub(crate) enum WarmEvent {
         generation: u64,
         open_epoch: u64,
     },
-    /// A crawl that cannot publish (its context came from unsaved project
-    /// input) stopped at a unit boundary after `CRAWL_SLICE`, so one queued
-    /// extraction batch runs before it is dispatched again (R8-2/D42). No
-    /// client preemption.
+    /// A crawl stopped at a unit boundary so that other warmer work runs
+    /// before it is dispatched again. No client preemption.
     Yielded {
         uri: Url,
         /// The crawl's progress count at the boundary where it yielded.
         done: usize,
+        /// To a due reuse pass, which the index gate lets run (D33).
+        /// Otherwise the crawl cannot publish (its context came from unsaved
+        /// project input) and one queued extraction batch runs after its
+        /// `CRAWL_SLICE` (R8-2/D42).
+        to_reuse: bool,
         generation: u64,
         open_epoch: u64,
     },
@@ -661,6 +683,10 @@ enum WarmJobKind {
         /// Set while a `Full` batch is queued: a crawl that cannot publish
         /// yields to it after `CRAWL_SLICE`.
         extraction_queued: Arc<AtomicBool>,
+        /// Set while a reuse pass is due: the crawl yields to it at a unit
+        /// boundary where the index gate passes (it was dispatched first
+        /// because Bulk work held the pass back).
+        reuse_due: Arc<AtomicBool>,
         /// The progress count at the crawl's last yield: it yields again only
         /// past it, so every slice analyses new units.
         resume_after: usize,
@@ -682,12 +708,12 @@ struct WarmJob {
 
 impl WarmJob {
     /// What the job analyses: an index batch reads the disk-only baseline
-    /// view while the store is enabled (D31), so it may publish. Built on
-    /// the warmer thread: comparing open buffers with their files reads
-    /// them.
-    fn job_input(&self) -> std::borrow::Cow<'_, WorkspaceInput> {
+    /// view while the store is enabled (`persisting`, D31), so it may
+    /// publish. Built on the warmer thread: comparing open buffers with
+    /// their files reads them.
+    fn job_input(&self, persisting: bool) -> std::borrow::Cow<'_, WorkspaceInput> {
         match self.kind {
-            WarmJobKind::Index(..) if self.persisting => {
+            WarmJobKind::Index(..) if persisting => {
                 std::borrow::Cow::Owned(self.input.disk_baseline())
             }
             WarmJobKind::Index(..) | WarmJobKind::Crawl { .. } => {
@@ -705,10 +731,18 @@ pub(crate) struct Warmer {
     /// Workspace-index anchors, project anchors first, deduplicated.
     index_queue: VecDeque<IndexAnchor>,
     /// Anchors whose reuse pass (D33) is due, project anchors first; only
-    /// filled while the store is enabled.
+    /// filled while the store is enabled, opening or fencing.
     reuse_queue: VecDeque<IndexAnchor>,
+    /// Set while `reuse_queue` holds a pass and the store is not off.
+    reuse_due: Arc<AtomicBool>,
+    /// Since when the store has been opening or fencing, as of the last
+    /// poll: a reuse pass waits for it ahead of the crawl for at most
+    /// `MAX_OPEN_WAIT` from then.
+    unsettled_since: Option<Instant>,
     /// Anchors whose reuse pass ended; extraction batches take them on.
     reuse_done: HashSet<IndexAnchor>,
+    /// Seals of each anchor a store bypass retired in a row.
+    seal_retries: HashMap<IndexAnchor, usize>,
     /// The index batch in flight.
     index_in_flight: Option<(IndexAnchor, IndexMode)>,
     /// The configured project's absolute path, as of the last poll.
@@ -757,7 +791,10 @@ impl Warmer {
             queue: WarmQueue::default(),
             index_queue: VecDeque::new(),
             reuse_queue: VecDeque::new(),
+            reuse_due: Arc::new(AtomicBool::new(false)),
+            unsettled_since: None,
             reuse_done: HashSet::new(),
+            seal_retries: HashMap::new(),
             index_in_flight: None,
             configured_project: None,
             crawl_pending: Arc::new(AtomicBool::new(false)),
@@ -892,7 +929,9 @@ impl Warmer {
         self.queue.clear();
         self.index_queue.clear();
         self.reuse_queue.clear();
+        self.reuse_due.store(false, Ordering::Relaxed);
         self.reuse_done.clear();
+        self.seal_retries.clear();
         self.interleave = false;
         self.crawl_resume.clear();
         self.dispatched_epochs.clear();
@@ -1061,28 +1100,50 @@ impl Warmer {
             .filter(|project| project.is_absolute())
             .map(std::path::Path::to_path_buf);
         let events = self.drain_events(workspace.project_cache());
-        let persisting = workspace.persistent_cache().state() == CacheState::Enabled;
-        if persisting {
+        let state = workspace.persistent_cache().state();
+        let persisting = state == CacheState::Enabled;
+        let settling = matches!(state, CacheState::Opening | CacheState::Fencing);
+        if settling {
+            self.unsettled_since.get_or_insert_with(Instant::now);
+        } else {
+            self.unsettled_since = None;
+        }
+        // A second start usually polls first while the store still opens:
+        // the reuse pass is queued anyway, and its batch waits for the store
+        // ahead of the crawl, within the store's open bound (D33).
+        let awaiting_store = self
+            .unsettled_since
+            .is_some_and(|since| since.elapsed() < pascal_cache::MAX_OPEN_WAIT);
+        if persisting || settling {
             self.queue_reuse_passes();
         } else {
             self.reuse_queue.clear();
         }
         // Index batches publish no parses (A13): they need room for their
         // own charges, not `has_room`, which pins can fill (l4d-axsn).
-        // A batch is dispatched only when it can run now; one waiting for
-        // its turn would hold the crawl back (one warmer thread).
+        // An extraction batch is dispatched only when it can run now; one
+        // waiting for its turn would hold the crawl back (one warmer
+        // thread).
         let gate = self.gate.clone();
         let index_fits =
             || gate.index_may_run_now() && workspace.project_cache().index_batch_fits();
-        // 1. A reuse pass, even while a crawl is queued (D33).
+        // 1. A reuse pass, even while a crawl is queued (D33). Only Bulk work
+        // lets the crawl go first: interactive work would pause the crawl as
+        // well, so the pass waits for it in `wait_index_turn`.
         if !self.busy
+            && (persisting || awaiting_store)
             && !self.reuse_queue.is_empty()
-            && index_fits()
+            && !gate.bulk_runs()
+            && workspace.project_cache().index_batch_fits()
             && let Some(anchor) = self.reuse_queue.pop_front()
         {
             let pending = self.crawl_pending.clone();
             self.dispatch_index(workspace, anchor, IndexMode::Reuse, persisting, pending);
         }
+        self.reuse_due.store(
+            (persisting || settling) && !self.reuse_queue.is_empty(),
+            Ordering::Relaxed,
+        );
         // 1b. One extraction batch after a crawl yielded to it (R8-2/D42),
         // which does not yield to the queued crawl in turn.
         // An interleave the gate holds back stays due; the crawl still runs.
@@ -1117,6 +1178,7 @@ impl Warmer {
                     uri,
                     open_epoch,
                     extraction_queued: self.extraction_queued.clone(),
+                    reuse_due: self.reuse_due.clone(),
                     resume_after: self.crawl_resume.get(&busy_uri).copied().unwrap_or(0),
                 };
                 let job = WarmJob {
@@ -1222,6 +1284,7 @@ impl Warmer {
             WarmEvent::Yielded {
                 uri,
                 done,
+                to_reuse,
                 generation,
                 open_epoch,
             } => {
@@ -1234,7 +1297,8 @@ impl Warmer {
                 }
                 self.queue.push_front(uri.clone());
                 self.crawl_pending.store(true, Ordering::Relaxed);
-                self.interleave = true;
+                // A yield to the reuse pass owes no extraction batch.
+                self.interleave |= !*to_reuse;
                 self.crawl_resume.insert(uri.clone(), *done);
                 true
             }
@@ -1263,9 +1327,22 @@ impl Warmer {
                         self.request_index(anchor.clone());
                     }
                 }
-                // A seal stopped by interactive work is tried again.
-                if *seal == Some(SealOutcome::Interrupted) {
-                    self.request_index(anchor.clone());
+                // A seal stopped by interactive work is tried again, and one
+                // a store bypass retired (another process writing: `Busy`)
+                // up to `MAX_SEAL_RETRIES` times in a row.
+                match seal {
+                    Some(SealOutcome::Interrupted) => self.request_index(anchor.clone()),
+                    Some(SealOutcome::Bypassed) => {
+                        let retries = self.seal_retries.entry(anchor.clone()).or_default();
+                        if *retries < MAX_SEAL_RETRIES {
+                            *retries += 1;
+                            self.request_index(anchor.clone());
+                        }
+                    }
+                    Some(SealOutcome::Sealed | SealOutcome::Unchanged) => {
+                        self.seal_retries.remove(anchor);
+                    }
+                    _ => {}
                 }
                 true
             }
@@ -1319,6 +1396,7 @@ impl Warmer {
         self.queue.clear();
         self.index_queue.clear();
         self.reuse_queue.clear();
+        self.reuse_due.store(false, Ordering::Relaxed);
         self.busy = false;
         self.busy_attempt = None;
         self.index_in_flight = None;
@@ -1381,20 +1459,27 @@ fn run_index_job(
     // A batch dispatched while the store was opening or reopening would
     // index memory-only, and its members would keep no record for the rest
     // of the process: no seal, extracted again on the next start. Once the
-    // store is enabled the batch goes back, and the next poll schedules it
-    // as persisting, reuse pass first (D33).
-    if !job.persisting
-        && job
+    // store is enabled an extraction batch goes back, and the next poll
+    // schedules it as persisting, reuse pass first (D33). A reuse pass,
+    // dispatched to wait for the store ahead of the crawl, runs as
+    // persisting at once; without an enabled store it goes back, and the
+    // next poll drops it or lets the crawl go first.
+    let mut persisting = job.persisting;
+    if !persisting {
+        let settled = job
             .input
             .persistent_cache
-            .wait_settled(pascal_cache::MAX_OPEN_WAIT, &job.cancel)
-            == CacheState::Enabled
-    {
-        return stopped(true);
+            .wait_settled(pascal_cache::MAX_OPEN_WAIT, &job.cancel);
+        match mode {
+            IndexMode::Full if settled == CacheState::Enabled => return stopped(true),
+            IndexMode::Full => {}
+            IndexMode::Reuse if settled == CacheState::Enabled => persisting = true,
+            IndexMode::Reuse => return stopped(!job.cancel.load(Ordering::Relaxed)),
+        }
     }
     let _span = crate::trace::Span::new(|| format!("warm index {anchor:?} ({mode:?})"));
     let started = Instant::now();
-    let mut workspace = Workspace::from_analysis_input(&job.job_input());
+    let mut workspace = Workspace::from_analysis_input(&job.job_input(persisting));
     // A reuse pass runs before the crawl by design (D33); extraction yields
     // to a queued crawl.
     let mut before_io = || {
@@ -1439,6 +1524,12 @@ fn run_index_job(
                     if gate.busy_before_seal.swap(false, Ordering::Relaxed) {
                         gate.set(1);
                     }
+                    #[cfg(test)]
+                    if gate.busy_store_before_seal.swap(false, Ordering::Relaxed)
+                        && let Some(job) = workspace.persistent_cache().job()
+                    {
+                        job.store().fail_next_for_test(pascal_cache::Bypass::Busy);
+                    }
                     let outcome = workspace.seal_baseline_if_due(key, &mut before_io);
                     crate::trace::trace!("index seal {anchor:?}: {outcome:?}");
                     outcome
@@ -1471,16 +1562,18 @@ fn run_index_job(
 }
 
 fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>) {
-    let (uri, open_epoch, extraction_queued, resume_after) = match &job.kind {
+    let (uri, open_epoch, extraction_queued, reuse_due, resume_after) = match &job.kind {
         WarmJobKind::Crawl {
             uri,
             open_epoch,
             extraction_queued,
+            reuse_due,
             resume_after,
         } => (
             uri.clone(),
             *open_epoch,
             extraction_queued.clone(),
+            reuse_due.clone(),
             *resume_after,
         ),
         WarmJobKind::Index(anchor, pending, mode) => {
@@ -1503,7 +1596,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
         job.cancel.clone(),
     ));
     let _span = crate::trace::Span::new(|| format!("warm crawl {}", uri));
-    let mut workspace = Workspace::from_analysis_input(&job.job_input());
+    let mut workspace = Workspace::from_analysis_input(&job.job_input(false));
     // The crawl publishes the disk-proven units it analyses (R8-2/D42). A
     // session's first crawl is usually dispatched while the store still
     // opens: it waits for the store to settle rather than publish nothing.
@@ -1516,7 +1609,10 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     // The slice starts at the first unit past the last yield: units replayed
     // as cache hits do not count.
     let slice_started = Mutex::new(None::<Instant>);
-    let yielded = Arc::new(Mutex::new(None::<usize>));
+    // The progress count where the crawl yielded, and whether to a reuse
+    // pass.
+    let yielded = Arc::new(Mutex::new(None::<(usize, bool)>));
+    let hook_cache = workspace.project_cache().clone();
     let hook_yielded = yielded.clone();
     #[cfg(test)]
     let slice_gate = gate.clone();
@@ -1557,16 +1653,26 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             });
         }
         crate::trace::trace!("  warm unit {done}/{total} {}", unit_name(unit));
+        // Only past the last yield, so every dispatch analyses new units.
+        let boundary = persists && done > resume_after && done < total;
+        // A reuse pass the crawl went ahead of while Bulk work held it back
+        // runs at the first unit boundary where the index gate passes (D33).
+        if boundary
+            && reuse_due.load(Ordering::Relaxed)
+            && hook_gate.index_may_run_now()
+            && hook_cache.index_batch_fits()
+        {
+            *hook_yielded.lock().unwrap_or_else(PoisonError::into_inner) = Some((done, true));
+            return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
+        }
         // A crawl that cannot publish lets one queued extraction batch run
         // at the first unit boundary past its slice (R8-2/D42).
-        if persists
-            && done > resume_after
-            && done < total
+        if boundary
             && private.load(Ordering::Relaxed)
             && extraction_queued.load(Ordering::Relaxed)
             && slice_over()
         {
-            *hook_yielded.lock().unwrap_or_else(PoisonError::into_inner) = Some(done);
+            *hook_yielded.lock().unwrap_or_else(PoisonError::into_inner) = Some((done, false));
             return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
         }
         // Pause between units while interactive requests run.
@@ -1604,13 +1710,22 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             end(outcome.fingerprint, pins)
         }
         Err(_)
-            if let Some(done) = *yielded.lock().unwrap_or_else(PoisonError::into_inner)
+            if let Some((done, to_reuse)) =
+                *yielded.lock().unwrap_or_else(PoisonError::into_inner)
                 && !job.cancel.load(Ordering::Relaxed) =>
         {
-            crate::trace::trace!("warm crawl {uri} yields to extraction after {done} units");
+            crate::trace::trace!(
+                "warm crawl {uri} yields to {} after {done} units",
+                if to_reuse {
+                    "a reuse pass"
+                } else {
+                    "extraction"
+                }
+            );
             let _ = events.send(WarmEvent::Yielded {
                 uri,
                 done,
+                to_reuse,
                 generation: job.generation,
                 open_epoch,
             });
@@ -3006,7 +3121,51 @@ mod tests {
         assert_eq!(
             gate.wait_index_turn(&cancel, &crawl, IndexMode::Reuse),
             IndexTurn::Yield,
-            "but does not wait in front of it"
+            "but does not wait in front of it for Bulk work"
+        );
+    }
+
+    /// Returns once an index batch waits in `wait_index_turn`.
+    fn wait_for_turn_waiter(gate: &InteractiveGate) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while gate.index_turn_waiters() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no index batch waits for its turn"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// I-1 (b): interactive work pauses the crawl as well, so a reuse batch
+    /// waits for it in front of a queued crawl instead of yielding.
+    #[test]
+    fn a_reuse_turn_waits_for_interactive_work_in_front_of_a_queued_crawl() {
+        let gate = Arc::new(InteractiveGate::default());
+        let crawl = Arc::new(AtomicBool::new(true));
+        gate.set(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let (gate, crawl) = (gate.clone(), crawl.clone());
+            std::thread::spawn(move || {
+                done_tx
+                    .send(gate.wait_index_turn(&AtomicBool::new(false), &crawl, IndexMode::Reuse))
+                    .unwrap();
+            })
+        };
+        wait_for_turn_waiter(&gate);
+        // Taking the gate's lock waits until the waiter's first check is
+        // done and it waits on the condvar (or has returned).
+        gate.set(1);
+        assert!(done_rx.try_recv().is_err(), "the turn waits");
+        gate.set(0);
+        assert_eq!(done_rx.recv().unwrap(), IndexTurn::Go);
+        waiter.join().unwrap();
+        gate.set(1);
+        assert_eq!(
+            gate.wait_index_turn(&AtomicBool::new(false), &crawl, IndexMode::Full),
+            IndexTurn::Yield,
+            "extraction still yields"
         );
     }
 
@@ -3066,12 +3225,20 @@ mod tests {
     #[test]
     fn a_disabled_cache_runs_no_reuse_pass_and_extracts_after_the_crawl() {
         let (_temp, workspace, main) = fixture();
+        assert_disabled_sequence(&workspace, &main, Arc::new(InteractiveGate::default()));
+    }
+
+    fn assert_disabled_sequence(
+        workspace: &crate::workspace::Workspace,
+        main: &Url,
+        gate: Arc<InteractiveGate>,
+    ) {
         assert!(!workspace.persistent_cache().is_enabled());
-        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        let mut warmer = Warmer::start(gate);
         warmer.open(main.clone());
         warmer.request_index(IndexAnchor::Document(main.clone()));
 
-        warmer.poll(&workspace);
+        warmer.poll(workspace);
         assert!(warmer.busy_attempt.is_some(), "the crawl goes first");
         assert!(
             warmer.reuse_queue.is_empty(),
@@ -3079,7 +3246,7 @@ mod tests {
         );
         assert_eq!(warmer.index_queue.len(), 1, "the index job waits");
 
-        let events = poll_until(&mut warmer, &workspace, |events| {
+        let events = poll_until(&mut warmer, workspace, |events| {
             events.iter().any(is_index_event)
         });
         let end = events
@@ -3114,6 +3281,7 @@ mod tests {
             WarmEvent::Progress { done, total, .. } => format!("Progress {done}/{total}"),
             WarmEvent::End { .. } => "End".into(),
             WarmEvent::Paused { .. } => "Paused".into(),
+            WarmEvent::Yielded { to_reuse: true, .. } => "Yielded to reuse".into(),
             WarmEvent::Yielded { .. } => "Yielded".into(),
             WarmEvent::ClosureStored { .. } => "ClosureStored".into(),
             WarmEvent::IndexProgress {
@@ -3359,7 +3527,10 @@ mod tests {
         /// A batch dispatched while the store is still opening must not
         /// index memory-only: its members would keep no record for the rest
         /// of the process, so no snapshot is sealed and a restart extracts
-        /// them again (protocol test `persistent_index`, l4d-zf1b.8).
+        /// them again (protocol test `persistent_index`, l4d-zf1b.8). The
+        /// store stays opening past `MAX_OPEN_WAIT`, so the reuse pass that
+        /// waits for it goes back and the crawl, then extraction, go ahead
+        /// (Task 10b: the wait ahead of the crawl is bounded).
         #[test]
         fn an_index_batch_dispatched_while_the_store_opens_persists_its_members() {
             let gate = Arc::new(InteractiveGate::default());
@@ -3495,6 +3666,163 @@ mod tests {
             );
             assert!(warmer.reuse_done.contains(&IndexAnchor::Document(main)));
             workspace.persistent_cache().shutdown();
+        }
+
+        fn reuse_progress(event: &WarmEvent) -> bool {
+            matches!(event, WarmEvent::IndexProgress { progress, .. } if progress.mode == IndexMode::Reuse)
+        }
+
+        fn position(events: &[WarmEvent], matching: impl Fn(&WarmEvent) -> bool) -> usize {
+            events
+                .iter()
+                .position(matching)
+                .unwrap_or_else(|| panic!("{events:?}"))
+        }
+
+        fn is_begin(event: &WarmEvent) -> bool {
+            matches!(event, WarmEvent::Begin { .. })
+        }
+
+        fn is_end(event: &WarmEvent) -> bool {
+            matches!(event, WarmEvent::End { .. })
+        }
+
+        /// I-1 (Task 10b): at a second start the store is usually still
+        /// opening at the first poll after `didOpen`. The reuse pass is
+        /// dispatched anyway and waits for the store; the crawl follows it.
+        #[test]
+        fn a_reuse_pass_due_while_the_store_opens_runs_before_the_crawl() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, cache, release, main) = opening_workspace(&gate);
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let mut events = warmer.poll(&workspace);
+            assert!(
+                matches!(warmer.index_in_flight, Some((_, IndexMode::Reuse)))
+                    && warmer.busy_attempt.is_none(),
+                "the first job is a reuse pass, not the crawl: {:?} {:?}",
+                warmer.index_in_flight,
+                warmer.busy_attempt
+            );
+            assert_eq!(cache.state(), CacheState::Opening);
+            release.send(()).unwrap();
+            events.extend(run_until_end_within(
+                &mut warmer,
+                &workspace,
+                Duration::from_secs(20),
+            ));
+            let reuse = position(&events, reuse_progress);
+            assert!(reuse < position(&events, is_begin), "{events:?}");
+            assert!(
+                events[..reuse].iter().all(|event| !is_index_event(event)),
+                "the pass ran as persisting, without a requeue: {events:?}"
+            );
+            cache.shutdown();
+        }
+
+        /// I-1 (b): diagnostics queued at `didOpen` hold the index gate. The
+        /// reuse pass is dispatched anyway and waits for them, ahead of the
+        /// crawl, which they would pause too.
+        #[test]
+        fn a_reuse_pass_held_by_interactive_work_still_runs_before_the_crawl() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, cache, release, main) = opening_workspace(&gate);
+            gate.set(1);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let mut events = warmer.poll(&workspace);
+            assert!(
+                matches!(warmer.index_in_flight, Some((_, IndexMode::Reuse)))
+                    && warmer.busy_attempt.is_none(),
+                "{:?} {:?}",
+                warmer.index_in_flight,
+                warmer.busy_attempt
+            );
+            wait_for_turn_waiter(&gate);
+            assert!(
+                warmer.events.try_recv().is_err(),
+                "the pass waits for interactive work and does not yield to the crawl"
+            );
+            release.send(()).unwrap();
+            gate.set(0);
+            events.extend(run_until_end_within(
+                &mut warmer,
+                &workspace,
+                Duration::from_secs(20),
+            ));
+            assert!(
+                position(&events, reuse_progress) < position(&events, is_begin),
+                "{events:?}"
+            );
+            cache.shutdown();
+        }
+
+        /// I-1 (c): Bulk work lets the crawl go first; once it ends, the crawl
+        /// yields to the due reuse pass at its next unit boundary, then
+        /// resumes and reaches its end.
+        #[test]
+        fn a_crawl_yields_to_a_due_reuse_pass_once_bulk_work_ends() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = wide_fixture(&gate);
+            gate.set_running_bulk(1);
+            // Bulk work ends at the crawl's first unit boundary check.
+            *gate.bulk_ends_after_checks.lock().unwrap() = Some(0);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &workspace, Duration::from_secs(20));
+            let kinds = events.iter().map(event_kind).collect::<Vec<_>>();
+            let begin = position(&events, is_begin);
+            let yielded = kinds
+                .iter()
+                .position(|kind| kind == "Yielded to reuse")
+                .unwrap_or_else(|| panic!("the crawl yielded to the reuse pass: {kinds:?}"));
+            let reuse = position(&events, reuse_progress);
+            let end = position(&events, is_end);
+            assert!(
+                begin < yielded && yielded < reuse && reuse < end,
+                "{kinds:?}"
+            );
+            assert!(
+                matches!(events[yielded], WarmEvent::Yielded { done: 1, .. }),
+                "at the first unit boundary: {kinds:?}"
+            );
+            assert!(
+                events[reuse..end].iter().any(is_begin),
+                "the crawl is dispatched again after the pass: {kinds:?}"
+            );
+            assert!(
+                !kinds[..end]
+                    .iter()
+                    .any(|kind| kind.starts_with("IndexProgress Full")),
+                "no extraction before the crawl's end: {kinds:?}"
+            );
+            assert!(warmer.reuse_queue.is_empty(), "{kinds:?}");
+            warmer.shutdown();
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// I-1: a disabled store keeps the sequence of a workspace without
+        /// one (`a_disabled_cache_runs_no_reuse_pass_and_extracts_after_the_crawl`).
+        #[test]
+        fn a_disabled_store_keeps_the_crawl_first_sequence() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, mut workspace, main) = fixture();
+            let store = crate::workspace::persist::tests::private_dir();
+            let cache = PersistentCache::start_unscheduled_for_test(
+                CacheOptions {
+                    enabled: false,
+                    directory: Some(store.path().to_path_buf()),
+                    ..CacheOptions::default()
+                },
+                workspace.project_cache().clone(),
+                gate.clone(),
+                pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([11; 32])),
+            );
+            assert_eq!(cache.state(), CacheState::Disabled);
+            workspace.set_persistent_cache(cache.clone());
+            assert_disabled_sequence(&workspace, &main, gate);
+            assert_eq!(cache.jobs_issued_for_test(), 0);
+            cache.shutdown();
         }
 
         fn project_reuse_batches(events: &[WarmEvent]) -> Vec<&IndexProgress> {
@@ -3701,6 +4029,30 @@ mod tests {
                 .baseline_hint(&key)
                 .expect("sealed");
             assert!(hint.sealed() && hint.held());
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// Task 10b: two servers sealing at once can find the store `Busy`
+        /// (protocol test `two_servers_index_the_same_workspace`). The
+        /// bypassed seal is tried again; without it the context would never
+        /// seal in this process.
+        #[test]
+        fn a_seal_the_store_bypassed_is_tried_again() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            gate.busy_store_before_seal.store(true, Ordering::Relaxed);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed))
+            });
+            let bypassed = position(&events, |event| sealed(event, &SealOutcome::Bypassed));
+            assert!(
+                bypassed < position(&events, |event| sealed(event, &SealOutcome::Sealed)),
+                "{events:?}"
+            );
             workspace.persistent_cache().shutdown();
         }
 

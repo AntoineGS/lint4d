@@ -7067,7 +7067,22 @@ fn build_snapshot_with_policy(
                 break;
             }
             demand_units += 1;
-            let Some(context_key) = loader.document_contexts.get(&demanded).cloned() else {
+            let context_key = loader.document_contexts.get(&demanded).cloned();
+            #[cfg(test)]
+            let context_key = context_key.filter(|_| {
+                !super::TEST_NO_DOCUMENT_CONTEXT_OF.with(|name| {
+                    name.borrow()
+                        .as_ref()
+                        .is_some_and(|name| demanded.path().ends_with(name.as_str()))
+                })
+            });
+            let Some(context_key) = context_key else {
+                demand_gaps.push((
+                    Some(demanded.clone()),
+                    format!(
+                        "the imports of {demanded} were not loaded: it has no document context"
+                    ),
+                ));
                 continue;
             };
             let direct = match loader.load_imports_with_cancel(

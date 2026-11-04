@@ -430,6 +430,9 @@ thread_local! {
     /// Loading the imports of a unit whose file name this is fails.
     static TEST_FAIL_IMPORTS_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// A demanded unit whose file name this is has no document context.
+    static TEST_NO_DOCUMENT_CONTEXT_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     /// Expanding a unit whose file name this is fails.
     static TEST_FAIL_EXPANSION_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };

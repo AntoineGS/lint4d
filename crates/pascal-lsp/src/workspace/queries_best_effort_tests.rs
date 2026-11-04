@@ -872,3 +872,24 @@ fn the_demand_byte_bound_counts_a_shared_source_once() {
         "{coverage:?}"
     );
 }
+
+/// l4d-4nbs final round (2): a demanded unit with no document context is
+/// a coverage gap of the answer, not skipped silently.
+#[test]
+fn a_demanded_unit_without_a_document_context_is_noted() {
+    crate::workspace::TEST_NO_DOCUMENT_CONTEXT_OF
+        .with(|name| *name.borrow_mut() = Some("/U1.pas".into()));
+    let (_temp, input, main, position) = ancestor_chain(4);
+    let completion = completion_from_input(input, &main, position, &AtomicBool::new(false))
+        .value
+        .expect("completion answers");
+    crate::workspace::TEST_NO_DOCUMENT_CONTEXT_OF.with(|name| *name.borrow_mut() = None);
+    assert!(completion.is_incomplete, "{completion:?}");
+    let coverage = super::completion_coverage_for_test();
+    assert!(
+        coverage
+            .iter()
+            .any(|gap| gap.contains("U1.pas") && gap.contains("document context")),
+        "the missing context is noted: {coverage:?}"
+    );
+}

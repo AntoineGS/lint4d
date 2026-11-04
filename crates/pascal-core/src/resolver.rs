@@ -4364,6 +4364,16 @@ impl<S: SourceStore> UnitResolver<S> {
         trace.push((directory.to_path_buf(), entry.clone(), stamp));
     }
 
+    /// The stamp of `directory` when lookups are traced and it is not traced
+    /// yet: a directory is stamped once, when first consulted.
+    fn untraced_stamp(&self, directory: &Path) -> Option<Option<ProjectReadStamp>> {
+        let trace = self.lookup_trace.as_ref()?;
+        if trace.iter().any(|(path, _, _)| path == directory) {
+            return None;
+        }
+        Some(pascal_project::path_stamp_result(directory).ok().flatten())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_directory(
         &mut self,
@@ -4378,16 +4388,16 @@ impl<S: SourceStore> UnitResolver<S> {
         // A search entry the session's name index proves cannot hold the
         // unit is skipped before any per-directory scratch (l4d-4nbs D19).
         // Stamp before the index decides, as a listing stamps before it lists.
-        let stamp = self
-            .lookup_trace
-            .is_some()
-            .then(|| pascal_project::path_stamp_result(directory).ok().flatten());
         if self.compile_time_store.is_some()
             && let Some(provided) = provided_entry
-            && self.indexed_absent(directory, provided, unit_name, namespaces, cancel)?
         {
-            self.trace_lookup(directory, provided, stamp.flatten());
-            return Ok(None);
+            let stamp = self.untraced_stamp(directory);
+            if self.indexed_absent(directory, provided, unit_name, namespaces, cancel)? {
+                if let Some(stamp) = stamp {
+                    self.trace_lookup(directory, provided, stamp);
+                }
+                return Ok(None);
+            }
         }
         let indexed = provided_entry.map(|provided| (directory.to_path_buf(), provided.clone()));
         let bytes = directory.as_os_str().len().saturating_mul(8); // canonical directory/entry scratch remains a later boundary
@@ -4404,12 +4414,9 @@ impl<S: SourceStore> UnitResolver<S> {
             path: directory.clone(),
             provenance: entry.provenance,
         };
-        let stamp = self
-            .lookup_trace
-            .is_some()
-            .then(|| pascal_project::path_stamp_result(&directory).ok().flatten())
-            .flatten();
-        self.trace_lookup(&directory, &entry, stamp);
+        if let Some(stamp) = self.untraced_stamp(&directory) {
+            self.trace_lookup(&directory, &entry, stamp);
+        }
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
         if self.compile_time_store.is_some()
             && let Some((path, provided)) = &indexed
@@ -10961,6 +10968,48 @@ mod tests {
             Default::default(),
         );
         (dir, root, resolver)
+    }
+
+    /// l4d-4nbs final round (4): a traced lookup stamps each directory it
+    /// consults once; the importer's directory, also a search entry, is not
+    /// stamped again.
+    #[test]
+    fn a_traced_lookup_stamps_each_directory_once() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        use pascal_project::analysis_metrics::{Metric, TestScope};
+        let stamps = |trace: bool| {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let scope = TestScope::new();
+            if trace {
+                resolver.trace_unit_lookups(true);
+            }
+            let outcome = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        requested_name: "Missing",
+                        importer_path: &root,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(!matches!(outcome.result(), Resolution::Found(_)));
+            let traced = resolver.trace_unit_lookups(false).len();
+            (
+                scope.snapshot().counts[Metric::ProjectStampProbes as usize],
+                traced,
+            )
+        };
+        let (untraced, _) = stamps(false);
+        let (traced, directories) = stamps(true);
+        assert_eq!(directories, 1, "one directory consulted");
+        assert_eq!(
+            traced - untraced,
+            directories as u64,
+            "one stamp per traced directory"
+        );
     }
 
     /// l4d-4nbs R13: a file read through two entries (provenances) in

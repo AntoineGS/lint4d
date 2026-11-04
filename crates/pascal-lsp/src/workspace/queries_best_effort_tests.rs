@@ -562,3 +562,45 @@ fn a_provider_past_the_branch_state_limit_leaves_its_importer_bound() {
     assert_read_only_features_answer(&fixture);
     assert_strict_features_keep_the_proof(&fixture);
 }
+
+/// l4d-4nbs review (completion parity): the ancestor of a member's type is
+/// declared in a unit the cached closure does not hold yet. Completion loads
+/// the imports its answer looked through and lists the inherited members,
+/// as it did when a wide definition walk had cached the whole closure.
+#[test]
+fn completion_loads_the_units_an_inherited_member_needs() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    fs::write(
+        root.join("Base.pas"),
+        "unit Base;\ninterface\ntype\n  TBase = class\n    procedure BaseMember;\n  end;\nimplementation\nprocedure TBase.BaseMember; begin end;\nend.\n",
+    )
+    .expect("base");
+    fs::write(
+        root.join("Mid.pas"),
+        "unit Mid;\ninterface\nuses Base;\ntype\n  TMid = class(TBase)\n    procedure MidMember;\n  end;\nimplementation\nprocedure TMid.MidMember; begin end;\nend.\n",
+    )
+    .expect("mid");
+    let main = "unit Main;\ninterface\nuses Mid;\nimplementation\nprocedure Run;\nvar X: TMid;\nbegin\n  X.\nend;\nend.\n";
+    fs::write(root.join("Main.pas"), main).expect("main");
+    let workspace = Workspace::with_override_session(
+        vec![root.to_path_buf()],
+        WorkspaceOptions::default(),
+        OverrideSession::new(None),
+    );
+    let completion = completion_from_input(
+        workspace.analysis_input(),
+        &uri(&root.join("Main.pas")),
+        Position::new(7, 4),
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("completion answers");
+    let labels = completion
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"MidMember"), "{labels:?}");
+    assert!(labels.contains(&"BaseMember"), "{labels:?}");
+}

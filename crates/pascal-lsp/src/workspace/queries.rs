@@ -292,30 +292,53 @@ pub(crate) fn completion_from_input_with_options(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return failed(source_generation, configuration_generation, error),
+    // The cached closure may not hold the units a member's ancestors are
+    // declared in: load the imports the answer looked through while fenced,
+    // then answer again (l4d-4nbs review), a few rounds at most.
+    let mut demanded: Vec<Url> = Vec::new();
+    let mut round = 0;
+    let (snapshot, value) = loop {
+        let snapshot = match assistance_snapshot(&input, &uri, Some(position), &demanded, cancel) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+        if let Err(error) = ensure_assistance_ready(&snapshot, &uri) {
+            let records = snapshot_records(&snapshot);
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                records,
+            );
+        }
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let _ = snapshot.index.take_binding_demand();
+        let value = snapshot.index.completion_with_cancel_and_options(
+            &uri,
+            position,
+            options.clone(),
+            cancel,
+        );
+        let fresh = snapshot
+            .index
+            .take_binding_demand()
+            .into_iter()
+            .filter(|demand| demand != &uri && !demanded.contains(demand))
+            .collect::<Vec<_>>();
+        round += 1;
+        if fresh.is_empty() || round >= MAX_ASSISTANCE_DEMAND_ROUNDS {
+            break (snapshot, value);
+        }
+        demanded.extend(fresh);
     };
     let records = snapshot_records(&snapshot);
-    if let Err(error) = ensure_assistance_ready(&snapshot, &uri) {
-        return with_records(
-            source_generation,
-            configuration_generation,
-            Err(error),
-            records,
-        );
-    }
-    if is_cancelled(cancel) {
-        return cancelled(source_generation, configuration_generation);
-    }
-    let value = snapshot
-        .index
-        .completion_with_cancel_and_options(&uri, position, options, cancel)
-        .map(|mut result| {
-            // D16: candidates from unproven dependencies may be missing.
-            result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
-            result
-        });
+    let value = value.map(|mut result| {
+        // D16: candidates from unproven dependencies may be missing.
+        result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
+        result
+    });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -358,7 +381,7 @@ pub(crate) fn completion_metadata_from_input(
     }
     let source_uri = super::canonical_file_uri(source_uri);
     let candidate_uri = super::canonical_file_uri(candidate_uri);
-    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), cancel) {
+    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -483,7 +506,7 @@ pub(crate) fn signature_help_from_input_with_format(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -532,7 +555,7 @@ pub(crate) fn semantic_tokens_from_input(
         );
     }
 
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -675,7 +698,7 @@ pub(crate) fn inlay_hints_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, None, &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -715,7 +738,7 @@ pub(crate) fn prepare_call_hierarchy_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -753,7 +776,7 @@ pub(crate) fn prepare_type_hierarchy_from_input(
             format!("document is outside configured workspace roots or source paths: {uri}"),
         );
     }
-    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), &[], cancel) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -1480,10 +1503,15 @@ fn binding_snapshot_scoped(
     )
 }
 
+/// Completion loads the imports its answer looked through at most this many
+/// times (an ancestor chain is loaded a level a round).
+const MAX_ASSISTANCE_DEMAND_ROUNDS: usize = 6;
+
 fn assistance_snapshot(
     input: &WorkspaceInput,
     uri: &Url,
     completion_position: Option<Position>,
+    demanded: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
@@ -1502,6 +1530,7 @@ fn assistance_snapshot(
             SnapshotSeed::new(record)
                 .with_consumed_configuration(&consumed_configuration)
                 .with_completion_position(completion_position)
+                .with_demanded(demanded)
                 .best_effort(),
         ),
         &[],

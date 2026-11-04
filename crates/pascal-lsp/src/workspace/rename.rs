@@ -561,6 +561,10 @@ pub(crate) struct SnapshotSeed {
     /// (D16): a dependency whose include audit cannot be proven becomes a
     /// coverage gap instead of refusing the request.
     pub(crate) best_effort: bool,
+    /// Units whose imports a previous answer looked through while they were
+    /// fenced (l4d-4nbs review): their imports are loaded, not left to the
+    /// cache-only closure walk.
+    pub(crate) demanded: Vec<Url>,
 }
 
 impl SnapshotSeed {
@@ -570,7 +574,13 @@ impl SnapshotSeed {
             consumed_configuration: Vec::new(),
             completion_position: None,
             best_effort: false,
+            demanded: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_demanded(mut self, demanded: &[Url]) -> Self {
+        self.demanded = demanded.to_vec();
+        self
     }
 
     pub(crate) fn best_effort(mut self) -> Self {
@@ -7017,6 +7027,36 @@ fn build_snapshot_with_policy(
             closure.providers.len(),
             closure.missed.len()
         );
+        let mut closure = closure;
+        // Load the imports a previous answer needed through fenced units,
+        // and walk the cached closure past them.
+        let demanded = priority_seed
+            .as_ref()
+            .map(|seed| seed.demanded.clone())
+            .unwrap_or_default();
+        for demanded in demanded {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if owned_sources.contains(&demanded) {
+                continue;
+            }
+            let Some(context_key) = loader.document_contexts.get(&demanded).cloned() else {
+                continue;
+            };
+            let Ok(direct) =
+                loader.load_imports_with_cancel(&demanded, &context_key, &mut pins, Some(cancel))
+            else {
+                continue;
+            };
+            let mut fenced = owned_sources.clone();
+            fenced.insert(demanded.clone());
+            let more =
+                super::closure::walk_interface_closure(&mut loader, &direct, &fenced, cancel)?;
+            closure.providers.extend(direct);
+            closure.providers.extend(more.providers);
+            closure.missed.extend(more.missed);
+        }
         for root in &priority {
             loader
                 .project_cache

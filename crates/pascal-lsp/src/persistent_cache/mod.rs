@@ -486,6 +486,26 @@ impl PersistentCache {
             .is_some_and(|inner| inner.lock().commands.is_some())
     }
 
+    /// Wait at most `timeout` while the state is `Opening` or `Fencing`,
+    /// returning early once `cancel` is set; returns the state.
+    pub(crate) fn wait_settled(&self, timeout: Duration, cancel: &AtomicBool) -> CacheState {
+        const SLICE: Duration = Duration::from_millis(25);
+        let Some(inner) = &self.inner else {
+            return CacheState::Disabled;
+        };
+        let unsettled =
+            |shared: &Shared| matches!(shared.state, CacheState::Opening | CacheState::Fencing);
+        let deadline = Instant::now() + timeout;
+        let mut shared = inner.lock();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !unsettled(&shared) || left.is_zero() || cancel.load(Ordering::Relaxed) {
+                return shared.state.clone();
+            }
+            shared = inner.wait_while(shared, left.min(SLICE), unsettled);
+        }
+    }
+
     /// A job while `Enabled`; `None` otherwise (and always when inert).
     pub(crate) fn job(&self) -> Option<CacheJob> {
         self.inner.as_ref()?.job()

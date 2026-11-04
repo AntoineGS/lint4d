@@ -1378,6 +1378,20 @@ fn run_index_job(
         IndexTurn::Yield => return stopped(true),
         IndexTurn::Cancelled => return stopped(false),
     }
+    // A batch dispatched while the store was opening or reopening would
+    // index memory-only, and its members would keep no record for the rest
+    // of the process: no seal, extracted again on the next start. Once the
+    // store is enabled the batch goes back, and the next poll schedules it
+    // as persisting, reuse pass first (D33).
+    if !job.persisting
+        && job
+            .input
+            .persistent_cache
+            .wait_settled(pascal_cache::MAX_OPEN_WAIT, &job.cancel)
+            == CacheState::Enabled
+    {
+        return stopped(true);
+    }
     let _span = crate::trace::Span::new(|| format!("warm index {anchor:?} ({mode:?})"));
     let started = Instant::now();
     let mut workspace = Workspace::from_analysis_input(&job.job_input());
@@ -1490,8 +1504,13 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     ));
     let _span = crate::trace::Span::new(|| format!("warm crawl {}", uri));
     let mut workspace = Workspace::from_analysis_input(&job.job_input());
-    // The crawl publishes the disk-proven units it analyses (R8-2/D42).
-    let persists = job.persisting && workspace.persistent_cache().state() == CacheState::Enabled;
+    // The crawl publishes the disk-proven units it analyses (R8-2/D42). A
+    // session's first crawl is usually dispatched while the store still
+    // opens: it waits for the store to settle rather than publish nothing.
+    let persists = workspace
+        .persistent_cache()
+        .wait_settled(pascal_cache::MAX_OPEN_WAIT, &job.cancel)
+        == CacheState::Enabled;
     workspace.set_crawl_persists(persists);
     let private = workspace.crawl_private_signal();
     // The slice starts at the first unit past the last yield: units replayed
@@ -3289,6 +3308,151 @@ mod tests {
 
         fn is_full_progress(event: &WarmEvent) -> bool {
             matches!(event, WarmEvent::IndexProgress { progress, .. } if progress.mode == IndexMode::Full)
+        }
+
+        /// `write_project(2)` with the project configured and `Main` open,
+        /// over a store whose open waits for the returned sender.
+        fn opening_workspace(
+            gate: &Arc<InteractiveGate>,
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            crate::workspace::Workspace,
+            PersistentCache,
+            std::sync::mpsc::Sender<()>,
+            Url,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), 2);
+            let store = crate::workspace::persist::tests::private_dir();
+            let mut workspace = crate::workspace::Workspace::with_override_session(
+                vec![temp.path().to_path_buf()],
+                crate::workspace::WorkspaceOptions {
+                    project_file: Some(temp.path().join("App.dproj")),
+                    ..Default::default()
+                },
+                pascal_project::delphi_overrides::OverrideSession::new(None),
+            );
+            let (entered, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+            let cache = PersistentCache::start_paused_for_test(
+                CacheOptions {
+                    enabled: true,
+                    directory: Some(store.path().to_path_buf()),
+                    ..CacheOptions::default()
+                },
+                workspace.project_cache().clone(),
+                gate.clone(),
+                pascal_cache::Namespace::new(pascal_cache::Digest::from_bytes([11; 32])),
+                entered.0,
+                release.1,
+            );
+            entered.1.recv().unwrap();
+            assert_eq!(cache.state(), CacheState::Opening);
+            workspace.set_persistent_cache(cache.clone());
+            let main = Url::from_file_path(temp.path().join("lib/Main.pas")).unwrap();
+            workspace
+                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .expect("open main unit");
+            (temp, store, workspace, cache, release.0, main)
+        }
+
+        /// A batch dispatched while the store is still opening must not
+        /// index memory-only: its members would keep no record for the rest
+        /// of the process, so no snapshot is sealed and a restart extracts
+        /// them again (protocol test `persistent_index`, l4d-zf1b.8).
+        #[test]
+        fn an_index_batch_dispatched_while_the_store_opens_persists_its_members() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, cache, release, main) = opening_workspace(&gate);
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main.clone());
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut events = Vec::new();
+            while !warmer
+                .index_in_flight
+                .as_ref()
+                .is_some_and(|(_, mode)| *mode == IndexMode::Full)
+            {
+                assert!(std::time::Instant::now() < deadline, "{events:?}");
+                events.extend(warmer.poll(&workspace));
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cache.state(),
+                CacheState::Opening,
+                "dispatched while opening"
+            );
+            release.send(()).unwrap();
+            events.extend(poll_until(&mut warmer, &workspace, |events| {
+                events.iter().any(|event| {
+                    matches!(event, WarmEvent::IndexProgress { progress, .. }
+                        if progress.mode == IndexMode::Full && progress.complete)
+                })
+            }));
+            let status = workspace.project_cache().index_status(&|_| false);
+            let counts = status[0].counts;
+            // The open, unedited `Main` is indexed and persisted from disk.
+            assert_eq!(counts.fresh, counts.members, "{counts:?}");
+            assert_eq!(counts.persisted, counts.members, "{counts:?}: {events:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    WarmEvent::IndexProgress {
+                        seal: Some(SealOutcome::Sealed),
+                        ..
+                    }
+                )),
+                "{events:?}"
+            );
+            assert_eq!(cache.state(), CacheState::Enabled);
+            assert!(
+                events
+                    .iter()
+                    .filter_map(index_mode)
+                    .any(|mode| mode == IndexMode::Reuse),
+                "the store's reuse pass ran once it was enabled: {events:?}"
+            );
+            cache.shutdown();
+        }
+
+        /// The first crawl of a session is usually dispatched while the
+        /// store still opens; it publishes once the store is enabled
+        /// (R8-2/D42, protocol test
+        /// `a_server_killed_during_the_crawl_reuses_what_the_crawl_published`).
+        #[test]
+        fn a_crawl_dispatched_while_the_store_opens_publishes_its_units() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (temp, _store, workspace, cache, release, main) = opening_workspace(&gate);
+            // Bulk work holds every index batch back: only the crawl runs.
+            gate.set_running_bulk(1);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut events = Vec::new();
+            while warmer.busy_attempt.is_none() {
+                assert!(std::time::Instant::now() < deadline, "{events:?}");
+                events.extend(warmer.poll(&workspace));
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cache.state(),
+                CacheState::Opening,
+                "dispatched while opening"
+            );
+            release.send(()).unwrap();
+            events.extend(run_until_end_within(
+                &mut warmer,
+                &workspace,
+                Duration::from_secs(20),
+            ));
+            assert!(!events.iter().any(is_index_event), "{events:?}");
+            warmer.shutdown();
+            assert_eq!(
+                workspace.project_cache().published_by_crawl_for_test(),
+                vec![temp.path().join("lib/Provider.pas")]
+            );
+            gate.set_running_bulk(0);
+            cache.shutdown();
         }
 
         #[test]

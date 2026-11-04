@@ -253,6 +253,9 @@ fn max_unverified_symbol_candidates() -> usize {
 
 /// Pending members one extraction batch takes.
 pub(crate) const EXTRACTION_BATCH_UNITS: usize = 64;
+/// How long a batch waits for the maintenance it woke before proving
+/// members refused for room (the worker's pressure interval, twice).
+const ROOM_WAIT: Duration = Duration::from_secs(2);
 
 /// What an index batch may do for a member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +366,10 @@ pub(crate) struct IndexProgress {
     /// Members retrying a previous refusal whose retry this batch ended
     /// (indexed, refused, limited or deferred for another reason).
     pub(crate) retries_attempted: usize,
+    /// Members whose publication was refused for room (WAL threshold,
+    /// disk budget, free space), to prove once the store has room; they
+    /// hold `complete` back.
+    pub(crate) awaiting_room: usize,
 }
 
 impl IndexProgress {
@@ -390,6 +397,7 @@ impl IndexProgress {
             persisted: 0,
             retrying: 0,
             retries_attempted: 0,
+            awaiting_room: 0,
         }
     }
 
@@ -527,6 +535,49 @@ pub(super) fn timed<T>(phase: ReusePhase, run: impl FnOnce() -> T) -> T {
     #[cfg(not(test))]
     let _ = phase;
     value
+}
+
+#[cfg(test)]
+thread_local! {
+    /// WAL bytes added by artifact (0) and record (1) publications, and
+    /// how many of each were measured.
+    static PUBLISH_WAL: std::cell::RefCell<[(u64, usize); 2]> =
+        const { std::cell::RefCell::new([(0, 0); 2]) };
+}
+
+/// The WAL's growth across one publication (a checkpoint in between
+/// counts as none).
+#[cfg(test)]
+struct WalGrowth {
+    path: PathBuf,
+    before: u64,
+}
+
+#[cfg(test)]
+impl WalGrowth {
+    fn new(store: &pascal_cache::Store) -> Self {
+        let path = store.location().database_files()[1].clone();
+        let before = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+        Self { path, before }
+    }
+
+    fn note(self, slot: usize) -> Self {
+        let after = std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
+        PUBLISH_WAL.with(|totals| {
+            let total = &mut totals.borrow_mut()[slot];
+            total.0 += after.saturating_sub(self.before);
+            total.1 += 1;
+        });
+        Self {
+            before: after,
+            ..self
+        }
+    }
+}
+
+#[cfg(test)]
+fn take_publish_wal() -> [(u64, usize); 2] {
+    PUBLISH_WAL.with(|totals| std::mem::take(&mut *totals.borrow_mut()))
 }
 
 /// The time and number of calls of each phase since the last take.
@@ -759,6 +810,12 @@ impl Workspace {
                 if restaled > 0 {
                     crate::trace::trace!("  {restaled} members indexed memory-only to prove");
                 }
+                if self.project_cache.index_awaiting_room(&key) > 0
+                    && self.store_has_room(before_io)?
+                {
+                    let restaled = self.project_cache.restale_awaiting_room(&key);
+                    crate::trace::trace!("  {restaled} members refused for room to prove");
+                }
             }
         }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
@@ -783,6 +840,10 @@ impl Workspace {
         let mut pending = std::collections::VecDeque::from(pending);
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
+        // A publication refused for room: the next extraction waits once
+        // for the maintenance it woke, so the members after it publish
+        // rather than being refused in turn.
+        let mut waited_for_room = false;
         while let Some(path) = pending.pop_front() {
             if tried.len() >= bound.units
                 || bound.time.is_some_and(|limit| started.elapsed() >= limit)
@@ -856,6 +917,12 @@ impl Workspace {
             // member's first check still holds.
             if asked {
                 before_io()?;
+            }
+            if !waited_for_room && self.project_cache.index_is_awaiting_room(&key) {
+                waited_for_room = true;
+                if self.store_has_room(before_io)? {
+                    self.project_cache.restale_awaiting_room(&key);
+                }
             }
             let retrying = self
                 .project_cache
@@ -935,9 +1002,43 @@ impl Workspace {
             .iter()
             .filter(|path| !self.is_open_member(path))
             .count();
-        progress.complete = progress.pending == progress.retrying && !progress.memory;
+        progress.awaiting_room = self.project_cache.index_awaiting_room(&key);
+        progress.complete = progress.pending == progress.retrying
+            && progress.awaiting_room == 0
+            && !progress.memory;
         progress.hinted = self.project_cache.baseline_hint(&key).is_some();
         Ok(progress)
+    }
+
+    /// Whether the store takes writes again. Under pressure the cache's
+    /// maintenance is woken and given one step (`check` runs while
+    /// waiting), then the pressure is read again.
+    fn store_has_room(
+        &self,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let pressure = || {
+            let job = self.persistent_cache().job()?;
+            match job.store().pressure() {
+                Ok(pressure) => Some(pressure),
+                Err(bypass) => {
+                    job.observe(&bypass);
+                    None
+                }
+            }
+        };
+        match pressure() {
+            Some(pascal_cache::Pressure::None) => return Ok(true),
+            Some(_) => {}
+            None => return Ok(false),
+        }
+        if !self
+            .persistent_cache()
+            .await_maintenance(ROOM_WAIT, check)?
+        {
+            return Ok(false);
+        }
+        Ok(pressure() == Some(pascal_cache::Pressure::None))
     }
 
     /// An open document (rejected ones included) is answered from the
@@ -1193,13 +1294,21 @@ impl Workspace {
                             // extraction), so no extracted member stays
                             // without its record and the snapshot can be
                             // sealed (D33, §6.3).
-                            if matches!(
-                                skip,
+                            match skip {
                                 PersistSkip::Store(
-                                    pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering
-                                )
-                            ) {
-                                self.project_cache.mark_index_stale(key, path);
+                                    pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering,
+                                ) => self.project_cache.mark_index_stale(key, path),
+                                // Only maintenance makes this room (the
+                                // store woke it): the member waits for a
+                                // batch that finds no pressure rather than
+                                // being extracted into the same refusal.
+                                PersistSkip::Store(
+                                    pascal_cache::Bypass::WalPressure
+                                    | pascal_cache::Bypass::OverBudget
+                                    | pascal_cache::Bypass::LowDiskSpace
+                                    | pascal_cache::Bypass::ScratchExhausted,
+                                ) => self.project_cache.note_index_awaiting_room(key),
+                                _ => {}
                             }
                             false
                         }
@@ -1313,7 +1422,12 @@ impl Workspace {
         if stopped() {
             return Err(PersistSkip::Unavailable);
         }
-        match prepared.publish(job.store()) {
+        #[cfg(test)]
+        let wal = WalGrowth::new(job.store());
+        let published = prepared.publish(job.store());
+        #[cfg(test)]
+        let wal = wal.note(0);
+        match published {
             Ok(_) => {}
             Err(super::persist::PersistError::Store(bypass)) => {
                 job.observe(&bypass);
@@ -1326,12 +1440,13 @@ impl Workspace {
         if stopped() {
             return Err(PersistSkip::Unavailable);
         }
-        publish_proven(job.store(), &eligible)
-            .map(|proof| (proof, inputs))
-            .map_err(|bypass| {
-                job.observe(&bypass);
-                PersistSkip::Store(bypass)
-            })
+        let proven = publish_proven(job.store(), &eligible);
+        #[cfg(test)]
+        wal.note(1);
+        proven.map(|proof| (proof, inputs)).map_err(|bypass| {
+            job.observe(&bypass);
+            PersistSkip::Store(bypass)
+        })
     }
 
     /// R8-2/D42: publish a unit the warm crawl just indexed in the session
@@ -5966,6 +6081,45 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// Task 11 fix round 1: a publication refused for room (the WAL at
+        /// its threshold) leaves the member memory-only; once the store
+        /// reports no pressure, a later batch proves it and the snapshot
+        /// seals, without a restart.
+        #[test]
+        fn a_publication_refused_for_wal_pressure_is_proven_by_a_later_batch() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 3, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let (handle, target) = (cache.clone(), member.clone());
+            set_before_persist_hook(Some(Box::new(move |path| {
+                if path == target {
+                    handle
+                        .job()
+                        .expect("job")
+                        .store()
+                        .fail_next_for_test(pascal_cache::Bypass::WalPressure);
+                }
+            })));
+            let first = advance(&mut view, &anchor, IndexBound::all());
+            set_before_persist_hook(None);
+            assert_eq!((first.indexed, first.persisted), (3, 2), "{first:?}");
+            assert!(!view.project_cache.index_member_has_record(&key, &member));
+            assert!(!first.complete, "the member is still to prove: {first:?}");
+            assert!(first.worth_requeue(), "{first:?}");
+            let second = advance(&mut view, &anchor, IndexBound::all());
+            assert!(second.complete, "{second:?}");
+            assert_eq!(second.indexed + second.reused, 1, "{second:?}");
+            assert_eq!(recorded(&view, &key).len(), 3);
+            assert_eq!(
+                view.seal_baseline_if_due(&key, &mut || Ok(())),
+                crate::workspace::baseline::SealOutcome::Sealed
+            );
+            cache.shutdown();
+        }
+
         /// Task 10b: a batch that ran memory-only (the store opened after
         /// `MAX_OPEN_WAIT`, or was enabled later) leaves members without a
         /// record. Once the store is enabled, the next batch proves them, so
@@ -7011,32 +7165,50 @@ end.
                 refused: usize,
                 limited: usize,
                 deferred: usize,
-                maintenance: Duration,
+                /// The largest WAL seen between batches.
+                wal_peak: u64,
+            }
+
+            /// A baseline view of `workspace` whose store under `directory`
+            /// has the production maintenance schedule (the worker's steps
+            /// and its wake on pressure), unlike `persisting_view`.
+            fn scheduled_view(
+                workspace: &Workspace,
+                directory: &Path,
+            ) -> (Workspace, PersistentCache) {
+                let cache = PersistentCache::start_with(
+                    CacheOptions {
+                        enabled: true,
+                        directory: Some(directory.to_path_buf()),
+                        ..CacheOptions::default()
+                    },
+                    workspace.project_cache().clone(),
+                    Arc::default(),
+                    Namespace::new(Digest::from_bytes([11; 32])),
+                );
+                assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+                (view_with(workspace, &cache), cache)
+            }
+
+            fn wal_pressure_bypasses(cache: &PersistentCache) -> u64 {
+                cache.counters().unwrap().snapshot().bypasses
+                    [crate::persistent_cache::names::bypass_index(
+                        &pascal_cache::Bypass::WalPressure,
+                    )]
             }
 
             /// Batches of `bound` until the index is complete; the first
-            /// `Err` (a cancellation) ends them. With `maintain`, a
-            /// maintenance step follows each batch, as the worker's would:
-            /// the test cache schedules none, and without its checkpoints
-            /// the WAL reaches its threshold after about 600 extracted
-            /// members, so later publications are refused.
+            /// `Err` (a cancellation) ends them. With `store`, the WAL's
+            /// size is sampled after each batch.
             fn batches(
                 view: &mut Workspace,
                 anchor: &IndexAnchor,
                 bound: IndexBound,
-                maintain: Option<&PersistentCache>,
+                store: Option<&Path>,
                 before_io: &mut dyn FnMut() -> Result<(), String>,
                 totals: &mut Totals,
             ) -> Result<(), String> {
                 loop {
-                    if let Some(cache) = maintain
-                        && totals.batches > 0
-                    {
-                        let started = Instant::now();
-                        let step = cache.step_now().expect("a maintenance step");
-                        assert!(step.is_ok(), "{step:?}");
-                        totals.maintenance += started.elapsed();
-                    }
                     let progress = view.advance_workspace_index(
                         anchor,
                         bound,
@@ -7050,6 +7222,9 @@ end.
                     totals.refused += progress.refused;
                     totals.limited += progress.limited;
                     totals.deferred += progress.deferred;
+                    if let Some(store) = store {
+                        totals.wal_peak = totals.wal_peak.max(store_bytes(store).1);
+                    }
                     if progress.complete {
                         return Ok(());
                     }
@@ -7091,6 +7266,56 @@ end.
                 }
             }
 
+            /// Task 11 fix round 1: past the WAL threshold, the production
+            /// schedule (the worker woken by the refusal) checkpoints, and
+            /// the refused members are proven by later batches: a cold run
+            /// persists every member and seals, with no hand-run step.
+            #[test]
+            fn a_cold_index_past_the_wal_threshold_persists_every_member_and_seals() {
+                const UNITS: usize = 60;
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (session, key, anchor) = synthetic_project(root, UNITS);
+                let (mut view, cache) = scheduled_view(&session, store.path());
+                {
+                    let job = cache.job().expect("job");
+                    let revision = job.store().policy().unwrap().revision;
+                    job.store()
+                        .set_policy(
+                            revision,
+                            pascal_cache::StorePolicy {
+                                wal_threshold_bytes: pascal_cache::MIN_WAL_THRESHOLD_BYTES,
+                                ..pascal_cache::StorePolicy::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                let mut totals = Totals::default();
+                batches(
+                    &mut view,
+                    &anchor,
+                    IndexBound::extraction(),
+                    Some(store.path()),
+                    &mut || Ok(()),
+                    &mut totals,
+                )
+                .unwrap();
+                assert!(
+                    wal_pressure_bypasses(&cache) > 0,
+                    "the WAL reached its threshold: {totals:?}"
+                );
+                // A member whose artifact got in before its record was
+                // refused is proven by reuse, the others by extraction.
+                assert!(totals.persisted + totals.reused >= UNITS, "{totals:?}");
+                assert_eq!(recorded(&view, &key).len(), UNITS);
+                assert_eq!(
+                    view.seal_baseline_if_due(&key, &mut || Ok(())),
+                    SealOutcome::Sealed
+                );
+                cache.shutdown();
+            }
+
             /// Spec §12.2 amendment 2026-11-03: second session, unchanged
             /// tree, zero parses. Ordinary test at 300 units; the
             /// 5,000-unit measurement is below.
@@ -7116,7 +7341,7 @@ end.
 
                 // 1. First session: extraction batches publish every member,
                 // then the baseline is sealed.
-                let (mut first, cache) = persisting_view(&session, store.path());
+                let (mut first, cache) = scheduled_view(&session, store.path());
                 crate::navigation::test_reset_document_parse_count();
                 let started = Instant::now();
                 let mut one = Totals::default();
@@ -7124,7 +7349,7 @@ end.
                     &mut first,
                     &anchor,
                     IndexBound::extraction(),
-                    Some(&cache),
+                    Some(store.path()),
                     &mut || Ok(()),
                     &mut one,
                 )
@@ -7144,9 +7369,24 @@ end.
                     (0, 0, 0),
                     "{one:?}"
                 );
-                assert_eq!((one.indexed, one.persisted, one.reused), (units, units, 0));
-                assert_eq!(parses1, units);
+                // A publication refused for room is proven again by a later
+                // batch: extracted again, or reused when its artifact got in.
+                assert!(one.persisted + one.reused >= units, "{one:?}");
+                assert!(one.indexed + one.reused >= units, "{one:?}");
+                assert_eq!(parses1, one.indexed);
                 assert_eq!(recorded(&first, &key).len(), units);
+                let pressure1 = wal_pressure_bypasses(&cache);
+                let [artifacts, records] = take_publish_wal();
+                eprintln!(
+                    "synthetic {units}: WAL growth: artifact publications {} bytes over {} \
+                     ({} per member), record publications {} bytes over {} ({} per member)",
+                    artifacts.0,
+                    artifacts.1,
+                    artifacts.0 / artifacts.1.max(1) as u64,
+                    records.0,
+                    records.1,
+                    records.0 / records.1.max(1) as u64,
+                );
                 let size1 = store_bytes(store.path());
                 let reserved1 = first.project_cache.stats().reserved_index_bytes;
                 cache.shutdown();
@@ -7156,7 +7396,8 @@ end.
                 // 2. Second session: a fresh project cache adopts the
                 // snapshot, then reuse batches fill the index from the
                 // store; every member is still read and hashed (R8-1).
-                let (mut second, cache) = restarted_view(root, store.path());
+                let (mut second, cache) =
+                    scheduled_view(&workspace(root, WorkspaceOptions::default()), store.path());
                 crate::navigation::test_reset_document_parse_count();
                 let started = Instant::now();
                 let cancel = AtomicBool::new(false);
@@ -7192,15 +7433,24 @@ end.
                 assert_eq!(members(&second, &key).len(), units);
                 assert_eq!(seal, SealOutcome::Unchanged);
                 assert_eq!(cache.counters().unwrap().snapshot().hits, units as u64);
+                // Only `Shared.inc` is validated through evidence, and it is
+                // read once: the process witness of its stamp proves it for
+                // the other includers (root bytes are read+hash, not
+                // validation reads).
+                assert!(reads >= 1, "{reads}");
                 let size2 = store_bytes(store.path());
                 let reserved2 = second.project_cache.stats().reserved_index_bytes;
                 eprintln!(
-                    "synthetic {units}: t1 {t1:?} (indexing {indexing1:?}, {} batches, \
-                     maintenance steps {:?}), \
-                     parses1 {parses1}; t2 {t2:?} (adoption {adoption:?}, reuse to {indexing2:?}, \
-                     {} batches), parses2 {parses2}, ratio {:.4}",
+                    "synthetic {units}: t1 {t1:?} (indexing {indexing1:?}, {} batches), \
+                     parses1 {parses1}, indexed {} reused {} persisted {}, WAL peak {} \
+                     (between batches), walPressure bypasses {pressure1}; t2 {t2:?} \
+                     (adoption {adoption:?}, reuse to {indexing2:?}, {} batches), parses2 \
+                     {parses2}, ratio {:.4}",
                     one.batches,
-                    one.maintenance,
+                    one.indexed,
+                    one.reused,
+                    one.persisted,
+                    one.wal_peak,
                     two.batches,
                     t2.as_secs_f64() / t1.as_secs_f64(),
                 );
@@ -7211,6 +7461,13 @@ end.
                 );
                 let phases = take_reuse_phases();
                 assert_eq!(phases[ReusePhase::ReadHash as usize].1, units, "{phases:?}");
+                // Every tenth unit includes `Shared.inc`: its member evidence
+                // is validated; the others are proven by their local key.
+                assert_eq!(
+                    phases[ReusePhase::Validation as usize].1,
+                    (units - 1).div_ceil(10),
+                    "{phases:?}"
+                );
                 report_phases(&format!("synthetic {units} second session"), phases);
                 cache.shutdown();
                 drop(second);
@@ -7227,7 +7484,7 @@ end.
                 let target = units * 2 / 5;
                 let store = private_dir();
                 let (mut first, cache) =
-                    persisting_view(&workspace(root, WorkspaceOptions::default()), store.path());
+                    scheduled_view(&workspace(root, WorkspaceOptions::default()), store.path());
                 // The hook runs after each member's reuse attempt, before its
                 // extraction: the attempt for member `target + 1` cancels.
                 let attempts = Rc::new(Cell::new(0));
@@ -7239,7 +7496,7 @@ end.
                     &mut first,
                     &anchor,
                     IndexBound::extraction(),
-                    Some(&cache),
+                    Some(store.path()),
                     &mut || {
                         if attempts.get() > target {
                             Err(CANCELLATION_MESSAGE.to_owned())
@@ -7253,11 +7510,18 @@ end.
                 let cancelled_after = started.elapsed();
                 assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
                 let published = recorded(&first, &key);
-                assert_eq!(published.len(), target);
+                // Fewer when a publication refused for room was not proven
+                // again before the kill.
+                assert!(
+                    published.len() <= target && !published.is_empty(),
+                    "{killed:?}"
+                );
+                let pressure_killed = wal_pressure_bypasses(&cache);
                 cache.shutdown();
                 drop(first);
 
-                let (mut resumed, cache) = restarted_view(root, store.path());
+                let (mut resumed, cache) =
+                    scheduled_view(&workspace(root, WorkspaceOptions::default()), store.path());
                 let loaded = record_loads();
                 crate::navigation::test_reset_document_parse_count();
                 let started = Instant::now();
@@ -7266,7 +7530,7 @@ end.
                     &mut resumed,
                     &anchor,
                     IndexBound::extraction(),
-                    Some(&cache),
+                    Some(store.path()),
                     &mut || Ok(()),
                     &mut resume,
                 );
@@ -7275,22 +7539,30 @@ end.
                 let resumed_in = started.elapsed();
                 let parses = crate::navigation::test_document_parse_count();
                 assert_eq!((resume.refused, resume.limited), (0, 0), "{resume:?}");
-                assert_eq!(parses, units - target);
-                assert_eq!(
-                    (resume.reused, resume.indexed, resume.persisted),
-                    (target, units - target, units - target)
-                );
+                // Every published member is reused; one whose artifact was
+                // published without its record is reused too.
+                assert!(resume.reused >= published.len(), "{resume:?}");
+                // More when publications refused for room were proven
+                // again by a later batch.
+                assert!(resume.reused + resume.indexed >= units, "{resume:?}");
+                assert_eq!(parses, resume.indexed);
                 let loaded = loaded.borrow();
-                assert_eq!(loaded.len(), units - target);
+                assert_eq!(loaded.len(), resume.indexed);
                 assert!(
                     loaded.iter().all(|path| !published.contains(path)),
                     "no published member is extracted again"
                 );
                 assert_eq!(recorded(&resumed, &key).len(), units);
                 eprintln!(
-                    "synthetic {units}: kill at {target} published after {cancelled_after:?}; \
-                     resume reused {}, parsed {parses} in {resumed_in:?} ({} batches)",
-                    resume.reused, resume.batches,
+                    "synthetic {units}: kill at {target} attempts, {} published after \
+                     {cancelled_after:?} (walPressure bypasses {pressure_killed}); resume \
+                     reused {}, parsed {parses}, persisted {} in {resumed_in:?} ({} batches, \
+                     walPressure bypasses {})",
+                    published.len(),
+                    resume.reused,
+                    resume.persisted,
+                    resume.batches,
+                    wal_pressure_bypasses(&cache),
                 );
                 cache.shutdown();
             }

@@ -5586,11 +5586,27 @@ struct StoredIndex {
     /// A batch indexed members while the store was not enabled: they have
     /// no record until the next persisting batch proves them again.
     memory_only: bool,
+    /// A publication was refused for room (the WAL at its threshold, the
+    /// disk budget, free space): its members stay memory-only until the
+    /// store reports no pressure, then a batch proves them again.
+    awaiting_room: bool,
 }
 
 impl StoredIndex {
     fn total_charge(&self) -> usize {
         self.charged.saturating_add(self.index.bytes())
+    }
+
+    fn unrecorded_fresh_members(&self) -> Vec<PathBuf> {
+        self.index
+            .records()
+            .into_iter()
+            .filter(|(path, record)| {
+                record.is_none()
+                    && self.index.state_of(path) == Some(crate::workspace_index::MemberState::Fresh)
+            })
+            .map(|(path, _)| path)
+            .collect()
     }
 }
 
@@ -6024,6 +6040,7 @@ impl ProjectCache {
                     last_seal: None,
                     hint_tried: false,
                     memory_only: false,
+                    awaiting_room: false,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -6355,17 +6372,51 @@ impl ProjectCache {
             return 0;
         };
         stored.memory_only = false;
-        let unrecorded = stored
-            .index
-            .records()
-            .into_iter()
-            .filter(|(path, record)| {
-                record.is_none()
-                    && stored.index.state_of(path)
-                        == Some(crate::workspace_index::MemberState::Fresh)
-            })
-            .map(|(path, _)| path)
-            .collect::<Vec<_>>();
+        let unrecorded = stored.unrecorded_fresh_members();
+        for path in &unrecorded {
+            stored.index.mark_stale(path);
+        }
+        unrecorded.len()
+    }
+
+    /// A publication of `key`'s member was refused for room.
+    pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.awaiting_room = true;
+        }
+    }
+
+    pub(crate) fn index_is_awaiting_room(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.awaiting_room)
+    }
+
+    /// After `note_index_awaiting_room`: the fresh members of `key` still
+    /// without a record (0 otherwise).
+    pub(crate) fn index_awaiting_room(&self, key: &ContextKey) -> usize {
+        self.index()
+            .contexts
+            .get(key)
+            .filter(|stored| stored.awaiting_room)
+            .map_or(0, |stored| stored.unrecorded_fresh_members().len())
+    }
+
+    /// Once the store has room again: marks the members
+    /// `index_awaiting_room` counts stale, so the next batches prove them
+    /// (reuse, else extraction). Returns how many.
+    pub(crate) fn restale_awaiting_room(&self, key: &ContextKey) -> usize {
+        let mut store = self.index();
+        let Some(stored) = store
+            .contexts
+            .get_mut(key)
+            .filter(|stored| stored.awaiting_room)
+        else {
+            return 0;
+        };
+        stored.awaiting_room = false;
+        let unrecorded = stored.unrecorded_fresh_members();
         for path in &unrecorded {
             stored.index.mark_stale(path);
         }

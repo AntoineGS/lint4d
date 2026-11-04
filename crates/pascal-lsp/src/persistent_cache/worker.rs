@@ -18,6 +18,9 @@ pub(super) const IDLE_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const PRESSURE_INTERVAL: Duration = Duration::from_secs(1);
 /// A step deferred by interactive work is tried again this soon.
 const GATE_RETRY: Duration = Duration::from_millis(25);
+/// A wake schedules the next step this long after the last one at the
+/// earliest: refused writes wake the worker once per refusal at most.
+pub(super) const WAKE_SPACING: Duration = Duration::from_millis(50);
 /// Past this since the last completed step (or the open), a step runs
 /// whatever the gate says, so the lease is renewed (D23); the step budget
 /// bounds what it takes from interactive work.
@@ -30,6 +33,9 @@ pub(super) enum Command {
     Open,
     /// Run one step now, gate ignored, and reply (tests).
     StepNow(crossbeam_channel::Sender<Option<StepResult>>),
+    /// Writes were refused for room: schedule the next step now
+    /// (`WAKE_SPACING` after the last).
+    Wake,
     Shutdown,
 }
 
@@ -82,6 +88,8 @@ pub(super) fn step(inner: &Arc<Inner>, cursor: &mut Cursor) -> Option<StepResult
         }
         Err(bypass) => job.observe(bypass),
     }
+    drop(job);
+    inner.note_step();
     Some(result)
 }
 
@@ -106,6 +114,8 @@ struct Schedule {
     due: Instant,
     /// The last completed step, or the open.
     renewed: Instant,
+    /// When the last scheduled step ran.
+    stepped: Option<Instant>,
     traced: Option<(Instant, String)>,
 }
 
@@ -116,6 +126,7 @@ impl Schedule {
             generation: 0,
             due: now,
             renewed: now,
+            stepped: None,
             traced: None,
         }
     }
@@ -142,6 +153,13 @@ impl Schedule {
         Some(self.due)
     }
 
+    /// A wake: the next step is due now, at most every `WAKE_SPACING`.
+    fn wake(&mut self) {
+        let now = Instant::now();
+        let earliest = self.stepped.map_or(now, |at| (at + WAKE_SPACING).max(now));
+        self.due = self.due.min(earliest);
+    }
+
     fn run(&mut self, inner: &Arc<Inner>, cursor: &mut Cursor) {
         let since_last = Instant::now().saturating_duration_since(self.renewed);
         let Some(result) = scheduled_step(inner, cursor, since_last) else {
@@ -151,6 +169,7 @@ impl Schedule {
             return;
         };
         let now = Instant::now();
+        self.stepped = Some(now);
         if matches!(&result, Ok(report) if !report.cancelled) {
             self.renewed = now;
         }
@@ -211,6 +230,12 @@ fn run(weak: &Weak<Inner>, commands: &crossbeam_channel::Receiver<Command>) {
                 Ok(Command::StepNow(reply)) => {
                     let result = weak.upgrade().and_then(|inner| step(&inner, &mut cursor));
                     let _ = reply.send(result);
+                }
+                Ok(Command::Wake) => {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.wake_pending.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                    schedule.wake();
                 }
                 Ok(Command::Shutdown) | Err(_) => return,
             },

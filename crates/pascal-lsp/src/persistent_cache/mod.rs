@@ -85,6 +85,8 @@ pub(super) struct Inner {
     /// `false` only in unit tests, which step maintenance by hand (Task 6
     /// honours it).
     schedule_maintenance: bool,
+    /// A wake is on its way to the worker (one at a time).
+    wake_pending: AtomicBool,
     /// Kept apart from `Shared` (which holds the command sender) so
     /// `shutdown` joins with no lock held.
     join: Mutex<Option<JoinHandle<()>>>,
@@ -119,6 +121,8 @@ pub(super) struct Shared {
     shut_down: bool,
     commands: Option<crossbeam_channel::Sender<worker::Command>>,
     worker_thread: Option<ThreadId>,
+    /// Maintenance steps the worker completed (any generation).
+    steps: u64,
     /// The last retry delay, doubled by each retried bypass.
     retry_delay: Option<Duration>,
     /// A retry due for the `Bypassed` state of this generation.
@@ -160,6 +164,7 @@ impl Shared {
             shut_down: false,
             commands: None,
             worker_thread: None,
+            steps: 0,
             retry_delay: None,
             retry: None,
             logged: [None; names::BYPASS_KINDS],
@@ -238,6 +243,7 @@ impl Inner {
             gate,
             namespace,
             schedule_maintenance,
+            wake_pending: AtomicBool::new(false),
             join: Mutex::new(None),
             #[cfg(test)]
             open_hook: Mutex::new(None),
@@ -358,6 +364,32 @@ impl Inner {
 
     /// Keep the worker's usage reading for the status, unless the
     /// generation moved on or left `Enabled` meanwhile.
+    /// Ask the worker for a scheduled step now: writes were refused for
+    /// room only maintenance makes (a checkpoint, reclaimed rows). Only
+    /// the cache's own schedule steps; without one this does nothing.
+    fn wake_maintenance(&self) {
+        if !self.schedule_maintenance || self.wake_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = self.lock();
+        // The worker's own step schedules its next one itself.
+        let sent = shared.worker_thread != Some(std::thread::current().id())
+            && shared
+                .commands
+                .as_ref()
+                .is_some_and(|commands| commands.send(worker::Command::Wake).is_ok());
+        drop(shared);
+        if !sent {
+            self.wake_pending.store(false, Ordering::Release);
+        }
+    }
+
+    /// A maintenance step finished.
+    fn note_step(&self) {
+        self.lock().steps += 1;
+        self.changed.notify_all();
+    }
+
     fn record_usage(&self, generation: u64, usage: status::UsageView) {
         let mut shared = self.lock();
         if shared.generation == generation && shared.state == CacheState::Enabled {
@@ -425,6 +457,9 @@ impl Inner {
         self.changed.notify_all();
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+const STEP_NOW_WAIT: Duration = Duration::from_secs(120);
 
 impl PersistentCache {
     pub(crate) fn start(
@@ -705,7 +740,8 @@ impl PersistentCache {
     }
 
     /// Run one maintenance step on the worker, gate ignored. `None` without
-    /// a worker, without a job, or when no reply comes within 5 s.
+    /// a worker or without a job. The wait is a backstop against a dead
+    /// worker, long enough that a loaded machine never reaches it.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn step_now(&self) -> Option<worker::StepResult> {
         let inner = self.inner.as_ref()?;
@@ -716,7 +752,7 @@ impl PersistentCache {
             .as_ref()?
             .send(worker::Command::StepNow(reply))
             .ok()?;
-        result.recv_timeout(Duration::from_secs(5)).ok().flatten()
+        result.recv_timeout(STEP_NOW_WAIT).ok().flatten()
     }
 
     /// The scheduled step's path (gate check included, never waiting) on
@@ -725,6 +761,42 @@ impl PersistentCache {
     pub(crate) fn scheduled_step_for_test(&self) -> Option<worker::StepResult> {
         let inner = self.inner.as_ref()?;
         worker::scheduled_step(inner, &mut worker::new_cursor(), Duration::ZERO)
+    }
+
+    /// Wake the scheduled maintenance and wait at most `timeout` for its
+    /// next step to finish, calling `check` between waits (an `Err` ends
+    /// the wait with it). `Ok(false)` without a schedule or when no step
+    /// finished in time. The caller then reads the store's pressure.
+    pub(crate) fn await_maintenance(
+        &self,
+        timeout: Duration,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        const SLICE: Duration = Duration::from_millis(25);
+        let Some(inner) = self
+            .inner
+            .as_ref()
+            .filter(|inner| inner.schedule_maintenance)
+        else {
+            return Ok(false);
+        };
+        let before = inner.lock().steps;
+        inner.wake_maintenance();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let shared = inner.wait_while(inner.lock(), left.min(SLICE), |shared| {
+                shared.steps == before && !shared.shut_down
+            });
+            if shared.steps != before {
+                return Ok(true);
+            }
+            if shared.shut_down || left.is_zero() {
+                return Ok(false);
+            }
+            drop(shared);
+            check()?;
+        }
     }
 
     /// Wait while the state is `Opening` or `Fencing`; returns the state.
@@ -815,6 +887,11 @@ impl CacheJob {
     pub(crate) fn observe(&self, bypass: &Bypass) {
         if *bypass != Bypass::Fenced {
             self.inner.counters.record_bypass(bypass);
+            // Only maintenance makes this room: step soon, not at the next
+            // idle interval.
+            if matches!(bypass, Bypass::WalPressure | Bypass::OverBudget) {
+                self.inner.wake_maintenance();
+            }
             return;
         }
         let mut shared = self.inner.lock();

@@ -1080,7 +1080,7 @@ fn project_conditional_metadata_fills_only_unknown_explicit_facts() {
             "<Project><PropertyGroup>",
             "<MainSource>Main.pas</MainSource>",
             "<CompilerVersion>24.0</CompilerVersion>",
-            "<DCC_RangeChecks>true</DCC_RangeChecks>",
+            "<DCC_RangeChecking>true</DCC_RangeChecking>",
             "<DCC_Define>PROJECT_DEFINE</DCC_Define>",
             "</PropertyGroup></Project>"
         ),

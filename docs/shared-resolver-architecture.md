@@ -95,8 +95,13 @@ directive metadata, and `complete`. The bounded analyzer understands `IFDEF`,
 `UNDEF`, and `I`/`INCLUDE` directives in the supported Pascal directive comment
 forms. Expressions cover defined/true/false values, `NOT`/`AND`/`OR`,
 parentheses, and bounded numeric/string/boolean comparisons. `IFOPT` uses
-explicit named compiler-option facts; absent facts remain unknown because
-compiler-option state is not inferred from the host.
+explicit named compiler-option facts; absent facts remain unknown, and the
+host is never consulted. Project discovery supplies those facts (D45): a
+switch the project's metadata and the installation leave unset takes dcc's
+observed default for the selected compiler and platform, library code gets a
+switch only where the project's value is that default, and anything an
+unevaluated import or `GlobalOptionFile` could change stays unknown
+(`pascal-project/src/switches.rs`).
 
 Known-inactive branches can be excluded. Unknown activity remains potentially
 active. Malformed nesting, unsupported active directives, cancellation, encoding

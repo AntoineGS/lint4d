@@ -14,6 +14,7 @@ use super::msbuild_eval::{
 };
 use super::packages::parse_explicit_unit_paths;
 use super::selection::{is_deleted_path, relevant_workspace_root, standalone_overrides};
+use super::switches::SwitchFacts;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -385,6 +386,7 @@ pub(super) fn build_project_context(
     let mut rtl_constants_override = None;
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
+    let mut installation_failed = false;
     let mut ide_path_warnings = Vec::new();
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
@@ -480,6 +482,7 @@ pub(super) fn build_project_context(
                         installation_environment = Some(environment);
                     }
                     Err(error) => {
+                        installation_failed = true;
                         installation_warnings.push(error);
                     }
                 }
@@ -494,6 +497,7 @@ pub(super) fn build_project_context(
                 }
             }
             Err(error) => {
+                installation_failed = true;
                 installation_warnings.push(error);
             }
         }
@@ -844,6 +848,7 @@ pub(super) fn build_project_context(
     } else {
         ConditionalFact::Unknown
     };
+    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     let mut conditional_warnings = Vec::new();
     let mut conditional_context = merge_project_conditional_context(
         &evaluation_options,
@@ -852,8 +857,21 @@ pub(super) fn build_project_context(
         &mut conditional_warnings,
     );
     builder.warnings.extend(conditional_warnings);
+    let switch_facts = SwitchFacts::evaluate(
+        &builder,
+        installation_environment
+            .as_ref()
+            .map(|environment| &environment.properties),
+        crate::switches::defaults_known(
+            installation_selection.as_ref(),
+            installation_failed,
+            target_platform.as_ref(),
+            builder.unknown_properties.contains("platform"),
+            conditional_context.compiler_version,
+        ),
+    );
+    switch_facts.apply_project(&mut conditional_context);
 
-    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
         target_platform.as_ref(),
@@ -899,6 +917,7 @@ pub(super) fn build_project_context(
         rtl_constants.as_deref(),
     );
     library_conditional_context.absent_define = ConditionalFact::Unknown;
+    switch_facts.apply_library(&mut library_conditional_context);
 
     let metadata_observations = complete_metadata_observations(
         &metadata_files,
@@ -1507,24 +1526,11 @@ fn merge_project_conditional_context(
         }
     }
 
-    // These are the bounded project-property spellings with stable Delphi
-    // IFOPT aliases.  Unknown properties are intentionally not guessed.
-    const OPTION_PROPERTIES: &[(&str, &str)] = &[
-        ("dcc_rangechecks", "R"),
-        ("dcc_overflowchecks", "Q"),
-        ("dcc_optimization", "O"),
-        ("dcc_assertions", "C"),
-        ("dcc_runtimechecks", "RUNTIME_CHECKS"),
-        ("dcc_debuginformation", "D"),
-    ];
-    for (property, canonical) in OPTION_PROPERTIES {
-        let Some(raw) = builder.property(property) else {
-            continue;
-        };
+    if let Some(raw) = builder.property("dcc_runtimechecks")
+        && !context.options.contains_key("RUNTIME_CHECKS")
+    {
         let value = parse_conditional_fact(&raw).unwrap_or(ConditionalFact::Unknown);
-        if !context.options.contains_key(*canonical) {
-            context.set_option(canonical, value);
-        }
+        context.set_option("RUNTIME_CHECKS", value);
     }
     context
 }

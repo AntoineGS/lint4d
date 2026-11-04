@@ -138,6 +138,7 @@ pub use packages::{
 mod membership;
 mod msbuild_eval;
 mod packages;
+mod switches;
 use assembly::add_unique_path;
 use authorization::{ExistingPathStatus, resolve_existing_path_status};
 use msbuild_eval::{ProjectBuilder, local_name, xml_attributes, xml_reference_text};

@@ -981,11 +981,25 @@ strings. Missing facts are `Unknown`; the server never infers them from the
 host OS, current date, Rust toolchain, or an unrelated target platform.
 
 Project discovery additionally reads explicit `CompilerVersion`/
-`DCC_CompilerVersion` metadata and a bounded set of option properties such as
-`DCC_RangeChecks`, `DCC_OverflowChecks`, `DCC_Optimization`,
-`DCC_Assertions`, `DCC_RuntimeChecks`, and `DCC_DebugInformation`. Explicit
-client facts win over these properties; unsupported or malformed metadata
-stays unknown and is reported as a warning. The same context identity is part
+`DCC_CompilerVersion` metadata and the compiler-switch properties that
+CodeGear.Delphi.Targets passes to dcc: `DCC_FullBooleanEvaluations` (`B`),
+`DCC_AssertionsAtRuntime` (`C`), `DCC_DebugInformation` (`D`),
+`DCC_LongStrings` (`H`), `DCC_IOChecking` (`I`), `DCC_Optimize` (`O`),
+`DCC_IntegerOverflowCheck` (`Q`), `DCC_RangeChecking` (`R`),
+`DCC_TypedAtParameter` (`T`), `DCC_ExtendedSyntax` (`X`) and
+`DCC_SymbolReferenceInfo` (`Y`), plus `DCC_RuntimeChecks`. Explicit client
+facts win over these properties; unsupported or malformed values stay unknown.
+A switch the project, its option sets, its configurations and the
+installation's `environment.proj` leave unset takes dcc's default
+(B- C+ D+ H+ I+ O+ Q- R- T- X+ Y+), for the compilers whose defaults were
+observed: 21.0 Win32, and 24.0 and 37.0 Win32/Win64. It stays unknown for
+other compilers and platforms, when the installation is not selected or did
+not load, when the project metadata is incomplete or an import was not
+evaluated, and whenever `GlobalOptionFile` is (or may be) set, because
+CodeGear.Common.Targets imports that file after the project. Library sources
+(outside the project's own roots) get a switch only where the project's value
+is that default, because dcc compiles them with the project's switches when
+their source is on the search path and their DCUs' switches are not known. The same context identity is part
 of project, parsed-source, include-expansion, package, and completion caches,
 so two projects can analyze the same physical source independently.
 

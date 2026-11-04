@@ -32,6 +32,12 @@ pub(super) struct ProjectBuilder {
     pub(super) path_issues: Vec<ProjectPathIssue>,
     pub(super) warnings: Vec<String>,
     pub(super) incomplete: bool,
+    /// Properties an element that was not evaluated (an unknown condition,
+    /// an unknown value, a value over budget) could have assigned. Imports
+    /// that were not evaluated are covered by [`Self::undefined_is_empty`].
+    pub(super) unevaluated_assignments: HashSet<String>,
+    /// Incompleteness that may have hidden any property.
+    pub(super) unbounded_incomplete: bool,
     active_imports: HashSet<PathBuf>,
     import_count: usize,
     pub(super) project_dir: PathBuf,
@@ -156,6 +162,8 @@ impl ProjectBuilder {
             path_issues: Vec::new(),
             warnings,
             incomplete,
+            unevaluated_assignments: HashSet::new(),
+            unbounded_incomplete: incomplete,
             active_imports: HashSet::new(),
             import_count: 0,
             project_dir,
@@ -423,6 +431,8 @@ impl ProjectBuilder {
             TruthValue::Unknown => {
                 self.incomplete = true;
                 for property in group.properties {
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                 }
                 return;
@@ -448,6 +458,8 @@ impl ProjectBuilder {
                 TruthValue::False => continue,
                 TruthValue::Unknown => {
                     self.incomplete = true;
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                     continue;
                 }
@@ -498,6 +510,9 @@ impl ProjectBuilder {
                 source_file,
             );
             let key = property.name.to_ascii_lowercase();
+            if value.undefined_property_unknown {
+                self.unevaluated_assignments.insert(key.clone());
+            }
             if !empty_expansions.is_empty()
                 && self.properties.get(&key).map(String::as_str) == Some(trimmed)
             {
@@ -529,6 +544,8 @@ impl ProjectBuilder {
             .saturating_add(value.len());
         if new_bytes > MAX_TOTAL_PROPERTY_BYTES {
             self.incomplete = true;
+            self.unevaluated_assignments.insert(key.clone());
+            self.unknown_properties.insert(key.clone());
             self.warnings.push(format!(
                 "property memory budget exceeded while evaluating {name} in {}; value ignored",
                 source_file.display()
@@ -540,7 +557,10 @@ impl ProjectBuilder {
         if unknown || value.contains(UNRESOLVED_MARKER) {
             self.unknown_properties.insert(key.clone());
         } else {
+            // A later definite assignment replaces whatever an earlier
+            // unevaluated element could have assigned.
             self.unknown_properties.remove(&key);
+            self.unevaluated_assignments.remove(&key);
         }
         if explicit_dependency {
             self.configured_properties.insert(key.clone());
@@ -920,6 +940,11 @@ enum FrameKind {
         operation: usize,
         condition: Option<String>,
     },
+    /// `Choose`: `branches` holds the conditions of the `When`s seen so far.
+    Choose {
+        condition: Option<String>,
+        branches: Vec<String>,
+    },
     Property {
         operation: usize,
         condition: Option<String>,
@@ -932,6 +957,7 @@ impl FrameKind {
     fn condition(&self) -> Option<&str> {
         match self {
             Self::Other { condition, .. }
+            | Self::Choose { condition, .. }
             | Self::PropertyGroup { condition, .. }
             | Self::Property { condition, .. } => condition.as_deref(),
         }
@@ -940,7 +966,7 @@ impl FrameKind {
     fn in_target(&self) -> bool {
         match self {
             Self::Other { in_target, .. } | Self::Property { in_target, .. } => *in_target,
-            Self::PropertyGroup { .. } => false,
+            Self::PropertyGroup { .. } | Self::Choose { .. } => false,
         }
     }
 }
@@ -993,6 +1019,63 @@ pub(super) fn parse_xml_operations(
                         kind: FrameKind::Other {
                             condition: effective_condition,
                             in_target: true,
+                        },
+                        text: String::new(),
+                    });
+                } else if name.eq_ignore_ascii_case("choose") {
+                    frames.push(XmlFrame {
+                        kind: FrameKind::Choose {
+                            condition: effective_condition,
+                            branches: Vec::new(),
+                        },
+                        text: String::new(),
+                    });
+                } else if (name.eq_ignore_ascii_case("when")
+                    || name.eq_ignore_ascii_case("otherwise"))
+                    && matches!(
+                        frames.last().map(|frame| &frame.kind),
+                        Some(FrameKind::Choose { .. })
+                    )
+                {
+                    // MSBuild applies the first `When` whose condition holds,
+                    // else `Otherwise`: each branch is guarded by the
+                    // negation of every earlier `When`.
+                    let is_when = name.eq_ignore_ascii_case("when");
+                    let Some(XmlFrame {
+                        kind:
+                            FrameKind::Choose {
+                                condition,
+                                branches,
+                            },
+                        ..
+                    }) = frames.last_mut()
+                    else {
+                        unreachable!("the parent frame was just matched as a Choose");
+                    };
+                    let mut guard = branches
+                        .iter()
+                        .map(|earlier| format!("!({earlier})"))
+                        .collect::<Vec<_>>()
+                        .join(" And ");
+                    if is_when {
+                        let own = own_condition
+                            .clone()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "'1'=='1'".to_string());
+                        if !guard.is_empty() {
+                            guard.push_str(" And ");
+                        }
+                        guard.push_str(&format!("({own})"));
+                        branches.push(own);
+                    }
+                    let branch_condition = combine_conditions(
+                        condition.as_deref(),
+                        Some(guard.as_str()).filter(|value| !value.is_empty()),
+                    );
+                    frames.push(XmlFrame {
+                        kind: FrameKind::Other {
+                            condition: branch_condition,
+                            in_target: false,
                         },
                         text: String::new(),
                     });
@@ -1813,6 +1896,14 @@ impl TruthValue {
         }
     }
 
+    pub(super) fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
     pub(super) fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::True, _) | (_, Self::True) => Self::True,
@@ -1831,6 +1922,7 @@ enum ConditionToken {
     LeftParen,
     RightParen,
     Comma,
+    Bang,
 }
 
 fn tokenize_condition(condition: &str) -> Result<Vec<ConditionToken>, String> {
@@ -1856,6 +1948,10 @@ fn tokenize_condition(condition: &str) -> Result<Vec<ConditionToken>, String> {
             continue;
         }
         match first {
+            '!' => {
+                tokens.push(ConditionToken::Bang);
+                cursor += 1;
+            }
             '(' => {
                 tokens.push(ConditionToken::LeftParen);
                 cursor += 1;
@@ -1956,6 +2052,9 @@ impl ConditionParser<'_> {
     }
 
     fn parse_primary(&mut self) -> Result<TruthValue, String> {
+        if self.take_token(|token| matches!(token, ConditionToken::Bang)) {
+            return Ok(self.parse_primary()?.not());
+        }
         if self.take_token(|token| matches!(token, ConditionToken::LeftParen)) {
             let value = self.parse_or()?;
             if !self.take_token(|token| matches!(token, ConditionToken::RightParen)) {

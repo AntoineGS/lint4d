@@ -11737,8 +11737,19 @@ fn event_loop(
             Message::Request(request)
                 if request.method == INDEX_STATUS_METHOD && !shutdown_received =>
             {
-                let status =
-                    crate::project_cache::index_status_json(&index_status_cache.index_status());
+                // While the store is enabled the baseline view indexes open
+                // members from disk; only a memory-only index leaves them.
+                let memory_only = !persistent.is_enabled();
+                let is_open = |path: &Path| {
+                    memory_only
+                        && Url::from_file_path(path).is_ok_and(|uri| {
+                            warmer.is_open(&uri)
+                                || warmer.is_open(&crate::workspace::canonical_file_uri(&uri))
+                        })
+                };
+                let status = crate::project_cache::index_status_json(
+                    &index_status_cache.index_status(&is_open),
+                );
                 send_ok(connection, request.id, status)?;
             }
             #[cfg(feature = "test-support")]

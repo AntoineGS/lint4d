@@ -5621,7 +5621,8 @@ pub(crate) struct IndexStatusEntry {
     pub(crate) membership_complete: bool,
     /// The membership is complete, current, and no member that can be
     /// indexed now is pending. Members retried after a refusal are not
-    /// counted against it: they are reported as a gap.
+    /// counted against it: they are reported as a gap. Neither are open
+    /// members still pending, which are answered from their buffers.
     pub(crate) complete: bool,
     /// `"sealed"`: a snapshot this process sealed is the baseline. `"held"`:
     /// the baseline was adopted from an earlier process's snapshot. `"none"`:
@@ -5632,7 +5633,7 @@ pub(crate) struct IndexStatusEntry {
 }
 
 impl IndexStatusEntry {
-    fn of(stored: &StoredIndex) -> Self {
+    fn of(stored: &StoredIndex, is_open: &dyn Fn(&Path) -> bool) -> Self {
         let counts = stored.index.counts();
         let (anchor_is_project, uri) = match &stored.anchor {
             IndexAnchor::Document(uri) => (false, uri.to_string()),
@@ -5645,7 +5646,24 @@ impl IndexStatusEntry {
         let (anchor, anchor_truncated) = truncate_utf8(&uri, STATUS_ANCHOR_BYTES);
         let membership = &stored.membership;
         let membership_complete = membership.complete && !stored.dirty;
-        let eligible_pending = counts.pending.saturating_sub(counts.retrying);
+        // An open member is answered from the editor's buffer: while the
+        // store is off it is never indexed (l4d-33), so it is not work the
+        // index waits for. With the store on, the baseline view indexes it
+        // from disk and it is counted as any other member.
+        let open_pending = if counts.pending > counts.retrying {
+            stored
+                .index
+                .pending(usize::MAX)
+                .iter()
+                .filter(|path| !stored.index.retrying(path) && is_open(path))
+                .count()
+        } else {
+            0
+        };
+        let eligible_pending = counts
+            .pending
+            .saturating_sub(counts.retrying)
+            .saturating_sub(open_pending);
         let mut gaps = Vec::new();
         match &membership.limit {
             Some(limit) => gaps.push(format!("{limit}; the rest are not indexed")),
@@ -6277,14 +6295,16 @@ impl ProjectCache {
     /// One entry per stored context, most recently used first (at most
     /// `MAX_INDEXED_CONTEXTS`), read under the index lock without IO or
     /// touching any context's recency.
-    pub(crate) fn index_status(&self) -> Vec<IndexStatusEntry> {
+    /// `is_open` names the open members a memory-only index leaves to
+    /// their buffers.
+    pub(crate) fn index_status(&self, is_open: &dyn Fn(&Path) -> bool) -> Vec<IndexStatusEntry> {
         let store = self.index();
         let mut stored: Vec<&StoredIndex> = store.contexts.values().collect();
         stored.sort_by_key(|stored| std::cmp::Reverse(stored.last_used));
         stored
             .into_iter()
             .take(MAX_INDEXED_CONTEXTS)
-            .map(IndexStatusEntry::of)
+            .map(|stored| IndexStatusEntry::of(stored, is_open))
             .collect()
     }
 
@@ -6924,7 +6944,7 @@ mod index_tests {
                 usize::MAX,
             );
         }
-        let entries = cache.index_status();
+        let entries = cache.index_status(&|_| false);
         assert_eq!(entries.len(), MAX_INDEXED_CONTEXTS);
         for entry in &entries {
             assert!(entry.anchor_truncated);
@@ -6959,7 +6979,7 @@ mod index_tests {
             stored.index.limit(Path::new("/w/Limited.pas"));
             stored.validation_reads = 7;
         }
-        let entries = cache.index_status();
+        let entries = cache.index_status(&|_| false);
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(
@@ -6998,6 +7018,31 @@ mod index_tests {
         assert!(!json.to_string().contains("Fresh.pas"));
     }
 
+    /// Without persistence an open member is answered from its buffer and
+    /// never indexed (l4d-33): it does not hold `complete` back, or a
+    /// memory-only index with an open member would never be complete
+    /// (protocol test `runtime_disable_is_acknowledged_then_performs_no_cache_io`).
+    #[test]
+    fn index_status_does_not_wait_for_open_members() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let paths = ["/w/Fresh.pas", "/w/Open.pas", "/w/Pending.pas"];
+        cache.set_index_membership(k.clone(), anchor("a"), membership(&paths), usize::MAX);
+        assert_eq!(publish(&cache, &k, "/w/Fresh.pas"), PublishOutcome::Indexed);
+        let is_open = |path: &Path| path == Path::new("/w/Open.pas");
+        let entry = &cache.index_status(&is_open)[0];
+        assert_eq!(entry.counts.pending, 2);
+        assert!(!entry.complete, "Pending.pas is still to index");
+        assert_eq!(
+            publish(&cache, &k, "/w/Pending.pas"),
+            PublishOutcome::Indexed
+        );
+        let entry = &cache.index_status(&is_open)[0];
+        assert_eq!(entry.counts.pending, 1, "the count stays the index's own");
+        assert!(entry.complete, "only the open member is pending");
+        assert!(!cache.index_status(&|_| false)[0].complete);
+    }
+
     #[test]
     fn index_status_lists_the_most_recently_used_context_first() {
         let cache = ProjectCache::new(1 << 30);
@@ -7010,7 +7055,7 @@ mod index_tests {
             );
         }
         cache.read_index(&key("a"), |_, _| ());
-        let entries = cache.index_status();
+        let entries = cache.index_status(&|_| false);
         assert_eq!(entries[0].anchor, "file:///anchors/a");
         assert_eq!(entries[1].anchor, "file:///anchors/b");
         assert!(!entries[0].complete, "the member is still pending");

@@ -9,6 +9,13 @@
 //! DCC task's option table (Borland.Build.Tasks.Delphi.dll). Other compiler
 //! versions and platforms were not observed and keep switches unknown.
 //!
+//! A switch is unknown when something lint4d did not evaluate could have
+//! set its property: an import of unknown content (any property), or a
+//! property group or property element whose condition or value could not be
+//! evaluated (the properties it names). An element that names only other
+//! properties, such as every XE+ template's
+//! `<ProjectName Condition="'$(ProjectName)'==''">`, does not block it.
+//!
 //! What can still change a switch after the project's groups, and how it is
 //! handled:
 //! - CodeGear.Delphi.Targets and CodeGear.Common.Targets assign none of these
@@ -22,6 +29,10 @@
 //!   seeds `environment.proj` before the project, so a switch it sets is
 //!   only known where the project's value equals it. `EnvOptions.proj` is
 //!   read for library paths only; the installations' copies set no switch.
+//! - XE+ templates import `$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\
+//!   $(PRODUCTVERSION)\UserTools.proj` after the project, if it exists. It
+//!   is evaluated like any project import when present (an unknown import
+//!   blocks every switch); none exists in the Headless-Delphi appdata.
 
 use crate::installations::InstallationSelection;
 use crate::msbuild_eval::ProjectBuilder;
@@ -170,7 +181,7 @@ impl SwitchFacts {
     ) -> Self {
         let global_option_file = global_option_file_possible(builder);
         let unset_is_default =
-            defaults_known && !builder.incomplete && builder.undefined_is_empty();
+            defaults_known && !builder.unbounded_incomplete && builder.undefined_is_empty();
         let mut facts = Self {
             project: Vec::new(),
             library: Vec::new(),
@@ -231,7 +242,9 @@ fn project_value(
     installed: Option<ConditionalFact>,
     unset_is_default: bool,
 ) -> Option<ConditionalFact> {
-    if builder.unknown_properties.contains(switch.property) {
+    if builder.unknown_properties.contains(switch.property)
+        || builder.unevaluated_assignments.contains(switch.property)
+    {
         return Some(ConditionalFact::Unknown);
     }
     let evaluated = builder
@@ -251,6 +264,7 @@ fn project_value(
 fn global_option_file_possible(builder: &ProjectBuilder) -> bool {
     !builder.undefined_is_empty()
         || builder.unknown_properties.contains("globaloptionfile")
+        || builder.unevaluated_assignments.contains("globaloptionfile")
         || builder
             .property("globaloptionfile")
             .is_some_and(|value| !value.trim().is_empty())

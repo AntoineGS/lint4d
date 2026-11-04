@@ -486,19 +486,48 @@ fn an_unresolved_setting_stays_unknown() {
     );
 }
 
+/// Every XE+ template has `<ProjectName Condition="'$(ProjectName)'==''">`,
+/// which cannot be evaluated (ProjectName can come from outside); an
+/// element that could set only other properties does not touch a switch.
 #[test]
-fn incomplete_metadata_keeps_unset_switches_unknown() {
-    // A group whose condition cannot be evaluated may set anything.
+fn an_unevaluated_element_setting_other_properties_keeps_the_defaults() {
     let workspace = Workspace::new(
-        "<PropertyGroup Condition=\"'$(Config)' &gt; 'Debug'\"><Other>1</Other></PropertyGroup>\
-         <PropertyGroup><DCC_RangeChecking>true</DCC_RangeChecking></PropertyGroup>",
+        "<PropertyGroup><ProjectName Condition=\"'$(ProjectName)'==''\">App</ProjectName></PropertyGroup>\
+         <PropertyGroup Condition=\"'$(ProjectName)'=='Other'\"><Other>1</Other></PropertyGroup>",
     );
     let context = workspace.context();
     assert!(!context.discovery_complete());
-    assert_eq!(context.conditional_context().option("R"), F::True);
-    assert_eq!(context.conditional_context().option("Q"), F::Unknown);
+    assert_defaults(context.conditional_context(), "project");
+    assert_defaults(context.library_conditional_context(), "library");
+}
+
+/// A group or property element that cannot be evaluated could have set the
+/// switch property it names, and only that one.
+#[test]
+fn an_unevaluated_element_setting_a_switch_keeps_only_that_switch_unknown() {
+    let workspace = Workspace::new(
+        "<PropertyGroup Condition=\"'$(ProjectName)'=='Other'\">\
+           <DCC_RangeChecking>true</DCC_RangeChecking>\
+         </PropertyGroup>\
+         <PropertyGroup>\
+           <DCC_IntegerOverflowCheck Condition=\"'$(Config)' &gt; 'Debug'\">true</DCC_IntegerOverflowCheck>\
+           <DCC_Optimize>false</DCC_Optimize>\
+         </PropertyGroup>",
+    );
+    let context = workspace.context();
+    assert!(!context.discovery_complete());
+    for which in [
+        context.conditional_context(),
+        context.library_conditional_context(),
+    ] {
+        assert_eq!(which.option("R"), F::Unknown, "{:?}", which.options);
+        assert_eq!(which.option("Q"), F::Unknown, "{:?}", which.options);
+        assert_eq!(which.option("I"), F::True, "{:?}", which.options);
+        assert_eq!(which.option("B"), F::False, "{:?}", which.options);
+    }
+    assert_eq!(context.conditional_context().option("O"), F::False);
     assert_eq!(
-        context.library_conditional_context().option("Q"),
+        context.library_conditional_context().option("O"),
         F::Unknown
     );
 }

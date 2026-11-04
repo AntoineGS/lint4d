@@ -32,6 +32,12 @@ pub(super) struct ProjectBuilder {
     pub(super) path_issues: Vec<ProjectPathIssue>,
     pub(super) warnings: Vec<String>,
     pub(super) incomplete: bool,
+    /// Properties an element that was not evaluated (an unknown condition,
+    /// an unknown value, a value over budget) could have assigned. Imports
+    /// that were not evaluated are covered by [`Self::undefined_is_empty`].
+    pub(super) unevaluated_assignments: HashSet<String>,
+    /// Incompleteness that may have hidden any property.
+    pub(super) unbounded_incomplete: bool,
     active_imports: HashSet<PathBuf>,
     import_count: usize,
     pub(super) project_dir: PathBuf,
@@ -156,6 +162,8 @@ impl ProjectBuilder {
             path_issues: Vec::new(),
             warnings,
             incomplete,
+            unevaluated_assignments: HashSet::new(),
+            unbounded_incomplete: incomplete,
             active_imports: HashSet::new(),
             import_count: 0,
             project_dir,
@@ -423,6 +431,8 @@ impl ProjectBuilder {
             TruthValue::Unknown => {
                 self.incomplete = true;
                 for property in group.properties {
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                 }
                 return;
@@ -448,6 +458,8 @@ impl ProjectBuilder {
                 TruthValue::False => continue,
                 TruthValue::Unknown => {
                     self.incomplete = true;
+                    self.unevaluated_assignments
+                        .insert(property.name.to_ascii_lowercase());
                     self.mark_property_unknown(&property.name, source_file, source_provenance);
                     continue;
                 }
@@ -498,6 +510,9 @@ impl ProjectBuilder {
                 source_file,
             );
             let key = property.name.to_ascii_lowercase();
+            if value.undefined_property_unknown {
+                self.unevaluated_assignments.insert(key.clone());
+            }
             if !empty_expansions.is_empty()
                 && self.properties.get(&key).map(String::as_str) == Some(trimmed)
             {
@@ -529,6 +544,7 @@ impl ProjectBuilder {
             .saturating_add(value.len());
         if new_bytes > MAX_TOTAL_PROPERTY_BYTES {
             self.incomplete = true;
+            self.unevaluated_assignments.insert(key.clone());
             self.warnings.push(format!(
                 "property memory budget exceeded while evaluating {name} in {}; value ignored",
                 source_file.display()
@@ -540,7 +556,10 @@ impl ProjectBuilder {
         if unknown || value.contains(UNRESOLVED_MARKER) {
             self.unknown_properties.insert(key.clone());
         } else {
+            // A later definite assignment replaces whatever an earlier
+            // unevaluated element could have assigned.
             self.unknown_properties.remove(&key);
+            self.unevaluated_assignments.remove(&key);
         }
         if explicit_dependency {
             self.configured_properties.insert(key.clone());

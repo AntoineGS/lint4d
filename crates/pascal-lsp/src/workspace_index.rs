@@ -293,7 +293,6 @@ struct Member {
 pub(crate) const RETRYING_REFUSAL: &str = "retrying a previous refusal";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by pascal/indexStatus (l4d-zf1b.8)
 pub(crate) struct IndexCounts {
     pub(crate) members: usize,
     pub(crate) fresh: usize,
@@ -737,7 +736,6 @@ impl ContextIndex {
             .collect()
     }
 
-    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn counts(&self) -> IndexCounts {
         let mut counts = IndexCounts {
             members: self.by_path.len(),

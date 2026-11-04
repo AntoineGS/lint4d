@@ -35,6 +35,66 @@ fn cache_status_reports_the_default_store_under_the_test_cache_home() {
     server.shutdown();
 }
 
+fn index_status(server: &mut TestServer, tag: usize) -> Value {
+    let id = RequestId::from(format!("index-status-{tag}"));
+    server.send_request(id.clone(), "pascal/indexStatus", json!({}));
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    response.result.unwrap()
+}
+
+#[test]
+fn index_status_answers_before_the_index_exists_and_names_no_member() {
+    let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
+    let environment = tempfile::tempdir().unwrap();
+    let mut server = TestServer::launch_with_environment_path(environment.path());
+    server.initialize(main.parent().unwrap(), Value::Null);
+    assert_eq!(
+        index_status(&mut server, 0),
+        json!({"schema": 1, "contexts": []})
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": Url::from_file_path(&main).unwrap(),
+            "languageId": "pascal",
+            "version": 1,
+            "text": main_source,
+        }}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut tag = 1;
+    let status = loop {
+        let status = index_status(&mut server, tag);
+        tag += 1;
+        let done = status["contexts"]
+            .as_array()
+            .is_some_and(|contexts| contexts.iter().any(|context| context["complete"] == true));
+        if done || Instant::now() >= deadline {
+            break status;
+        }
+    };
+    let text = status.to_string();
+    assert!(text.len() <= 8192, "{text}");
+    assert_eq!(status["schema"], 1, "{text}");
+    let context = status["contexts"]
+        .as_array()
+        .and_then(|contexts| contexts.iter().find(|context| context["complete"] == true))
+        .unwrap_or_else(|| panic!("no complete context: {text}"));
+    assert!(context["members"].as_u64().unwrap() >= 2, "{text}");
+    assert_eq!(context["pending"], 0, "{text}");
+    assert!(
+        context["anchor"]["document"].is_string() || context["anchor"]["project"].is_string(),
+        "{text}"
+    );
+    assert!(!text.contains("Provider.pas"), "{text}");
+    assert!(
+        !text.contains(&provider.to_string_lossy().to_string()),
+        "{text}"
+    );
+    server.shutdown();
+}
+
 #[test]
 fn a_disabled_cache_reports_disabled_and_creates_nothing() {
     let (_temp, main, _provider, _main_source, _provider_source) = standard_workspace();

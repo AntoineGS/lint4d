@@ -62,7 +62,6 @@ impl BaselineHint {
         self.held
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // pascal/indexStatus (l4d-zf1b.8)
     pub(crate) fn sealed(&self) -> bool {
         self.sealed
     }

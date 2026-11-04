@@ -10703,6 +10703,7 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
 #[cfg(feature = "test-support")]
 const TEST_ANALYSIS_METRICS_METHOD: &str = "pascal/testAnalysisMetrics";
 const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
+const INDEX_STATUS_METHOD: &str = "pascal/indexStatus";
 #[cfg(feature = "test-support")]
 const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
 
@@ -11192,6 +11193,9 @@ fn event_loop(
     #[cfg(feature = "test-support")] analysis_metrics_endpoint: bool,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
+    // A file-notification worker takes the workspace while it runs; the
+    // status request is answered from this handle to the same cache.
+    let index_status_cache = workspace.project_cache().clone();
     let mut deferred_configuration_messages = VecDeque::new();
     let mut deferred_workspace_messages = VecDeque::new();
     let mut deferred_workspace_message_bytes = 0usize;
@@ -11727,6 +11731,15 @@ fn event_loop(
                 if request.method == CACHE_STATUS_METHOD && !shutdown_received =>
             {
                 send_ok(connection, request.id, persistent.status().to_json())?;
+            }
+            // Unordered like the cache status: a bounded read of the index
+            // store, answered ahead of deferred workspace work.
+            Message::Request(request)
+                if request.method == INDEX_STATUS_METHOD && !shutdown_received =>
+            {
+                let status =
+                    crate::project_cache::index_status_json(&index_status_cache.index_status());
+                send_ok(connection, request.id, status)?;
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)

@@ -5576,7 +5576,6 @@ struct StoredIndex {
     charged: usize,
     memory_exhausted: bool,
     /// Store reads spent validating members of this context.
-    #[allow(dead_code)] // read by pascal/indexStatus (l4d-zf1b.8)
     validation_reads: u64,
     /// The snapshot this context's index started from or last sealed (D40).
     baseline: Option<crate::workspace::baseline::BaselineHint>,
@@ -5589,6 +5588,181 @@ struct StoredIndex {
 impl StoredIndex {
     fn total_charge(&self) -> usize {
         self.charged.saturating_add(self.index.bytes())
+    }
+}
+
+/// The longest anchor URI `pascal/indexStatus` reports.
+const STATUS_ANCHOR_BYTES: usize = 512;
+/// At most this many gaps per context, each at most `STATUS_GAP_BYTES`.
+const STATUS_GAPS: usize = 4;
+const STATUS_GAP_BYTES: usize = 160;
+/// The whole `pascal/indexStatus` document.
+const STATUS_DOCUMENT_BYTES: usize = 8192;
+
+fn truncate_utf8(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// One context of `pascal/indexStatus`: counts, never member paths.
+#[derive(Debug, Clone)]
+pub(crate) struct IndexStatusEntry {
+    /// The anchor URI, at most `STATUS_ANCHOR_BYTES` bytes.
+    pub(crate) anchor: String,
+    pub(crate) anchor_is_project: bool,
+    pub(crate) anchor_truncated: bool,
+    pub(crate) counts: crate::workspace_index::IndexCounts,
+    pub(crate) membership_complete: bool,
+    /// The membership is complete, current, and no member that can be
+    /// indexed now is pending. Members retried after a refusal are not
+    /// counted against it: they are reported as a gap.
+    pub(crate) complete: bool,
+    /// `"sealed"`: a snapshot this process sealed is the baseline. `"held"`:
+    /// the baseline was adopted from an earlier process's snapshot. `"none"`:
+    /// no baseline hint.
+    pub(crate) snapshot: &'static str,
+    pub(crate) validation_reads: u64,
+    pub(crate) gaps: Vec<String>,
+}
+
+impl IndexStatusEntry {
+    fn of(stored: &StoredIndex) -> Self {
+        let counts = stored.index.counts();
+        let (anchor_is_project, uri) = match &stored.anchor {
+            IndexAnchor::Document(uri) => (false, uri.to_string()),
+            IndexAnchor::Project(path) => (
+                true,
+                Url::from_file_path(path)
+                    .map_or_else(|()| path.to_string_lossy().into_owned(), String::from),
+            ),
+        };
+        let (anchor, anchor_truncated) = truncate_utf8(&uri, STATUS_ANCHOR_BYTES);
+        let membership = &stored.membership;
+        let membership_complete = membership.complete && !stored.dirty;
+        let eligible_pending = counts.pending.saturating_sub(counts.retrying);
+        let mut gaps = Vec::new();
+        match &membership.limit {
+            Some(limit) => gaps.push(format!("{limit}; the rest are not indexed")),
+            None if !membership.complete => {
+                gaps.push("membership is incomplete; some units are not indexed".to_owned());
+            }
+            None => {}
+        }
+        if membership.packages {
+            gaps.push("units provided through runtime packages are not indexed".to_owned());
+        }
+        if counts.refused > 0 {
+            gaps.push(format!("{} units could not be indexed", counts.refused));
+        }
+        if counts.limited > 0 {
+            gaps.push(format!(
+                "{} units exceed the index limits and are not indexed",
+                counts.limited
+            ));
+        }
+        if counts.deferred > 0 {
+            gaps.push(format!(
+                "{} units failed to load for the index and are retried later",
+                counts.deferred
+            ));
+        }
+        if counts.retrying > 0 {
+            gaps.push(format!(
+                "{} members retried after a previous refusal",
+                counts.retrying
+            ));
+        }
+        if stored.memory_exhausted {
+            gaps.push("the workspace index memory share is exhausted".to_owned());
+        }
+        gaps.truncate(STATUS_GAPS);
+        for gap in &mut gaps {
+            let (kept, _) = truncate_utf8(gap, STATUS_GAP_BYTES);
+            let kept = kept.len();
+            gap.truncate(kept);
+        }
+        Self {
+            anchor: anchor.to_owned(),
+            anchor_is_project,
+            anchor_truncated,
+            counts,
+            membership_complete,
+            complete: membership_complete && eligible_pending == 0,
+            snapshot: match stored.baseline.as_ref() {
+                None => "none",
+                Some(hint) if hint.sealed() => "sealed",
+                Some(_) => "held",
+            },
+            validation_reads: stored.validation_reads,
+            gaps,
+        }
+    }
+
+    fn to_json(&self, anchor_bytes: usize) -> serde_json::Value {
+        let (anchor, cut) = truncate_utf8(&self.anchor, anchor_bytes);
+        let key = if self.anchor_is_project {
+            "project"
+        } else {
+            "document"
+        };
+        let counts = &self.counts;
+        serde_json::json!({
+            "anchor": {key: anchor},
+            "anchorTruncated": self.anchor_truncated || cut,
+            "members": counts.members,
+            "fresh": counts.fresh,
+            "reused": counts.reused,
+            "extracted": counts.extracted,
+            "pending": counts.pending,
+            "reusePending": counts.reuse_pending,
+            "refused": counts.refused,
+            "limited": counts.limited,
+            "deferred": counts.deferred,
+            "persisted": counts.persisted,
+            "retrying": counts.retrying,
+            "membershipComplete": self.membership_complete,
+            "complete": self.complete,
+            "snapshot": self.snapshot,
+            "validationReads": self.validation_reads,
+            "gaps": self.gaps,
+        })
+    }
+}
+
+/// The `pascal/indexStatus` result. It never exceeds
+/// `STATUS_DOCUMENT_BYTES`: when the entries do not fit, gaps are dropped
+/// from the least recently used contexts first, then anchors are cut.
+pub(crate) fn index_status_json(entries: &[IndexStatusEntry]) -> serde_json::Value {
+    let mut entries = entries.to_vec();
+    let mut anchor_bytes = STATUS_ANCHOR_BYTES;
+    loop {
+        let document = serde_json::json!({
+            "schema": 1,
+            "contexts": entries
+                .iter()
+                .map(|entry| entry.to_json(anchor_bytes))
+                .collect::<Vec<_>>(),
+        });
+        if document.to_string().len() <= STATUS_DOCUMENT_BYTES {
+            return document;
+        }
+        match entries
+            .iter_mut()
+            .rev()
+            .find(|entry| !entry.gaps.is_empty())
+        {
+            Some(entry) => {
+                entry.gaps.pop();
+            }
+            None if anchor_bytes > 16 => anchor_bytes /= 2,
+            None => return document,
+        }
     }
 }
 
@@ -6098,6 +6272,20 @@ impl ProjectCache {
             .contexts
             .get(key)
             .map_or(0, |stored| stored.validation_reads)
+    }
+
+    /// One entry per stored context, most recently used first (at most
+    /// `MAX_INDEXED_CONTEXTS`), read under the index lock without IO or
+    /// touching any context's recency.
+    pub(crate) fn index_status(&self) -> Vec<IndexStatusEntry> {
+        let store = self.index();
+        let mut stored: Vec<&StoredIndex> = store.contexts.values().collect();
+        stored.sort_by_key(|stored| std::cmp::Reverse(stored.last_used));
+        stored
+            .into_iter()
+            .take(MAX_INDEXED_CONTEXTS)
+            .map(IndexStatusEntry::of)
+            .collect()
     }
 
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
@@ -6718,6 +6906,121 @@ mod index_tests {
         cache
             .read_index(key, |index, _| index.generation())
             .expect("context is stored")
+    }
+
+    #[test]
+    fn the_largest_index_status_fits_eight_kibibytes() {
+        let cache = ProjectCache::new(1 << 30);
+        for index in 0..MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            let mut limited = membership(&["/w/A.pas"]);
+            limited.complete = false;
+            limited.packages = true;
+            limited.limit = Some("x".repeat(400));
+            cache.set_index_membership(
+                key(&name),
+                IndexAnchor::Project(PathBuf::from(format!("/{}/{name}", "d".repeat(4096)))),
+                limited,
+                usize::MAX,
+            );
+        }
+        let entries = cache.index_status();
+        assert_eq!(entries.len(), MAX_INDEXED_CONTEXTS);
+        for entry in &entries {
+            assert!(entry.anchor_truncated);
+            assert!(entry.gaps.len() <= 4, "{:?}", entry.gaps);
+            assert!(entry.gaps.iter().all(|gap| gap.len() <= 160));
+            assert!(!entry.complete);
+        }
+        let text = index_status_json(&entries).to_string();
+        assert!(text.len() <= 8192, "{} bytes", text.len());
+        assert!(text.contains("\"anchorTruncated\":true"), "{text}");
+        assert!(!text.contains("/w/A.pas"));
+    }
+
+    #[test]
+    fn index_status_counts_members_by_state() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let paths = [
+            "/w/Fresh.pas",
+            "/w/Refused.pas",
+            "/w/Limited.pas",
+            "/w/Pending.pas",
+        ];
+        cache.set_index_membership(k.clone(), anchor("a"), membership(&paths), usize::MAX);
+        assert_eq!(publish(&cache, &k, "/w/Fresh.pas"), PublishOutcome::Indexed);
+        {
+            let mut store = cache.index();
+            let stored = store.contexts.get_mut(&k).unwrap();
+            stored
+                .index
+                .refuse(Path::new("/w/Refused.pas"), "r".to_owned());
+            stored.index.limit(Path::new("/w/Limited.pas"));
+            stored.validation_reads = 7;
+        }
+        let entries = cache.index_status();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(
+            (
+                entry.counts.members,
+                entry.counts.fresh,
+                entry.counts.refused,
+                entry.counts.limited,
+                entry.counts.pending
+            ),
+            (4, 1, 1, 1, 1)
+        );
+        assert_eq!(entry.validation_reads, 7);
+        assert_eq!(entry.snapshot, "none");
+        assert!(entry.membership_complete);
+        assert!(!entry.complete, "a pending member is not complete");
+        assert!(
+            entry
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("1 units could not be indexed")),
+            "{:?}",
+            entry.gaps
+        );
+        let json = index_status_json(&entries);
+        let context = &json["contexts"][0];
+        assert_eq!(json["schema"], 1);
+        assert_eq!(context["anchor"]["project"], "file:///anchors/a");
+        assert_eq!(context["anchorTruncated"], false);
+        assert_eq!(context["members"], 4);
+        assert_eq!(context["pending"], 1);
+        assert_eq!(context["refused"], 1);
+        assert_eq!(context["limited"], 1);
+        assert_eq!(context["snapshot"], "none");
+        assert_eq!(context["validationReads"], 7);
+        assert!(!json.to_string().contains("Fresh.pas"));
+    }
+
+    #[test]
+    fn index_status_lists_the_most_recently_used_context_first() {
+        let cache = ProjectCache::new(1 << 30);
+        for name in ["a", "b"] {
+            cache.set_index_membership(
+                key(name),
+                anchor(name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
+        }
+        cache.read_index(&key("a"), |_, _| ());
+        let entries = cache.index_status();
+        assert_eq!(entries[0].anchor, "file:///anchors/a");
+        assert_eq!(entries[1].anchor, "file:///anchors/b");
+        assert!(!entries[0].complete, "the member is still pending");
+        assert_eq!(entries[0].counts.pending, 1);
+        assert!(
+            index_status_json(&[])["contexts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

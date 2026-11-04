@@ -3817,17 +3817,17 @@ fn is_else_directive(body: &str) -> bool {
 fn directive_symbol(body: &str) -> Option<String> {
     let argument = directive_arguments(body).trim();
     let symbol = argument.strip_prefix('&').unwrap_or(argument);
-    let mut characters = symbol.chars();
-    let first = characters.next()?;
-    if !first.is_ascii_alphanumeric() && first != '_' {
+    // dcc reads the symbol's leading identifier and ignores what follows:
+    // `{$define DELPHI.NET}` defines DELPHI, `{$ifdef FOO junk}` tests FOO
+    // (dcc32 21.0 and 24.0, l4d-onnm).
+    let end = symbol
+        .bytes()
+        .position(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+        .unwrap_or(symbol.len());
+    if end == 0 {
         return None;
     }
-    if !characters
-        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '.')
-    {
-        return None;
-    }
-    canonical_symbol(argument)
+    canonical_symbol(&symbol[..end])
 }
 
 /// Return the canonical symbol from a DEFINE/UNDEF directive for bounded

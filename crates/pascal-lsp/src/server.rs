@@ -1631,6 +1631,8 @@ struct CompletionResolutionContext {
     resolve_documentation: bool,
     resolve_detail: bool,
     records: Vec<SourceRecord>,
+    /// Units the completion's demand rounds loaded (l4d-4nbs re-review).
+    demanded: Vec<Url>,
 }
 
 #[derive(Debug, Clone)]
@@ -1760,6 +1762,11 @@ impl CompletionResolutionStore {
         }
 
         let (compact_records, context_bytes) = compact_completion_records(records)?;
+        let context_bytes = result.demanded.iter().fold(context_bytes, |total, uri| {
+            total
+                .saturating_add(size_of::<Url>())
+                .saturating_add(uri.as_str().len())
+        });
         if compact_records.len() > MAX_COMPLETION_RESOLUTION_RECORDS {
             return Err("completion dependency observations exceed the bounded limit".to_string());
         }
@@ -1782,6 +1789,7 @@ impl CompletionResolutionStore {
             resolve_documentation,
             resolve_detail,
             records: compact_records,
+            demanded: result.demanded.clone(),
         });
 
         let mut pending = Vec::with_capacity(result.list.items.len());
@@ -6316,6 +6324,7 @@ impl AnalysisJobs {
                                     context.resolve_detail,
                                     context.snippet_support,
                                     &context.records,
+                                    &context.demanded,
                                     &worker_cancellation,
                                 );
                                 // Keep the identity's original generation as the
@@ -18167,6 +18176,7 @@ mod tests {
                     }],
                 },
                 seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
+                demanded: Vec::new(),
             }),
         }
     }

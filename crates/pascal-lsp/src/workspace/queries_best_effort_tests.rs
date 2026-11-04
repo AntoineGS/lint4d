@@ -604,3 +604,87 @@ fn completion_loads_the_units_an_inherited_member_needs() {
     assert!(labels.contains(&"MidMember"), "{labels:?}");
     assert!(labels.contains(&"BaseMember"), "{labels:?}");
 }
+
+/// A chain `Main -> X: T0`, `T{n} = class(T{n+1})` in unit `U{n}` (which uses
+/// `U{n+1}`), each declaring a documented member `M{n}`.
+fn ancestor_chain(levels: usize) -> (TempDir, WorkspaceInput, Url, Position) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    for n in 0..levels {
+        let (uses, base) = if n + 1 == levels {
+            (String::new(), String::new())
+        } else {
+            (format!("uses U{};\n", n + 1), format!("(T{})", n + 1))
+        };
+        fs::write(
+            root.join(format!("U{n}.pas")),
+            format!(
+                "unit U{n};\ninterface\n{uses}type\n  T{n} = class{base}\n    /// Member of level {n}.\n    procedure M{n};\n  end;\nimplementation\nprocedure T{n}.M{n}; begin end;\nend.\n"
+            ),
+        )
+        .expect("chain unit");
+    }
+    let main = "unit Main;\ninterface\nuses U0;\nimplementation\nprocedure Run;\nvar X: T0;\nbegin\n  X.\nend;\nend.\n";
+    fs::write(root.join("Main.pas"), main).expect("main");
+    let workspace = Workspace::with_override_session(
+        vec![root.to_path_buf()],
+        WorkspaceOptions::default(),
+        OverrideSession::new(None),
+    );
+    let input = workspace.analysis_input();
+    let main = uri(&root.join("Main.pas"));
+    (temp, input, main, Position::new(7, 4))
+}
+
+/// l4d-4nbs re-review: completion found M1 by loading U0's imports in a
+/// demand round; resolving each item rebuilds that snapshot, so its
+/// observations match and the documentation resolves.
+#[test]
+fn completion_items_found_by_a_demand_round_resolve() {
+    let (_temp, input, main, position) = ancestor_chain(3);
+    let cancel = AtomicBool::new(false);
+    let completion = super::completion_from_input_with_options(
+        input.clone(),
+        &main,
+        position,
+        crate::navigation::CompletionOptions {
+            format: MarkupKind::Markdown,
+            defer_documentation: true,
+            defer_detail: true,
+            snippet_support: false,
+        },
+        &cancel,
+    );
+    let result = completion.value.expect("completion");
+    for member in ["M0", "M1", "M2"] {
+        let index = result
+            .list
+            .items
+            .iter()
+            .position(|item| item.label == member)
+            .unwrap_or_else(|| panic!("{member} is listed: {:?}", result.list.items));
+        let seed = &result.seeds[index];
+        let metadata = super::completion_metadata_from_input(
+            input.clone(),
+            &main,
+            position,
+            input.source_generation,
+            input.configuration_generation,
+            seed.candidate_uri(),
+            seed.candidate_index(),
+            MarkupKind::Markdown,
+            true,
+            true,
+            false,
+            &completion.records,
+            &result.demanded,
+            &cancel,
+        )
+        .value
+        .unwrap_or_else(|error| panic!("{member} resolves: {error}"));
+        assert!(
+            metadata.documentation.is_some(),
+            "{member} has documentation"
+        );
+    }
+}

@@ -337,6 +337,7 @@ pub(crate) fn completion_from_input_with_options(
     let value = value.map(|mut result| {
         // D16: candidates from unproven dependencies may be missing.
         result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
+        result.demanded = demanded;
         result
     });
     if is_cancelled(cancel) {
@@ -359,6 +360,7 @@ pub(crate) fn completion_metadata_from_input(
     resolve_detail: bool,
     snippet_support: bool,
     original_records: &[super::rename::SourceRecord],
+    demanded: &[Url],
     cancel: &AtomicBool,
 ) -> super::rename::Computed<CompletionMetadata> {
     let source_generation = input.source_generation;
@@ -381,7 +383,10 @@ pub(crate) fn completion_metadata_from_input(
     }
     let source_uri = super::canonical_file_uri(source_uri);
     let candidate_uri = super::canonical_file_uri(candidate_uri);
-    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), &[], cancel) {
+    // Rebuild the snapshot the completion answered from, demand rounds
+    // included, so its observations match (l4d-4nbs re-review).
+    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), demanded, cancel)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -5869,6 +5874,7 @@ mod tests {
                 true,
                 false,
                 &original_records,
+                &[],
                 &cancel,
             )
         });

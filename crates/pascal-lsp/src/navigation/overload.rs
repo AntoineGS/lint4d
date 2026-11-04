@@ -2591,6 +2591,7 @@ fn default_property_result_type(
         &instance.substitution,
         None,
         allow_implementation,
+        false,
         cancel,
         budget,
     )?;

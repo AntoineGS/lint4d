@@ -688,3 +688,73 @@ fn completion_items_found_by_a_demand_round_resolve() {
         );
     }
 }
+
+fn chain_completion(levels: usize) -> (Vec<String>, bool, Option<String>) {
+    let (_temp, input, main, position) = ancestor_chain(levels);
+    let completion = completion_from_input(input, &main, position, &AtomicBool::new(false))
+        .value
+        .expect("completion answers");
+    let labels = completion
+        .items
+        .iter()
+        .map(|item| item.label.clone())
+        .filter(|label| label.starts_with('M'))
+        .collect();
+    let note = completion.items.iter().find_map(|item| {
+        item.label
+            .starts_with('M')
+            .then(|| item.detail.clone())
+            .flatten()
+    });
+    (labels, completion.is_incomplete, note)
+}
+
+/// l4d-4nbs re-review (b): past the round cap, completion lists every
+/// member the loaded prefix of the chain proves, marked incomplete.
+#[test]
+fn past_the_demand_round_cap_completion_lists_the_loaded_prefix() {
+    let (labels, incomplete, _) = chain_completion(10);
+    for member in ["M0", "M1", "M2", "M3", "M4", "M5"] {
+        assert!(
+            labels.iter().any(|label| label == member),
+            "{member}: {labels:?}"
+        );
+    }
+    assert!(incomplete, "the rest of the chain is not loaded");
+}
+
+/// l4d-4nbs re-review (a): demand rounds are bounded by the definition
+/// walk's byte limit; past it the answer is incomplete.
+#[test]
+fn demand_rounds_stop_at_the_walk_byte_limit() {
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(Some(1)));
+    let (labels, incomplete, _) = chain_completion(4);
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(None));
+    assert!(labels.iter().any(|label| label == "M0"), "{labels:?}");
+    assert!(!labels.iter().any(|label| label == "M3"), "{labels:?}");
+    assert!(incomplete);
+}
+
+/// l4d-4nbs re-review (c): a demanded unit whose imports fail to load is a
+/// coverage gap of the answer, not skipped silently.
+#[test]
+fn a_demand_round_load_failure_is_noted() {
+    crate::workspace::TEST_FAIL_IMPORTS_OF.with(|name| *name.borrow_mut() = Some("/U1.pas".into()));
+    let (_temp, input, main, position) = ancestor_chain(4);
+    let completion = completion_from_input(input, &main, position, &AtomicBool::new(false))
+        .value
+        .expect("completion answers");
+    crate::workspace::TEST_FAIL_IMPORTS_OF.with(|name| *name.borrow_mut() = None);
+    assert!(completion.is_incomplete, "{completion:?}");
+    let labels = completion
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"M1"), "{labels:?}");
+    let coverage = super::completion_coverage_for_test();
+    assert!(
+        coverage.iter().any(|gap| gap.contains("U1.pas")),
+        "the failure is noted: {coverage:?}"
+    );
+}

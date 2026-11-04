@@ -6461,6 +6461,7 @@ fn build_snapshot_with_policy(
     let mut other_include_errors = false;
     let mut include_error_owners = Vec::new();
     let mut dependency_coverage = Coverage::default();
+    let mut demand_gaps: Vec<(Option<Url>, String)> = Vec::new();
     let best_effort = priority_seed.as_ref().is_some_and(|seed| seed.best_effort)
         && matches!(
             mode,
@@ -7038,10 +7039,15 @@ fn build_snapshot_with_policy(
         let mut closure = closure;
         // Load the imports a previous answer needed through fenced units,
         // and walk the cached closure past them.
+        // Bounded like the definition walk (l4d-4nbs re-review): at most
+        // its unit and byte limits in all, past which the answer is
+        // incomplete; a demanded unit that fails to load is a gap.
         let demanded = priority_seed
             .as_ref()
             .map(|seed| seed.demanded.clone())
             .unwrap_or_default();
+        let byte_limit = super::navigation_walk_byte_limit();
+        let (mut demand_units, mut demand_bytes) = (0usize, 0usize);
         for demanded in demanded {
             if is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -7049,14 +7055,40 @@ fn build_snapshot_with_policy(
             if owned_sources.contains(&demanded) {
                 continue;
             }
+            if demand_units >= super::MAX_NAVIGATION_WALK_WORK || demand_bytes >= byte_limit {
+                demand_gaps.push((
+                    None,
+                    format!(
+                        "completion stopped loading the units its answer needs at the walk limit ({} units or {byte_limit} source bytes)",
+                        super::MAX_NAVIGATION_WALK_WORK
+                    ),
+                ));
+                break;
+            }
+            demand_units += 1;
             let Some(context_key) = loader.document_contexts.get(&demanded).cloned() else {
                 continue;
             };
-            let Ok(direct) =
-                loader.load_imports_with_cancel(&demanded, &context_key, &mut pins, Some(cancel))
-            else {
-                continue;
+            let direct = match loader.load_imports_with_cancel(
+                &demanded,
+                &context_key,
+                &mut pins,
+                Some(cancel),
+            ) {
+                Ok(direct) => direct,
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(error) => {
+                    demand_gaps.push((
+                        Some(demanded.clone()),
+                        format!("the imports of {demanded} could not be loaded: {error}"),
+                    ));
+                    continue;
+                }
             };
+            for dependency in &direct {
+                demand_bytes = demand_bytes
+                    .saturating_add(loader.index.source_text(dependency).map_or(0, str::len));
+            }
             let mut fenced = owned_sources.clone();
             fenced.insert(demanded.clone());
             let more =
@@ -7353,6 +7385,9 @@ fn build_snapshot_with_policy(
             complete = false;
             incomplete_reason.get_or_insert(reason);
         }
+    }
+    for (uri, reason) in &demand_gaps {
+        dependency_coverage.note(uri.as_ref(), reason.clone());
     }
     if let Some(analysis_records) = loader.analysis_records.take() {
         for (uri, record) in analysis_records {

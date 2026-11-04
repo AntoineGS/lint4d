@@ -334,6 +334,14 @@ pub(crate) fn completion_from_input_with_options(
         demanded.extend(fresh);
     };
     let records = snapshot_records(&snapshot);
+    #[cfg(test)]
+    TEST_COMPLETION_COVERAGE.with(|coverage| {
+        *coverage.borrow_mut() = answer_coverage(&snapshot)
+            .gaps
+            .iter()
+            .map(|gap| format!("{:?}: {}", gap.uri.as_ref().map(Url::as_str), gap.reason))
+            .collect();
+    });
     let value = value.map(|mut result| {
         // D16: candidates from unproven dependencies may be missing.
         result.list.is_incomplete |= !answer_coverage(&snapshot).is_complete();
@@ -1506,6 +1514,18 @@ fn binding_snapshot_scoped(
         scope,
         cancel,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETION_COVERAGE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The coverage gaps of this thread's last completion.
+#[cfg(test)]
+pub(crate) fn completion_coverage_for_test() -> Vec<String> {
+    TEST_COMPLETION_COVERAGE.with(|coverage| coverage.borrow().clone())
 }
 
 /// Completion loads the imports its answer looked through at most this many

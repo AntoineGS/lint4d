@@ -12467,10 +12467,12 @@ impl NavigationIndex {
         substitution: &GenericSubstitution,
         member_key: Option<&str>,
         allow_implementation: bool,
+        proven_prefix: bool,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
         let mut ancestry_state = AncestryResolutionState::new();
+        ancestry_state.proven_prefix = proven_prefix;
         let ordinary = self.member_candidates_for_type_with_state_and_budget(
             type_uri,
             type_key,
@@ -12793,6 +12795,7 @@ impl NavigationIndex {
             substitution,
             Some(member_key),
             allow_implementation,
+            false,
             cancel,
             budget,
         )
@@ -12942,6 +12945,7 @@ impl NavigationIndex {
                 substitution,
                 None,
                 allow_implementation,
+                true,
                 cancel,
                 budget,
             )
@@ -13077,7 +13081,34 @@ impl NavigationIndex {
                 complete_ancestry(Vec::new())
             };
             if ancestry.status != AncestryStatus::Complete {
-                return Ok(MemberLookup::unknown(direct)
+                // An ancestor further out is unknown, but the parents this
+                // type names may still resolve: the proven prefix of the
+                // ancestry supplies its members, and the lookup stays
+                // unknown (l4d-4nbs re-review).
+                let parents = if state.proven_prefix {
+                    self.immediate_type_parents_with_budget(type_uri, type_key, cancel, budget)?
+                } else {
+                    Vec::new()
+                };
+                if parents.is_empty() {
+                    return Ok(MemberLookup::unknown(direct)
+                        .with_implicit_member_known(implicit_root_member_known));
+                }
+                let mut parent_lookups = Vec::with_capacity(parents.len());
+                for (parent_uri, parent_key) in parents {
+                    parent_lookups.push(self.member_candidates_for_type_with_state_and_budget(
+                        &parent_uri,
+                        &parent_key,
+                        ROOT_SCOPE,
+                        member_key,
+                        allow_implementation,
+                        state,
+                        cancel,
+                        budget,
+                    )?);
+                }
+                let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
+                return Ok(MemberLookup::unknown(merged.candidates)
                     .with_implicit_member_known(implicit_root_member_known));
             }
 
@@ -13096,6 +13127,9 @@ impl NavigationIndex {
                 )?;
                 if !lookup.ancestry_known {
                     ancestry_known = false;
+                    if state.proven_prefix {
+                        parent_lookups.push(lookup);
+                    }
                     break;
                 }
                 parent_lookups.push(lookup);
@@ -13104,7 +13138,12 @@ impl NavigationIndex {
                 self.merge_member_candidates(direct, parent_lookups, member_key)
                     .with_implicit_member_known(implicit_root_member_known)
             } else {
-                MemberLookup::unknown(direct).with_implicit_member_known(implicit_root_member_known)
+                // The proven prefix of the ancestry still supplies its members:
+                // an unknown ancestor further out cannot hide a nearer one's
+                // (l4d-4nbs re-review). The lookup stays unknown.
+                let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
+                MemberLookup::unknown(merged.candidates)
+                    .with_implicit_member_known(implicit_root_member_known)
             })
         })();
         state.active_members.remove(&identity);
@@ -13566,6 +13605,36 @@ impl NavigationIndex {
         budget.require_owned_bytes(ancestry_resolution_owned_bytes(&result), cancel)?;
         state.resolved_types.insert(identity, result.clone());
         Ok(result)
+    }
+
+    /// The parents `type_key` names that resolve, without requiring their
+    /// own ancestry to be known.
+    fn immediate_type_parents_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<(Url, String)>, String> {
+        let Some(document) = self.documents.get(type_uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(entries) = document.type_ancestry.get(type_key) else {
+            return Ok(Vec::new());
+        };
+        if entries.len() != 1 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .resolve_type_ancestry_entry_with_budget(
+                type_uri,
+                type_key,
+                &entries[0],
+                document,
+                cancel,
+                budget,
+            )?
+            .parents)
     }
 
     fn resolve_type_ancestry_entry_with_budget(
@@ -15717,6 +15786,10 @@ impl MemberLookup {
 
 struct AncestryResolutionState {
     remaining_work: usize,
+    /// Completion lists what the proven prefix of an unknown ancestry
+    /// declares (l4d-4nbs re-review); every other consumer gets only the
+    /// type's own members from an unknown ancestry.
+    proven_prefix: bool,
     active_types: HashSet<(Url, String)>,
     resolved_types: HashMap<(Url, String), TypeAncestryResolution>,
     active_members: HashSet<(Url, String, usize, Option<String>, bool)>,
@@ -15728,6 +15801,7 @@ impl AncestryResolutionState {
     fn new() -> Self {
         Self {
             remaining_work: MAX_ANCESTRY_WORK,
+            proven_prefix: false,
             active_types: HashSet::new(),
             resolved_types: HashMap::new(),
             active_members: HashSet::new(),

@@ -420,3 +420,139 @@ fn the_index_targets_the_selected_project_for_the_unit() {
         .expect("membership");
     assert!(membership.paths.contains(&fixture.users));
 }
+
+// Fix round 2: the claimant set comes only from inputs both workspaces
+// share (selections and open documents' projects), computed once per claim
+// generation in the main workspace and carried to request workspaces.
+
+#[test]
+fn a_selection_keeps_claiming_after_its_documents_close() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert!(workspace.close_document(&uri(&fixture.app)));
+
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+}
+
+#[test]
+fn deselecting_a_closed_project_makes_the_unit_projectless() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert!(workspace.close_document(&uri(&fixture.app)));
+    workspace.select_project(&uri(&fixture.app), None).unwrap();
+
+    assert_owner(&mut workspace, &fixture, None);
+}
+
+#[test]
+fn deselecting_a_closed_project_hands_the_unit_to_an_open_one() {
+    let fixture = fixture("");
+    let (second_project, second) = app_project(&fixture.root, "Second");
+    pascal_project::backdate_tree_for_test(&fixture.root);
+    let mut workspace = app_with_users_open(&fixture, true);
+    assert!(workspace.close_document(&uri(&fixture.app)));
+    open(&mut workspace, &second);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+
+    workspace.select_project(&uri(&fixture.app), None).unwrap();
+
+    assert_owner(&mut workspace, &fixture, Some(&second_project));
+}
+
+/// Minor (a): a request on a claimed unit reuses the main workspace's
+/// claim: no project discovery (no ancestor walk), no claimant list. The
+/// freshness check of the shared context still stats its candidate
+/// directories, as for any context.
+#[test]
+fn a_request_on_a_claimed_unit_neither_discovers_nor_computes_claimants() {
+    let fixture = fixture("");
+    let workspace = app_with_users_open(&fixture, true);
+    let input = workspace.analysis_input();
+
+    pascal_project::test_reset_project_discovery_counts();
+    let computes = super::test_claimant_list_computes();
+    let mut request = Workspace::from_analysis_input(&input);
+    let key = request
+        .context_for_uri(&uri(&fixture.users))
+        .expect("request context");
+    let (discoveries, builds) = pascal_project::test_project_discovery_counts();
+
+    assert_eq!(key, key_of(&workspace, &fixture.app));
+    assert_eq!(
+        (discoveries, builds),
+        (0, 0),
+        "the request must reuse the claim"
+    );
+    assert_eq!(super::test_claimant_list_computes(), computes);
+}
+
+/// Minor (a): an open computes the claimant list once.
+#[test]
+fn an_open_computes_the_claimant_list_once() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, true);
+    let before = super::test_claimant_list_computes();
+    open(&mut workspace, &fixture.base);
+
+    assert_eq!(super::test_claimant_list_computes() - before, 1);
+}
+
+/// Minor (b): directory owners the l4d-33 index discovered through a claim
+/// are reassigned when the claimant leaves, even with no reclaimed document.
+#[test]
+fn index_directory_owners_found_through_a_claim_are_reassigned() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    open(&mut workspace, &fixture.app);
+    let app_key = key_of(&workspace, &fixture.app);
+    let input = workspace.analysis_input();
+    let mut request = Workspace::from_analysis_input(&input);
+    request
+        .index_targets(
+            &input,
+            None,
+            TargetPurpose::References,
+            &AtomicBool::new(false),
+        )
+        .expect("targets");
+    let rules = fixture.users.parent().unwrap();
+    assert_eq!(workspace.project_cache.owner_of(rules), Some(app_key));
+
+    assert!(workspace.close_document(&uri(&fixture.app)));
+
+    assert_eq!(workspace.project_cache.owner_of(rules), None);
+}
+
+/// Minor (f): a failure while revisiting claims does not undo the open.
+#[test]
+fn a_failed_claim_revisit_still_opens_the_document() {
+    let fixture = fixture("");
+    let mut workspace = workspace(&fixture);
+    super::TEST_FAIL_CLAIM_REVISIT.with(|fail| fail.set(true));
+    let opened = workspace.open_document(
+        uri(&fixture.app),
+        fs::read_to_string(&fixture.app).unwrap(),
+        1,
+    );
+    super::TEST_FAIL_CLAIM_REVISIT.with(|fail| fail.set(false));
+
+    assert!(opened.is_ok(), "{opened:?}");
+    assert!(workspace.open_document_uris().contains(&uri(&fixture.app)));
+}
+
+/// Minor (g): reclaiming skips a claimant whose context went stale, as a
+/// claim does, so the workspaces still agree.
+#[test]
+fn reclaim_skips_a_stale_claimant_as_a_claim_does() {
+    let fixture = fixture("");
+    let mut workspace = app_with_users_open(&fixture, false);
+    assert_owner(&mut workspace, &fixture, Some(&fixture.app_project));
+    let text = fs::read_to_string(&fixture.app_project).unwrap();
+    write(&fixture.app_project, &format!("{text}\n"));
+
+    workspace.reclaim_projectless_units(None, None).unwrap();
+
+    let main = project_of(&mut workspace, &fixture.users);
+    let (main_definition, request_definition) = definitions(&mut workspace, &fixture.users);
+    assert_eq!(main_definition, request_definition, "main {main:?}");
+}

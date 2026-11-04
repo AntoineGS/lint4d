@@ -1053,8 +1053,19 @@ impl Workspace {
         };
         match snapshot_context_for_uri(self, &uri, cancel, false) {
             Ok(owner) => {
-                self.project_cache
-                    .remember_owner(directory.to_path_buf(), owner.clone());
+                let claimable = self
+                    .document_owners
+                    .get(&uri)
+                    .is_some_and(|known| known.claimed && known.key == owner)
+                    || self
+                        .contexts
+                        .get(&owner)
+                        .is_some_and(|state| state.context.project_file().is_none());
+                self.project_cache.remember_owner_claimable(
+                    directory.to_path_buf(),
+                    owner.clone(),
+                    claimable,
+                );
                 discovery.fresh.insert(owner.clone(), true);
                 Ok(Some(owner))
             }

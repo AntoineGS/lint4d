@@ -752,6 +752,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(build_context_info(project_uri, &validation))
     }
 
@@ -905,6 +906,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(InstallationContextInfo {
             project_uri: canonical_file_uri(project_uri),
             candidates,
@@ -985,6 +987,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(())
     }
 
@@ -1056,6 +1059,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_configuration_change(&project_dependency, false);
+        self.revisit_claims_logged("a build or installation choice");
         Ok(())
     }
 
@@ -1228,7 +1232,7 @@ impl Workspace {
         self.bump_configuration_generation();
         self.invalidate_project_selection_uris(&affected_uris, None, None)?;
         let info = self.project_context(&uri)?;
-        self.reclaim_projectless_units(None, None)?;
+        self.revisit_claims(None, None)?;
         Ok(info)
     }
 
@@ -1401,7 +1405,7 @@ impl Workspace {
         }
         let info = context.info.clone();
         self.apply_project_context_preparation(context);
-        self.reclaim_projectless_units(None, Some(budget))?;
+        self.revisit_claims(None, Some(budget))?;
         Ok(info)
     }
 

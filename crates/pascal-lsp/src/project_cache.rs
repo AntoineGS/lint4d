@@ -5647,6 +5647,8 @@ struct IndexStore {
     contexts: HashMap<ContextKey, StoredIndex>,
     clock: u64,
     owners: HashMap<PathBuf, ContextKey>,
+    /// Owners that are D43 claims or projectless (see `remember_owner_claimable`).
+    claimable_owners: HashSet<PathBuf>,
     requests: Vec<IndexAnchor>,
     unit_limit: usize,
 }
@@ -5657,6 +5659,7 @@ impl Default for IndexStore {
             contexts: HashMap::new(),
             clock: 0,
             owners: HashMap::new(),
+            claimable_owners: HashSet::new(),
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
         }
@@ -6031,12 +6034,42 @@ impl ProjectCache {
         self.index().owners.get(directory).cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn remember_owner(&self, directory: PathBuf, key: ContextKey) {
+        self.remember_owner_claimable(directory, key, false);
+    }
+
+    /// Remember `directory`'s owner; `claimable` when the owner is a D43
+    /// claim or projectless, so a new claimant list reassigns it.
+    pub(crate) fn remember_owner_claimable(
+        &self,
+        directory: PathBuf,
+        key: ContextKey,
+        claimable: bool,
+    ) {
         let mut store = self.index();
         if store.owners.len() >= MAX_OWNERS && !store.owners.contains_key(&directory) {
             store.owners.clear();
+            store.claimable_owners.clear();
+        }
+        if claimable {
+            store.claimable_owners.insert(directory.clone());
+        } else {
+            store.claimable_owners.remove(&directory);
         }
         store.owners.insert(directory, key);
+    }
+
+    /// D43: a new claimant list: forget the directory owners that were
+    /// claims or projectless, dirtying the memberships listing them.
+    pub(crate) fn reassign_claimable_owners(&self) {
+        let directories = {
+            let mut store = self.index();
+            std::mem::take(&mut store.claimable_owners)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        self.reassign_owners(&directories);
     }
 
     /// D43: the owners of `directories` changed because a claimant project

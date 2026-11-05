@@ -4269,3 +4269,77 @@ end.
         "rename accepted an inaccessible receiver's unit fallback: {result:?}"
     );
 }
+
+#[test]
+fn renames_a_class_and_every_method_heading_that_names_it() {
+    let source = r#"unit HeadingRename;
+interface
+type
+  TFoo = class
+    procedure Bar;
+    destructor Destroy; override;
+  type
+    TInner = class
+      function Method: Integer;
+    end;
+  end;
+implementation
+procedure TFoo.Bar;
+begin
+end;
+destructor TFoo.Destroy;
+begin
+  inherited;
+end;
+function TFoo.TInner.Method: Integer;
+begin
+  Result := 0;
+end;
+end.
+"#;
+    let source_uri = uri("HeadingRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("heading rename source parses");
+
+    for position in [
+        position_of(source, "TFoo", 0),
+        position_of(source, "TFoo", 2),
+    ] {
+        let edits = index
+            .rename_edits(&source_uri, position, "TBar")
+            .expect("class rename succeeds");
+        assert_exact_edits(
+            &edits,
+            (0..4)
+                .map(|occurrence| {
+                    (
+                        source_uri.clone(),
+                        range_of(source, "TFoo", occurrence),
+                        "TBar".to_owned(),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "TInner", 1), "TNested")
+        .expect("nested class rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "TInner", 0),
+                "TNested".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "TInner", 1),
+                "TNested".to_owned(),
+            ),
+        ],
+    );
+}

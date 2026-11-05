@@ -7169,6 +7169,25 @@ impl NavigationIndex {
             direct
         } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
             generic
+        } else if let Ok(Some(owner)) =
+            method_heading_owner_path_at(identifier, &document.source, &mut || Ok(()))
+        {
+            let cancel = AtomicBool::new(false);
+            let mut budget = AssistanceBudget::new(
+                MAX_NAVIGATION_OVERLOAD_WORK,
+                MAX_NAVIGATION_OVERLOAD_BYTES,
+                "method heading owner",
+            );
+            self.method_heading_owner_candidates_with_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &owner,
+                &cancel,
+                &mut budget,
+            )
+            .unwrap_or_default()
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at(identifier, &document.source)
         {
@@ -7227,6 +7246,15 @@ impl NavigationIndex {
             budget.require_work(generic.len(), cancel)?;
             budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
             Ok(generic)
+        } else if let Some(owner) =
+            method_heading_owner_path_at(identifier, &document.source, &mut || {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)
+            })?
+        {
+            self.method_heading_owner_candidates_with_budget(
+                uri, document, offset, identifier, &owner, cancel, budget,
+            )
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at_with_budget(identifier, &document.source, cancel, budget)?
         {
@@ -7889,6 +7917,96 @@ impl NavigationIndex {
             }
         }
         Ok(references)
+    }
+
+    /// The type an owner segment of a method heading names. Its first
+    /// segment is looked up as a type in the unit scope and the rest as
+    /// directly nested types. An implementation heading only ever names a
+    /// type declared in the unit or program that holds the body, so one that
+    /// reaches another document binds nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn method_heading_owner_candidates_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        owner: &MethodHeadingOwner,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let owners = self.type_reference_candidates_with_budget(
+            uri,
+            document,
+            offset,
+            identifier,
+            &owner.path[..1],
+            0,
+            cancel,
+            budget,
+        )?;
+        if owner.implementation && owners.iter().any(|candidate| candidate.uri != *uri) {
+            return Ok(Vec::new());
+        }
+        self.nested_type_candidates(owners, &owner.path[1..], &mut |work| {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(work, cancel)
+        })
+    }
+
+    /// Follow `segments` from `owners` through directly nested type
+    /// declarations, as a method heading's `TOuter.TInner` names them: each
+    /// segment is a type declared inside the previous one's declaration.
+    fn nested_type_candidates(
+        &self,
+        owners: Vec<Candidate>,
+        segments: &[String],
+        tick: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<Vec<Candidate>, String> {
+        let mut current = owners;
+        for segment in segments {
+            let key = canonical_name(segment);
+            let mut next = Vec::new();
+            for owner in &current {
+                let (Some(owner_symbol), Some(document)) =
+                    (self.symbol(owner), self.documents.get(&owner.uri))
+                else {
+                    continue;
+                };
+                let Some(indices) = document
+                    .member_symbol_indices
+                    .get(&(owner_symbol.key.clone(), key.clone()))
+                else {
+                    continue;
+                };
+                tick(indices.len().max(1))?;
+                for index in indices {
+                    if document.symbols.get(*index).is_some_and(|symbol| {
+                        symbol.kind == SymbolKind::Type
+                            && symbol.declaration_span != owner_symbol.declaration_span
+                            && owner_symbol
+                                .declaration_span
+                                .contains(symbol.declaration_span)
+                    }) {
+                        push_unique_candidate(
+                            &mut next,
+                            Candidate {
+                                uri: owner.uri.clone(),
+                                index: *index,
+                            },
+                        );
+                    }
+                }
+            }
+            if next
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Ok(Vec::new());
+            }
+            current = next;
+        }
+        Ok(current)
     }
 
     fn type_reference_candidates(
@@ -20435,6 +20553,114 @@ fn qualified_identifier_index_with_budget(
         }
     }
     Ok(None)
+}
+
+/// The owner segments of a dotted routine name in a `declProc`, when
+/// `identifier` is one of them:
+///
+/// - a method implementation heading (`procedure TOuter.TInner.Method`,
+///   `procedure TList<T>.Add`, `class operator TRec.Add`), whose owner is a
+///   type of the current unit or program;
+/// - a method resolution clause in a class body (`procedure IFoo.Bar = Baz;`),
+///   whose owner is a visible interface type, possibly from a used unit.
+///
+/// `path` holds the segments up to and including the cursor, so `TOuter`
+/// resolves to `TOuter` itself and not to `TInner`. The last segment (the
+/// method) is not an owner: a heading's method binds through the routine's
+/// direct symbol, and a resolution clause's method is not bound here.
+struct MethodHeadingOwner {
+    path: Vec<String>,
+    implementation: bool,
+}
+
+fn method_heading_owner_path_at(
+    identifier: Node<'_>,
+    source: &str,
+    tick: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<MethodHeadingOwner>, String> {
+    let mut current = identifier;
+    if let Some(parent) = current.tree_parent()
+        && parent.kind() == "genericTpl"
+        && parent
+            .child_by_field_name("entity")
+            .is_some_and(|entity| Span::from_node(entity) == Span::from_node(current))
+    {
+        current = parent;
+    }
+    let mut top = None;
+    while let Some(parent) = current.tree_parent() {
+        tick()?;
+        let is_operand = ["lhs", "rhs"].into_iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|operand| Span::from_node(operand) == Span::from_node(current))
+        });
+        if parent.kind() != "genericDot" || !is_operand {
+            break;
+        }
+        top = Some(parent);
+        current = parent;
+    }
+    let Some(top) = top else {
+        return Ok(None);
+    };
+    let Some(header) = top.tree_parent().filter(|header| {
+        header.kind() == "declProc"
+            && header
+                .child_by_field_name("name")
+                .is_some_and(|name| Span::from_node(name) == Span::from_node(top))
+    }) else {
+        return Ok(None);
+    };
+    let implementation = header.tree_parent().is_some_and(|definition| {
+        definition.kind() == "defProc"
+            && definition
+                .child_by_field_name("header")
+                .is_some_and(|node| Span::from_node(node) == Span::from_node(header))
+    });
+    let Some(owner) = top.child_by_field_name("lhs") else {
+        return Ok(None);
+    };
+    let target = Span::from_node(identifier);
+    let mut parts = Vec::new();
+    let mut cursor_index = None;
+    let mut pending = vec![owner];
+    while let Some(node) = pending.pop() {
+        tick()?;
+        match node.kind() {
+            "identifier" => {
+                if Span::from_node(node) == target {
+                    cursor_index = Some(parts.len());
+                }
+                parts.push(node_text(node, source));
+            }
+            "genericTpl" => {
+                let Some(entity) = node.child_by_field_name("entity") else {
+                    return Ok(None);
+                };
+                pending.push(entity);
+            }
+            "genericDot" => {
+                let (Some(lhs), Some(rhs)) = (
+                    node.child_by_field_name("lhs"),
+                    node.child_by_field_name("rhs"),
+                ) else {
+                    return Ok(None);
+                };
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(cursor_index) = cursor_index else {
+        return Ok(None);
+    };
+    parts.truncate(cursor_index + 1);
+    Ok(Some(MethodHeadingOwner {
+        path: parts,
+        implementation,
+    }))
 }
 
 fn qualified_type_path_at(identifier: Node<'_>, source: &str) -> Option<(Vec<String>, usize)> {

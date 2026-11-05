@@ -1679,3 +1679,89 @@ fn hppemit_bodies_end_at_the_first_closer() {
     assert!(analysis.root.complete, "{:?}", analysis.reasons);
     assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
 }
+
+/// l4d-ztip: the short code-generation switches `B`, `J`, `V`, `I+`/`I-`,
+/// `STRINGCHECKS` and the numeric list members `Z1`/`A4` are harmless, and
+/// the tracked `$IFOPT` options keep their state.
+#[test]
+fn short_code_generation_switches_are_harmless() {
+    for body in [
+        "B-",
+        "B+",
+        "J+",
+        "J-",
+        "V-",
+        "I+",
+        "I-",
+        "O-",
+        "D+",
+        "STRINGCHECKS OFF",
+        "A+,B-,C-,D+,E-,F-,G+,H+,I+,J+,K-,L+,M-,N-,O+,P+,Q-,R-,S-,T-,U-,V+,W-,X+,Y-,Z1",
+        "A4,Z4",
+        "B-,A8,Z2",
+    ] {
+        let kind =
+            pascal_core::conditional::analyze(&format!("{{${body}}}"), &[]).directives[0].kind;
+        assert_eq!(
+            kind,
+            pascal_core::conditional::DirectiveKind::Harmless,
+            "{body}"
+        );
+    }
+    for body in ["I file.inc", "I", "A3,Z4", "B1,Z1", "A4,Z3"] {
+        let kind =
+            pascal_core::conditional::analyze(&format!("{{${body}}}"), &[]).directives[0].kind;
+        assert_ne!(
+            kind,
+            pascal_core::conditional::DirectiveKind::Harmless,
+            "{body}"
+        );
+    }
+    let source = "unit T; interface {$A+,B-,I-,J+,V-,Z1}{$STRINGCHECKS OFF}\
+        {$IFOPT B-}const A = 1;{$ELSE}const X = 1;{$ENDIF}\
+        {$IFOPT I-}{$DEFINE IO_OFF}{$ENDIF}{$I+}{$IFOPT I+}{$DEFINE IO_ON}{$ENDIF}\
+        implementation end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE IO_OFF"), Truth::True);
+    assert_eq!(activity(&analysis, "DEFINE IO_ON"), Truth::True);
+}
+
+/// l4d-ztip: a numeric member in a switch list sets the same layout state as
+/// the standalone `{$Z4}` and `{$A1}`.
+#[test]
+fn switch_list_numeric_members_update_layout() {
+    let source = "unit T; interface {$A+,B-,Z1} type E1=(a,b); {$A4,Z4} type E4=(c,d); \
+        R4=record X:Byte; Y:Integer; end; {$B-,A1,Z2} type E2=(e,f); R1=record X:Byte; Y:Integer; end; \
+        {$IF SizeOf(E1)=1}{$DEFINE E1}{$ENDIF}{$IF SizeOf(E4)=4}{$DEFINE E4}{$ENDIF}\
+        {$IF SizeOf(R4)=8}{$DEFINE R4}{$ENDIF}{$IF SizeOf(E2)=2}{$DEFINE E2}{$ENDIF}\
+        {$IF SizeOf(R1)=5}{$DEFINE R1}{$ENDIF}\
+        implementation end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    for name in ["E1", "E4", "R4", "E2", "R1"] {
+        assert_eq!(
+            activity(&analysis, &format!("DEFINE {name}")),
+            Truth::True,
+            "{name}: {:?}",
+            analysis.reasons
+        );
+    }
+}
+
+/// l4d-ztip: `{$push}`/`{$pop}` are FPC-only; in a branch that is not active
+/// they are not reported, and the nesting stays balanced.
+#[test]
+fn fpc_push_pop_in_an_inactive_branch_is_not_reported() {
+    let source = "unit T; interface {$IFDEF FPC}{$push}{$IFDEF X}{$pop}{$ENDIF}{$pop}{$ENDIF}\
+        {$DEFINE AFTER}implementation end.";
+    let analysis = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
+}

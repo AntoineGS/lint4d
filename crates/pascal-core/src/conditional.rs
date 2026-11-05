@@ -4808,6 +4808,12 @@ impl ExpressionParser<'_> {
                 }
                 symbol
                     .map(|symbol| {
+                        // dcc rejects a dotted argument (E2029 ')' expected
+                        // but '.' found, dcc32 21.0 and 24.0): its value is
+                        // not known (l4d-onnm).
+                        if symbol.contains('.') {
+                            return Value::Unknown;
+                        }
                         if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
                             lookup(ExpressionQuery::Defined(&symbol, symbol_range))
                         }) {

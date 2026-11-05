@@ -85,3 +85,24 @@ fn an_inactive_dotted_block_and_version_chains_are_complete() {
     assert_eq!(activity("define DELPHI.NET"), Truth::False);
     assert_eq!(activity("define WRONG"), Truth::False);
 }
+
+/// Fix round 1 (I2): dcc rejects a dotted `Defined()` argument (E2029 ')'
+/// expected but '.' found, dcc32 21.0 and 24.0), so it is unknown.
+#[test]
+fn a_dotted_defined_argument_is_unknown() {
+    let analysis = conditional::analyze_with_context(
+        "{$define DELPHI.NET}{$IF Defined(DELPHI.NET)}{$DEFINE HIT}{$IFEND}\
+         {$IF Defined(DELPHI)}{$DEFINE HIT2}{$IFEND}",
+        &closed(),
+    );
+    let activity = |body: &str| {
+        analysis
+            .directives
+            .iter()
+            .find(|d| d.body == body)
+            .map(|d| d.activity)
+            .unwrap()
+    };
+    assert_eq!(activity("DEFINE HIT"), Truth::Unknown);
+    assert_eq!(activity("DEFINE HIT2"), Truth::True);
+}

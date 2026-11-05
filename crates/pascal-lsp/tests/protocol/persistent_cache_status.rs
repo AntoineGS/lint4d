@@ -51,7 +51,13 @@ fn index_status_answers_before_the_index_exists_and_names_no_member() {
     server.initialize(main.parent().unwrap(), Value::Null);
     assert_eq!(
         index_status(&mut server, 0),
-        json!({"schema": 1, "contexts": []})
+        json!({
+            "schema": 1,
+            "crawlPublished": 0,
+            "crawlDeferred": 0,
+            "providerGraphsRefused": 0,
+            "contexts": []
+        })
     );
     server.send_notification(
         "textDocument/didOpen",

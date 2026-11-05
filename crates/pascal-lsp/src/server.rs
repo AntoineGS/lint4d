@@ -11872,6 +11872,7 @@ fn event_loop(
                 };
                 let status = crate::project_cache::index_status_json(
                     &index_status_cache.index_status(&is_open),
+                    index_status_cache.index_process_counts(),
                 );
                 send_ok(connection, request.id, status)?;
             }

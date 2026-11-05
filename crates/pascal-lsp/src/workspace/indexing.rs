@@ -30,7 +30,7 @@ use super::{
     path_stamp, path_stamp_from_project_read, path_starts_with_ci,
 };
 use crate::catalogue::{Catalogue, CatalogueKey, MAX_CATALOGUE_ENTRIES};
-use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome, ReservationKind};
+use crate::project_cache::{IndexAnchor, IndexMembership, PublishOutcome};
 pub(crate) use crate::workspace_index::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
 use crate::workspace_index::{
     CandidateQuery, Candidates, ContextIndex, IndexCoverage, IndexedSymbol, MemberFacts,
@@ -681,7 +681,8 @@ pub(crate) enum PersistSkip {
     /// store.
     Unavailable,
     Prepare(super::persist::PersistError),
-    /// `maxCacheBytes` had no room for the publication's transient bytes.
+    /// Neither the publication pool nor `maxCacheBytes` had room for the
+    /// publication's transient bytes.
     Memory,
     Ineligible(super::eligible::Ineligible),
     Store(pascal_cache::Bypass),
@@ -1491,9 +1492,11 @@ impl Workspace {
             )
             .map_err(PersistSkip::Ineligible)?;
         let inputs = prepared.input_paths();
+        // From the publication pool, not the parse budget the crawl's pins
+        // and leases fill (13b-3, A2).
         let _transient = self
             .project_cache
-            .reserve(ReservationKind::Scratch, prepared.transient_bytes())
+            .reserve_publication(prepared.transient_bytes())
             .ok_or(PersistSkip::Memory)?;
         let job = self
             .persistent_cache()
@@ -1550,9 +1553,9 @@ impl Workspace {
         cancel: &AtomicBool,
     ) {
         // Considered once per job, before the proofs: a unit skipped for a
-        // transient reason (a refused reservation, a store bypass,
-        // cancellation) is not retried by the same crawl. The Full batch
-        // extracts it, or a later crawl job publishes it.
+        // transient reason (a store bypass, cancellation) is not retried by
+        // the same crawl. The Full batch extracts it, or a later crawl job
+        // publishes it. A refused reservation forgets it (below).
         if !self.crawl_persists
             || !self.persistent_cache().is_enabled()
             || !self.crawl_considered.insert(uri.clone())
@@ -1605,6 +1608,13 @@ impl Workspace {
             Ok((_, inputs)) => self
                 .project_cache
                 .note_published(&path, hash, context, &inputs),
+            // No room even in the publication pool: the unit is left to
+            // the index batch, which still holds it pending and extracts and
+            // publishes it; this job may try it again (13b-3, A2).
+            Err(PersistSkip::Memory) => {
+                self.crawl_considered.remove(uri);
+                self.project_cache.note_crawl_deferred(&path);
+            }
             Err(skip) => {
                 crate::trace::trace!("  crawl unit {} not persisted: {skip:?}", path.display());
                 // No later crawl job tries the same write; the index batch
@@ -6590,7 +6600,7 @@ pub(in crate::workspace) mod tests {
                     .any(|gap| gap.starts_with("1 members are too large to store")),
                 "{entry:?}"
             );
-            let json = crate::project_cache::index_status_json(&status);
+            let json = crate::project_cache::index_status_json(&status, Default::default());
             assert_eq!(json["contexts"][0]["overLimit"], 1, "{json}");
             let records = records(&view, &key);
             assert_eq!(records.len(), COUNT, "{records:?}");
@@ -6816,17 +6826,26 @@ pub(in crate::workspace) mod tests {
             let target = member.clone();
             let shrunk = Rc::new(Cell::new(false));
             let flag = Rc::clone(&shrunk);
+            let pool = Rc::new(RefCell::new(None));
+            let held = Rc::clone(&pool);
             set_before_persist_hook(Some(Box::new(move |path| {
                 if path == target {
                     let stats = project_cache.stats();
-                    // No room is left for anything new.
+                    // No room is left for anything new, not even in the
+                    // publication pool (13b-3).
                     project_cache.set_max_bytes(stats.outstanding_bytes + stats.reserved_bytes());
+                    *held.borrow_mut() =
+                        project_cache.reserve_publication(project_cache.publication_pool_bytes());
                     flag.set(true);
                 }
             })));
             let progress = advance(&mut view, &anchor, IndexBound::all());
             set_before_persist_hook(None);
             assert!(shrunk.get());
+            assert!(
+                pool.borrow_mut().take().is_some(),
+                "the whole pool was held"
+            );
             workspace
                 .project_cache()
                 .set_max_bytes(crate::project_cache::DEFAULT_MAX_CACHE_BYTES);
@@ -7070,6 +7089,126 @@ pub(in crate::workspace) mod tests {
             assert_eq!(progress.reused, ROOT_UNITS, "{progress:?}");
             assert_eq!(fresh(&restarted, &key), units(root, ROOT_UNITS));
             assert_eq!(recorded(&restarted, &key).len(), ROOT_UNITS);
+            cache.shutdown();
+        }
+
+        /// Holds every byte of `cache`'s budget that pins, leases and held
+        /// reservations leave, as the crawl's pins and leases did in Task 13
+        /// R1 (A2): no ordinary reservation fits until it is dropped.
+        fn fill_parse_budget(
+            cache: &crate::project_cache::ProjectCache,
+        ) -> crate::project_cache::Reservation {
+            let stats = cache.stats();
+            let used = stats
+                .pinned_bytes
+                .saturating_add(stats.outstanding_bytes)
+                .saturating_add(stats.reserved_bytes());
+            let filler = cache
+                .reserve(
+                    crate::project_cache::ReservationKind::Facts,
+                    cache.max_bytes() - used,
+                )
+                .expect("the rest of the budget");
+            assert!(
+                cache
+                    .reserve(crate::project_cache::ReservationKind::Scratch, 1)
+                    .is_none()
+            );
+            filler
+        }
+
+        /// 13b-3 (A2): a parse budget full of the crawl's own pins and
+        /// leases does not stop the crawl publishing: a publication's
+        /// transients draw on their own pool.
+        #[test]
+        fn a_crawl_publishes_while_its_pins_fill_the_parse_budget() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, _key, anchor, open) = crawled_project(root);
+            let cache = start(&session, store.path(), true);
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            let filler = fill_parse_budget(&session.project_cache);
+            crawl(&session, &cache, &open);
+            drop(filler);
+            assert_eq!(
+                sorted(session.project_cache.published_by_crawl_for_test()),
+                units(root, ROOT_UNITS),
+            );
+            let counts = session.project_cache.index_process_counts();
+            assert_eq!(
+                (counts.crawl_published, counts.crawl_deferred),
+                (ROOT_UNITS as u64, 0),
+                "{counts:?}"
+            );
+            cache.shutdown();
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, ROOT_UNITS, "{progress:?}");
+            cache.shutdown();
+        }
+
+        /// 13b-3 (A2): with no room even in the publication pool, the crawl
+        /// defers each unit to the index batch, counted, instead of dropping
+        /// it: the next Full batch extracts and publishes every one.
+        #[test]
+        fn a_refused_crawl_publication_is_published_by_the_next_full_batch() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let pool = session
+                .project_cache
+                .reserve_publication(session.project_cache.publication_pool_bytes())
+                .expect("the whole pool");
+            let filler = fill_parse_budget(&session.project_cache);
+            let crawled = crawl(&session, &cache, &open);
+            drop((filler, pool));
+            assert!(
+                session
+                    .project_cache
+                    .published_by_crawl_for_test()
+                    .is_empty()
+            );
+            let counts = session.project_cache.index_process_counts();
+            assert_eq!(
+                (counts.crawl_published, counts.crawl_deferred),
+                (0, ROOT_UNITS as u64),
+                "{counts:?}"
+            );
+            for unit in units(root, ROOT_UNITS) {
+                let uri = Url::from_file_path(&unit).unwrap();
+                assert!(
+                    !crawled.crawl_considered.contains(&uri),
+                    "{} may be tried again",
+                    unit.display()
+                );
+            }
+
+            let loaded = record_loads();
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            let mut expected = units(root, ROOT_UNITS);
+            expected.extend([root.join("App.dpr"), root.join("lib/Root.pas")]);
+            assert_eq!(sorted(loaded.borrow().clone()), sorted(expected));
+            assert_eq!(recorded(&view, &key).len(), ROOT_UNITS + 2);
+            cache.shutdown();
+
+            let (mut restarted, cache) = restarted_view(root, store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut restarted,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert_eq!(progress.reused, ROOT_UNITS + 2, "{progress:?}");
             cache.shutdown();
         }
 

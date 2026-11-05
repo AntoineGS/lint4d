@@ -44,6 +44,14 @@ const INDEX_BATCH_DISPATCH_BYTES: usize = 4 * 1024;
 /// Compiled provider interfaces may hold a quarter of `maxCacheBytes`
 /// (l4d-4nbs D29); past it their own least recently used are evicted.
 const PROVIDER_GRAPH_BUDGET_SHARE: usize = 4;
+/// A publication's transient buffers (its encoded facts and evidence) draw
+/// on a pool of their own, the smaller of this and a sixteenth of
+/// `maxCacheBytes` (13b-3, A2): the crawl's pins and leases filling the
+/// parse budget never refuse them. One member's transients are at most
+/// `MAX_ARTIFACT_CONTENT_BYTES` (16 MiB) plus its observations, so a few
+/// publications fit at once; past the pool they ask the budget.
+const PUBLICATION_POOL_BYTES: usize = 64 * 1024 * 1024;
+const PUBLICATION_POOL_SHARE: usize = 16;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
 /// Paths `IndexStore::crawl_published` remembers; past it, it starts over.
@@ -3103,6 +3111,8 @@ mod cache_tests {
         ));
         assert_eq!(cache.provider_graph_count(), 0);
         assert_eq!(cache.provider_graph_bytes(), 0);
+        // 13b-3 (N1): the refusal is counted for `pascal/indexStatus`.
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 1);
         assert!(cache.put_provider_graph(
             7,
             provider_key("A"),
@@ -3249,6 +3259,71 @@ mod cache_tests {
         );
         assert!(cache.charge_index(INDEX_BATCH_DISPATCH_BYTES));
         drop(held);
+    }
+
+    /// 13b-3 (A2): `make_room` and `index_batch_fits` leave the shared
+    /// provider interfaces out of what cannot give way, as `has_room` does:
+    /// with pinned, outstanding and other reserved bytes leaving room, a
+    /// small request evicts the interfaces instead of being refused while
+    /// the budget is over (outstanding bytes counted past it).
+    #[test]
+    fn evictable_provider_interfaces_never_refuse_a_small_request() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(5_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        assert!(graphs > INDEX_BATCH_DISPATCH_BYTES + 100, "{graphs}");
+        let held = cache.reserve(ReservationKind::Scratch, 16_000).unwrap();
+        // Parses evicted while leased: their charge stays outstanding, and
+        // with the interfaces the budget is over.
+        lock(&cache.inner).outstanding_bytes = max - 16_000 - INDEX_BATCH_DISPATCH_BYTES - 100;
+        assert!(cache.has_room(), "{:?}", cache.stats());
+        assert!(cache.index_batch_fits(), "{:?}", cache.stats());
+        let small = cache.reserve(ReservationKind::Scratch, 100);
+        assert!(
+            small.is_some(),
+            "the interface gives way: {:?}",
+            cache.stats()
+        );
+        assert_eq!(cache.provider_graph_count(), 0);
+        drop((small, held));
+    }
+
+    /// 13b-3 (A2): a publication's transients draw on a small pool of their
+    /// own, so they are admitted while pins, leases and other reservations
+    /// fill the parse budget; past the pool they ask the budget as any
+    /// reservation does. The crawl's and the index's room ignore them.
+    #[test]
+    fn publication_transients_draw_on_their_own_pool() {
+        let max = 160_000;
+        let cache = ProjectCache::new(max);
+        let pool = cache.publication_pool_bytes();
+        assert_eq!(pool, max / PUBLICATION_POOL_SHARE);
+        let full = cache.reserve(ReservationKind::Facts, max).unwrap();
+        assert!(cache.reserve(ReservationKind::Scratch, 1).is_none());
+        let first = cache.reserve_publication(pool / 2).expect("from the pool");
+        let second = cache.reserve_publication(pool / 2).expect("from the pool");
+        assert_eq!(cache.stats().reserved_publication_bytes, pool);
+        assert!(
+            cache.reserve_publication(1).is_none(),
+            "the pool is used up and the budget is full"
+        );
+        drop(full);
+        assert!(cache.has_room() && cache.index_batch_fits());
+        let past = cache
+            .reserve_publication(1)
+            .expect("past the pool, from the budget");
+        drop((first, second, past));
+        assert_eq!(cache.stats().reserved_publication_bytes, 0);
+        let big = cache.reserve_publication(max / 2).expect("from the budget");
+        assert_eq!(cache.stats().reserved_publication_bytes, max / 2);
+        drop(big);
     }
 
     /// Evictable provider interfaces do not stop the crawl (l4d-axsn): with
@@ -3783,6 +3858,8 @@ struct State {
     /// Held reservations by `ReservationKind::index`. Poison recovery keeps
     /// them: their holders release them on drop.
     reserved: [usize; ReservationKind::COUNT],
+    /// The part of `reserved[Publication]` drawn on the publication pool.
+    publication_pooled: usize,
     watch_counts: HashMap<PathBuf, usize>,
     /// Advances when poison recovery drains `watch_counts`: a catalogue's
     /// watches acquired under an older one were drained and are not released.
@@ -3830,6 +3907,7 @@ impl Default for State {
             leases: HashMap::new(),
             outstanding_bytes: 0,
             reserved: [0; ReservationKind::COUNT],
+            publication_pooled: 0,
             watch_counts: HashMap::new(),
             watch_count_epoch: 0,
             watch_changes: Vec::new(),
@@ -3880,6 +3958,9 @@ struct Inner {
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
+    /// Provider interfaces not shared because their reads overflowed
+    /// (13b-2 follow-up N1), for `pascal/indexStatus`.
+    provider_graphs_refused: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -4035,6 +4116,7 @@ pub(crate) struct CacheStats {
     pub reserved_catalogue_bytes: usize,
     pub reserved_index_bytes: usize,
     pub reserved_provider_graph_bytes: usize,
+    pub reserved_publication_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4046,6 +4128,7 @@ impl CacheStats {
             .saturating_add(self.reserved_catalogue_bytes)
             .saturating_add(self.reserved_index_bytes)
             .saturating_add(self.reserved_provider_graph_bytes)
+            .saturating_add(self.reserved_publication_bytes)
     }
 }
 
@@ -4070,10 +4153,12 @@ pub(crate) enum ReservationKind {
     /// Compiled provider interfaces (l4d-4nbs D29), held by their store like
     /// the catalogues.
     ProviderGraphs,
+    /// A member publication's transient buffers (`reserve_publication`).
+    Publication,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         match self {
@@ -4083,6 +4168,7 @@ impl ReservationKind {
             Self::Catalogues => 3,
             Self::WorkspaceIndex => 4,
             Self::ProviderGraphs => 5,
+            Self::Publication => 6,
         }
     }
 }
@@ -4097,6 +4183,8 @@ pub(crate) struct Reservation {
     inner: Arc<Inner>,
     kind: ReservationKind,
     bytes: usize,
+    /// Drawn on the publication pool rather than made room for.
+    pooled: bool,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -4125,6 +4213,9 @@ impl Reservation {
         let mut state = lock(&self.inner);
         let reserved = &mut state.reserved[self.kind.index()];
         *reserved = reserved.saturating_sub(self.bytes - bytes);
+        if self.pooled {
+            state.publication_pooled = state.publication_pooled.saturating_sub(self.bytes - bytes);
+        }
         self.bytes = bytes;
     }
 }
@@ -4134,7 +4225,14 @@ impl Drop for Reservation {
         let mut state = lock(&self.inner);
         let reserved = &mut state.reserved[self.kind.index()];
         *reserved = reserved.saturating_sub(self.bytes);
+        if self.pooled {
+            state.publication_pooled = state.publication_pooled.saturating_sub(self.bytes);
+        }
     }
+}
+
+fn publication_pool(state: &State) -> usize {
+    PUBLICATION_POOL_BYTES.min(state.max_bytes / PUBLICATION_POOL_SHARE)
 }
 
 fn reserved_bytes(state: &State) -> usize {
@@ -4154,14 +4252,36 @@ fn fits(state: &State, retained: usize, request: usize) -> bool {
         .is_some_and(|total| total <= state.max_bytes)
 }
 
+/// What no eviction frees: pinned, outstanding and reserved bytes, less the
+/// shared provider interfaces, a cache that gives way to every request
+/// (l4d-4nbs review I2), and less the publication pool, a budget of its own
+/// (13b-3, A2).
+fn committed_bytes(state: &State) -> usize {
+    state
+        .pinned_bytes
+        .saturating_add(state.outstanding_bytes)
+        .saturating_add(
+            reserved_bytes(state)
+                .saturating_sub(state.provider_graphs.bytes)
+                .saturating_sub(state.publication_pooled),
+        )
+}
+
+/// Whether `request` fits beside what no eviction frees.
+fn fits_committed(state: &State, request: usize) -> bool {
+    committed_bytes(state)
+        .checked_add(request)
+        .is_some_and(|total| total <= state.max_bytes)
+}
+
 /// Evicts unpinned entries, least recently used first, until `request` more
 /// bytes fit. False when they cannot: pinned, outstanding and reserved bytes
 /// alone leave no room, or nothing is left to evict.
 fn make_room(state: &mut State, request: usize) -> bool {
-    // Shared provider interfaces are a cache: their charge never stands in
-    // the way of a request (l4d-4nbs review I2).
-    let graphs = state.provider_graphs.bytes;
-    if !fits(state, state.pinned_bytes, request.saturating_sub(graphs)) {
+    // The interfaces' charge is checked against `reserved`, not subtracted
+    // from the request (13b-3, A2: a small request was refused before the
+    // interfaces were evicted).
+    if !fits_committed(state, request) {
         return false;
     }
     while !fits(state, state.bytes, request) {
@@ -4408,9 +4528,47 @@ impl ProjectCache {
                     inner: Arc::clone(&self.inner),
                     kind,
                     bytes,
+                    pooled: false,
                 })
                 .collect(),
         )
+    }
+
+    /// Reserve a member publication's transient bytes (13b-3, A2). Up to
+    /// the publication pool they are admitted whatever pins, leases and
+    /// other reservations hold, evicting unpinned entries as far as it can
+    /// so they stay within `maxCacheBytes` when that is possible; past the
+    /// pool they are made room for as `reserve` does, or refused.
+    pub(crate) fn reserve_publication(&self, bytes: usize) -> Option<Reservation> {
+        let kind = ReservationKind::Publication;
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let pooled = state
+            .publication_pooled
+            .checked_add(bytes)
+            .is_some_and(|total| total <= publication_pool(&state));
+        if pooled {
+            state.publication_pooled += bytes;
+            state.reserved[kind.index()] += bytes;
+            evict_to_budget(&mut state);
+        } else if make_room(&mut state, bytes) {
+            state.reserved[kind.index()] += bytes;
+        } else {
+            self.release(state);
+            return None;
+        }
+        self.release(state);
+        Some(Reservation {
+            inner: Arc::clone(&self.inner),
+            kind,
+            bytes,
+            pooled,
+        })
+    }
+
+    /// The publication pool's size under the current budget.
+    pub(crate) fn publication_pool_bytes(&self) -> usize {
+        publication_pool(&lock(&self.inner))
     }
 
     /// Releases the state lock, then applies the watch changes it queued.
@@ -6050,12 +6208,7 @@ impl ProjectCache {
     pub(crate) fn index_batch_fits(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        let graphs = state.provider_graphs.bytes;
-        fits(
-            &state,
-            state.pinned_bytes,
-            INDEX_BATCH_DISPATCH_BYTES.saturating_sub(graphs),
-        )
+        fits_committed(&state, INDEX_BATCH_DISPATCH_BYTES)
     }
 
     /// Whether the crawl may dispatch. Shared provider interfaces are not
@@ -6064,11 +6217,7 @@ impl ProjectCache {
     pub(crate) fn has_room(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        state
-            .pinned_bytes
-            .saturating_add(state.outstanding_bytes)
-            .saturating_add(reserved_bytes(&state).saturating_sub(state.provider_graphs.bytes))
-            < state.max_bytes
+        committed_bytes(&state) < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -6098,6 +6247,7 @@ impl ProjectCache {
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
+            reserved_publication_bytes: state.reserved[ReservationKind::Publication.index()],
         }
     }
 
@@ -6349,6 +6499,13 @@ impl ProjectCache {
         // inherit the overflow, never prove its inputs. It compiles the
         // provider itself instead, capturing its own reads.
         if reads.overflowed {
+            self.inner
+                .provider_graphs_refused
+                .fetch_add(1, Ordering::Relaxed);
+            crate::trace::trace!(
+                "  provider interface {} not shared: its reads overflowed",
+                key.source.as_str()
+            );
             return false;
         }
         let full = (configuration, key);
@@ -6749,15 +6906,32 @@ impl IndexStatusEntry {
     }
 }
 
+/// What `pascal/indexStatus` counts for the whole process, not per context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IndexProcessCounts {
+    /// Units the warm crawl published (R8-2/D42).
+    pub(crate) crawl_published: u64,
+    /// Crawl publications that found no room, left to the index batch.
+    pub(crate) crawl_deferred: u64,
+    /// Provider interfaces not shared because their reads overflowed.
+    pub(crate) provider_graphs_refused: u64,
+}
+
 /// The `pascal/indexStatus` result. It never exceeds
 /// `STATUS_DOCUMENT_BYTES`: when the entries do not fit, gaps are dropped
 /// from the least recently used contexts first, then anchors are cut.
-pub(crate) fn index_status_json(entries: &[IndexStatusEntry]) -> serde_json::Value {
+pub(crate) fn index_status_json(
+    entries: &[IndexStatusEntry],
+    process: IndexProcessCounts,
+) -> serde_json::Value {
     let mut entries = entries.to_vec();
     let mut anchor_bytes = STATUS_ANCHOR_BYTES;
     loop {
         let document = serde_json::json!({
             "schema": 1,
+            "crawlPublished": process.crawl_published,
+            "crawlDeferred": process.crawl_deferred,
+            "providerGraphsRefused": process.provider_graphs_refused,
             "contexts": entries
                 .iter()
                 .map(|entry| entry.to_json(anchor_bytes))
@@ -6810,6 +6984,11 @@ struct IndexStore {
     /// another input does not: the member then stays unpublished in this
     /// process, which is never a wrong publication.
     over_limit: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+    /// Units the warm crawl published in this process (13b-3, A2).
+    crawl_published_count: u64,
+    /// Units whose crawl publication found no room and were left to the
+    /// index batch, which extracts and publishes them (13b-3, A2).
+    crawl_deferred_count: u64,
     /// The paths the warm crawl published, in publication order.
     #[cfg(test)]
     published_by_crawl: Vec<PathBuf>,
@@ -6829,6 +7008,8 @@ impl Default for IndexStore {
             crawl_published: HashMap::new(),
             crawl_dependents: HashMap::new(),
             over_limit: HashMap::new(),
+            crawl_published_count: 0,
+            crawl_deferred_count: 0,
             #[cfg(test)]
             published_by_crawl: Vec::new(),
         }
@@ -7225,6 +7406,7 @@ impl ProjectCache {
         inputs: &[PathBuf],
     ) {
         let mut index = self.index();
+        index.crawl_published_count = index.crawl_published_count.saturating_add(1);
         for stored in index.contexts.values_mut() {
             stored.index.clear_reuse_tried(path);
         }
@@ -7250,6 +7432,30 @@ impl ProjectCache {
         }
         #[cfg(test)]
         index.published_by_crawl.push(path.to_path_buf());
+    }
+
+    /// The warm crawl found no room to publish `path` (13b-3, A2). Nothing
+    /// is dropped: every context index still holds the member pending, so
+    /// its next Full batch extracts and publishes it; this counts it.
+    pub(crate) fn note_crawl_deferred(&self, path: &Path) {
+        let mut index = self.index();
+        index.crawl_deferred_count = index.crawl_deferred_count.saturating_add(1);
+        crate::trace::trace!(
+            "  crawl unit {} deferred to the index batch: no room for its publication",
+            path.display()
+        );
+    }
+
+    /// The process-wide counts `pascal/indexStatus` reports beside its
+    /// contexts.
+    pub(crate) fn index_process_counts(&self) -> IndexProcessCounts {
+        let provider_graphs_refused = self.inner.provider_graphs_refused.load(Ordering::Relaxed);
+        let index = self.index();
+        IndexProcessCounts {
+            crawl_published: index.crawl_published_count,
+            crawl_deferred: index.crawl_deferred_count,
+            provider_graphs_refused,
+        }
     }
 
     /// Whether the crawl published `path` from the bytes hashed `hash` under
@@ -8158,10 +8364,32 @@ mod index_tests {
             assert!(entry.gaps.iter().all(|gap| gap.len() <= 160));
             assert!(!entry.complete);
         }
-        let text = index_status_json(&entries).to_string();
+        let text = index_status_json(&entries, Default::default()).to_string();
         assert!(text.len() <= 8192, "{} bytes", text.len());
         assert!(text.contains("\"anchorTruncated\":true"), "{text}");
         assert!(!text.contains("/w/A.pas"));
+    }
+
+    /// 13b-3 (A2, N1): the process's crawl publications, crawl deferrals to
+    /// the index batch and provider interfaces refused for overflowed reads
+    /// are reported beside the contexts.
+    #[test]
+    fn index_status_reports_crawl_publications_and_deferrals() {
+        let cache = ProjectCache::new(1 << 30);
+        let digest = pascal_cache::Digest::from_bytes([3; 32]);
+        cache.note_published(Path::new("/w/A.pas"), 1, digest, &[]);
+        cache.note_published(Path::new("/w/B.pas"), 1, digest, &[]);
+        cache.note_crawl_deferred(Path::new("/w/C.pas"));
+        let counts = cache.index_process_counts();
+        assert_eq!(
+            (counts.crawl_published, counts.crawl_deferred),
+            (2, 1),
+            "{counts:?}"
+        );
+        let json = index_status_json(&cache.index_status(&|_| false), counts);
+        assert_eq!(json["crawlPublished"], 2, "{json}");
+        assert_eq!(json["crawlDeferred"], 1, "{json}");
+        assert_eq!(json["providerGraphsRefused"], 0, "{json}");
     }
 
     /// Task 10b: a member reused from the store is never counted as
@@ -8239,7 +8467,7 @@ mod index_tests {
             "{:?}",
             entry.gaps
         );
-        let json = index_status_json(&entries);
+        let json = index_status_json(&entries, Default::default());
         let context = &json["contexts"][0];
         assert_eq!(json["schema"], 1);
         assert_eq!(context["anchor"]["project"], "file:///anchors/a");
@@ -8296,7 +8524,7 @@ mod index_tests {
         assert!(!entries[0].complete, "the member is still pending");
         assert_eq!(entries[0].counts.pending, 1);
         assert!(
-            index_status_json(&[])["contexts"]
+            index_status_json(&[], Default::default())["contexts"]
                 .as_array()
                 .unwrap()
                 .is_empty()

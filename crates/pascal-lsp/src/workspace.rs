@@ -22346,6 +22346,70 @@ mod tests {
         rename_tprovided(&main, &workspace).expect("rename succeeds");
     }
 
+    /// l4d-1qta fix round 1 (M4): an unqualified unscoped enum value is an
+    /// enum member token; a scoped one used qualified is too.
+    #[test]
+    fn semantic_tokens_classify_unqualified_enum_values() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            concat!(
+                "unit Main;\n",               // 0
+                "interface\n",                // 1
+                "type\n",                     // 2
+                "  TColor = (Red, Green);\n", // 3
+                "implementation\n",           // 4
+                "procedure Run;\n",           // 5
+                "var C: TColor;\n",           // 6
+                "begin\n",                    // 7
+                "  C := Green;\n",            // 8
+                "end;\n",                     // 9
+                "end.\n",
+            ),
+        )
+        .unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let tokens = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(8, 0),
+                lsp_types::Position::new(9, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens");
+        let legend = crate::NavigationIndex::semantic_tokens_legend();
+        let (mut line, mut character) = (0u32, 0u32);
+        let decoded = tokens
+            .data
+            .iter()
+            .map(|token| {
+                line += token.delta_line;
+                character = if token.delta_line == 0 {
+                    character + token.delta_start
+                } else {
+                    token.delta_start
+                };
+                (
+                    line,
+                    character,
+                    legend.token_types[token.token_type as usize]
+                        .as_str()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            decoded.contains(&(8, 7, "enumMember".to_string())),
+            "{decoded:?}"
+        );
+    }
+
     /// l4d-1qta: `{$SCOPEDENUMS ON}` read from an include scopes the enum
     /// declared after it: the unqualified `Green` is the constant and the
     /// value is referenced only qualified.

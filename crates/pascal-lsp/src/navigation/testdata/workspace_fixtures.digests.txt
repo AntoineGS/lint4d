@@ -35,7 +35,7 @@ crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Generics.pas 6892dd30e9607e7b
 crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Inheritance.pas 06749b6cce8e2843 37
 crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Interfaces.pas 513b9f6e758868f8 21
 crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Records.pas f37f6f73c9aa10f9 24
-crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Torture.pas 15a7543c91c2a452 130
+crates/lint4d/tests/fixtures/dcu/src/Lint4dFixture.Torture.pas 0c03b8bececacb61 130
 crates/lint4d/tests/fixtures/dcu/xe3_win32/Lint4dFixtures.dpr a95609f14d6c3979 1
 crates/lint4d/tests/fixtures/digest/collapse.pas 0a76dc593486bae8 3
 crates/lint4d/tests/fixtures/digest/compaction.pas 5052ef5912de45d4 6

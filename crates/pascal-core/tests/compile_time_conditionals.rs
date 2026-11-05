@@ -1846,3 +1846,46 @@ fn an_imported_scoped_enum_exports_no_unqualified_values() {
         assert_eq!(activity(&a, "DEFINE CONSTANT"), expected, "{directive:?}");
     }
 }
+
+/// l4d-1qta fix round 1 (dcc 37.0 `T2c`, `N1`, `S1`): the values of an
+/// enumerated type nested in a class or record are unqualified names of the
+/// unit, so they bind in `$IF` and shadow an earlier unit's constant.
+#[test]
+fn nested_enum_values_are_unit_scope_compile_time_names() {
+    for outer in ["record", "class"] {
+        let source = format!(
+            "unit T; interface type TR = {outer} type TQ=(qA,qB); end; \
+            {{$IF Ord(qB)=1}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+        );
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(a.root.complete, "{outer}: {:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE HIT"), Truth::True, "{outer}");
+    }
+}
+
+/// l4d-1qta fix round 1: an imported unit's nested enum value is a candidate
+/// for `e1` beside the earlier unit's constant, so the constant is not proven.
+#[test]
+fn an_imported_nested_enum_value_shadows_an_earlier_constant() {
+    for outer in ["record", "class"] {
+        let source = "unit T; interface uses Q, P; \
+            {$IF e1=5}{$DEFINE CONSTANT}{$ENDIF} implementation end.";
+        let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+        fixture.unit(
+            "Q",
+            "unit Q; interface const e1 = 5; implementation end.",
+            context(LayoutPlatform::Win32),
+        );
+        fixture.unit(
+            "P",
+            &format!(
+                "unit P; interface type TR = {outer} type E=(e0,e1); end; implementation end."
+            ),
+            context(LayoutPlatform::Win32),
+        );
+        let a = fixture.analyze().unwrap();
+        assert_ne!(activity(&a, "DEFINE CONSTANT"), Truth::True, "{outer}");
+    }
+}

@@ -5551,7 +5551,7 @@ fn is_harmless_keyword(keyword: &str) -> bool {
         return suffixed;
     }
     // Name binding reads `SCOPEDENUMS ON`/`OFF` per enumerated type through
-    // `ScopedEnums`; a `+`/`-` spelling is not modelled there.
+    // `ScopedEnums`; dcc 37.0 rejects the `+`/`-` spelling (E1030).
     if keyword == "scopedenums" {
         return !suffixed;
     }

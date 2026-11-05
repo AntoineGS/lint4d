@@ -490,7 +490,9 @@ fn retained_constant_expressions_participate_in_recovery_fingerprints() {
 #[test]
 fn record_and_qualified_routine_sites_have_distinct_lexical_scopes() {
     let h = Harness::plain(
-        "unit T; interface type E=Extended; R=record {FIELD} Next:^R; end; implementation procedure T.P; type Local=Byte; begin {METHOD} end; end.",
+        // The method's class is declared: an undeclared one leaves its member
+        // scope, and so every name in the method, unproven (l4d-wwmg).
+        "unit T; interface type E=Extended; R=record {FIELD} Next:^R; end; TQ=class procedure P; end; implementation procedure TQ.P; type Local=Byte; begin {METHOD} end; end.",
         context(LayoutPlatform::Win64),
     );
     let field = h

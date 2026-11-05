@@ -60,6 +60,53 @@ pub(crate) struct Declaration {
     /// Logical start of the original defaultValue node, never a parser-wrapper
     /// offset. Its physical segments live in the state's occurrence span map.
     pub initializer_logical: Option<usize>,
+    /// What a class, record, interface or helper body could declare, for
+    /// the member scope of its methods (l4d-wwmg).
+    pub shape: Option<std::sync::Arc<ClassShape>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ShapeKind {
+    Class,
+    /// An old-style `object`: no implicit ancestor.
+    Object,
+    Record,
+    Interface,
+    Helper,
+}
+
+/// The members a composite type body could declare. `names` holds every
+/// identifier its active body text spells (D46's lexical rule applied to
+/// one body); `None` when that text could not be read as a proof. The
+/// heritage list is kept as spelled; a helper also keeps the type it helps.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ClassShape {
+    pub kind: ShapeKind,
+    pub names: Option<super::InterfaceNames>,
+    pub parents: Vec<String>,
+    pub helped: Option<String>,
+}
+
+impl ClassShape {
+    pub(super) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self
+                .names
+                .as_ref()
+                .map_or(0, super::InterfaceNames::retained_bytes)
+            + self
+                .parents
+                .iter()
+                .chain(self.helped.iter())
+                .map(|p| size_of::<String>() + p.len())
+                .sum::<usize>()
+    }
+
+    fn may_declare(&self, name: &str) -> bool {
+        self.names
+            .as_ref()
+            .is_none_or(|names| names.may_declare(name))
+    }
 }
 
 /// A provider's graph is retained in its own binding namespace. Declaration
@@ -666,6 +713,44 @@ pub(super) fn layout_name(
     result.unwrap_or_else(Fact::Incomplete)
 }
 
+/// What a name that a member of the method's type could declare binds to:
+/// a declaration that is neither a constant, a type nor a routine, so no
+/// consumer proves anything from it (l4d-wwmg).
+static MEMBER_BLOCKER: std::sync::LazyLock<Declaration> = std::sync::LazyLock::new(|| {
+    let site = BindingSite {
+        scope: ScopeId(0),
+        sequence: Sequence(0),
+    };
+    Declaration {
+        name: String::new(),
+        key: DefinitionKey {
+            anchor: SourceAnchor {
+                source: crate::SourceId::new(String::new()),
+                occurrence: OccurrenceId(0),
+                range: 0..0,
+            },
+            scope: ScopeId(0),
+        },
+        site: site.clone(),
+        type_site: site,
+        ty: TypeExpr::Unsupported(String::new()),
+        is_type: false,
+        exported: false,
+        is_constant: false,
+        is_routine: false,
+        settings: LayoutSettings::default(),
+        provenance: Vec::new(),
+        initializer: None,
+        initializer_logical: None,
+        shape: None,
+    }
+});
+
+/// The binding stands for a possible member of a method's type.
+pub(super) fn is_member_blocker(decl: &Declaration) -> bool {
+    std::ptr::eq(decl, &*MEMBER_BLOCKER)
+}
+
 pub(super) fn lookup<'a>(
     state: &'a CompileTimeState,
     site: &BindingSite,
@@ -690,6 +775,13 @@ pub(super) fn lookup<'a>(
                     }
                 }
             }
+        }
+        // A method's parameters and locals come first, then the members of
+        // its type, its ancestors and the helpers in scope (dcc 37.0 C1).
+        if let Some(owner) = state.scopes[id.0 as usize].owner.as_deref()
+            && member_may_bind(state, site, owner, name, budget)?
+        {
+            return Ok(Some(Binding::Declaration(&MEMBER_BLOCKER)));
         }
         scope = state.scopes[id.0 as usize].parent;
     }
@@ -717,6 +809,321 @@ pub(super) fn lookup<'a>(
         }
     }
     Ok(None)
+}
+
+/// The members the `TObject` declarations of System.pas declare, in all
+/// their conditional branches: RAD Studio 7.0 and 10.0, Studio 37.0 (the
+/// names `member_names` would collect from them). A class without a
+/// heritage list derives from System's TObject whatever `TObject` names in
+/// its scope, and System declares no class helper.
+const TOBJECT_MEMBERS: &[&str] = &[
+    "__markdestroying",
+    "__objaddref",
+    "__objrelease",
+    "__setdisposed",
+    "afterconstruction",
+    "beforedestruction",
+    "checkdisposed",
+    "classinfo",
+    "classname",
+    "classnameis",
+    "classparent",
+    "classtype",
+    "cleanupinstance",
+    "cpp_abi_1",
+    "cpp_abi_2",
+    "cpp_abi_3",
+    "create",
+    "defaulthandler",
+    "destroy",
+    "dispatch",
+    "disposed",
+    "disposeof",
+    "equals",
+    "fieldaddress",
+    "free",
+    "freeinstance",
+    "frefcount",
+    "getdisposed",
+    "gethashcode",
+    "getinterface",
+    "getinterfaceentry",
+    "getinterfacetable",
+    "inheritsfrom",
+    "initinstance",
+    "instancesize",
+    "methodaddress",
+    "methodname",
+    "newinstance",
+    "objdestroyingflag",
+    "objdisposedflag",
+    "qualifiedclassname",
+    "refcount",
+    "safecallexception",
+    "tostring",
+    "unitname",
+    "unitscope",
+];
+
+fn tobject_may_declare(
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    budget.charge(TOBJECT_MEMBERS.len().ilog2() as usize + 1, name.len(), 0)?;
+    let name = name.strip_prefix('&').unwrap_or(name);
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Ok(true);
+    }
+    Ok(TOBJECT_MEMBERS
+        .binary_search_by(|probe| {
+            probe
+                .bytes()
+                .cmp(name.bytes().map(|b| b.to_ascii_lowercase()))
+        })
+        .is_ok())
+}
+
+/// A composite type a heritage list or a method heading names.
+enum Resolved<'a> {
+    Type(&'a CompileTimeState, &'a Declaration),
+    /// System's TObject.
+    SystemObject,
+    /// Not proven: unresolved, ambiguous, not a composite type body, or
+    /// declared where it cannot be read.
+    Unproven,
+}
+
+fn resolve_type<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Resolved<'a>, IncompleteReason> {
+    budget.charge(1, name.len(), 0)?;
+    if name.is_empty() || name.contains(['.', '<']) {
+        return Ok(Resolved::Unproven);
+    }
+    if state.unknown || !state.alternatives.is_empty() || state.hidden_at(site, budget)? {
+        return Ok(Resolved::Unproven);
+    }
+    let (owner, decl) = match lookup(state, site, name, budget)? {
+        Some(Binding::Declaration(decl)) => (state, decl),
+        Some(Binding::EnumMember { .. }) => return Ok(Resolved::Unproven),
+        None => match imported_declaration(state, site, name, budget)? {
+            Some(Fact::Known(found)) => found,
+            Some(_) => return Ok(Resolved::Unproven),
+            None if same_name(name, "tobject") => return Ok(Resolved::SystemObject),
+            None => return Ok(Resolved::Unproven),
+        },
+    };
+    Ok(if decl.is_type && decl.shape.is_some() {
+        Resolved::Type(owner, decl)
+    } else {
+        Resolved::Unproven
+    })
+}
+
+/// Whether a member of `decl`'s type, of its ancestors or, for a helper, of
+/// the helped type could declare `name`.
+fn type_may_declare(
+    state: &CompileTimeState,
+    decl: &Declaration,
+    name: &str,
+    depth: usize,
+    visited: &mut Vec<*const Declaration>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(visited.len() + 1, 0, 0)?;
+    let Some(shape) = &decl.shape else {
+        return Ok(true);
+    };
+    if visited.contains(&(decl as *const Declaration)) {
+        // A cyclic heritage list does not compile; it proves nothing.
+        return Ok(true);
+    }
+    budget.charge(
+        shape
+            .names
+            .as_ref()
+            .map_or(1, |n| n.len().max(1).ilog2() as usize + 1),
+        name.len(),
+        0,
+    )?;
+    if shape.may_declare(name) {
+        return Ok(true);
+    }
+    visited.push(decl);
+    let site = decl.site.clone();
+    let result = (|| {
+        let mut class_parent = false;
+        let helped = shape
+            .helped
+            .iter()
+            .filter(|_| shape.kind == ShapeKind::Helper);
+        for parent in shape.parents.iter().chain(helped) {
+            match resolve_type(state, &site, parent, budget)? {
+                Resolved::Type(owner, parent) => {
+                    let interface = parent
+                        .shape
+                        .as_ref()
+                        .is_some_and(|s| s.kind == ShapeKind::Interface);
+                    class_parent |= !interface;
+                    // An interface's members are not in a class's scope.
+                    if !interface
+                        && type_may_declare(owner, parent, name, depth + 1, visited, budget)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                Resolved::SystemObject => {
+                    class_parent = true;
+                    if tobject_may_declare(name, budget)? {
+                        return Ok(true);
+                    }
+                }
+                Resolved::Unproven => return Ok(true),
+            }
+        }
+        if shape.kind == ShapeKind::Class && !class_parent {
+            return tobject_may_declare(name, budget);
+        }
+        Ok(false)
+    })();
+    visited.pop();
+    result
+}
+
+/// Whether a helper or one of its ancestor helpers could declare `name`.
+fn helper_may_declare(
+    state: &CompileTimeState,
+    decl: &Declaration,
+    name: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    let Some(shape) = &decl.shape else {
+        return Ok(true);
+    };
+    budget.charge(
+        shape
+            .names
+            .as_ref()
+            .map_or(1, |n| n.len().max(1).ilog2() as usize + 1),
+        name.len(),
+        0,
+    )?;
+    if shape.may_declare(name) {
+        return Ok(true);
+    }
+    for parent in &shape.parents {
+        match resolve_type(state, &decl.site, parent, budget)? {
+            Resolved::Type(owner, parent) => {
+                if helper_may_declare(owner, parent, name, depth + 1, budget)? {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a class or record helper in scope at `site` could declare
+/// `name`. Which helper is active for which type is not modelled: every
+/// helper the unit declares or imports counts. An imported interface
+/// that is not known still cannot declare a member it never spells (D46).
+fn helpers_may_declare(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    fn declared(
+        state: &CompileTimeState,
+        site: &BindingSite,
+        name: &str,
+        exported: bool,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        for decl in &state.declarations {
+            budget.charge(1, 0, 0)?;
+            if decl.site.sequence.0 > site.sequence.0
+                || (exported && !decl.exported)
+                || decl
+                    .shape
+                    .as_ref()
+                    .is_none_or(|shape| shape.kind != ShapeKind::Helper)
+            {
+                continue;
+            }
+            if helper_may_declare(state, decl, name, 0, budget)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    if declared(state, site, name, false, budget)? {
+        return Ok(true);
+    }
+    for interface in &state.interfaces {
+        budget.charge(1, 0, 0)?;
+        if interface.site.sequence.0 > site.sequence.0 {
+            continue;
+        }
+        if !interface.pending.authorized {
+            return Ok(true);
+        }
+        let known = interface.graph.as_ref().filter(|graph| {
+            graph.alternatives.is_empty() && graph.failure.is_none() && !graph.unknown
+        });
+        if let Some(graph) = known {
+            if declared(graph, &graph.site(), name, true, budget)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        let Some(names) = &interface.names else {
+            return Ok(true);
+        };
+        budget.charge(names.len().max(1).ilog2() as usize + 1, name.len(), 0)?;
+        if names.may_declare(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether, in a method of `owner`, a member could bind `name` before the
+/// scopes enclosing the method do.
+fn member_may_bind(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    owner: &str,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let root = name.split('.').next().unwrap_or(name);
+    let global = BindingSite {
+        scope: ScopeId(0),
+        sequence: site.sequence,
+    };
+    let mut visited = Vec::new();
+    match resolve_type(state, &global, owner, budget)? {
+        Resolved::Type(owner_state, decl)
+            if decl
+                .shape
+                .as_ref()
+                .is_some_and(|shape| shape.kind != ShapeKind::Interface) =>
+        {
+            if type_may_declare(owner_state, decl, root, 0, &mut visited, budget)? {
+                return Ok(true);
+            }
+        }
+        _ => return Ok(true),
+    }
+    helpers_may_declare(state, &global, root, budget)
 }
 
 pub(super) fn storage_name<'a>(
@@ -826,5 +1233,27 @@ fn make_layout(fact: Fact<StorageLayout>, identity: TypeIdentity) -> Fact<KnownL
         }),
         Fact::Unknown(r) => Fact::Unknown(r),
         Fact::Incomplete(r) => Fact::Incomplete(r),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tobject_members_are_sorted_lowercase_identifiers() {
+        assert!(TOBJECT_MEMBERS.windows(2).all(|w| w[0] < w[1]));
+        assert!(TOBJECT_MEMBERS.iter().all(|name| {
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        }));
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        for name in ["Free", "CLASSNAME", "&Create", "Unit.Name"] {
+            assert!(tobject_may_declare(name, &mut budget).unwrap(), "{name}");
+        }
+        for name in ["CompilerVersion", "Integer", "TObject"] {
+            assert!(!tobject_may_declare(name, &mut budget).unwrap(), "{name}");
+        }
     }
 }

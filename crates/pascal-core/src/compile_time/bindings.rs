@@ -36,6 +36,8 @@ pub(crate) struct EnumMember {
     pub value: Option<String>,
     pub value_logical: Option<usize>,
     pub key: DefinitionKey,
+    /// Declared under `{$SCOPEDENUMS ON}`: only `Type.Value` names it.
+    pub scoped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -682,7 +684,7 @@ pub(super) fn lookup<'a>(
                 if let (true, TypeExpr::Enum(members)) = (decl.is_type, &decl.ty) {
                     for (index, member) in members.iter().enumerate() {
                         budget.charge(1, member.name.len().min(name.len()), 0)?;
-                        if same_name(&member.name, name) {
+                        if !member.scoped && same_name(&member.name, name) {
                             return Ok(Some(Binding::EnumMember { owner: decl, index }));
                         }
                     }

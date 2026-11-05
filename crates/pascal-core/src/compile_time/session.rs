@@ -4878,6 +4878,12 @@ fn apply_path_directive_inner(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<(), IncompleteReason> {
     let key = layout_body_key(&directive.body);
+    if let Some(scoped) = conditional::scoped_enums_switch(&directive.body) {
+        path.state_mut().scoped_enums = scoped;
+    } else if key.eq_ignore_ascii_case("POPOPT") || key.eq_ignore_ascii_case("POP") {
+        // The saved options are not tracked for SCOPEDENUMS.
+        path.state_mut().scoped_enums = Truth::Unknown;
+    }
     let value = directive.body.trim().get(key.len()..).unwrap_or("!").trim();
     let supported = value.is_empty()
         && path.state().context.compiler_version

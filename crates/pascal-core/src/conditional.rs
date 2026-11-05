@@ -3849,6 +3849,75 @@ pub fn defined_symbol(body: &str) -> Option<String> {
     directive_symbol(body)
 }
 
+/// The value a `{$SCOPEDENUMS}` directive sets, `None` for any other
+/// directive. A value other than `ON` or `OFF` is unknown.
+pub fn scoped_enums_switch(body: &str) -> Option<Truth> {
+    let keyword = directive_keyword(body)?;
+    if !keyword.eq_ignore_ascii_case("scopedenums") {
+        return None;
+    }
+    let value = directive_arguments(body).trim();
+    Some(if value.eq_ignore_ascii_case("on") {
+        Truth::True
+    } else if value.eq_ignore_ascii_case("off") {
+        Truth::False
+    } else {
+        Truth::Unknown
+    })
+}
+
+/// Whether `{$SCOPEDENUMS ON}` is in effect at each offset of a source,
+/// from its directives in source order (l4d-1qta). An enumerated type takes
+/// the state at its declaration: while it is on, the type's values are not
+/// added to the enclosing scope. The state starts off; a directive under
+/// unknown activity that would change it, an unexpanded include (its text
+/// is unknown) and an options restore (`POPOPT`, `POP`) make it unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopedEnums {
+    /// The state from each offset on, in increasing offset order.
+    changes: Vec<(usize, Truth)>,
+}
+
+impl ScopedEnums {
+    pub fn new(directives: &[ConditionalDirective]) -> Self {
+        let mut state = Truth::False;
+        let mut changes = Vec::new();
+        for directive in directives {
+            if directive.activity == Truth::False {
+                continue;
+            }
+            let next = if directive.kind == DirectiveKind::Include {
+                Truth::Unknown
+            } else if let Some(value) = scoped_enums_switch(&directive.body) {
+                if directive.activity == Truth::True || value == state {
+                    value
+                } else {
+                    Truth::Unknown
+                }
+            } else if directive_keyword(&directive.body).is_some_and(|keyword| {
+                keyword.eq_ignore_ascii_case("popopt") || keyword.eq_ignore_ascii_case("pop")
+            }) {
+                Truth::Unknown
+            } else {
+                continue;
+            };
+            if next != state {
+                state = next;
+                changes.push((directive.end, state));
+            }
+        }
+        Self { changes }
+    }
+
+    /// The state in effect at `offset`.
+    pub fn at(&self, offset: usize) -> Truth {
+        let index = self.changes.partition_point(|(start, _)| *start <= offset);
+        index
+            .checked_sub(1)
+            .map_or(Truth::False, |index| self.changes[index].1)
+    }
+}
+
 fn evaluate_condition(
     body: &str,
     environment: &ConditionalEnvironment,
@@ -5480,6 +5549,11 @@ fn is_harmless_keyword(keyword: &str) -> bool {
     // `{$I+}` and `{$I-}` are IOCHECKS, but a bare `{$I name}` is an include.
     if keyword == "i" {
         return suffixed;
+    }
+    // Name binding reads `SCOPEDENUMS ON`/`OFF` per enumerated type through
+    // `ScopedEnums`; dcc 37.0 rejects the `+`/`-` spelling (E1030).
+    if keyword == "scopedenums" {
+        return !suffixed;
     }
     matches!(
         keyword,

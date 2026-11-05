@@ -1624,7 +1624,11 @@ impl NavigationIndex {
                 .symbols
                 .iter()
                 .find(|symbol| symbol_id(&member.uri, symbol) == *member)
-                .is_some_and(|symbol| symbol.owner_type.is_some())
+                // An enum value's owner is its enumerated type, which has no
+                // ancestors; unscoped, it is an unqualified name (l4d-1qta).
+                .is_some_and(|symbol| {
+                    symbol.owner_type.is_some() && symbol.kind != SymbolKind::EnumValue
+                })
         })
     }
 

@@ -7531,7 +7531,7 @@ impl NavigationIndex {
                 };
                 if scope_id != ROOT_SCOPE
                     && !symbol.local_only
-                    && symbol.owner_type.is_none()
+                    && document.has_unqualified_owner(*index, symbol)
                     && symbol.generic_parameter.is_none()
                     && symbol.kind != SymbolKind::Unit
                     && !symbol.unresolved_abbreviated
@@ -7652,7 +7652,7 @@ impl NavigationIndex {
                 continue;
             };
             if !symbol.local_only
-                && symbol.owner_type.is_none()
+                && document.has_unqualified_owner(*index, symbol)
                 && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.unresolved_abbreviated
@@ -7818,7 +7818,7 @@ impl NavigationIndex {
             let Some(symbol) = document.symbols.get(*index) else {
                 continue;
             };
-            if symbol.owner_type.is_none()
+            if document.has_unqualified_owner(*index, symbol)
                 && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.local_only
@@ -9151,7 +9151,7 @@ impl NavigationIndex {
                     document.symbols.get(*index).is_some_and(|symbol| {
                         scope_id != ROOT_SCOPE
                             && !symbol.local_only
-                            && symbol.owner_type.is_none()
+                            && document.has_unqualified_owner(*index, symbol)
                             && symbol.generic_parameter.is_none()
                             && symbol.kind != SymbolKind::Unit
                             && !symbol.unresolved_abbreviated
@@ -9235,7 +9235,7 @@ impl NavigationIndex {
             .filter(|index| {
                 document.symbols.get(*index).is_some_and(|symbol| {
                     !symbol.local_only
-                        && symbol.owner_type.is_none()
+                        && document.has_unqualified_owner(*index, symbol)
                         && symbol.generic_parameter.is_none()
                         && symbol.kind != SymbolKind::Unit
                         && !symbol.unresolved_abbreviated
@@ -9339,9 +9339,10 @@ impl NavigationIndex {
                     self.exported_references_for_document(&unit_uri)
                         .into_iter()
                         .filter(|candidate| {
-                            self.symbol(candidate).is_some_and(|symbol| {
-                                symbol.owner_type.is_none() && symbol.key == key
-                            })
+                            self.candidate_has_unqualified_owner(candidate)
+                                && self
+                                    .symbol(candidate)
+                                    .is_some_and(|symbol| symbol.key == key)
                         }),
                 ),
                 Receiver::Type(instance) => {
@@ -14133,6 +14134,15 @@ impl NavigationIndex {
             .collect()
     }
 
+    fn candidate_has_unqualified_owner(&self, candidate: &Candidate) -> bool {
+        self.documents.get(&candidate.uri).is_some_and(|document| {
+            document
+                .symbols
+                .get(candidate.index)
+                .is_some_and(|symbol| document.has_unqualified_owner(candidate.index, symbol))
+        })
+    }
+
     fn symbol(&self, candidate: &Candidate) -> Option<&Symbol> {
         self.documents
             .get(&candidate.uri)
@@ -16203,6 +16213,10 @@ pub(crate) struct ParsedDocument {
     verified_header: Option<Range>,
     compile_time_session: Option<Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
     conditional_unknown_symbols: Vec<bool>,
+    /// By symbol index: an enum value that has an owner type yet is an
+    /// unqualified name in its declaring scope, its type not declared under
+    /// `{$SCOPEDENUMS ON}` (l4d-1qta).
+    unscoped_enum_values: Vec<bool>,
     has_initialization: bool,
     has_finalization: bool,
     unknown_class_owners: HashSet<String>,
@@ -16229,6 +16243,12 @@ pub(crate) struct ParsedDocument {
 }
 
 impl ParsedDocument {
+    /// Whether symbol `index` can be an unqualified name: it has no owner
+    /// type, or it is an unscoped enum value (l4d-1qta).
+    fn has_unqualified_owner(&self, index: usize, symbol: &Symbol) -> bool {
+        symbol.owner_type.is_none() || self.unscoped_enum_values.get(index) == Some(&true)
+    }
+
     fn current_verified_header(&self) -> Option<Range> {
         self.compile_time_session.as_ref()?;
         self.verified_header
@@ -16380,6 +16400,9 @@ impl ParsedDocument {
             visit(0)?;
         }
         for _ in &self.conditional_unknown_symbols {
+            visit(0)?;
+        }
+        for _ in &self.unscoped_enum_values {
             visit(0)?;
         }
         for (key, indices) in &self.symbol_indices_by_scope_key {
@@ -16917,8 +16940,15 @@ impl Document {
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
         let documentation = documentation::collect(&source, &symbols, cancel)?;
         inherit_member_routine_visibility(&mut symbols);
-        let conditional_unknown_symbols =
+        let mut conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
+        let unscoped_enum_values = enum_value_scoping(
+            root,
+            &conditionals,
+            &symbols,
+            &mut conditional_unknown_symbols,
+            cancel,
+        )?;
         let helpers = collect_helpers(root, &source);
         let (type_ancestry, superseded_forward_types) = collect_type_ancestry(root, &source);
         let method_resolutions = collect_method_resolutions(root, &source);
@@ -16960,8 +16990,8 @@ impl Document {
         let exported_symbol_indices = symbols
             .iter()
             .enumerate()
-            .filter(|(_, symbol)| {
-                if symbol.owner_type.is_some()
+            .filter(|(index, symbol)| {
+                if (symbol.owner_type.is_some() && !unscoped_enum_values[*index])
                     || symbol.kind == SymbolKind::Unit
                     || symbol.local_only
                     || symbol.generic_parameter.is_some()
@@ -17081,6 +17111,7 @@ impl Document {
             verified_header,
             compile_time_session,
             conditional_unknown_symbols,
+            unscoped_enum_values,
             has_initialization,
             has_finalization,
             unknown_class_owners,
@@ -17379,7 +17410,10 @@ fn symbol_is_available_at(
     current_uri: &Url,
     offset: usize,
 ) -> bool {
-    if candidate_uri != current_uri || symbol.owner_type.is_some() || !symbol.declaration_ordered {
+    if candidate_uri != current_uri
+        || (symbol.owner_type.is_some() && symbol.kind != SymbolKind::EnumValue)
+        || !symbol.declaration_ordered
+    {
         return true;
     }
     if symbol.span.start <= offset {
@@ -18286,7 +18320,10 @@ fn add_named_symbol<'a>(
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
             visibility,
-            declaration_ordered: scope != ROOT_SCOPE && owner_type.is_none(),
+            // An enum value's owner is its type, yet it is an unqualified
+            // name declared in order like the type (l4d-1qta).
+            declaration_ordered: scope != ROOT_SCOPE
+                && (owner_type.is_none() || kind == SymbolKind::EnumValue),
             generic_parameters: generic_parameters.clone(),
             generic_parameter: None,
             type_name: type_name.clone(),
@@ -19768,6 +19805,106 @@ fn conditional_unknown_symbols(
             symbol_unknown || type_unknown || header_unknown
         })
         .collect()
+}
+
+/// Which enum values are unqualified names (l4d-1qta). An enumerated type
+/// takes the `{$SCOPEDENUMS}` state at its declaration: off, its values
+/// enter the scope that declares the type, besides `Type.Value`; on, only
+/// the qualified spelling names them. An unknown state makes the values'
+/// binding unknown, as for a declaration under unknown conditional
+/// activity. Checked against dcc 37.0:
+/// - the values of a type nested in a class or record enter the scope that
+///   declares the outer type, not the class (`TR.rB` is E2003, unqualified
+///   `rB` and `Unit.rB` compile, also in the type's methods and importers).
+///   A nested type in a section other than public or published is not
+///   modelled: its values' binding is unknown;
+/// - the values of an anonymous enumerated type (`set of (A, B)`,
+///   `var X: (A, B)`) are unqualified names whatever the state.
+fn enum_value_scoping(
+    root: Node<'_>,
+    conditionals: &ConditionalAnalysis,
+    symbols: &[Symbol],
+    conditional_unknown: &mut [bool],
+    cancel: &AtomicBool,
+) -> Result<Vec<bool>, String> {
+    let mut unscoped = vec![false; symbols.len()];
+    if !symbols
+        .iter()
+        .any(|symbol| symbol.kind == SymbolKind::EnumValue)
+    {
+        return Ok(unscoped);
+    }
+    let states = conditional::ScopedEnums::new(&conditionals.directives);
+    // Value name start -> (state at the type's declaration, a named type,
+    // nested in a class or record).
+    let mut values = HashMap::new();
+    let mut visited = 0usize;
+    let mut cancelled = false;
+    collect_nodes_with_ancestors(root, &mut |node, ancestors| {
+        visited += 1;
+        if cancelled || (visited.is_multiple_of(4096) && cancel.load(Ordering::Relaxed)) {
+            cancelled = true;
+            return;
+        }
+        if node.kind() != "declEnumValue" {
+            return;
+        }
+        let Some(name) = node.child_by_field_name("name") else {
+            return;
+        };
+        let mut nearest = nearest_first(ancestors);
+        let enumeration = nearest.next();
+        let wrapper = nearest.next();
+        let declaration = nearest.next();
+        let named = match (enumeration, wrapper, declaration) {
+            (Some(enumeration), Some(wrapper), Some(declaration)) => {
+                enumeration.kind() == "declEnum"
+                    && wrapper.kind() == "type"
+                    && declaration.kind() == "declType"
+                    && declaration
+                        .child_by_field_name("type")
+                        .is_some_and(|field| field.id() == wrapper.id())
+            }
+            _ => false,
+        };
+        let nested = ancestors
+            .iter()
+            .any(|ancestor| matches!(ancestor.kind(), "declClass" | "declIntf" | "declHelper"));
+        let declared_at = if named {
+            declaration.map_or(node.start_byte(), |declaration| declaration.start_byte())
+        } else {
+            enumeration.map_or(node.start_byte(), |enumeration| enumeration.start_byte())
+        };
+        values.insert(name.start_byte(), (states.at(declared_at), named, nested));
+    });
+    if cancelled || cancel.load(Ordering::Relaxed) {
+        return Err("request cancelled".to_string());
+    }
+    for (index, symbol) in symbols.iter().enumerate() {
+        if symbol.kind != SymbolKind::EnumValue || symbol.origin != Origin::Declaration {
+            continue;
+        }
+        let Some(&(state, named, nested)) = values.get(&symbol.span.start) else {
+            continue;
+        };
+        let hidden_section = nested
+            && !matches!(
+                symbol.visibility,
+                Visibility::Public | Visibility::Published
+            );
+        let state = if named {
+            state
+        } else {
+            conditional::Truth::False
+        };
+        if state == conditional::Truth::Unknown
+            || (hidden_section && state == conditional::Truth::False)
+        {
+            conditional_unknown[index] = true;
+        }
+        unscoped[index] = symbol.owner_type.is_some() && state != conditional::Truth::True;
+    }
+    Ok(unscoped)
 }
 
 fn collect_nodes_matching<'a>(root: Node<'a>, kind: &str) -> Vec<Node<'a>> {

@@ -17584,3 +17584,288 @@ fn method_heading_generic_owners_pin_ambiguity_and_nested_generics() {
     );
     assert!(index.rename_edits(&source_uri, inner, "TZ").is_err());
 }
+
+fn declaration_of(
+    index: &NavigationIndex,
+    source_uri: &Url,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> Vec<(Url, Position)> {
+    locations_at(
+        index,
+        source_uri,
+        source,
+        needle,
+        occurrence,
+        NavigationTarget::Declaration,
+    )
+    .into_iter()
+    .map(|location| (location.uri, location.range.start))
+    .collect()
+}
+
+/// l4d-1qta: without `{$SCOPEDENUMS ON}` an enumerated type's values enter
+/// the enclosing scope, and the qualified spelling names them as well.
+#[test]
+fn unscoped_enum_values_bind_unqualified_and_qualified() {
+    let source = "unit Colors;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Green;\n  C := TColor.Green;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    let declaration = vec![(source_uri.clone(), position_of(source, "Green", 0))];
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 1),
+        declaration
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        declaration
+    );
+}
+
+/// l4d-1qta: the values of an enumerated type declared under
+/// `{$SCOPEDENUMS ON}` are reached only qualified, so an unqualified `Green`
+/// is the constant; `{$SCOPEDENUMS OFF}` restores unqualified values.
+#[test]
+fn scoped_enum_values_bind_only_qualified() {
+    let source = "unit Colors;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TColor = (Red, Green);\n{$SCOPEDENUMS OFF}\n  TShade = (Light, Dark);\nconst Green = 5;\nimplementation\nprocedure Run;\nvar C: TColor; S: TShade; N: Integer;\nbegin\n  N := Green;\n  C := TColor.Green;\n  S := Dark;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        vec![(source_uri.clone(), position_of(source, "Green", 1))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 3),
+        vec![(source_uri.clone(), position_of(source, "Green", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Dark", 1),
+        vec![(source_uri.clone(), position_of(source, "Dark", 0))]
+    );
+}
+
+/// l4d-1qta: an imported unit's scoped values do not enter the importer's
+/// scope, so `Yes` is only the other unit's constant; an unscoped value is
+/// an imported candidate as well.
+#[test]
+fn an_imported_scoped_enum_exports_no_unqualified_values() {
+    for (directive, scoped) in [("{$SCOPEDENUMS ON}\n", true), ("", false)] {
+        let provider = format!(
+            "unit Provider;\ninterface\n{directive}type\n  TState = (Maybe, Yes);\nimplementation\nend.\n"
+        );
+        let other = "unit Other;\ninterface\nconst Yes = 1;\nimplementation\nend.\n";
+        let consumer = "unit Consumer;\ninterface\nuses Other, Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(Yes);\n  Log(TState.Yes);\nend;\nend.\n";
+        let provider_uri = uri("Provider");
+        let other_uri = uri("Other");
+        let consumer_uri = uri("Consumer");
+        let mut index = NavigationIndex::new();
+        for (name, text) in [
+            (&provider_uri, provider.as_str()),
+            (&other_uri, other),
+            (&consumer_uri, consumer),
+        ] {
+            index
+                .update(name.clone(), text.to_owned())
+                .expect("source parses");
+        }
+        index.bind_imports(
+            &consumer_uri,
+            [
+                ("Provider".to_owned(), provider_uri.clone()),
+                ("Other".to_owned(), other_uri.clone()),
+            ],
+        );
+        let value = (provider_uri.clone(), position_of(&provider, "Yes", 0));
+        let constant = (other_uri.clone(), position_of(other, "Yes", 0));
+        // Both imports declare an unqualified `Yes` when unscoped; the
+        // binder reports every imported candidate.
+        let expected = if scoped {
+            vec![constant]
+        } else {
+            vec![constant, value.clone()]
+        };
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 0),
+            expected,
+            "{directive:?}"
+        );
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 1),
+            vec![value],
+            "{directive:?}"
+        );
+    }
+}
+
+fn indexed(sources: &[(&Url, &str)], imports: &[(&Url, &[(&str, &Url)])]) -> NavigationIndex {
+    let mut index = NavigationIndex::new();
+    for (name, text) in sources {
+        index
+            .update((*name).clone(), (*text).to_owned())
+            .expect("source parses");
+    }
+    for (consumer, bindings) in imports {
+        index.bind_imports(
+            consumer,
+            bindings
+                .iter()
+                .map(|(unit, uri)| ((*unit).to_owned(), (*uri).clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    index
+}
+
+/// l4d-1qta fix round 1 (C1, dcc 37.0 `O1.dpr`): a routine-local enum value
+/// is declared in order, so `lA` in `Inner`, before `type TL`, is the unit
+/// constant.
+#[test]
+fn routine_local_enum_values_follow_declaration_order() {
+    let source = "unit P11;\ninterface\nconst lA = 1;\nimplementation\nprocedure Outer;\n  procedure Inner;\n  var N: Integer;\n  begin\n    N := lA;\n  end;\ntype TL = (lA, lB);\nvar L: TL;\nbegin\n  L := lA;\nend;\nend.\n";
+    let source_uri = uri("P11");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "lA", 1),
+        vec![(source_uri.clone(), position_of(source, "lA", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "lA", 3),
+        vec![(source_uri.clone(), position_of(source, "lA", 2))]
+    );
+}
+
+const NESTED_UNIT: &str = "unit NU;\ninterface\ntype\n  TC = class\n  type TE = (cA, cB);\n  var F: TE;\n  end;\n  TR = record\n  type TQ = (qA, qB);\n  var G: TQ;\n  procedure M;\n  end;\nimplementation\nprocedure TR.M;\nbegin\n  G := qA;\nend;\nprocedure Run;\nvar R: TR;\nbegin\n  R.G := qB;\nend;\nend.\n";
+
+/// l4d-1qta fix round 1 (I1, dcc 37.0 `T2`/`T2c`/`N1`/`N2`): the values of an
+/// enum nested in a class or record are unqualified names of the unit, in
+/// the type's methods, in the unit and in an importer, also unit-qualified.
+#[test]
+fn nested_enum_values_are_unit_scope_names() {
+    let unit_uri = uri("NU");
+    let consumer = "unit Consumer;\ninterface\nuses NU;\nimplementation\nprocedure Run;\nvar O: TC; Q: TR.TQ;\nbegin\n  O.F := cA;\n  Q := qB;\n  O.F := NU.cB;\nend;\nend.\n";
+    let consumer_uri = uri("Consumer");
+    let index = indexed(
+        &[(&unit_uri, NESTED_UNIT), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("NU", &unit_uri)])],
+    );
+    let at = |needle: &str| vec![(unit_uri.clone(), position_of(NESTED_UNIT, needle, 0))];
+    assert_eq!(
+        declaration_of(&index, &unit_uri, NESTED_UNIT, "qA", 1),
+        at("qA")
+    );
+    assert_eq!(
+        declaration_of(&index, &unit_uri, NESTED_UNIT, "qB", 1),
+        at("qB")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "cA", 0),
+        at("cA")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "qB", 0),
+        at("qB")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "cB", 0),
+        at("cB")
+    );
+}
+
+/// l4d-1qta fix round 1 (I1, dcc 37.0 `S1.dpr`, `S2.dpr`): a record-nested
+/// value is a candidate for `qB` beside another unit's constant; dcc takes
+/// the last unit used, which the binder reports as both candidates. Declared
+/// in the consumer itself, the nested value is the binding.
+#[test]
+fn nested_enum_values_shadow_an_imported_constant() {
+    let sa = "unit SA;\ninterface\ntype\n  TR = record\n  type TQ = (qA, qB);\n  end;\nimplementation\nend.\n";
+    let sb = "unit SB;\ninterface\nconst qB = 7;\nimplementation\nend.\n";
+    let s1 = "unit S1;\ninterface\nuses SB, SA;\nimplementation\nprocedure Run;\nvar Q: TR.TQ;\nbegin\n  Q := qB;\nend;\nend.\n";
+    let s2 = "unit S2;\ninterface\nuses SB;\ntype\n  TR = record\n  type TQ = (qA, qB);\n  end;\nimplementation\nprocedure Run;\nvar Q: TR.TQ;\nbegin\n  Q := qB;\nend;\nend.\n";
+    let (sa_uri, sb_uri, s1_uri, s2_uri) = (uri("SA"), uri("SB"), uri("S1"), uri("S2"));
+    let index = indexed(
+        &[(&sa_uri, sa), (&sb_uri, sb), (&s1_uri, s1), (&s2_uri, s2)],
+        &[
+            (&s1_uri, &[("SA", &sa_uri), ("SB", &sb_uri)]),
+            (&s2_uri, &[("SB", &sb_uri)]),
+        ],
+    );
+    let candidates = declaration_of(&index, &s1_uri, s1, "qB", 0);
+    assert!(
+        candidates.contains(&(sa_uri.clone(), position_of(sa, "qB", 0))),
+        "{candidates:?}"
+    );
+    assert_eq!(
+        declaration_of(&index, &s2_uri, s2, "qB", 1),
+        vec![(s2_uri.clone(), position_of(s2, "qB", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (I1): a scoped nested enum's values are named only
+/// through the enum type, never unqualified.
+#[test]
+fn scoped_nested_enum_values_are_not_unqualified_names() {
+    let source = "unit SN;\ninterface\nconst rA = 5;\n{$SCOPEDENUMS ON}\ntype\n  TR = record\n  type TE = (rA, rB);\n  var F: TE;\n  end;\n{$SCOPEDENUMS OFF}\nimplementation\nprocedure Run;\nvar N: Integer;\nbegin\n  N := rA;\nend;\nend.\n";
+    let source_uri = uri("SN");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "rA", 2),
+        vec![(source_uri.clone(), position_of(source, "rA", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (I2): `Unit.Value` names an unscoped enum value.
+#[test]
+fn unit_qualified_enum_values_resolve() {
+    let colors = "unit Colors;\ninterface\ntype\n  TColor = (Red, Blue);\nimplementation\nend.\n";
+    let cons = "unit Cons;\ninterface\nuses Colors;\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Colors.Red;\nend;\nend.\n";
+    let (colors_uri, cons_uri) = (uri("Colors"), uri("Cons"));
+    let index = indexed(
+        &[(&colors_uri, colors), (&cons_uri, cons)],
+        &[(&cons_uri, &[("Colors", &colors_uri)])],
+    );
+    assert_eq!(
+        declaration_of(&index, &cons_uri, cons, "Red", 0),
+        vec![(colors_uri.clone(), position_of(colors, "Red", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (M1, dcc 37.0 `T3.dpr`, `T6.dpr`): the values of an
+/// anonymous enumerated type are unqualified names under SCOPEDENUMS ON too.
+#[test]
+fn anonymous_enum_values_stay_unqualified_under_scopedenums() {
+    let source = "unit AN;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TS = set of (sA, sB);\nvar\n  X: (aA, aB);\n  S: TS;\nimplementation\nprocedure Run;\nbegin\n  X := aA;\n  S := [sA];\nend;\nend.\n";
+    let source_uri = uri("AN");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "aA", 1),
+        vec![(source_uri.clone(), position_of(source, "aA", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "sA", 1),
+        vec![(source_uri.clone(), position_of(source, "sA", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (M4): a local variable shadows an unscoped enum
+/// value, and hover on an unqualified value shows the value.
+#[test]
+fn unqualified_enum_values_shadow_and_hover() {
+    let source = "unit SH;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar Green: Integer; C: TColor;\nbegin\n  Green := 1;\n  C := Red;\nend;\nend.\n";
+    let source_uri = uri("SH");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        vec![(source_uri.clone(), position_of(source, "Green", 1))]
+    );
+    let hover = index
+        .hover(&source_uri, position_of(source, "Red", 1))
+        .expect("hover on an unqualified enum value");
+    assert!(format!("{:?}", hover.contents).contains("Red"), "{hover:?}");
+}

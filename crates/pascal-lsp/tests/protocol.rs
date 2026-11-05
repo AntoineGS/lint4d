@@ -16888,7 +16888,7 @@ fn unsupported_directive_consumer_workspace() -> (TempDir, PathBuf, &'static str
     );
     write_file(
         &temp.path().join("Legacy.pas"),
-        "unit Legacy;\n{$SCOPEDENUMS ON}\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Total: Integer;\nbegin\n  Total := SharedValue;\nend;\nend.\n",
+        "unit Legacy;\n{$POINTERMATH ON}\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Total: Integer;\nbegin\n  Total := SharedValue;\nend;\nend.\n",
     );
     (temp, provider, provider_source)
 }

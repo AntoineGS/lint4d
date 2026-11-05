@@ -55,6 +55,15 @@ false
 5: false
 6: false
 7: false
+## unscoped_enum_values
+0: false
+1: false
+2: false
+3: false
+4: false
+5: false
+6: false
+7: false
 ## unknown_class_owners
 ## known_non_class_owners
 0: "\"tlocalrecord\""

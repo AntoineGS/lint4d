@@ -376,7 +376,7 @@ fn legacy_ifend_keeps_the_conditional_structure() {
 
 #[test]
 fn binding_sensitive_directives_remain_unsupported() {
-    for directive in ["{$SCOPEDENUMS ON}", "{$POINTERMATH ON}"] {
+    for directive in ["{$POINTERMATH ON}", "{$SCOPEDENUMS+}"] {
         let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());
         assert_eq!(
             analysis.directives[0].kind,
@@ -1432,4 +1432,32 @@ fn assembler_double_quoted_characters_do_not_stop_directive_lexing() {
             .activity,
         Truth::True
     );
+}
+
+/// l4d-1qta: SCOPEDENUMS is modelled per enumerated type rather than an
+/// unsupported directive; the state starts off and follows the directives
+/// that may run.
+#[test]
+fn scopedenums_state_follows_the_directives() {
+    let source = "{$SCOPEDENUMS ON} @A {$SCOPEDENUMS OFF} @B {$IFDEF MYSTERY}{$SCOPEDENUMS ON}{$ENDIF} @C \
+        {$SCOPEDENUMS OFF} @D {$IF False}{$SCOPEDENUMS ON}{$ENDIF} @E {$I Other.inc} @F";
+    let analysis = conditional::analyze_with_context(source, &ConditionalContext::default());
+    assert!(
+        analysis
+            .directives
+            .iter()
+            .filter(|directive| directive.body.starts_with("SCOPEDENUMS"))
+            .all(|directive| directive.kind == conditional::DirectiveKind::Harmless),
+        "{:?}",
+        analysis.directives
+    );
+    let states = conditional::ScopedEnums::new(&analysis.directives);
+    let at = |marker: &str| states.at(source.find(marker).unwrap());
+    assert_eq!(states.at(0), Truth::False);
+    assert_eq!(at("@A"), Truth::True);
+    assert_eq!(at("@B"), Truth::False);
+    assert_eq!(at("@C"), Truth::Unknown);
+    assert_eq!(at("@D"), Truth::False);
+    assert_eq!(at("@E"), Truth::False);
+    assert_eq!(at("@F"), Truth::Unknown);
 }

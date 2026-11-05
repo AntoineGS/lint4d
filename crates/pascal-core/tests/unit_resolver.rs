@@ -1982,6 +1982,8 @@ fn rtl_cbuilder_and_linker_directives_do_not_make_project_resolution_unsupported
         "{$Z4}",
         "{$STACKFRAMES ON}",
         "{$VARPROPSETTER ON}",
+        // l4d-1qta: the binder reads it per enumerated type.
+        "{$SCOPEDENUMS ON}",
     ] {
         let project = resolve_project_importing_classes(directive);
 
@@ -1991,7 +1993,7 @@ fn rtl_cbuilder_and_linker_directives_do_not_make_project_resolution_unsupported
 
 #[test]
 fn binding_relevant_rtl_directives_stay_unsupported() {
-    for directive in ["{$SCOPEDENUMS ON}", "{$POINTERMATH ON}"] {
+    for directive in ["{$POINTERMATH ON}", "{$SCOPEDENUMS+}"] {
         let project = resolve_project_importing_classes(directive);
 
         assert!(!project.complete, "{directive}");

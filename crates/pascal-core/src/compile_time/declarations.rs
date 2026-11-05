@@ -85,6 +85,9 @@ pub struct CompileTimeState {
     pub(super) settings: pascal_project::LayoutSettings,
     pub(super) settings_stack: Vec<Option<pascal_project::LayoutSettings>>,
     pub(super) settings_history: Vec<super::records::LayoutChange>,
+    /// The `{$SCOPEDENUMS}` state that an enumerated type declared now
+    /// takes (l4d-1qta).
+    pub(super) scoped_enums: Truth,
     spans: Vec<Span>,
     pub(super) sequence: Sequence,
     logical: usize,
@@ -239,6 +242,7 @@ impl CompileTimeState {
             settings: context.layout.defaults.clone(),
             settings_stack: Vec::new(),
             settings_history: Vec::new(),
+            scoped_enums: Truth::False,
             spans: Vec::new(),
             sequence: Sequence(0),
             logical: 0,
@@ -1202,6 +1206,11 @@ impl CompileTimeState {
             if strong && let TypeExpr::Named(name) = ty {
                 ty = TypeExpr::StrongAlias(name);
             }
+            if matches!(ty, TypeExpr::Enum(_)) && self.scoped_enums == Truth::Unknown {
+                // Whether the values enter the scope is unknown, like a
+                // declaration under unknown conditional activity.
+                self.unknown = true;
+            }
             self.sequence.0 = self
                 .sequence
                 .0
@@ -1240,9 +1249,127 @@ impl CompileTimeState {
                 initializer: initializer.map(str::to_owned),
                 initializer_logical,
             });
+            if is_type
+                && valid
+                && let Some(ty_node) = ty_node
+                && matches!(
+                    ty_node.kind(),
+                    "declClass" | "declIntf" | "declHelper" | "type"
+                )
+            {
+                self.admit_nested_enums(
+                    ty_node,
+                    bytes,
+                    prefix,
+                    type_sequence,
+                    &mut definition_count,
+                    &mut field_count,
+                    &mut variant_count,
+                    budget,
+                )?;
+            }
             self.definition_count = definition_count;
             self.field_count = field_count;
             self.variant_count = variant_count;
+        }
+        Ok(())
+    }
+
+    /// The values of an enumerated type nested in a class or record are
+    /// unqualified names of the scope that declares the outer type (dcc 37.0,
+    /// l4d-1qta). Each nested enumerated type is admitted as a type
+    /// declaration whose name no query can spell, so only its values bind.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_nested_enums(
+        &mut self,
+        outer: Node<'_>,
+        bytes: &[u8],
+        prefix: usize,
+        type_sequence: Sequence,
+        definition_count: &mut usize,
+        field_count: &mut usize,
+        variant_count: &mut usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        let mut pending = vec![outer];
+        while let Some(node) = pending.pop() {
+            budget.charge(1, 0, 0)?;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                pending.push(child);
+            }
+            if node.kind() != "declType" {
+                continue;
+            }
+            let Some(wrapper) = node.child_by_field_name("type") else {
+                continue;
+            };
+            let enumeration = if wrapper.kind() == "declEnum" {
+                Some(wrapper)
+            } else if wrapper.kind() == "type" && wrapper.named_child_count() == 1 {
+                wrapper.named_child(0).filter(|n| n.kind() == "declEnum")
+            } else {
+                None
+            };
+            if enumeration.is_none() {
+                continue;
+            }
+            let Some(name) = node
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "identifier")
+            else {
+                self.unknown = true;
+                continue;
+            };
+            let raw = wrapper
+                .utf8_text(bytes)
+                .map_err(|_| IncompleteReason::MalformedSource)?;
+            budget.charge(1, raw.len(), size_of::<Declaration>() + 1)?;
+            let ty = type_expr(
+                self,
+                type_sequence,
+                prefix,
+                Some(wrapper),
+                bytes,
+                raw,
+                false,
+                1,
+                definition_count,
+                field_count,
+                variant_count,
+                budget,
+            )?;
+            if self.scoped_enums == Truth::Unknown {
+                self.unknown = true;
+            }
+            let site = self.site();
+            let logical_name = name
+                .start_byte()
+                .checked_sub(prefix)
+                .and_then(|n| self.pending_start.checked_add(n))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let anchor =
+                self.anchor_at(logical_name, name.end_byte() - name.start_byte(), budget)?;
+            let provenance = self.provenance(self.pending_start, self.logical, budget)?;
+            self.declarations.push(Declaration {
+                // A space never occurs in a queried name.
+                name: " ".to_owned(),
+                key: DefinitionKey {
+                    anchor,
+                    scope: site.scope,
+                },
+                site: site.clone(),
+                type_site: site.clone(),
+                ty,
+                is_type: true,
+                exported: self.in_interface && !self.implementation && site.scope == ScopeId(0),
+                is_constant: false,
+                is_routine: false,
+                settings: self.settings_at_logical(logical_name, budget)?.clone(),
+                provenance,
+                initializer: None,
+                initializer_logical: None,
+            });
         }
         Ok(())
     }
@@ -1540,6 +1667,7 @@ impl CompileTimeState {
         self.settings.hash(&mut h);
         self.settings_stack.hash(&mut h);
         self.settings_history.hash(&mut h);
+        self.scoped_enums.hash(&mut h);
         self.logical.hash(&mut h);
         self.pending_start.hash(&mut h);
         self.pending.hash(&mut h);
@@ -2023,6 +2151,7 @@ pub(super) fn type_expr(
                 value,
                 value_logical,
                 key,
+                scoped: state.scoped_enums == Truth::True,
             });
         }
         Ok(TypeExpr::Enum(members))

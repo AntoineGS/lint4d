@@ -2827,9 +2827,22 @@ pub(crate) fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &st
     let members = body.split(',').map(str::trim);
     let valid = members.clone().all(|member| {
         let bytes = member.as_bytes();
-        bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-')
+        (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-'))
+            || is_numeric_switch(member)
     });
     valid.then_some(members)
+}
+
+/// A switch carrying its value as digits: `A1`/`A2`/`A4`/`A8`/`A16` (record
+/// alignment) and `Z1`/`Z2`/`Z4` (minimum enumeration size). They are the
+/// numeric forms of `ALIGN` and `MINENUMSIZE`, which the layout engine models.
+fn is_numeric_switch(member: &str) -> bool {
+    let (letter, digits) = member.split_at_checked(1).unwrap_or_default();
+    match letter {
+        "A" | "a" => matches!(digits, "1" | "2" | "4" | "8" | "16"),
+        "Z" | "z" => matches!(digits, "1" | "2" | "4"),
+        _ => false,
+    }
 }
 
 pub(crate) fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
@@ -5462,7 +5475,12 @@ pub fn is_harmless_directive_keyword(keyword: &str) -> bool {
 }
 
 fn is_harmless_keyword(keyword: &str) -> bool {
+    let suffixed = keyword.ends_with(['+', '-']);
     let keyword = keyword.trim_end_matches(['+', '-']);
+    // `{$I+}` and `{$I-}` are IOCHECKS, but a bare `{$I name}` is an include.
+    if keyword == "i" {
+        return suffixed;
+    }
     matches!(
         keyword,
         "a" | "a1"
@@ -5586,6 +5604,25 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "p"
             | "s"
             | "w"
+            // Short forms of switches whose long forms are listed above, each
+            // a code generation switch: `B` is `BOOLEVAL` (short-circuit
+            // evaluation), `J` is `WRITEABLECONST` (typed constants may be
+            // assigned; the name still binds the same declaration), `V` is
+            // `VARSTRINGCHECKS`, `O` is `OPTIMIZATION`, `D` is `DEBUGINFO`
+            // (`{$D 'text'}` is the harmless `DESCRIPTION`), `Y` is
+            // `REFERENCEINFO`, `G` is `IMPORTEDDATA` and `U` is `SAFEDIVIDE`.
+            // `B`, `O`, `D` and `Y` stay tracked `$IFOPT` options through
+            // `supported_option_name`, like `R`; `I` is handled above.
+            | "b"
+            | "j"
+            | "v"
+            | "o"
+            | "d"
+            | "y"
+            | "g"
+            | "u"
+            // Delphi 2009/2010 string-conversion checks, like `VARSTRINGCHECKS`.
+            | "stringchecks"
     )
 }
 

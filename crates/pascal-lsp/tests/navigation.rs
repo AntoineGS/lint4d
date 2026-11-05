@@ -17078,3 +17078,241 @@ fn program_uses_with_explicit_paths_and_anonymous_methods_stay_navigable() {
             .is_empty()
     );
 }
+
+const METHOD_HEADING_SOURCE: &str = r#"unit Heading;
+interface
+type
+  TFoo = class
+    procedure Bar;
+    constructor Create(A: Integer);
+    destructor Destroy; override;
+    class function Make: Integer;
+  end;
+  TOuter = class
+  type
+    TInner = class
+      function Method: Integer;
+    end;
+  end;
+  TList<T> = class
+    procedure Add(const Item: T);
+  end;
+  TRec = record
+    class operator Add(const A, B: TRec): TRec;
+  end;
+implementation
+procedure TFoo.Bar;
+begin
+end;
+constructor TFoo.Create(A: Integer);
+begin
+end;
+destructor TFoo.Destroy;
+begin
+  inherited;
+end;
+class function TFoo.Make: Integer;
+begin
+  Result := 0;
+end;
+function TOuter.TInner.Method: Integer;
+begin
+  Result := 0;
+end;
+procedure TList<T>.Add(const Item: T);
+begin
+end;
+class operator TRec.Add(const A, B: TRec): TRec;
+begin
+end;
+end.
+"#;
+
+fn method_heading_index() -> (NavigationIndex, Url) {
+    let source_uri = uri("Heading");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), METHOD_HEADING_SOURCE.to_owned())
+        .expect("method heading source parses");
+    (index, source_uri)
+}
+
+/// Position of `name` inside the first occurrence of `heading`.
+fn heading_position(heading: &str, name: &str) -> Position {
+    let mut position = position_of(METHOD_HEADING_SOURCE, heading, 0);
+    position.character += heading.find(name).expect("name in heading") as u32;
+    position
+}
+
+#[test]
+fn method_heading_class_names_navigate_to_their_type_declarations() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    for (heading, name, declaration) in [
+        ("procedure TFoo.Bar;", "TFoo", "TFoo = class"),
+        ("constructor TFoo.Create", "TFoo", "TFoo = class"),
+        ("destructor TFoo.Destroy", "TFoo", "TFoo = class"),
+        ("class function TFoo.Make", "TFoo", "TFoo = class"),
+        ("function TOuter.TInner.Method", "TOuter", "TOuter = class"),
+        ("function TOuter.TInner.Method", "TInner", "TInner = class"),
+        ("procedure TList<T>.Add", "TList", "TList<T> = class"),
+        ("class operator TRec.Add", "TRec", "TRec = record"),
+    ] {
+        for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+            let locations = index.navigate(&source_uri, heading_position(heading, name), target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{name} in {heading:?} ({target:?}): {locations:?}"
+            );
+            assert_location_start(
+                &locations[0],
+                &source_uri,
+                position_of(source, declaration, 0),
+            );
+        }
+    }
+}
+
+#[test]
+fn method_heading_method_names_navigate_to_their_member_declarations() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    for (heading, name, declaration) in [
+        ("procedure TFoo.Bar;", "Bar", "procedure Bar;"),
+        ("destructor TFoo.Destroy", "Destroy", "destructor Destroy;"),
+        (
+            "function TOuter.TInner.Method",
+            "Method",
+            "function Method:",
+        ),
+        ("procedure TList<T>.Add", "Add", "procedure Add("),
+        ("class operator TRec.Add", "Add", "class operator Add("),
+    ] {
+        let locations = index.navigate(
+            &source_uri,
+            heading_position(heading, name),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{name} in {heading:?}: {locations:?}");
+        let mut expected = position_of(source, declaration, 0);
+        expected.character += declaration.find(name).expect("name in declaration") as u32;
+        assert_location_start(&locations[0], &source_uri, expected);
+    }
+}
+
+#[test]
+fn method_heading_class_names_are_references_of_their_types() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    let starts = |position: Position| {
+        let mut starts = index
+            .binding_locations(&source_uri, position, false)
+            .expect("type references are available")
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        starts
+    };
+    let headings = [
+        "procedure TFoo.Bar;",
+        "constructor TFoo.Create",
+        "destructor TFoo.Destroy",
+        "class function TFoo.Make",
+    ];
+    let expected = headings
+        .iter()
+        .map(|heading| heading_position(heading, "TFoo"))
+        .collect::<Vec<_>>();
+    assert_eq!(starts(position_of(source, "TFoo = class", 0)), expected);
+    assert_eq!(
+        starts(heading_position("destructor TFoo.Destroy", "TFoo")),
+        expected
+    );
+    assert_eq!(
+        starts(position_of(source, "TInner = class", 0)),
+        vec![heading_position("function TOuter.TInner.Method", "TInner")]
+    );
+    assert_eq!(
+        starts(position_of(source, "TOuter = class", 0)),
+        vec![heading_position("function TOuter.TInner.Method", "TOuter")]
+    );
+    let rec_starts = starts(position_of(source, "TRec = record", 0));
+    assert!(
+        rec_starts.contains(&heading_position("class operator TRec.Add", "TRec")),
+        "{rec_starts:?}"
+    );
+    assert_eq!(
+        starts(position_of(source, "TList<T> = class", 0)),
+        vec![heading_position("procedure TList<T>.Add", "TList")]
+    );
+    // A method body is one of the method's declaration sites.
+    let mut bar = position_of(source, "procedure Bar;", 0);
+    bar.character += "procedure ".len() as u32;
+    let method_starts = index
+        .binding_locations(&source_uri, bar, true)
+        .expect("method references are available")
+        .into_iter()
+        .map(|location| location.range.start)
+        .collect::<Vec<_>>();
+    assert!(
+        method_starts.contains(&heading_position("procedure TFoo.Bar;", "Bar")),
+        "{method_starts:?}"
+    );
+}
+
+#[test]
+fn method_heading_class_names_hover_as_their_types() {
+    let (index, source_uri) = method_heading_index();
+    let hover = index
+        .hover(
+            &source_uri,
+            heading_position("destructor TFoo.Destroy", "TFoo"),
+        )
+        .expect("hover on a heading's class name");
+    let text = hover_text(&hover);
+    assert!(text.contains("TFoo = class"), "{text}");
+}
+
+#[test]
+fn method_heading_owner_segments_bind_only_declared_nested_types() {
+    let source = r#"unit HeadingOwners;
+interface
+type
+  TOther = class
+    procedure Run;
+  end;
+  TFoo = class
+    procedure Run;
+  end;
+implementation
+procedure TFoo.TOther.Run;
+begin
+end;
+procedure TMissing.Run;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("HeadingOwners");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("heading owner source parses");
+    for (needle, occurrence) in [("TOther", 1), ("TMissing", 0)] {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, needle, occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(locations.is_empty(), "{needle}: {locations:?}");
+    }
+    let foo = index.navigate(
+        &source_uri,
+        position_of(source, "TFoo", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(foo.len(), 1);
+    assert_location_start(&foo[0], &source_uri, position_of(source, "TFoo", 0));
+}

@@ -7,6 +7,7 @@
 //! incomplete; the gaps only describe what may be missing.
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 use lsp_types::Url;
 
@@ -19,7 +20,7 @@ const MAX_RETAINED_GAPS: usize = 32;
 const MAX_LOGGED_GAPS: usize = 8;
 
 /// One reason a read-only answer may be missing items.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CoverageGap {
     /// The unit whose facts were withheld, when the gap is local to one.
     pub(crate) uri: Option<Url>,
@@ -36,6 +37,9 @@ pub(crate) struct Coverage {
     pub(crate) units: HashSet<Url>,
     /// Whether a gap named no unit, retained or not.
     pub(crate) unattributed: bool,
+    /// Hashes of the gaps counted in `omitted`, so a gap noted again is
+    /// not counted twice.
+    omitted_keys: HashSet<u64>,
 }
 
 impl Coverage {
@@ -62,7 +66,11 @@ impl Coverage {
         if self.gaps.len() < MAX_RETAINED_GAPS {
             self.gaps.push(gap);
         } else {
-            self.omitted = self.omitted.saturating_add(1);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            gap.hash(&mut hasher);
+            if self.omitted_keys.insert(hasher.finish()) {
+                self.omitted = self.omitted.saturating_add(1);
+            }
         }
     }
 
@@ -131,6 +139,11 @@ mod tests {
         for index in 0..MAX_RETAINED_GAPS + 5 {
             coverage.note(Some(&unit(&format!("Unit{index}"))), "parser recovery");
         }
+        // A gap past the limit noted again is not another one.
+        coverage.note(
+            Some(&unit(&format!("Unit{}", MAX_RETAINED_GAPS + 4))),
+            "parser recovery",
+        );
         assert_eq!(coverage.gaps.len(), MAX_RETAINED_GAPS);
         assert_eq!(coverage.omitted, 5);
         // l4d-mayy: the units past the limit are still known.

@@ -2111,6 +2111,8 @@ impl NavigationIndex {
 
             let guarded = options.guard.filter(|guard| guard.documents.contains(uri));
             let own_top_level = guarded.is_some() && binding_is_top_level_in(binding, uri);
+            let uses_unproven = guarded
+                .is_some_and(|guard| own_top_level && self.uses_unproven_unit(document, guard));
             let root = document.tree.root_node();
             let unit_spans = if binding.kind == SymbolKind::Unit {
                 if let Some(shared_work_budget) = options.shared_work_budget.as_deref_mut() {
@@ -2433,6 +2435,7 @@ impl NavigationIndex {
                     if let Some(guard) = guarded
                         && let Some(reason) = self.dependency_gap_reaches(
                             guard,
+                            uses_unproven,
                             uri,
                             document,
                             identifier,
@@ -2495,20 +2498,26 @@ impl NavigationIndex {
     /// never consulted a unit it uses. The binder resolves an unqualified
     /// name (`unqualified_references_with_budget_at_scope_and_state`) through,
     /// in order: generic parameters; `with` receivers; the enclosing routine
-    /// scopes; the members of the enclosing type and of its ancestors; the
-    /// unit's own top-level declarations; and only when none of those holds
+    /// scopes; the members of the enclosing type, of the helper active for
+    /// it and of its ancestors; the unit's own top-level declarations; and only when none of those holds
     /// the name, the units of the interface `uses` and, in the
     /// implementation, of the implementation `uses` too
     /// (`imported_references_with_budget`), then System. A unit used in
     /// either clause therefore cannot shadow the unit's own top-level
     /// declaration. It can still reach the occurrence through a `with`
-    /// receiver or an inherited member of the enclosing type, either of which
-    /// may be declared in an unproven unit, and through a qualifier, resolved
-    /// through the visible units.
+    /// receiver, through a qualifier, resolved through the visible units, and
+    /// inside a type (its declaration, its methods and the routines nested in
+    /// them) through a member of the type's ancestors or of a helper for the
+    /// type, an ancestor or `TObject`. A helper is active only from a unit
+    /// the document uses, so while one of those is unproven every occurrence
+    /// inside a type is withheld; otherwise only an unproven ancestry is.
+    /// Plain routines, their nested routines, the initialization and
+    /// finalization sections and unit-level declarations have no type.
     #[allow(clippy::too_many_arguments)]
     fn dependency_gap_reaches(
         &self,
         guard: &DependencyGuard,
+        uses_unproven: bool,
         uri: &Url,
         document: &Document,
         identifier: Node<'_>,
@@ -2531,6 +2540,11 @@ impl NavigationIndex {
             .filter(|context| context.span.contains(span))
             .map(|context| context.owner_type.clone());
         for owner in routine_owner.into_iter().chain(declaration_owners) {
+            if uses_unproven {
+                return Some(
+                    "a unit it uses could not be analyzed, so a member or helper it declares may shadow an occurrence inside a type",
+                );
+            }
             if !self.type_ancestry_avoids(uri, &owner, &guard.unproven) {
                 return Some(
                     "an occurrence inside a type whose ancestry is unproven may be shadowed by an inherited member",
@@ -2538,6 +2552,23 @@ impl NavigationIndex {
             }
         }
         None
+    }
+
+    /// Whether a unit `document` uses, System included, is unresolved or
+    /// unproven: what it declares is then unknown.
+    fn uses_unproven_unit(&self, document: &Document, guard: &DependencyGuard) -> bool {
+        !document.unknown_imports.is_empty()
+            || self
+                .units
+                .get("system")
+                .is_some_and(|urls| urls.iter().any(|url| guard.unproven.contains(url)))
+            || document
+                .active_uses(super::Region::Implementation)
+                .into_iter()
+                .any(|unit| {
+                    let urls = self.unit_urls_for_import(document, unit);
+                    urls.is_empty() || urls.iter().any(|url| guard.unproven.contains(url))
+                })
     }
 
     /// Whether the type `key` declared in `uri` and every ancestor it

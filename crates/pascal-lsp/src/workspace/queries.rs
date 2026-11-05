@@ -2095,6 +2095,22 @@ fn read_only_reference_coverage(
         .flat_map(|expansion| expansion.dependencies.iter().cloned())
         .collect::<Vec<_>>();
     withheld.extend(included);
+    // A requested include file another owner withholds would lose its
+    // proven occurrences; never answer without them (l4d-mayy).
+    if withheld.contains(uri) {
+        let owner = snapshot
+            .expansions
+            .iter()
+            .filter(|(owner, expansion)| {
+                withheld.contains(*owner) && expansion.dependencies.contains(uri)
+            })
+            .map(|(owner, _)| owner.as_str())
+            .min()
+            .unwrap_or(uri.as_str());
+        return Err(format!(
+            "reference workspace scan incomplete: {uri} is included by {owner}, whose analysis is unproven"
+        ));
+    }
     if !snapshot.complete {
         coverage.note(
             None,
@@ -4684,7 +4700,7 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
-                    && gap.reason.contains("ancestry")),
+                    && gap.reason.contains("helper")),
             "{:?}",
             partial.coverage
         );
@@ -4703,9 +4719,135 @@ mod tests {
             vec![
                 (source_uri(&downstream), 4, 2),
                 (source_uri(&downstream), 14, 10),
-                (source_uri(&downstream), 23, 10),
             ]
         );
+    }
+
+    /// Runs references from `uri` on the best-effort local snapshot that
+    /// answers without the index, where an import's failure is a gap.
+    fn references_without_the_index(
+        root: &Path,
+        uri: &Url,
+        position: Position,
+    ) -> Result<crate::coverage::Partial<Vec<lsp_types::Location>>, String> {
+        let input =
+            test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_target_error(false);
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_target_error(true);
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(0));
+        references_from_input(input, uri, position, true, &AtomicBool::new(false)).value
+    }
+
+    /// l4d-mayy fix round 1: a helper an unproven import declares, even for
+    /// `TObject`, extends the members a method of an own class resolves
+    /// first, so the occurrence there is withheld; a plain routine has no
+    /// Self and keeps its occurrence.
+    #[test]
+    fn a_helper_an_unproven_import_may_declare_withholds_occurrences_inside_methods() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Failing.pas"),
+            concat!(
+                "unit Failing;\n",
+                "interface\n",
+                "type\n",
+                "  TObjHelper = class helper for TObject\n",
+                "{$I Missing.inc}\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            concat!(
+                "unit Downstream;\n",      // 0
+                "interface\n",             // 1
+                "uses Failing;\n",         // 2
+                "type\n",                  // 3
+                "  TLocal = class\n",      // 4
+                "    procedure Run;\n",    // 5
+                "  end;\n",                // 6
+                "procedure Marker;\n",     // 7
+                "implementation\n",        // 8
+                "procedure Marker;\n",     // 9
+                "begin\n",                 // 10
+                "end;\n",                  // 11
+                "procedure Plain;\n",      // 12
+                "begin\n",                 // 13
+                "  Marker;\n",             // 14
+                "end;\n",                  // 15
+                "procedure TLocal.Run;\n", // 16
+                "begin\n",                 // 17
+                "  Marker;\n",             // 18
+                "end;\n",                  // 19
+                "end.\n",
+            ),
+        )
+        .expect("downstream");
+        let partial =
+            references_without_the_index(&root, &source_uri(&downstream), Position::new(7, 10))
+                .expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("helper")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&downstream), 7, 10),
+                (source_uri(&downstream), 9, 10),
+                (source_uri(&downstream), 14, 2),
+            ]
+        );
+    }
+
+    /// l4d-mayy fix round 1: a requested include file whose other owner is
+    /// withheld for its own unsupported directive would lose the
+    /// occurrences it holds, so references refuse rather than answer
+    /// without them.
+    #[test]
+    fn a_requested_include_withheld_through_another_owner_refuses_references() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.inc");
+        fs::write(&shared, "const IncValue = 1;\n").expect("include");
+        fs::write(
+            root.join("Good.pas"),
+            "unit Good;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(IncValue);\nend;\nend.\n",
+        )
+        .expect("good");
+        fs::write(
+            root.join("Bad.pas"),
+            "unit Bad;\ninterface\n{$SCOPEDENUMS ON}\n{$I Shared.inc}\nimplementation\nend.\n",
+        )
+        .expect("bad");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let computed = references_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(0, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(computed.value.is_err(), "{:?}", computed.value);
     }
 
     #[test]

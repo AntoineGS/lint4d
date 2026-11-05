@@ -6,16 +6,21 @@
 //! check. Every item in such an answer is proven even when the coverage is
 //! incomplete; the gaps only describe what may be missing.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+
 use lsp_types::Url;
 
 /// Gaps beyond this many are counted but not retained, so a workspace where
-/// every unit is unprovable cannot grow the result without bound.
+/// every unit is unprovable cannot grow the result without bound. The limit
+/// bounds only what is displayed: `units` and `unattributed` keep what
+/// withholding decisions need.
 const MAX_RETAINED_GAPS: usize = 32;
 /// Gaps named in the one-line client log.
 const MAX_LOGGED_GAPS: usize = 8;
 
 /// One reason a read-only answer may be missing items.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CoverageGap {
     /// The unit whose facts were withheld, when the gap is local to one.
     pub(crate) uri: Option<Url>,
@@ -27,6 +32,14 @@ pub(crate) struct Coverage {
     pub(crate) gaps: Vec<CoverageGap>,
     /// Distinct gaps past `MAX_RETAINED_GAPS`.
     pub(crate) omitted: usize,
+    /// Every unit a gap named, retained or not. Callers name units of
+    /// their snapshot, so this is bounded by its member count.
+    pub(crate) units: HashSet<Url>,
+    /// Whether a gap named no unit, retained or not.
+    pub(crate) unattributed: bool,
+    /// Hashes of the gaps counted in `omitted`, so a gap noted again is
+    /// not counted twice.
+    omitted_keys: HashSet<u64>,
 }
 
 impl Coverage {
@@ -35,6 +48,14 @@ impl Coverage {
     }
 
     pub(crate) fn note(&mut self, uri: Option<&Url>, reason: impl Into<String>) {
+        match uri {
+            Some(uri) => {
+                if !self.units.contains(uri) {
+                    self.units.insert(uri.clone());
+                }
+            }
+            None => self.unattributed = true,
+        }
         let gap = CoverageGap {
             uri: uri.cloned(),
             reason: reason.into(),
@@ -45,7 +66,11 @@ impl Coverage {
         if self.gaps.len() < MAX_RETAINED_GAPS {
             self.gaps.push(gap);
         } else {
-            self.omitted = self.omitted.saturating_add(1);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            gap.hash(&mut hasher);
+            if self.omitted_keys.insert(hasher.finish()) {
+                self.omitted = self.omitted.saturating_add(1);
+            }
         }
     }
 
@@ -114,8 +139,21 @@ mod tests {
         for index in 0..MAX_RETAINED_GAPS + 5 {
             coverage.note(Some(&unit(&format!("Unit{index}"))), "parser recovery");
         }
+        // A gap past the limit noted again is not another one.
+        coverage.note(
+            Some(&unit(&format!("Unit{}", MAX_RETAINED_GAPS + 4))),
+            "parser recovery",
+        );
         assert_eq!(coverage.gaps.len(), MAX_RETAINED_GAPS);
         assert_eq!(coverage.omitted, 5);
+        // l4d-mayy: the units past the limit are still known.
+        assert_eq!(coverage.units.len(), MAX_RETAINED_GAPS + 5);
+        assert!(
+            coverage
+                .units
+                .contains(&unit(&format!("Unit{}", MAX_RETAINED_GAPS + 4)))
+        );
+        assert!(!coverage.unattributed);
         let summary = coverage.summary("textDocument/references");
         assert!(summary.contains("textDocument/references"), "{summary}");
         assert!(summary.contains("Unit0.pas"), "{summary}");
@@ -126,5 +164,7 @@ mod tests {
             )),
             "{summary}"
         );
+        coverage.note(None, "the audit stopped");
+        assert!(coverage.unattributed);
     }
 }

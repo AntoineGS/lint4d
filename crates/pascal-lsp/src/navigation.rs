@@ -91,6 +91,7 @@ mod inlay;
 mod overload;
 mod rename;
 pub(crate) use rename::BindingWorkBudget;
+pub(crate) use rename::DependencyGuard;
 #[cfg(test)]
 pub(crate) use rename::test_set_occurrence_prefilter;
 mod selection;

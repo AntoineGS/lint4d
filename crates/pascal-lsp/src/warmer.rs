@@ -25,6 +25,9 @@ const MAX_SEAL_RETRIES: usize = 3;
 /// room while the store's pressure outlasts their waits (each waits for a
 /// maintenance step, which paces them).
 const MAX_ROOM_RETRIES: usize = 3;
+/// Reuse batches an anchor runs again, in a row, that met only retryable
+/// misses (a busy store, a refused decode reservation) before its pass ends.
+const MAX_REUSE_RETRIES: usize = 3;
 
 #[derive(Default)]
 pub(crate) struct InteractiveGate {
@@ -750,6 +753,9 @@ pub(crate) struct Warmer {
     /// Batches of each anchor asked for again in a row for members refused
     /// for room.
     room_retries: HashMap<IndexAnchor, usize>,
+    /// Reuse batches of each anchor run again in a row that met only
+    /// retryable misses.
+    reuse_retries: HashMap<IndexAnchor, usize>,
     /// The index batch in flight.
     index_in_flight: Option<(IndexAnchor, IndexMode)>,
     /// The configured project's absolute path, as of the last poll.
@@ -802,6 +808,7 @@ impl Warmer {
             reuse_done: HashSet::new(),
             seal_retries: HashMap::new(),
             room_retries: HashMap::new(),
+            reuse_retries: HashMap::new(),
             index_in_flight: None,
             configured_project: None,
             crawl_pending: Arc::new(AtomicBool::new(false)),
@@ -960,6 +967,7 @@ impl Warmer {
         self.reuse_done.clear();
         self.seal_retries.clear();
         self.room_retries.clear();
+        self.reuse_retries.clear();
         self.interleave = false;
         self.crawl_resume.clear();
         self.dispatched_epochs.clear();
@@ -1347,7 +1355,24 @@ impl Warmer {
                 // A reuse pass goes on over a cold or partly filled store
                 // until every member was tried (A5): published records are
                 // spread over the path order, and an absent miss is cheap.
-                let requeued = progress.worth_requeue();
+                let mut requeued = progress.worth_requeue();
+                // A reuse batch that met only retryable misses (a busy
+                // store, a refused decode reservation) runs again up to
+                // `MAX_REUSE_RETRIES` times in a row before its pass ends.
+                if progress.mode == IndexMode::Reuse {
+                    if requeued {
+                        self.reuse_retries.remove(anchor);
+                    } else if progress.reuse_deferred > 0
+                        && progress.reuse_pending > 0
+                        && !progress.memory
+                    {
+                        let retries = self.reuse_retries.entry(anchor.clone()).or_default();
+                        if *retries < MAX_REUSE_RETRIES {
+                            *retries += 1;
+                            requeued = true;
+                        }
+                    }
+                }
                 let settled = progress.indexed
                     + progress.refreshed
                     + progress.refused
@@ -1371,6 +1396,7 @@ impl Warmer {
                 } else if progress.mode == IndexMode::Reuse {
                     // The pass is done: extraction follows the crawl.
                     self.reuse_done.insert(anchor.clone());
+                    self.reuse_retries.remove(anchor);
                     if !progress.complete {
                         self.request_index(anchor.clone());
                     }
@@ -3500,10 +3526,21 @@ mod tests {
             store: &std::path::Path,
             gate: &Arc<InteractiveGate>,
         ) -> crate::workspace::Workspace {
+            persisting_workspace_with(root, store, gate, Default::default())
+        }
+
+        /// `persisting_workspace` under `limits`.
+        fn persisting_workspace_with(
+            root: &std::path::Path,
+            store: &std::path::Path,
+            gate: &Arc<InteractiveGate>,
+            limits: crate::workspace::ResourceLimits,
+        ) -> crate::workspace::Workspace {
             let mut workspace = crate::workspace::Workspace::with_override_session(
                 vec![root.to_path_buf()],
                 crate::workspace::WorkspaceOptions {
                     project_file: Some(root.join("App.dproj")),
+                    limits,
                     ..Default::default()
                 },
                 pascal_project::delphi_overrides::OverrideSession::new(None),
@@ -4089,6 +4126,115 @@ mod tests {
             );
             let reused = batches.iter().map(|batch| batch.reused).sum::<usize>();
             assert_eq!(reused, published, "{batches:?}");
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// A5 fix round 1 (Important 1): a sealed snapshot lists the first
+        /// members in path order artifact-less (refused for the per-file
+        /// limit), more than one reuse batch of them. A batch that only met
+        /// such members still goes on, and every published member after them
+        /// is reused before the crawl's `End`.
+        #[test]
+        fn a_reuse_pass_goes_on_past_a_batch_of_retrying_refusals() {
+            const EXTRA: usize = 1200;
+            const TAIL: usize = 60;
+            let gate = Arc::new(InteractiveGate::default());
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), EXTRA);
+            let members = members_in_path_order(temp.path());
+            let refused_from = 3;
+            let refused_to = members.len() - TAIL;
+            assert!(refused_to - refused_from > 2 * 512, "{}", members.len());
+            for path in &members[refused_from..refused_to] {
+                assert!(path.file_stem().unwrap().to_str().unwrap().starts_with('U'));
+                let text = std::fs::read_to_string(path).unwrap();
+                write(path, &format!("{text}{{ {} }}\n", "x".repeat(400)));
+            }
+            pascal_project::backdate_tree_for_test(temp.path());
+            let limits = || crate::workspace::ResourceLimits {
+                max_file_bytes: 300,
+                ..Default::default()
+            };
+            let store = crate::workspace::persist::tests::private_dir();
+            let main = Url::from_file_path(temp.path().join("lib/Main.pas")).unwrap();
+
+            let mut first = persisting_workspace_with(temp.path(), store.path(), &gate, limits());
+            first
+                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .unwrap();
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main.clone());
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let mut events = Vec::new();
+            while !events
+                .iter()
+                .any(|event| sealed(event, &SealOutcome::Sealed))
+            {
+                assert!(std::time::Instant::now() < deadline, "not sealed");
+                events.extend(warmer.poll(&first));
+                std::thread::yield_now();
+            }
+            warmer.shutdown();
+            first.persistent_cache().shutdown();
+            drop(first);
+
+            let mut second = persisting_workspace_with(temp.path(), store.path(), &gate, limits());
+            second
+                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .unwrap();
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &second, Duration::from_secs(120));
+            let batches = reuse_batches_before_end(&events);
+            let reused = batches.iter().map(|batch| batch.reused).sum::<usize>();
+            assert_eq!(
+                reused,
+                members.len() - (refused_to - refused_from),
+                "{batches:?}"
+            );
+            second.persistent_cache().shutdown();
+        }
+
+        /// A5 fix round 1 (Minor 2): a reuse batch that only met retryable
+        /// misses is tried again, at most `MAX_REUSE_RETRIES` times in a row,
+        /// before the pass ends; a batch that progressed resets the count.
+        #[test]
+        fn a_reuse_batch_of_retryable_misses_is_retried_a_bounded_number_of_times() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let mut warmer = Warmer::start(gate);
+            let anchor = IndexAnchor::Document(main);
+            let key = crate::workspace::ContextKey::for_test("/retry");
+            let batch = |deferred: usize, missed: usize| {
+                let mut progress = IndexProgress::new(key.clone(), IndexMode::Reuse);
+                progress.reuse_deferred = deferred;
+                progress.reuse_missed = missed;
+                progress.reuse_pending = 10;
+                progress.pending = 10;
+                WarmEvent::IndexProgress {
+                    anchor: anchor.clone(),
+                    progress: Box::new(progress),
+                    seal: None,
+                    generation: 0,
+                }
+            };
+            let accept = |warmer: &mut Warmer, event: &WarmEvent| {
+                warmer.busy = true;
+                assert!(warmer.accept_event(event, workspace.project_cache()));
+                let requeued = warmer.reuse_queue.front() == Some(&anchor);
+                warmer.reuse_queue.clear();
+                requeued
+            };
+            for _ in 0..MAX_REUSE_RETRIES {
+                assert!(accept(&mut warmer, &batch(5, 0)), "retried");
+            }
+            // Progress resets the count.
+            assert!(accept(&mut warmer, &batch(5, 1)));
+            for _ in 0..MAX_REUSE_RETRIES {
+                assert!(accept(&mut warmer, &batch(5, 0)), "retried again");
+            }
+            assert!(!accept(&mut warmer, &batch(5, 0)), "the pass ends");
+            assert!(warmer.reuse_done.contains(&anchor));
             workspace.persistent_cache().shutdown();
         }
 

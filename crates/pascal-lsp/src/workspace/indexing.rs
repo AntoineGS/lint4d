@@ -351,6 +351,9 @@ pub(crate) struct IndexProgress {
     pub(crate) reuse_missed: usize,
     /// Of `reuse_missed`, members the store held nothing for.
     pub(crate) reuse_absent: usize,
+    /// Members the held snapshot lists artifact-less (a previous refusal),
+    /// now tried for reuse: they are retried last by extraction.
+    pub(crate) reuse_retrying: usize,
     /// Pending closed members not tried for reuse since they last changed.
     pub(crate) reuse_pending: usize,
     /// Retryable reuse misses this batch (left untried for reuse).
@@ -371,7 +374,7 @@ pub(crate) struct IndexProgress {
 }
 
 impl IndexProgress {
-    fn new(key: ContextKey, mode: IndexMode) -> Self {
+    pub(crate) fn new(key: ContextKey, mode: IndexMode) -> Self {
         Self {
             key: Some(key),
             mode,
@@ -389,6 +392,7 @@ impl IndexProgress {
             reused: 0,
             reuse_missed: 0,
             reuse_absent: 0,
+            reuse_retrying: 0,
             reuse_pending: 0,
             reuse_deferred: 0,
             persisted: 0,
@@ -402,8 +406,10 @@ impl IndexProgress {
     /// members no batch has tried yet are still pending. A batch that only
     /// deferred members already deferred is not requeued (no livelock); a
     /// request or invalidation asks for the anchor again. A reuse batch is
-    /// requeued while members are left to try and it tried one for good, so
-    /// a run of retryable misses alone does not loop either. A Full batch
+    /// requeued while members are left to try and it tried one for good (a
+    /// miss, or a member the snapshot lists as refused), so a run of
+    /// retryable misses alone does not loop either (the warmer retries such
+    /// a batch a bounded number of times). A Full batch
     /// that left members retrying a previous refusal (they go last, so its
     /// bound may end before them) is requeued for them although the index
     /// is `complete`, if it settled or retried anything: trying one clears
@@ -420,7 +426,9 @@ impl IndexProgress {
         }
         settled
             || (self.deferred > 0 && self.untried > 0)
-            || (self.mode == IndexMode::Reuse && self.reuse_pending > 0 && self.reuse_missed > 0)
+            || (self.mode == IndexMode::Reuse
+                && self.reuse_pending > 0
+                && self.reuse_missed + self.reuse_retrying > 0)
     }
 }
 
@@ -837,6 +845,7 @@ impl Workspace {
         let mut pending = std::collections::VecDeque::from(pending);
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
+        let mut context_key = super::persist::ContextKeyMemo::default();
         while let Some(path) = pending.pop_front() {
             if tried.len() >= bound.units
                 || bound.time.is_some_and(|limit| started.elapsed() >= limit)
@@ -869,7 +878,7 @@ impl Workspace {
                 progress.refreshed += 1;
                 continue;
             }
-            let reuse = self.reuse_index_member(&key, &path, &own_stamp, cancel);
+            let reuse = self.reuse_index_member(&key, &path, &own_stamp, &mut context_key, cancel);
             #[cfg(test)]
             run_hook(&AFTER_REUSE, &path);
             let asked = !matches!(reuse, ReuseOutcome::NoStore);
@@ -888,6 +897,7 @@ impl Workspace {
                 // Full batch comes back to it at its end, within its bound,
                 // when it is tried for reuse no more.
                 ReuseOutcome::Retrying => {
+                    progress.reuse_retrying += 1;
                     self.project_cache.mark_index_reuse_tried(&key, &path);
                     self.project_cache
                         .defer_index_member(&key, &path, RETRYING_REFUSAL);
@@ -1633,6 +1643,7 @@ impl Workspace {
         key: &ContextKey,
         path: &Path,
         own_stamp: &PathStamp,
+        context_key: &mut super::persist::ContextKeyMemo,
         cancel: &AtomicBool,
     ) -> ReuseOutcome {
         if !self.is_baseline()
@@ -1684,9 +1695,10 @@ impl Workspace {
             }
         }
         let result = hinted.unwrap_or_else(|| {
-            self.reuse_in_context(
+            self.reuse_in_context_with(
                 &uri,
                 key,
+                context_key,
                 job.store(),
                 &work,
                 pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,

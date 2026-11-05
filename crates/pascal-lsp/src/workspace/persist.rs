@@ -291,6 +291,24 @@ pub(crate) fn reset_reuse_in_context_calls_for_test() {
     REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(0));
 }
 
+/// The store's key of one installed context, encoded once (A5: the reuse
+/// pass looks up every member of a context).
+#[derive(Default)]
+pub(crate) struct ContextKeyMemo(Option<(Arc<ProjectContext>, CacheContextKey)>);
+
+impl ContextKeyMemo {
+    fn key_of(&mut self, context: &Arc<ProjectContext>) -> &CacheContextKey {
+        if !self
+            .0
+            .as_ref()
+            .is_some_and(|(held, _)| Arc::ptr_eq(held, context))
+        {
+            self.0 = Some((Arc::clone(context), CacheContextKey::new(context)));
+        }
+        &self.0.as_ref().expect("just set").1
+    }
+}
+
 impl Workspace {
     /// The saved root bytes of `uri`, read under `context`'s current policy.
     pub(super) fn saved_root_bytes(
@@ -504,6 +522,30 @@ impl Workspace {
         decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
+        self.reuse_in_context_with(
+            uri,
+            key,
+            &mut ContextKeyMemo::default(),
+            store,
+            work,
+            decode_limit,
+            cancel,
+        )
+    }
+
+    /// `reuse_in_context`, encoding the store's context key once for all
+    /// the calls that share `memo` and the same installed context.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reuse_in_context_with(
+        &self,
+        uri: &Url,
+        key: &ContextKey,
+        memo: &mut ContextKeyMemo,
+        store: &Store,
+        work: &dyn ProjectWorkBudget,
+        decode_limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Reuse, PersistError> {
         #[cfg(test)]
         REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
@@ -546,9 +588,9 @@ impl Workspace {
             Ok(Lookup::Miss(_)) => {}
             Err(miss) => return Ok(Reuse::Miss(miss)),
         }
-        let context_key = CacheContextKey::new(&context);
+        let context_key = memo.key_of(&context);
         let headers = match store
-            .find_evidence(&context_key, &local)
+            .find_evidence(context_key, &local)
             .map_err(PersistError::Store)?
         {
             Lookup::Hit(headers) => headers,
@@ -559,7 +601,7 @@ impl Workspace {
         let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let mut validator = Validator::new(
             CurrentInputs {
-                context: &context_key,
+                context: context_key,
                 read_policy: context.read_policy(),
                 overlays: &overlays,
                 deleted: &deleted,
@@ -709,6 +751,27 @@ pub(crate) mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_context_key_memo_encodes_once_per_installed_context() {
+        let one = Arc::new(ProjectContext::default());
+        let other = Arc::new(ProjectContext::default());
+        let mut memo = ContextKeyMemo::default();
+        assert_eq!(*memo.key_of(&one), CacheContextKey::new(&one));
+        assert!(
+            memo.0
+                .as_ref()
+                .is_some_and(|(held, _)| Arc::ptr_eq(held, &one))
+        );
+        assert_eq!(*memo.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(*memo.key_of(&other), CacheContextKey::new(&other));
+        assert!(
+            memo.0
+                .as_ref()
+                .is_some_and(|(held, _)| Arc::ptr_eq(held, &other)),
+            "another installed context is encoded again"
+        );
     }
 
     #[test]

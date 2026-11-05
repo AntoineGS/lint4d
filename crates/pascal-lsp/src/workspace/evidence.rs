@@ -1,13 +1,14 @@
 //! Durable evidence of what a compile-time session consulted (spec §7).
 
 use super::Workspace;
-use super::capture::{CapturedReads, ListingCapture};
-use super::resolver::path_equivalent;
+use super::capture::{CapturedReads, IndexedReads, ListingCapture};
+use super::resolver::path_key;
 use lsp_types::Url;
 use pascal_cache::Observation;
 use pascal_core::resolver::{ResolutionObservation, SourceRevision};
 use pascal_project::ProjectObservations;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Why a session's inputs cannot be proven to another process. The facts
@@ -49,13 +50,14 @@ pub(crate) fn session_evidence(
     if reads.editor_state {
         return Err(EvidenceGap::Overlay);
     }
-    let searched = SearchedDirectories::of(observations, reads);
-    let mut evidence = Vec::with_capacity(observations.len());
+    let reads = reads.indexed();
+    let searched = SearchedDirectories::of(observations, &reads);
+    let mut evidence = Evidence::default();
     for observation in observations {
         if cancel.load(Ordering::Relaxed) {
             return Err(EvidenceGap::Cancelled);
         }
-        evidence.push(match observation {
+        evidence.insert(match observation {
             ResolutionObservation::Directory {
                 complete: false, ..
             } => return Err(EvidenceGap::Incomplete),
@@ -123,7 +125,37 @@ pub(crate) fn session_evidence(
             }
         });
     }
-    Ok(evidence)
+    Ok(evidence.observations)
+}
+
+/// Evidence observations, each distinct one once in first-seen order. The
+/// resolver observes a directory once per lookup that consults it, and a
+/// validator checks each observation against the current filesystem on its
+/// own, so a repeat proves nothing its first occurrence does not. Two
+/// observations of one path that differ (two payloads read there) are both
+/// kept.
+#[derive(Default)]
+struct Evidence {
+    observations: Vec<Observation>,
+    /// Positions in `observations` by kind and exact path.
+    seen: HashMap<(u8, PathBuf), Vec<usize>>,
+}
+
+impl Evidence {
+    fn insert(&mut self, observation: Observation) {
+        let at = self
+            .seen
+            .entry((observation.kind(), observation.path().to_path_buf()))
+            .or_default();
+        if at
+            .iter()
+            .any(|&known| self.observations[known] == observation)
+        {
+            return;
+        }
+        at.push(self.observations.len());
+        self.observations.push(observation);
+    }
 }
 
 /// What proves an include search's stat-only marker of a directory it
@@ -133,40 +165,36 @@ pub(crate) fn session_evidence(
 /// there. Every directory where the exact name missed was listed by the
 /// case-insensitive fallback; that listing is its own observation and is
 /// proven by its capture.
-struct SearchedDirectories<'a> {
-    hit_parents: Vec<&'a Path>,
-    listed: Vec<&'a Path>,
+struct SearchedDirectories {
+    /// `path_key`s of the hits' parents and of the listed directories.
+    proven: HashSet<String>,
 }
 
-impl<'a> SearchedDirectories<'a> {
-    fn of(observations: &'a [ResolutionObservation], reads: &CapturedReads) -> Self {
-        let mut searched = Self {
-            hit_parents: Vec::new(),
-            listed: Vec::new(),
-        };
+impl SearchedDirectories {
+    fn of(observations: &[ResolutionObservation], reads: &IndexedReads<'_>) -> Self {
+        let mut proven = HashSet::new();
         for observation in observations {
             match observation {
                 ResolutionObservation::Directory {
                     path, listed: true, ..
-                } => searched.listed.push(path),
+                } => {
+                    proven.insert(path_key(path));
+                }
                 ResolutionObservation::Payload {
                     path,
                     revision: SourceRevision::Disk { content_hash, .. },
                     ..
                 } if reads.payload_of(path, *content_hash).is_some() => {
-                    searched.hit_parents.extend(path.parent());
+                    proven.extend(path.parent().map(path_key));
                 }
                 _ => {}
             }
         }
-        searched
+        Self { proven }
     }
 
     fn proves(&self, directory: &Path) -> bool {
-        self.hit_parents
-            .iter()
-            .chain(&self.listed)
-            .any(|path| path_equivalent(path, directory))
+        self.proven.contains(&path_key(directory))
     }
 }
 
@@ -507,6 +535,182 @@ mod tests {
                 listing: Digest::from_bytes([1; 32]),
             }])
         );
+    }
+
+    fn disk_payload(path: &str, content_hash: u64) -> ResolutionObservation {
+        ResolutionObservation::Payload {
+            source_id: pascal_core::SourceId::new(format!("source:{path}")),
+            path: PathBuf::from(path),
+            revision: pascal_core::SourceRevision::Disk {
+                stamp: pascal_project::ProjectReadStamp {
+                    bytes: 1,
+                    modified: None,
+                    is_dir: false,
+                    is_symlink: false,
+                    change: None,
+                    settled: false,
+                },
+                content_hash,
+                read_policy: Default::default(),
+                path_entry: ProjectPathEntry::configured(PathBuf::from(path)),
+            },
+        }
+    }
+
+    /// Rootcause "common root": one Directory observation per lookup
+    /// becomes one evidence observation per distinct input, in first-seen
+    /// order; nothing distinct is dropped.
+    #[test]
+    fn repeated_lookups_give_each_distinct_observation_once() {
+        let directory = |path: &str| ResolutionObservation::Directory {
+            path: PathBuf::from(path),
+            entry: ProjectPathEntry::configured(PathBuf::from(path)),
+            stamp: None,
+            complete: true,
+            listed: true,
+        };
+        let absent = ResolutionObservation::Candidate {
+            path: PathBuf::from("/w/a/U.pas"),
+            entry: None,
+            stamp: None,
+            present: false,
+        };
+        let captured_listing = |path: &str, byte| CapturedListing {
+            directory: PathBuf::from(path),
+            listing: Digest::from_bytes([byte; 32]),
+            complete: true,
+            overlay: false,
+        };
+        let captured_payload = |content_hash, bytes: &[u8]| CapturedPayload {
+            path: PathBuf::from("/w/b/X.inc"),
+            content_hash,
+            content: SourceContent::from_bytes(bytes),
+        };
+        let reads = CapturedReads {
+            listings: vec![captured_listing("/w/a", 1), captured_listing("/w/b", 2)],
+            payloads: vec![captured_payload(7, b"x"), captured_payload(8, b"y")],
+            ..CapturedReads::default()
+        };
+        let mut observations = Vec::new();
+        for _ in 0..100 {
+            observations.extend([
+                directory("/w/a"),
+                absent.clone(),
+                directory("/w/b"),
+                disk_payload("/w/b/X.inc", 7),
+            ]);
+        }
+        // The same path read again with other bytes is another input.
+        observations.push(disk_payload("/w/b/X.inc", 8));
+        let evidence = session_evidence(
+            &observations,
+            &reads,
+            &ProjectObservations::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let entry = |path: &str| ProjectPathEntry::configured(PathBuf::from(path));
+        assert_eq!(
+            evidence,
+            vec![
+                Observation::Listing {
+                    path: PathBuf::from("/w/a"),
+                    entry: entry("/w/a"),
+                    listing: Digest::from_bytes([1; 32]),
+                },
+                Observation::Presence {
+                    path: PathBuf::from("/w/a/U.pas"),
+                    entry: None,
+                    present: false,
+                },
+                Observation::Listing {
+                    path: PathBuf::from("/w/b"),
+                    entry: entry("/w/b"),
+                    listing: Digest::from_bytes([2; 32]),
+                },
+                Observation::Payload {
+                    path: PathBuf::from("/w/b/X.inc"),
+                    entry: entry("/w/b/X.inc"),
+                    content: SourceContent::from_bytes(b"x"),
+                },
+                Observation::Payload {
+                    path: PathBuf::from("/w/b/X.inc"),
+                    entry: entry("/w/b/X.inc"),
+                    content: SourceContent::from_bytes(b"y"),
+                },
+            ]
+        );
+    }
+
+    /// A real session over a search path: the evidence holds no exact
+    /// duplicate, and every distinct input the per-observation mapping
+    /// named is still in it.
+    #[test]
+    fn a_session_s_evidence_has_no_duplicate_and_drops_no_input() {
+        let dproj = b"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>s1;s2;s3</DCC_UnitSearchPath></PropertyGroup></Project>";
+        let main = b"unit Main;\ninterface\nuses P1, P2, P3, P4;\n{$IF P1.Flag = 1}const One = 1;{$ENDIF}\nimplementation\nend.\n";
+        let provider = |n: usize| {
+            format!("unit P{n};\ninterface\nconst Flag = {n};\nimplementation\nend.\n").into_bytes()
+        };
+        let sources: Vec<(String, Vec<u8>)> = (1..=4)
+            .map(|n| (format!("s3/P{n}.pas"), provider(n)))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![("App.dproj", dproj), ("Main.pas", main)];
+        files.extend(
+            sources
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+        );
+        let indexed = index(&files, &["Main.pas"]);
+        let uri = indexed.uri("Main.pas");
+        let evidence = indexed
+            .workspace
+            .source_evidence(&uri, &AtomicBool::new(false))
+            .unwrap();
+        for (n, observation) in evidence.iter().enumerate() {
+            assert!(
+                !evidence[..n].contains(observation),
+                "{observation:?} twice in {evidence:?}"
+            );
+        }
+        let observations = &indexed.workspace.expansions[&uri]
+            .expanded
+            .session
+            .as_ref()
+            .unwrap()
+            .observations;
+        for observation in observations {
+            match observation {
+                ResolutionObservation::Directory {
+                    path, listed: true, ..
+                } => assert!(
+                    evidence.iter().any(|evidence| matches!(
+                        evidence,
+                        Observation::Listing { path: listed, .. } if listed == path
+                    )),
+                    "{path:?} not in {evidence:?}"
+                ),
+                ResolutionObservation::Candidate { path, .. } => assert!(
+                    evidence.iter().any(|evidence| matches!(
+                        evidence,
+                        Observation::Presence { path: looked, .. } if looked == path
+                    )),
+                    "{path:?} not in {evidence:?}"
+                ),
+                ResolutionObservation::Payload {
+                    path,
+                    revision: SourceRevision::Disk { .. },
+                    ..
+                } => assert!(
+                    evidence.iter().any(|evidence| matches!(
+                        evidence,
+                        Observation::Payload { path: read, .. } if read == path
+                    )),
+                    "{path:?} not in {evidence:?}"
+                ),
+                _ => {}
+            }
+        }
     }
 
     #[test]

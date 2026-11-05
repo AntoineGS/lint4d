@@ -687,6 +687,23 @@ pub(crate) enum PersistSkip {
     Store(pascal_cache::Bypass),
 }
 
+impl PersistSkip {
+    /// The publication exceeds a fixed limit its inputs decide: more
+    /// distinct reads than a capture holds, or a store admission limit.
+    /// Publishing the same member again fails the same way.
+    fn over_fixed_limit(&self) -> bool {
+        use super::evidence::EvidenceGap;
+        use super::persist::PersistError;
+        matches!(
+            self,
+            Self::Prepare(
+                PersistError::Evidence(EvidenceGap::Overflowed)
+                    | PersistError::Store(pascal_cache::Bypass::TooLarge(_))
+            ) | Self::Store(pascal_cache::Bypass::TooLarge(_))
+        )
+    }
+}
+
 /// The slot paths and stamps of reused facts: slot 0 is the member (its
 /// stamp taken before reuse read it), then one slot per include in slot
 /// order, normalized as `source_slot_paths` does. An include's stamp is
@@ -1333,6 +1350,15 @@ impl Workspace {
                                     pascal_cache::Bypass::WalPressure
                                     | pascal_cache::Bypass::OverBudget,
                                 ) => self.project_cache.note_index_awaiting_room(key),
+                                // The same inputs exceed the same fixed limit
+                                // every time: the facts stay indexed here and
+                                // an artifact-less record lists the member, so
+                                // the snapshot seals and the next process
+                                // retries it last instead of failing the same
+                                // write in path order (l4d-kqbb, A1).
+                                skip if skip.over_fixed_limit() => {
+                                    self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+                                }
                                 _ => {}
                             }
                             false
@@ -6467,6 +6493,62 @@ pub(in crate::workspace) mod tests {
             );
             assert!(!view.project_cache.index_member_has_record(&key, &member));
             assert_eq!(recorded(&view, &key).len(), 3);
+            cache.shutdown();
+        }
+
+        /// Rootcause A1 fix 4 (l4d-kqbb): a member whose evidence or
+        /// artifact exceeds a fixed store limit keeps its facts in this
+        /// process's index and gets an artifact-less record; it is never a
+        /// write that fails the same way each batch, and the context still
+        /// completes and seals.
+        #[test]
+        fn a_publication_over_a_fixed_limit_is_an_artifact_less_member() {
+            const COUNT: usize = 4;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), COUNT, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U0.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let target = member.clone();
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path == target).then_some(pascal_cache::Bypass::TooLarge(
+                    pascal_cache::TooLarge::Observations { count: 70_000 },
+                ))
+            })));
+            let loaded = record_loads();
+            let (mut indexed, mut persisted) = (0, 0);
+            let mut last = None;
+            for _ in 0..10 {
+                let progress = advance(&mut view, &anchor, IndexBound::all());
+                indexed += progress.indexed;
+                persisted += progress.persisted;
+                let settled = !progress.worth_requeue();
+                last = Some(progress);
+                if settled {
+                    break;
+                }
+            }
+            set_after_load_hook(None);
+            let last = last.unwrap();
+            assert!(last.complete, "{last:?}");
+            assert_eq!(
+                loaded
+                    .borrow()
+                    .iter()
+                    .filter(|path| **path == member)
+                    .count(),
+                1,
+                "{last:?}"
+            );
+            assert_eq!((indexed, persisted), (COUNT, COUNT - 1), "{last:?}");
+            let records = records(&view, &key);
+            assert_eq!(records.len(), COUNT, "{records:?}");
+            assert!(view.project_cache.index_member_has_record(&key, &member));
+            assert_eq!(
+                view.seal_baseline_if_due(&key, &mut || Ok(())),
+                crate::workspace::baseline::SealOutcome::Sealed
+            );
             cache.shutdown();
         }
 

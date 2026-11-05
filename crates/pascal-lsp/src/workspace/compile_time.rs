@@ -117,7 +117,8 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
         if !shareable {
             return;
         }
-        let reads = self.capture.snapshot().restricted_to(&graph.observations);
+        let probes = crate::project_cache::dedup_probes(probes);
+        let reads = self.capture.restricted_to(&graph.observations);
         self.cache
             .put_provider_graph(self.configuration, key, graph, probes, reads);
     }
@@ -1492,6 +1493,86 @@ mod tests {
         assert_eq!(
             first.expanded.reads, second.expanded.reads,
             "the reuse replays what the compilation read"
+        );
+    }
+
+    /// Rootcause A1: a provider whose interface looks up many units over a
+    /// search path is replayed with one listing per directory, so a session
+    /// that reuses it captures every directory once.
+    #[test]
+    fn a_reused_provider_replays_one_listing_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>s1;s2;s3</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .unwrap();
+        for directory in ["s1", "s2", "s3"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let units: Vec<String> = (0..12).map(|n| format!("B{n}")).collect();
+        for unit in &units {
+            std::fs::write(
+                root.join("s3").join(format!("{unit}.pas")),
+                format!("unit {unit}; interface const {unit}Value = 1; implementation end."),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("s3/A.pas"),
+            format!(
+                "unit A; interface uses {}; const Flag = 8; implementation end.",
+                units.join(", ")
+            ),
+        )
+        .unwrap();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ENDIF} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let first = expand_main(&workspace, &uri, source, &key);
+        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        let second = expand_main(&workspace, &uri, source, &key);
+        for result in [&first, &second] {
+            let reads = result.expanded.reads.as_ref().unwrap();
+            assert!(!reads.overflowed);
+            for (n, listing) in reads.listings.iter().enumerate() {
+                assert!(
+                    !reads.listings[..n].contains(listing),
+                    "{listing:?} twice in {:?}",
+                    reads.listings
+                );
+            }
+            for (n, payload) in reads.payloads.iter().enumerate() {
+                assert!(!reads.payloads[..n].contains(payload), "{payload:?} twice");
+            }
+        }
+        let directories = |result: &ExpansionResult| {
+            let mut listed: Vec<_> = result
+                .expanded
+                .reads
+                .as_ref()
+                .unwrap()
+                .listings
+                .iter()
+                .map(|listing| listing.directory.clone())
+                .collect();
+            listed.sort();
+            listed
+        };
+        assert_eq!(directories(&first), directories(&second));
+        assert!(
+            directories(&first)
+                .iter()
+                .any(|directory| directory.ends_with("s1")),
+            "{:?}",
+            directories(&first)
         );
     }
 

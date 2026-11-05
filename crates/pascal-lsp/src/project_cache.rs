@@ -224,7 +224,7 @@ pub(crate) fn report_probes(
         probes.pop()
     });
     probes.extend(observed);
-    (probes, dirs)
+    (dedup_probes(probes), dirs)
 }
 
 /// Probes for resolver observations, and the directories whose watches
@@ -284,7 +284,42 @@ pub(crate) fn observation_probes(
     }
     dirs.sort();
     dirs.dedup();
-    (probes, dirs)
+    (dedup_probes(probes), dirs)
+}
+
+/// `probes` with each exact duplicate dropped, in first-seen order: a hit
+/// checks every probe (`probes_hold`), and the resolver observes a
+/// directory once per lookup that consults it (rootcause A4,
+/// l4d-zf1b.8). Probes of one path that differ are all kept.
+pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
+    let mut seen: HashMap<&Path, Vec<usize>> = HashMap::new();
+    let mut kept = Vec::with_capacity(probes.len());
+    for (at, probe) in probes.iter().enumerate() {
+        let path = match probe {
+            Probe::Stamp { path, .. } | Probe::Content { path, .. } => path.as_path(),
+            Probe::Overlay { uri, .. } => Path::new(uri.path()),
+        };
+        let same = seen.entry(path).or_default();
+        if same.iter().any(|&known| probes[known] == *probe) {
+            continue;
+        }
+        same.push(at);
+        kept.push(at);
+    }
+    if kept.len() == probes.len() {
+        return probes;
+    }
+    let mut keep = kept.into_iter().peekable();
+    probes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, probe)| {
+            (keep.peek() == Some(&at)).then(|| {
+                keep.next();
+                probe
+            })
+        })
+        .collect()
 }
 
 /// Every include candidate observed while resolving an expansion, plus the
@@ -465,6 +500,52 @@ mod probe_tests {
                 >= after_empty.value(Metric::ProjectCacheProbeNanos)
         );
         after_removed.checked_delta(&after_empty).unwrap();
+    }
+
+    /// Rootcause A4: one Directory observation per lookup is one stamp
+    /// probe per distinct directory and stamp; a directory seen with two
+    /// stamps keeps both probes.
+    #[test]
+    fn repeated_observations_give_one_probe_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = |path: &Path, stamp: Option<ProjectReadStamp>| {
+            pascal_core::ResolutionObservation::Directory {
+                path: path.to_path_buf(),
+                entry: pascal_project::ProjectPathEntry::configured(path.to_path_buf()),
+                stamp,
+                complete: true,
+                listed: true,
+            }
+        };
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut observations = Vec::new();
+        for _ in 0..50 {
+            observations.push(directory(&a, stamp(&a)));
+            observations.push(directory(&b, stamp(&b)));
+        }
+        observations.push(directory(&a, None));
+        let (probes, dirs) = observation_probes(&observations, &mut |_, _| None);
+        assert_eq!(
+            probes,
+            vec![
+                Probe::Stamp {
+                    path: a.clone(),
+                    expected: stamp(&a),
+                },
+                Probe::Stamp {
+                    path: b.clone(),
+                    expected: stamp(&b),
+                },
+                Probe::Stamp {
+                    path: a.clone(),
+                    expected: None,
+                },
+            ]
+        );
+        assert_eq!(dirs.len(), 2);
     }
 
     #[test]

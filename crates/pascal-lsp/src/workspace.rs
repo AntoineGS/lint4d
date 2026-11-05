@@ -20298,7 +20298,7 @@ mod tests {
         // must never reach the audit.
         fs::write(
             fixture.root.join("Base.pas"),
-            INHERITED_BASE.replace("unit Base;\n", "unit Base;\n{$SCOPEDENUMS ON}\n"),
+            INHERITED_BASE.replace("unit Base;\n", "unit Base;\n{$POINTERMATH ON}\n"),
         )
         .unwrap();
         fixture.warm(&[&fixture.main, &fixture.derived]);
@@ -21932,13 +21932,13 @@ mod tests {
 
     #[test]
     fn semantic_tokens_resolve_identifiers_when_a_dependency_has_an_unsupported_directive() {
-        let tokens = provider_parameter_body_tokens("", "{$SCOPEDENUMS ON}");
+        let tokens = provider_parameter_body_tokens("", "{$POINTERMATH ON}");
         assert!(has_parameter_token_for_value(&tokens), "{tokens:?}");
     }
 
     #[test]
     fn semantic_tokens_stay_lexical_when_the_document_has_an_unsupported_directive() {
-        let tokens = provider_parameter_body_tokens(" {$SCOPEDENUMS ON}", "");
+        let tokens = provider_parameter_body_tokens(" {$POINTERMATH ON}", "");
         assert!(!has_parameter_token_for_value(&tokens), "{tokens:?}");
         assert!(
             tokens.iter().all(|(.., kind)| kind == "operator"),
@@ -21958,7 +21958,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("Provider.pas"),
-            "unit Provider;\n{$SCOPEDENUMS ON}\ninterface\ntype\n  TProvided = class\n  end;\nimplementation\nend.\n",
+            "unit Provider;\n{$POINTERMATH ON}\ninterface\ntype\n  TProvided = class\n  end;\nimplementation\nend.\n",
         )
         .unwrap();
         let main_uri = Url::from_file_path(&main).unwrap();
@@ -21978,7 +21978,7 @@ mod tests {
     }
 
     /// `Main` calls `Value.Hello` on a `TProvided` from `Provider`, whose
-    /// `{$SCOPEDENUMS ON}` the include audit rejects. `main_directive` follows
+    /// `{$POINTERMATH ON}` the include audit rejects. `main_directive` follows
     /// `unit Main;` on line 0, so positions do not shift.
     fn unsupported_provider_fixture(
         main_directive: &str,
@@ -21988,7 +21988,7 @@ mod tests {
         let root = temp.path();
         fs::write(
             root.join("Provider.pas"),
-            "unit Provider;\n{$SCOPEDENUMS ON}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
+            "unit Provider;\n{$POINTERMATH ON}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
         )
         .unwrap();
         let main = root.join("Main.pas");
@@ -22048,7 +22048,7 @@ mod tests {
     #[test]
     fn hover_still_fails_closed_on_an_unsupported_directive_in_the_document() {
         let (_temp, main, workspace) =
-            unsupported_provider_fixture(" {$SCOPEDENUMS ON}", "Value.Hello;");
+            unsupported_provider_fixture(" {$POINTERMATH ON}", "Value.Hello;");
 
         let hover = super::queries::hover_from_input(
             workspace.analysis_input(),
@@ -22103,7 +22103,7 @@ mod tests {
     #[test]
     fn references_still_fail_closed_on_an_unsupported_directive_in_the_document() {
         let (_temp, main, workspace) =
-            unsupported_provider_fixture(" {$SCOPEDENUMS ON}", "Value.Hello;");
+            unsupported_provider_fixture(" {$POINTERMATH ON}", "Value.Hello;");
 
         let references = super::queries::references_from_input(
             workspace.analysis_input(),
@@ -22118,11 +22118,11 @@ mod tests {
     }
 
     /// Like `unsupported_provider_fixture`, but `Provider` takes its
-    /// `{$SCOPEDENUMS ON}` from `Provider.inc`.
+    /// `{$POINTERMATH ON}` from `Provider.inc`.
     fn unsupported_provider_include_fixture(body: &str) -> (tempfile::TempDir, Url, Workspace) {
         let (temp, main, workspace) = unsupported_provider_fixture("", body);
         let root = temp.path();
-        fs::write(root.join("Provider.inc"), "{$SCOPEDENUMS ON}\n").unwrap();
+        fs::write(root.join("Provider.inc"), "{$POINTERMATH ON}\n").unwrap();
         fs::write(
             root.join("Provider.pas"),
             "unit Provider;\n{$I Provider.inc}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
@@ -22292,11 +22292,116 @@ mod tests {
         let (_temp, main, workspace) = other_owner_include_fixture("{$HINTS ON}");
         rename_tprovided(&main, &workspace).expect("a harmless include does not block rename");
 
-        let (_temp, main, workspace) = other_owner_include_fixture("{$SCOPEDENUMS ON}");
+        let (_temp, main, workspace) = other_owner_include_fixture("{$POINTERMATH ON}");
         let error = rename_tprovided(&main, &workspace).expect_err("rename must fail closed");
         assert!(
             error.contains("unsupported directive") && error.contains("Other.inc"),
             "{error}"
+        );
+    }
+
+    /// l4d-1qta: `{$SCOPEDENUMS ON}` is modelled, not an unsupported
+    /// directive: a unit that contains it is proven for references and
+    /// rename, from the unit itself and from an importer.
+    #[test]
+    fn a_unit_with_scopedenums_is_proven_for_references_and_rename() {
+        let (_temp, main, workspace) = unsupported_provider_fixture("", "Value.Hello;");
+        let root = main.to_file_path().unwrap();
+        let root = root.parent().unwrap();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$SCOPEDENUMS ON}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
+        )
+        .unwrap();
+        drop(workspace);
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let provider = main.join("Provider.pas").unwrap();
+
+        let references = super::queries::references_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(4, 23),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references succeed");
+        assert!(
+            references.coverage.is_complete(),
+            "{:?}",
+            references.coverage
+        );
+        assert_eq!(
+            references
+                .value
+                .iter()
+                .map(|location| (&location.uri, location.range.start))
+                .collect::<Vec<_>>(),
+            vec![
+                (&main, lsp_types::Position::new(4, 21)),
+                (&provider, lsp_types::Position::new(4, 2)),
+                (&provider, lsp_types::Position::new(9, 10)),
+            ]
+        );
+        rename_tprovided(&main, &workspace).expect("rename succeeds");
+    }
+
+    /// l4d-1qta: `{$SCOPEDENUMS ON}` read from an include scopes the enum
+    /// declared after it: the unqualified `Green` is the constant and the
+    /// value is referenced only qualified.
+    #[test]
+    fn scopedenums_from_an_include_scopes_the_following_enum() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(root.join("Scoped.inc"), "{$SCOPEDENUMS ON}\n").unwrap();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            concat!(
+                "unit Main;\n",                 // 0
+                "interface\n",                  // 1
+                "{$I Scoped.inc}\n",            // 2
+                "type\n",                       // 3
+                "  TColor = (Red, Green);\n",   // 4
+                "const Green = 5;\n",           // 5
+                "implementation\n",             // 6
+                "procedure Run;\n",             // 7
+                "var C: TColor; N: Integer;\n", // 8
+                "begin\n",                      // 9
+                "  N := Green;\n",              // 10
+                "  C := TColor.Green;\n",       // 11
+                "end;\n",                       // 12
+                "end.\n",
+            ),
+        )
+        .unwrap();
+        let main = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let references = |position| {
+            let result = super::queries::references_from_input(
+                workspace.analysis_input(),
+                &main,
+                position,
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references succeed");
+            assert!(result.coverage.is_complete(), "{:?}", result.coverage);
+            result
+                .value
+                .iter()
+                .map(|location| (location.range.start.line, location.range.start.character))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            references(lsp_types::Position::new(4, 17)),
+            vec![(4, 17), (11, 14)]
+        );
+        assert_eq!(
+            references(lsp_types::Position::new(5, 6)),
+            vec![(5, 6), (10, 7)]
         );
     }
 

@@ -4848,7 +4848,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         fs::write(
             root.join("Partial.pas"),
-            "unit Partial;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TState = (Maybe, Yes);\nimplementation\nend.\n",
+            "unit Partial;\ninterface\n{$POINTERMATH ON}\ntype\n  TState = (Maybe, Yes);\nimplementation\nend.\n",
         )
         .expect("partial");
         let downstream = root.join("Downstream.pas");
@@ -4949,7 +4949,7 @@ mod tests {
         .expect("good");
         fs::write(
             root.join("Bad.pas"),
-            "unit Bad;\ninterface\n{$SCOPEDENUMS ON}\n{$I Shared.inc}\nimplementation\nend.\n",
+            "unit Bad;\ninterface\n{$POINTERMATH ON}\n{$I Shared.inc}\nimplementation\nend.\n",
         )
         .expect("bad");
         let input =

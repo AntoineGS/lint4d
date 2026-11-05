@@ -1765,3 +1765,84 @@ fn fpc_push_pop_in_an_inactive_branch_is_not_reported() {
     assert!(analysis.root.complete, "{:?}", analysis.reasons);
     assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
 }
+
+/// l4d-1qta: a value of an enumerated type declared under
+/// `{$SCOPEDENUMS ON}` is not an unqualified name, so `e1` here is the
+/// earlier constant; `{$SCOPEDENUMS OFF}` restores unqualified values.
+#[test]
+fn scoped_enum_values_are_not_unqualified_compile_time_names() {
+    let source = "unit T; interface const e1 = 5; \
+        {$SCOPEDENUMS ON} type E=(e0,e1); {$SCOPEDENUMS OFF} type F=(f0,f1); \
+        {$IF e1=5}{$DEFINE SCOPED}{$ENDIF} \
+        {$IF Ord(f1)=1}{$DEFINE UNSCOPED}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SCOPED"), Truth::True);
+    assert_eq!(activity(&a, "DEFINE UNSCOPED"), Truth::True);
+}
+
+/// l4d-1qta: a SCOPEDENUMS directive under an unknown condition leaves only
+/// the scoping of the enumerated types declared after it unknown, each
+/// reachable branch keeping its own state.
+#[test]
+fn scoped_enums_under_an_unknown_condition_leave_the_value_unknown() {
+    let source = "unit T; interface type G=(e1); \
+        {$IFDEF MYSTERY}{$SCOPEDENUMS ON}{$ENDIF} type E=(e0,e1); \
+        {$IF Ord(e1)=1}{$DEFINE SCOPED}{$ENDIF} \
+        {$IF SizeOf(Integer)=4}{$DEFINE INDEPENDENT}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SCOPED"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE INDEPENDENT"), Truth::True);
+}
+
+/// l4d-1qta: a SCOPEDENUMS value other than ON or OFF, or an options
+/// restore whose saved state is not tracked, leaves later enumerated types'
+/// scoping unknown. Name lookups after such a declaration are unproven, as
+/// after a declaration under unknown activity.
+#[test]
+fn an_unknown_scopedenums_state_leaves_the_value_unknown() {
+    for directive in [
+        "{$SCOPEDENUMS MAYBE}",
+        "{$PUSHOPT}{$SCOPEDENUMS ON}{$POPOPT}",
+    ] {
+        let source = format!(
+            "unit T; interface type G=(e1); {directive} type E=(e0,e1); \
+            {{$IF Ord(e1)=1}}{{$DEFINE SCOPED}}{{$ENDIF}} implementation end."
+        );
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert_eq!(activity(&a, "DEFINE SCOPED"), Truth::Unknown, "{directive}");
+    }
+}
+
+/// l4d-1qta: an imported unit's scoped enumeration exports no unqualified
+/// value names, so `e1` is the constant of the unit used before it. An
+/// unscoped one shadows that constant; imported enum values are not
+/// evaluated, so the condition stays unknown.
+#[test]
+fn an_imported_scoped_enum_exports_no_unqualified_values() {
+    for (directive, expected) in [("{$SCOPEDENUMS ON}", Truth::True), ("", Truth::Unknown)] {
+        let source = "unit T; interface uses Q, P; \
+            {$IF e1=5}{$DEFINE CONSTANT}{$ENDIF} implementation end.";
+        let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+        fixture.unit(
+            "Q",
+            "unit Q; interface const e1 = 5; implementation end.",
+            context(LayoutPlatform::Win32),
+        );
+        fixture.unit(
+            "P",
+            &format!("unit P; interface {directive} type E=(e0,e1); implementation end."),
+            context(LayoutPlatform::Win32),
+        );
+        let a = fixture.analyze().unwrap();
+        assert!(a.root.complete, "{directive:?}: {:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE CONSTANT"), expected, "{directive:?}");
+    }
+}

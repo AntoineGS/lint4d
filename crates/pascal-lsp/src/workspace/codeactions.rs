@@ -7271,7 +7271,7 @@ mod tests {
             "a harmless include does not block fix-all"
         );
         assert!(
-            !fix_all_offered_with_other_include("{$SCOPEDENUMS ON}"),
+            !fix_all_offered_with_other_include("{$POINTERMATH ON}"),
             "an unsupported directive in a dependency include blocks fix-all"
         );
     }

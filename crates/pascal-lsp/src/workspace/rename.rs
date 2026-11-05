@@ -13939,10 +13939,13 @@ mod tests {
             "Z4",
             "STACKFRAMES ON",
             "VARPROPSETTER ON",
+            // l4d-1qta: modelled by the binder per enumerated type.
+            "SCOPEDENUMS ON",
+            "SCOPEDENUMS OFF",
         ] {
             assert_eq!(directive_kind(body), DirectiveKind::Harmless, "{body}");
         }
-        for body in ["SCOPEDENUMS ON", "POINTERMATH ON"] {
+        for body in ["POINTERMATH ON", "SCOPEDENUMS+"] {
             assert_eq!(directive_kind(body), DirectiveKind::Other, "{body}");
         }
     }

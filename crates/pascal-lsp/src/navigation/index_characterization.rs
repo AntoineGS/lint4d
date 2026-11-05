@@ -104,6 +104,11 @@ pub(super) fn render(document: &ParsedDocument) -> String {
     );
     lines(
         &mut output,
+        "unscoped_enum_values",
+        &document.unscoped_enum_values,
+    );
+    lines(
+        &mut output,
         "unknown_class_owners",
         sorted(&document.unknown_class_owners),
     );

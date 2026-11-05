@@ -17584,3 +17584,122 @@ fn method_heading_generic_owners_pin_ambiguity_and_nested_generics() {
     );
     assert!(index.rename_edits(&source_uri, inner, "TZ").is_err());
 }
+
+fn declaration_of(
+    index: &NavigationIndex,
+    source_uri: &Url,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> Vec<(Url, Position)> {
+    locations_at(
+        index,
+        source_uri,
+        source,
+        needle,
+        occurrence,
+        NavigationTarget::Declaration,
+    )
+    .into_iter()
+    .map(|location| (location.uri, location.range.start))
+    .collect()
+}
+
+/// l4d-1qta: without `{$SCOPEDENUMS ON}` an enumerated type's values enter
+/// the enclosing scope, and the qualified spelling names them as well.
+#[test]
+fn unscoped_enum_values_bind_unqualified_and_qualified() {
+    let source = "unit Colors;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Green;\n  C := TColor.Green;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    let declaration = vec![(source_uri.clone(), position_of(source, "Green", 0))];
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 1),
+        declaration
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        declaration
+    );
+}
+
+/// l4d-1qta: the values of an enumerated type declared under
+/// `{$SCOPEDENUMS ON}` are reached only qualified, so an unqualified `Green`
+/// is the constant; `{$SCOPEDENUMS OFF}` restores unqualified values.
+#[test]
+fn scoped_enum_values_bind_only_qualified() {
+    let source = "unit Colors;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TColor = (Red, Green);\n{$SCOPEDENUMS OFF}\n  TShade = (Light, Dark);\nconst Green = 5;\nimplementation\nprocedure Run;\nvar C: TColor; S: TShade; N: Integer;\nbegin\n  N := Green;\n  C := TColor.Green;\n  S := Dark;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        vec![(source_uri.clone(), position_of(source, "Green", 1))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 3),
+        vec![(source_uri.clone(), position_of(source, "Green", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Dark", 1),
+        vec![(source_uri.clone(), position_of(source, "Dark", 0))]
+    );
+}
+
+/// l4d-1qta: an imported unit's scoped values do not enter the importer's
+/// scope, so `Yes` is only the other unit's constant; an unscoped value is
+/// an imported candidate as well.
+#[test]
+fn an_imported_scoped_enum_exports_no_unqualified_values() {
+    for (directive, scoped) in [("{$SCOPEDENUMS ON}\n", true), ("", false)] {
+        let provider = format!(
+            "unit Provider;\ninterface\n{directive}type\n  TState = (Maybe, Yes);\nimplementation\nend.\n"
+        );
+        let other = "unit Other;\ninterface\nconst Yes = 1;\nimplementation\nend.\n";
+        let consumer = "unit Consumer;\ninterface\nuses Other, Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(Yes);\n  Log(TState.Yes);\nend;\nend.\n";
+        let provider_uri = uri("Provider");
+        let other_uri = uri("Other");
+        let consumer_uri = uri("Consumer");
+        let mut index = NavigationIndex::new();
+        for (name, text) in [
+            (&provider_uri, provider.as_str()),
+            (&other_uri, other),
+            (&consumer_uri, consumer),
+        ] {
+            index
+                .update(name.clone(), text.to_owned())
+                .expect("source parses");
+        }
+        index.bind_imports(
+            &consumer_uri,
+            [
+                ("Provider".to_owned(), provider_uri.clone()),
+                ("Other".to_owned(), other_uri.clone()),
+            ],
+        );
+        let value = (provider_uri.clone(), position_of(&provider, "Yes", 0));
+        let constant = (other_uri.clone(), position_of(other, "Yes", 0));
+        // Both imports declare an unqualified `Yes` when unscoped; the
+        // binder reports every imported candidate.
+        let expected = if scoped {
+            vec![constant]
+        } else {
+            vec![constant, value.clone()]
+        };
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 0),
+            expected,
+            "{directive:?}"
+        );
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 1),
+            vec![value],
+            "{directive:?}"
+        );
+    }
+}

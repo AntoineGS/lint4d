@@ -4343,3 +4343,133 @@ end.
         ],
     );
 }
+
+const SCOPED_ENUM_RENAME: &str = "unit ScopedRename;
+interface
+{$SCOPEDENUMS ON}
+type
+  TColor = (Red, Green);
+{$SCOPEDENUMS OFF}
+  TShade = (Light, Dark);
+const Green = 5;
+implementation
+procedure Run;
+var C: TColor; S: TShade; N: Integer;
+begin
+  N := Green;
+  C := TColor.Green;
+  S := Dark;
+  S := TShade.Dark;
+end;
+end.
+";
+
+/// l4d-1qta: renaming a scoped enum value edits its declaration and its
+/// qualified uses, never the unqualified `Green`, which is the constant.
+#[test]
+fn renaming_a_scoped_enum_value_edits_only_its_qualified_uses() {
+    let source = SCOPED_ENUM_RENAME;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ScopedRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Green", 0), "Lime")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Green", 0),
+                "Lime".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Green", 3),
+                "Lime".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta: an unscoped enum value is renamed at its unqualified and its
+/// qualified uses.
+#[test]
+fn renaming_an_unscoped_enum_value_edits_unqualified_and_qualified_uses() {
+    let source = SCOPED_ENUM_RENAME;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ScopedRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Dark", 0), "Deep")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 0),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 1),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 2),
+                "Deep".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta: a SCOPEDENUMS directive under an unknown condition leaves the
+/// scoping of the enumerated types after it unknown: renaming one of their
+/// values refuses, an enum declared before the directive is unaffected.
+#[test]
+fn scoped_enums_under_an_unknown_condition_leave_only_later_values_unknown() {
+    let source = "unit UnknownScoping;
+interface
+type
+  TShade = (Light, Dark);
+{$IFDEF MYSTERY}{$SCOPEDENUMS ON}{$ENDIF}
+  TColor = (Red, Green);
+implementation
+procedure Run;
+var C: TColor; S: TShade;
+begin
+  C := Green;
+  S := Dark;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "UnknownScoping", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Green", 0), "Lime")
+            .is_err(),
+        "a value whose scoping is unknown cannot be renamed"
+    );
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Dark", 0), "Deep")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 0),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 1),
+                "Deep".to_owned(),
+            ),
+        ],
+    );
+}

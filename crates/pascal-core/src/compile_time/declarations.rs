@@ -85,6 +85,9 @@ pub struct CompileTimeState {
     pub(super) settings: pascal_project::LayoutSettings,
     pub(super) settings_stack: Vec<Option<pascal_project::LayoutSettings>>,
     pub(super) settings_history: Vec<super::records::LayoutChange>,
+    /// The `{$SCOPEDENUMS}` state that an enumerated type declared now
+    /// takes (l4d-1qta).
+    pub(super) scoped_enums: Truth,
     spans: Vec<Span>,
     pub(super) sequence: Sequence,
     logical: usize,
@@ -239,6 +242,7 @@ impl CompileTimeState {
             settings: context.layout.defaults.clone(),
             settings_stack: Vec::new(),
             settings_history: Vec::new(),
+            scoped_enums: Truth::False,
             spans: Vec::new(),
             sequence: Sequence(0),
             logical: 0,
@@ -1202,6 +1206,11 @@ impl CompileTimeState {
             if strong && let TypeExpr::Named(name) = ty {
                 ty = TypeExpr::StrongAlias(name);
             }
+            if matches!(ty, TypeExpr::Enum(_)) && self.scoped_enums == Truth::Unknown {
+                // Whether the values enter the scope is unknown, like a
+                // declaration under unknown conditional activity.
+                self.unknown = true;
+            }
             self.sequence.0 = self
                 .sequence
                 .0
@@ -1540,6 +1549,7 @@ impl CompileTimeState {
         self.settings.hash(&mut h);
         self.settings_stack.hash(&mut h);
         self.settings_history.hash(&mut h);
+        self.scoped_enums.hash(&mut h);
         self.logical.hash(&mut h);
         self.pending_start.hash(&mut h);
         self.pending.hash(&mut h);
@@ -2023,6 +2033,7 @@ pub(super) fn type_expr(
                 value,
                 value_logical,
                 key,
+                scoped: state.scoped_enums == Truth::True,
             });
         }
         Ok(TypeExpr::Enum(members))

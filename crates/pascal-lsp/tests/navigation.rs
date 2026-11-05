@@ -17316,3 +17316,271 @@ end.
     assert_eq!(foo.len(), 1);
     assert_location_start(&foo[0], &source_uri, position_of(source, "TFoo", 0));
 }
+
+fn heading_program_source(keyword: &str) -> String {
+    format!(
+        r#"{keyword} Heading{keyword};
+type
+  TFoo = class
+    procedure Bar;
+  end;
+procedure TFoo.Bar;
+begin
+end;
+begin
+end.
+"#
+    )
+}
+
+#[test]
+fn method_heading_class_names_resolve_in_programs_and_libraries() {
+    for keyword in ["program", "library"] {
+        let source = heading_program_source(keyword);
+        let source_uri = Url::parse(&format!("file:///workspace/Heading{keyword}.dpr"))
+            .expect("valid program URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(source_uri.clone(), source.clone())
+            .expect("program heading source parses");
+        let heading = position_of(&source, "TFoo", 1);
+        let declaration = position_of(&source, "TFoo", 0);
+        for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+            let locations = index.navigate(&source_uri, heading, target);
+            assert_eq!(locations.len(), 1, "{keyword} {target:?}: {locations:?}");
+            assert_location_start(&locations[0], &source_uri, declaration);
+        }
+        let hover = index
+            .hover(&source_uri, heading)
+            .unwrap_or_else(|| panic!("{keyword}: hover on a heading's class name"));
+        assert!(hover_text(&hover).contains("TFoo = class"), "{keyword}");
+        let references = index
+            .binding_locations(&source_uri, declaration, false)
+            .expect("program type references are available")
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        assert_eq!(references, vec![heading], "{keyword}");
+        let edits = index
+            .rename_edits(&source_uri, heading, "TBar")
+            .unwrap_or_else(|error| panic!("{keyword}: rename fails: {error}"));
+        let mut starts = edits[&source_uri]
+            .iter()
+            .map(|edit| edit.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        assert_eq!(starts, vec![declaration, heading], "{keyword}");
+    }
+}
+
+#[test]
+fn method_heading_owner_fails_closed_for_conditionally_unknown_nested_types() {
+    let source = r#"unit HeadingUnknown;
+interface
+type
+  TOuter = class
+  type
+{$IFDEF MAYBE}
+    TInner = class
+      procedure M;
+    end;
+{$ENDIF}
+  end;
+implementation
+procedure TOuter.TInner.M;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("HeadingUnknown");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("conditional heading source parses");
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "TInner", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty(), "{locations:?}");
+}
+
+#[test]
+fn method_heading_owner_is_never_a_type_from_a_used_unit() {
+    let provider = "unit HeadingProvider;\ninterface\ntype\n  TFoo = class\n    procedure Bar;\n  end;\nimplementation\nprocedure TFoo.Bar;\nbegin\nend;\nend.\n";
+    let consumer = "unit HeadingConsumer;\ninterface\nuses HeadingProvider;\nimplementation\nprocedure TFoo.Bar;\nbegin\nend;\nend.\n";
+    let provider_uri = uri("HeadingProvider");
+    let consumer_uri = uri("HeadingConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("HeadingProvider".to_owned(), provider_uri.clone())],
+    );
+    for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+        let locations = index.navigate(&consumer_uri, position_of(consumer, "TFoo", 0), target);
+        assert!(locations.is_empty(), "{target:?}: {locations:?}");
+    }
+    // The consumer's heading is invalid Delphi; strict references refuse
+    // rather than bind it to the provider's type or drop it silently.
+    let references =
+        index.binding_locations(&provider_uri, position_of(provider, "TFoo", 0), false);
+    assert!(
+        references
+            .as_ref()
+            .is_err_and(|error| error.contains("unresolved rename reference")),
+        "{references:?}"
+    );
+}
+
+#[test]
+fn method_resolution_clause_binds_its_interface_from_a_used_unit() {
+    let provider = "unit ClauseProvider;\ninterface\ntype\n  IFoo = interface\n    procedure Bar;\n  end;\nimplementation\nend.\n";
+    let consumer = "unit ClauseConsumer;\ninterface\nuses ClauseProvider;\ntype\n  TImpl = class(TInterfacedObject, IFoo)\n    procedure IFoo.Bar = Baz;\n    procedure Baz;\n  end;\nimplementation\nprocedure TImpl.Baz;\nbegin\nend;\nend.\n";
+    let provider_uri = uri("ClauseProvider");
+    let consumer_uri = uri("ClauseConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ClauseProvider".to_owned(), provider_uri.clone())],
+    );
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "IFoo", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(provider, "IFoo", 0),
+    );
+}
+
+const GENERIC_HEADING_SOURCE: &str = r#"unit HeadingGenerics;
+interface
+type
+  TList = class
+    procedure Add;
+  end;
+  TList<T> = class
+    procedure Add(const Item: T);
+  end;
+  TOuter<T> = class
+  type
+    TInner<U> = class
+      procedure M;
+    end;
+  end;
+implementation
+procedure TList.Add;
+begin
+end;
+procedure TList<T>.Add(const Item: T);
+begin
+end;
+procedure TOuter<T>.TInner<U>.M;
+begin
+end;
+end.
+"#;
+
+/// Pins current behaviour: a heading cannot tell `TList` from `TList<T>`
+/// (both are keyed `tlist`), so navigation lists both and strict references
+/// and rename refuse; a nested generic owner navigates, and its references
+/// and rename refuse rather than guess.
+#[test]
+fn method_heading_generic_owners_pin_ambiguity_and_nested_generics() {
+    let source = GENERIC_HEADING_SOURCE;
+    let source_uri = uri("HeadingGenerics");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic heading source parses");
+    let starts = |locations: Vec<Location>| {
+        let mut starts = locations
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        starts
+    };
+    let both_lists = vec![
+        position_of(source, "TList", 0),
+        position_of(source, "TList", 1),
+    ];
+    for occurrence in [2, 3] {
+        let heading = position_of(source, "TList", occurrence);
+        assert_eq!(
+            starts(index.navigate(&source_uri, heading, NavigationTarget::Declaration)),
+            both_lists
+        );
+        let references = index.binding_locations(&source_uri, heading, true);
+        assert!(
+            references
+                .as_ref()
+                .is_err_and(|error| error.contains("unresolved or ambiguous")),
+            "{references:?}"
+        );
+        assert!(index.rename_edits(&source_uri, heading, "TZ").is_err());
+    }
+    for occurrence in [0, 1] {
+        let references =
+            index.binding_locations(&source_uri, position_of(source, "TList", occurrence), true);
+        assert!(
+            references
+                .as_ref()
+                .is_err_and(|error| error.contains("ambiguous rename reference")),
+            "{references:?}"
+        );
+    }
+
+    let outer = position_of(source, "TOuter", 1);
+    assert_eq!(
+        starts(index.navigate(&source_uri, outer, NavigationTarget::Declaration)),
+        vec![position_of(source, "TOuter", 0)]
+    );
+    let outer_sites = vec![position_of(source, "TOuter", 0), outer];
+    assert_eq!(
+        starts(
+            index
+                .binding_locations(&source_uri, outer, true)
+                .expect("outer references")
+        ),
+        outer_sites
+    );
+    let edits = index
+        .rename_edits(&source_uri, outer, "TZ")
+        .expect("outer rename");
+    let mut edit_starts = edits[&source_uri]
+        .iter()
+        .map(|edit| edit.range.start)
+        .collect::<Vec<_>>();
+    edit_starts.sort_by_key(|start| (start.line, start.character));
+    assert_eq!(edit_starts, outer_sites);
+
+    let inner = position_of(source, "TInner", 1);
+    assert_eq!(
+        starts(index.navigate(&source_uri, inner, NavigationTarget::Declaration)),
+        vec![position_of(source, "TInner", 0)]
+    );
+    let references = index.binding_locations(&source_uri, inner, true);
+    assert!(
+        references
+            .as_ref()
+            .is_err_and(|error| error.contains("inherited class lookup")),
+        "{references:?}"
+    );
+    assert!(index.rename_edits(&source_uri, inner, "TZ").is_err());
+}

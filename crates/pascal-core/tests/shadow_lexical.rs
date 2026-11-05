@@ -316,3 +316,27 @@ fn the_names_an_unknown_interface_holds_are_shared_and_validated_with_it() {
     let mut third = shared("{$IFDEF U9} const CompilerVersion = 1; {$ENDIF}", 2);
     assert_eq!(hit(&mut third), Truth::Unknown);
 }
+
+/// Fix round 1 (I1): a conditional an include opens and the unit closes
+/// hides the `implementation` that follows it, so the scan cannot stop there.
+#[test]
+fn an_implementation_inside_a_conditional_an_include_opened_does_not_end_the_scan() {
+    let provider = "unit P; interface {$I open.inc} implementation {$ENDIF} \
+        const CompilerVersion = 1; implementation end.";
+    let mut f = fixture(ROOT, provider);
+    f.include("open.inc", "{$IFDEF U1}");
+    assert_eq!(hit(&mut f), Truth::Unknown);
+}
+
+/// Fix round 1 (minor): `implementation` after a `.` is not the section
+/// keyword.
+#[test]
+fn a_qualified_implementation_word_does_not_end_the_scan() {
+    let mut f = fixture(
+        ROOT,
+        &branch_limited(
+            "const X = Foo.implementation; {$IFDEF U9} const CompilerVersion = 1; {$ENDIF}",
+        ),
+    );
+    assert_eq!(hit(&mut f), Truth::Unknown);
+}

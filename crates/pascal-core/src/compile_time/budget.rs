@@ -544,6 +544,11 @@ impl<'a> CompileTimeBudget<'a> {
         result
     }
 
+    /// Forget the last refused charge once its failure was handled.
+    pub(super) fn clear_failed_charge(&mut self) {
+        self.last_failed_charge = None;
+    }
+
     pub(super) fn failure_observed(&self, name: &'static str, maximum: usize) -> Option<usize> {
         self.last_failed_charge
             .filter(|(failed, _, limit)| *failed == name && *limit == maximum)

@@ -18,6 +18,17 @@ use std::ops::Range;
 /// Bytes scanned between budget charges and cancellation checks.
 const CHUNK: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    static EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count bytes a delimiter search examines, for the linearity tests.
+fn examined(_bytes: usize) {
+    #[cfg(test)]
+    EXAMINED.with(|count| count.set(count.get() + _bytes));
+}
+
 /// Identifiers occurring in a provider's interface text and every include
 /// it could expand there, ASCII-lowercased and sorted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -157,9 +168,10 @@ impl Scanner<'_, '_, '_> {
 }
 
 /// Scan `text` for identifiers. A root source stops at an `implementation`
-/// keyword outside every conditional: whichever `implementation` the
-/// compiler takes is not later than that one, and everything before it is
-/// read. An include is read whole.
+/// keyword outside every conditional, when no include came before it (an
+/// include may open a conditional the unit closes): whichever
+/// `implementation` the compiler takes is not later than that one, and
+/// everything before it is read. An include is read whole.
 pub(super) fn scan(
     text: &str,
     root: bool,
@@ -178,6 +190,9 @@ pub(super) fn scan(
     let bytes = text.as_bytes();
     // `None`: unbalanced nesting, so no `implementation` is unconditional.
     let mut depth = Some(0usize);
+    // The last byte of the previous token, outside comments: `.` and `&`
+    // make the next word an identifier, not a keyword.
+    let mut previous = 0u8;
     let mut index = 0;
     let end = loop {
         if index >= bytes.len() {
@@ -196,6 +211,7 @@ pub(super) fn scan(
                         Some(_) => at += 1,
                     }
                 };
+                previous = b'\'';
                 match close {
                     Some(next) => index = next,
                     None => {
@@ -205,14 +221,21 @@ pub(super) fn scan(
                 }
             }
             b'"' => {
-                let line_end = text[index + 1..]
-                    .find('\n')
-                    .map_or(bytes.len(), |n| index + 1 + n);
-                scanner.reach(line_end)?;
-                index = match text[index + 1..line_end].find('"') {
-                    Some(n) => index + 1 + n + 1,
-                    None => index + 1,
+                // As `skip_assembler_string`: to the closing quote on the
+                // same line, else past the quote alone. A later quote on the
+                // line would have closed it, so each byte is read once.
+                let mut at = index + 1;
+                let close = loop {
+                    scanner.reach(at + 1)?;
+                    match bytes.get(at) {
+                        None | Some(b'\n') => break None,
+                        Some(b'"') => break Some(at),
+                        Some(_) => at += 1,
+                    }
                 };
+                examined(at - index);
+                previous = b'"';
+                index = close.map_or(index + 1, |close| close + 1);
             }
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
                 let line_end = text[index..].find('\n').map_or(bytes.len(), |n| index + n);
@@ -251,15 +274,16 @@ pub(super) fn scan(
                     stop += 1;
                     scanner.reach(stop + 1)?;
                 }
-                let escaped = index > 0 && bytes[index - 1] == b'&';
                 if root
                     && depth == Some(0)
-                    && !escaped
+                    && scanner.includes.is_empty()
+                    && !matches!(previous, b'&' | b'.')
                     && text[index..stop].eq_ignore_ascii_case("implementation")
                 {
                     break stop;
                 }
                 scanner.run(index, stop)?;
+                previous = bytes[stop - 1];
                 index = stop;
             }
             byte if byte >= 0x80 => {
@@ -267,9 +291,15 @@ pub(super) fn scan(
                 if folds_to_ascii(ch) {
                     scanner.proof = false;
                 }
+                previous = byte;
                 index += ch.len_utf8();
             }
-            _ => index += 1,
+            byte => {
+                if !byte.is_ascii_whitespace() {
+                    previous = byte;
+                }
+                index += 1;
+            }
         }
     };
     Ok(Scan {
@@ -324,6 +354,21 @@ mod tests {
         assert!(n.may_declare("B"));
         let (n, _) = names("A implementation B", false);
         assert!(n.may_declare("B"));
+    }
+
+    /// Fix round 1 (I3): a line of double quotes is scanned once, charged
+    /// as it is read.
+    #[test]
+    fn a_long_double_quote_line_is_scanned_linearly() {
+        let text = format!("A {} B", "\"".repeat(20_000));
+        let before = EXAMINED.with(std::cell::Cell::get);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let scan = scan(&text, true, 0, &mut budget).unwrap();
+        let examined = EXAMINED.with(std::cell::Cell::get) - before;
+        assert!(examined <= 2 * text.len(), "{examined} bytes examined");
+        assert!(budget.snapshot().byte_work >= text.len());
+        let names = InterfaceNames::new(scan.names);
+        assert!(names.may_declare("A") && names.may_declare("B"));
     }
 
     #[test]

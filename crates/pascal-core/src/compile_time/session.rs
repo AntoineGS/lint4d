@@ -785,11 +785,11 @@ fn same_file_state(left: &crate::SourceRevision, right: &crate::SourceRevision) 
         )
 }
 
-/// A provider identity's compiled interface graph, with the most names
-/// prepared so far.
 /// The names an interface could declare and the includes read to find them.
 type ScannedNames = (Arc<InterfaceNames>, Vec<ProviderDependency>);
 
+/// A provider identity's compiled interface graph, with the most names
+/// prepared so far.
 struct ProviderGraph {
     occurrence: OccurrenceId,
     /// `None`: the interface could not be completed (an Unknown fact), which
@@ -3284,7 +3284,13 @@ impl ProviderEngine<'_, '_> {
             .release(self.budget.manual_retained().saturating_sub(before));
         match result {
             Ok(true) => {}
-            Ok(false) | Err(ResolverError::LimitExceeded { .. }) => return Ok(None),
+            Ok(false) => return Ok(None),
+            Err(ResolverError::LimitExceeded { .. }) => {
+                // The refused charge was absorbed here: a later failure must
+                // not report its observation.
+                self.budget.clear_failed_charge();
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         }
         Ok(Some((Arc::new(InterfaceNames::new(names)), included)))

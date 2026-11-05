@@ -1442,6 +1442,7 @@ context key, so its facts are not shared with the saved project; a relative
 | Field | Meaning |
 | --- | --- |
 | `schema` | `1` |
+| `crawlPublished`, `crawlDeferred`, `providerGraphsRefused` | Process-wide counts since the server started, not per context: |
 | `crawlPublished` | Units the open-file crawl published to the store in this process |
 | `crawlDeferred` | Crawl publications that found no room for their transient buffers; the units stay pending and the next index batch extracts and publishes them |
 | `providerGraphsRefused` | Compiled provider interfaces not shared between sessions because their reads overflowed the capture; each session compiles them again |
@@ -1461,6 +1462,7 @@ Each context has:
 | `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
 | `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |
 | `validationReads` | Files read and hashed to validate the baseline |
+| `publicationsRefused` | Extracted members whose publication found no memory for its transient buffers in this process: they stay memory-only, without a record, and the next start extracts them again |
 | `gaps` | At most 4 texts of at most 160 bytes explaining what is not indexed |
 
 When the document would exceed 8 KiB, gaps of the least recently used contexts
@@ -1581,7 +1583,7 @@ least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
 | `directory` | The store directory, cut at 4,096 escaped bytes |
 | `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
 | `resetEpoch` | The namespace's reset counter while open |
-| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own (the smaller of 64 MiB and a sixteenth of `maxCacheBytes`) before asking the budget |
+| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
 | `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
 | `lockWaits` | Process-wide `poolWaits`, `lockWaits`, their `*Micros` totals and `busy` outcomes. Waits inside a statement after `BEGIN` are not measured |
 | `counters` | `hits`, `decodedBytes`, `misses` by cause (`input`, `version`, `freshness`, `budget`, `authorization`, `integrity`), non-zero `bypasses` by name, and `maintenance` (`steps`, `cycles`, `rows`, `skipped`) |

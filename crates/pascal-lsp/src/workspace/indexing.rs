@@ -1366,6 +1366,12 @@ impl Workspace {
                                 skip if skip.over_fixed_limit() => {
                                     self.record_over_limit(key, path, hash, cancel);
                                 }
+                                // Not even the publication pool had room: the
+                                // member stays memory-only (a retryable miss,
+                                // never a refusal record), counted with a gap.
+                                PersistSkip::Memory => {
+                                    self.project_cache.note_index_publication_refused(key);
+                                }
                                 _ => {}
                             }
                             false
@@ -1553,9 +1559,9 @@ impl Workspace {
         cancel: &AtomicBool,
     ) {
         // Considered once per job, before the proofs: a unit skipped for a
-        // transient reason (a store bypass, cancellation) is not retried by
-        // the same crawl. The Full batch extracts it, or a later crawl job
-        // publishes it. A refused reservation forgets it (below).
+        // transient reason (a refused reservation, a store bypass,
+        // cancellation) is not retried by the same crawl. The Full batch
+        // extracts it, or a later crawl job publishes it.
         if !self.crawl_persists
             || !self.persistent_cache().is_enabled()
             || !self.crawl_considered.insert(uri.clone())
@@ -1608,11 +1614,12 @@ impl Workspace {
             Ok((_, inputs)) => self
                 .project_cache
                 .note_published(&path, hash, context, &inputs),
-            // No room even in the publication pool: the unit is left to
-            // the index batch, which still holds it pending and extracts and
-            // publishes it; this job may try it again (13b-3, A2).
+            // No room even in the publication pool. The crawl publishes
+            // nothing for the unit, and it stays pending in every context
+            // index that has it as a member, so the next Full batch extracts
+            // and publishes it. It stays considered: this job does not
+            // prepare it again on each edge to it (13b-3, A2).
             Err(PersistSkip::Memory) => {
-                self.crawl_considered.remove(uri);
                 self.project_cache.note_crawl_deferred(&path);
             }
             Err(skip) => {
@@ -6853,6 +6860,18 @@ pub(in crate::workspace) mod tests {
             assert_eq!((progress.indexed, progress.persisted), (2, 1));
             assert_eq!(state(&view, &key, &member), Some(MemberState::Fresh));
             assert_eq!(recorded(&view, &key), vec![temp.path().join("App.dpr")]);
+            // 13b-3 fix round 1 (M3): counted and explained, not re-queued.
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].publications_refused, 1, "{status:?}");
+            assert!(
+                status[0]
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("1 members found no memory to publish")),
+                "{status:?}"
+            );
+            let json = crate::project_cache::index_status_json(&status, Default::default());
+            assert_eq!(json["contexts"][0]["publicationsRefused"], 1, "{json}");
             cache.shutdown();
             let (mut second, cache) = restarted_view(temp.path(), store.path());
             let loaded = record_loads();
@@ -7093,8 +7112,9 @@ pub(in crate::workspace) mod tests {
         }
 
         /// Holds every byte of `cache`'s budget that pins, leases and held
-        /// reservations leave, as the crawl's pins and leases did in Task 13
-        /// R1 (A2): no ordinary reservation fits until it is dropped.
+        /// reservations leave, standing in for the crawl's pins and leases
+        /// of Task 13 R1 (A2): no ordinary reservation fits until it is
+        /// dropped.
         fn fill_parse_budget(
             cache: &crate::project_cache::ProjectCache,
         ) -> crate::project_cache::Reservation {
@@ -7102,7 +7122,9 @@ pub(in crate::workspace) mod tests {
             let used = stats
                 .pinned_bytes
                 .saturating_add(stats.outstanding_bytes)
-                .saturating_add(stats.reserved_bytes());
+                .saturating_add(stats.reserved_bytes())
+                // Held from the publication pool, outside the budget.
+                .saturating_sub(stats.reserved_publication_bytes);
             let filler = cache
                 .reserve(
                     crate::project_cache::ReservationKind::Facts,
@@ -7117,11 +7139,12 @@ pub(in crate::workspace) mod tests {
             filler
         }
 
-        /// 13b-3 (A2): a parse budget full of the crawl's own pins and
-        /// leases does not stop the crawl publishing: a publication's
-        /// transients draw on their own pool.
+        /// 13b-3 (A2): a parse budget with no room left (held here by one
+        /// reservation, by the crawl's pins and leases in Task 13 R1) does
+        /// not stop the crawl publishing: a publication's transients draw
+        /// on their own pool.
         #[test]
-        fn a_crawl_publishes_while_its_pins_fill_the_parse_budget() {
+        fn a_crawl_publishes_while_the_parse_budget_is_full() {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             let store = private_dir();
@@ -7153,8 +7176,9 @@ pub(in crate::workspace) mod tests {
         }
 
         /// 13b-3 (A2): with no room even in the publication pool, the crawl
-        /// defers each unit to the index batch, counted, instead of dropping
-        /// it: the next Full batch extracts and publishes every one.
+        /// defers each unit to the index batch, counted once per job and
+        /// not prepared again by it, instead of dropping it: the next Full
+        /// batch extracts and publishes every one.
         #[test]
         fn a_refused_crawl_publication_is_published_by_the_next_full_batch() {
             let temp = tempfile::tempdir().unwrap();
@@ -7181,11 +7205,13 @@ pub(in crate::workspace) mod tests {
                 (0, ROOT_UNITS as u64),
                 "{counts:?}"
             );
+            // Each unit is deferred once: the index batch is its queue, so
+            // the job does not prepare it again on every edge to it.
             for unit in units(root, ROOT_UNITS) {
                 let uri = Url::from_file_path(&unit).unwrap();
                 assert!(
-                    !crawled.crawl_considered.contains(&uri),
-                    "{} may be tried again",
+                    crawled.crawl_considered.contains(&uri),
+                    "{} is not tried again by this job",
                     unit.display()
                 );
             }

@@ -50,6 +50,8 @@ const PROVIDER_GRAPH_BUDGET_SHARE: usize = 4;
 /// parse budget never refuse them. One member's transients are at most
 /// `MAX_ARTIFACT_CONTENT_BYTES` (16 MiB) plus its observations, so a few
 /// publications fit at once; past the pool they ask the budget.
+/// Pooled bytes are outside `maxCacheBytes`: they add at most the pool to
+/// it, and never evict or refuse anything charged to it.
 const PUBLICATION_POOL_BYTES: usize = 64 * 1024 * 1024;
 const PUBLICATION_POOL_SHARE: usize = 16;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
@@ -3295,6 +3297,53 @@ mod cache_tests {
         drop((small, held));
     }
 
+    /// 13b-3 fix round 1 (I1): pooled publication bytes are outside the
+    /// budget everywhere: admitting them evicts nothing, and a reservation
+    /// beside them is checked and made room for without them, so it never
+    /// flushes the cache and is then refused.
+    #[test]
+    fn pooled_publication_bytes_are_outside_the_budget() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        let ctx = context("A.dproj");
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(4_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        fill(&cache, "Old.pas", &ctx, 1, 1_000);
+        let held = cache
+            .reserve(ReservationKind::Facts, max - graphs - 1_000)
+            .unwrap();
+        assert_eq!(cache.provider_graph_count(), 1);
+        let pool = cache.publication_pool_bytes();
+        let pooled = cache.reserve_publication(pool).expect("from the pool");
+        assert_eq!(cache.provider_graph_count(), 1, "admission evicts nothing");
+        assert!(ready(&cache, "Old.pas"), "admission evicts nothing");
+        assert!(
+            cache
+                .reserve(ReservationKind::Scratch, graphs + 1_001)
+                .is_none(),
+            "refused before eviction"
+        );
+        assert_eq!(cache.provider_graph_count(), 1, "nothing was flushed");
+        assert!(ready(&cache, "Old.pas"), "nothing was flushed");
+        drop(held);
+        let small = cache
+            .reserve(ReservationKind::Scratch, 1_000)
+            .expect("fits beside the pool");
+        assert_eq!(
+            cache.provider_graph_count(),
+            1,
+            "nothing given way for the pool"
+        );
+        assert!(ready(&cache, "Old.pas"));
+        drop((small, pooled));
+    }
+
     /// 13b-3 (A2): a publication's transients draw on a small pool of their
     /// own, so they are admitted while pins, leases and other reservations
     /// fill the parse budget; past the pool they ask the budget as any
@@ -4242,29 +4291,30 @@ fn reserved_bytes(state: &State) -> usize {
         .fold(0usize, |total, bytes| total.saturating_add(*bytes))
 }
 
+/// Reserved bytes charged to `maxCacheBytes`: all but those drawn on the
+/// publication pool, a budget of its own (13b-3, A2).
+fn budgeted_reserved_bytes(state: &State) -> usize {
+    reserved_bytes(state).saturating_sub(state.publication_pooled)
+}
+
 /// Whether `retained` plus everything outstanding and reserved, plus
 /// `request`, fits the budget.
 fn fits(state: &State, retained: usize, request: usize) -> bool {
     retained
         .checked_add(state.outstanding_bytes)
-        .and_then(|total| total.checked_add(reserved_bytes(state)))
+        .and_then(|total| total.checked_add(budgeted_reserved_bytes(state)))
         .and_then(|total| total.checked_add(request))
         .is_some_and(|total| total <= state.max_bytes)
 }
 
-/// What no eviction frees: pinned, outstanding and reserved bytes, less the
-/// shared provider interfaces, a cache that gives way to every request
-/// (l4d-4nbs review I2), and less the publication pool, a budget of its own
-/// (13b-3, A2).
+/// What no eviction frees: pinned, outstanding and budgeted reserved
+/// bytes, less the shared provider interfaces, a cache that gives way to
+/// every request (l4d-4nbs review I2).
 fn committed_bytes(state: &State) -> usize {
     state
         .pinned_bytes
         .saturating_add(state.outstanding_bytes)
-        .saturating_add(
-            reserved_bytes(state)
-                .saturating_sub(state.provider_graphs.bytes)
-                .saturating_sub(state.publication_pooled),
-        )
+        .saturating_add(budgeted_reserved_bytes(state).saturating_sub(state.provider_graphs.bytes))
 }
 
 /// Whether `request` fits beside what no eviction frees.
@@ -4536,8 +4586,8 @@ impl ProjectCache {
 
     /// Reserve a member publication's transient bytes (13b-3, A2). Up to
     /// the publication pool they are admitted whatever pins, leases and
-    /// other reservations hold, evicting unpinned entries as far as it can
-    /// so they stay within `maxCacheBytes` when that is possible; past the
+    /// other reservations hold, and evict nothing: the pool is outside
+    /// `maxCacheBytes`, which no check or eviction counts it in. Past the
     /// pool they are made room for as `reserve` does, or refused.
     pub(crate) fn reserve_publication(&self, bytes: usize) -> Option<Reservation> {
         let kind = ReservationKind::Publication;
@@ -4550,7 +4600,6 @@ impl ProjectCache {
         if pooled {
             state.publication_pooled += bytes;
             state.reserved[kind.index()] += bytes;
-            evict_to_budget(&mut state);
         } else if make_room(&mut state, bytes) {
             state.reserved[kind.index()] += bytes;
         } else {
@@ -5700,7 +5749,7 @@ fn evict_to_budget(state: &mut State) {
     while state
         .bytes
         .saturating_add(state.outstanding_bytes)
-        .saturating_add(reserved_bytes(state))
+        .saturating_add(budgeted_reserved_bytes(state))
         > state.max_bytes
     {
         if !evict_oldest(state) {
@@ -6717,6 +6766,10 @@ struct StoredIndex {
     awaiting_room: bool,
     /// A batch's wait for maintenance found no room; cleared by room.
     room_wait_failed: bool,
+    /// Extracted members whose publication found no memory for its
+    /// transient buffers in this process: they stay memory-only, without a
+    /// record, and the next start extracts them again (13b-3).
+    publications_refused: u64,
 }
 
 impl StoredIndex {
@@ -6775,6 +6828,8 @@ pub(crate) struct IndexStatusEntry {
     /// no baseline hint.
     pub(crate) snapshot: &'static str,
     pub(crate) validation_reads: u64,
+    /// `StoredIndex::publications_refused`.
+    pub(crate) publications_refused: u64,
     pub(crate) gaps: Vec<String>,
 }
 
@@ -6836,6 +6891,12 @@ impl IndexStatusEntry {
                 counts.over_limit
             ));
         }
+        if stored.publications_refused > 0 {
+            gaps.push(format!(
+                "{} members found no memory to publish and are extracted again by the next start",
+                stored.publications_refused
+            ));
+        }
         if counts.deferred > 0 {
             gaps.push(format!(
                 "{} units failed to load for the index and are retried later",
@@ -6870,6 +6931,7 @@ impl IndexStatusEntry {
                 Some(_) => "held",
             },
             validation_reads: stored.validation_reads,
+            publications_refused: stored.publications_refused,
             gaps,
         }
     }
@@ -6901,6 +6963,7 @@ impl IndexStatusEntry {
             "complete": self.complete,
             "snapshot": self.snapshot,
             "validationReads": self.validation_reads,
+            "publicationsRefused": self.publications_refused,
             "gaps": self.gaps,
         })
     }
@@ -7216,6 +7279,7 @@ impl ProjectCache {
                     memory_only: false,
                     awaiting_room: false,
                     room_wait_failed: false,
+                    publications_refused: 0,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -7435,8 +7499,9 @@ impl ProjectCache {
     }
 
     /// The warm crawl found no room to publish `path` (13b-3, A2). Nothing
-    /// is dropped: every context index still holds the member pending, so
-    /// its next Full batch extracts and publishes it; this counts it.
+    /// is dropped: each context index with `path` as a member still holds
+    /// it pending, so its next Full batch extracts and publishes it; this
+    /// counts the deferral.
     pub(crate) fn note_crawl_deferred(&self, path: &Path) {
         let mut index = self.index();
         index.crawl_deferred_count = index.crawl_deferred_count.saturating_add(1);
@@ -7614,6 +7679,13 @@ impl ProjectCache {
     pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.awaiting_room = true;
+        }
+    }
+
+    /// An extracted member of `key` found no memory to publish (13b-3).
+    pub(crate) fn note_index_publication_refused(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.publications_refused = stored.publications_refused.saturating_add(1);
         }
     }
 

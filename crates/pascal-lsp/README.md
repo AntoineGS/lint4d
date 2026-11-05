@@ -1420,7 +1420,9 @@ validated, so the snapshot is never proof.
 - **Scheduling.** On every start with a populated store, the reuse passes run
   before the crawl, waiting for the store to open (within its open bound); the
   crawl goes first only while bulk work (such as workspace-wide requests)
-  runs. Index batches run behind interactive and bulk work and are bounded: a
+  runs. A reuse pass tries every member of its context, however few of them
+  the store holds, before extraction starts. Index batches run behind
+  interactive and bulk work and are bounded: a
   reuse batch is 512 members or 200 ms, an extraction batch 64 members or 2 s.
   A member whose write the store refuses under WAL pressure stays pending and
   is retried later.

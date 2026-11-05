@@ -351,8 +351,6 @@ pub(crate) struct IndexProgress {
     pub(crate) reuse_missed: usize,
     /// Of `reuse_missed`, members the store held nothing for.
     pub(crate) reuse_absent: usize,
-    /// The context had an adopted baseline hint after the batch.
-    pub(crate) hinted: bool,
     /// Pending closed members not tried for reuse since they last changed.
     pub(crate) reuse_pending: usize,
     /// Retryable reuse misses this batch (left untried for reuse).
@@ -391,7 +389,6 @@ impl IndexProgress {
             reused: 0,
             reuse_missed: 0,
             reuse_absent: 0,
-            hinted: false,
             reuse_pending: 0,
             reuse_deferred: 0,
             persisted: 0,
@@ -424,18 +421,6 @@ impl IndexProgress {
         settled
             || (self.deferred > 0 && self.untried > 0)
             || (self.mode == IndexMode::Reuse && self.reuse_pending > 0 && self.reuse_missed > 0)
-    }
-
-    /// A reuse batch that found a cold store: it reused nothing, the store
-    /// held nothing for any member it missed, and no baseline hint was
-    /// adopted. Its pass ends there; the untried members keep their reuse
-    /// attempt for the extraction batches, which try reuse first.
-    pub(crate) fn found_a_cold_store(&self) -> bool {
-        self.mode == IndexMode::Reuse
-            && self.reused == 0
-            && self.reuse_missed > 0
-            && self.reuse_absent == self.reuse_missed
-            && !self.hinted
     }
 }
 
@@ -1018,7 +1003,6 @@ impl Workspace {
         progress.complete = progress.pending == progress.retrying
             && progress.awaiting_room == 0
             && !progress.memory;
-        progress.hinted = self.project_cache.baseline_hint(&key).is_some();
         Ok(progress)
     }
 

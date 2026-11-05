@@ -510,8 +510,6 @@ impl Workspace {
         if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
-        let overlays = self.overlay_inputs();
-        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let context = Arc::clone(
             &self
                 .contexts
@@ -556,6 +554,9 @@ impl Workspace {
             Lookup::Hit(headers) => headers,
             Lookup::Miss(miss) => return Ok(Reuse::Miss(ReuseMiss::Store(miss))),
         };
+        // Only a member with candidates pays for the editor state (A5).
+        let overlays = self.overlay_inputs();
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let mut validator = Validator::new(
             CurrentInputs {
                 context: &context_key,

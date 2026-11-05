@@ -1344,9 +1344,10 @@ impl Warmer {
                 // A batch that settled nothing and left no untried member
                 // (deferred or open-only members), or hit the memory limit,
                 // cannot gain from a retry.
-                // A cold store ends the pass at once: hashing every member
-                // before the crawl would find nothing either.
-                let requeued = progress.worth_requeue() && !progress.found_a_cold_store();
+                // A reuse pass goes on over a cold or partly filled store
+                // until every member was tried (A5): published records are
+                // spread over the path order, and an absent miss is cheap.
+                let requeued = progress.worth_requeue();
                 let settled = progress.indexed
                     + progress.refreshed
                     + progress.refused
@@ -3970,23 +3971,50 @@ mod tests {
             workspace.persistent_cache().shutdown();
         }
 
+        /// Every reuse batch before the crawl's `End`, of any anchor.
+        fn reuse_batches_before_end(events: &[WarmEvent]) -> Vec<&IndexProgress> {
+            let end = position(events, is_end);
+            events[..end]
+                .iter()
+                .filter_map(|event| match event {
+                    WarmEvent::IndexProgress { progress, .. }
+                        if progress.mode == IndexMode::Reuse =>
+                    {
+                        Some(&**progress)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The members of `write_project(root, _)` in membership (path) order.
+        fn members_in_path_order(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut members = std::fs::read_dir(root.join("lib"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .chain(std::iter::once(root.join("App.dpr")))
+                .collect::<Vec<_>>();
+            members.sort_by_cached_key(|path| crate::workspace::rename::path_key(path));
+            members
+        }
+
+        /// A5 (Task 13b): a cold store no longer ends the pass after one
+        /// batch: every member is tried before the crawl, in bounded
+        /// batches, and extraction follows the crawl.
         #[test]
-        fn a_cold_store_ends_the_reuse_pass_after_one_batch() {
+        fn a_cold_store_reuse_pass_tries_every_member_before_the_crawl() {
             let gate = Arc::new(InteractiveGate::default());
             let (temp, _store, workspace, main) = fixture_persisting_with(600, &gate);
             let mut warmer = Warmer::start(gate);
             warmer.open(main);
             let events = run_until_end_within(&mut warmer, &workspace, Duration::from_secs(60));
-            let end = events
-                .iter()
-                .position(|event| matches!(event, WarmEvent::End { .. }))
-                .unwrap();
-            let batches = project_reuse_batches(&events[..end]);
-            assert_eq!(batches.len(), 1, "{events:?}");
-            assert!(batches[0].found_a_cold_store(), "{:?}", batches[0]);
-            assert!(
-                batches[0].reuse_pending > 0,
-                "members are left for extraction"
+            let batches = reuse_batches_before_end(&events);
+            assert!(batches.len() >= 2, "{events:?}");
+            assert_eq!(batches.iter().map(|batch| batch.reused).sum::<usize>(), 0);
+            assert_eq!(
+                batches.last().unwrap().reuse_pending,
+                0,
+                "every member was tried: {batches:?}"
             );
             let project = IndexAnchor::Project(temp.path().join("App.dproj"));
             assert!(warmer.reuse_done.contains(&project));
@@ -3996,6 +4024,129 @@ mod tests {
                 "extraction follows"
             );
             workspace.persistent_cache().shutdown();
+        }
+
+        /// A5 (Task 13b, R2 shape): the store holds records for members
+        /// spread over the end of the path order only, so the first reuse
+        /// batch misses every member it tries (all absent). The pass goes
+        /// on and reuses every published member before the crawl's `End`.
+        #[test]
+        fn a_partly_filled_store_is_reused_past_an_absent_first_batch() {
+            const ABSENT_PREFIX: usize = 530;
+            let gate = Arc::new(InteractiveGate::default());
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), 600);
+            let store = crate::workspace::persist::tests::private_dir();
+            let first = persisting_workspace(temp.path(), store.path(), &gate);
+            let mut view = Workspace::from_analysis_input(&first.analysis_input().disk_baseline());
+            let project = IndexAnchor::Project(temp.path().join("App.dproj"));
+            let progress = view
+                .advance_workspace_index(
+                    &project,
+                    IndexBound::all(),
+                    &mut || Ok(()),
+                    &AtomicBool::new(false),
+                )
+                .expect("first session");
+            assert!(progress.complete, "{progress:?}");
+            first.persistent_cache().shutdown();
+            drop((view, first));
+            // New bytes have no record: every member of the prefix, and
+            // every other one after it, is absent from the store.
+            let main_path = temp.path().join("lib/Main.pas");
+            let members = members_in_path_order(temp.path());
+            assert!(members.len() > ABSENT_PREFIX + 40, "{}", members.len());
+            // `Main` too: the index batches read the disk, open or not.
+            let mut published = 0;
+            for (at, path) in members.iter().enumerate() {
+                if at < ABSENT_PREFIX || at % 2 == 0 {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    write(path, &format!("{text}{{ edited }}\n"));
+                } else {
+                    published += 1;
+                }
+            }
+            pascal_project::backdate_tree_for_test(temp.path());
+
+            let mut workspace = persisting_workspace(temp.path(), store.path(), &gate);
+            let main = Url::from_file_path(&main_path).unwrap();
+            workspace
+                .open_document(
+                    main.clone(),
+                    std::fs::read_to_string(&main_path).unwrap(),
+                    1,
+                )
+                .unwrap();
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &workspace, Duration::from_secs(60));
+            let batches = reuse_batches_before_end(&events);
+            let first_batch = batches.first().expect("a reuse batch ran");
+            assert_eq!(first_batch.reused, 0, "{first_batch:?}");
+            assert_eq!(
+                first_batch.reuse_absent, first_batch.reuse_missed,
+                "{first_batch:?}"
+            );
+            let reused = batches.iter().map(|batch| batch.reused).sum::<usize>();
+            assert_eq!(reused, published, "{batches:?}");
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// A5 (Task 13b, R4 shape): a first server's crawl publishes units
+        /// spread over the end of the path order, and the server stops
+        /// before any index batch (no seal, no snapshot to hint). The next
+        /// start reuses all of them in its reuse pass, before its crawl.
+        #[test]
+        fn a_restart_reuses_every_unit_a_stopped_crawl_published() {
+            let gate = Arc::new(InteractiveGate::default());
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), 600);
+            let members = members_in_path_order(temp.path());
+            let crawled = members[540..]
+                .iter()
+                .step_by(5)
+                .filter_map(|path| {
+                    let name = path.file_stem()?.to_str()?;
+                    name.starts_with('U').then(|| name.to_owned())
+                })
+                .collect::<Vec<_>>();
+            assert!(crawled.len() >= 10, "{crawled:?}");
+            let main_text = format!(
+                "unit Main;\ninterface\nuses {};\nimplementation\nend.\n",
+                crawled.join(", ")
+            );
+            let main_path = temp.path().join("lib/Main.pas");
+            write(&main_path, &main_text);
+            pascal_project::backdate_tree_for_test(temp.path());
+            let store = crate::workspace::persist::tests::private_dir();
+            let main = Url::from_file_path(&main_path).unwrap();
+
+            let mut first = persisting_workspace(temp.path(), store.path(), &gate);
+            first
+                .open_document(main.clone(), main_text.clone(), 1)
+                .unwrap();
+            // Bulk work holds every index batch back: only the crawl runs.
+            gate.set_running_bulk(1);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main.clone());
+            let events = run_until_end_within(&mut warmer, &first, Duration::from_secs(60));
+            assert!(!events.iter().any(is_index_event), "{events:?}");
+            warmer.shutdown();
+            let published = first.project_cache().published_by_crawl_for_test();
+            assert_eq!(published.len(), crawled.len(), "{published:?}");
+            first.persistent_cache().shutdown();
+            drop(first);
+            gate.set_running_bulk(0);
+
+            let mut second = persisting_workspace(temp.path(), store.path(), &gate);
+            second.open_document(main.clone(), main_text, 1).unwrap();
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &second, Duration::from_secs(60));
+            let batches = reuse_batches_before_end(&events);
+            let reused = batches.iter().map(|batch| batch.reused).sum::<usize>();
+            assert_eq!(reused, published.len(), "{batches:?}");
+            second.persistent_cache().shutdown();
         }
 
         #[test]

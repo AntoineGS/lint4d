@@ -2111,8 +2111,21 @@ impl NavigationIndex {
 
             let guarded = options.guard.filter(|guard| guard.documents.contains(uri));
             let own_top_level = guarded.is_some() && binding_is_top_level_in(binding, uri);
-            let uses_unproven = guarded
-                .is_some_and(|guard| own_top_level && self.uses_unproven_unit(document, guard));
+            let uses_unproven =
+                guarded.is_some_and(|guard| self.uses_unproven_unit(document, guard, None));
+            // A binding declared elsewhere is shadowed by what another
+            // unproven unit the document uses may declare; the units declaring
+            // it cannot shadow their own declaration.
+            let shadowing_unproven = guarded.is_some_and(|guard| {
+                !own_top_level && {
+                    let declaring = binding
+                        .members
+                        .iter()
+                        .map(|member| &member.uri)
+                        .collect::<HashSet<_>>();
+                    self.uses_unproven_unit(document, guard, Some(&declaring))
+                }
+            });
             let root = document.tree.root_node();
             let unit_spans = if binding.kind == SymbolKind::Unit {
                 if let Some(shared_work_budget) = options.shared_work_budget.as_deref_mut() {
@@ -2420,7 +2433,7 @@ impl NavigationIndex {
                         })?;
                         continue;
                     }
-                    if guarded.is_some() && !own_top_level {
+                    if shadowing_unproven {
                         // A binding declared elsewhere may itself be shadowed
                         // by what an unproven unit declares: the document is
                         // withheld, as any importer of a failed unit is.
@@ -2512,7 +2525,13 @@ impl NavigationIndex {
     /// the document uses, so while one of those is unproven every occurrence
     /// inside a type is withheld; otherwise only an unproven ancestry is.
     /// Plain routines, their nested routines, the initialization and
-    /// finalization sections and unit-level declarations have no type.
+    /// finalization sections and unit-level declarations have no type. A
+    /// unit is unproven here when it is withheld for any reason.
+    ///
+    /// A binding declared in another unit follows the same rules once no
+    /// unproven unit the document uses, other than the units declaring it,
+    /// could declare the name and shadow it; otherwise every occurrence in
+    /// the document is withheld.
     #[allow(clippy::too_many_arguments)]
     fn dependency_gap_reaches(
         &self,
@@ -2526,6 +2545,20 @@ impl NavigationIndex {
         qualified: bool,
     ) -> Option<&'static str> {
         if is_binding_member {
+            return None;
+        }
+        // The owner qualifier of an implementation heading binds only a type
+        // the document itself declares (`method_heading_owner_candidates_with_budget`).
+        if super::method_heading_owner_path_at(identifier, &document.source, &mut || Ok(()))
+            .ok()
+            .flatten()
+            .is_some_and(|owner| owner.implementation)
+        {
+            return None;
+        }
+        // A uses clause names units, which the unit lookup finds and no
+        // declaration shadows.
+        if has_ancestor_kind(identifier, "declUses") {
             return None;
         }
         if qualified || has_ancestor_kind(identifier, "with") {
@@ -2556,18 +2589,27 @@ impl NavigationIndex {
 
     /// Whether a unit `document` uses, System included, is unresolved or
     /// unproven: what it declares is then unknown.
-    fn uses_unproven_unit(&self, document: &Document, guard: &DependencyGuard) -> bool {
+    /// Units in `except` do not count.
+    fn uses_unproven_unit(
+        &self,
+        document: &Document,
+        guard: &DependencyGuard,
+        except: Option<&HashSet<&Url>>,
+    ) -> bool {
+        let unproven = |url: &Url| {
+            guard.unproven.contains(url) && !except.is_some_and(|except| except.contains(url))
+        };
         !document.unknown_imports.is_empty()
             || self
                 .units
                 .get("system")
-                .is_some_and(|urls| urls.iter().any(|url| guard.unproven.contains(url)))
+                .is_some_and(|urls| urls.iter().any(unproven))
             || document
                 .active_uses(super::Region::Implementation)
                 .into_iter()
                 .any(|unit| {
                     let urls = self.unit_urls_for_import(document, unit);
-                    urls.is_empty() || urls.iter().any(|url| guard.unproven.contains(url))
+                    urls.is_empty() || urls.iter().any(unproven)
                 })
     }
 

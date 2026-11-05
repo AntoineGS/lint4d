@@ -2111,6 +2111,24 @@ fn read_only_reference_coverage(
             "reference workspace scan incomplete: {uri} is included by {owner}, whose analysis is unproven"
         ));
     }
+    // A requesting document that uses a unit withheld for any reason, not
+    // only a failed one, is guarded too: what that unit declares, helpers
+    // included, is unproven (l4d-mayy fix round 2).
+    let mut guarded = guarded;
+    for owner in &requesting {
+        if withheld.contains(owner) || guarded.contains(owner) {
+            continue;
+        }
+        let uses_withheld = snapshot.index.imports(owner).iter().any(|import| {
+            snapshot
+                .index
+                .import_provider_uri(owner, &import.name)
+                .is_some_and(|provider| withheld.contains(provider))
+        });
+        if uses_withheld {
+            guarded.insert(owner.clone());
+        }
+    }
     if !snapshot.complete {
         coverage.note(
             None,
@@ -4814,6 +4832,102 @@ mod tests {
                 (source_uri(&downstream), 7, 10),
                 (source_uri(&downstream), 9, 10),
                 (source_uri(&downstream), 14, 2),
+            ]
+        );
+    }
+
+    /// l4d-mayy fix round 2: a used unit withheld for its own unsupported
+    /// directive is as unproven as one whose analysis failed. Occurrences
+    /// inside the requesting document's methods are withheld, since a
+    /// helper it declares may capture them; plain routines and the owner
+    /// qualifier of an implementation heading, bound in the unit itself,
+    /// keep theirs.
+    #[test]
+    fn a_used_unit_withheld_for_its_own_directive_withholds_occurrences_inside_methods() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Partial.pas"),
+            "unit Partial;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TState = (Maybe, Yes);\nimplementation\nend.\n",
+        )
+        .expect("partial");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            concat!(
+                "unit Downstream;\n",      // 0
+                "interface\n",             // 1
+                "uses Partial;\n",         // 2
+                "type\n",                  // 3
+                "  TLocal = class\n",      // 4
+                "    procedure Run;\n",    // 5
+                "  end;\n",                // 6
+                "  TDownInfo = class\n",   // 7
+                "  end;\n",                // 8
+                "implementation\n",        // 9
+                "procedure Plain;\n",      // 10
+                "var Info: TDownInfo;\n",  // 11
+                "begin\n",                 // 12
+                "end;\n",                  // 13
+                "procedure TLocal.Run;\n", // 14
+                "var Info: TDownInfo;\n",  // 15
+                "begin\n",                 // 16
+                "end;\n",                  // 17
+                "end.\n",
+            ),
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let partial = references_from_input(
+            input.clone(),
+            &source_uri(&downstream),
+            Position::new(7, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&root.join("Partial.pas")))),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("helper")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&downstream), 7, 2),
+                (source_uri(&downstream), 11, 10),
+            ]
+        );
+        let owner = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(4, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("a partial result, not a refusal");
+        assert_eq!(
+            located(&owner.value),
+            vec![
+                (source_uri(&downstream), 4, 2),
+                (source_uri(&downstream), 14, 10)
             ]
         );
     }

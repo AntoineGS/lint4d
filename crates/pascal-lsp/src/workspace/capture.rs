@@ -22,6 +22,25 @@ use std::sync::{Mutex, PoisonError};
 /// growing.
 pub(crate) const MAX_CAPTURED_READS: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CAPTURE_BOUND: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests on this thread capture at most `bound` distinct reads.
+#[cfg(test)]
+pub(crate) fn set_capture_bound_for_test(bound: Option<usize>) {
+    TEST_CAPTURE_BOUND.with(|cell| cell.set(bound));
+}
+
+fn capture_bound() -> usize {
+    #[cfg(test)]
+    if let Some(bound) = TEST_CAPTURE_BOUND.with(std::cell::Cell::get) {
+        return bound;
+    }
+    MAX_CAPTURED_READS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedListing {
     pub(crate) directory: PathBuf,
@@ -237,7 +256,7 @@ impl ReadsIndex {
         if self.listings(reads, &key).any(|known| *known == listing) {
             return;
         }
-        if reads.total() >= MAX_CAPTURED_READS {
+        if reads.total() >= capture_bound() {
             reads.drop_read(key);
             return;
         }
@@ -256,7 +275,7 @@ impl ReadsIndex {
         {
             return;
         }
-        if reads.total() >= MAX_CAPTURED_READS {
+        if reads.total() >= capture_bound() {
             reads.drop_read(key);
             return;
         }

@@ -914,6 +914,50 @@ mod tests {
         validate_evidence(store, header, &mut validator).unwrap()
     }
 
+    /// 13b-2 fix round 1 (M4): a set stored before deduplication, which
+    /// repeats its observations, validates exactly as the deduplicated set
+    /// of the same inputs, unchanged or changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_set_with_duplicates_validates_as_its_deduplicated_set() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        let fixture = fixture();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let distinct = vec![
+            fixture.listing(),
+            fixture.absent("include/B.inc"),
+            fixture.payload(),
+        ];
+        let repeated: Vec<_> = (0..20).flat_map(|_| distinct.iter().cloned()).collect();
+        let old = stored_evidence(&store, &repeated);
+        let new = stored_evidence(&store, &distinct);
+        assert_ne!(old.evidence_id(), new.evidence_id());
+        let both = |fixture: &Fixture| {
+            (
+                validate_with(fixture, &store, &old, false),
+                validate_with(fixture, &store, &new, false),
+            )
+        };
+        let (old_check, new_check) = both(&fixture);
+        assert_eq!(old_check, EvidenceCheck::Holds);
+        assert_eq!(old_check, new_check);
+        std::fs::write(fixture.root.join("include/A.inc"), b"{$DEFINE CHANGED}").unwrap();
+        let (old_check, new_check) = both(&fixture);
+        assert!(
+            matches!(old_check, EvidenceCheck::Stale(_)),
+            "{old_check:?}"
+        );
+        assert_eq!(old_check, new_check);
+        std::fs::write(fixture.root.join("include/B.inc"), b"{}").unwrap();
+        let (old_check, new_check) = both(&fixture);
+        assert_eq!(
+            old_check,
+            EvidenceCheck::Stale(Stale::Listing(fixture.root.join("include")))
+        );
+        assert_eq!(old_check, new_check);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_verified_set_is_unproven_when_cancelled_after_its_last_batch() {

@@ -1453,6 +1453,7 @@ Each context has:
 | `reused`, `extracted`, `persisted` | Members reused from the store, parsed in this process, and with a record proven by this process (includes reused members) |
 | `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
 | `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
+| `overLimit` | Fresh members whose facts are too large to store (more distinct reads than a capture holds, or a store size limit): indexed in this process, recorded without an artifact, and extracted again by the next start |
 | `membershipComplete` | The member list is complete and current |
 | `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
 | `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |

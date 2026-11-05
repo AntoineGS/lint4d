@@ -1320,6 +1320,12 @@ impl Workspace {
                 PublishOutcome::Indexed => {
                     #[cfg(test)]
                     run_hook(&BEFORE_PERSIST, path);
+                    // These facts exceeded a fixed limit already: the write
+                    // would fail the same way.
+                    if self.known_over_limit(key, path, hash) {
+                        self.record_over_limit(key, path, hash, cancel);
+                        return Ok(MemberOutcome::Published { persisted: false });
+                    }
                     // The one extraction pass serves the index and the store.
                     let persisted = match self.persist_extracted(key, uri, facts, cancel) {
                         Ok(proof) => self.set_member_record(key, &proof),
@@ -1357,7 +1363,7 @@ impl Workspace {
                                 // retries it last instead of failing the same
                                 // write in path order (l4d-kqbb, A1).
                                 skip if skip.over_fixed_limit() => {
-                                    self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+                                    self.record_over_limit(key, path, hash, cancel);
                                 }
                                 _ => {}
                             }
@@ -1370,6 +1376,30 @@ impl Workspace {
                 PublishOutcome::Memory => MemberOutcome::Memory,
             },
         )
+    }
+
+    fn known_over_limit(&self, key: &ContextKey, path: &Path, hash: u64) -> bool {
+        self.contexts.get(key).is_some_and(|state| {
+            self.project_cache
+                .over_limit(path, hash, CacheContextKey::new(&state.context).digest())
+        })
+    }
+
+    /// `path`'s facts, indexed from the bytes hashed `hash`, exceed a fixed
+    /// limit of the store: the same inputs fail the same way every time.
+    /// The facts stay indexed in this process, an artifact-less record
+    /// lists the member so the snapshot seals, and the next process
+    /// retries it last (l4d-kqbb, A1); status reports it (`overLimit`).
+    fn record_over_limit(&self, key: &ContextKey, path: &Path, hash: u64, cancel: &AtomicBool) {
+        if let Some(state) = self.contexts.get(key) {
+            self.project_cache.note_over_limit(
+                path,
+                hash,
+                CacheContextKey::new(&state.context).digest(),
+            );
+        }
+        self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+        self.project_cache.mark_index_over_limit(key, path);
     }
 
     fn refuse_member(
@@ -1558,6 +1588,7 @@ impl Workspace {
         // bytes under the same context (an earlier crawl job), or indexed it
         // so and proved its record.
         if self.project_cache.crawl_published(&path, hash, context)
+            || self.project_cache.over_limit(&path, hash, context)
             || self.project_cache.index_member_is_proven(&path, hash)
         {
             return;
@@ -1576,6 +1607,11 @@ impl Workspace {
                 .note_published(&path, hash, context, &inputs),
             Err(skip) => {
                 crate::trace::trace!("  crawl unit {} not persisted: {skip:?}", path.display());
+                // No later crawl job tries the same write; the index batch
+                // indexes the member and records it artifact-less.
+                if skip.over_fixed_limit() {
+                    self.project_cache.note_over_limit(&path, hash, context);
+                }
             }
         }
     }
@@ -6542,6 +6578,20 @@ pub(in crate::workspace) mod tests {
                 "{last:?}"
             );
             assert_eq!((indexed, persisted), (COUNT, COUNT - 1), "{last:?}");
+            // Reported, not hidden: a distinct count and a gap.
+            let status = view.project_cache.index_status(&|_| false);
+            let entry = &status[0];
+            assert_eq!(entry.counts.over_limit, 1, "{entry:?}");
+            assert_eq!(entry.counts.limited, 0, "{entry:?}");
+            assert!(
+                entry
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("1 members are too large to store")),
+                "{entry:?}"
+            );
+            let json = crate::project_cache::index_status_json(&status);
+            assert_eq!(json["contexts"][0]["overLimit"], 1, "{json}");
             let records = records(&view, &key);
             assert_eq!(records.len(), COUNT, "{records:?}");
             assert!(view.project_cache.index_member_has_record(&key, &member));
@@ -6549,6 +6599,44 @@ pub(in crate::workspace) mod tests {
                 view.seal_baseline_if_due(&key, &mut || Ok(())),
                 crate::workspace::baseline::SealOutcome::Sealed
             );
+            cache.shutdown();
+        }
+
+        /// 13b-2 fix round 1 (M1): a session that reads more distinct
+        /// inputs than a capture holds fails evidence with `Overflowed`,
+        /// the member's own fixed limit: it is recorded artifact-less and
+        /// reported, not re-extracted into the same failure.
+        #[test]
+        fn a_member_whose_capture_overflows_is_an_artifact_less_member() {
+            const COUNT: usize = 3;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            // U0 reads an include, so its session captures reads; with a
+            // bound of 1 it captures more than it may hold.
+            let member = temp.path().join("lib/U0.pas");
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), COUNT, WorkspaceOptions::default());
+            write(&member.with_file_name("x.inc"), "const X = 1;\n");
+            write(&member.with_file_name("y.inc"), "const Y = 1;\n");
+            write(
+                &member,
+                "unit U0;\ninterface\n{$I x.inc}\n{$I y.inc}\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(temp.path());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            crate::workspace::capture::set_capture_bound_for_test(Some(1));
+            let loaded = record_loads();
+            let first = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            let again = advance(&mut view, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            crate::workspace::capture::set_capture_bound_for_test(None);
+            assert!(first.complete, "{first:?}");
+            assert_eq!(loaded.borrow().len(), COUNT, "each member loaded once");
+            assert_eq!((again.indexed, again.persisted), (0, 0), "{again:?}");
+            assert_eq!(recorded(&view, &key).len(), COUNT);
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.over_limit, 1, "{:?}", status[0]);
+            assert!(view.project_cache.index_member_has_record(&key, &member));
             cache.shutdown();
         }
 
@@ -7243,6 +7331,45 @@ pub(in crate::workspace) mod tests {
                 vec![root.join("App.dpr")],
                 "only the open main source is extracted"
             );
+            cache.shutdown();
+        }
+
+        /// 13b-2 fix round 1 (I1): a crawl unit whose publication exceeds
+        /// a fixed limit is not tried again by a later crawl job, and the
+        /// index batch indexes it without the failing write and records it
+        /// artifact-less.
+        #[test]
+        fn a_crawl_unit_over_a_fixed_limit_is_published_once_and_recorded_by_the_index() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            let (session, key, anchor, open) = crawled_project(root);
+            let (mut view, cache) = persisting_view(&session, store.path());
+            let member = root.join("lib/U0.pas");
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (target, counted) = (member.clone(), Arc::clone(&attempts));
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path == target).then(|| {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    pascal_cache::Bypass::TooLarge(pascal_cache::TooLarge::Observations {
+                        count: 70_000,
+                    })
+                })
+            })));
+            crawl(&session, &cache, &open);
+            crawl(&session, &cache, &open);
+            assert_eq!(attempts.load(Ordering::Relaxed), 1, "one failing write");
+            assert_eq!(
+                session.project_cache.published_by_crawl_for_test().len(),
+                ROOT_UNITS - 1
+            );
+            let progress = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(attempts.load(Ordering::Relaxed), 1, "the index skips it");
+            assert_eq!(state(&view, &key, &member), Some(MemberState::Fresh));
+            assert!(view.project_cache.index_member_has_record(&key, &member));
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.over_limit, 1, "{:?}", status[0]);
             cache.shutdown();
         }
 

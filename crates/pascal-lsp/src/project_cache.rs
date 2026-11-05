@@ -3084,6 +3084,34 @@ mod cache_tests {
         })
     }
 
+    /// 13b-2 fix round 1 (M2): a provider interface whose reads may lack
+    /// one it named is not shared, so no session inherits that overflow;
+    /// each compiles it with its own reads instead.
+    #[test]
+    fn a_provider_interface_with_overflowed_reads_is_not_kept() {
+        let cache = ProjectCache::new(1 << 20);
+        let overflowed = crate::workspace::capture::CapturedReads {
+            overflowed: true,
+            ..Default::default()
+        };
+        assert!(!cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(1_000),
+            vec![],
+            overflowed
+        ));
+        assert_eq!(cache.provider_graph_count(), 0);
+        assert_eq!(cache.provider_graph_bytes(), 0);
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(1_000),
+            vec![],
+            Default::default()
+        ));
+    }
+
     /// l4d-4nbs D29: shared provider interfaces are charged to
     /// `maxCacheBytes` and evicted least recently used first past their
     /// share; reuse refreshes an entry.
@@ -6317,6 +6345,12 @@ impl ProjectCache {
             .saturating_add(graph.retained_bytes)
             .saturating_add(probes_bytes(&probes))
             .saturating_add(reads.retained_bytes());
+        // A read it named may be missing: a session reusing it could only
+        // inherit the overflow, never prove its inputs. It compiles the
+        // provider itself instead, capturing its own reads.
+        if reads.overflowed {
+            return false;
+        }
         let full = (configuration, key);
         let mut state = lock(&self.inner);
         let share = state.max_bytes / PROVIDER_GRAPH_BUDGET_SHARE;
@@ -6639,6 +6673,12 @@ impl IndexStatusEntry {
                 counts.limited
             ));
         }
+        if counts.over_limit > 0 {
+            gaps.push(format!(
+                "{} members are too large to store and are extracted again by the next start",
+                counts.over_limit
+            ));
+        }
         if counts.deferred > 0 {
             gaps.push(format!(
                 "{} units failed to load for the index and are retried later",
@@ -6699,6 +6739,7 @@ impl IndexStatusEntry {
             "deferred": counts.deferred,
             "persisted": counts.persisted,
             "retrying": counts.retrying,
+            "overLimit": counts.over_limit,
             "membershipComplete": self.membership_complete,
             "complete": self.complete,
             "snapshot": self.snapshot,
@@ -6761,6 +6802,14 @@ struct IndexStore {
     /// For each path a crawl publication's evidence names, the published
     /// units that read it: a change to it makes them publishable again.
     crawl_dependents: HashMap<PathBuf, HashSet<PathBuf>>,
+    /// Per path, the content hash and context digest of each extraction in
+    /// this process whose publication exceeded a fixed limit
+    /// (`PersistSkip::over_fixed_limit`): the same write would fail again,
+    /// so neither the crawl nor the index attempts it. Bounded like
+    /// `crawl_published`; a change to the path forgets it. A change to
+    /// another input does not: the member then stays unpublished in this
+    /// process, which is never a wrong publication.
+    over_limit: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
     /// The paths the warm crawl published, in publication order.
     #[cfg(test)]
     published_by_crawl: Vec<PathBuf>,
@@ -6779,6 +6828,7 @@ impl Default for IndexStore {
             released: Vec::new(),
             crawl_published: HashMap::new(),
             crawl_dependents: HashMap::new(),
+            over_limit: HashMap::new(),
             #[cfg(test)]
             published_by_crawl: Vec::new(),
         }
@@ -7216,6 +7266,37 @@ impl ProjectCache {
             .is_some_and(|published| published.contains(&(hash, context)))
     }
 
+    /// `path`'s facts from the bytes hashed `hash`, under the context with
+    /// cache digest `context`, exceed a fixed limit of the store.
+    pub(crate) fn note_over_limit(&self, path: &Path, hash: u64, context: pascal_cache::Digest) {
+        let mut index = self.index();
+        if index.over_limit.len() >= MAX_CRAWL_PUBLISHED && !index.over_limit.contains_key(path) {
+            index.over_limit.clear();
+        }
+        let noted = index.over_limit.entry(path.to_path_buf()).or_default();
+        if !noted.contains(&(hash, context)) {
+            if noted.len() >= MAX_CRAWL_PUBLICATIONS_PER_PATH {
+                noted.remove(0);
+            }
+            noted.push((hash, context));
+        }
+    }
+
+    /// Whether `note_over_limit` noted these facts in this process.
+    pub(crate) fn over_limit(&self, path: &Path, hash: u64, context: pascal_cache::Digest) -> bool {
+        self.index()
+            .over_limit
+            .get(path)
+            .is_some_and(|noted| noted.contains(&(hash, context)))
+    }
+
+    /// `key`'s Fresh member `path` is too large to store.
+    pub(crate) fn mark_index_over_limit(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_over_limit(path);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn published_by_crawl_for_test(&self) -> Vec<PathBuf> {
         self.index().published_by_crawl.clone()
@@ -7621,6 +7702,7 @@ impl ProjectCache {
         let mut store = self.index();
         let store = &mut *store;
         store.crawl_published.remove(path);
+        store.over_limit.remove(path);
         let changed = std::iter::once(path).chain(path.parent().filter(|_| include_parent));
         for changed in changed {
             for dependent in store.crawl_dependents.remove(changed).unwrap_or_default() {
@@ -7634,6 +7716,7 @@ impl ProjectCache {
         // Overflow lost which paths changed: nothing is known published.
         store.crawl_published.clear();
         store.crawl_dependents.clear();
+        store.over_limit.clear();
         let mut anchors = Vec::new();
         for stored in store.contexts.values_mut() {
             stored.index.mark_all_stale();

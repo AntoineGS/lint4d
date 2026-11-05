@@ -285,6 +285,9 @@ struct Member {
     reuse_tried: bool,
     /// The facts came from the store, not from an extraction.
     reused: bool,
+    /// The facts are too large to store (a fixed capture or store limit):
+    /// the record lists the member without an artifact.
+    over_limit: bool,
     /// The proven record of this member's state, set by this process.
     record: Option<Digest>,
 }
@@ -304,6 +307,9 @@ pub(crate) struct IndexCounts {
     pub(crate) limited: usize,
     pub(crate) deferred: usize,
     pub(crate) retrying: usize,
+    /// Fresh members whose facts are too large to store; their records
+    /// have no artifact, so the next process extracts them again.
+    pub(crate) over_limit: usize,
     /// Members with a proven record set by this process.
     pub(crate) persisted: usize,
 }
@@ -573,6 +579,7 @@ impl ContextIndex {
         member.deferred = 0;
         member.retrying = false;
         member.reused = false;
+        member.over_limit = false;
         member.record = None;
         for name in posting_ids {
             list_remove(&mut self.postings, name, id);
@@ -704,6 +711,17 @@ impl ContextIndex {
         }
     }
 
+    /// The Fresh member's facts are too large to store
+    /// (`IndexCounts::over_limit`).
+    pub(crate) fn mark_over_limit(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            let member = &mut self.members[id.0 as usize];
+            if matches!(member.state(), MemberState::Fresh) {
+                member.over_limit = true;
+            }
+        }
+    }
+
     /// Only a Fresh, Refused or Limited member holds a record.
     pub(crate) fn set_record(&mut self, path: &Path, record: Digest) -> bool {
         let Some(id) = self.id_of(path) else {
@@ -746,6 +764,7 @@ impl ContextIndex {
             match member.state() {
                 MemberState::Fresh => {
                     counts.fresh += 1;
+                    counts.over_limit += usize::from(member.over_limit);
                     if member.reused {
                         counts.reused += 1;
                     } else {
@@ -999,6 +1018,7 @@ impl ContextIndex {
                 member.record = None;
                 member.reuse_tried = false;
                 member.reused = false;
+                member.over_limit = false;
                 true
             }
             MemberState::Unindexed | MemberState::Stale => false,
@@ -1495,6 +1515,7 @@ mod tests {
                 limited: 0,
                 deferred: 1,
                 retrying: 1,
+                over_limit: 0,
                 persisted: 0,
             }
         );

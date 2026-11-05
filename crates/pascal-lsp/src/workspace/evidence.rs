@@ -673,43 +673,36 @@ mod tests {
                 "{observation:?} twice in {evidence:?}"
             );
         }
-        let observations = &indexed.workspace.expansions[&uri]
-            .expanded
-            .session
-            .as_ref()
-            .unwrap()
-            .observations;
-        for observation in observations {
-            match observation {
-                ResolutionObservation::Directory {
-                    path, listed: true, ..
-                } => assert!(
-                    evidence.iter().any(|evidence| matches!(
-                        evidence,
-                        Observation::Listing { path: listed, .. } if listed == path
-                    )),
-                    "{path:?} not in {evidence:?}"
-                ),
-                ResolutionObservation::Candidate { path, .. } => assert!(
-                    evidence.iter().any(|evidence| matches!(
-                        evidence,
-                        Observation::Presence { path: looked, .. } if looked == path
-                    )),
-                    "{path:?} not in {evidence:?}"
-                ),
-                ResolutionObservation::Payload {
-                    path,
-                    revision: SourceRevision::Disk { .. },
-                    ..
-                } => assert!(
-                    evidence.iter().any(|evidence| matches!(
-                        evidence,
-                        Observation::Payload { path: read, .. } if read == path
-                    )),
-                    "{path:?} not in {evidence:?}"
-                ),
-                _ => {}
+        let record = &indexed.workspace.expansions[&uri];
+        let session = record.expanded.session.as_ref().unwrap();
+        let reads = record.expanded.reads.as_ref().unwrap();
+        let context = &indexed.workspace.contexts[&record.context_key].context_observations;
+        // The mapping before deduplication: each observation's own evidence.
+        // A search marker proves nothing alone (its hit or listing does) and
+        // context metadata is proven by the context key: neither has any.
+        let mut mapped = Vec::new();
+        for observation in &session.observations {
+            if matches!(
+                observation,
+                ResolutionObservation::Directory { listed: false, .. }
+            ) {
+                continue;
             }
+            mapped.extend(
+                session_evidence(
+                    std::slice::from_ref(observation),
+                    reads,
+                    context,
+                    &AtomicBool::new(false),
+                )
+                .unwrap_or_else(|gap| panic!("{observation:?}: {gap:?}")),
+            );
+        }
+        for observation in &mapped {
+            assert!(evidence.contains(observation), "{observation:?} dropped");
+        }
+        for observation in &evidence {
+            assert!(mapped.contains(observation), "{observation:?} invented");
         }
     }
 

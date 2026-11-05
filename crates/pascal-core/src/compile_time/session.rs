@@ -130,6 +130,11 @@ pub struct SharedProviderGraph {
     /// How many of the first observations and warnings are the lookup that
     /// found the provider (l4d-4nbs D44).
     pub lookup: (usize, usize),
+    /// The identifiers its interface text and includes hold, when the
+    /// interface is unknown or partly unknown (l4d-onnm, D46). `None`: not
+    /// computed, or no proof (an unresolved include, an unterminated
+    /// comment). Its sources are among `dependencies`.
+    pub names: Option<Arc<InterfaceNames>>,
     /// Bytes the graph retains, for the store's accounting.
     pub retained_bytes: usize,
 }
@@ -780,6 +785,9 @@ fn same_file_state(left: &crate::SourceRevision, right: &crate::SourceRevision) 
         )
 }
 
+/// The names an interface could declare and the includes read to find them.
+type ScannedNames = (Arc<InterfaceNames>, Vec<ProviderDependency>);
+
 /// A provider identity's compiled interface graph, with the most names
 /// prepared so far.
 struct ProviderGraph {
@@ -792,6 +800,8 @@ struct ProviderGraph {
     /// Where the graph is shared beyond the session, with what its
     /// compilation reported: a graph with more names prepared replaces it.
     shared: Option<Arc<SharedOrigin>>,
+    /// The identifiers its interface could declare (l4d-onnm, D46).
+    names: Option<Arc<InterfaceNames>>,
 }
 
 struct SharedOrigin {
@@ -875,12 +885,14 @@ fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
 /// scans, nested parts, lookup trace and key (l4d-4nbs review I1).
 fn shared_retained_bytes(
     graph: Option<&AdmittedInterfaceGraph>,
+    names: Option<&InterfaceNames>,
     key: &ProviderGraphKey,
     origin: &SharedOrigin,
     dependencies: &[ProviderDependency],
 ) -> usize {
     let mut retained_bytes = size_of::<SharedProviderGraph>();
     let mut add = |n: usize| retained_bytes = retained_bytes.saturating_add(n);
+    add(names.map_or(0, InterfaceNames::retained_bytes));
     if let Some(graph) = graph {
         let mut state = 0usize;
         let _ = graph.visit_snapshot_payload(&mut |n| {
@@ -2500,13 +2512,15 @@ impl ProviderEngine<'_, '_> {
             }
             if let Some(provider) = state.interfaces[index].provided.take() {
                 let lookup = state.interfaces[index].lookup.take();
-                match self.compile_provider_interface(
+                let (fact, names) = self.compile_provider_interface(
                     provider,
                     suffix,
                     pointers,
                     depth + 1,
                     lookup.as_deref(),
-                )? {
+                )?;
+                state.interfaces[index].names = names;
+                match fact {
                     Fact::Known(graph) => {
                         state.interfaces[index].occurrence =
                             self.providers.graphs.iter().find_map(|entry| {
@@ -2738,7 +2752,7 @@ impl ProviderEngine<'_, '_> {
         pointers: bool,
         depth: usize,
         lookup: Option<&LookupReports>,
-    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+    ) -> Result<(Fact<AdmittedInterfaceGraph>, Option<Arc<InterfaceNames>>), ResolverError> {
         if self.providers.segments.is_empty() {
             return self.compile_provider_interface_inner(provider, name, pointers, depth, lookup);
         }
@@ -2769,7 +2783,7 @@ impl ProviderEngine<'_, '_> {
         pointers: bool,
         depth: usize,
         lookup: Option<&LookupReports>,
-    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
+    ) -> Result<(Fact<AdmittedInterfaceGraph>, Option<Arc<InterfaceNames>>), ResolverError> {
         self.budget
             .charge(
                 self.providers.active.len() + self.providers.identities.len() + 1,
@@ -2834,7 +2848,7 @@ impl ProviderEngine<'_, '_> {
                 && key.context == provider.context
                 && same_qualifiers(&key.qualifiers, &provider.authorized_qualifiers)
         }) {
-            return Ok(Fact::Unknown(UnknownReason::CyclicProvider));
+            return Ok((Fact::Unknown(UnknownReason::CyclicProvider), None));
         }
         super::declarations::limit(
             self.providers.active.len() + 1,
@@ -2881,7 +2895,8 @@ impl ProviderEngine<'_, '_> {
                 if let Some(origin) = self.providers.graphs[index].shared.clone() {
                     self.providers.note_trace(&origin.trace);
                 }
-                return self.prepare_memoized(index, name, pointers, depth);
+                let names = self.providers.graphs[index].names.clone();
+                return Ok((self.prepare_memoized(index, name, pointers, depth)?, names));
             }
         }
         let shared = if new_identity {
@@ -2906,14 +2921,15 @@ impl ProviderEngine<'_, '_> {
             let found = lookup.is_some_and(|lookup| {
                 lookup.session == self.providers.session && !lookup.reported.0.is_empty()
             });
-            return self.reuse_shared_graph(
+            let fact = self.reuse_shared_graph(
                 provider,
                 metadata,
                 (&hit, key.clone(), found),
                 name,
                 pointers,
                 depth,
-            );
+            )?;
+            return Ok((fact, hit.names.clone()));
         }
         let observations_before = self.observations.len();
         let warnings_before = self.warnings.len();
@@ -3045,6 +3061,32 @@ impl ProviderEngine<'_, '_> {
                 .map_err(|r| resolver_error(r, self.budget))?;
             move_report_vector(self.warnings, owned, self.budget)?;
         }
+        let names = if branch_limited || {
+            let facts = analysis.facts();
+            !facts.interface_complete
+                || facts.unknown
+                || !facts.alternatives.is_empty()
+                || facts.failure.is_some()
+        } {
+            self.interface_names(&provider.unit.source)?
+        } else {
+            None
+        };
+        let dependencies = match &names {
+            Some((_, included)) if !included.is_empty() => {
+                let included = Arc::new(included.clone());
+                self.note_dependencies(&included)?;
+                let mut all = dependencies.as_ref().clone();
+                all.extend(included.iter().cloned());
+                all.sort_by(|a, b| {
+                    (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
+                });
+                all.dedup();
+                Arc::new(all)
+            }
+            _ => dependencies,
+        };
+        let names = names.map(|(names, _)| names);
         let origin = shared_key.map(|key| {
             // The lookup's reports come first, so a session that reuses the
             // interface reports how the provider was found.
@@ -3086,8 +3128,10 @@ impl ProviderEngine<'_, '_> {
                         revision: origin.revision.clone(),
                         lookup: origin.lookup,
                         trace: origin.trace.clone(),
+                        names: names.clone(),
                         retained_bytes: shared_retained_bytes(
                             None,
+                            names.as_deref(),
                             &origin.key,
                             origin,
                             &dependencies,
@@ -3102,10 +3146,11 @@ impl ProviderEngine<'_, '_> {
                     graph: None,
                     dependencies,
                     shared: origin,
+                    names: names.clone(),
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             push_owner(&mut self.providers.graphs, entry, self.budget)?;
-            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+            return Ok((Fact::Unknown(UnknownReason::UnresolvedName), names));
         }
         let output = analysis.value_mut();
         let occurrences = &output.occurrences;
@@ -3172,8 +3217,10 @@ impl ProviderEngine<'_, '_> {
                     revision: origin.revision.clone(),
                     lookup: origin.lookup,
                     trace: origin.trace.clone(),
+                    names: names.clone(),
                     retained_bytes: shared_retained_bytes(
                         Some(&graph),
+                        names.as_deref(),
                         &origin.key,
                         origin,
                         &dependencies,
@@ -3188,10 +3235,11 @@ impl ProviderEngine<'_, '_> {
                 graph: Some(graph.clone()),
                 dependencies,
                 shared: origin,
+                names: names.clone(),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
-        Ok(Fact::Known(graph))
+        Ok((Fact::Known(graph), names))
     }
 
     /// Credit the scans a reused interface's compilation made as if this
@@ -3217,6 +3265,98 @@ impl ProviderEngine<'_, '_> {
         self.budget
             .charge_scanned(granted, 0, 0)
             .map_err(|r| resolver_error(r, self.budget))
+    }
+
+    /// The identifiers the interface of `source` could declare, and the
+    /// includes read to find them (l4d-onnm, D46). `None`: no proof, because
+    /// an include does not resolve, a comment or string does not end, or a
+    /// limit was reached. Cancellation still ends the request.
+    fn interface_names(
+        &mut self,
+        source: &LoadedSource,
+    ) -> Result<Option<ScannedNames>, ResolverError> {
+        let before = self.budget.manual_retained();
+        let mut names = Vec::new();
+        let mut included = Vec::new();
+        let mut active = vec![source.id.clone()];
+        let result = self.scan_names(source, true, &mut active, &mut names, &mut included);
+        self.budget
+            .release(self.budget.manual_retained().saturating_sub(before));
+        match result {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(ResolverError::LimitExceeded { .. }) => {
+                // The refused charge was absorbed here: a later failure must
+                // not report its observation.
+                self.budget.clear_failed_charge();
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(Some((Arc::new(InterfaceNames::new(names)), included)))
+    }
+
+    fn scan_names(
+        &mut self,
+        source: &LoadedSource,
+        root: bool,
+        active: &mut Vec<crate::SourceId>,
+        names: &mut Vec<Box<str>>,
+        included: &mut Vec<ProviderDependency>,
+    ) -> Result<bool, ResolverError> {
+        let funded = self
+            .providers
+            .fund_validation(source, self.resolver, self.budget)?;
+        let text = super::coordinates::text(source, self.budget, self.cancel, funded)?;
+        let floor = self
+            .resolver
+            .scan_credit_floor(source)
+            .max(self.providers.credit_floor(source));
+        let scan = super::names::scan(&text, root, floor, self.budget)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        drop(text);
+        self.resolver.note_scanned(source, scan.end);
+        self.providers.note_scanned(source, scan.end, self.budget)?;
+        if !scan.proof {
+            return Ok(false);
+        }
+        names.extend(scan.names);
+        for (range, name) in scan.includes {
+            if active.len() > self.resolver.max_include_depth() {
+                return Ok(false);
+            }
+            let outcome = self.budget.external(|budget| {
+                self.resolver.include_capability(
+                    IncludeResolveRequest {
+                        including_path: &source.path,
+                        byte_range: range,
+                        requested_name: &name,
+                        legacy_route: None,
+                    },
+                    budget,
+                    self.cancel,
+                )
+            })?;
+            let (result, reports) = outcome.into_parts();
+            reports.consume_into(self.observations, self.warnings, self.budget)?;
+            let Resolution::Found(child) = result.result() else {
+                drop(result);
+                return Ok(false);
+            };
+            let child = child.clone();
+            drop(result);
+            if active.contains(&child.id) {
+                return Ok(false);
+            }
+            included.push(ProviderDependency::of(&child));
+            active.push(child.id.clone());
+            let proven = self.scan_names(&child, false, active, names, included)?;
+            active.pop();
+            if !proven {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Record that the compilation in progress used `dependencies`.
@@ -3307,6 +3447,7 @@ impl ProviderEngine<'_, '_> {
                     scanned: hit.scanned.clone(),
                     children: hit.children.clone(),
                 })),
+                names: hit.names.clone(),
             })
             .map_err(|r| resolver_error(r, self.budget))?;
         push_owner(&mut self.providers.graphs, entry, self.budget)?;
@@ -3590,8 +3731,10 @@ impl ProviderEngine<'_, '_> {
             revision: origin.revision.clone(),
             lookup: origin.lookup,
             trace: origin.trace.clone(),
+            names: entry.names.clone(),
             retained_bytes: shared_retained_bytes(
                 Some(&prepared),
+                entry.names.as_deref(),
                 &origin.key,
                 &origin,
                 &entry.dependencies,
@@ -3651,6 +3794,7 @@ impl RootSession<'_, '_> {
                                 occurrence: None,
                                 lookup: None,
                                 pending,
+                                names: None,
                                 attempted: activity != Truth::True,
                                 provided: None,
                                 failure: if activity != Truth::True {
@@ -5516,8 +5660,11 @@ mod tests {
                 };
                 assert!(out.reports().warnings().len() < 8);
                 assert!(out.reports().observations().len() < 64);
-                self.warnings = out.reports().warnings().to_vec();
-                self.observations = out.reports().observations().to_vec();
+                // A provider's unknown interface resolves its includes again
+                // to scan them for names (l4d-onnm): keep every report.
+                self.warnings.extend_from_slice(out.reports().warnings());
+                self.observations
+                    .extend_from_slice(out.reports().observations());
                 Ok(out)
             }
             fn unit_report_capability(

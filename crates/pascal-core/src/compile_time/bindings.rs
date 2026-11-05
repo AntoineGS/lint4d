@@ -78,6 +78,9 @@ pub(super) struct InterfaceFacts {
     pub attempted: bool,
     pub provided: Option<super::session::AdmittedProviderSource>,
     pub failure: Option<UnknownReason>,
+    /// The identifiers an unknown or partly unknown interface could declare
+    /// (l4d-onnm, D46): a name outside them is not declared there.
+    pub names: Option<std::sync::Arc<super::InterfaceNames>>,
 }
 
 #[derive(Debug, Clone, Hash)]
@@ -135,6 +138,7 @@ impl InterfaceFacts {
             }
         }
         self.graph.as_ref().map(|g| g.fingerprint()).hash(&mut h);
+        self.names.hash(&mut h);
         h.finish()
     }
     pub(super) fn visit_recovery_payload(
@@ -185,6 +189,9 @@ impl InterfaceFacts {
         }
         if recovery && let Some(graph) = &self.graph {
             graph.visit_recovery_payload(visit)?;
+        }
+        if recovery && let Some(names) = &self.names {
+            visit(names.retained_bytes())?;
         }
         Ok(())
     }
@@ -240,6 +247,9 @@ pub(super) fn imported_declaration<'a>(
         // After qualified exclusion, they prevent an unqualified identity proof.
         if !interface.pending.authorized {
             return Ok(Some(Fact::Unknown(UnknownReason::UnknownActivity)));
+        }
+        if !qualified && proven_undeclared(interface, root, budget)? {
+            continue;
         }
         let Some(graph) = &interface.graph else {
             if qualified || !name.contains('.') {
@@ -317,6 +327,9 @@ pub(super) fn imported_operand_with_query(
             .next()
             .unwrap_or(suffix)
             .trim();
+        if !qualified && proven_undeclared(interface, root, budget)? {
+            continue;
+        }
         let Some(graph) = &interface.graph else {
             if qualified || !text.contains('.') {
                 return Ok(Some(Fact::Unknown(
@@ -374,6 +387,28 @@ pub(super) fn imported_operand_with_query(
         result = Some(fact);
     }
     Ok(result)
+}
+
+/// An interface that is unknown, or partly unknown, still cannot declare a
+/// name that never occurs as an identifier in its interface text or the
+/// includes it could expand there (l4d-onnm, D46). A known interface is
+/// read instead.
+fn proven_undeclared(
+    interface: &InterfaceFacts,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let Some(names) = &interface.names else {
+        return Ok(false);
+    };
+    let unknown = interface.graph.as_ref().is_none_or(|graph| {
+        !graph.alternatives.is_empty() || graph.failure.is_some() || graph.unknown
+    });
+    if !unknown {
+        return Ok(false);
+    }
+    budget.charge(names.len().max(1).ilog2() as usize + 1, name.len(), 0)?;
+    Ok(!names.may_declare(name))
 }
 
 /// Match the preparation path's authorized, source-visible provider spellings.

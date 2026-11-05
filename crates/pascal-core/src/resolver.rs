@@ -15831,14 +15831,18 @@ mod tests {
                 assert_eq!(r.requested_name, "export.inc");
                 let out = self.inner.include_capability(r, b, c)?;
                 self.incomplete = matches!(out.result(),Resolution::Incomplete {reason,candidates} if reason=="include export.inc lookup was incomplete" && candidates.is_empty());
+                // A provider's unknown interface resolves the include again to
+                // scan it for names (l4d-onnm); its report is not repeated.
                 if self.incomplete {
-                    let warning = out
-                        .reports()
-                        .warnings()
-                        .iter()
-                        .find(|w| w.starts_with("include candidate could not be loaded:"))
-                        .expect("actual typed limit warning");
-                    self.warning = Some((warning.clone(), warning.as_ptr() as usize));
+                    if self.warning.is_none() {
+                        let warning = out
+                            .reports()
+                            .warnings()
+                            .iter()
+                            .find(|w| w.starts_with("include candidate could not be loaded:"))
+                            .expect("actual typed limit warning");
+                        self.warning = Some((warning.clone(), warning.as_ptr() as usize));
+                    }
                 } else {
                     assert!(
                         matches!(out.result(),Resolution::Found(source) if source.path.ends_with("export.inc"))

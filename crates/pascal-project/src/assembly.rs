@@ -1493,10 +1493,18 @@ fn merge_project_conditional_context(
     warnings: &mut Vec<String>,
 ) -> ConditionalContext {
     let mut context = options.conditional_context.clone();
+    // The DCC task passes DCC_Define as `-D<list>`, and dcc defines every
+    // identifier of an item: `-DX.Y` defines X and Y, `-DX-Y` too (dcc32
+    // 21.0, l4d-onnm).
     for define in project_defines {
-        let name = define.trim().trim_start_matches('&').to_ascii_uppercase();
-        if !name.is_empty() && !context.defines.contains_key(&name) {
-            context.set_define(name, ConditionalFact::True);
+        for name in define
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|name| !name.is_empty())
+        {
+            let name = name.to_ascii_uppercase();
+            if !context.defines.contains_key(&name) {
+                context.set_define(name, ConditionalFact::True);
+            }
         }
     }
 

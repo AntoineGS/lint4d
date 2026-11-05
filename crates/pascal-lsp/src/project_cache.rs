@@ -6729,6 +6729,9 @@ pub(crate) struct IndexMembership {
     pub(crate) limit: Option<String>,
     pub(crate) packages: bool,
     pub(crate) owner_pending: usize,
+    /// The cache digest of the context the members belong to: the crawl's
+    /// publications under it count as the members' (`IndexCounts::persisted`).
+    pub(crate) context: Option<pascal_cache::Digest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6834,8 +6837,21 @@ pub(crate) struct IndexStatusEntry {
 }
 
 impl IndexStatusEntry {
-    fn of(stored: &StoredIndex, is_open: &dyn Fn(&Path) -> bool) -> Self {
-        let counts = stored.index.counts();
+    fn of(
+        stored: &StoredIndex,
+        crawl_published: &HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+        is_open: &dyn Fn(&Path) -> bool,
+    ) -> Self {
+        let counts = match stored.membership.context {
+            Some(context) => stored.index.counts_with(&|path, hash| {
+                crawl_published.get(path).is_some_and(|published| {
+                    published
+                        .iter()
+                        .any(|&(h, c)| c == context && hash.is_none_or(|hash| hash == h))
+                })
+            }),
+            None => stored.index.counts(),
+        };
         let (anchor_is_project, uri) = match &stored.anchor {
             IndexAnchor::Document(uri) => (false, uri.to_string()),
             IndexAnchor::Project(path) => (
@@ -7644,7 +7660,7 @@ impl ProjectCache {
         stored
             .into_iter()
             .take(MAX_INDEXED_CONTEXTS)
-            .map(|stored| IndexStatusEntry::of(stored, is_open))
+            .map(|stored| IndexStatusEntry::of(stored, &store.crawl_published, is_open))
             .collect()
     }
 
@@ -8462,6 +8478,75 @@ mod index_tests {
         assert_eq!(json["crawlPublished"], 2, "{json}");
         assert_eq!(json["crawlDeferred"], 1, "{json}");
         assert_eq!(json["providerGraphsRefused"], 0, "{json}");
+    }
+
+    fn membership_under(paths: &[&str], context: pascal_cache::Digest) -> IndexMembership {
+        IndexMembership {
+            context: Some(context),
+            ..membership(paths)
+        }
+    }
+
+    /// 13b-4 (A3): `persisted` counts the members of the context whose
+    /// units the crawl published under its digest, before any index batch.
+    #[test]
+    fn persisted_counts_crawl_publications_of_the_context() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let mine = pascal_cache::Digest::from_bytes([3; 32]);
+        let other = pascal_cache::Digest::from_bytes([4; 32]);
+        let paths = ["/w/A.pas", "/w/B.pas", "/w/C.pas", "/w/D.pas"];
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership_under(&paths, mine),
+            usize::MAX,
+        );
+        cache.note_published(Path::new("/w/A.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/B.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/C.pas"), 1, other, &[]);
+        cache.note_published(Path::new("/w/NotMember.pas"), 1, mine, &[]);
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!(counts.persisted, 2, "{counts:?}");
+        assert_eq!(counts.pending, 4, "{counts:?}");
+    }
+
+    /// 13b-4: a member published by both the index and the crawl counts
+    /// once; a Fresh member whose crawl publication is of other bytes, and
+    /// an over-limit member (no artifact), do not count.
+    #[test]
+    fn persisted_counts_each_member_once_and_only_with_an_artifact() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let mine = pascal_cache::Digest::from_bytes([3; 32]);
+        let paths = ["/w/Both.pas", "/w/OtherBytes.pas", "/w/Big.pas"];
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership_under(&paths, mine),
+            usize::MAX,
+        );
+        for path in paths {
+            assert_eq!(publish(&cache, &k, path), PublishOutcome::Indexed);
+        }
+        {
+            let mut store = cache.index();
+            let index = &mut store.contexts.get_mut(&k).unwrap().index;
+            assert!(index.set_record(
+                Path::new("/w/Both.pas"),
+                pascal_cache::Digest::from_bytes([9; 32])
+            ));
+            assert!(index.set_record(
+                Path::new("/w/Big.pas"),
+                pascal_cache::Digest::from_bytes([8; 32])
+            ));
+            index.mark_over_limit(Path::new("/w/Big.pas"));
+        }
+        cache.note_published(Path::new("/w/Both.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/OtherBytes.pas"), 2, mine, &[]);
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!(counts.persisted, 1, "{counts:?}");
+        assert_eq!(counts.over_limit, 1, "{counts:?}");
     }
 
     /// Task 10b: a member reused from the store is never counted as

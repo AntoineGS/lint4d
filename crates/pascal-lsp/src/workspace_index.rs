@@ -310,7 +310,13 @@ pub(crate) struct IndexCounts {
     /// Fresh members whose facts are too large to store; their records
     /// have no artifact, so the next process extracts them again.
     pub(crate) over_limit: usize,
-    /// Members with a proven record set by this process.
+    /// Members whose artifact and record are known published in this
+    /// process, each counted once: a Fresh member with a record this process
+    /// proved (reused members included; `over_limit` members are not, their
+    /// record has no artifact), or a member the crawl published under this
+    /// context's digest (a Fresh member only from the same bytes; a pending
+    /// member by path, since an invalidation forgets the publication).
+    /// Refused and Limited members have no artifact and never count.
     pub(crate) persisted: usize,
 }
 
@@ -755,14 +761,28 @@ impl ContextIndex {
     }
 
     pub(crate) fn counts(&self) -> IndexCounts {
+        self.counts_with(&|_, _| false)
+    }
+
+    /// `counts`, where `crawl_published(path, hash)` says the crawl
+    /// published `path` under this context; `hash` is the bytes a Fresh
+    /// member was indexed from, `None` for a pending member.
+    pub(crate) fn counts_with(
+        &self,
+        crawl_published: &dyn Fn(&Path, Option<u64>) -> bool,
+    ) -> IndexCounts {
         let mut counts = IndexCounts {
             members: self.by_path.len(),
             ..IndexCounts::default()
         };
         for member in self.by_path.values().map(|id| &self.members[id.0 as usize]) {
-            counts.persisted += usize::from(member.record.is_some());
             match member.state() {
                 MemberState::Fresh => {
+                    counts.persisted += usize::from(if member.record.is_some() {
+                        !member.over_limit
+                    } else {
+                        crawl_published(&member.path, member.hash)
+                    });
                     counts.fresh += 1;
                     counts.over_limit += usize::from(member.over_limit);
                     if member.reused {
@@ -772,6 +792,7 @@ impl ContextIndex {
                     }
                 }
                 MemberState::Unindexed | MemberState::Stale => {
+                    counts.persisted += usize::from(crawl_published(&member.path, None));
                     counts.pending += 1;
                     counts.reuse_pending += usize::from(!member.reuse_tried);
                     if member.retrying {

@@ -1454,7 +1454,8 @@ Each context has:
 | --- | --- |
 | `anchor` | `{"document": uri}` or `{"project": uri}`, at most 512 bytes; `anchorTruncated` says if it was cut |
 | `members`, `fresh` | Members of the project and those whose index entry is current |
-| `reused`, `extracted`, `persisted` | Members reused from the store, parsed in this process, and with a record proven by this process (includes reused members) |
+| `reused`, `extracted` | Members reused from the store and parsed in this process |
+| `persisted` | Members whose artifact and record this process knows are published, each counted once: indexed members with a record it proved (reused members included), and members the open-file crawl published under this context's cache key from the current bytes (so it rises while the crawl runs, before any index batch reaches them). `overLimit` members are not counted (their record has no artifact), nor are refused and limited members. Computed in memory, without reading the store |
 | `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
 | `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
 | `overLimit` | Fresh members whose facts are too large to store (more distinct reads than a capture holds, or a store size limit): indexed in this process, recorded without an artifact, and extracted again by the next start |

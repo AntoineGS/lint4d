@@ -281,6 +281,15 @@ fn a_server_killed_during_the_crawl_reuses_what_the_crawl_published() {
     initialize_and_open(&mut first, &root, "App.dpr");
     barrier.wait_until_entered();
     assert_nothing_extracted(&mut first);
+    let held = request(&mut first, "pascal/indexStatus", json!({}));
+    assert!(
+        held["contexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|context| context["persisted"] == CRAWLED),
+        "persisted counts the crawl's publications before any batch: {held}"
+    );
     first.kill();
 
     let mut second = launch(environment.path());

@@ -1899,6 +1899,7 @@ impl Workspace {
         let mut membership = IndexMembership {
             complete: true,
             packages: !context.packages().is_empty(),
+            context: Some(CacheContextKey::new(&context).digest()),
             ..IndexMembership::default()
         };
         let mut paths = Vec::new();

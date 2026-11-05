@@ -109,6 +109,9 @@ pub struct CompileTimeState {
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// The previous token was `=` (or `= packed`): a `class` here is a
+    /// type, also inside a composite body (a nested class).
+    after_eq: bool,
     /// A composite header's heritage list opened at this paren level
     /// (`class(Exception)`): a `;` right after it ends a bodiless class.
     class_heritage: Option<usize>,
@@ -262,6 +265,7 @@ impl CompileTimeState {
             composite_depth: 0,
             rhs: false,
             pending_class: false,
+            after_eq: false,
             class_heritage: None,
             parens: 0,
             implementation: false,
@@ -552,6 +556,9 @@ impl CompileTimeState {
             return Ok(());
         }
         self.flush_word(budget)?;
+        if !ch.is_whitespace() {
+            self.after_eq = ch == '=';
+        }
         self.escaped_word = matches!(ch, '@' | '&');
         if ch == ';'
             && let Some(header) = &mut self.anonymous_header
@@ -750,11 +757,13 @@ impl CompileTimeState {
         }
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
+        let after_eq = std::mem::take(&mut self.after_eq);
         let result = if std::mem::take(&mut self.escaped_word) {
             Ok(())
         } else {
-            self.process_word(&word, budget)
+            self.process_word(&word, after_eq, budget)
         };
+        self.after_eq = after_eq && word == "packed";
         drop(word);
         budget.release(std::mem::replace(&mut self.word_backing, 0));
         result
@@ -763,6 +772,7 @@ impl CompileTimeState {
     fn process_word(
         &mut self,
         word: &str,
+        after_eq: bool,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
         if self.root_ended {
@@ -827,8 +837,10 @@ impl CompileTimeState {
                     return Ok(());
                 }
             }
+            // In a composite body `class` also prefixes members (`class
+            // function`); after `=` it is a nested class type.
             if matches!(word, "record" | "object" | "interface" | "dispinterface")
-                || (word == "class" && self.composite_depth == 0)
+                || (word == "class" && (self.composite_depth == 0 || after_eq))
             {
                 self.composite_depth += 1;
                 self.pending_class = true;
@@ -974,6 +986,9 @@ impl CompileTimeState {
             drop(source);
             result?;
         }
+        if self.procedural_directive_continuation(budget)? {
+            return Ok(());
+        }
         let (prefix, suffix, kind) = match self.section {
             Section::Imports => (
                 "unit T; interface uses ",
@@ -1069,6 +1084,57 @@ impl CompileTimeState {
             self.section = Section::None;
         }
         result
+    }
+
+    /// A calling convention after a procedural type ends with its own `;`
+    /// (`F: function: Integer; stdcall = Init;`, SysUtils'
+    /// GetFileAttributesExFunc). It and the variable's or typed constant's
+    /// initializer declare nothing: the declaration admitted before it
+    /// stands.
+    fn procedural_directive_continuation(
+        &self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        if !matches!(
+            self.section,
+            Section::Vars | Section::Consts | Section::Types
+        ) {
+            return Ok(false);
+        }
+        budget.charge(1, self.pending.len(), 0)?;
+        let text = self.pending.trim();
+        let end = text
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(text.len());
+        let word = &text[..end];
+        if ![
+            "stdcall", "cdecl", "pascal", "register", "safecall", "winapi", "varargs",
+        ]
+        .iter()
+        .any(|directive| word.eq_ignore_ascii_case(directive))
+        {
+            return Ok(false);
+        }
+        let Some(rest) = text[end..].trim().strip_suffix(';') else {
+            return Ok(false);
+        };
+        let rest = rest.trim();
+        if !(rest.is_empty() || (self.section != Section::Types && rest.starts_with('='))) {
+            return Ok(false);
+        }
+        let scope = self.site().scope;
+        Ok(self.declarations.last().is_some_and(|last| {
+            last.site.scope == scope
+                && matches!(&last.ty, TypeExpr::Unsupported(text) if {
+                    let text = text.trim_start();
+                    let head = text
+                        .find(|c: char| !c.is_ascii_alphabetic())
+                        .map_or(text, |n| &text[..n]);
+                    ["procedure", "function", "reference"]
+                        .iter()
+                        .any(|keyword| head.eq_ignore_ascii_case(keyword))
+                })
+        }))
     }
 
     fn admit_imports(

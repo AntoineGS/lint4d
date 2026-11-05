@@ -370,3 +370,49 @@ fn types_a_member_declaration_refers_to_are_not_members() {
         Truth::True
     );
 }
+
+// Scanner framing the fix above exposed in SysUtils and OtlParallel: each
+// used to end every later proof.
+
+#[test]
+fn a_class_nested_in_a_class_body_keeps_the_framing() {
+    // OtlParallel's TOmniParallelLoop<T>: a nested class type.
+    for nested in [
+        "TInner = class(TObject) private F: Integer; end;",
+        "TInner = class F: Integer; end;",
+        "TInner = class;",
+        "TInner = class(TObject);",
+        "TMeta = class of TObject;",
+        "TInner = class sealed F: Integer; end;",
+    ] {
+        let source = format!(
+            "unit T; interface type TOuter = class strict private type {nested} \
+             var G: Integer; public procedure M; end; TNext = class X: Integer; end; \
+             {CV} implementation end."
+        );
+        assert_eq!(hit(&source), Truth::True, "{nested}");
+    }
+}
+
+#[test]
+fn a_calling_convention_after_a_procedural_type_keeps_the_framing() {
+    // SysUtils' GetFileAttributesExFunc.
+    for declaration in [
+        "function Pre(A: Integer): Boolean; stdcall; forward; \
+         var F: function(A: Integer): Boolean; stdcall = Pre;",
+        "var F: procedure(A: Integer); cdecl;",
+        "type TF = function: Integer; stdcall;",
+        "type TM = procedure of object; register;",
+        "var G: procedure; safecall; varargs;",
+    ] {
+        let source = format!("unit T; interface implementation {declaration} {CV} end.");
+        assert_eq!(hit(&source), Truth::True, "{declaration}");
+    }
+    // Anything else after the procedural type is still not admitted.
+    assert_eq!(
+        hit(&format!(
+            "unit T; interface implementation var F: procedure; stdcall X = 1; {CV} end."
+        )),
+        Truth::Unknown
+    );
+}

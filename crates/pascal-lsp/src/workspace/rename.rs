@@ -1043,6 +1043,7 @@ impl RenameSnapshot {
         include_declaration: bool,
         cancel: &AtomicBool,
         gaps: &mut Coverage,
+        guard: Option<&crate::navigation::DependencyGuard>,
     ) -> Result<Vec<Location>, String> {
         let mut locations = Vec::new();
         let mut seen = HashSet::new();
@@ -1070,6 +1071,7 @@ impl RenameSnapshot {
                     &mut resolution_budget,
                     &mut semantic_budget,
                     gaps,
+                    guard,
                 )?;
             for location in query_locations {
                 for mapped in self.map_location_with_budget(

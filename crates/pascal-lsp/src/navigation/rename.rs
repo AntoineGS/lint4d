@@ -311,6 +311,24 @@ pub(crate) struct ReferenceTargets {
     pub(crate) members: Vec<ReferenceTargetMember>,
 }
 
+/// Whether every member of `binding` is a top-level declaration of `uri`,
+/// one that no unit `uri` uses can shadow unqualified.
+fn binding_is_top_level_in(binding: &Binding, uri: &Url) -> bool {
+    !binding.members.is_empty()
+        && binding.members.iter().all(|member| {
+            member.uri == *uri
+                && member.scope == ROOT_SCOPE
+                && member.owner_type.is_none()
+                && !matches!(
+                    member.kind,
+                    SymbolKind::EnumValue
+                        | SymbolKind::Field
+                        | SymbolKind::Property
+                        | SymbolKind::Unit
+                )
+        })
+}
+
 fn is_explicit_uses_path_keyword(identifier: Node<'_>, document: &Document, span: Span) -> bool {
     if !node_text(identifier, &document.source).eq_ignore_ascii_case("in")
         || !has_ancestor_kind(identifier, "declUses")
@@ -422,6 +440,17 @@ enum BindingGroup {
     Parameter(ParameterBindingKey),
 }
 
+/// What a dependency gap leaves unproven in the documents only it would
+/// withhold (l4d-mayy).
+#[derive(Debug, Default)]
+pub(crate) struct DependencyGuard {
+    /// Index documents whose occurrences are withheld only where an
+    /// unproven unit can reach their binding.
+    pub(crate) documents: HashSet<Url>,
+    /// Units whose declarations are unproven.
+    pub(crate) unproven: HashSet<Url>,
+}
+
 struct BindingLocationOptions<'a> {
     document_uri: Option<&'a Url>,
     strict_resolution: bool,
@@ -431,6 +460,7 @@ struct BindingLocationOptions<'a> {
     work_budget: Option<&'a mut BindingWorkBudget>,
     shared_work_budget: Option<&'a mut super::AssistanceBudget>,
     gaps: Option<&'a mut Coverage>,
+    guard: Option<&'a DependencyGuard>,
 }
 
 struct OccurrenceCollectionOptions<'a> {
@@ -447,6 +477,7 @@ struct OccurrenceCollectionOptions<'a> {
     /// The requested occurrence. It must be proven even for read-only
     /// callers, since it identifies the binding.
     selected: Option<(&'a Url, Span)>,
+    guard: Option<&'a DependencyGuard>,
 }
 
 impl OccurrenceCollectionOptions<'_> {
@@ -502,6 +533,7 @@ impl NavigationIndex {
                 work_budget: None,
                 shared_work_budget: Some(&mut semantic_budget),
                 gaps: None,
+                guard: None,
             },
         )
     }
@@ -532,6 +564,7 @@ impl NavigationIndex {
                 work_budget: Some(work_budget),
                 shared_work_budget: Some(shared_work_budget),
                 gaps: None,
+                guard: None,
             },
         )
     }
@@ -550,6 +583,7 @@ impl NavigationIndex {
         work_budget: &mut BindingWorkBudget,
         shared_work_budget: &mut super::AssistanceBudget,
         gaps: &mut Coverage,
+        guard: Option<&DependencyGuard>,
     ) -> Result<Vec<lsp_types::Location>, String> {
         self.binding_locations_impl(
             uri,
@@ -564,6 +598,7 @@ impl NavigationIndex {
                 work_budget: Some(work_budget),
                 shared_work_budget: Some(shared_work_budget),
                 gaps: Some(gaps),
+                guard,
             },
         )
     }
@@ -634,6 +669,7 @@ impl NavigationIndex {
             shared_work_budget: Some(semantic_budget),
             gaps: None,
             selected: None,
+            guard: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         let position_index = PositionIndex::new_with_cancel(&document.source, cancel)
@@ -891,6 +927,7 @@ impl NavigationIndex {
                 .is_some()
                 .then(|| (uri, Span::from_node(selected_identifier))),
             gaps: options.gaps,
+            guard: options.guard,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         self.locations_for_occurrences(
@@ -1305,6 +1342,7 @@ impl NavigationIndex {
             shared_work_budget: Some(budget),
             gaps: None,
             selected: None,
+            guard: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
@@ -1632,6 +1670,7 @@ impl NavigationIndex {
             shared_work_budget: None,
             gaps: None,
             selected: None,
+            guard: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
@@ -2070,6 +2109,8 @@ impl NavigationIndex {
             #[cfg(test)]
             super::test_record_bound_document(uri);
 
+            let guarded = options.guard.filter(|guard| guard.documents.contains(uri));
+            let own_top_level = guarded.is_some() && binding_is_top_level_in(binding, uri);
             let root = document.tree.root_node();
             let unit_spans = if binding.kind == SymbolKind::Unit {
                 if let Some(shared_work_budget) = options.shared_work_budget.as_deref_mut() {
@@ -2377,6 +2418,39 @@ impl NavigationIndex {
                         })?;
                         continue;
                     }
+                    if guarded.is_some() && !own_top_level {
+                        // A binding declared elsewhere may itself be shadowed
+                        // by what an unproven unit declares: the document is
+                        // withheld, as any importer of a failed unit is.
+                        if let Some(gaps) = options.gaps.as_deref_mut() {
+                            gaps.note(
+                                Some(uri),
+                                "a unit it uses could not be analyzed, so its bindings are unproven",
+                            );
+                        }
+                        continue;
+                    }
+                    if let Some(guard) = guarded
+                        && let Some(reason) = self.dependency_gap_reaches(
+                            guard,
+                            uri,
+                            document,
+                            identifier,
+                            span,
+                            is_binding_member,
+                            member_expression.is_some()
+                                || qualified_type_path.is_some()
+                                || use_name.is_some(),
+                        )
+                    {
+                        options.withhold(uri, Some(span), reason, || {
+                            format!(
+                                "references cannot prove the binding of {:?} at {}:{}: {reason}",
+                                binding.old_key, uri, span.start
+                            )
+                        })?;
+                        continue;
+                    }
                     let occurrence = Occurrence {
                         uri: uri.clone(),
                         span: unit_span.unwrap_or(span),
@@ -2412,6 +2486,111 @@ impl NavigationIndex {
             }
         }
         Ok(occurrences)
+    }
+
+    /// Why a dependency gap may change the binding of a proven occurrence in
+    /// a guarded document, or `None` when it cannot (l4d-mayy).
+    ///
+    /// An occurrence bound to the document's own top-level declaration
+    /// never consulted a unit it uses. The binder resolves an unqualified
+    /// name (`unqualified_references_with_budget_at_scope_and_state`) through,
+    /// in order: generic parameters; `with` receivers; the enclosing routine
+    /// scopes; the members of the enclosing type and of its ancestors; the
+    /// unit's own top-level declarations; and only when none of those holds
+    /// the name, the units of the interface `uses` and, in the
+    /// implementation, of the implementation `uses` too
+    /// (`imported_references_with_budget`), then System. A unit used in
+    /// either clause therefore cannot shadow the unit's own top-level
+    /// declaration. It can still reach the occurrence through a `with`
+    /// receiver or an inherited member of the enclosing type, either of which
+    /// may be declared in an unproven unit, and through a qualifier, resolved
+    /// through the visible units.
+    #[allow(clippy::too_many_arguments)]
+    fn dependency_gap_reaches(
+        &self,
+        guard: &DependencyGuard,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        span: Span,
+        is_binding_member: bool,
+        qualified: bool,
+    ) -> Option<&'static str> {
+        if is_binding_member {
+            return None;
+        }
+        if qualified || has_ancestor_kind(identifier, "with") {
+            return Some(
+                "a unit it uses could not be analyzed, so an occurrence bound through a qualifier or a with statement is unproven",
+            );
+        }
+        let routine_owner = document.owner_type_for_scope(document.scope_at(span.start));
+        let declaration_owners = document
+            .owner_type_contexts
+            .iter()
+            .filter(|context| context.span.contains(span))
+            .map(|context| context.owner_type.clone());
+        for owner in routine_owner.into_iter().chain(declaration_owners) {
+            if !self.type_ancestry_avoids(uri, &owner, &guard.unproven) {
+                return Some(
+                    "an occurrence inside a type whose ancestry is unproven may be shadowed by an inherited member",
+                );
+            }
+        }
+        None
+    }
+
+    /// Whether the type `key` declared in `uri` and every ancestor it
+    /// inherits members from are resolved, and none is declared in an
+    /// `unproven` unit.
+    fn type_ancestry_avoids(&self, uri: &Url, key: &str, unproven: &HashSet<Url>) -> bool {
+        // A nested owner sees its outer types' members too.
+        if key.contains('.') {
+            return false;
+        }
+        let mut state = super::AncestryResolutionState::new();
+        let mut pending = vec![(uri.clone(), key.to_owned())];
+        let mut seen = HashSet::new();
+        while let Some((type_uri, type_key)) = pending.pop() {
+            if !seen.insert((type_uri.clone(), type_key.clone())) {
+                continue;
+            }
+            if unproven.contains(&type_uri) {
+                return false;
+            }
+            let Some(type_document) = self.documents.get(&type_uri) else {
+                return false;
+            };
+            // A helper's members include those of the type it helps.
+            if type_document
+                .helpers
+                .iter()
+                .any(|helper| helper.key == type_key)
+            {
+                return false;
+            }
+            let resolution = self.resolve_type_ancestry(&type_uri, &type_key, &mut state);
+            if resolution.status != super::AncestryStatus::Complete {
+                return false;
+            }
+            let class = type_document
+                .type_ancestry
+                .get(&type_key)
+                .and_then(|entries| entries.first())
+                .is_some_and(|entry| entry.kind == super::TypeKind::Class);
+            // A class with no resolved superclass inherits System's TObject.
+            if class
+                && resolution.parents.is_empty()
+                && self
+                    .units
+                    .get("system")
+                    .is_some_and(|urls| urls.iter().any(|url| unproven.contains(url)))
+            {
+                return false;
+            }
+            pending.extend(resolution.parents);
+        }
+        true
     }
 
     fn locations_for_occurrences(
@@ -4646,6 +4825,7 @@ mod tests {
             &mut work_budget,
             &mut shared,
             &mut gaps,
+            None,
         )?;
         let mut found = locations
             .into_iter()

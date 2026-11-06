@@ -1032,8 +1032,9 @@ fn helper_may_declare(
 
 /// Whether a class or record helper in scope at `site` could declare
 /// `name`. Which helper is active for which type is not modelled: every
-/// helper the unit declares or imports counts. An imported interface
-/// that is not known still cannot declare a member it never spells (D46).
+/// helper the unit declares or imports counts, with its ancestor helpers.
+/// An imported interface that is not known and never spells `helper`
+/// declares no helper (D46); one that does may declare any member.
 fn helpers_may_declare(
     state: &CompileTimeState,
     site: &BindingSite,
@@ -1087,8 +1088,11 @@ fn helpers_may_declare(
         let Some(names) = &interface.names else {
             return Ok(true);
         };
-        budget.charge(names.len().max(1).ilog2() as usize + 1, name.len(), 0)?;
-        if names.may_declare(name) {
+        budget.charge(2 * (names.len().max(1).ilog2() as usize + 1), name.len(), 0)?;
+        // A helper there may inherit the name from an ancestor helper of
+        // another unit, which its own text never spells (review P1, dcc
+        // 37.0): a unit that may declare a helper at all proves nothing.
+        if names.may_declare("helper") || names.may_declare(name) {
             return Ok(true);
         }
     }

@@ -109,6 +109,10 @@ pub struct CompileTimeState {
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// Where the statement that just admitted a procedural-type declaration
+    /// ended, with its section and scope: only a statement starting there
+    /// can be its calling convention.
+    procedural_tail: Option<(Section, ScopeId, usize)>,
     /// The previous token was `=` (or `= packed`): a `class` here is a
     /// type, also inside a composite body (a nested class).
     after_eq: bool,
@@ -266,6 +270,7 @@ impl CompileTimeState {
             rhs: false,
             pending_class: false,
             after_eq: false,
+            procedural_tail: None,
             class_heritage: None,
             parens: 0,
             implementation: false,
@@ -952,6 +957,30 @@ impl CompileTimeState {
         &mut self,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
+        let section = self.section;
+        let admitted = self.declarations.len();
+        let continuation = self.procedural_directive_continuation(budget)?;
+        let result = if continuation {
+            Ok(())
+        } else {
+            self.admit_statement_inner(budget)
+        };
+        let scope = self.site().scope;
+        self.procedural_tail =
+            (matches!(section, Section::Vars | Section::Consts | Section::Types)
+                && (continuation
+                    || (self.declarations.len() > admitted
+                        && self.declarations.last().is_some_and(|last| {
+                            last.site.scope == scope && procedural_type(&last.ty)
+                        }))))
+            .then_some((section, scope, self.logical));
+        result
+    }
+
+    fn admit_statement_inner(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
         if self.section == Section::None && self.unit_name.is_none() && self.sequence.0 == 0 {
             let suffix = " interface implementation end.";
             let len = self.pending.len() + suffix.len();
@@ -985,9 +1014,6 @@ impl CompileTimeState {
             });
             drop(source);
             result?;
-        }
-        if self.procedural_directive_continuation(budget)? {
-            return Ok(());
         }
         let (prefix, suffix, kind) = match self.section {
             Section::Imports => (
@@ -1089,8 +1115,8 @@ impl CompileTimeState {
     /// A calling convention after a procedural type ends with its own `;`
     /// (`F: function: Integer; stdcall = Init;`, SysUtils'
     /// GetFileAttributesExFunc). It and the variable's or typed constant's
-    /// initializer declare nothing: the declaration admitted before it
-    /// stands.
+    /// initializer declare nothing: the declaration admitted right before
+    /// it, in the same section and scope, stands.
     fn procedural_directive_continuation(
         &self,
         budget: &mut CompileTimeBudget<'_>,
@@ -1122,19 +1148,7 @@ impl CompileTimeState {
         if !(rest.is_empty() || (self.section != Section::Types && rest.starts_with('='))) {
             return Ok(false);
         }
-        let scope = self.site().scope;
-        Ok(self.declarations.last().is_some_and(|last| {
-            last.site.scope == scope
-                && matches!(&last.ty, TypeExpr::Unsupported(text) if {
-                    let text = text.trim_start();
-                    let head = text
-                        .find(|c: char| !c.is_ascii_alphabetic())
-                        .map_or(text, |n| &text[..n]);
-                    ["procedure", "function", "reference"]
-                        .iter()
-                        .any(|keyword| head.eq_ignore_ascii_case(keyword))
-                })
-        }))
+        Ok(self.procedural_tail == Some((self.section, self.site().scope, self.pending_start)))
     }
 
     fn admit_imports(
@@ -1844,6 +1858,7 @@ impl CompileTimeState {
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
         self.class_heritage.hash(&mut h);
+        self.procedural_tail.hash(&mut h);
         self.failure.hash(&mut h);
         self.option_stack.len().hash(&mut h);
         for saved in &self.option_stack {
@@ -2099,6 +2114,19 @@ fn push_continuation_char(
     }
     text.push(ch);
     Ok(())
+}
+
+/// A procedural type: `procedure`, `function` or `reference to`.
+fn procedural_type(ty: &TypeExpr) -> bool {
+    matches!(ty, TypeExpr::Unsupported(text) if {
+        let text = text.trim_start();
+        let head = text
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .map_or(text, |n| &text[..n]);
+        ["procedure", "function", "reference"]
+            .iter()
+            .any(|keyword| head.eq_ignore_ascii_case(keyword))
+    })
 }
 
 /// The type a qualified method implementation heading names (`TC` in

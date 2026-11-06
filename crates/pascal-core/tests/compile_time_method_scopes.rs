@@ -267,11 +267,8 @@ fn a_class_helper_member_shadows_in_a_method() {
 }
 
 #[test]
-fn an_unknown_interface_that_never_spells_the_name_declares_no_helper_member() {
-    let provider = branch_limited(
-        "H",
-        "type TCHelper = class helper for TObject procedure Foo; end;",
-    );
+fn an_unknown_interface_that_never_spells_helper_declares_no_helper_member() {
+    let provider = branch_limited("H", "type TOther = class procedure Foo; end;");
     assert_eq!(
         hit_with(
             &method("uses H; type TC = class procedure M; end;", CV),
@@ -279,17 +276,60 @@ fn an_unknown_interface_that_never_spells_the_name_declares_no_helper_member() {
         ),
         Truth::True
     );
-    let provider = branch_limited(
-        "H",
+    // A helper there, even one that spells neither the name nor an
+    // ancestor, keeps it unknown (fix round 1).
+    for helper in [
+        "type TCHelper = class helper for TObject procedure Foo; end;",
         "type TCHelper = class helper for TObject const CompilerVersion = 1; end;",
+        "type TCHelper = record HELPER for Integer end;",
+        "{$I h.inc}",
+    ] {
+        let provider = branch_limited("H", helper);
+        let mut f = Fixture::new(
+            &method("uses H; type TC = class procedure M; end;", CV),
+            context(LayoutPlatform::Win32),
+        );
+        f.unit("H", &provider, context(LayoutPlatform::Win32));
+        f.include("h.inc", "type TIncHelper = class helper for TObject end;");
+        let a = f.analyze().unwrap();
+        assert_eq!(activity(&a, "DEFINE HIT"), Truth::Unknown, "{helper}");
+    }
+}
+
+/// Review P1 (dcc 37.0: False): a helper inherits its ancestor helper's
+/// members from another unit.
+#[test]
+fn a_helper_inherits_its_ancestor_helpers_members() {
+    let base = "unit HB; interface type TBaseH = class helper for TObject \
+        const CompilerVersion = 1; end; implementation end.";
+    let consumer = method("uses HD; type TC = class procedure M; end;", CV);
+    // HD unknown.
+    let derived = branch_limited(
+        "HD",
+        "uses HB; type TDerivH = class helper(TBaseH) for TObject procedure Foo; end;",
     );
     assert_eq!(
-        hit_with(
-            &method("uses H; type TC = class procedure M; end;", CV),
-            &[("H", &provider)]
-        ),
+        hit_with(&consumer, &[("HD", &derived), ("HB", base)]),
         Truth::Unknown
     );
+    // HD known: the ancestor is followed into HB, which declares it.
+    let derived = "unit HD; interface uses HB; type TDerivH = class helper(TBaseH) \
+        for TObject procedure Foo; end; implementation end.";
+    assert_eq!(
+        hit_with(&consumer, &[("HD", derived), ("HB", base)]),
+        Truth::Unknown
+    );
+    // A local helper whose ancestor is imported.
+    let local = method(
+        "uses HB; type TC = class procedure M; end; \
+         TLocalH = class helper(TBaseH) for TObject end;",
+        CV,
+    );
+    assert_eq!(hit_with(&local, &[("HB", base)]), Truth::Unknown);
+    // An ancestor helper without the name, in a known unit, proves it.
+    let base = "unit HB; interface type TBaseH = class helper for TObject \
+        procedure Bar; end; implementation end.";
+    assert_eq!(hit_with(&local, &[("HB", base)]), Truth::True);
 }
 
 #[test]
@@ -415,4 +455,24 @@ fn a_calling_convention_after_a_procedural_type_keeps_the_framing() {
         )),
         Truth::Unknown
     );
+}
+
+/// Review minor 1: the calling-convention skip applies only right after
+/// the procedural declaration, in the same section.
+#[test]
+fn a_calling_convention_named_declaration_in_a_new_section_is_kept() {
+    for (declaration, condition) in [
+        ("var F: procedure; const stdcall = 1;", "stdcall = 1"),
+        ("var F: procedure; const stdcall = 1;", "Declared(stdcall)"),
+        ("type TF = procedure; const cdecl = 2;", "cdecl = 2"),
+        (
+            "var F: procedure; X: Integer; const stdcall = 1;",
+            "stdcall = 1",
+        ),
+    ] {
+        let source = format!(
+            "unit T; interface {declaration} {{$IF {condition}}}{{$DEFINE HIT}}{{$IFEND}} implementation end."
+        );
+        assert_eq!(hit(&source), Truth::True, "{declaration} {condition}");
+    }
 }

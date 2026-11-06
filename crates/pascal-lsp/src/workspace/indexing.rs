@@ -2057,6 +2057,15 @@ impl Workspace {
                                 skip if skip.over_fixed_limit() => {
                                     self.record_over_limit(key, path, hash, cancel);
                                 }
+                                // The session read an input its capture did
+                                // not record: no evidence proves it to
+                                // another process. Listed artifact-less and
+                                // counted, never left memory-only, so the
+                                // snapshot seals and the next process
+                                // retries it last (13c-1, l4d-kqbb).
+                                PersistSkip::Prepare(super::persist::PersistError::Evidence(
+                                    super::evidence::EvidenceGap::Uncaptured,
+                                )) => self.record_unprovable(key, path, uri, cancel),
                                 // Not even the publication pool had room: the
                                 // member stays memory-only (a retryable miss,
                                 // never a refusal record), counted with a gap.
@@ -2098,6 +2107,18 @@ impl Workspace {
         }
         self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
         self.project_cache.mark_index_over_limit(key, path);
+    }
+
+    fn record_unprovable(&self, key: &ContextKey, path: &Path, uri: &Url, cancel: &AtomicBool) {
+        let (kind, input) = self
+            .uncaptured_input(uri)
+            .unwrap_or(("unknown", String::new()));
+        crate::trace::trace!(
+            "  index member {} unprovable: {kind} {input}",
+            path.display()
+        );
+        self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+        self.project_cache.mark_index_unprovable(key, path, kind);
     }
 
     fn refuse_member(
@@ -7828,6 +7849,59 @@ pub(in crate::workspace) mod tests {
             let status = view.project_cache.index_status(&|_| false);
             assert_eq!(status[0].counts.over_limit, 1, "{:?}", status[0]);
             assert!(view.project_cache.index_member_has_record(&key, &member));
+            cache.shutdown();
+        }
+
+        /// 13c-1 (rootcause2 U1): a session whose evidence names an input
+        /// the capture did not record (`Uncaptured`) is never left
+        /// memory-only: it is recorded artifact-less, counted `unprovable`
+        /// (not `persisted`, not `overLimit`) with a gap naming the input's
+        /// kind, it is not extracted again, and the context seals.
+        #[test]
+        fn a_member_with_an_uncaptured_input_is_an_unprovable_artifact_less_member() {
+            const COUNT: usize = 3;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let member = temp.path().join("lib/U0.pas");
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), COUNT, WorkspaceOptions::default());
+            write(&member.with_file_name("x.inc"), "const X = 1;\n");
+            write(
+                &member,
+                "unit U0;\ninterface\n{$I x.inc}\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(temp.path());
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            crate::workspace::capture::set_uncaptured_payload_for_test(Some("x.inc"));
+            let loaded = record_loads();
+            let first = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            let again = advance(&mut view, &anchor, IndexBound::all());
+            set_after_load_hook(None);
+            crate::workspace::capture::set_uncaptured_payload_for_test(None);
+            assert!(first.complete, "{first:?}");
+            assert_eq!(loaded.borrow().len(), COUNT, "each member loaded once");
+            assert_eq!((again.indexed, again.persisted), (0, 0), "{again:?}");
+            assert_eq!(recorded(&view, &key).len(), COUNT);
+            assert!(view.project_cache.index_member_has_record(&key, &member));
+            let status = view.project_cache.index_status(&|_| false);
+            let entry = &status[0];
+            assert_eq!(entry.counts.unprovable, 1, "{entry:?}");
+            assert_eq!(entry.counts.over_limit, 0, "{entry:?}");
+            assert_eq!(entry.counts.persisted, COUNT - 1, "{entry:?}");
+            assert!(
+                // The include's search marker is proven by its hit, the
+                // payload the capture missed: it is the first unproven input.
+                entry.gaps.iter().any(|gap| gap.starts_with(
+                    "1 members read an input the cache cannot prove (first: a directory search)"
+                )),
+                "{entry:?}"
+            );
+            let json = crate::project_cache::index_status_json(&status, Default::default());
+            assert_eq!(json["contexts"][0]["unprovable"], 1, "{json}");
+            assert_eq!(
+                view.seal_baseline_if_due(&key, &mut || Ok(())),
+                crate::workspace::baseline::SealOutcome::Sealed
+            );
             cache.shutdown();
         }
 

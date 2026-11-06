@@ -118,7 +118,12 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
             return;
         }
         let probes = crate::project_cache::dedup_probes(probes);
-        let reads = self.capture.restricted_to(&graph.observations);
+        // The trace's directories too: a reusing session reports them
+        // (`replay_trace`), so its evidence needs their listings even when
+        // this session's report had deduplicated them away (rootcause2 U1).
+        let reads = self
+            .capture
+            .restricted_to(graph.observations.iter().chain(graph.trace.iter()));
         self.cache
             .put_provider_graph(self.configuration, key, graph, probes, reads);
     }

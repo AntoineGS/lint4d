@@ -6863,6 +6863,9 @@ struct StoredIndex {
     /// transient buffers in this process: they stay memory-only, without a
     /// record, and the next start extracts them again (13b-3).
     publications_refused: u64,
+    /// The kind of input the first `unprovable` member of this process
+    /// read without a capture (`Workspace::uncaptured_input`).
+    unprovable_kind: Option<&'static str>,
 }
 
 impl StoredIndex {
@@ -7004,6 +7007,13 @@ impl IndexStatusEntry {
                 counts.over_limit
             ));
         }
+        if counts.unprovable > 0 {
+            gaps.push(format!(
+                "{} members read an input the cache cannot prove (first: {}) and are extracted again by the next start",
+                counts.unprovable,
+                stored.unprovable_kind.unwrap_or("unknown")
+            ));
+        }
         if stored.publications_refused > 0 {
             gaps.push(format!(
                 "{} members found no memory to publish and are extracted again by the next start",
@@ -7072,6 +7082,7 @@ impl IndexStatusEntry {
             "persisted": counts.persisted,
             "retrying": counts.retrying,
             "overLimit": counts.over_limit,
+            "unprovable": counts.unprovable,
             "overDeadline": counts.over_deadline,
             "membershipComplete": self.membership_complete,
             "complete": self.complete,
@@ -7394,6 +7405,7 @@ impl ProjectCache {
                     awaiting_room: false,
                     room_wait_failed: false,
                     publications_refused: 0,
+                    unprovable_kind: None,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             stored.membership = membership;
@@ -7689,6 +7701,15 @@ impl ProjectCache {
     pub(crate) fn mark_index_over_limit(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_over_limit(path);
+        }
+    }
+
+    /// `key`'s Fresh member `path` read an input of `kind` that no capture
+    /// recorded, so it cannot be proven to another process.
+    pub(crate) fn mark_index_unprovable(&self, key: &ContextKey, path: &Path, kind: &'static str) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_unprovable(path);
+            stored.unprovable_kind.get_or_insert(kind);
         }
     }
 

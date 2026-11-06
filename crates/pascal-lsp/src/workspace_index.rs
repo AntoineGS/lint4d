@@ -288,6 +288,9 @@ struct Member {
     /// The facts are too large to store (a fixed capture or store limit):
     /// the record lists the member without an artifact.
     over_limit: bool,
+    /// The session's evidence names an input no capture recorded: the
+    /// record lists the member without an artifact (13c-1).
+    unprovable: bool,
     /// The Limited member's extraction passed its deadline (13b-5, A4).
     over_deadline: bool,
     /// The proven record of this member's state, set by this process.
@@ -312,11 +315,16 @@ pub(crate) struct IndexCounts {
     /// Fresh members whose facts are too large to store; their records
     /// have no artifact, so the next process extracts them again.
     pub(crate) over_limit: usize,
+    /// Fresh members whose evidence names an input no capture recorded:
+    /// their records have no artifact, so the next process extracts them
+    /// again.
+    pub(crate) unprovable: usize,
     /// Of `limited`, members whose extraction passed its deadline.
     pub(crate) over_deadline: usize,
     /// Members whose artifact and record are known published in this
     /// process, each counted once: a Fresh member with a record this process
-    /// proved (reused members included; `over_limit` members are not, their
+    /// proved (reused members included; `over_limit` and `unprovable`
+    /// members are not, their
     /// record has no artifact), or a member the crawl published under this
     /// context's digest (a Fresh member only from the same bytes; a pending
     /// member by path, since an invalidation forgets the publication).
@@ -590,6 +598,7 @@ impl ContextIndex {
         member.retrying = false;
         member.reused = false;
         member.over_limit = false;
+        member.unprovable = false;
         member.over_deadline = false;
         member.record = None;
         for name in posting_ids {
@@ -733,6 +742,17 @@ impl ContextIndex {
         }
     }
 
+    /// The Fresh member's evidence names an input no capture recorded
+    /// (`IndexCounts::unprovable`).
+    pub(crate) fn mark_unprovable(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            let member = &mut self.members[id.0 as usize];
+            if matches!(member.state(), MemberState::Fresh) {
+                member.unprovable = true;
+            }
+        }
+    }
+
     /// Only a Fresh, Refused or Limited member holds a record.
     pub(crate) fn set_record(&mut self, path: &Path, record: Digest) -> bool {
         let Some(id) = self.id_of(path) else {
@@ -784,12 +804,13 @@ impl ContextIndex {
             match member.state() {
                 MemberState::Fresh => {
                     counts.persisted += usize::from(if member.record.is_some() {
-                        !member.over_limit
+                        !member.over_limit && !member.unprovable
                     } else {
                         crawl_published(&member.path, member.hash)
                     });
                     counts.fresh += 1;
                     counts.over_limit += usize::from(member.over_limit);
+                    counts.unprovable += usize::from(member.unprovable);
                     if member.reused {
                         counts.reused += 1;
                     } else {
@@ -1050,6 +1071,7 @@ impl ContextIndex {
                 member.reuse_tried = false;
                 member.reused = false;
                 member.over_limit = false;
+                member.unprovable = false;
                 member.over_deadline = false;
                 true
             }
@@ -1548,6 +1570,7 @@ mod tests {
                 deferred: 1,
                 retrying: 1,
                 over_limit: 0,
+                unprovable: 0,
                 over_deadline: 0,
                 persisted: 0,
             }

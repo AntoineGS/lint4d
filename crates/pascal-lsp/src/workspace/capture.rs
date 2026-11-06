@@ -33,6 +33,18 @@ pub(crate) fn set_capture_bound_for_test(bound: Option<usize>) {
     TEST_CAPTURE_BOUND.with(|cell| cell.set(bound));
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_UNCAPTURED_PAYLOAD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests on this thread do not capture payloads whose path ends with
+/// `suffix`, as if the read had escaped the capture.
+#[cfg(test)]
+pub(crate) fn set_uncaptured_payload_for_test(suffix: Option<&str>) {
+    TEST_UNCAPTURED_PAYLOAD.with(|cell| *cell.borrow_mut() = suffix.map(str::to_owned));
+}
+
 fn capture_bound() -> usize {
     #[cfg(test)]
     if let Some(bound) = TEST_CAPTURE_BOUND.with(std::cell::Cell::get) {
@@ -127,7 +139,10 @@ impl CapturedReads {
 
     /// `ReadCapture::restricted_to` over these reads.
     #[cfg(test)]
-    pub(crate) fn restricted_to(&self, observations: &[ResolutionObservation]) -> Self {
+    pub(crate) fn restricted_to<'o>(
+        &self,
+        observations: impl IntoIterator<Item = &'o ResolutionObservation>,
+    ) -> Self {
         restrict(self, &ReadsIndex::of(self), observations)
     }
 
@@ -306,10 +321,10 @@ impl<'a> IndexedReads<'a> {
     }
 }
 
-fn restrict(
+fn restrict<'o>(
     reads: &CapturedReads,
     index: &ReadsIndex,
-    observations: &[ResolutionObservation],
+    observations: impl IntoIterator<Item = &'o ResolutionObservation>,
 ) -> CapturedReads {
     let mut restricted = CapturedReads {
         editor_state: reads.editor_state,
@@ -392,6 +407,14 @@ impl ReadCapture {
         let SourceRevision::Disk { content_hash, .. } = &source.revision else {
             return;
         };
+        #[cfg(test)]
+        if TEST_UNCAPTURED_PAYLOAD.with(|cell| {
+            cell.borrow()
+                .as_deref()
+                .is_some_and(|suffix| source.path.to_string_lossy().ends_with(suffix))
+        }) {
+            return;
+        }
         let payload = CapturedPayload {
             path: source.path.clone(),
             content_hash: *content_hash,
@@ -432,7 +455,10 @@ impl ReadCapture {
     /// the observations name: either makes evidence from the reuse refused
     /// as from the original. An overflow that dropped only reads the
     /// observations do not name stays with this capture.
-    pub(crate) fn restricted_to(&self, observations: &[ResolutionObservation]) -> CapturedReads {
+    pub(crate) fn restricted_to<'o>(
+        &self,
+        observations: impl IntoIterator<Item = &'o ResolutionObservation>,
+    ) -> CapturedReads {
         let captured = self.lock();
         restrict(&captured.reads, &captured.index, observations)
     }

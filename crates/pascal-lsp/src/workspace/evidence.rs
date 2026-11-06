@@ -57,75 +57,105 @@ pub(crate) fn session_evidence(
         if cancel.load(Ordering::Relaxed) {
             return Err(EvidenceGap::Cancelled);
         }
-        evidence.insert(match observation {
-            ResolutionObservation::Directory {
-                complete: false, ..
-            } => return Err(EvidenceGap::Incomplete),
-            ResolutionObservation::Directory {
-                path,
-                listed: false,
-                ..
-            } if searched.proves(path) => continue,
-            ResolutionObservation::Directory { listed: false, .. } => {
-                return Err(EvidenceGap::Uncaptured);
-            }
-            ResolutionObservation::Directory { path, entry, .. } => match reads.listing_of(path) {
-                ListingCapture::One(listing) if listing.overlay => {
-                    return Err(EvidenceGap::Overlay);
-                }
-                ListingCapture::One(listing) if !listing.complete => {
-                    return Err(EvidenceGap::Incomplete);
-                }
-                ListingCapture::One(listing) => Observation::Listing {
-                    path: path.clone(),
-                    entry: entry.clone(),
-                    listing: listing.listing,
-                },
-                ListingCapture::Absent => return Err(EvidenceGap::Uncaptured),
-                ListingCapture::Conflicting => return Err(EvidenceGap::Conflicting),
-            },
-            ResolutionObservation::Candidate {
-                path,
-                entry,
-                present,
-                ..
-            } => Observation::Presence {
-                path: path.clone(),
-                entry: entry.clone(),
-                present: *present,
-            },
-            ResolutionObservation::Payload {
-                revision: SourceRevision::Overlay { .. },
-                ..
-            } => return Err(EvidenceGap::Overlay),
-            ResolutionObservation::Payload {
-                path,
-                revision:
-                    SourceRevision::Disk {
-                        content_hash,
-                        path_entry,
-                        ..
-                    },
-                ..
-            } => match reads.payload_of(path, *content_hash) {
-                Some(content) => Observation::Payload {
-                    path: path.clone(),
-                    entry: path_entry.clone(),
-                    content: *content,
-                },
-                None => return Err(EvidenceGap::Uncaptured),
-            },
-            ResolutionObservation::Metadata(metadata)
-                if context.metadata_observations.contains(metadata) =>
-            {
-                continue;
-            }
-            ResolutionObservation::Metadata(_) | ResolutionObservation::ProjectRead(_) => {
-                return Err(EvidenceGap::Uncaptured);
-            }
-        });
+        if let Some(proof) = observation_evidence(observation, &reads, &searched, context)? {
+            evidence.insert(proof);
+        }
     }
     Ok(evidence.observations)
+}
+
+/// The first of `observations` that `session_evidence` cannot prove, and
+/// why, once the whole-capture checks (overflow, editor state) passed.
+/// Diagnostics only: names what a refused member consulted.
+pub(crate) fn first_unproven<'o>(
+    observations: &'o [ResolutionObservation],
+    reads: &CapturedReads,
+    context: &ProjectObservations,
+) -> Option<(EvidenceGap, &'o ResolutionObservation)> {
+    let reads = reads.indexed();
+    let searched = SearchedDirectories::of(observations, &reads);
+    observations.iter().find_map(|observation| {
+        observation_evidence(observation, &reads, &searched, context)
+            .err()
+            .map(|gap| (gap, observation))
+    })
+}
+
+/// What proves `observation`: `None` when another observation or the
+/// context key does.
+fn observation_evidence(
+    observation: &ResolutionObservation,
+    reads: &IndexedReads<'_>,
+    searched: &SearchedDirectories,
+    context: &ProjectObservations,
+) -> Result<Option<Observation>, EvidenceGap> {
+    Ok(Some(match observation {
+        ResolutionObservation::Directory {
+            complete: false, ..
+        } => return Err(EvidenceGap::Incomplete),
+        ResolutionObservation::Directory {
+            path,
+            listed: false,
+            ..
+        } if searched.proves(path) => return Ok(None),
+        ResolutionObservation::Directory { listed: false, .. } => {
+            return Err(EvidenceGap::Uncaptured);
+        }
+        ResolutionObservation::Directory { path, entry, .. } => match reads.listing_of(path) {
+            ListingCapture::One(listing) if listing.overlay => {
+                return Err(EvidenceGap::Overlay);
+            }
+            ListingCapture::One(listing) if !listing.complete => {
+                return Err(EvidenceGap::Incomplete);
+            }
+            ListingCapture::One(listing) => Observation::Listing {
+                path: path.clone(),
+                entry: entry.clone(),
+                listing: listing.listing,
+            },
+            ListingCapture::Absent => return Err(EvidenceGap::Uncaptured),
+            ListingCapture::Conflicting => return Err(EvidenceGap::Conflicting),
+        },
+        ResolutionObservation::Candidate {
+            path,
+            entry,
+            present,
+            ..
+        } => Observation::Presence {
+            path: path.clone(),
+            entry: entry.clone(),
+            present: *present,
+        },
+        ResolutionObservation::Payload {
+            revision: SourceRevision::Overlay { .. },
+            ..
+        } => return Err(EvidenceGap::Overlay),
+        ResolutionObservation::Payload {
+            path,
+            revision:
+                SourceRevision::Disk {
+                    content_hash,
+                    path_entry,
+                    ..
+                },
+            ..
+        } => match reads.payload_of(path, *content_hash) {
+            Some(content) => Observation::Payload {
+                path: path.clone(),
+                entry: path_entry.clone(),
+                content: *content,
+            },
+            None => return Err(EvidenceGap::Uncaptured),
+        },
+        ResolutionObservation::Metadata(metadata)
+            if context.metadata_observations.contains(metadata) =>
+        {
+            return Ok(None);
+        }
+        ResolutionObservation::Metadata(_) | ResolutionObservation::ProjectRead(_) => {
+            return Err(EvidenceGap::Uncaptured);
+        }
+    }))
 }
 
 /// Evidence observations, each distinct one once in first-seen order. The
@@ -226,6 +256,31 @@ impl Workspace {
             &state.context_observations,
             cancel,
         )
+    }
+
+    /// The kind of the first input of `uri`'s indexed session that its
+    /// capture did not record (`EvidenceGap::Uncaptured`), and a
+    /// description of it for the trace. Status reports name the kind only,
+    /// never a path.
+    pub(crate) fn uncaptured_input(&self, uri: &Url) -> Option<(&'static str, String)> {
+        let record = self.expansions.get(uri)?;
+        let session = record.expanded.session.as_ref()?;
+        let reads = record.expanded.reads.as_ref()?;
+        let state = self.contexts.get(&record.context_key)?;
+        let (gap, observation) =
+            first_unproven(&session.observations, reads, &state.context_observations)?;
+        if gap != EvidenceGap::Uncaptured {
+            return None;
+        }
+        let kind = match observation {
+            ResolutionObservation::Directory { listed: true, .. } => "a directory listing",
+            ResolutionObservation::Directory { .. } => "a directory search",
+            ResolutionObservation::Candidate { .. } => "a file lookup",
+            ResolutionObservation::Payload { .. } => "a source read",
+            ResolutionObservation::Metadata(_) => "project metadata",
+            ResolutionObservation::ProjectRead(_) => "a project file read",
+        };
+        Some((kind, format!("{observation:?}")))
     }
 }
 
@@ -639,6 +694,59 @@ mod tests {
                     content: SourceContent::from_bytes(b"y"),
                 },
             ]
+        );
+    }
+
+    /// Rootcause2 U1: a session that reaches a directory only through a
+    /// reused provider interface's lookups is proven by the listing the
+    /// interface's own session captured. That session listed `gen` before
+    /// it compiled `Prov`, so `gen` is in the graph's trace and not in its
+    /// observations. `BaseA` finds `Prov` in its own directory and never
+    /// lists `gen` itself.
+    #[test]
+    fn a_directory_reached_only_through_a_reused_provider_s_trace_is_proven() {
+        let dproj = b"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib;gen</DCC_UnitSearchPath></PropertyGroup></Project>";
+        let main = b"unit Main;\ninterface\nuses GenB, Prov;\n{$IF GenB.B = 1}const Two = 2;{$ENDIF}\n{$IF Prov.Flag = 1}const One = 1;{$ENDIF}\nimplementation\nend.\n";
+        let base = b"unit BaseA;\ninterface\nuses Prov;\n{$IF Prov.Flag = 1}const One = 1;{$ENDIF}\nimplementation\nend.\n";
+        let provider = b"unit Prov;\ninterface\nuses GenB;\n{$IF GenB.B = 1}const Flag = 1;{$ENDIF}\nimplementation\nend.\n";
+        let generated = b"unit GenB;\ninterface\nconst B = 1;\nimplementation\nend.\n";
+        let files: [(&str, &[u8]); 6] = [
+            ("App.dproj", dproj),
+            ("Main.pas", main),
+            ("BaseA.pas", base),
+            ("Prov.pas", provider),
+            (
+                "lib/Lib.pas",
+                b"unit Lib;\ninterface\nimplementation\nend.\n",
+            ),
+            ("gen/GenB.pas", generated),
+        ];
+        let indexed = index(&files, &["Main.pas", "BaseA.pas"]);
+        assert!(indexed.workspace.project_cache.provider_graph_count() > 0);
+        let uri = indexed.uri("BaseA.pas");
+        let session = indexed.workspace.expansions[&uri]
+            .expanded
+            .session
+            .as_ref()
+            .unwrap();
+        assert!(
+            session.observations.iter().any(|observation| matches!(
+                observation,
+                ResolutionObservation::Directory { path, listed: true, .. } if path.ends_with("gen")
+            )),
+            "BaseA reaches gen through Prov: {:?}",
+            session.observations
+        );
+        let evidence = indexed
+            .workspace
+            .source_evidence(&uri, &AtomicBool::new(false))
+            .unwrap();
+        assert!(
+            evidence.iter().any(|observation| matches!(
+                observation,
+                Observation::Listing { path, .. } if path.ends_with("gen")
+            )),
+            "{evidence:?}"
         );
     }
 

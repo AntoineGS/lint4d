@@ -7888,6 +7888,33 @@ impl ProjectCache {
         self.index().contexts.contains_key(key)
     }
 
+    /// A8: when no index is stored under `key` but one is stored under a
+    /// key that differs from it only in the runtime selection (the same
+    /// project resolved before `pascal/selectProject` selected it), that
+    /// index moves to `key` instead of being built again. The directory
+    /// owners recorded against the old key are forgotten, as on eviction.
+    /// Returns whether an index moved.
+    pub(crate) fn rekey_index_selection(&self, key: &ContextKey) -> bool {
+        let mut store = self.index();
+        if store.contexts.contains_key(key) {
+            return false;
+        }
+        let Some(old) = store
+            .contexts
+            .keys()
+            .find(|old| old.differs_only_in_selection(key))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(stored) = store.contexts.remove(&old) else {
+            return false;
+        };
+        store.contexts.insert(key.clone(), stored);
+        store.owners.retain(|_, owner| *owner != old);
+        true
+    }
+
     /// Whether the store holds an index built for `anchor`.
     pub(crate) fn holds_index_for(&self, anchor: &IndexAnchor) -> bool {
         self.index()

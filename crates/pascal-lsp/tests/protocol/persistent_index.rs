@@ -344,6 +344,55 @@ fn a_configured_project_reuses_what_a_killed_crawl_published() {
     shutdown(second);
 }
 
+/// A8 (13b-6): `pascal/selectProject` selecting the project an absolute
+/// `projectFile` already names gives one context, not one per anchor: an
+/// open unit's owner resolved before the selection is indexed under the
+/// project's anchor, and every member is extracted once. `wait_index`
+/// asserts at most one context on every poll.
+#[test]
+fn a_selected_configured_project_is_one_index_context() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = fixture(environment.path(), UNITS);
+    let project = root.join("App.dproj");
+    let mut server = launch(environment.path());
+    server.initialize(&root, json!({"projectFile": project.display().to_string()}));
+    open_disk(&mut server, &root.join("lib/U1.pas"));
+    request(
+        &mut server,
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&root.join("App.dpr"))}, "projectUri": uri(&project)}),
+    );
+    let done = wait_index(&mut server, persisted);
+    assert_eq!(done["anchor"]["project"], uri(&project).as_str(), "{done}");
+    assert_eq!(done["members"], MEMBERS, "{done}");
+    assert_eq!(done["extracted"], MEMBERS, "{done}");
+    assert_nothing_refused(&done);
+    let status = request(&mut server, "pascal/indexStatus", json!({}));
+    assert_eq!(status["contexts"].as_array().unwrap().len(), 1, "{status}");
+    shutdown(server);
+}
+
+/// Task 10b follow-up (13b-6): a relative `projectFile` is looked up under
+/// the workspace root, so the project's anchor indexes the context.
+#[test]
+fn a_relative_configured_project_is_indexed_under_its_project_anchor() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = fixture(environment.path(), UNITS);
+    let mut server = launch(environment.path());
+    server.initialize(&root, json!({"projectFile": "App.dproj"}));
+    open_disk(&mut server, &root.join("App.dpr"));
+    let done = wait_index(&mut server, persisted);
+    assert_eq!(
+        done["anchor"]["project"],
+        uri(&root.join("App.dproj")).as_str(),
+        "{done}"
+    );
+    assert_eq!(done["members"], MEMBERS, "{done}");
+    assert_eq!(done["extracted"], MEMBERS, "{done}");
+    assert_nothing_refused(&done);
+    shutdown(server);
+}
+
 #[test]
 fn two_servers_index_the_same_workspace() {
     let environment = tempfile::tempdir().unwrap();

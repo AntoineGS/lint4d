@@ -857,11 +857,11 @@ impl Workspace {
         before_io: &mut dyn FnMut() -> Result<(), String>,
         cancel: &AtomicBool,
     ) -> Result<IndexProgress, String> {
-        let key = self.index_context_for(anchor, cancel)?;
+        let (key, anchor) = self.index_target_for(anchor, cancel)?;
         // Skipped files prune the contexts no document uses, and a build
         // view holds a document only while it loads one.
         self.pinned_context = Some(key.clone());
-        self.ensure_index_membership(&key, anchor, cancel)?;
+        self.ensure_index_membership(&key, &anchor, cancel)?;
         let persisting = self.persistent_cache().is_enabled();
         // A publication refused for room: the batch waits once at most for
         // the maintenance it woke (here, or before its next extraction).
@@ -1044,7 +1044,7 @@ impl Workspace {
                 }
             }
         }
-        self.ensure_index_membership(&key, anchor, cancel)?;
+        self.ensure_index_membership(&key, &anchor, cancel)?;
         let (all_pending, untried, reuse_pending, generation, retrying) = self
             .project_cache
             .read_index(&key, |index, _| {
@@ -1960,30 +1960,77 @@ impl Workspace {
         anchor: &IndexAnchor,
         cancel: &AtomicBool,
     ) -> Result<ContextKey, String> {
-        match anchor {
-            IndexAnchor::Document(uri) => snapshot_context_for_uri(self, uri, cancel, false),
+        self.index_target_for(anchor, cancel).map(|(key, _)| key)
+    }
+
+    /// The context `anchor` names and the anchor that names it once: a
+    /// document whose context has a project file is indexed under its
+    /// project's anchor (A8), the key searches use (`owner_target`). Its
+    /// owner may hold an older resolution of the same project, for instance
+    /// one made before `pascal/selectProject` selected it. When the project
+    /// no longer resolves, the document's own context stays.
+    fn index_target_for(
+        &mut self,
+        anchor: &IndexAnchor,
+        cancel: &AtomicBool,
+    ) -> Result<(ContextKey, IndexAnchor), String> {
+        let uri = match anchor {
             IndexAnchor::Project(descriptor) => {
-                check_workspace_cancel(Some(cancel))?;
-                let uri = Url::from_file_path(descriptor)
-                    .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
-                let roots = self.workspace_root_paths();
-                let mut options = self.project_options();
-                options.project_file = Some(descriptor.clone());
-                let (key, project) =
-                    self.readonly_context_for_uri(&uri, descriptor, &roots, &options)?;
-                self.install_context(
-                    key.clone(),
-                    project.context,
-                    project.observations,
-                    Vec::new(),
-                    HashMap::new(),
-                    descriptor,
-                    Some(cancel),
-                    None,
-                )?;
-                Ok(key)
+                return Ok((
+                    self.project_anchor_context(descriptor, cancel)?,
+                    anchor.clone(),
+                ));
+            }
+            IndexAnchor::Document(uri) => uri,
+        };
+        let key = snapshot_context_for_uri(self, uri, cancel, false)?;
+        let Some(project) = self
+            .contexts
+            .get(&key)
+            .and_then(|state| state.context.project_file().map(Path::to_path_buf))
+        else {
+            return Ok((key, anchor.clone()));
+        };
+        match self.project_anchor_context(&project, cancel) {
+            Ok(project_key) => Ok((project_key, IndexAnchor::Project(project))),
+            Err(error) if error == CANCELLATION_MESSAGE => Err(error),
+            Err(error) => {
+                crate::trace::trace!("  index anchor {uri}: its project did not resolve: {error}");
+                Ok((key, anchor.clone()))
             }
         }
+    }
+
+    /// The context of the Project anchor `descriptor`, resolved and
+    /// retained. An index stored under an earlier resolution of the same
+    /// context, made under another runtime selection, moves to its key
+    /// (A8).
+    fn project_anchor_context(
+        &mut self,
+        descriptor: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<ContextKey, String> {
+        check_workspace_cancel(Some(cancel))?;
+        let uri = Url::from_file_path(descriptor)
+            .map_err(|()| format!("could not create a file URI for {descriptor:?}"))?;
+        let roots = self.workspace_root_paths();
+        let mut options = self.project_options();
+        options.project_file = Some(descriptor.to_path_buf());
+        let (key, project) = self.readonly_context_for_uri(&uri, descriptor, &roots, &options)?;
+        self.install_context(
+            key.clone(),
+            project.context,
+            project.observations,
+            Vec::new(),
+            HashMap::new(),
+            descriptor,
+            Some(cancel),
+            None,
+        )?;
+        if self.project_cache.rekey_index_selection(&key) {
+            crate::trace::trace!("  index of {descriptor:?} moved to the current selection");
+        }
+        Ok(key)
     }
 
     /// The compilable units of `key`, from disk only. The unit cap is applied
@@ -3069,7 +3116,7 @@ impl Workspace {
 
     /// The configured project file; a relative one is looked up under the
     /// workspace roots.
-    fn configured_project_path(&self) -> Option<PathBuf> {
+    pub(crate) fn configured_project_path(&self) -> Option<PathBuf> {
         let project = self.configured_project_file()?;
         if project.is_absolute() {
             return Some(project.to_path_buf());
@@ -4954,6 +5001,153 @@ pub(in crate::workspace) mod tests {
         let found = targets(&mut workspace, Some(&uri), TargetPurpose::References);
         assert_eq!(keys(&found), [configured]);
         assert_eq!(found.from_open_or_configured, 1);
+    }
+
+    /// `App.dproj` (main source `App.dpr`, search path `lib`) beside
+    /// `Other.dproj` (main source `Other.dpr`, no search path), with
+    /// `lib/U0..U2.pas`; `projectFile` is the absolute `App.dproj`.
+    fn selectable_projects(root: &Path) -> (Workspace, PathBuf) {
+        let app = project(root, "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>", "");
+        let other = root.join("Other.dproj");
+        write(
+            &other,
+            "<Project><PropertyGroup><MainSource>Other.dpr</MainSource></PropertyGroup><ItemGroup></ItemGroup></Project>",
+        );
+        write(&root.join("Other.dpr"), "program Other; begin end.\n");
+        for index in 0..3 {
+            named_unit(
+                &root.join(format!("lib/U{index}.pas")),
+                &format!("P{index}"),
+            );
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let options = WorkspaceOptions {
+            project_file: Some(app.clone()),
+            ..WorkspaceOptions::default()
+        };
+        (workspace(root, options), app)
+    }
+
+    fn open_from_disk(workspace: &mut Workspace, path: &Path) -> Url {
+        let uri = Url::from_file_path(path).unwrap();
+        workspace
+            .open_document(uri.clone(), fs::read_to_string(path).unwrap(), 1)
+            .unwrap();
+        uri
+    }
+
+    fn select(workspace: &mut Workspace, document: &Path, project: &Path) {
+        workspace
+            .select_project(
+                &Url::from_file_path(document).unwrap(),
+                Some(&Url::from_file_path(project).unwrap()),
+            )
+            .expect("select project");
+    }
+
+    fn status(workspace: &Workspace) -> Vec<crate::project_cache::IndexStatusEntry> {
+        workspace.project_cache.index_status(&|_| false)
+    }
+
+    /// A8 (13b-6): an open document's owner resolved from the absolute
+    /// `projectFile` before `pascal/selectProject` selects that project has
+    /// no selection, the Project anchor's has one. Both anchors still name
+    /// one context: one key, one index, one status entry, every member
+    /// extracted once, under the persisted key the owner's context gives.
+    #[test]
+    fn a_selected_configured_project_and_its_documents_share_one_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, app) = selectable_projects(root);
+        let document = open_from_disk(&mut workspace, &root.join("lib/U0.pas"));
+        let owner_context = workspace.document_owners[&document].state.context.clone();
+        select(&mut workspace, &root.join("App.dpr"), &app);
+
+        let project = IndexAnchor::Project(app.clone());
+        let by_document = context(&mut workspace, IndexAnchor::Document(document.clone()));
+        let by_project = context(&mut workspace, project.clone());
+        assert_eq!(by_document, by_project);
+
+        let first = advance(&mut workspace, &project, IndexBound::all());
+        assert!(first.complete, "{first:?}");
+        let second = advance(
+            &mut workspace,
+            &IndexAnchor::Document(document),
+            IndexBound::all(),
+        );
+        assert_eq!(second.key.as_ref(), Some(&by_project));
+        assert_eq!((second.indexed, second.reused), (0, 0), "{second:?}");
+        let entries = status(&workspace);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0].anchor_is_project, "{entries:?}");
+        let persisted = workspace
+            .project_cache
+            .read_index(&by_project, |_, membership| membership.context)
+            .flatten();
+        assert_eq!(
+            persisted,
+            Some(CacheContextKey::new(&owner_context).digest())
+        );
+    }
+
+    /// A8 (13b-6): the Project anchor indexed before the selection keeps its
+    /// index once the same project is selected: the index moves to the key
+    /// the selection gives, nothing is indexed again.
+    #[test]
+    fn selecting_the_configured_project_later_keeps_its_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, app) = selectable_projects(root);
+        let project = IndexAnchor::Project(app.clone());
+        let before = context(&mut workspace, project.clone());
+        let first = advance(&mut workspace, &project, IndexBound::all());
+        assert!(first.complete, "{first:?}");
+        select(&mut workspace, &root.join("App.dpr"), &app);
+        let after = context(&mut workspace, project.clone());
+        assert!(
+            before.differs_only_in_selection(&after),
+            "{before:?} {after:?}"
+        );
+        assert!(!workspace.project_cache.holds_index(&before));
+        let again = advance(&mut workspace, &project, IndexBound::all());
+        assert_eq!(again.key.as_ref(), Some(&after));
+        assert_eq!((again.indexed, again.reused), (0, 0), "{again:?}");
+        assert!(again.complete, "{again:?}");
+        assert_eq!(status(&workspace).len(), 1);
+    }
+
+    /// A8 (13b-6): a document whose selected project is not the configured
+    /// one keeps its own context beside the configured project's.
+    #[test]
+    fn selecting_another_project_keeps_two_contexts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let configured = named_project(root, "A", true);
+        let other = named_project(root, "B", true);
+        pascal_project::backdate_tree_for_test(root);
+        let options = WorkspaceOptions {
+            project_file: Some(configured.clone()),
+            ..WorkspaceOptions::default()
+        };
+        let mut workspace = workspace(root, options);
+        let document = open_from_disk(&mut workspace, &root.join("B/U.pas"));
+        select(&mut workspace, &root.join("B/U.pas"), &other);
+        let project = IndexAnchor::Project(configured.clone());
+        let by_project = context(&mut workspace, project.clone());
+        let by_document = context(&mut workspace, IndexAnchor::Document(document.clone()));
+        assert_ne!(by_project, by_document);
+        assert_eq!(
+            by_project.project_file.as_deref(),
+            Some(configured.as_path())
+        );
+        assert_eq!(by_document.project_file.as_deref(), Some(other.as_path()));
+        advance(&mut workspace, &project, IndexBound::all());
+        advance(
+            &mut workspace,
+            &IndexAnchor::Document(document),
+            IndexBound::all(),
+        );
+        assert_eq!(status(&workspace).len(), 2);
     }
 
     #[test]

@@ -2275,6 +2275,37 @@ impl ContextKey {
         }
     }
 
+    /// Whether `self` and `other` differ at most in the runtime selection
+    /// current when each was resolved (A8). That is provenance, not
+    /// context: a selection that changes the resolved context also changes
+    /// `project_file` or `context_fingerprint`.
+    pub(crate) fn differs_only_in_selection(&self, other: &Self) -> bool {
+        let Self {
+            project_file,
+            installation_id,
+            workspace_root,
+            project_scope,
+            selection_scope: _,
+            selection_project: _,
+            config,
+            platform,
+            build_selection_modes,
+            conditional_context,
+            context_fingerprint,
+            overrides,
+        } = self;
+        *project_file == other.project_file
+            && *installation_id == other.installation_id
+            && *workspace_root == other.workspace_root
+            && *project_scope == other.project_scope
+            && *config == other.config
+            && *platform == other.platform
+            && *build_selection_modes == other.build_selection_modes
+            && *context_fingerprint == other.context_fingerprint
+            && *conditional_context == other.conditional_context
+            && *overrides == other.overrides
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

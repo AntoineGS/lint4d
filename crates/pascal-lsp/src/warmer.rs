@@ -1131,10 +1131,7 @@ impl Warmer {
     }
 
     pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
-        self.configured_project = workspace
-            .configured_project_file()
-            .filter(|project| project.is_absolute())
-            .map(std::path::Path::to_path_buf);
+        self.configured_project = workspace.configured_project_path();
         let events = self.drain_events(workspace.project_cache());
         let state = workspace.persistent_cache().state();
         let persisting = state == CacheState::Enabled;
@@ -3068,6 +3065,26 @@ mod tests {
             anchors,
             [IndexAnchor::Project(project), IndexAnchor::Document(main)]
         );
+    }
+
+    /// Task 10b follow-up (13b-6): a relative `projectFile` is looked up
+    /// under the workspace roots and gets its Project anchor.
+    #[test]
+    fn a_relative_configured_project_gets_its_project_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("App.dproj");
+        std::fs::write(&project, "<Project></Project>").unwrap();
+        let workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions {
+                project_file: Some("App.dproj".into()),
+                ..Default::default()
+            },
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.poll(&workspace);
+        assert_eq!(warmer.configured_project, Some(project));
     }
 
     #[test]

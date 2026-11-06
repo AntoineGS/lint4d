@@ -1044,7 +1044,11 @@ impl Workspace {
                 }
             }
         }
-        self.ensure_index_membership(&key, &anchor, cancel)?;
+        // The index moved to the key a new selection gives (A8) while the
+        // batch ran: storing a membership here would bring the old key back.
+        if !self.project_cache.index_moved_by_selection(&key) {
+            self.ensure_index_membership(&key, &anchor, cancel)?;
+        }
         let (all_pending, untried, reuse_pending, generation, retrying) = self
             .project_cache
             .read_index(&key, |index, _| {
@@ -2027,7 +2031,12 @@ impl Workspace {
             Some(cancel),
             None,
         )?;
-        if self.project_cache.rekey_index_selection(&key) {
+        if self.project_cache.index_moved_by_selection(&key)
+            && let Some(state) = self.contexts.get(&key)
+            && self
+                .project_cache
+                .rekey_index_selection(&key, CacheContextKey::new(&state.context).digest())
+        {
             crate::trace::trace!("  index of {descriptor:?} moved to the current selection");
         }
         Ok(key)
@@ -2325,12 +2334,17 @@ impl Workspace {
                     owner.key.clone(),
                     owner.state.context.project_file().map(Path::to_path_buf),
                 )),
-                None => match self.index_context_for(&IndexAnchor::Document(uri.clone()), cancel) {
-                    Ok(key) => {
+                None => match self.index_target_for(&IndexAnchor::Document(uri.clone()), cancel) {
+                    Ok((key, anchor)) => {
                         let project = self
                             .contexts
                             .get(&key)
                             .and_then(|state| state.context.project_file().map(Path::to_path_buf));
+                        // The document resolved through its project's anchor:
+                        // `owner_target` need not resolve it again.
+                        if let IndexAnchor::Project(project) = &anchor {
+                            projects.insert(path_key(project), Some(key.clone()));
+                        }
                         Some((key, project))
                     }
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
@@ -3121,10 +3135,17 @@ impl Workspace {
         if project.is_absolute() {
             return Some(project.to_path_buf());
         }
-        self.roots
+        // One match only: a project found under several roots is ambiguous,
+        // as discovery treats it.
+        let mut found = self
+            .roots
             .iter()
-            .map(|root| root.path.join(project))
-            .find(|candidate| candidate.is_file())
+            .map(|root| absolute_path(root.path.join(project)))
+            .filter(|candidate| candidate.is_file());
+        let first = found.next()?;
+        found
+            .all(|other| path_key(&other) == path_key(&first))
+            .then_some(first)
     }
 }
 
@@ -5114,6 +5135,88 @@ pub(in crate::workspace) mod tests {
         assert_eq!((again.indexed, again.reused), (0, 0), "{again:?}");
         assert!(again.complete, "{again:?}");
         assert_eq!(status(&workspace).len(), 1);
+    }
+
+    /// A8 (13b-6 fix round 1): a search re-keys the Project anchor's index
+    /// for a new selection while a batch still runs on the old key; the
+    /// batch's closing membership must not store the old key again.
+    #[test]
+    fn a_batch_on_a_rekeyed_index_does_not_bring_the_old_key_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let (mut workspace, app) = selectable_projects(&root);
+        let project = IndexAnchor::Project(app.clone());
+        let old = context(&mut workspace, project.clone());
+        let selected = old.clone().with_selection_for_test(&root, &app);
+        let cache = workspace.project_cache.clone();
+        let hook_old = old.clone();
+        let hook_selected = selected.clone();
+        set_after_reuse_hook(Some(Box::new(move |_| {
+            if let Some(Some(context)) =
+                cache.read_index(&hook_old, |_, membership| membership.context)
+            {
+                assert!(cache.rekey_index_selection(&hook_selected, context));
+            }
+        })));
+        let progress = advance(&mut workspace, &project, IndexBound::all());
+        set_after_reuse_hook(None);
+        assert_eq!(progress.key.as_ref(), Some(&old));
+        assert!(!workspace.project_cache.holds_index(&old));
+        assert!(workspace.project_cache.holds_index(&selected));
+        assert_eq!(status(&workspace).len(), 1);
+    }
+
+    /// A8 (13b-6 fix round 1): a project index whose membership was computed
+    /// for another persisted context is not moved to the new selection.
+    #[test]
+    fn a_rekey_needs_the_same_persisted_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, app) = selectable_projects(root);
+        let project = IndexAnchor::Project(app.clone());
+        let before = context(&mut workspace, project.clone());
+        advance(&mut workspace, &project, IndexBound::all());
+        workspace
+            .project_cache
+            .with_index_membership_context_for_test(
+                &before,
+                pascal_cache::Digest::from_bytes([9; 32]),
+            );
+        select(&mut workspace, &root.join("App.dpr"), &app);
+        let after = context(&mut workspace, project);
+        assert!(before.differs_only_in_selection(&after));
+        assert!(workspace.project_cache.holds_index(&before));
+        assert!(!workspace.project_cache.holds_index(&after));
+    }
+
+    /// 13b-6 fix round 1: a relative `projectFile` is normalized, and one
+    /// found under two roots is ambiguous.
+    #[test]
+    fn a_relative_configured_project_is_normalized_and_unique() {
+        let temp = tempfile::tempdir().unwrap();
+        let (one, two) = (temp.path().join("one"), temp.path().join("two"));
+        write(&one.join("App.dproj"), "<Project/>");
+        fs::create_dir_all(one.join("lib")).unwrap();
+        let options = |project: &str| WorkspaceOptions {
+            project_file: Some(PathBuf::from(project)),
+            ..WorkspaceOptions::default()
+        };
+        let single = Workspace::with_override_session(
+            vec![one.clone(), two.clone()],
+            options("lib/../App.dproj"),
+            OverrideSession::new(None),
+        );
+        assert_eq!(
+            single.configured_project_path(),
+            Some(one.join("App.dproj"))
+        );
+        write(&two.join("App.dproj"), "<Project/>");
+        let ambiguous = Workspace::with_override_session(
+            vec![one, two],
+            options("App.dproj"),
+            OverrideSession::new(None),
+        );
+        assert_eq!(ambiguous.configured_project_path(), None);
     }
 
     /// A8 (13b-6): a document whose selected project is not the configured

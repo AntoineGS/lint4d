@@ -2275,6 +2275,14 @@ impl ContextKey {
         }
     }
 
+    /// `self` resolved under the runtime selection `scope` → `project`.
+    #[cfg(test)]
+    pub(crate) fn with_selection_for_test(mut self, scope: &Path, project: &Path) -> Self {
+        self.selection_scope = Some(scope.to_path_buf());
+        self.selection_project = Some(project.to_path_buf());
+        self
+    }
+
     /// Whether `self` and `other` differ at most in the runtime selection
     /// current when each was resolved (A8). That is provenance, not
     /// context: a selection that changes the resolved context also changes

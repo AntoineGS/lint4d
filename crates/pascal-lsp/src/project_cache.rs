@@ -7888,22 +7888,53 @@ impl ProjectCache {
         self.index().contexts.contains_key(key)
     }
 
-    /// A8: when no index is stored under `key` but one is stored under a
-    /// key that differs from it only in the runtime selection (the same
-    /// project resolved before `pascal/selectProject` selected it), that
-    /// index moves to `key` instead of being built again. The directory
-    /// owners recorded against the old key are forgotten, as on eviction.
-    /// Returns whether an index moved.
-    pub(crate) fn rekey_index_selection(&self, key: &ContextKey) -> bool {
+    #[cfg(test)]
+    pub(crate) fn with_index_membership_context_for_test(
+        &self,
+        key: &ContextKey,
+        context: pascal_cache::Digest,
+    ) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.membership.context = Some(context);
+        }
+    }
+
+    /// Whether no index is stored under `key` but one is stored under a key
+    /// that differs from it only in the runtime selection (A8): `key`'s
+    /// context resolved again under another selection.
+    pub(crate) fn index_moved_by_selection(&self, key: &ContextKey) -> bool {
+        let store = self.index();
+        !store.contexts.contains_key(key)
+            && store
+                .contexts
+                .keys()
+                .any(|old| old.differs_only_in_selection(key))
+    }
+
+    /// A8: when no index is stored under `key`, the most recently used
+    /// index stored under a key that differs from it only in the runtime
+    /// selection (the same project resolved before `pascal/selectProject`
+    /// selected it) moves to `key` instead of being built again, provided
+    /// its membership was computed for the persisted context `context`.
+    /// Otherwise it is left to eviction. The directory owners recorded
+    /// against the old key are forgotten, as on eviction. Returns whether
+    /// an index moved.
+    pub(crate) fn rekey_index_selection(
+        &self,
+        key: &ContextKey,
+        context: pascal_cache::Digest,
+    ) -> bool {
         let mut store = self.index();
         if store.contexts.contains_key(key) {
             return false;
         }
         let Some(old) = store
             .contexts
-            .keys()
-            .find(|old| old.differs_only_in_selection(key))
-            .cloned()
+            .iter()
+            .filter(|(old, _)| old.differs_only_in_selection(key))
+            .max_by_key(|(_, stored)| stored.last_used)
+            .filter(|(_, stored)| stored.membership.context == Some(context))
+            .map(|(old, _)| old.clone())
         else {
             return false;
         };
@@ -8621,6 +8652,52 @@ mod index_tests {
         );
         let counts = cache.index_status(&|_| false)[0].counts;
         assert_eq!((counts.reused, counts.extracted), (1, 0), "{counts:?}");
+    }
+
+    /// A8 (13b-6 fix round 1): an index re-keyed for a new selection moves
+    /// only when its membership was computed for the same persisted
+    /// context, and the most recently used of several candidates moves.
+    #[test]
+    fn a_selection_rekey_checks_the_context_and_takes_the_latest_index() {
+        let cache = ProjectCache::new(1 << 30);
+        let base = key("a");
+        let selected = base
+            .clone()
+            .with_selection_for_test(Path::new("/w"), Path::new("/w/A.dproj"));
+        let older = base
+            .clone()
+            .with_selection_for_test(Path::new("/w"), Path::new("/w/Old.dproj"));
+        let context = pascal_cache::Digest::from_bytes([1; 32]);
+        let with_context = |paths: &[&str]| IndexMembership {
+            context: Some(context),
+            ..membership(paths)
+        };
+        cache.set_index_membership(
+            older.clone(),
+            anchor("a"),
+            with_context(&["/w/O.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            base.clone(),
+            anchor("a"),
+            with_context(&["/w/U.pas"]),
+            usize::MAX,
+        );
+        assert!(cache.index_moved_by_selection(&selected));
+        assert!(!cache.rekey_index_selection(&selected, pascal_cache::Digest::from_bytes([2; 32])));
+        assert!(cache.holds_index(&base) && !cache.holds_index(&selected));
+        assert!(cache.rekey_index_selection(&selected, context));
+        assert!(
+            !cache.holds_index(&base),
+            "the most recently used index moved"
+        );
+        assert!(cache.holds_index(&older));
+        let moved = cache
+            .read_index(&selected, |index, _| index.member_paths())
+            .unwrap();
+        assert_eq!(moved, [PathBuf::from("/w/U.pas")]);
+        assert!(!cache.index_moved_by_selection(&selected));
     }
 
     #[test]

@@ -1566,7 +1566,20 @@ fn run_index_job(
         IndexMode::Reuse => IndexBound::reuse_pass(),
         IndexMode::Full => IndexBound::extraction(),
     };
-    let result = workspace.advance_workspace_index(&anchor, bound, &mut before_io, &job.cancel);
+    // A reuse pass validates on the analysis slots (R8-1); its workers
+    // stop at their next member once interactive work arrives.
+    let may_run = || gate.index_may_run_now() && !job.cancel.load(Ordering::Relaxed);
+    let validation = crate::workspace::indexing::ParallelValidation {
+        threads: crate::server::analysis_slots(),
+        may_run: &may_run,
+    };
+    let result = workspace.advance_workspace_index_with(
+        &anchor,
+        bound,
+        &mut before_io,
+        Some(validation),
+        &job.cancel,
+    );
     match result {
         Ok(progress) => {
             crate::trace::trace!(

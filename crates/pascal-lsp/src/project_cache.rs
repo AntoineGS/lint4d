@@ -105,6 +105,52 @@ struct Witness {
 /// Witnesses past this are not recorded; validation reads instead.
 pub(crate) const MAX_WITNESSES: usize = 131_072;
 
+/// A complete directory listing this process read (R8-1): the names the
+/// validator checks editor buffers and deletions against.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) directories: Vec<PathBuf>,
+}
+
+/// How a memoized listing was read: a listing is the same one only under
+/// the same route form and at most the entry limit it was complete under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListedUnder {
+    pub(crate) legacy: bool,
+    pub(crate) entry_limit: usize,
+}
+
+#[derive(Debug)]
+struct ListedWitness {
+    stamp: ProjectReadStamp,
+    under: ListedUnder,
+    listed: Arc<Listed>,
+}
+
+/// Listings memoized at once, in listed paths: about 100 bytes each.
+pub(crate) const MAX_LISTED_PATHS: usize = 131_072;
+
+#[derive(Debug, Default)]
+struct Witnesses {
+    proven: HashMap<PathBuf, Witness>,
+    listings: HashMap<PathBuf, ListedWitness>,
+    /// Paths the memoized listings hold, against `MAX_LISTED_PATHS`.
+    listed_paths: usize,
+}
+
+impl Witnesses {
+    fn remove_listing(&mut self, path: &Path) {
+        if let Some(old) = self.listings.remove(path) {
+            self.listed_paths -= old.listed.files.len() + old.listed.directories.len();
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn overlay_content_hash(text: &str) -> u64 {
     pascal_project::content_hash_bytes(text.as_bytes())
@@ -3999,7 +4045,7 @@ struct Inner {
     changed: Condvar,
     watcher: Mutex<WatcherState>,
     /// Never held together with `state` or `watcher`.
-    witnesses: Mutex<HashMap<PathBuf, Witness>>,
+    witnesses: Mutex<Witnesses>,
     /// Never held together with `state`, `watcher` or `witnesses`.
     catalogues: Mutex<CatalogueStore>,
     /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
@@ -6163,11 +6209,7 @@ impl ProjectCache {
         self.release(state);
         self.inner.changed.notify_all();
         // Overflow lost which paths changed: no witness survives it.
-        self.inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.witnesses().clear();
         // Overflow lost which directories changed: no catalogue survives it.
         let removed = self.catalogues().clear();
         self.release_catalogues(removed);
@@ -6189,41 +6231,87 @@ impl ProjectCache {
         if !stamp.settled || !stamp.has_change_identity() {
             return;
         }
-        let mut witnesses = self
-            .inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if witnesses.len() >= MAX_WITNESSES && !witnesses.contains_key(path) {
+        let mut witnesses = self.witnesses();
+        if witnesses.proven.len() >= MAX_WITNESSES && !witnesses.proven.contains_key(path) {
             return;
         }
-        witnesses.insert(path.to_path_buf(), Witness { stamp, proven });
+        witnesses
+            .proven
+            .insert(path.to_path_buf(), Witness { stamp, proven });
     }
 
     /// What this process proved about `path`, if `current` (taken now)
     /// shows it unchanged since.
     pub(crate) fn witness(&self, path: &Path, current: &ProjectReadStamp) -> Option<Proven> {
-        let witnesses = self
-            .inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let witness = witnesses.get(path)?;
+        let witnesses = self.witnesses();
+        let witness = witnesses.proven.get(path)?;
         witness
             .stamp
             .proves_unchanged(current)
             .then(|| witness.proven.clone())
     }
 
-    fn drop_witnesses(&self, path: &Path, include_parent: bool) {
-        let mut witnesses = self
-            .inner
+    /// Remember the complete listing of directory `path` read while it had
+    /// `stamp` (R8-1). A witness like `record_witness`: only a settled stamp
+    /// with a change identity memoizes, and a watcher event for the
+    /// directory or a path in it, or an overflow, forgets it.
+    pub(crate) fn record_listing(
+        &self,
+        path: &Path,
+        stamp: ProjectReadStamp,
+        under: ListedUnder,
+        listed: Arc<Listed>,
+    ) {
+        if !stamp.settled || !stamp.has_change_identity() {
+            return;
+        }
+        let paths = listed.files.len() + listed.directories.len();
+        let mut witnesses = self.witnesses();
+        witnesses.remove_listing(path);
+        if witnesses.listed_paths + paths > MAX_LISTED_PATHS {
+            return;
+        }
+        witnesses.listed_paths += paths;
+        witnesses.listings.insert(
+            path.to_path_buf(),
+            ListedWitness {
+                stamp,
+                under,
+                listed,
+            },
+        );
+    }
+
+    /// The listing of `path` this process read under `under`, if `current`
+    /// (taken now) shows the directory unchanged since.
+    pub(crate) fn listing(
+        &self,
+        path: &Path,
+        current: &ProjectReadStamp,
+        under: ListedUnder,
+    ) -> Option<Arc<Listed>> {
+        let witnesses = self.witnesses();
+        let witness = witnesses.listings.get(path)?;
+        (witness.under.legacy == under.legacy
+            && witness.under.entry_limit <= under.entry_limit
+            && witness.stamp.proves_unchanged(current))
+        .then(|| Arc::clone(&witness.listed))
+    }
+
+    fn witnesses(&self) -> std::sync::MutexGuard<'_, Witnesses> {
+        self.inner
             .witnesses
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        witnesses.remove(path);
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn drop_witnesses(&self, path: &Path, include_parent: bool) {
+        let mut witnesses = self.witnesses();
+        witnesses.proven.remove(path);
+        witnesses.remove_listing(path);
         if let Some(parent) = path.parent().filter(|_| include_parent) {
-            witnesses.remove(parent);
+            witnesses.proven.remove(parent);
+            witnesses.remove_listing(parent);
         }
     }
 

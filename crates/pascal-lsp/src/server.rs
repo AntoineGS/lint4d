@@ -10415,6 +10415,16 @@ fn send_diagnostic_server_cancelled(
 /// costs only address space until touched.
 pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
+/// The analysis threads background index work may run at once: the
+/// server's analysis slots (`MAX_ANALYSIS_JOBS`), never more than the CPUs.
+/// Index batches run only while no interactive or client request runs or
+/// waits (D33), so their workers take the slots such requests would.
+pub(crate) fn analysis_slots() -> usize {
+    thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_ANALYSIS_JOBS)
+}
+
 /// A builder for a thread that runs analysis, with its explicit stack.
 pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
     thread::Builder::new()

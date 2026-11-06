@@ -723,6 +723,207 @@ enum ReuseOutcome {
     Cancelled,
 }
 
+/// `validate_reuse`'s answer: an outcome, or proven facts to apply.
+enum Validated {
+    Outcome(ReuseOutcome),
+    Hit(ReuseHit),
+}
+
+/// Facts the store proved for a member, charged until applied or dropped.
+struct ReuseHit {
+    facts: super::persist::AdmittedFacts,
+    reads: usize,
+    artifact: pascal_cache::Digest,
+    evidence: Option<pascal_cache::Digest>,
+    include_stamps: Vec<(PathBuf, PathStamp)>,
+    root_hash: u64,
+}
+
+/// Bounded parallel validation of a reuse batch (R8-1): up to `threads`
+/// analysis threads validate members ahead of the batch, which applies
+/// their results in member order. Each worker checks `may_run` (interactive
+/// work, cancellation) before each member it starts. The proof rule is
+/// unchanged: a worker runs the serial validation of one member.
+#[derive(Clone, Copy)]
+pub(crate) struct ParallelValidation<'a> {
+    pub(crate) threads: usize,
+    pub(crate) may_run: &'a (dyn Fn() -> bool + Sync),
+}
+
+/// What a worker found for one member of a parallel reuse batch.
+enum Prefetched {
+    /// Open in the editor: skipped.
+    Open,
+    /// The worker found interactive work or cancellation before it started
+    /// this member: the batch stops here.
+    Preempted,
+    /// `stamp` is `None` when the member is gone.
+    Member {
+        stamp: Option<PathStamp>,
+        reuse: Option<Box<Validated>>,
+    },
+}
+
+/// The hand-off between a parallel reuse batch and its workers. Members are
+/// taken in order and at most `window` past the one the batch applies, so
+/// at most `window` members' facts are alive at once (D41).
+struct Pipeline {
+    state: std::sync::Mutex<PipelineState>,
+    changed: std::sync::Condvar,
+    window: usize,
+    #[cfg(test)]
+    live: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    peak: std::sync::Mutex<ValidationPeak>,
+}
+
+#[derive(Default)]
+struct PipelineState {
+    /// The next member a worker takes.
+    next: usize,
+    /// The member the batch is at; those before it are done.
+    done: usize,
+    results: HashMap<usize, Prefetched>,
+    stopped: bool,
+}
+
+/// The most facts a parallel batch held at once (test measure).
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ValidationPeak {
+    pub(crate) held: usize,
+    pub(crate) reserved_bytes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_PEAK: std::cell::Cell<ValidationPeak> =
+        const { std::cell::Cell::new(ValidationPeak { held: 0, reserved_bytes: 0 }) };
+}
+
+/// The peak of the last parallel batch on this thread.
+#[cfg(test)]
+pub(crate) fn take_validation_peak() -> ValidationPeak {
+    VALIDATION_PEAK.with(std::cell::Cell::take)
+}
+
+impl Pipeline {
+    fn new(window: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::default(),
+            changed: std::sync::Condvar::new(),
+            window,
+            #[cfg(test)]
+            live: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            peak: std::sync::Mutex::default(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PipelineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait<'a>(
+        &self,
+        state: std::sync::MutexGuard<'a, PipelineState>,
+    ) -> std::sync::MutexGuard<'a, PipelineState> {
+        self.changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The next member for a worker, once the window has room; `None` when
+    /// every member is taken or the batch stopped.
+    fn take_next(&self, members: usize) -> Option<usize> {
+        let mut state = self.lock();
+        loop {
+            if state.stopped || state.next >= members {
+                return None;
+            }
+            if state.next < state.done + self.window {
+                let position = state.next;
+                state.next += 1;
+                return Some(position);
+            }
+            state = self.wait(state);
+        }
+    }
+
+    fn put(&self, position: usize, prefetched: Prefetched) {
+        let mut state = self.lock();
+        if matches!(prefetched, Prefetched::Preempted) {
+            state.stopped = true;
+        }
+        state.results.insert(position, prefetched);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// The batch is at `position`: what a worker found for it, once found.
+    /// The members before it are done, which makes room in the window.
+    fn take(&self, position: usize) -> Prefetched {
+        let mut state = self.lock();
+        state.done = position;
+        self.changed.notify_all();
+        loop {
+            if let Some(prefetched) = state.results.remove(&position) {
+                return prefetched;
+            }
+            // Never taken: a worker stopped before it.
+            if state.stopped && state.next <= position {
+                return Prefetched::Preempted;
+            }
+            state = self.wait(state);
+        }
+    }
+
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn note_hit(&self, reserved_bytes: usize) {
+        let held = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut peak = self
+            .peak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        peak.held = peak.held.max(held);
+        peak.reserved_bytes = peak.reserved_bytes.max(reserved_bytes);
+    }
+
+    #[cfg(test)]
+    fn note_applied(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A member a worker took and has not handed over: dropped (an early
+/// return, a panic) it stops the batch there.
+struct InFlight<'a> {
+    pipeline: &'a Pipeline,
+    position: usize,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.pipeline.put(self.position, Prefetched::Preempted);
+    }
+}
+
+/// Stops the workers however the batch ends.
+struct StopOnDrop<'a>(&'a Pipeline);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// Why an extracted member was not persisted. None is an error: the member
 /// stays memory-only, and a later process extracts it again. The reasons are
 /// diagnostics (traces).
@@ -836,6 +1037,7 @@ impl Workspace {
     /// or cancelled batch keeps its work. Parses are not published to the
     /// cache (A13). A transient failure returns `Err` with the member still
     /// pending; a stable one refuses it (A6).
+    #[cfg(test)]
     pub(crate) fn advance_workspace_index(
         &mut self,
         anchor: &IndexAnchor,
@@ -843,8 +1045,21 @@ impl Workspace {
         before_io: &mut dyn FnMut() -> Result<(), String>,
         cancel: &AtomicBool,
     ) -> Result<IndexProgress, String> {
+        self.advance_workspace_index_with(anchor, bound, before_io, None, cancel)
+    }
+
+    /// `advance_workspace_index`, a Reuse batch of a persisting baseline
+    /// view validating its members on `validation`'s workers (R8-1).
+    pub(crate) fn advance_workspace_index_with(
+        &mut self,
+        anchor: &IndexAnchor,
+        bound: IndexBound,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+        validation: Option<ParallelValidation<'_>>,
+        cancel: &AtomicBool,
+    ) -> Result<IndexProgress, String> {
         let previous = std::mem::replace(&mut self.index_build, true);
-        let result = self.advance_index_batch(anchor, bound, before_io, cancel);
+        let result = self.advance_index_batch(anchor, bound, before_io, validation, cancel);
         self.index_build = previous;
         self.pinned_context = None;
         result
@@ -855,6 +1070,7 @@ impl Workspace {
         anchor: &IndexAnchor,
         bound: IndexBound,
         before_io: &mut dyn FnMut() -> Result<(), String>,
+        validation: Option<ParallelValidation<'_>>,
         cancel: &AtomicBool,
     ) -> Result<IndexProgress, String> {
         let (key, anchor) = self.index_target_for(anchor, cancel)?;
@@ -916,6 +1132,31 @@ impl Workspace {
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
         let mut context_key = super::persist::ContextKeyMemo::default();
+        // Workers validate a Reuse batch's members ahead of it (R8-1); a
+        // batch without a store, or one that extracts, stays serial.
+        let parallel = validation.filter(|validation| {
+            validation.threads > 1
+                && bound.mode == IndexMode::Reuse
+                && persisting
+                && self.is_baseline()
+                && pending.len() > 1
+        });
+        if let Some(validation) = parallel {
+            // No worker could start: the batch runs serially.
+            if self.reuse_in_parallel(
+                &key,
+                &mut pending,
+                bound,
+                started,
+                before_io,
+                validation,
+                &mut progress,
+                &mut tried,
+                cancel,
+            )? {
+                pending.clear();
+            }
+        }
         while let Some(path) = pending.pop_front() {
             if tried.len() >= bound.units
                 || bound.time.is_some_and(|limit| started.elapsed() >= limit)
@@ -1093,6 +1334,190 @@ impl Workspace {
             && progress.awaiting_room == 0
             && !progress.memory;
         Ok(progress)
+    }
+
+    /// The members of a Reuse batch, validated by `validation.threads`
+    /// workers ahead of the batch and applied here in member order, with
+    /// every check the serial loop makes (R8-1). `before_io` runs before
+    /// each member applied; a worker that finds `may_run` false stops the
+    /// batch at that member, as a failing `before_io` does.
+    #[allow(clippy::too_many_arguments)]
+    fn reuse_in_parallel(
+        &self,
+        key: &ContextKey,
+        pending: &mut std::collections::VecDeque<PathBuf>,
+        bound: IndexBound,
+        started: Instant,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+        validation: ParallelValidation<'_>,
+        progress: &mut IndexProgress,
+        tried: &mut HashSet<String>,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        let members = Vec::from_iter(pending.iter().cloned());
+        let threads = validation.threads.min(members.len()).max(1);
+        let pipeline = Pipeline::new(threads);
+        let result = std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&pipeline);
+            let (pipeline, members) = (&pipeline, &members);
+            let mut spawned = 0;
+            for worker in 0..threads {
+                spawned += usize::from(
+                    crate::server::analysis_thread(&format!("PascalLspReuse{worker}"))
+                        .spawn_scoped(scope, move || {
+                            self.prefetch_members(key, members, pipeline, validation, cancel);
+                        })
+                        .is_ok(),
+                );
+            }
+            if spawned == 0 {
+                return Ok(false);
+            }
+            self.apply_prefetched(
+                key, members, pipeline, bound, started, before_io, progress, tried, cancel,
+            )
+            .map(|()| true)
+        });
+        #[cfg(test)]
+        VALIDATION_PEAK.with(|peak| {
+            peak.set(
+                *pipeline
+                    .peak
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        });
+        result
+    }
+
+    /// One worker of `reuse_in_parallel`.
+    fn prefetch_members(
+        &self,
+        key: &ContextKey,
+        members: &[PathBuf],
+        pipeline: &Pipeline,
+        validation: ParallelValidation<'_>,
+        cancel: &AtomicBool,
+    ) {
+        let mut context_key = super::persist::ContextKeyMemo::default();
+        while let Some(position) = pipeline.take_next(members.len()) {
+            // A worker that panics stops the batch at its member rather
+            // than leave it waiting; the scope then propagates the panic.
+            let in_flight = InFlight { pipeline, position };
+            if cancel.load(Ordering::Relaxed) || !(validation.may_run)() {
+                drop(in_flight);
+                return;
+            }
+            let path = &members[position];
+            let prefetched = if self.is_open_member(path) {
+                Prefetched::Open
+            } else {
+                // The stamp precedes the bytes it describes (A7).
+                let stamp = path_stamp(path);
+                let reprove = self.may_publish(key)
+                    && self.persistent_cache().is_enabled()
+                    && !self.project_cache.index_member_has_record(key, path);
+                // A stale member may be refreshed from its stamps: the
+                // batch decides, in order.
+                let refresh = !reprove
+                    && self
+                        .project_cache
+                        .read_index(key, |index, _| {
+                            index.state_of(path) == Some(MemberState::Stale)
+                        })
+                        .unwrap_or(false);
+                let reuse = (stamp.is_some() && !refresh)
+                    .then(|| Box::new(self.validate_reuse(key, path, &mut context_key, cancel)));
+                #[cfg(test)]
+                if matches!(reuse.as_deref(), Some(Validated::Hit(_))) {
+                    pipeline.note_hit(self.project_cache.stats().reserved_facts_bytes);
+                }
+                Prefetched::Member { stamp, reuse }
+            };
+            std::mem::forget(in_flight);
+            pipeline.put(position, prefetched);
+        }
+    }
+
+    /// The batch's side of `reuse_in_parallel`: the serial loop's checks
+    /// and outcomes, Reuse mode, in member order.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_prefetched(
+        &self,
+        key: &ContextKey,
+        members: &[PathBuf],
+        pipeline: &Pipeline,
+        bound: IndexBound,
+        started: Instant,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+        progress: &mut IndexProgress,
+        tried: &mut HashSet<String>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let mut context_key = super::persist::ContextKeyMemo::default();
+        for (position, path) in members.iter().enumerate() {
+            if tried.len() >= bound.units
+                || bound.time.is_some_and(|limit| started.elapsed() >= limit)
+            {
+                break;
+            }
+            let (stamp, reuse) = match pipeline.take(position) {
+                Prefetched::Preempted => return Err(CANCELLATION_MESSAGE.to_owned()),
+                Prefetched::Open => continue,
+                Prefetched::Member { stamp, reuse } => (stamp, reuse),
+            };
+            tried.insert(path_key(path));
+            #[cfg(test)]
+            let stamp = stamp.filter(|_| !UNSTAMPABLE.with(|slot| slot.borrow().contains(path)));
+            before_io()?;
+            let Some(own_stamp) = stamp else {
+                self.project_cache.invalidate_path(path);
+                continue;
+            };
+            let reuse = match reuse.map(|reuse| *reuse) {
+                Some(Validated::Hit(hit)) => {
+                    let outcome = self.apply_reuse(key, path, &own_stamp, hit, cancel);
+                    #[cfg(test)]
+                    pipeline.note_applied();
+                    outcome
+                }
+                Some(Validated::Outcome(outcome)) => outcome,
+                None => {
+                    let reprove = self.may_publish(key)
+                        && self.persistent_cache().is_enabled()
+                        && !self.project_cache.index_member_has_record(key, path);
+                    if !reprove && self.refresh_unchanged_member(key, path, &own_stamp) {
+                        progress.refreshed += 1;
+                        continue;
+                    }
+                    self.reuse_index_member(key, path, &own_stamp, &mut context_key, cancel)
+                }
+            };
+            #[cfg(test)]
+            run_hook(&AFTER_REUSE, path);
+            match reuse {
+                ReuseOutcome::Reused => progress.reused += 1,
+                ReuseOutcome::Missed { absent } => {
+                    self.project_cache.mark_index_reuse_tried(key, path);
+                    progress.reuse_missed += 1;
+                    progress.reuse_absent += usize::from(absent);
+                }
+                ReuseOutcome::Retry => progress.reuse_deferred += 1,
+                ReuseOutcome::Retrying => {
+                    progress.reuse_retrying += 1;
+                    self.project_cache.mark_index_reuse_tried(key, path);
+                    self.project_cache
+                        .defer_index_member(key, path, RETRYING_REFUSAL);
+                }
+                ReuseOutcome::Memory => {
+                    progress.memory = true;
+                    break;
+                }
+                ReuseOutcome::NoStore => {}
+                ReuseOutcome::Cancelled => return Err(CANCELLATION_MESSAGE.to_owned()),
+            }
+        }
+        Ok(())
     }
 
     /// Whether the store takes writes again. Under pressure a maintenance
@@ -1834,19 +2259,36 @@ impl Workspace {
         context_key: &mut super::persist::ContextKeyMemo,
         cancel: &AtomicBool,
     ) -> ReuseOutcome {
+        match self.validate_reuse(key, path, context_key, cancel) {
+            Validated::Outcome(outcome) => outcome,
+            Validated::Hit(hit) => self.apply_reuse(key, path, own_stamp, hit, cancel),
+        }
+    }
+
+    /// The store half of `reuse_index_member`: find the member's facts and
+    /// prove them against current inputs. It changes no member's index
+    /// state, so workers run it ahead of the batch (R8-1); the caller takes
+    /// the member's stamp before, so it precedes every byte read (A7).
+    fn validate_reuse(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        context_key: &mut super::persist::ContextKeyMemo,
+        cancel: &AtomicBool,
+    ) -> Validated {
         if !self.is_baseline()
             || !self
                 .project_cache
                 .read_index(key, |index, _| !index.reuse_tried(path))
                 .unwrap_or(false)
         {
-            return ReuseOutcome::NoStore;
+            return Validated::Outcome(ReuseOutcome::NoStore);
         }
         let Ok(uri) = Url::from_file_path(path) else {
-            return ReuseOutcome::Missed { absent: false };
+            return Validated::Outcome(ReuseOutcome::Missed { absent: false });
         };
         let Some(job) = self.persistent_cache().job() else {
-            return ReuseOutcome::NoStore;
+            return Validated::Outcome(ReuseOutcome::NoStore);
         };
         let work = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
         // The held snapshot first: its record skips the candidate search.
@@ -1863,7 +2305,7 @@ impl Workspace {
                 job.cancel_flag(),
             ) {
                 Ok(HintReuse::Done(reuse)) => hinted = Some(Ok(reuse)),
-                Ok(HintReuse::Retrying) => return ReuseOutcome::Retrying,
+                Ok(HintReuse::Retrying) => return Validated::Outcome(ReuseOutcome::Retrying),
                 Ok(HintReuse::Gone) => {
                     let id = hint.header().id();
                     if self
@@ -1878,7 +2320,7 @@ impl Workspace {
                 Ok(HintReuse::Fallback) => {}
                 Err(bypass) => {
                     job.observe(&bypass);
-                    return ReuseOutcome::Retry;
+                    return Validated::Outcome(ReuseOutcome::Retry);
                 }
             }
         }
@@ -1895,7 +2337,7 @@ impl Workspace {
         });
         job.record_reuse(&result);
         if cancel.load(Ordering::Relaxed) {
-            return ReuseOutcome::Cancelled;
+            return Validated::Outcome(ReuseOutcome::Cancelled);
         }
         let (facts, reads, artifact, evidence, include_stamps, root_hash) = match result {
             Ok(Reuse::Hit {
@@ -1907,22 +2349,54 @@ impl Workspace {
                 root_hash,
                 ..
             }) => (facts, reads, artifact, evidence, include_stamps, root_hash),
-            Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => return ReuseOutcome::Retry,
+            Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => {
+                return Validated::Outcome(ReuseOutcome::Retry);
+            }
             Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => {
-                return ReuseOutcome::Missed { absent: true };
+                return Validated::Outcome(ReuseOutcome::Missed { absent: true });
             }
             Ok(Reuse::Miss(ReuseMiss::Stale(_) | ReuseMiss::Store(_) | ReuseMiss::Open)) => {
-                return ReuseOutcome::Missed { absent: false };
+                return Validated::Outcome(ReuseOutcome::Missed { absent: false });
             }
             // `record_reuse` observed the bypass.
-            Err(super::persist::PersistError::Store(_)) => return ReuseOutcome::Retry,
-            Err(_) => return ReuseOutcome::Missed { absent: false },
+            Err(super::persist::PersistError::Store(_)) => {
+                return Validated::Outcome(ReuseOutcome::Retry);
+            }
+            Err(_) => return Validated::Outcome(ReuseOutcome::Missed { absent: false }),
         };
         job.store().hint_used(match evidence {
             Some(id) => Hint::Evidence(id),
             None => Hint::Artifact(artifact),
         });
         drop(job);
+        Validated::Hit(ReuseHit {
+            facts,
+            reads,
+            artifact,
+            evidence,
+            include_stamps,
+            root_hash,
+        })
+    }
+
+    /// The index half of `reuse_index_member`, in member order: index the
+    /// proven facts and prove the member's record; the facts drop here.
+    fn apply_reuse(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        own_stamp: &PathStamp,
+        hit: ReuseHit,
+        cancel: &AtomicBool,
+    ) -> ReuseOutcome {
+        let ReuseHit {
+            facts,
+            reads,
+            artifact,
+            evidence,
+            include_stamps,
+            root_hash,
+        } = hit;
         self.project_cache
             .add_index_validation_reads(key, u64::try_from(reads).unwrap_or(u64::MAX));
         let published = timed(ReusePhase::Insert, || {
@@ -7593,6 +8067,299 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// R8-1: bounded parallel validation of reuse batches.
+        mod parallel_reuse {
+            use super::*;
+            use std::sync::atomic::AtomicUsize;
+            use std::time::Instant;
+
+            /// Search-path directories `d00..`, and `units` units spread over
+            /// them; every unit includes `Shared.inc` from the last one, so
+            /// each member's evidence names the whole search path
+            /// (multidev's shape: many members over ~40 shared directories).
+            pub(super) fn shared_directories_project(
+                root: &Path,
+                directories: usize,
+                units: usize,
+            ) -> (Workspace, ContextKey, IndexAnchor) {
+                let names = (0..directories)
+                    .map(|index| format!("d{index:02}"))
+                    .collect::<Vec<_>>();
+                write(
+                    &root.join(names.last().unwrap()).join("Shared.inc"),
+                    "const Shared = 1;\n",
+                );
+                for index in 0..units - 1 {
+                    let directory = &names[index % directories];
+                    write(
+                        &root.join(directory).join(format!("U{index:04}.pas")),
+                        &format!(
+                            "unit U{index:04};\ninterface\n{{$I Shared.inc}}\nprocedure P{index};\nimplementation\nprocedure P{index};\nbegin\nend;\nend.\n"
+                        ),
+                    );
+                }
+                let (workspace, key) = project_workspace(
+                    root,
+                    &format!(
+                        "<DCC_UnitSearchPath>{}</DCC_UnitSearchPath><DCC_IncludePath>{}</DCC_IncludePath>",
+                        names.join(";"),
+                        names.join(";")
+                    ),
+                    "",
+                    WorkspaceOptions::default(),
+                );
+                (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
+            }
+
+            /// A first process indexes and publishes every member.
+            pub(super) fn published(
+                root: &Path,
+                store: &Path,
+                directories: usize,
+                units: usize,
+            ) -> (ContextKey, IndexAnchor) {
+                let (workspace, key, anchor) = shared_directories_project(root, directories, units);
+                // The production maintenance schedule checkpoints the WAL
+                // as the extraction batches fill it.
+                let (mut first, cache) = super::synthetic::scheduled_view(&workspace, store);
+                let mut totals = super::synthetic::Totals::default();
+                super::synthetic::batches(
+                    &mut first,
+                    &anchor,
+                    IndexBound::extraction(),
+                    None,
+                    &mut || Ok(()),
+                    &mut totals,
+                )
+                .unwrap();
+                assert_eq!(recorded(&first, &key).len(), units, "{totals:?}");
+                cache.shutdown();
+                (key, anchor)
+            }
+
+            pub(super) fn reuse_pass(
+                view: &mut Workspace,
+                anchor: &IndexAnchor,
+                threads: usize,
+                may_run: &(dyn Fn() -> bool + Sync),
+            ) -> Result<IndexProgress, String> {
+                view.advance_workspace_index_with(
+                    anchor,
+                    IndexBound::all().with_mode(IndexMode::Reuse),
+                    &mut || Ok(()),
+                    Some(ParallelValidation { threads, may_run }),
+                    &AtomicBool::new(false),
+                )
+            }
+
+            /// Everything a reuse pass leaves in the index, per member.
+            fn snapshot(view: &Workspace, key: &ContextKey) -> Vec<String> {
+                let mut rows = members(view, key)
+                    .into_iter()
+                    .map(|path| {
+                        let detail = view
+                            .project_cache
+                            .read_index(key, |index, _| {
+                                format!(
+                                    "{:?} {:?} {:?} {}",
+                                    index.state_of(&path),
+                                    index.stamps_of(&path),
+                                    index.slot_paths_of(&path),
+                                    index.reuse_tried(&path),
+                                )
+                            })
+                            .unwrap_or_default();
+                        format!("{} {detail}", path.display())
+                    })
+                    .collect::<Vec<_>>();
+                rows.extend(
+                    records(view, key)
+                        .into_iter()
+                        .map(|(path, record)| format!("record {} {record:?}", path.display())),
+                );
+                rows
+            }
+
+            #[test]
+            fn parallel_and_serial_validation_give_the_same_index_and_records() {
+                const UNITS: usize = 30;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (key, anchor) = published(temp.path(), store.path(), 6, UNITS);
+                let mut runs = Vec::new();
+                let mut reads = Vec::new();
+                for threads in [1, 3] {
+                    let (mut view, cache) = restarted_view(temp.path(), store.path());
+                    let progress = reuse_pass(&mut view, &anchor, threads, &|| true).unwrap();
+                    assert_eq!(progress.reused, UNITS, "{threads} threads: {progress:?}");
+                    let hits = cache.counters().unwrap().snapshot().hits;
+                    let names = (0..UNITS - 1)
+                        .step_by(7)
+                        .map(|index| selected(&view, &key, &format!("P{index}")))
+                        .collect::<Vec<_>>();
+                    runs.push((progress, hits, snapshot(&view, &key), names));
+                    reads.push(view.project_cache.index_validation_reads(&key));
+                    cache.shutdown();
+                }
+                assert_eq!(runs[0], runs[1]);
+                // A cost measure, not state: two workers may both read a
+                // directory before either's witness is recorded.
+                assert!(reads[0] >= 1 && reads[0] <= reads[1], "{reads:?}");
+            }
+
+            #[test]
+            fn interactive_work_stops_the_workers_between_members() {
+                const UNITS: usize = 24;
+                const PASSING: usize = 5;
+                const THREADS: usize = 3;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (key, anchor) = published(temp.path(), store.path(), 4, UNITS);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let checks = AtomicUsize::new(0);
+                // Interactive work arrives after `PASSING` members started.
+                let gate = || checks.fetch_add(1, Ordering::SeqCst) < PASSING;
+                let result = reuse_pass(&mut view, &anchor, THREADS, &gate);
+                assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                let hits = cache.counters().unwrap().snapshot().hits as usize;
+                assert!((1..=PASSING).contains(&hits), "{hits}");
+                assert!(
+                    checks.load(Ordering::SeqCst) <= PASSING + THREADS,
+                    "each worker stops at its next member: {} checks",
+                    checks.load(Ordering::SeqCst)
+                );
+                // The members applied are a prefix of the batch, in order; a
+                // member validated past the stop is dropped, not applied.
+                let order = members(&view, &key);
+                let fresh = order
+                    .iter()
+                    .filter(|path| state(&view, &key, path) == Some(MemberState::Fresh))
+                    .count();
+                assert!((1..=hits).contains(&fresh), "{fresh} of {hits}");
+                let mut sorted = order.clone();
+                sorted.sort_by_key(|path| path_key(path));
+                assert!(
+                    sorted[..fresh]
+                        .iter()
+                        .all(|path| state(&view, &key, path) == Some(MemberState::Fresh)),
+                    "the applied members are the first in path order"
+                );
+                let progress = reuse_pass(&mut view, &anchor, THREADS, &|| true).unwrap();
+                assert_eq!(progress.reused, UNITS - fresh, "{progress:?}");
+                assert!(progress.complete, "{progress:?}");
+                cache.shutdown();
+            }
+
+            #[test]
+            fn cancellation_stops_a_parallel_pass() {
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 4, 12);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let cancel = AtomicBool::new(false);
+                let checks = AtomicUsize::new(0);
+                // The request is cancelled once two members started.
+                let gate = || {
+                    if checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                    true
+                };
+                let result = view.advance_workspace_index_with(
+                    &anchor,
+                    IndexBound::all().with_mode(IndexMode::Reuse),
+                    &mut || Ok(()),
+                    Some(ParallelValidation {
+                        threads: 3,
+                        may_run: &gate,
+                    }),
+                    &cancel,
+                );
+                assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                assert!(
+                    checks.load(Ordering::SeqCst) <= 2 + 3,
+                    "{} checks",
+                    checks.load(Ordering::SeqCst)
+                );
+                // At most one member a worker, started before it saw the flag.
+                assert!(cache.counters().unwrap().snapshot().hits <= 3);
+                cache.shutdown();
+            }
+
+            #[test]
+            fn parallel_validation_holds_at_most_one_members_facts_per_thread() {
+                const THREADS: usize = 3;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 4, 24);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let progress = reuse_pass(&mut view, &anchor, THREADS, &|| true).unwrap();
+                assert_eq!(progress.reused, 24);
+                let peak = take_validation_peak();
+                assert!(peak.held <= THREADS, "{peak:?}");
+                assert!(peak.held >= 1, "{peak:?}");
+                assert!(
+                    peak.reserved_bytes <= THREADS * pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
+                    "{peak:?}"
+                );
+                assert_eq!(view.project_cache.stats().reserved_facts_bytes, 0);
+                cache.shutdown();
+            }
+
+            #[test]
+            fn without_a_store_a_parallel_pass_changes_nothing() {
+                let temp = tempfile::tempdir().unwrap();
+                let (workspace, key, anchor) = shared_directories_project(temp.path(), 4, 12);
+                let mut serial = workspace.analysis_input().disk_baseline();
+                serial.persistent_cache = Default::default();
+                let mut serial = Workspace::from_analysis_input(&serial);
+                let mut parallel =
+                    Workspace::from_analysis_input(&workspace.analysis_input().disk_baseline());
+                let one = reuse_pass(&mut serial, &anchor, 1, &|| true).unwrap();
+                let checks = AtomicUsize::new(0);
+                let two = reuse_pass(&mut parallel, &anchor, 3, &|| {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+                .unwrap();
+                assert_eq!(one, two);
+                assert_eq!(checks.load(Ordering::SeqCst), 0, "no worker started");
+                assert_eq!(snapshot(&serial, &key), snapshot(&parallel, &key));
+            }
+
+            /// Release measurement (report-only; numbers go into the task
+            /// report):
+            /// TMPDIR=$HOME/.cache/l4d-tmp cargo test -p pascal-lsp --release --lib parallel_validation_speedup -- --ignored --nocapture
+            #[test]
+            #[ignore = "release measurement, run explicitly"]
+            fn parallel_validation_speedup_on_shared_directories() {
+                const DIRECTORIES: usize = 40;
+                const UNITS: usize = 2_000;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), DIRECTORIES, UNITS);
+                let threads = crate::server::analysis_slots();
+                let mut times = Vec::new();
+                for threads in [1, threads] {
+                    let (mut view, cache) = restarted_view(temp.path(), store.path());
+                    let started = Instant::now();
+                    let progress = reuse_pass(&mut view, &anchor, threads, &|| true).unwrap();
+                    let elapsed = started.elapsed();
+                    assert_eq!(progress.reused, UNITS, "{progress:?}");
+                    eprintln!(
+                        "R8-1 shared directories: {UNITS} members over {DIRECTORIES} \
+                         directories, {threads} threads: reuse pass {elapsed:?}"
+                    );
+                    times.push(elapsed);
+                    cache.shutdown();
+                }
+                eprintln!(
+                    "R8-1 shared directories: speedup {:.2}x",
+                    times[0].as_secs_f64() / times[1].as_secs_f64()
+                );
+            }
+        }
+
         /// Maintenance in another process: retire every unreferenced row
         /// (no snapshot lists the records) and, with `reclaim`, delete them.
         fn retire_everything(root: &Path, directory: &Path, reclaim: bool) -> usize {
@@ -8603,7 +9370,7 @@ end.
             }
 
             #[derive(Debug, Default)]
-            struct Totals {
+            pub(super) struct Totals {
                 batches: usize,
                 indexed: usize,
                 reused: usize,
@@ -8618,7 +9385,7 @@ end.
             /// A baseline view of `workspace` whose store under `directory`
             /// has the production maintenance schedule (the worker's steps
             /// and its wake on pressure), unlike `persisting_view`.
-            fn scheduled_view(
+            pub(super) fn scheduled_view(
                 workspace: &Workspace,
                 directory: &Path,
             ) -> (Workspace, PersistentCache) {
@@ -8646,7 +9413,7 @@ end.
             /// Batches of `bound` until the index is complete; the first
             /// `Err` (a cancellation) ends them. With `store`, the WAL's
             /// size is sampled after each batch.
-            fn batches(
+            pub(super) fn batches(
                 view: &mut Workspace,
                 anchor: &IndexAnchor,
                 bound: IndexBound,

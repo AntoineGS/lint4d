@@ -697,20 +697,15 @@ mod tests {
         );
     }
 
-    /// Rootcause2 U1: a session that reaches a directory only through a
-    /// reused provider interface's lookups is proven by the listing the
-    /// interface's own session captured. That session listed `gen` before
-    /// it compiled `Prov`, so `gen` is in the graph's trace and not in its
-    /// observations. `BaseA` finds `Prov` in its own directory and never
-    /// lists `gen` itself.
-    #[test]
-    fn a_directory_reached_only_through_a_reused_provider_s_trace_is_proven() {
+    /// Main and BaseA both use `Prov`, whose interface looks up `GenB` in
+    /// `gen`, a directory BaseA never lists itself.
+    fn reused_provider_files() -> [(&'static str, &'static [u8]); 6] {
         let dproj = b"<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib;gen</DCC_UnitSearchPath></PropertyGroup></Project>";
         let main = b"unit Main;\ninterface\nuses GenB, Prov;\n{$IF GenB.B = 1}const Two = 2;{$ENDIF}\n{$IF Prov.Flag = 1}const One = 1;{$ENDIF}\nimplementation\nend.\n";
         let base = b"unit BaseA;\ninterface\nuses Prov;\n{$IF Prov.Flag = 1}const One = 1;{$ENDIF}\nimplementation\nend.\n";
         let provider = b"unit Prov;\ninterface\nuses GenB;\n{$IF GenB.B = 1}const Flag = 1;{$ENDIF}\nimplementation\nend.\n";
         let generated = b"unit GenB;\ninterface\nconst B = 1;\nimplementation\nend.\n";
-        let files: [(&str, &[u8]); 6] = [
+        [
             ("App.dproj", dproj),
             ("Main.pas", main),
             ("BaseA.pas", base),
@@ -720,9 +715,29 @@ mod tests {
                 b"unit Lib;\ninterface\nimplementation\nend.\n",
             ),
             ("gen/GenB.pas", generated),
-        ];
+        ]
+    }
+
+    /// Rootcause2 U1: a session that reaches a directory only through a
+    /// reused provider interface's lookups is proven by the listing the
+    /// interface's own session captured. That session listed `gen` before
+    /// it compiled `Prov`, so `gen` is in the graph's trace and not in its
+    /// observations. `BaseA` finds `Prov` in its own directory and never
+    /// lists `gen` itself.
+    #[test]
+    fn a_directory_reached_only_through_a_reused_provider_s_trace_is_proven() {
+        let files = reused_provider_files();
         let indexed = index(&files, &["Main.pas", "BaseA.pas"]);
         assert!(indexed.workspace.project_cache.provider_graph_count() > 0);
+        // BaseA's evidence below comes from a reused graph, not from a
+        // compilation of its own: a hit happened.
+        assert!(
+            indexed
+                .workspace
+                .project_cache
+                .provider_graph_hits_for_test()
+                > 0
+        );
         let uri = indexed.uri("BaseA.pas");
         let session = indexed.workspace.expansions[&uri]
             .expanded

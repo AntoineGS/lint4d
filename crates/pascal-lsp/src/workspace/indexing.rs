@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lsp_types::Url;
@@ -556,8 +556,15 @@ pub(super) enum ReusePhase {
     Prove,
 }
 
-#[cfg(test)]
 const REUSE_PHASES: usize = 6;
+const REUSE_PHASE_NAMES: [&str; REUSE_PHASES] = [
+    "lookup",
+    "readHash",
+    "validation",
+    "decode",
+    "insert",
+    "prove",
+];
 
 #[cfg(test)]
 thread_local! {
@@ -565,20 +572,155 @@ thread_local! {
         const { std::cell::RefCell::new([(Duration::ZERO, 0); REUSE_PHASES]) };
 }
 
-/// `run`, timed as `phase` on this thread in tests.
-#[cfg_attr(not(test), inline(always))]
+/// Process-wide time and calls of each reuse phase, summed over every
+/// thread (the parallel workers included); recorded only while
+/// `phase_metrics_on`.
+static PHASE_NANOS: [AtomicU64; REUSE_PHASES] = [const { AtomicU64::new(0) }; REUSE_PHASES];
+static PHASE_CALLS: [AtomicU64; REUSE_PHASES] = [const { AtomicU64::new(0) }; REUSE_PHASES];
+
+#[cfg(test)]
+static PHASE_METRICS_FORCED: AtomicBool = AtomicBool::new(false);
+
+/// Tests turn the phase counters on without the trace file (never off:
+/// tests run in parallel and the counters are process-wide).
+#[cfg(test)]
+fn set_phase_metrics_for_test(on: bool) {
+    PHASE_METRICS_FORCED.store(on, Ordering::Relaxed);
+}
+
+/// The phase counters run in release builds behind the trace switch
+/// (`PASCAL_LSP_TRACE`), which also receives their report.
+fn phase_metrics_on() -> bool {
+    #[cfg(test)]
+    if PHASE_METRICS_FORCED.load(Ordering::Relaxed) {
+        return true;
+    }
+    crate::trace::enabled()
+}
+
+/// A reading of the process-wide phase counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct ReusePhaseTotals {
+    nanos: [u64; REUSE_PHASES],
+    calls: [u64; REUSE_PHASES],
+}
+
+impl ReusePhaseTotals {
+    fn snapshot() -> Self {
+        let mut totals = Self::default();
+        for at in 0..REUSE_PHASES {
+            totals.nanos[at] = PHASE_NANOS[at].load(Ordering::Relaxed);
+            totals.calls[at] = PHASE_CALLS[at].load(Ordering::Relaxed);
+        }
+        totals
+    }
+
+    /// What was recorded after `earlier`.
+    fn since(&self, earlier: &Self) -> Self {
+        let mut totals = Self::default();
+        for at in 0..REUSE_PHASES {
+            totals.nanos[at] = self.nanos[at].saturating_sub(earlier.nanos[at]);
+            totals.calls[at] = self.calls[at].saturating_sub(earlier.calls[at]);
+        }
+        totals
+    }
+
+    #[cfg(test)]
+    fn calls(&self, phase: ReusePhase) -> usize {
+        usize::try_from(self.calls[phase as usize]).unwrap_or(usize::MAX)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.iter().all(|calls| *calls == 0)
+    }
+}
+
+/// One batch's reuse phases: the trace line that splits a reuse pass's
+/// time between read+hash, validation, decode, insert and prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReusePhaseReport {
+    mode: IndexMode,
+    /// Validation threads the batch used (1 when serial).
+    threads: usize,
+    /// Members the batch tried.
+    members: usize,
+    totals: ReusePhaseTotals,
+}
+
+impl std::fmt::Display for ReusePhaseReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "reuse phases: mode={:?} threads={} members={}",
+            self.mode, self.threads, self.members
+        )?;
+        for (at, name) in REUSE_PHASE_NAMES.iter().enumerate() {
+            write!(
+                formatter,
+                " {name}={:.1}ms/{}",
+                self.totals.nanos[at] as f64 / 1e6,
+                self.totals.calls[at]
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_PHASE_REPORT: std::cell::RefCell<Option<ReusePhaseReport>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The report the last batch on this thread emitted.
+#[cfg(test)]
+fn take_phase_report() -> Option<ReusePhaseReport> {
+    LAST_PHASE_REPORT.with(|report| report.borrow_mut().take())
+}
+
+/// Traces what the batch added to the phase counters since `before`.
+fn report_reuse_phases(before: &ReusePhaseTotals, mode: IndexMode, threads: usize, members: usize) {
+    if !phase_metrics_on() {
+        return;
+    }
+    let totals = ReusePhaseTotals::snapshot().since(before);
+    if totals.is_empty() {
+        return;
+    }
+    let report = ReusePhaseReport {
+        mode,
+        threads,
+        members,
+        totals,
+    };
+    crate::trace::trace!("  {report}");
+    #[cfg(test)]
+    LAST_PHASE_REPORT.with(|last| *last.borrow_mut() = Some(report));
+}
+
+/// `run`, timed as `phase` on this thread in tests, and in the
+/// process-wide counters while phase metrics are on.
+#[inline]
 pub(super) fn timed<T>(phase: ReusePhase, run: impl FnOnce() -> T) -> T {
-    #[cfg(test)]
-    let started = Instant::now();
+    let record = phase_metrics_on();
+    let started = (cfg!(test) || record).then(Instant::now);
     let value = run();
-    #[cfg(test)]
-    REUSE_PHASE_TIMES.with(|times| {
-        let slot = &mut times.borrow_mut()[phase as usize];
-        slot.0 += started.elapsed();
-        slot.1 += 1;
-    });
-    #[cfg(not(test))]
-    let _ = phase;
+    if let Some(started) = started {
+        let elapsed = started.elapsed();
+        #[cfg(test)]
+        REUSE_PHASE_TIMES.with(|times| {
+            let slot = &mut times.borrow_mut()[phase as usize];
+            slot.0 += elapsed;
+            slot.1 += 1;
+        });
+        if record {
+            PHASE_NANOS[phase as usize].fetch_add(
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     value
 }
 
@@ -1204,6 +1346,8 @@ impl Workspace {
             }
         }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
+        let phases_before = ReusePhaseTotals::snapshot();
+        let mut validation_threads = 1;
         let started = Instant::now();
         // Open members are skipped, so ask for enough to fill the bound.
         let wanted = bound.units.saturating_add(self.open_documents.len());
@@ -1236,6 +1380,7 @@ impl Workspace {
                 && pending.len() > 1
         });
         if let Some(validation) = parallel {
+            let members = pending.len();
             // No worker could start: the batch runs serially.
             if self.reuse_in_parallel(
                 &key,
@@ -1249,6 +1394,7 @@ impl Workspace {
                 cancel,
             )? {
                 pending.clear();
+                validation_threads = validation.threads.min(members).max(1);
             }
         }
         while let Some(path) = pending.pop_front() {
@@ -1362,7 +1508,7 @@ impl Workspace {
                     progress.indexed += 1;
                     progress.persisted += usize::from(persisted);
                     if !persisted && !self.persistent_cache().is_enabled() {
-                        self.project_cache.note_index_memory_only(&key);
+                        self.project_cache.note_index_memory_only(&key, &path);
                     }
                 }
                 MemberOutcome::Refused => progress.refused += 1,
@@ -1427,6 +1573,7 @@ impl Workspace {
         progress.complete = progress.pending == progress.retrying
             && progress.awaiting_room == 0
             && !progress.memory;
+        report_reuse_phases(&phases_before, bound.mode, validation_threads, tried.len());
         Ok(progress)
     }
 
@@ -2047,7 +2194,7 @@ impl Workspace {
                                 PersistSkip::Store(
                                     pascal_cache::Bypass::WalPressure
                                     | pascal_cache::Bypass::OverBudget,
-                                ) => self.project_cache.note_index_awaiting_room(key),
+                                ) => self.project_cache.note_index_awaiting_room(key, path),
                                 // The same inputs exceed the same fixed limit
                                 // every time: the facts stay indexed here and
                                 // an artifact-less record lists the member, so
@@ -8087,6 +8234,90 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// 13c-2 (rootcause2 U2): a refusal for room restales exactly the
+        /// refused member. A member that stays memory-only for another
+        /// reason (here, no free disk space) is neither extracted again nor
+        /// counted as awaiting room.
+        #[test]
+        fn a_refusal_for_room_restales_only_the_refused_member() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 6, WorkspaceOptions::default());
+            // The unrelated member comes before the refused one, so the
+            // restale at the next member's start finds it unrecorded.
+            let (other, refused) = (
+                temp.path().join("lib/U1.pas"),
+                temp.path().join("lib/U2.pas"),
+            );
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let (target, unrelated) = (refused.clone(), other.clone());
+            let mut once = false;
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                if path == unrelated {
+                    Some(pascal_cache::Bypass::LowDiskSpace)
+                } else {
+                    (path == target && !std::mem::replace(&mut once, true))
+                        .then_some(pascal_cache::Bypass::WalPressure)
+                }
+            })));
+            let loaded = record_loads();
+            let last = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            set_after_load_hook(None);
+            let count = |path: &PathBuf| loaded.borrow().iter().filter(|p| *p == path).count();
+            assert_eq!(count(&refused), 2, "refused member: {last:?}");
+            assert_eq!(count(&other), 1, "unrelated member: {last:?}");
+            assert_eq!((last.awaiting_room, last.complete), (0, true), "{last:?}");
+            let unrecorded = records(&view, &key)
+                .into_iter()
+                .filter(|(_, record)| record.is_none())
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>();
+            assert_eq!(unrecorded, vec![other.clone()]);
+            assert_eq!(state(&view, &key, &other), Some(MemberState::Fresh));
+            cache.shutdown();
+        }
+
+        /// 13c-2: the awaiting-room and memory-only sets hold the members
+        /// that were refused or indexed memory-only, nothing else
+        /// unrecorded.
+        #[test]
+        fn the_awaiting_room_and_memory_only_sets_hold_only_their_members() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            let (a, b) = (
+                temp.path().join("lib/U1.pas"),
+                temp.path().join("lib/U2.pas"),
+            );
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let pair = [a.clone(), b.clone()];
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                pair.contains(&path.to_path_buf())
+                    .then_some(pascal_cache::Bypass::LowDiskSpace)
+            })));
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(progress.awaiting_room, 0, "{progress:?}");
+            assert!(progress.complete, "{progress:?}");
+            let cache_of = &view.project_cache;
+            assert!(!cache_of.index_is_awaiting_room(&key));
+            assert_eq!(cache_of.restale_awaiting_room(&key), 0);
+            assert_eq!(cache_of.restale_memory_only_members(&key), 0);
+            cache_of.note_index_awaiting_room(&key, &a);
+            assert!(cache_of.index_is_awaiting_room(&key));
+            assert_eq!(cache_of.index_awaiting_room(&key), 1);
+            assert_eq!(cache_of.restale_awaiting_room(&key), 1);
+            assert_eq!(state(&view, &key, &a), Some(MemberState::Stale));
+            assert_eq!(state(&view, &key, &b), Some(MemberState::Fresh));
+            assert_eq!(cache_of.index_awaiting_room(&key), 0);
+            cache_of.note_index_memory_only(&key, &b);
+            assert_eq!(cache_of.restale_memory_only_members(&key), 1);
+            assert_eq!(state(&view, &key, &b), Some(MemberState::Stale));
+            assert_eq!(cache_of.restale_memory_only_members(&key), 0);
+            cache.shutdown();
+        }
+
         /// Task 10b: a batch that ran memory-only (the store opened after
         /// `MAX_OPEN_WAIT`, or was enabled later) leaves members without a
         /// record. Once the store is enabled, the next batch proves them, so
@@ -8267,6 +8498,48 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// 13c-2 (fix #5): a batch reports its reuse phases without the test
+        /// timers, once phase metrics are on (the trace switch in release).
+        #[test]
+        fn a_reuse_batch_reports_its_phase_timings() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (_, anchor) = first_session(temp.path(), store.path(), 12);
+            let (mut second, cache) = restarted_view(temp.path(), store.path());
+            set_phase_metrics_for_test(true);
+            take_phase_report();
+            let before = ReusePhaseTotals::snapshot();
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            let totals = ReusePhaseTotals::snapshot().since(&before);
+            let report = take_phase_report().expect("the batch reported");
+            assert_eq!(progress.reused, 12);
+            assert_eq!(report.threads, 1);
+            assert_eq!(report.mode, IndexMode::Reuse);
+            // Insert and prove are timed on every reuse path; the others
+            // only on the snapshot path.
+            for phase in [ReusePhase::Insert, ReusePhase::Prove] {
+                assert!(report.totals.calls(phase) >= 12, "{phase:?}: {report:?}");
+                assert!(totals.calls(phase) >= 12, "{phase:?}: {totals:?}");
+            }
+            let line = report.to_string();
+            for name in [
+                "lookup",
+                "readHash",
+                "validation",
+                "decode",
+                "insert",
+                "prove",
+                "threads=1",
+            ] {
+                assert!(line.contains(name), "{name} in {line}");
+            }
+            cache.shutdown();
+        }
+
         #[test]
         fn reuse_holds_one_members_facts_at_a_time() {
             let temp = tempfile::tempdir().unwrap();
@@ -8443,6 +8716,29 @@ pub(in crate::workspace) mod tests {
                 // A cost measure, not state: two workers may both read a
                 // directory before either's witness is recorded.
                 assert!(reads[0] >= 1 && reads[0] <= reads[1], "{reads:?}");
+            }
+
+            /// 13c-2: the report of a parallel batch names its worker threads.
+            #[test]
+            fn a_parallel_batch_reports_its_threads() {
+                const UNITS: usize = 30;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 6, UNITS);
+                set_phase_metrics_for_test(true);
+                for threads in [1, 3] {
+                    let (mut view, cache) = restarted_view(temp.path(), store.path());
+                    take_phase_report();
+                    let progress = reuse_pass(&mut view, &anchor, threads, &|| true).unwrap();
+                    let report = take_phase_report().expect("reported");
+                    assert_eq!(progress.reused, UNITS);
+                    assert_eq!(report.threads, threads, "{report:?}");
+                    assert!(
+                        report.totals.calls(ReusePhase::Prove) >= UNITS,
+                        "{report:?}"
+                    );
+                    cache.shutdown();
+                }
             }
 
             #[test]

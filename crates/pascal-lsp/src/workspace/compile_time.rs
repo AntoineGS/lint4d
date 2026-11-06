@@ -1437,6 +1437,86 @@ mod tests {
     use lsp_types::Position;
     use pascal_project::delphi_overrides::OverrideSession;
 
+    /// 13c-1 review: a read the capture bound dropped and only the graph's
+    /// trace names still makes the graph's reads overflowed (`put` stores
+    /// the reads of observations and trace), so `put_provider_graph`
+    /// refuses it; no later session reuses it and each compiles the
+    /// provider itself.
+    #[test]
+    fn a_read_dropped_by_the_capture_bound_and_named_by_the_trace_refuses_the_graph() {
+        use pascal_core::SourceId;
+        use pascal_core::compile_time::{ProviderGraphKey, SharedProviderGraph};
+        use pascal_core::resolver::{DirectoryListing, ResolutionObservation};
+        let directory = |path: &str| ResolutionObservation::Directory {
+            path: path.into(),
+            entry: pascal_project::ProjectPathEntry::configured(path.into()),
+            stamp: None,
+            complete: true,
+            listed: true,
+        };
+        let listing = DirectoryListing {
+            files: Vec::new(),
+            directories: Vec::new(),
+            stamp: None,
+            complete: true,
+        };
+        let key = ProviderGraphKey {
+            source: SourceId::new("/p/Prov.pas"),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        };
+        let graph = |trace: Vec<ResolutionObservation>| {
+            Arc::new(SharedProviderGraph {
+                occurrence: OccurrenceId(1),
+                graph: None,
+                observations: Arc::new(vec![directory("/w/obs")]),
+                warnings: Default::default(),
+                dependencies: Default::default(),
+                scanned: Default::default(),
+                children: Default::default(),
+                trace: Arc::new(trace),
+                revision: pascal_core::SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 1,
+                },
+                lookup: (0, 0),
+                retained_bytes: 100,
+            })
+        };
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let capture = Arc::new(crate::workspace::capture::ReadCapture::default());
+        crate::workspace::capture::set_capture_bound_for_test(Some(1));
+        // The first read fits; `/w/gen` is dropped.
+        capture.listed(std::path::Path::new("/w/obs"), &listing, false);
+        capture.listed(std::path::Path::new("/w/gen"), &listing, false);
+        crate::workspace::capture::set_capture_bound_for_test(None);
+        assert!(capture.snapshot().overflowed);
+        let graphs = CachedProviderGraphs {
+            cache: cache.clone(),
+            configuration: 3,
+            overlays: Default::default(),
+            capture: Arc::clone(&capture),
+        };
+        use pascal_core::compile_time::SharedProviderGraphs;
+        // Named by observations alone, the dropped read is not missing.
+        graphs.put(key.clone(), graph(Vec::new()));
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 0);
+        // Named by the trace, it is: the graph is refused and counted.
+        let traced = ProviderGraphKey {
+            source: SourceId::new("/p/Traced.pas"),
+            ..key.clone()
+        };
+        graphs.put(traced.clone(), graph(vec![directory("/w/gen")]));
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 1);
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert!(graphs.get(&traced).is_none(), "the consumer compiles it");
+        assert!(graphs.get(&key).is_some());
+    }
+
     fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
         std::fs::write(root.join("Main.pas"), source).unwrap();

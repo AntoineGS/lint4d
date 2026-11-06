@@ -4058,6 +4058,9 @@ struct Inner {
     /// Provider interfaces not shared because their reads overflowed
     /// (13b-2 follow-up N1), for `pascal/indexStatus`.
     provider_graphs_refused: AtomicU64,
+    /// Provider interfaces handed out by `provider_graph` (tests only).
+    #[cfg(test)]
+    provider_graph_hits: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -6614,7 +6617,17 @@ impl ProjectCache {
         let tick = state.clock;
         state.provider_graphs.touch(&full, tick);
         self.release(state);
+        #[cfg(test)]
+        self.inner
+            .provider_graph_hits
+            .fetch_add(1, Ordering::Relaxed);
         Some(hit)
+    }
+
+    /// How many provider interfaces `provider_graph` handed out.
+    #[cfg(test)]
+    pub(crate) fn provider_graph_hits_for_test(&self) -> u64 {
+        self.inner.provider_graph_hits.load(Ordering::Relaxed)
     }
 
     /// Keep a compiled provider interface, charged to `maxCacheBytes` within
@@ -6850,13 +6863,15 @@ struct StoredIndex {
     last_seal: Option<std::time::Instant>,
     /// Whether this process looked for a sealed snapshot to start from.
     hint_tried: bool,
-    /// A batch indexed members while the store was not enabled: they have
-    /// no record until the next persisting batch proves them again.
-    memory_only: bool,
-    /// A publication was refused for room (the WAL at its threshold, the
-    /// disk budget, free space): its members stay memory-only until the
-    /// store reports no pressure, then a batch proves them again.
-    awaiting_room: bool,
+    /// Members a batch indexed while the store was not enabled: they have
+    /// no record until the next persisting batch proves them again. Only
+    /// these, never other members that lack a record (13c-2).
+    memory_only: HashSet<PathBuf>,
+    /// Members whose publication was refused for room (the WAL at its
+    /// threshold, the disk budget): they stay memory-only until the store
+    /// reports no pressure, then a batch proves them again. Only these,
+    /// never other members that lack a record (13c-2).
+    awaiting_room: HashSet<PathBuf>,
     /// A batch's wait for maintenance found no room; cleared by room.
     room_wait_failed: bool,
     /// Extracted members whose publication found no memory for its
@@ -6873,12 +6888,17 @@ impl StoredIndex {
         self.charged.saturating_add(self.index.bytes())
     }
 
-    fn unrecorded_fresh_members(&self) -> Vec<PathBuf> {
+    /// The members of `set` still fresh without a record.
+    fn unrecorded_fresh_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        if set.is_empty() {
+            return Vec::new();
+        }
         self.index
             .records()
             .into_iter()
             .filter(|(path, record)| {
                 record.is_none()
+                    && set.contains(path)
                     && self.index.state_of(path) == Some(crate::workspace_index::MemberState::Fresh)
             })
             .map(|(path, _)| path)
@@ -7401,8 +7421,8 @@ impl ProjectCache {
                     baseline: None,
                     last_seal: None,
                     hint_tried: false,
-                    memory_only: false,
-                    awaiting_room: false,
+                    memory_only: HashSet::new(),
+                    awaiting_room: HashSet::new(),
                     room_wait_failed: false,
                     publications_refused: 0,
                     unprovable_kind: None,
@@ -7793,37 +7813,38 @@ impl ProjectCache {
             .collect()
     }
 
-    /// A batch of `key` indexed members while the store was not enabled.
-    pub(crate) fn note_index_memory_only(&self, key: &ContextKey) {
+    /// A batch indexed `path`, a member of `key`, while the store was not
+    /// enabled.
+    pub(crate) fn note_index_memory_only(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.memory_only = true;
+            stored.memory_only.insert(path.to_path_buf());
         }
     }
 
-    /// After `note_index_memory_only`, once: marks every fresh member of
-    /// `key` without a record stale, so the next batches prove it again
-    /// (the reprove path). Returns how many.
+    /// Once: marks the members `note_index_memory_only` named that are
+    /// still fresh without a record stale, so the next batches prove them
+    /// again (the reprove path). Returns how many.
     pub(crate) fn restale_memory_only_members(&self, key: &ContextKey) -> usize {
         let mut store = self.index();
         let Some(stored) = store
             .contexts
             .get_mut(key)
-            .filter(|stored| stored.memory_only)
+            .filter(|stored| !stored.memory_only.is_empty())
         else {
             return 0;
         };
-        stored.memory_only = false;
-        let unrecorded = stored.unrecorded_fresh_members();
+        let named = std::mem::take(&mut stored.memory_only);
+        let unrecorded = stored.unrecorded_fresh_among(&named);
         for path in &unrecorded {
             stored.index.mark_stale(path);
         }
         unrecorded.len()
     }
 
-    /// A publication of `key`'s member was refused for room.
-    pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey) {
+    /// The publication of `path`, a member of `key`, was refused for room.
+    pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.awaiting_room = true;
+            stored.awaiting_room.insert(path.to_path_buf());
         }
     }
 
@@ -7848,20 +7869,19 @@ impl ProjectCache {
     }
 
     pub(crate) fn index_is_awaiting_room(&self, key: &ContextKey) -> bool {
-        self.index()
-            .contexts
-            .get(key)
-            .is_some_and(|stored| stored.awaiting_room)
+        self.index().contexts.get(key).is_some_and(|stored| {
+            !stored
+                .unrecorded_fresh_among(&stored.awaiting_room)
+                .is_empty()
+        })
     }
 
-    /// After `note_index_awaiting_room`: the fresh members of `key` still
-    /// without a record (0 otherwise).
+    /// The members `note_index_awaiting_room` named that are still fresh
+    /// without a record (0 when none).
     pub(crate) fn index_awaiting_room(&self, key: &ContextKey) -> usize {
-        self.index()
-            .contexts
-            .get(key)
-            .filter(|stored| stored.awaiting_room)
-            .map_or(0, |stored| stored.unrecorded_fresh_members().len())
+        self.index().contexts.get(key).map_or(0, |stored| {
+            stored.unrecorded_fresh_among(&stored.awaiting_room).len()
+        })
     }
 
     /// Once the store has room again: marks the members
@@ -7872,12 +7892,12 @@ impl ProjectCache {
         let Some(stored) = store
             .contexts
             .get_mut(key)
-            .filter(|stored| stored.awaiting_room)
+            .filter(|stored| !stored.awaiting_room.is_empty())
         else {
             return 0;
         };
-        stored.awaiting_room = false;
-        let unrecorded = stored.unrecorded_fresh_members();
+        let named = std::mem::take(&mut stored.awaiting_room);
+        let unrecorded = stored.unrecorded_fresh_among(&named);
         for path in &unrecorded {
             stored.index.mark_stale(path);
         }

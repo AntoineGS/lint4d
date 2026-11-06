@@ -3301,6 +3301,10 @@ pub struct Workspace {
     /// `true` in an index build view: loads then drop their cache claim
     /// instead of publishing the parse (l4d-33 A13).
     pub(crate) index_build: bool,
+    /// While an index batch extracts one member, when its extraction is
+    /// over: compile-time sessions stop at it as at a cancellation (13b-5,
+    /// A4). `None` for every other analysis, the crawl's included.
+    pub(crate) member_deadline: Option<Instant>,
     /// The context an index build is working in: no prune drops it.
     pinned_context: Option<ContextKey>,
     /// Why the last load that returned `Ok(false)` skipped its file: a read

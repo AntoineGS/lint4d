@@ -794,9 +794,10 @@ mod tests {
     use crate::persistent_cache::PersistentCache;
     use crate::project_cache::{IndexAnchor, MAX_INDEXED_CONTEXTS};
     use crate::workspace::eligible::Ineligible;
+    use crate::workspace::indexing::slow_member_for_test;
     use crate::workspace::indexing::tests::persisting::{persisting_view, records, restarted_view};
     use crate::workspace::indexing::tests::{
-        advance, indexed_project, members, named_unit, selected, workspace, write,
+        advance, indexed_project, members, named_unit, selected, session_unit, workspace, write,
     };
     use crate::workspace::indexing::{IndexBound, IndexMode};
     use crate::workspace::persist::tests::private_dir;
@@ -1199,6 +1200,62 @@ mod tests {
             "{progress:?}"
         );
         assert!(second.project_cache.index_member_has_record(&key, &big));
+        assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
+        cache.shutdown();
+    }
+
+    /// 13b-5 (A4, R8-3): a member limited by its extraction deadline gets
+    /// an artifact-less record, never a persisted refusal: the context seals
+    /// with it as a gap, and the next start reuses every other member and
+    /// retries it last, under a fresh deadline.
+    #[test]
+    fn a_member_past_its_extraction_deadline_seals_as_a_gap_and_is_retried_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (session, key, anchor) = indexed_project(temp.path(), 4, WorkspaceOptions::default());
+        let slow = temp.path().join("lib/U0.pas");
+        session_unit(&slow);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let _slow = slow_member_for_test(&slow);
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert_eq!(
+            (progress.indexed, progress.limited, progress.persisted),
+            (3, 1, 3),
+            "{progress:?}"
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert!(first.project_cache.index_member_has_record(&key, &slow));
+        assert_eq!(records(&first, &key).len(), 4);
+        let status = first.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (status[0].counts.over_deadline, status[0].counts.refused),
+            (1, 0),
+            "{:?}",
+            status[0]
+        );
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        cache.shutdown();
+
+        let (mut second, cache) = persisting_view(
+            &workspace(temp.path(), WorkspaceOptions::default()),
+            store.path(),
+        );
+        let progress = advance(&mut second, &anchor, IndexBound::all());
+        assert_eq!(
+            (
+                progress.reused,
+                progress.limited,
+                progress.refused,
+                progress.retries_attempted
+            ),
+            (3, 1, 0, 1),
+            "{progress:?}"
+        );
+        assert!(
+            progress.complete && !progress.worth_requeue(),
+            "{progress:?}"
+        );
         assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
         cache.shutdown();
     }

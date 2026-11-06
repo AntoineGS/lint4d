@@ -288,6 +288,8 @@ struct Member {
     /// The facts are too large to store (a fixed capture or store limit):
     /// the record lists the member without an artifact.
     over_limit: bool,
+    /// The Limited member's extraction passed its deadline (13b-5, A4).
+    over_deadline: bool,
     /// The proven record of this member's state, set by this process.
     record: Option<Digest>,
 }
@@ -310,6 +312,8 @@ pub(crate) struct IndexCounts {
     /// Fresh members whose facts are too large to store; their records
     /// have no artifact, so the next process extracts them again.
     pub(crate) over_limit: usize,
+    /// Of `limited`, members whose extraction passed its deadline.
+    pub(crate) over_deadline: usize,
     /// Members whose artifact and record are known published in this
     /// process, each counted once: a Fresh member with a record this process
     /// proved (reused members included; `over_limit` members are not, their
@@ -586,6 +590,7 @@ impl ContextIndex {
         member.retrying = false;
         member.reused = false;
         member.over_limit = false;
+        member.over_deadline = false;
         member.record = None;
         for name in posting_ids {
             list_remove(&mut self.postings, name, id);
@@ -802,7 +807,10 @@ impl ContextIndex {
                     }
                 }
                 MemberState::Refused(_) => counts.refused += 1,
-                MemberState::Limited => counts.limited += 1,
+                MemberState::Limited => {
+                    counts.limited += 1;
+                    counts.over_deadline += usize::from(member.over_deadline);
+                }
             }
         }
         counts
@@ -1006,12 +1014,14 @@ impl ContextIndex {
 
     /// Returns the old charge, `None` if `path` is not a member. The member
     /// keeps no facts and stays an unverified candidate until it is stale.
-    pub(crate) fn limit(&mut self, path: &Path) -> Option<usize> {
+    /// `over_deadline` when its extraction passed its deadline.
+    pub(crate) fn limit(&mut self, path: &Path, over_deadline: bool) -> Option<usize> {
         let id = self.id_of(path)?;
         let old = self.release(id);
         let member = &mut self.members[id.0 as usize];
         member.hash = None;
         member.state = Some(MemberState::Limited);
+        member.over_deadline = over_deadline;
         let path = member.path.clone();
         self.log([path]);
         Some(old)
@@ -1040,6 +1050,7 @@ impl ContextIndex {
                 member.reuse_tried = false;
                 member.reused = false;
                 member.over_limit = false;
+                member.over_deadline = false;
                 true
             }
             MemberState::Unindexed | MemberState::Stale => false,
@@ -1482,7 +1493,7 @@ mod tests {
         assert_eq!(index.counts().persisted, 4);
         index.mark_stale(a);
         index.refuse(b, "no".into());
-        index.limit(c);
+        index.limit(c, false);
         assert_eq!(index.record(a), None);
         assert_eq!(index.record(b), None);
         assert_eq!(index.record(c), None);
@@ -1537,6 +1548,7 @@ mod tests {
                 deferred: 1,
                 retrying: 1,
                 over_limit: 0,
+                over_deadline: 0,
                 persisted: 0,
             }
         );

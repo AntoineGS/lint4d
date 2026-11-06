@@ -1425,7 +1425,10 @@ validated, so the snapshot is never proof.
   interactive and bulk work and are bounded: a
   reuse batch is 512 members or 200 ms, an extraction batch 64 members or 2 s.
   A member whose write the store refuses under WAL pressure stays pending and
-  is retried later.
+  is retried later. One member's extraction may take at most 10 seconds:
+  past that it is stopped and counted as `limited` (and `overDeadline`), the
+  batch goes on, and the member is read directly by the requests that need
+  it until it changes. The open-file crawl has no such deadline.
 - **Refusals.** A member that was refused or exceeded the index limits is not
   stored as a refusal. It is retried last in the background and reported as a
   `retrying` gap rather than as an incomplete index.
@@ -1459,6 +1462,7 @@ Each context has:
 | `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
 | `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
 | `overLimit` | Fresh members whose facts are too large to store (more distinct reads than a capture holds, or a store size limit): indexed in this process, recorded without an artifact, and extracted again by the next start |
+| `overDeadline` | Of `limited`, members whose extraction took longer than 10 seconds and was stopped: recorded without an artifact (not as a refusal), so the snapshot can still be sealed, and retried last by the next start |
 | `membershipComplete` | The member list is complete and current |
 | `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
 | `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |

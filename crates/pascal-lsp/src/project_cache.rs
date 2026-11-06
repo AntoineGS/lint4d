@@ -6895,10 +6895,17 @@ impl IndexStatusEntry {
         if counts.refused > 0 {
             gaps.push(format!("{} units could not be indexed", counts.refused));
         }
-        if counts.limited > 0 {
+        let over_index_limits = counts.limited - counts.over_deadline;
+        if over_index_limits > 0 {
             gaps.push(format!(
-                "{} units exceed the index limits and are not indexed",
-                counts.limited
+                "{over_index_limits} units exceed the index limits and are not indexed"
+            ));
+        }
+        if counts.over_deadline > 0 {
+            gaps.push(format!(
+                "{} units took longer than {} s to extract and are not indexed; the next start retries them last",
+                counts.over_deadline,
+                crate::workspace::indexing::MEMBER_DEADLINE.as_secs()
             ));
         }
         if counts.over_limit > 0 {
@@ -6975,6 +6982,7 @@ impl IndexStatusEntry {
             "persisted": counts.persisted,
             "retrying": counts.retrying,
             "overLimit": counts.over_limit,
+            "overDeadline": counts.over_deadline,
             "membershipComplete": self.membership_complete,
             "complete": self.complete,
             "snapshot": self.snapshot,
@@ -7437,11 +7445,21 @@ impl ProjectCache {
     }
 
     pub(crate) fn limit_index_member(&self, key: &ContextKey, path: &Path) {
+        self.limit_index_member_as(key, path, false);
+    }
+
+    /// `limit_index_member` for a member whose extraction passed its
+    /// deadline (`IndexCounts::over_deadline`).
+    pub(crate) fn limit_index_member_past_deadline(&self, key: &ContextKey, path: &Path) {
+        self.limit_index_member_as(key, path, true);
+    }
+
+    fn limit_index_member_as(&self, key: &ContextKey, path: &Path, over_deadline: bool) {
         let old = self
             .index()
             .contexts
             .get_mut(key)
-            .and_then(|stored| stored.index.limit(path));
+            .and_then(|stored| stored.index.limit(path, over_deadline));
         if let Some(old) = old {
             self.release_index(old);
         }
@@ -8596,7 +8614,7 @@ mod index_tests {
             stored
                 .index
                 .refuse(Path::new("/w/Refused.pas"), "r".to_owned());
-            stored.index.limit(Path::new("/w/Limited.pas"));
+            stored.index.limit(Path::new("/w/Limited.pas"), false);
             stored.validation_reads = 7;
         }
         let entries = cache.index_status(&|_| false);

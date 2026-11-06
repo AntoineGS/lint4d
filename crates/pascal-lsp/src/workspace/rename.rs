@@ -282,6 +282,19 @@ pub(crate) struct CachedDocument {
     pub(crate) parsed: Arc<ParsedDocument>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Document owner entries `analysis_input` copied on this thread.
+    static OWNERS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The document owner entries `analysis_input` copied on this thread since
+/// the last take.
+#[cfg(test)]
+pub(crate) fn take_owners_copied_for_test() -> usize {
+    OWNERS_COPIED.with(|copied| copied.replace(0))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
@@ -1625,6 +1638,35 @@ impl Workspace {
     }
 
     pub(crate) fn analysis_input(&self) -> WorkspaceInput {
+        #[cfg(test)]
+        OWNERS_COPIED.with(|copied| copied.set(copied.get() + self.document_owners.len()));
+        let cached_documents = self
+            .index
+            .reusable_documents()
+            .into_iter()
+            .filter_map(|(uri, parsed)| {
+                let context_key = self.document_contexts.get(&uri)?;
+                let context = self.contexts.get(context_key)?.context.clone();
+                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
+            })
+            .collect();
+        self.input_with(self.document_owners.clone(), cached_documents)
+    }
+
+    /// `analysis_input` without the document owners and reusable parses,
+    /// which grow with every document the workspace loads: only for a
+    /// compile-time session's source store and provider configuration,
+    /// which read neither. A batch's member sessions then cost no more for
+    /// the members loaded before them (13b-5, A4).
+    pub(super) fn session_source_input(&self) -> WorkspaceInput {
+        self.input_with(HashMap::new(), HashMap::new())
+    }
+
+    fn input_with(
+        &self,
+        document_owners: HashMap<Url, KnownDocumentOwner>,
+        cached_documents: HashMap<Url, CachedDocument>,
+    ) -> WorkspaceInput {
         let overlays = self
             .open_documents
             .iter()
@@ -1661,16 +1703,6 @@ impl Workspace {
             .iter()
             .map(|(uri, document)| (canonical_file_uri(uri), document.version))
             .collect();
-        let cached_documents = self
-            .index
-            .reusable_documents()
-            .into_iter()
-            .filter_map(|(uri, parsed)| {
-                let context_key = self.document_contexts.get(&uri)?;
-                let context = self.contexts.get(context_key)?.context.clone();
-                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
-            })
-            .collect();
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
@@ -1678,7 +1710,7 @@ impl Workspace {
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
             build_selections: self.build_selections.clone(),
-            document_owners: self.document_owners.clone(),
+            document_owners,
             overlays,
             cached_documents,
             project_cache: self.project_cache.clone(),

@@ -161,6 +161,8 @@ fn provider_graph_configuration(
 struct Control<'a> {
     cancel: &'a AtomicBool,
     budget: Option<&'a ReconciliationBudget>,
+    /// An index member's extraction deadline (`Workspace::member_deadline`).
+    deadline: Option<std::time::Instant>,
 }
 
 #[cfg(test)]
@@ -192,6 +194,11 @@ impl Control<'_> {
         }
         if self.cancel.load(Ordering::Relaxed) {
             Err(super::CANCELLATION_MESSAGE.into())
+        } else if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            Err(super::indexing::MEMBER_DEADLINE_MESSAGE.into())
         } else {
             Ok(())
         }
@@ -578,6 +585,7 @@ pub(super) fn selected_import_header(
     let control = Control {
         cancel,
         budget: None,
+        deadline: None,
     };
     control.check()?;
     let input = workspace.analysis_input();
@@ -892,7 +900,11 @@ pub(super) fn expand_with_limits(
 ) -> Result<ExpansionResult, String> {
     let directory_limit = limits.directory_entries;
     let limits = limits.expansion;
-    let control = Control { cancel, budget };
+    let control = Control {
+        cancel,
+        budget,
+        deadline: workspace.member_deadline,
+    };
     control.check()?;
     #[cfg(test)]
     if TEST_EXPANSION_FAILURE.with(|value| {
@@ -933,7 +945,7 @@ pub(super) fn expand_with_limits(
         .get(key)
         .ok_or("project context was not retained")?;
     let context = state.context.clone();
-    let input = workspace.analysis_input();
+    let input = workspace.session_source_input();
     let source_hash = if input.overlays.contains_key(uri) {
         crate::project_cache::overlay_content_hash(source)
     } else {
@@ -2072,5 +2084,61 @@ mod tests {
                 .any(|gap| gap.reason.contains("include expansion is incomplete"))
         );
         assert!(partial.value.iter().all(|location| location.uri == main));
+    }
+
+    /// 13b-5 (A4): a passed member deadline stops the session as
+    /// cancellation does, under its own message; cancellation comes first,
+    /// so a cancelled member is never taken for one past its deadline.
+    #[test]
+    fn a_passed_member_deadline_stops_the_session_after_cancellation() {
+        let cancel = AtomicBool::new(false);
+        let passed = Control {
+            cancel: &cancel,
+            budget: None,
+            deadline: Some(std::time::Instant::now()),
+        };
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::indexing::MEMBER_DEADLINE_MESSAGE
+        );
+        assert!(passed.is_cancelled());
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::CANCELLATION_MESSAGE
+        );
+        let running = AtomicBool::new(false);
+        let ahead = Control {
+            cancel: &running,
+            budget: None,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3_600)),
+        };
+        assert!(ahead.check().is_ok());
+        assert!(!ahead.is_cancelled());
+    }
+
+    /// 13b-5 (A4): an expansion in a view with a passed member deadline
+    /// fails with the deadline's message; without a deadline it succeeds.
+    #[test]
+    fn an_expansion_past_the_member_deadline_fails_with_its_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("x.inc"), "const X = 1;\n").unwrap();
+        let source = "unit Main; interface {$I x.inc} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let limits = workspace.include_expansion_limits();
+        let cancel = AtomicBool::new(false);
+        workspace.member_deadline = Some(std::time::Instant::now());
+        let error = expand(&workspace, &uri, source, &key, limits, &cancel, None).unwrap_err();
+        assert_eq!(error, super::super::indexing::MEMBER_DEADLINE_MESSAGE);
+        workspace.member_deadline = None;
+        assert!(expand(&workspace, &uri, source, &key, limits, &cancel, None).is_ok());
     }
 }

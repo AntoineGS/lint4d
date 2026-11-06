@@ -257,6 +257,58 @@ pub(crate) const EXTRACTION_BATCH_UNITS: usize = 64;
 /// members refused for room (the worker's pressure interval, twice).
 const ROOM_WAIT: Duration = Duration::from_secs(2);
 
+/// How long an index batch lets one member's extraction run (13b-5, A4):
+/// five extraction batch bounds. A member's compile-time session is the
+/// cost it bounds, and that session runs in milliseconds to about a second
+/// for ordinary units once observations are deduplicated (13b-2), so only a
+/// pathological unit reaches it. Such a unit costs at most this once per
+/// start: it is limited, listed by an artifact-less record and retried last
+/// by the next start (R8-3).
+pub(crate) const MEMBER_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Why a compile-time session stopped at `Workspace::member_deadline`. It is
+/// no stable load refusal (`is_stable_load_refusal`): the member is limited,
+/// never stored as refused.
+pub(crate) const MEMBER_DEADLINE_MESSAGE: &str = "the member's extraction passed its deadline";
+
+#[cfg(test)]
+thread_local! {
+    /// The member whose extraction deadline has passed when it starts, as
+    /// for a member slower than `MEMBER_DEADLINE`.
+    static SLOW_MEMBER: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears `slow_member_for_test` when dropped.
+#[cfg(test)]
+pub(crate) struct SlowMember;
+
+#[cfg(test)]
+impl Drop for SlowMember {
+    fn drop(&mut self) {
+        SLOW_MEMBER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Makes `path` a member whose extraction outlasts its deadline on this
+/// thread, until the guard drops.
+#[cfg(test)]
+pub(crate) fn slow_member_for_test(path: &Path) -> SlowMember {
+    SLOW_MEMBER.with(|slot| *slot.borrow_mut() = Some(path.to_path_buf()));
+    SlowMember
+}
+
+/// When the extraction of `path`, starting now, must be over.
+fn member_deadline(path: &Path) -> Instant {
+    #[cfg(test)]
+    if SLOW_MEMBER.with(|slot| slot.borrow().as_deref() == Some(path)) {
+        return Instant::now();
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    Instant::now() + MEMBER_DEADLINE
+}
+
 /// What an index batch may do for a member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexMode {
@@ -954,7 +1006,12 @@ impl Workspace {
                 .read_index(&key, |index, _| index.retrying(&path))
                 .unwrap_or(false);
             // One member's failure never stops the batch: it stays pending.
-            let outcome = match self.index_member(&key, &path, own_stamp, cancel) {
+            // Its extraction runs under its own deadline (A4); the batch
+            // bound is checked between members.
+            self.member_deadline = Some(member_deadline(&path));
+            let indexed = self.index_member(&key, &path, own_stamp, cancel);
+            self.member_deadline = None;
+            let outcome = match indexed {
                 Ok(outcome) => outcome,
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                 Err(error) => MemberOutcome::Deferred(error),
@@ -1219,7 +1276,59 @@ impl Workspace {
         let loaded = self.load_source_with_cancel(&uri, key, &HashSet::new(), Some(cancel));
         #[cfg(test)]
         run_hook(&AFTER_LOAD, path);
-        let outcome = match loaded {
+        let past_deadline = match &loaded {
+            Err(error) => error.contains(MEMBER_DEADLINE_MESSAGE),
+            Ok(false) => self
+                .load_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains(MEMBER_DEADLINE_MESSAGE)),
+            Ok(true) => false,
+        };
+        let outcome = if past_deadline {
+            self.load_refusal = None;
+            self.limit_past_deadline(key, path, cancel)
+        } else {
+            self.member_loaded(key, path, &uri, loaded, own_stamp, cancel)
+        };
+        if !held {
+            let _ = self.remove_indexed_with_control(&uri, None, None, false);
+        }
+        outcome
+    }
+
+    /// The member's extraction passed its deadline (A4): limited, an
+    /// unverified candidate until it changes, listed by an artifact-less
+    /// record so the context still seals; the next start retries it last
+    /// (R8-3). A cancellation that came meanwhile wins: the member stays
+    /// pending and the batch is requeued.
+    fn limit_past_deadline(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<MemberOutcome, String> {
+        check_workspace_cancel(Some(cancel))?;
+        crate::trace::trace!(
+            "  index member {} limited: extraction over {} s",
+            path.display(),
+            MEMBER_DEADLINE.as_secs()
+        );
+        self.project_cache
+            .limit_index_member_past_deadline(key, path);
+        self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+        Ok(MemberOutcome::Limited)
+    }
+
+    fn member_loaded(
+        &mut self,
+        key: &ContextKey,
+        path: &Path,
+        uri: &Url,
+        loaded: Result<bool, String>,
+        own_stamp: crate::workspace::PathStamp,
+        cancel: &AtomicBool,
+    ) -> Result<MemberOutcome, String> {
+        match loaded {
             Err(error) if is_stable_load_refusal(&error) => {
                 Ok(self.refuse_unless_vanished(key, path, error, cancel))
             }
@@ -1240,12 +1349,8 @@ impl Workspace {
                     })))
                 }
             },
-            Ok(true) => self.publish_member(key, path, &uri, own_stamp, cancel),
-        };
-        if !held {
-            let _ = self.remove_indexed_with_control(&uri, None, None, false);
+            Ok(true) => self.publish_member(key, path, uri, own_stamp, cancel),
         }
-        outcome
     }
 
     /// A file that is gone is not a refusal: its directory listing changed.
@@ -4223,6 +4328,143 @@ pub(in crate::workspace) mod tests {
         assert_eq!(state(&workspace, &key, &limited), Some(MemberState::Stale));
     }
 
+    /// A unit that reads an include, so its load runs a compile-time
+    /// session (the work a member deadline bounds).
+    pub(in crate::workspace) fn session_unit(path: &Path) {
+        write(&path.with_file_name("x.inc"), "const X = 1;\n");
+        let unit = path.file_stem().unwrap().to_string_lossy().into_owned();
+        write(
+            path,
+            &format!("unit {unit};\ninterface\n{{$I x.inc}}\nimplementation\nend.\n"),
+        );
+    }
+
+    /// 13b-5 (A4): a member whose extraction passes its deadline is aborted
+    /// through its session's control and limited. The batch goes on, the
+    /// other members are not affected, the context completes and reports
+    /// the member as a gap, and no later batch of this process extracts it
+    /// again.
+    #[test]
+    fn a_member_past_its_extraction_deadline_is_limited_and_the_batch_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 4, WorkspaceOptions::default());
+        let slow = root.join("lib/U0.pas");
+        session_unit(&slow);
+        // A normal member with a session of its own keeps the default
+        // deadline.
+        let normal = root.join("lib/U1.pas");
+        session_unit(&normal);
+        pascal_project::backdate_tree_for_test(root);
+        let _slow = slow_member_for_test(&slow);
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (
+                progress.indexed,
+                progress.limited,
+                progress.deferred,
+                progress.refused
+            ),
+            (3, 1, 0, 0),
+            "{progress:?}"
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(state(&workspace, &key, &slow), Some(MemberState::Limited));
+        for path in members(&workspace, &key)
+            .into_iter()
+            .filter(|path| *path != slow)
+        {
+            assert_eq!(
+                state(&workspace, &key, &path),
+                Some(MemberState::Fresh),
+                "{path:?}"
+            );
+        }
+        let status = workspace.project_cache.index_status(&|_| false);
+        assert_eq!(status[0].counts.limited, 1, "{:?}", status[0]);
+        assert_eq!(status[0].counts.over_deadline, 1, "{:?}", status[0]);
+        assert!(
+            status[0]
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("1 units took longer than")),
+            "{:?}",
+            status[0]
+        );
+        assert!(
+            !status[0]
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("exceed the index limits")),
+            "{:?}",
+            status[0]
+        );
+        let json = crate::project_cache::index_status_json(&status, Default::default());
+        assert_eq!(json["contexts"][0]["overDeadline"], 1, "{json}");
+        let again = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!((again.indexed, again.limited, again.pending), (0, 0, 0));
+        // A change makes it a pending member again, extracted under a
+        // fresh deadline.
+        workspace.project_cache.invalidate_path(&slow);
+        assert_eq!(state(&workspace, &key, &slow), Some(MemberState::Stale));
+        let status = workspace.project_cache.index_status(&|_| false);
+        assert_eq!(status[0].counts.over_deadline, 0, "{:?}", status[0]);
+    }
+
+    /// 13b-5 (A4): a member's compile-time session does not copy the
+    /// workspace's document owners, which grow with every member a batch
+    /// loads, so a member's cost does not grow with the members before it.
+    #[test]
+    fn a_member_session_copies_no_document_owners() {
+        const COUNT: usize = 41;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) =
+            indexed_project(root, COUNT, WorkspaceOptions::default());
+        for index in 0..COUNT - 1 {
+            session_unit(&root.join(format!("lib/U{index}.pas")));
+        }
+        pascal_project::backdate_tree_for_test(root);
+        super::super::rename::take_owners_copied_for_test();
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        let copied = super::super::rename::take_owners_copied_for_test();
+        assert_eq!(progress.indexed, COUNT, "{progress:?}");
+        assert!(members(&workspace, &key).len() == COUNT);
+        // Quadratic before: each session copied the owners of every member
+        // loaded before it.
+        assert!(copied <= COUNT, "{copied} owner entries copied");
+    }
+
+    /// 13b-5 (A4): cancellation of the batch (interactive work, a new
+    /// generation) during a member whose deadline also passed stops the
+    /// batch; the member stays pending for the next batch, never limited.
+    #[test]
+    fn a_cancelled_slow_member_stays_pending_rather_than_limited() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 3, WorkspaceOptions::default());
+        let slow = root.join("lib/U0.pas");
+        session_unit(&slow);
+        pascal_project::backdate_tree_for_test(root);
+        let _slow = slow_member_for_test(&slow);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (flag, target) = (std::sync::Arc::clone(&cancel), slow.clone());
+        set_after_load_hook(Some(Box::new(move |path| {
+            if path == target {
+                flag.store(true, Ordering::Relaxed);
+            }
+        })));
+        let result =
+            workspace.advance_workspace_index(&anchor, IndexBound::all(), &mut || Ok(()), &cancel);
+        set_after_load_hook(None);
+        assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+        assert_eq!(state(&workspace, &key, &slow), Some(MemberState::Unindexed));
+        let resumed = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(resumed.limited, 1, "{resumed:?}");
+        assert!(resumed.complete, "{resumed:?}");
+        assert_eq!(state(&workspace, &key, &slow), Some(MemberState::Limited));
+    }
+
     /// A unit whose include expansion exceeds a compile-time limit fails the
     /// same way for the same bytes, in a batch as in a request (A6).
     #[test]
@@ -6655,6 +6897,143 @@ pub(in crate::workspace) mod tests {
             let status = view.project_cache.index_status(&|_| false);
             assert_eq!(status[0].counts.over_limit, 1, "{:?}", status[0]);
             assert!(view.project_cache.index_member_has_record(&key, &member));
+            cache.shutdown();
+        }
+
+        /// 13b-5 (A4) measurement, not a gate: per-member extraction cost
+        /// on a multidev-shaped project (`DIRS` search-path directories,
+        /// `L4D_MEASURE_UNITS` (600) units whose interfaces use lower units
+        /// (`L4D_MEASURE_SHAPE=tree`: only one, half its index) and test a
+        /// provider constant, so each session compiles a provider closure,
+        /// and one shared include found through the search path). Run with
+        /// `cargo test -p pascal-lsp --release --lib -- --ignored
+        /// measure_member_cost_on_a_search_path_shape --nocapture`.
+        #[test]
+        #[ignore]
+        fn measure_member_cost_on_a_search_path_shape() {
+            const DIRS: usize = 40;
+            let units = std::env::var("L4D_MEASURE_UNITS")
+                .ok()
+                .and_then(|units| units.parse().ok())
+                .unwrap_or(600_usize);
+            let tree = std::env::var("L4D_MEASURE_SHAPE").is_ok_and(|shape| shape == "tree");
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let root = temp.path();
+            write(
+                &root.join("lib/d0/Defines.inc"),
+                "{$DEFINE SHARED}\nconst Shared = 1;\n",
+            );
+            for unit in 0..units {
+                let path = root.join(format!("lib/d{}/U{unit}.pas", unit % DIRS));
+                // `tree`: only `unit / 2`, a closure of log depth.
+                let uses = if tree {
+                    vec![unit / 2]
+                } else {
+                    vec![unit.saturating_sub(1), unit.saturating_sub(2), unit / 2]
+                };
+                let uses = uses
+                    .into_iter()
+                    .filter(|used| *used < unit)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut text = format!("unit U{unit};\ninterface\n");
+                if let Some(first) = uses.first() {
+                    let names = uses
+                        .iter()
+                        .map(|used| format!("U{used}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    text.push_str(&format!(
+                        "uses {names};\n{{$IF U{first}.Flag = 1}}\nconst Flag = 1;\n{{$ELSE}}\nconst Flag = 2;\n{{$ENDIF}}\n"
+                    ));
+                } else {
+                    text.push_str("const Flag = 1;\n");
+                }
+                text.push_str(&format!(
+                    "{{$I Defines.inc}}\nconst C{unit} = {unit};\nprocedure P{unit};\nimplementation\nprocedure P{unit};\nbegin\nend;\nend.\n"
+                ));
+                write(&path, &text);
+            }
+            let search = (0..DIRS)
+                .map(|dir| format!("lib/d{dir}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            let (session, _key, anchor) = {
+                let (workspace, key) = project_workspace(
+                    root,
+                    &format!("<DCC_UnitSearchPath>{search}</DCC_UnitSearchPath>"),
+                    "",
+                    WorkspaceOptions::default(),
+                );
+                (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
+            };
+            let (mut view, cache) = persisting_view(&session, store.path());
+            // Per member: the reuse attempt's end, then the load's end.
+            type Mark = (PathBuf, Instant, Option<Instant>);
+            let marks: Rc<RefCell<Vec<Mark>>> = Rc::default();
+            let reuse_marks = Rc::clone(&marks);
+            set_after_reuse_hook(Some(Box::new(move |path| {
+                reuse_marks
+                    .borrow_mut()
+                    .push((path.to_path_buf(), Instant::now(), None));
+            })));
+            let load_marks = Rc::clone(&marks);
+            set_after_load_hook(Some(Box::new(move |path| {
+                if let Some(last) = load_marks.borrow_mut().last_mut()
+                    && last.0 == path
+                {
+                    last.2 = Some(Instant::now());
+                }
+            })));
+            let started = Instant::now();
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            let ended = Instant::now();
+            set_after_reuse_hook(None);
+            set_after_load_hook(None);
+            let marks = marks.borrow();
+            let mut loads = Vec::new();
+            let mut totals = Vec::new();
+            for (at, (_, reused, loaded)) in marks.iter().enumerate() {
+                let next = marks.get(at + 1).map_or(ended, |next| next.1);
+                totals.push(next - *reused);
+                if let Some(loaded) = loaded {
+                    loads.push(*loaded - *reused);
+                }
+            }
+            let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            let summary = |name: &str, values: &[Duration]| {
+                let mut sorted = values.to_vec();
+                sorted.sort();
+                let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+                let tenth = values.len() / 10;
+                let mean = |part: &[Duration]| {
+                    ms(part.iter().sum::<Duration>()) / part.len().max(1) as f64
+                };
+                println!(
+                    "{name}: n={} median={:.2} ms p95={:.2} ms max={:.2} ms first-10%-mean={:.2} ms last-10%-mean={:.2} ms",
+                    values.len(),
+                    ms(at(0.5)),
+                    ms(at(0.95)),
+                    ms(at(1.0)),
+                    mean(&values[..tenth]),
+                    mean(&values[values.len() - tenth..]),
+                );
+            };
+            println!(
+                "batch: indexed={} persisted={} awaiting_room={} limited={} refused={} in {:.0} ms; providerGraphsRefused={}",
+                progress.indexed,
+                progress.persisted,
+                progress.awaiting_room,
+                progress.limited,
+                progress.refused,
+                ms(ended - started),
+                view.project_cache
+                    .index_process_counts()
+                    .provider_graphs_refused,
+            );
+            summary("load (session + parse)", &loads);
+            summary("member total (load + facts + publish)", &totals);
+            assert_eq!(progress.limited, 0, "{progress:?}");
             cache.shutdown();
         }
 

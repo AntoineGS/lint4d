@@ -5351,6 +5351,15 @@ impl AnalysisJobs {
             })
             .count();
         self.interactive_gate.set(running + queued);
+        // The general slots in use, as `worker_admission` counts them.
+        self.interactive_gate.set_running_general(
+            self.diagnostics.len()
+                + self
+                    .pending
+                    .values()
+                    .filter(|job| job.priority != AnalysisPriority::Interactive)
+                    .count(),
+        );
         // Index batches also wait for running Bulk requests (D33).
         self.interactive_gate.set_running_bulk(
             self.pending
@@ -10415,14 +10424,22 @@ fn send_diagnostic_server_cancelled(
 /// costs only address space until touched.
 pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-/// The analysis threads background index work may run at once: the
-/// server's analysis slots (`MAX_ANALYSIS_JOBS`), never more than the CPUs.
-/// Index batches run only while no interactive or client request runs or
-/// waits (D33), so their workers take the slots such requests would.
-pub(crate) fn analysis_slots() -> usize {
-    thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(MAX_ANALYSIS_JOBS)
+/// The workers a reuse batch validates on (R8-1) while `running_general`
+/// jobs hold the general analysis slots: the free general slots, at least
+/// one (the warmer's own thread works meanwhile only to apply results), and
+/// never more than the CPUs. The interactive-reserved slot is never taken.
+pub(crate) fn validation_threads(running_general: usize) -> usize {
+    validation_threads_for(
+        running_general,
+        thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+fn validation_threads_for(running_general: usize, cpus: usize) -> usize {
+    MAX_GENERAL_ANALYSIS_JOBS
+        .saturating_sub(running_general)
+        .max(1)
+        .min(cpus.max(1))
 }
 
 /// A builder for a thread that runs analysis, with its explicit stack.
@@ -19847,6 +19864,53 @@ mod tests {
         jobs.pending.clear();
         jobs.publish_interactive_load();
         assert!(jobs.interactive_gate.index_may_run(&cancel));
+    }
+
+    #[test]
+    fn reuse_validation_takes_only_the_free_general_slots() {
+        use super::{MAX_GENERAL_ANALYSIS_JOBS, validation_threads_for};
+        assert_eq!(MAX_GENERAL_ANALYSIS_JOBS, 2);
+        assert_eq!(validation_threads_for(0, 8), 2);
+        assert_eq!(validation_threads_for(1, 8), 1);
+        // At least one; never the interactive slot, never past the CPUs.
+        assert_eq!(validation_threads_for(2, 8), 1);
+        assert_eq!(validation_threads_for(5, 8), 1);
+        assert_eq!(validation_threads_for(0, 1), 1);
+        assert_eq!(validation_threads_for(0, 0), 1);
+    }
+
+    #[test]
+    fn running_diagnostics_shrink_the_reuse_validation_threads() {
+        let mut jobs = AnalysisJobs::new();
+        jobs.publish_interactive_load();
+        let free = jobs.interactive_gate.validation_threads();
+        assert!((1..=2).contains(&free), "{free}");
+        let running = |priority| super::PendingAnalysis {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            handle: thread::spawn(|| {}),
+            recipients: Vec::new(),
+            key: None,
+            priority,
+        };
+        jobs.pending.insert(
+            AnalysisComputationId(31_100),
+            running(AnalysisPriority::Interactive),
+        );
+        jobs.publish_interactive_load();
+        assert_eq!(
+            jobs.interactive_gate.validation_threads(),
+            free,
+            "interactive work holds its own slot"
+        );
+        jobs.pending.insert(
+            AnalysisComputationId(31_101),
+            running(AnalysisPriority::Diagnostics),
+        );
+        jobs.publish_interactive_load();
+        assert_eq!(jobs.interactive_gate.validation_threads(), 1);
+        jobs.pending.clear();
+        jobs.publish_interactive_load();
+        assert_eq!(jobs.interactive_gate.validation_threads(), free);
     }
 
     #[test]

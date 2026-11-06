@@ -742,12 +742,15 @@ struct ReuseHit {
 /// Bounded parallel validation of a reuse batch (R8-1): up to `threads`
 /// analysis threads validate members ahead of the batch, which applies
 /// their results in member order. Each worker checks `may_run` (interactive
-/// work, cancellation) before each member it starts. The proof rule is
-/// unchanged: a worker runs the serial validation of one member.
+/// work, cancellation) before each member it starts, and worker `n` takes a
+/// member only while `workers()` (the free general analysis slots) exceeds
+/// `n`; worker 0 always may. The proof rule is unchanged: a worker runs the
+/// serial validation of one member.
 #[derive(Clone, Copy)]
 pub(crate) struct ParallelValidation<'a> {
     pub(crate) threads: usize,
     pub(crate) may_run: &'a (dyn Fn() -> bool + Sync),
+    pub(crate) workers: &'a (dyn Fn() -> usize + Sync),
 }
 
 /// What a worker found for one member of a parallel reuse batch.
@@ -757,8 +760,11 @@ enum Prefetched {
     /// The worker found interactive work or cancellation before it started
     /// this member: the batch stops here.
     Preempted,
-    /// `stamp` is `None` when the member is gone.
+    /// `stamp` is `None` when the member is gone. `epoch` is the cache's
+    /// invalidation epoch before the stamp: a watcher event since makes the
+    /// batch prove the member again itself.
     Member {
+        epoch: u64,
         stamp: Option<PathStamp>,
         reuse: Option<Box<Validated>>,
     },
@@ -771,6 +777,11 @@ struct Pipeline {
     state: std::sync::Mutex<PipelineState>,
     changed: std::sync::Condvar,
     window: usize,
+    /// Set once the batch stops or interactive work arrives: the
+    /// validations in flight stop through their work budget (M5).
+    tripped: Arc<AtomicBool>,
+    #[cfg(test)]
+    takes: std::sync::Mutex<Vec<(usize, usize)>>,
     #[cfg(test)]
     live: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -807,12 +818,36 @@ pub(crate) fn take_validation_peak() -> ValidationPeak {
     VALIDATION_PEAK.with(std::cell::Cell::take)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `(worker, workers())` for each member taken, in take order.
+    static VALIDATION_TAKES: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Runs in the batch before it applies a worker's result.
+    static BEFORE_APPLY: std::cell::RefCell<Option<LoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The takes of the last parallel batch on this thread.
+#[cfg(test)]
+pub(crate) fn take_validation_takes() -> Vec<(usize, usize)> {
+    VALIDATION_TAKES.with(|takes| std::mem::take(&mut *takes.borrow_mut()))
+}
+
+#[cfg(test)]
+fn set_before_apply_hook(hook: Option<LoadHook>) {
+    BEFORE_APPLY.with(|slot| *slot.borrow_mut() = hook);
+}
+
 impl Pipeline {
     fn new(window: usize) -> Self {
         Self {
             state: std::sync::Mutex::default(),
             changed: std::sync::Condvar::new(),
             window,
+            tripped: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            takes: std::sync::Mutex::default(),
             #[cfg(test)]
             live: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -835,17 +870,32 @@ impl Pipeline {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The next member for a worker, once the window has room; `None` when
-    /// every member is taken or the batch stopped.
-    fn take_next(&self, members: usize) -> Option<usize> {
+    /// The next member for `worker`, once the window has room; `None` when
+    /// every member is taken, the batch stopped or the worker's slot was
+    /// taken (`workers()` is `worker` or less).
+    fn take_next(
+        &self,
+        members: usize,
+        worker: usize,
+        workers: &(dyn Fn() -> usize + Sync),
+    ) -> Option<usize> {
         let mut state = self.lock();
         loop {
             if state.stopped || state.next >= members {
                 return None;
             }
+            let allowed = workers();
+            if worker > 0 && worker >= allowed {
+                return None;
+            }
             if state.next < state.done + self.window {
                 let position = state.next;
                 state.next += 1;
+                #[cfg(test)]
+                self.takes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((worker, allowed));
                 return Some(position);
             }
             state = self.wait(state);
@@ -856,6 +906,7 @@ impl Pipeline {
         let mut state = self.lock();
         if matches!(prefetched, Prefetched::Preempted) {
             state.stopped = true;
+            self.tripped.store(true, Ordering::Relaxed);
         }
         state.results.insert(position, prefetched);
         drop(state);
@@ -864,7 +915,9 @@ impl Pipeline {
 
     /// The batch is at `position`: what a worker found for it, once found.
     /// The members before it are done, which makes room in the window.
-    fn take(&self, position: usize) -> Prefetched {
+    /// While it waits, interactive work (`may_run` false) trips the
+    /// validations in flight.
+    fn take(&self, position: usize, may_run: &(dyn Fn() -> bool + Sync)) -> Prefetched {
         let mut state = self.lock();
         state.done = position;
         self.changed.notify_all();
@@ -876,12 +929,20 @@ impl Pipeline {
             if state.stopped && state.next <= position {
                 return Prefetched::Preempted;
             }
-            state = self.wait(state);
+            if !self.tripped.load(Ordering::Relaxed) && !may_run() {
+                self.tripped.store(true, Ordering::Relaxed);
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(25))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
     }
 
     fn stop(&self) {
         self.lock().stopped = true;
+        self.tripped.store(true, Ordering::Relaxed);
         self.changed.notify_all();
     }
 
@@ -1354,7 +1415,17 @@ impl Workspace {
         tried: &mut HashSet<String>,
         cancel: &AtomicBool,
     ) -> Result<bool, String> {
-        let members = Vec::from_iter(pending.iter().cloned());
+        // Workers take no member the bound leaves untried (M1); skipped
+        // open members do not count towards it. Members validated past the
+        // time bound or a stop are dropped unapplied, so the store's hit
+        // count may exceed `reused` by up to the window.
+        let untried = bound.units.saturating_sub(tried.len());
+        let members = Vec::from_iter(
+            pending
+                .iter()
+                .take(untried.saturating_add(self.open_documents.len()))
+                .cloned(),
+        );
         let threads = validation.threads.min(members.len()).max(1);
         let pipeline = Pipeline::new(threads);
         let result = std::thread::scope(|scope| {
@@ -1365,7 +1436,9 @@ impl Workspace {
                 spawned += usize::from(
                     crate::server::analysis_thread(&format!("PascalLspReuse{worker}"))
                         .spawn_scoped(scope, move || {
-                            self.prefetch_members(key, members, pipeline, validation, cancel);
+                            self.prefetch_members(
+                                key, members, pipeline, worker, validation, cancel,
+                            );
                         })
                         .is_ok(),
                 );
@@ -1374,7 +1447,8 @@ impl Workspace {
                 return Ok(false);
             }
             self.apply_prefetched(
-                key, members, pipeline, bound, started, before_io, progress, tried, cancel,
+                key, members, pipeline, bound, started, before_io, validation, progress, tried,
+                cancel,
             )
             .map(|()| true)
         });
@@ -1383,6 +1457,15 @@ impl Workspace {
             peak.set(
                 *pipeline
                     .peak
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        });
+        #[cfg(test)]
+        VALIDATION_TAKES.with(|takes| {
+            *takes.borrow_mut() = std::mem::take(
+                &mut *pipeline
+                    .takes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
@@ -1396,11 +1479,12 @@ impl Workspace {
         key: &ContextKey,
         members: &[PathBuf],
         pipeline: &Pipeline,
+        worker: usize,
         validation: ParallelValidation<'_>,
         cancel: &AtomicBool,
     ) {
         let mut context_key = super::persist::ContextKeyMemo::default();
-        while let Some(position) = pipeline.take_next(members.len()) {
+        while let Some(position) = pipeline.take_next(members.len(), worker, validation.workers) {
             // A worker that panics stops the batch at its member rather
             // than leave it waiting; the scope then propagates the panic.
             let in_flight = InFlight { pipeline, position };
@@ -1412,6 +1496,7 @@ impl Workspace {
             let prefetched = if self.is_open_member(path) {
                 Prefetched::Open
             } else {
+                let epoch = self.project_cache.invalidation_epoch();
                 // The stamp precedes the bytes it describes (A7).
                 let stamp = path_stamp(path);
                 let reprove = self.may_publish(key)
@@ -1426,13 +1511,24 @@ impl Workspace {
                             index.state_of(path) == Some(MemberState::Stale)
                         })
                         .unwrap_or(false);
-                let reuse = (stamp.is_some() && !refresh)
-                    .then(|| Box::new(self.validate_reuse(key, path, &mut context_key, cancel)));
+                let reuse = (stamp.is_some() && !refresh).then(|| {
+                    Box::new(self.validate_reuse(
+                        key,
+                        path,
+                        &mut context_key,
+                        &pipeline.tripped,
+                        cancel,
+                    ))
+                });
                 #[cfg(test)]
                 if matches!(reuse.as_deref(), Some(Validated::Hit(_))) {
                     pipeline.note_hit(self.project_cache.stats().reserved_facts_bytes);
                 }
-                Prefetched::Member { stamp, reuse }
+                Prefetched::Member {
+                    epoch,
+                    stamp,
+                    reuse,
+                }
             };
             std::mem::forget(in_flight);
             pipeline.put(position, prefetched);
@@ -1450,6 +1546,7 @@ impl Workspace {
         bound: IndexBound,
         started: Instant,
         before_io: &mut dyn FnMut() -> Result<(), String>,
+        validation: ParallelValidation<'_>,
         progress: &mut IndexProgress,
         tried: &mut HashSet<String>,
         cancel: &AtomicBool,
@@ -1461,12 +1558,28 @@ impl Workspace {
             {
                 break;
             }
-            let (stamp, reuse) = match pipeline.take(position) {
+            let (epoch, mut stamp, mut reuse) = match pipeline.take(position, validation.may_run) {
                 Prefetched::Preempted => return Err(CANCELLATION_MESSAGE.to_owned()),
                 Prefetched::Open => continue,
-                Prefetched::Member { stamp, reuse } => (stamp, reuse),
+                Prefetched::Member {
+                    epoch,
+                    stamp,
+                    reuse,
+                } => (epoch, stamp, reuse),
             };
             tried.insert(path_key(path));
+            #[cfg(test)]
+            run_hook(&BEFORE_APPLY, path);
+            // A watcher event since the worker's stamp may concern what it
+            // read: the batch proves the member again itself (M2).
+            if self.project_cache.invalidation_epoch() != epoch {
+                #[cfg(test)]
+                if matches!(reuse.as_deref(), Some(Validated::Hit(_))) {
+                    pipeline.note_applied();
+                }
+                reuse = None;
+                stamp = path_stamp(path);
+            }
             #[cfg(test)]
             let stamp = stamp.filter(|_| !UNSTAMPABLE.with(|slot| slot.borrow().contains(path)));
             before_io()?;
@@ -2259,7 +2372,8 @@ impl Workspace {
         context_key: &mut super::persist::ContextKeyMemo,
         cancel: &AtomicBool,
     ) -> ReuseOutcome {
-        match self.validate_reuse(key, path, context_key, cancel) {
+        let stop = Arc::new(AtomicBool::new(false));
+        match self.validate_reuse(key, path, context_key, &stop, cancel) {
             Validated::Outcome(outcome) => outcome,
             Validated::Hit(hit) => self.apply_reuse(key, path, own_stamp, hit, cancel),
         }
@@ -2274,6 +2388,7 @@ impl Workspace {
         key: &ContextKey,
         path: &Path,
         context_key: &mut super::persist::ContextKeyMemo,
+        stop: &Arc<AtomicBool>,
         cancel: &AtomicBool,
     ) -> Validated {
         if !self.is_baseline()
@@ -2290,7 +2405,8 @@ impl Workspace {
         let Some(job) = self.persistent_cache().job() else {
             return Validated::Outcome(ReuseOutcome::NoStore);
         };
-        let work = super::ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        // `stop` ends the validation within: a parallel batch's trip (M5).
+        let work = super::ReconciliationBudget::new(Arc::clone(stop));
         // The held snapshot first: its record skips the candidate search.
         let mut hinted = None;
         if let Some(hint) = self.project_cache.baseline_hint(key) {
@@ -8147,7 +8263,11 @@ pub(in crate::workspace) mod tests {
                     anchor,
                     IndexBound::all().with_mode(IndexMode::Reuse),
                     &mut || Ok(()),
-                    Some(ParallelValidation { threads, may_run }),
+                    Some(ParallelValidation {
+                        threads,
+                        may_run,
+                        workers: &move || threads,
+                    }),
                     &AtomicBool::new(false),
                 )
             }
@@ -8216,33 +8336,39 @@ pub(in crate::workspace) mod tests {
                 let store = private_dir();
                 let (key, anchor) = published(temp.path(), store.path(), 4, UNITS);
                 let (mut view, cache) = restarted_view(temp.path(), store.path());
-                let checks = AtomicUsize::new(0);
-                // Interactive work arrives after `PASSING` members started.
-                let gate = || checks.fetch_add(1, Ordering::SeqCst) < PASSING;
+                let (checks, closed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+                // Interactive work arrives after `PASSING` passing checks
+                // (by the workers, or the batch while it waits).
+                let gate = || {
+                    let open = checks.fetch_add(1, Ordering::SeqCst) < PASSING;
+                    closed.fetch_add(usize::from(!open), Ordering::SeqCst);
+                    open
+                };
                 let result = reuse_pass(&mut view, &anchor, THREADS, &gate);
                 assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
                 let hits = cache.counters().unwrap().snapshot().hits as usize;
-                assert!((1..=PASSING).contains(&hits), "{hits}");
+                assert!(hits <= PASSING, "{hits}");
+                // Each worker stops at its next member, and the batch trips
+                // the validations in flight once: one closed check each.
                 assert!(
-                    checks.load(Ordering::SeqCst) <= PASSING + THREADS,
-                    "each worker stops at its next member: {} checks",
-                    checks.load(Ordering::SeqCst)
+                    closed.load(Ordering::SeqCst) <= THREADS + 1,
+                    "{} closed checks",
+                    closed.load(Ordering::SeqCst)
                 );
-                // The members applied are a prefix of the batch, in order; a
-                // member validated past the stop is dropped, not applied.
-                let order = members(&view, &key);
+                // No member started after the gate closed is applied: the
+                // applied ones are among the first members in path order.
+                let mut order = members(&view, &key);
+                order.sort_by_key(|path| path_key(path));
                 let fresh = order
                     .iter()
                     .filter(|path| state(&view, &key, path) == Some(MemberState::Fresh))
                     .count();
-                assert!((1..=hits).contains(&fresh), "{fresh} of {hits}");
-                let mut sorted = order.clone();
-                sorted.sort_by_key(|path| path_key(path));
+                assert!(fresh <= hits, "{fresh} of {hits}");
                 assert!(
-                    sorted[..fresh]
+                    order[PASSING + THREADS..]
                         .iter()
-                        .all(|path| state(&view, &key, path) == Some(MemberState::Fresh)),
-                    "the applied members are the first in path order"
+                        .all(|path| state(&view, &key, path) != Some(MemberState::Fresh)),
+                    "a member past the stop was applied"
                 );
                 let progress = reuse_pass(&mut view, &anchor, THREADS, &|| true).unwrap();
                 assert_eq!(progress.reused, UNITS - fresh, "{progress:?}");
@@ -8272,6 +8398,7 @@ pub(in crate::workspace) mod tests {
                     Some(ParallelValidation {
                         threads: 3,
                         may_run: &gate,
+                        workers: &|| 3,
                     }),
                     &cancel,
                 );
@@ -8327,6 +8454,137 @@ pub(in crate::workspace) mod tests {
                 assert_eq!(snapshot(&serial, &key), snapshot(&parallel, &key));
             }
 
+            /// I1: worker `n` takes no member once the free general slots
+            /// are `n` or fewer (diagnostics started); worker 0 goes on.
+            #[test]
+            fn workers_shrink_when_diagnostics_take_the_slots() {
+                const UNITS: usize = 24;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 4, UNITS);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let free = Arc::new(AtomicUsize::new(3));
+                let applied = Rc::new(Cell::new(0));
+                let (slots, count) = (Arc::clone(&free), Rc::clone(&applied));
+                // Diagnostics start once four members are applied.
+                set_after_reuse_hook(Some(Box::new(move |_| {
+                    count.set(count.get() + 1);
+                    if count.get() == 4 {
+                        slots.store(1, Ordering::SeqCst);
+                    }
+                })));
+                let progress = view.advance_workspace_index_with(
+                    &anchor,
+                    IndexBound::all().with_mode(IndexMode::Reuse),
+                    &mut || Ok(()),
+                    Some(ParallelValidation {
+                        threads: 3,
+                        may_run: &|| true,
+                        workers: &|| free.load(Ordering::SeqCst),
+                    }),
+                    &AtomicBool::new(false),
+                );
+                set_after_reuse_hook(None);
+                let progress = progress.unwrap();
+                assert_eq!(progress.reused, UNITS, "{progress:?}");
+                let takes = take_validation_takes();
+                assert_eq!(takes.len(), UNITS);
+                assert!(
+                    takes
+                        .iter()
+                        .all(|&(worker, free)| worker == 0 || worker < free),
+                    "{takes:?}"
+                );
+                let first_shrunk = takes
+                    .iter()
+                    .position(|&(_, free)| free == 1)
+                    .expect("members taken after the diagnostics started");
+                assert!(
+                    takes[first_shrunk..].iter().all(|&(worker, _)| worker == 0),
+                    "only worker 0 takes members once one slot is free: {takes:?}"
+                );
+                cache.shutdown();
+            }
+
+            /// M1: workers take no member past the batch's unit bound.
+            #[test]
+            fn workers_take_no_member_past_the_unit_bound() {
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 4, 24);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let progress = view
+                    .advance_workspace_index_with(
+                        &anchor,
+                        IndexBound::units(5).with_mode(IndexMode::Reuse),
+                        &mut || Ok(()),
+                        Some(ParallelValidation {
+                            threads: 3,
+                            may_run: &|| true,
+                            workers: &|| 3,
+                        }),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                assert_eq!(progress.reused, 5, "{progress:?}");
+                assert_eq!(take_validation_takes().len(), 5);
+                assert_eq!(cache.counters().unwrap().snapshot().hits, 5);
+                cache.shutdown();
+            }
+
+            /// M2: a watcher event between a worker's validation and the
+            /// batch's apply makes the batch prove the member again itself:
+            /// the worker's facts of the old bytes are never indexed.
+            #[test]
+            fn an_event_after_a_workers_validation_is_proven_again_by_the_batch() {
+                const UNITS: usize = 12;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (key, anchor) = published(temp.path(), store.path(), 4, UNITS);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let edited = temp.path().join("d03/U0003.pas");
+                let target = edited.clone();
+                let project_cache = view.project_cache().clone();
+                set_before_apply_hook(Some(Box::new(move |path| {
+                    if path == target {
+                        write(
+                            &target,
+                            "unit U0003;\ninterface\nprocedure Q3;\nimplementation\nprocedure Q3;\nbegin\nend;\nend.\n",
+                        );
+                        project_cache.invalidate_path(&target);
+                    }
+                })));
+                let progress = reuse_pass(&mut view, &anchor, 3, &|| true);
+                set_before_apply_hook(None);
+                let progress = progress.unwrap();
+                assert_eq!(progress.reused, UNITS - 1, "{progress:?}");
+                assert_eq!(progress.reuse_missed, 1, "{progress:?}");
+                assert!(selected(&view, &key, "P3").is_empty());
+                assert_ne!(state(&view, &key, &edited), Some(MemberState::Fresh));
+                cache.shutdown();
+            }
+
+            /// M5: interactive work arriving while the batch waits trips the
+            /// validations in flight (their work budget is cancelled).
+            #[test]
+            fn interactive_work_trips_the_validations_in_flight() {
+                let pipeline = Pipeline::new(2);
+                // Worker took member 0; the batch waits for it.
+                assert_eq!(pipeline.take_next(1, 0, &|| 2), Some(0));
+                std::thread::scope(|scope| {
+                    let waiting = scope.spawn(|| pipeline.take(0, &|| false));
+                    let budget =
+                        crate::workspace::ReconciliationBudget::new(Arc::clone(&pipeline.tripped));
+                    // The worker's validation sees its budget cancelled ...
+                    while pascal_project::ProjectWorkBudget::check_cancelled(&budget).is_ok() {
+                        std::thread::yield_now();
+                    }
+                    // ... and hands its (cancelled) result over.
+                    pipeline.put(0, Prefetched::Open);
+                    assert!(matches!(waiting.join().unwrap(), Prefetched::Open));
+                });
+            }
+
             /// Release measurement (report-only; numbers go into the task
             /// report):
             /// TMPDIR=$HOME/.cache/l4d-tmp cargo test -p pascal-lsp --release --lib parallel_validation_speedup -- --ignored --nocapture
@@ -8338,7 +8596,7 @@ pub(in crate::workspace) mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 let store = private_dir();
                 let (_, anchor) = published(temp.path(), store.path(), DIRECTORIES, UNITS);
-                let threads = crate::server::analysis_slots();
+                let threads = crate::server::validation_threads(0);
                 let mut times = Vec::new();
                 for threads in [1, threads] {
                     let (mut view, cache) = restarted_view(temp.path(), store.path());

@@ -128,7 +128,9 @@ struct ListedWitness {
     listed: Arc<Listed>,
 }
 
-/// Listings memoized at once, in listed paths: about 100 bytes each.
+/// Listings memoized at once, in listed paths: about 100 bytes each, so
+/// about 13 MB at worst. This memory is not charged to `maxCacheBytes`
+/// (like the witnesses beside it); the bound is what keeps it small.
 pub(crate) const MAX_LISTED_PATHS: usize = 131_072;
 
 #[derive(Debug, Default)]

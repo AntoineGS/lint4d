@@ -42,6 +42,10 @@ pub(crate) struct InteractiveGate {
     paused: std::sync::atomic::AtomicUsize,
     /// Running Bulk client requests; index batches wait for them (D33).
     running_bulk: std::sync::atomic::AtomicUsize,
+    /// Running jobs in the general analysis slots (pull and push
+    /// diagnostics, Bulk): the slots parallel reuse validation leaves them
+    /// (R8-1).
+    running_general: std::sync::atomic::AtomicUsize,
     /// Test seam: after this many passing `try_wait_idle` or
     /// `index_may_run` checks, mark the gate busy so a pause lands at an
     /// exact unit boundary.
@@ -127,6 +131,16 @@ impl InteractiveGate {
             let _busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
             self.idle.notify_all();
         }
+    }
+
+    /// Records how many jobs hold the general analysis slots.
+    pub(crate) fn set_running_general(&self, running: usize) {
+        self.running_general.store(running, Ordering::Relaxed);
+    }
+
+    /// How many workers a reuse batch may validate on now (R8-1).
+    pub(crate) fn validation_threads(&self) -> usize {
+        crate::server::validation_threads(self.running_general.load(Ordering::Relaxed))
     }
 
     /// Whether a Bulk client request runs: index batches wait for it, and
@@ -1566,12 +1580,15 @@ fn run_index_job(
         IndexMode::Reuse => IndexBound::reuse_pass(),
         IndexMode::Full => IndexBound::extraction(),
     };
-    // A reuse pass validates on the analysis slots (R8-1); its workers
-    // stop at their next member once interactive work arrives.
+    // A reuse pass validates on the free general analysis slots (R8-1);
+    // its workers stop at their next member once interactive work arrives,
+    // and the extra ones as diagnostics take the slots.
     let may_run = || gate.index_may_run_now() && !job.cancel.load(Ordering::Relaxed);
+    let workers = || gate.validation_threads();
     let validation = crate::workspace::indexing::ParallelValidation {
-        threads: crate::server::analysis_slots(),
+        threads: gate.validation_threads(),
         may_run: &may_run,
+        workers: &workers,
     };
     let result = workspace.advance_workspace_index_with(
         &anchor,

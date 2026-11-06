@@ -109,6 +109,10 @@ pub struct CompileTimeState {
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// The previous word of a declaration's right-hand side was `of`: an
+    /// `object` here ends a method-pointer type (`procedure of object`),
+    /// it opens no body.
+    after_of: bool,
     /// Where the statement that just admitted a procedural-type declaration
     /// ended, with its section and scope: only a statement starting there
     /// can be its calling convention.
@@ -269,6 +273,7 @@ impl CompileTimeState {
             composite_depth: 0,
             rhs: false,
             pending_class: false,
+            after_of: false,
             after_eq: false,
             procedural_tail: None,
             class_heritage: None,
@@ -479,6 +484,7 @@ impl CompileTimeState {
         self.pending_start = self.logical;
         self.rhs = false;
         self.pending_class = false;
+        self.after_of = false;
         self.class_heritage = None;
     }
 
@@ -831,6 +837,7 @@ impl CompileTimeState {
         ) && self.rhs
             && word != "asm"
         {
+            let after_of = std::mem::replace(&mut self.after_of, word == "of");
             if self.pending_class {
                 if matches!(word, "abstract" | "sealed") {
                     return Ok(());
@@ -844,7 +851,11 @@ impl CompileTimeState {
             }
             // In a composite body `class` also prefixes members (`class
             // function`); after `=` it is a nested class type.
-            if matches!(word, "record" | "object" | "interface" | "dispinterface")
+            // `of object` ends a method-pointer type: with an initialiser
+            // (`P: procedure of object = nil;`) no `;` follows it to close
+            // a body (Classes.pas 7.0 AddDataModule, l4d-rrzi).
+            if matches!(word, "record" | "interface" | "dispinterface")
+                || (word == "object" && !after_of)
                 || (word == "class" && (self.composite_depth == 0 || after_eq))
             {
                 self.composite_depth += 1;
@@ -1857,6 +1868,7 @@ impl CompileTimeState {
         self.unknown.hash(&mut h);
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
+        self.after_of.hash(&mut h);
         self.class_heritage.hash(&mut h);
         self.procedural_tail.hash(&mut h);
         self.failure.hash(&mut h);

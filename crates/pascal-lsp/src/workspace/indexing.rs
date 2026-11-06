@@ -796,6 +796,9 @@ struct PipelineState {
     done: usize,
     results: HashMap<usize, Prefetched>,
     stopped: bool,
+    /// Workers started and not yet exited: with none, a member never
+    /// taken or never handed over cannot arrive (N2).
+    workers: usize,
 }
 
 /// The most facts a parallel batch held at once (test measure).
@@ -878,7 +881,7 @@ impl Pipeline {
         members: usize,
         worker: usize,
         workers: &(dyn Fn() -> usize + Sync),
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let mut state = self.lock();
         loop {
             if state.stopped || state.next >= members {
@@ -891,15 +894,28 @@ impl Pipeline {
             if state.next < state.done + self.window {
                 let position = state.next;
                 state.next += 1;
-                #[cfg(test)]
-                self.takes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((worker, allowed));
-                return Some(position);
+                return Some((position, allowed));
             }
             state = self.wait(state);
         }
+    }
+
+    /// A worker starts; `worker_exited` must follow.
+    fn worker_started(&self) {
+        self.lock().workers += 1;
+    }
+
+    fn worker_exited(&self) {
+        self.lock().workers -= 1;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn note_take(&self, worker: usize, allowed: usize) {
+        self.takes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((worker, allowed));
     }
 
     fn put(&self, position: usize, prefetched: Prefetched) {
@@ -925,12 +941,20 @@ impl Pipeline {
             if let Some(prefetched) = state.results.remove(&position) {
                 return prefetched;
             }
-            // Never taken: a worker stopped before it.
-            if state.stopped && state.next <= position {
+            // Never taken: a worker stopped before it. With no worker
+            // left, nothing else can arrive.
+            if (state.stopped && state.next <= position) || state.workers == 0 {
                 return Prefetched::Preempted;
             }
-            if !self.tripped.load(Ordering::Relaxed) && !may_run() {
+            // Interactive work: stop the batch here, as a failing
+            // `before_io` does, and trip the validations in flight. The
+            // trip lasts as long as this pipeline, which ends with the
+            // batch (N1).
+            if !may_run() {
+                state.stopped = true;
                 self.tripped.store(true, Ordering::Relaxed);
+                self.changed.notify_all();
+                return Prefetched::Preempted;
             }
             state = self
                 .changed
@@ -973,6 +997,15 @@ struct InFlight<'a> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         self.pipeline.put(self.position, Prefetched::Preempted);
+    }
+}
+
+/// A worker exits, however it ends.
+struct WorkerExit<'a>(&'a Pipeline);
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        self.0.worker_exited();
     }
 }
 
@@ -1431,17 +1464,22 @@ impl Workspace {
         let result = std::thread::scope(|scope| {
             let _stop = StopOnDrop(&pipeline);
             let (pipeline, members) = (&pipeline, &members);
+            // Worker ids follow spawn order, so worker 0 (which always
+            // may run) exists whenever any worker does (N2).
             let mut spawned = 0;
-            for worker in 0..threads {
-                spawned += usize::from(
-                    crate::server::analysis_thread(&format!("PascalLspReuse{worker}"))
-                        .spawn_scoped(scope, move || {
-                            self.prefetch_members(
-                                key, members, pipeline, worker, validation, cancel,
-                            );
-                        })
-                        .is_ok(),
-                );
+            for _ in 0..threads {
+                let worker = spawned;
+                pipeline.worker_started();
+                let started = crate::server::analysis_thread(&format!("PascalLspReuse{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let _exit = WorkerExit(pipeline);
+                        self.prefetch_members(key, members, pipeline, worker, validation, cancel);
+                    });
+                if started.is_ok() {
+                    spawned += 1;
+                } else {
+                    pipeline.worker_exited();
+                }
             }
             if spawned == 0 {
                 return Ok(false);
@@ -1484,7 +1522,9 @@ impl Workspace {
         cancel: &AtomicBool,
     ) {
         let mut context_key = super::persist::ContextKeyMemo::default();
-        while let Some(position) = pipeline.take_next(members.len(), worker, validation.workers) {
+        while let Some((position, allowed)) =
+            pipeline.take_next(members.len(), worker, validation.workers)
+        {
             // A worker that panics stops the batch at its member rather
             // than leave it waiting; the scope then propagates the panic.
             let in_flight = InFlight { pipeline, position };
@@ -1492,6 +1532,10 @@ impl Workspace {
                 drop(in_flight);
                 return;
             }
+            #[cfg(test)]
+            pipeline.note_take(worker, allowed);
+            #[cfg(not(test))]
+            let _ = allowed;
             let path = &members[position];
             let prefetched = if self.is_open_member(path) {
                 Prefetched::Open
@@ -8564,25 +8608,64 @@ pub(in crate::workspace) mod tests {
                 cache.shutdown();
             }
 
-            /// M5: interactive work arriving while the batch waits trips the
-            /// validations in flight (their work budget is cancelled).
+            /// M5/N1: interactive work found while the batch waits stops the
+            /// batch at that member and trips the validations in flight.
             #[test]
-            fn interactive_work_trips_the_validations_in_flight() {
+            fn interactive_work_while_the_batch_waits_stops_it_and_trips_the_workers() {
                 let pipeline = Pipeline::new(2);
-                // Worker took member 0; the batch waits for it.
-                assert_eq!(pipeline.take_next(1, 0, &|| 2), Some(0));
-                std::thread::scope(|scope| {
-                    let waiting = scope.spawn(|| pipeline.take(0, &|| false));
-                    let budget =
-                        crate::workspace::ReconciliationBudget::new(Arc::clone(&pipeline.tripped));
-                    // The worker's validation sees its budget cancelled ...
-                    while pascal_project::ProjectWorkBudget::check_cancelled(&budget).is_ok() {
-                        std::thread::yield_now();
+                pipeline.worker_started();
+                // A worker took member 0; the batch waits for it.
+                assert_eq!(pipeline.take_next(2, 0, &|| 2), Some((0, 2)));
+                assert!(matches!(pipeline.take(0, &|| false), Prefetched::Preempted));
+                let budget =
+                    crate::workspace::ReconciliationBudget::new(Arc::clone(&pipeline.tripped));
+                assert!(pascal_project::ProjectWorkBudget::check_cancelled(&budget).is_err());
+                assert_eq!(pipeline.take_next(2, 0, &|| 2), None, "the workers stop");
+            }
+
+            /// N2: with no worker left, the batch never waits for a member.
+            #[test]
+            fn the_batch_does_not_wait_once_every_worker_exited() {
+                let pipeline = Pipeline::new(2);
+                pipeline.worker_started();
+                assert_eq!(pipeline.take_next(2, 0, &|| 2), Some((0, 2)));
+                pipeline.worker_exited();
+                assert!(matches!(pipeline.take(0, &|| true), Prefetched::Preempted));
+            }
+
+            /// N1: a gate closed for one check while the batch waits ends
+            /// the batch with a cancellation (the normal yield), not with
+            /// every later member a retryable miss; the next batch reuses
+            /// everything.
+            #[test]
+            fn a_short_interactive_request_while_the_batch_waits_yields_the_batch() {
+                const UNITS: usize = 12;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 4, UNITS);
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                let batch = std::thread::current().id();
+                let closed = AtomicBool::new(false);
+                // The batch's first check (waiting for member 0) finds the
+                // gate closed; workers wait for it before their first member,
+                // so the batch does wait.
+                let gate = || {
+                    if std::thread::current().id() == batch {
+                        // Closed once, open again after.
+                        closed.swap(true, Ordering::SeqCst)
+                    } else {
+                        while !closed.load(Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                        true
                     }
-                    // ... and hands its (cancelled) result over.
-                    pipeline.put(0, Prefetched::Open);
-                    assert!(matches!(waiting.join().unwrap(), Prefetched::Open));
-                });
+                };
+                let result = reuse_pass(&mut view, &anchor, 3, &gate);
+                assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                let progress = reuse_pass(&mut view, &anchor, 3, &|| true).unwrap();
+                assert_eq!(progress.reused, UNITS, "{progress:?}");
+                assert_eq!(progress.reuse_deferred, 0, "{progress:?}");
+                cache.shutdown();
             }
 
             /// Release measurement (report-only; numbers go into the task

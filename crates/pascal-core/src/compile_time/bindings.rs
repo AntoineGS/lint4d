@@ -865,16 +865,52 @@ const TOBJECT_MEMBERS: &[&str] = &[
     "unitscope",
 ];
 
-fn tobject_may_declare(
+/// The members System.pas's `TInterfacedObject` declares, in all branches
+/// (AUTOREFCOUNT): RAD Studio 7.0 lines 518-529, 10.0 lines 813-828,
+/// Studio 37.0 lines 1064-1085. Its ancestor is TObject.
+const TINTERFACEDOBJECT_MEMBERS: &[&str] = &[
+    "__markdestroying",
+    "_addref",
+    "_release",
+    "afterconstruction",
+    "beforedestruction",
+    "frefcount",
+    "getrefcount",
+    "newinstance",
+    "objdestroyingflag",
+    "queryinterface",
+    "refcount",
+];
+
+/// The members System.pas's `TAggregatedObject` declares: RAD Studio 7.0
+/// lines 562-574, 10.0 lines 863-875, Studio 37.0 lines 1120-1131. Its
+/// ancestor is TObject.
+const TAGGREGATEDOBJECT_MEMBERS: &[&str] = &[
+    "_addref",
+    "_release",
+    "controller",
+    "create",
+    "fcontroller",
+    "getcontroller",
+    "queryinterface",
+];
+
+/// The members System.pas's `TContainedObject` declares: RAD Studio 7.0
+/// lines 590-594, 10.0 lines 893-897, Studio 37.0 lines 1149-1153. Its
+/// ancestor is TAggregatedObject.
+const TCONTAINEDOBJECT_MEMBERS: &[&str] = &["queryinterface"];
+
+fn members_may_declare(
+    members: &[&str],
     name: &str,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<bool, IncompleteReason> {
-    budget.charge(TOBJECT_MEMBERS.len().ilog2() as usize + 1, name.len(), 0)?;
+    budget.charge(members.len().max(1).ilog2() as usize + 1, name.len(), 0)?;
     let name = name.strip_prefix('&').unwrap_or(name);
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return Ok(true);
     }
-    Ok(TOBJECT_MEMBERS
+    Ok(members
         .binary_search_by(|probe| {
             probe
                 .bytes()
@@ -883,11 +919,73 @@ fn tobject_may_declare(
         .is_ok())
 }
 
+fn tobject_may_declare(
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    members_may_declare(TOBJECT_MEMBERS, name, budget)
+}
+
+/// A type System declares that a heritage list commonly names. System and
+/// SysInit declare no class helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemType {
+    Object,
+    /// IInterface, IUnknown, IDispatch, IInvokable (RAD Studio 7.0 lines
+    /// 455-503, 10.0 lines 746-796, Studio 37.0 lines 994-1047).
+    Interface,
+    InterfacedObject,
+    AggregatedObject,
+    ContainedObject,
+}
+
+impl SystemType {
+    fn named(name: &str) -> Option<Self> {
+        let name = name.strip_prefix('&').unwrap_or(name);
+        [
+            ("tobject", Self::Object),
+            ("iinterface", Self::Interface),
+            ("iunknown", Self::Interface),
+            ("idispatch", Self::Interface),
+            ("iinvokable", Self::Interface),
+            ("tinterfacedobject", Self::InterfacedObject),
+            ("taggregatedobject", Self::AggregatedObject),
+            ("tcontainedobject", Self::ContainedObject),
+        ]
+        .into_iter()
+        .find_map(|(system, ty)| name.eq_ignore_ascii_case(system).then_some(ty))
+    }
+
+    /// Whether a member of this class or of its System ancestors could
+    /// declare `name`. An interface adds no member to a class's scope.
+    fn may_declare(
+        self,
+        name: &str,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        let own = match self {
+            Self::Interface => return Ok(false),
+            Self::Object => return tobject_may_declare(name, budget),
+            Self::InterfacedObject => TINTERFACEDOBJECT_MEMBERS,
+            Self::AggregatedObject => TAGGREGATEDOBJECT_MEMBERS,
+            Self::ContainedObject => TCONTAINEDOBJECT_MEMBERS,
+        };
+        if members_may_declare(own, name, budget)? {
+            return Ok(true);
+        }
+        let parent = match self {
+            Self::ContainedObject => Self::AggregatedObject,
+            _ => Self::Object,
+        };
+        parent.may_declare(name, budget)
+    }
+}
+
 /// A composite type a heritage list or a method heading names.
 enum Resolved<'a> {
     Type(&'a CompileTimeState, &'a Declaration),
-    /// System's TObject.
-    SystemObject,
+    /// A type of System, which no unit in scope redeclares.
+    System(SystemType),
     /// Not proven: unresolved, ambiguous, not a composite type body, or
     /// declared where it cannot be read.
     Unproven,
@@ -912,8 +1010,9 @@ fn resolve_type<'a>(
         None => match imported_declaration(state, site, name, budget)? {
             Some(Fact::Known(found)) => found,
             Some(_) => return Ok(Resolved::Unproven),
-            None if same_name(name, "tobject") => return Ok(Resolved::SystemObject),
-            None => return Ok(Resolved::Unproven),
+            None => {
+                return Ok(SystemType::named(name).map_or(Resolved::Unproven, Resolved::System));
+            }
         },
     };
     Ok(if decl.is_type && decl.shape.is_some() {
@@ -961,7 +1060,17 @@ fn type_may_declare(
             .helped
             .iter()
             .filter(|_| shape.kind == ShapeKind::Helper);
-        for parent in shape.parents.iter().chain(helped) {
+        // The first entry of a compiling class's heritage list is its
+        // ancestor class (`class(IInterface)` is E2021 in dcc 7.0 and
+        // 37.0, treated as TObject here); the others are implemented
+        // interfaces, which add no member to its scope (dcc C3), resolved
+        // or not.
+        let parents = if shape.kind == ShapeKind::Class {
+            &shape.parents[..shape.parents.len().min(1)]
+        } else {
+            &shape.parents[..]
+        };
+        for parent in parents.iter().chain(helped) {
             match resolve_type(state, &site, parent, budget)? {
                 Resolved::Type(owner, parent) => {
                     let interface = parent
@@ -976,9 +1085,9 @@ fn type_may_declare(
                         return Ok(true);
                     }
                 }
-                Resolved::SystemObject => {
-                    class_parent = true;
-                    if tobject_may_declare(name, budget)? {
+                Resolved::System(system) => {
+                    class_parent |= system != SystemType::Interface;
+                    if system.may_declare(name, budget)? {
                         return Ok(true);
                     }
                 }
@@ -1245,12 +1354,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tobject_members_are_sorted_lowercase_identifiers() {
-        assert!(TOBJECT_MEMBERS.windows(2).all(|w| w[0] < w[1]));
-        assert!(TOBJECT_MEMBERS.iter().all(|name| {
-            name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        }));
+    fn system_members_are_sorted_lowercase_identifiers() {
+        for members in [
+            TOBJECT_MEMBERS,
+            TINTERFACEDOBJECT_MEMBERS,
+            TAGGREGATEDOBJECT_MEMBERS,
+            TCONTAINEDOBJECT_MEMBERS,
+        ] {
+            assert!(members.windows(2).all(|w| w[0] < w[1]));
+            assert!(members.iter().all(|name| {
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            }));
+        }
         let mut budget =
             CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
         for name in ["Free", "CLASSNAME", "&Create", "Unit.Name"] {

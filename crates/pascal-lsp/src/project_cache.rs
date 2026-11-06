@@ -7428,6 +7428,13 @@ impl ProjectCache {
                     unprovable_kind: None,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
+            let index = &stored.index;
+            stored
+                .awaiting_room
+                .retain(|path| index.state_of(path).is_some());
+            stored
+                .memory_only
+                .retain(|path| index.state_of(path).is_some());
             stored.membership = membership;
             stored.anchor = anchor;
             stored.dirty = false;
@@ -7517,6 +7524,10 @@ impl ProjectCache {
                     .index
                     .insert_paid(path, facts, stamps, content_hash, bytes);
                 if old.is_some() {
+                    // Indexed again: a refusal of an earlier extraction
+                    // does not describe this one.
+                    stored.awaiting_room.remove(path);
+                    stored.memory_only.remove(path);
                     stored.memory_exhausted = false;
                     if reused {
                         stored.index.mark_reused(path);
@@ -7758,11 +7769,14 @@ impl ProjectCache {
         context: pascal_cache::Digest,
     ) -> bool {
         proof.context() == context
-            && self
-                .index()
-                .contexts
-                .get_mut(key)
-                .is_some_and(|stored| stored.index.set_record(proof.path(), proof.record_id()))
+            && self.index().contexts.get_mut(key).is_some_and(|stored| {
+                let recorded = stored.index.set_record(proof.path(), proof.record_id());
+                if recorded {
+                    stored.awaiting_room.remove(proof.path());
+                    stored.memory_only.remove(proof.path());
+                }
+                recorded
+            })
     }
 
     pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {
@@ -7907,6 +7921,8 @@ impl ProjectCache {
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_stale(path);
+            stored.awaiting_room.remove(path);
+            stored.memory_only.remove(path);
         }
     }
 

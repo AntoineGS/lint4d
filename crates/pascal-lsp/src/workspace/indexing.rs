@@ -1347,7 +1347,9 @@ impl Workspace {
         }
         let mut progress = IndexProgress::new(key.clone(), bound.mode);
         let phases_before = ReusePhaseTotals::snapshot();
-        let mut validation_threads = 1;
+        // Workers that validated this batch's members: the requested count
+        // capped by the members queued, 1 when the batch ran serially.
+        let mut workers_used = 1;
         let started = Instant::now();
         // Open members are skipped, so ask for enough to fill the bound.
         let wanted = bound.units.saturating_add(self.open_documents.len());
@@ -1394,7 +1396,7 @@ impl Workspace {
                 cancel,
             )? {
                 pending.clear();
-                validation_threads = validation.threads.min(members).max(1);
+                workers_used = validation.threads.min(members).max(1);
             }
         }
         while let Some(path) = pending.pop_front() {
@@ -1573,7 +1575,7 @@ impl Workspace {
         progress.complete = progress.pending == progress.retrying
             && progress.awaiting_room == 0
             && !progress.memory;
-        report_reuse_phases(&phases_before, bound.mode, validation_threads, tried.len());
+        report_reuse_phases(&phases_before, bound.mode, workers_used, tried.len());
         Ok(progress)
     }
 
@@ -8278,6 +8280,44 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// 13c-2 fix round 1: a member refused for room whose later
+        /// extraction ends memory-only for another reason is no longer
+        /// awaiting room.
+        #[test]
+        fn a_member_indexed_again_leaves_the_awaiting_room_set() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (workspace, key, anchor) =
+                indexed_project(temp.path(), 4, WorkspaceOptions::default());
+            let member = temp.path().join("lib/U2.pas");
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let target = member.clone();
+            cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path == target).then_some(pascal_cache::Bypass::LowDiskSpace)
+            })));
+            let first = advance(&mut view, &anchor, IndexBound::all());
+            assert!(first.complete, "{first:?}");
+            view.project_cache.note_index_awaiting_room(&key, &member);
+            view.project_cache.note_index_memory_only(&key, &member);
+            assert_eq!(view.project_cache.index_awaiting_room(&key), 1);
+            // The member changes and is extracted again.
+            fs::write(
+                &member,
+                "unit U2;\ninterface\nconst Changed = 1;\nimplementation\nend.\n",
+            )
+            .unwrap();
+            view.project_cache.invalidate_path(&member);
+            let second = advance(&mut view, &anchor, IndexBound::all());
+            assert_eq!(second.indexed, 1, "{second:?}");
+            assert_eq!(second.persisted, 0, "{second:?}");
+            assert_eq!(second.awaiting_room, 0, "{second:?}");
+            assert!(second.complete, "{second:?}");
+            assert!(!view.project_cache.index_is_awaiting_room(&key));
+            assert_eq!(view.project_cache.restale_awaiting_room(&key), 0);
+            assert_eq!(view.project_cache.restale_memory_only_members(&key), 0);
+            cache.shutdown();
+        }
+
         /// 13c-2: the awaiting-room and memory-only sets hold the members
         /// that were refused or indexed memory-only, nothing else
         /// unrecorded.
@@ -8716,6 +8756,43 @@ pub(in crate::workspace) mod tests {
                 // A cost measure, not state: two workers may both read a
                 // directory before either's witness is recorded.
                 assert!(reads[0] >= 1 && reads[0] <= reads[1], "{reads:?}");
+            }
+
+            /// 13c-2 fix round 1: without a held snapshot (the member-by-member
+            /// store path) a batch still reports non-zero lookup, read+hash,
+            /// validation and decode calls, for hits and misses alike.
+            #[test]
+            fn a_snapshotless_batch_reports_every_reuse_phase() {
+                const UNITS: usize = 30;
+                let temp = tempfile::tempdir().unwrap();
+                let store = private_dir();
+                let (_, anchor) = published(temp.path(), store.path(), 6, UNITS);
+                set_phase_metrics_for_test(true);
+                // One member now misses: its saved root changed.
+                write(
+                    &temp.path().join("d00/U0000.pas"),
+                    "unit U0000;\ninterface\n{$I Shared.inc}\nprocedure Changed;\nimplementation\nprocedure Changed;\nbegin\nend;\nend.\n",
+                );
+                let (mut view, cache) = restarted_view(temp.path(), store.path());
+                take_phase_report();
+                let progress = reuse_pass(&mut view, &anchor, 1, &|| true).unwrap();
+                let report = take_phase_report().expect("reported");
+                assert_eq!(progress.reused, UNITS - 1, "{progress:?}");
+                assert_eq!(progress.reuse_missed, 1, "{progress:?}");
+                for phase in [
+                    ReusePhase::Lookup,
+                    ReusePhase::ReadHash,
+                    ReusePhase::Validation,
+                    ReusePhase::Decode,
+                ] {
+                    assert!(report.totals.calls(phase) > 0, "{phase:?}: {report}");
+                }
+                // Every member reads and hashes its root, hit or miss.
+                assert!(
+                    report.totals.calls(ReusePhase::ReadHash) >= UNITS,
+                    "{report}"
+                );
+                cache.shutdown();
             }
 
             /// 13c-2: the report of a parallel batch names its worker threads.

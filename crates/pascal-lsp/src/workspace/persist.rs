@@ -4,6 +4,7 @@
 
 use super::evidence::EvidenceGap;
 use super::facts::SourceFacts;
+use super::indexing::{ReusePhase, timed};
 use super::validate::{
     CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
 };
@@ -559,13 +560,16 @@ impl Workspace {
                 .ok_or(PersistError::NotIndexed)?
                 .context,
         );
-        let bytes = self.saved_root_bytes(uri, &context)?;
-        let root_hash = pascal_project::content_hash_bytes(&bytes);
-        let local = LocalArtifactKey::new(
-            &SourceContent::from_bytes(&bytes),
-            &super::conditional_context_for_uri(&context, uri),
-            context.source_origin(&path),
-        );
+        let (root_hash, local) = timed(ReusePhase::ReadHash, || {
+            let bytes = self.saved_root_bytes(uri, &context)?;
+            let root_hash = pascal_project::content_hash_bytes(&bytes);
+            let local = LocalArtifactKey::new(
+                &SourceContent::from_bytes(&bytes),
+                &super::conditional_context_for_uri(&context, uri),
+                context.source_origin(&path),
+            );
+            Ok::<_, PersistError>((root_hash, local))
+        })?;
         let Some(charge) = self
             .project_cache
             .reserve(ReservationKind::Facts, decode_limit)
@@ -573,7 +577,9 @@ impl Workspace {
             return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)));
         };
         let mut budget = FactBudget::new(decode_limit);
-        match decoded(store.load_facts(ArtifactKeyRef::local(&local), &mut budget))? {
+        match decoded(timed(ReusePhase::Decode, || {
+            store.load_facts(ArtifactKeyRef::local(&local), &mut budget)
+        }))? {
             Ok(Lookup::Hit(facts)) => {
                 return Ok(Reuse::Hit {
                     facts: admitted(facts, &budget, charge),
@@ -589,9 +595,10 @@ impl Workspace {
             Err(miss) => return Ok(Reuse::Miss(miss)),
         }
         let context_key = memo.key_of(&context);
-        let headers = match store
-            .find_evidence(context_key, &local)
-            .map_err(PersistError::Store)?
+        let headers = match timed(ReusePhase::Lookup, || {
+            store.find_evidence(context_key, &local)
+        })
+        .map_err(PersistError::Store)?
         {
             Lookup::Hit(headers) => headers,
             Lookup::Miss(miss) => return Ok(Reuse::Miss(ReuseMiss::Store(miss))),
@@ -619,7 +626,11 @@ impl Workspace {
                 continue;
             };
             let held_before = validator.held_payloads().len();
-            match validate_evidence(store, header, &mut validator).map_err(PersistError::Store)? {
+            match timed(ReusePhase::Validation, || {
+                validate_evidence(store, header, &mut validator)
+            })
+            .map_err(PersistError::Store)?
+            {
                 EvidenceCheck::Holds => {}
                 EvidenceCheck::Stale(stale) => {
                     last = ReuseMiss::Stale(stale);
@@ -639,7 +650,9 @@ impl Workspace {
                 .cloned()
                 .collect();
             return Ok(
-                match decoded(store.load_facts_by_id(artifact, &mut budget))? {
+                match decoded(timed(ReusePhase::Decode, || {
+                    store.load_facts_by_id(artifact, &mut budget)
+                }))? {
                     Ok(Lookup::Hit(facts)) => Reuse::Hit {
                         facts: admitted(facts, &budget, charge),
                         via: ReuseVia::Evidence,

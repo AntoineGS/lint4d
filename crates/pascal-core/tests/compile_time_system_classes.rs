@@ -3,9 +3,10 @@
 //! - A `var`/typed `const` of a method-pointer type with an initialiser
 //!   (`AddDataModule: procedure (...) of object = nil;`) left the declaration
 //!   scanner inside a composite, so Classes's interface never completed.
-//! - In a class's heritage list only the first entry can be the ancestor
-//!   class; implemented interfaces add no member to a method's scope (dcc
-//!   C3), whether they resolve or not.
+//! - The first entry of a compiling class's heritage list is its ancestor
+//!   class (`class(IInterface)` and `class(IInterface, TObject)` are E2021
+//!   in dcc64 37.0 and dcc32 7.0); the implemented interfaces after it add
+//!   no member to a method's scope (dcc C3), whether they resolve or not.
 //! - System's IInterface/IUnknown/IDispatch/IInvokable are interfaces, and
 //!   TInterfacedObject/TAggregatedObject/TContainedObject have fixed member
 //!   lists, as TObject has.
@@ -59,6 +60,60 @@ fn a_method_pointer_variable_with_an_initialiser_keeps_the_framing() {
 }
 
 #[test]
+fn a_method_pointer_with_a_calling_convention_and_an_initialiser_keeps_the_framing() {
+    // dcc 37.0 compiles `procedure of object stdcall = nil` (no `;`).
+    for declaration in [
+        "var P: procedure of object stdcall = nil;",
+        "var P: procedure of object; stdcall = nil;",
+        "const P: function: Integer of object cdecl = nil;",
+    ] {
+        assert_eq!(
+            hit(&format!(
+                "unit T; interface {declaration} const X = 1; \
+                 {{$IF X = 1}}{{$DEFINE HIT}}{{$IFEND}} implementation end."
+            )),
+            Truth::True,
+            "{declaration}"
+        );
+    }
+}
+
+#[test]
+fn an_object_type_still_opens_a_body() {
+    for keyword in ["object", "packed object"] {
+        // A member of the object blocks a name in its method.
+        assert_eq!(
+            hit(&format!(
+                "unit T; interface const X = 1; type TC = {keyword} X: Integer; procedure M; end; \
+                 implementation procedure TC.M; begin {{$IF X = 1}}{{$DEFINE HIT}}{{$IFEND}} end; end."
+            )),
+            Truth::Unknown,
+            "{keyword}"
+        );
+        // A non-member is proven there, and the member is not a unit-scope
+        // name after the body, also after an initialised method pointer.
+        assert_eq!(
+            hit(&format!(
+                "unit T; interface var P: procedure of object = nil; \
+                 type TC = {keyword} Y: Integer; procedure M; end; const X = 1; \
+                 implementation procedure TC.M; begin {{$IF X = 1}}{{$DEFINE HIT}}{{$IFEND}} end; end."
+            )),
+            Truth::True,
+            "{keyword}"
+        );
+        assert_eq!(
+            hit(&format!(
+                "unit T; interface const Y = 1; \
+                 type TC = {keyword} Y: Integer; F: procedure of object; end; \
+                 {{$IF Y = 1}}{{$DEFINE HIT}}{{$IFEND}} implementation end."
+            )),
+            Truth::True,
+            "{keyword}"
+        );
+    }
+}
+
+#[test]
 fn a_provider_with_method_pointer_variables_has_a_complete_interface() {
     // The Classes.pas 7.0 shape (lines 1599-1602, then routine headings
     // with default parameters before `implementation`).
@@ -93,8 +148,7 @@ fn an_implemented_system_interface_does_not_block_a_method() {
     for heritage in [
         "TObject, IInterface",
         "TObject, IUnknown, IDispatch",
-        "IInterface",
-        "IInvokable, IMissing",
+        "TObject, IInvokable, IMissing",
         "TObject, IInterface, ILocal, IMissing",
     ] {
         assert_eq!(
@@ -109,10 +163,10 @@ fn an_implemented_system_interface_does_not_block_a_method() {
             "{heritage}"
         );
     }
-    // A class whose first entry is a System interface derives from TObject.
+    // TObject's members stay in scope after implemented interfaces.
     assert_eq!(
         hit(&method(
-            "const Free = 1; type TC = class(IInterface) procedure M; end;",
+            "const Free = 1; type TC = class(TObject, IInterface) procedure M; end;",
             "{$IF Free = 1}{$DEFINE HIT}{$IFEND}"
         )),
         Truth::Unknown
@@ -152,6 +206,8 @@ fn a_system_interfaced_class_ancestor_is_known() {
 #[test]
 fn a_member_of_a_system_interfaced_class_blocks_a_method() {
     for (ancestor, member) in [
+        // Also a TObject member (37.0 AUTOREFCOUNT), so it blocks either way.
+        ("TInterfacedObject", "RefCount"),
         ("TInterfacedObject", "QueryInterface"),
         ("TInterfacedObject", "_Release"),
         ("TInterfacedObject", "GetRefCount"),

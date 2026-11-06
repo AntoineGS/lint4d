@@ -1060,9 +1060,11 @@ fn type_may_declare(
             .helped
             .iter()
             .filter(|_| shape.kind == ShapeKind::Helper);
-        // Only the first entry of a class's heritage list can be its
-        // ancestor; the others are implemented interfaces, which add no
-        // member to its scope (dcc C3), resolved or not.
+        // The first entry of a compiling class's heritage list is its
+        // ancestor class (`class(IInterface)` is E2021 in dcc 7.0 and
+        // 37.0, treated as TObject here); the others are implemented
+        // interfaces, which add no member to its scope (dcc C3), resolved
+        // or not.
         let parents = if shape.kind == ShapeKind::Class {
             &shape.parents[..shape.parents.len().min(1)]
         } else {

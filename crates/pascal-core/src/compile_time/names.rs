@@ -91,7 +91,7 @@ fn identifier_byte(byte: u8) -> bool {
 /// A non-ASCII character an identifier could hold that Delphi's
 /// case-insensitive comparison might equate with an ASCII letter (U+017F
 /// uppercases to `S`, U+212A lowercases to `k`).
-fn folds_to_ascii(ch: char) -> bool {
+pub(super) fn folds_to_ascii(ch: char) -> bool {
     ch.is_alphanumeric()
         && (ch.to_uppercase().any(|c| c.is_ascii_alphanumeric())
             || ch.to_lowercase().any(|c| c.is_ascii_alphanumeric()))

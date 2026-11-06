@@ -2275,6 +2275,17 @@ impl ProviderEngine<'_, '_> {
         super::declarations::limit(depth, self.budget.limits().max_type_depth, "max_type_depth")
             .map_err(|r| resolver_error(r, self.budget))?;
         let root = name.split('.').next().unwrap_or(name);
+        if let Some(owner) = state.method_owner_at(site) {
+            // In a method, a member of its type, of an ancestor or of a
+            // helper in scope binds first: read their providers (l4d-wwmg).
+            let owner = owner.to_owned();
+            let global = BindingSite {
+                scope: ScopeId(0),
+                sequence: site.sequence,
+            };
+            self.prepare_name(state, &global, &owner, false, depth + 1)?;
+            self.prepare_imports(state, &global, root, root, pointers, depth)?;
+        }
         let binding = super::bindings::lookup(state, site, name, self.budget)
             .map_err(|r| resolver_error(r, self.budget))?;
         let binding = if binding.is_some() {
@@ -2287,7 +2298,7 @@ impl ProviderEngine<'_, '_> {
             let Binding::Declaration(decl) = binding else {
                 return Ok(());
             };
-            if decl.is_routine {
+            if decl.is_routine || super::bindings::is_member_blocker(decl) {
                 return Ok(());
             }
             self.budget
@@ -2342,11 +2353,32 @@ impl ProviderEngine<'_, '_> {
                         depth + 1,
                     )?;
                 }
-                self.prepare_type(state, &decl.type_site, &decl.ty, pointers, depth + 1)
+                self.prepare_type(state, &decl.type_site, &decl.ty, pointers, depth + 1)?;
+                // A method's member scope reads the ancestors and the
+                // helped type of a composite type.
+                if let Some(shape) = &decl.shape {
+                    for parent in shape.parents.iter().chain(shape.helped.iter()) {
+                        self.prepare_name(state, &decl.site, parent, false, depth + 1)?;
+                    }
+                }
+                Ok(())
             });
             self.providers.declarations.value_mut().pop();
             return result;
         }
+        self.prepare_imports(state, site, name, root, pointers, depth)
+    }
+
+    /// Look up and prepare every source-visible provider for `name`.
+    fn prepare_imports(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        name: &str,
+        root: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
         for index in 0..state.interfaces.len() {
             self.budget
                 .charge(1, 0, 0)

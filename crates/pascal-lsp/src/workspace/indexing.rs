@@ -4627,8 +4627,10 @@ impl Workspace {
             let outside =
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
             outside_gap(&mut result.gaps, outside, &display);
-            // A member retrying a previous refusal stays counted by the
-            // "retried later" gap, so it is bound, not excluded (l4d-1nfk).
+            // A member retrying a previous refusal is unverified like any
+            // other: its text may prove the name absent (R9-5); the rest use
+            // the bound, and those past it stay the "retried later" gap
+            // (l4d-1nfk).
             let deferral_gap = searched && coverage.first_deferral.is_some();
             if searched && let Some(ranking) = ranking.as_mut() {
                 let absent = ranking.rank(
@@ -4638,7 +4640,7 @@ impl Workspace {
                         let key = path_key(path);
                         open.contains(&key) || taken.contains(&key) || deleted(path)
                     },
-                    &|path: &Path| !(deferral_gap && retrying.contains(&path_key(path))),
+                    &|_| true,
                     cancel,
                 );
                 lexically_excluded += absent.len();
@@ -7741,6 +7743,37 @@ pub(in crate::workspace) mod tests {
         assert_eq!(state(&workspace, &key, &plain), Some(MemberState::Limited));
     }
 
+    /// l4d-1nfk on the references path: a member retrying a previous
+    /// refusal whose bytes cannot hold `SharedValue` is excluded with its
+    /// stamp; it stays counted by the "retried later" gap.
+    #[test]
+    fn a_retrying_member_without_the_name_is_left_out_of_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.mark_index_stale(&key, &plain);
+        workspace
+            .project_cache
+            .defer_index_member(&key, &plain, RETRYING_REFUSAL);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &plain), "{:?}", found.baseline);
+        assert_eq!(
+            found.gaps,
+            [
+                "1 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
+            ]
+        );
+    }
+
     #[test]
     fn a_limited_member_spelling_the_name_is_still_read() {
         let temp = tempfile::tempdir().unwrap();
@@ -8377,6 +8410,73 @@ pub(in crate::workspace) mod tests {
                 "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal",
             ]
         );
+    }
+
+    /// l4d-1nfk: a retrying member is an unverified member like any other,
+    /// so one whose text cannot hold the query is excluded with its stamp
+    /// (R9-5), not read directly; one spelling the query is still read.
+    #[test]
+    fn retrying_members_without_the_query_are_not_read_directly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 6, WorkspaceOptions::default());
+        assert!(advance(&mut workspace, &anchor, IndexBound::all()).complete);
+        let retry = |workspace: &mut Workspace, name: &str| {
+            let path = root.join("lib").join(name);
+            workspace.project_cache.mark_index_stale(&key, &path);
+            workspace
+                .project_cache
+                .defer_index_member(&key, &path, RETRYING_REFUSAL);
+        };
+        for name in ["U2.pas", "U3.pas"] {
+            retry(&mut workspace, name);
+        }
+        let progress = advance(&mut workspace, &anchor, IndexBound::units(0));
+        assert!(
+            progress.complete && progress.retrying == 2,
+            "retrying members do not hold complete back: {progress:?}"
+        );
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let (sources, symbols) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert!(
+            source_names(&sources).is_empty(),
+            "{:?}",
+            source_names(&sources)
+        );
+        for name in ["U2.pas", "U3.pas"] {
+            assert!(
+                baselined(&sources, &root.join("lib").join(name)),
+                "{name}: {:?}",
+                sources.baseline
+            );
+        }
+        assert!(!symbols.is_empty());
+        assert!(
+            symbols
+                .iter()
+                .all(|(_, symbol)| symbol.member.ends_with("U1.pas")
+                    && &*symbol.declaration.display == "P1"),
+            "{symbols:?}"
+        );
+        assert!(
+            !sources
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("not indexed yet")),
+            "{:?}",
+            sources.gaps
+        );
+
+        named_unit(&root.join("lib/U3.pas"), "P1Too");
+        retry(&mut workspace, "U3.pas");
+        let input = workspace.analysis_input();
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["U3.pas"]);
     }
 
     /// `P1` (its `U.pas` open) and `P2`, each with `U`, `V` and `W` naming

@@ -899,6 +899,16 @@ fn take_reuse_phases() -> [(Duration, usize); REUSE_PHASES] {
     REUSE_PHASE_TIMES.with(|times| std::mem::take(&mut *times.borrow_mut()))
 }
 
+/// Holds a reuse batch once it has reused `count` members
+/// (`PASCAL_LSP_TEST_REUSE_PASS_BARRIER`), so protocol tests can query
+/// while the reuse pass runs.
+#[cfg(feature = "test-support")]
+fn wait_at_reuse_pass_barrier(mode: IndexMode, reused: usize) {
+    if mode == IndexMode::Reuse {
+        super::wait_at_walk_test_barrier("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", reused);
+    }
+}
+
 #[cfg(test)]
 fn run_hook(
     slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<LoadHook>>>,
@@ -1701,6 +1711,8 @@ impl Workspace {
             match reuse {
                 ReuseOutcome::Reused => {
                     progress.reused += 1;
+                    #[cfg(feature = "test-support")]
+                    wait_at_reuse_pass_barrier(bound.mode, progress.reused);
                     continue;
                 }
                 ReuseOutcome::Missed { absent } => {
@@ -2020,7 +2032,11 @@ impl Workspace {
             #[cfg(test)]
             run_hook(&AFTER_REUSE, path);
             match reuse {
-                ReuseOutcome::Reused => progress.reused += 1,
+                ReuseOutcome::Reused => {
+                    progress.reused += 1;
+                    #[cfg(feature = "test-support")]
+                    wait_at_reuse_pass_barrier(IndexMode::Reuse, progress.reused);
+                }
                 ReuseOutcome::Missed { absent } => {
                     self.project_cache.mark_index_reuse_tried(key, path);
                     progress.reuse_missed += 1;
@@ -14009,6 +14025,95 @@ end.
                 );
                 cache.shutdown();
             }
+        }
+
+        /// D24 during a query: an administrative reset fences the store
+        /// after the request read its target's index; the warm answer stays
+        /// the memory-only one.
+        #[test]
+        fn a_bypassed_store_mid_request_keeps_the_answer() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(
+                &root.join("Shared.pas"),
+                "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+            );
+            for name in ["User1", "User2"] {
+                write(
+                    &root.join(format!("{name}.pas")),
+                    &format!(
+                        "unit {name};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                );
+            }
+            write(
+                &root.join("Other.pas"),
+                "unit Other;\ninterface\nconst SharedValue = 2;\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+            let shared = Url::from_file_path(root.join("Shared.pas")).unwrap();
+            let anchor = IndexAnchor::Document(shared.clone());
+            let references = |input: WorkspaceInput| {
+                let partial = crate::workspace::queries::references_from_input(
+                    input,
+                    &shared,
+                    lsp_types::Position::new(2, 6),
+                    true,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("references");
+                let mut found = partial
+                    .value
+                    .iter()
+                    .map(|location| (location.uri.clone(), location.range.start))
+                    .collect::<Vec<_>>();
+                found.sort_by_key(|(uri, start)| (uri.to_string(), start.line, start.character));
+                (found, partial.coverage.is_complete())
+            };
+
+            let mut memory = workspace(root, WorkspaceOptions::default());
+            advance(&mut memory, &anchor, IndexBound::all());
+            let expected = references(memory.analysis_input());
+            assert_eq!(expected.0.len(), 3, "{expected:?}");
+            assert!(expected.1, "complete");
+
+            let store = private_dir();
+            let (mut first, cache) =
+                persisting_view(&workspace(root, WorkspaceOptions::default()), store.path());
+            let progress = advance(&mut first, &anchor, IndexBound::all());
+            assert_eq!(progress.persisted, 4, "{progress:?}");
+            cache.shutdown();
+            let (mut second, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.reused, 4, "{progress:?}");
+
+            let fenced = Rc::new(Cell::new(0));
+            let count = Rc::clone(&fenced);
+            let directory = store.path().to_path_buf();
+            set_after_target_view_hook(Some(Box::new(move |_| {
+                if count.get() == 0 {
+                    assert_eq!(
+                        pascal_cache::admin::reset(
+                            &directory,
+                            &Namespace::new(Digest::from_bytes([11; 32])),
+                            pascal_cache::StoreLimits::default(),
+                        ),
+                        Ok(true)
+                    );
+                }
+                count.set(count.get() + 1);
+            })));
+            let found = references(second.analysis_input());
+            set_after_target_view_hook(None);
+            assert!(fenced.get() >= 1, "the store was fenced mid-request");
+            assert_eq!(found, expected);
+            cache.shutdown();
         }
     }
 }

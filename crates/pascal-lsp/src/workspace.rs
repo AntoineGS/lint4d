@@ -16930,7 +16930,8 @@ fn wait_at_import_claim_test_barrier() {
 /// work (diagnostics, `PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER`) so protocol
 /// tests can issue interactive work while it runs, or the warm crawl
 /// (`PASCAL_LSP_TEST_WARM_CRAWL_BARRIER`) once it has analysed and published
-/// exactly `units` units.
+/// exactly `units` units; a reuse batch
+/// (`PASCAL_LSP_TEST_REUSE_PASS_BARRIER`) once it has reused `units` members.
 #[cfg(feature = "test-support")]
 fn wait_at_walk_test_barrier(variable: &str, index: usize) {
     use std::io::Write as _;

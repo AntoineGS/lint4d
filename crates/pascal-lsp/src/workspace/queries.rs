@@ -4365,6 +4365,329 @@ mod tests {
         cache.shutdown();
     }
 
+    const SHADOWING_IMPORTER: &str = "unit Shadow;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nvar\n  SharedValue: Integer;\nbegin\n  SharedValue := 2;\n  Log(SharedValue);\nend;\nend.\n";
+
+    /// D48 (spec §8.2): `Shadow` imports `Shared` but spells `SharedValue`
+    /// only through a local that shadows it. Its posting selects it and
+    /// binding rejects it: it is no location and the answer is complete,
+    /// indexed in memory and through a warm restarted view.
+    #[test]
+    fn a_posting_without_a_binding_is_never_a_location() {
+        use crate::workspace::indexing::IndexMode;
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::{persisting_view, restarted_view};
+        let (_temp, root, workspace) =
+            lexical_workspace(&[("Shadow.pas", SHADOWING_IMPORTER.as_bytes().to_vec())]);
+        let shadow = root.join("Shadow.pas");
+        let expected = vec![
+            (source_uri(&root.join("Importer.pas")), 6, 6),
+            (source_uri(&root.join("Shared.pas")), 2, 6),
+        ];
+        let walked = lexical_references(workspace.analysis_input(), &root);
+        assert_eq!(located(&walked.value), expected, "the walk's answer");
+        let check = |input: WorkspaceInput, label: &str| {
+            crate::workspace::rename::test_take_indexed_sources();
+            crate::navigation::test_reset_bound_documents();
+            let found = lexical_references(input, &root);
+            let indexed = indexed_sources();
+            assert!(indexed.contains(&shadow), "{label}: selected {indexed:?}");
+            assert!(
+                bound_documents().contains(&source_uri(&shadow)),
+                "{label}: bound"
+            );
+            assert!(
+                found.coverage.is_complete(),
+                "{label}: {:?}",
+                found.coverage
+            );
+            assert_eq!(located(&found.value), expected, "{label}");
+        };
+
+        let indexed = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        build_index_for(
+            &indexed.analysis_input(),
+            &source_uri(&root.join("Shared.pas")),
+        );
+        check(indexed.analysis_input(), "indexed");
+
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut first, cache) = persisting_view(
+            &test_workspace(vec![root.clone()], WorkspaceOptions::default()),
+            store.path(),
+        );
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 4, "{progress:?}");
+        cache.shutdown();
+        let (mut second, cache) = restarted_view(&root, store.path());
+        let progress = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.reused, 4, "{progress:?}");
+        check(second.analysis_input(), "warm");
+        cache.shutdown();
+    }
+
+    /// D47 (LSP side), through the in-memory `l4d-33` selector (A1
+    /// import-name matching), the production selector under R9-1: the
+    /// store's `find_importers` has no caller until `l4d-u3if`, and its
+    /// rows are covered in `pascal-cache`. `lib1/Utils.pas` and
+    /// `lib2/Utils.pas` both declare `Helper`; `PA` finds `Utils` in `lib1`,
+    /// `PB` in `lib2` before `lib1`. Both importers spell `Utils`, so both
+    /// are candidates; binding proves only `A`'s call.
+    #[test]
+    fn an_ambiguous_unit_name_keeps_every_importer_a_candidate_and_proves_locations_by_binding() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().to_path_buf());
+        let utils = "unit Utils;\ninterface\nprocedure Helper;\nimplementation\nprocedure Helper;\nbegin\nend;\nend.\n";
+        for library in ["lib1", "lib2"] {
+            let path = root.join(library).join("Utils.pas");
+            fs::create_dir_all(path.parent().unwrap()).expect("library directory");
+            fs::write(&path, utils).expect("utils");
+        }
+        for (project, unit, search) in [("PA", "A", "..\\lib1"), ("PB", "B", "..\\lib2;..\\lib1")] {
+            let directory = root.join(project);
+            fs::create_dir_all(&directory).expect("project directory");
+            fs::write(
+                directory.join(format!("{project}.dproj")),
+                format!(
+                    "<Project><PropertyGroup><MainSource>{project}.dpr</MainSource><DCC_UnitSearchPath>{search}</DCC_UnitSearchPath></PropertyGroup></Project>"
+                ),
+            )
+            .expect("descriptor");
+            fs::write(
+                directory.join(format!("{project}.dpr")),
+                format!("program {project};\nuses {unit};\nbegin\nend.\n"),
+            )
+            .expect("main source");
+            fs::write(
+                directory.join(format!("{unit}.pas")),
+                format!(
+                    "unit {unit};\ninterface\nuses Utils;\nimplementation\nprocedure Run;\nbegin\n  Helper;\nend;\nend.\n"
+                ),
+            )
+            .expect("importer");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let declaring = root.join("lib1/Utils.pas");
+        let (a, b) = (root.join("PA/A.pas"), root.join("PB/B.pas"));
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        // The importers stay closed, so the selection, not the open
+        // buffers rule (A4), makes them candidates.
+        open_source(&mut workspace, &root.join("PA/PA.dpr"));
+        open_source(&mut workspace, &root.join("PB/PB.dpr"));
+        let input = workspace.analysis_input();
+        let references = |input: WorkspaceInput| {
+            references_from_input(
+                input,
+                &source_uri(&declaring),
+                Position::new(2, 10),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+        let walked = references(input.clone());
+        for project in ["PA", "PB"] {
+            build_index_at(
+                &input,
+                &IndexAnchor::Project(root.join(project).join(format!("{project}.dproj"))),
+            );
+        }
+        crate::workspace::rename::test_take_indexed_sources();
+        crate::navigation::test_reset_bound_documents();
+        let found = references(input);
+        let indexed = indexed_sources();
+        assert!(
+            indexed.contains(&a) && indexed.contains(&b),
+            "both importers are candidates: {indexed:?}"
+        );
+        assert!(
+            bound_documents().contains(&source_uri(&b)),
+            "B is excluded by its binding, not by selection"
+        );
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        let found_locations = located(&found.value);
+        assert!(
+            found_locations.contains(&(source_uri(&a), 6, 2)),
+            "{found_locations:?}"
+        );
+        assert!(
+            found_locations
+                .iter()
+                .all(|(uri, _, _)| *uri == source_uri(&a) || *uri == source_uri(&declaring)),
+            "only lib1's importer and the declaring unit: {found_locations:?}"
+        );
+        assert_eq!(found_locations, located(&walked.value));
+    }
+
+    /// Spec §7: rename and the code actions computing workspace edits keep
+    /// their strict walk with a built and persisted index: no snapshot over
+    /// index candidates, and the edits of an unindexed session.
+    #[test]
+    fn rename_and_code_actions_never_use_index_selection() {
+        use crate::workspace::codeactions::{
+            ClientActionFeatures, code_actions_from_input, resolve_from_input,
+        };
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::persisting_view;
+        use lsp_types::{CodeActionOrCommand, WorkspaceEdit};
+        type Edits = Vec<(String, u32, u32, u32, u32, String)>;
+        fn edits(edit: WorkspaceEdit) -> Edits {
+            let mut found = edit
+                .changes
+                .expect("plain changes")
+                .into_iter()
+                .flat_map(|(uri, edits)| {
+                    edits.into_iter().map(move |edit| {
+                        (
+                            uri.to_string(),
+                            edit.range.start.line,
+                            edit.range.start.character,
+                            edit.range.end.line,
+                            edit.range.end.character,
+                            edit.new_text,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join(".lint4d.toml"),
+            "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+        )
+        .expect("lint configuration");
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for index in 0..3 {
+            fs::write(
+                root.join(format!("Importer{index}.pas")),
+                format!(
+                    "unit Importer{index};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(badConst);\nend;\nend.\n"
+                ),
+            )
+            .expect("importer");
+        }
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("Other{index}.pas")),
+                format!(
+                    "unit Other{index};\ninterface\nconst\n  BAD_CONST = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("other");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let uri = source_uri(&shared);
+        let features = |resolve| ClientActionFeatures {
+            resolve,
+            document_changes: false,
+            disabled: false,
+        };
+        let params = || -> lsp_types::CodeActionParams {
+            serde_json::from_value(serde_json::json!({
+                "textDocument": {"uri": uri},
+                "range": {
+                    "start": {"line": 3, "character": 2},
+                    "end": {"line": 3, "character": 10}
+                },
+                "context": {"diagnostics": [], "only": ["quickfix"]}
+            }))
+            .expect("code action parameters")
+        };
+        let action_edit = |actions: Vec<CodeActionOrCommand>| match actions.into_iter().next() {
+            Some(CodeActionOrCommand::CodeAction(action)) => action,
+            other => panic!("expected a code action: {other:?}"),
+        };
+        // (rename, eager quick fix, resolved quick fix) edits of `input`.
+        let all_edits = |input: WorkspaceInput| {
+            let cancel = AtomicBool::new(false);
+            let renamed = crate::workspace::rename::rename_from_input(
+                input.clone(),
+                &uri,
+                Position::new(3, 2),
+                "BAD_CONST_RENAMED",
+                false,
+                &cancel,
+            )
+            .value
+            .expect("rename");
+            let eager = action_edit(
+                code_actions_from_input(input.clone(), params(), features(false), &cancel)
+                    .value
+                    .expect("eager actions"),
+            );
+            assert_eq!(eager.title, "Rename 'badConst' to 'BAD_CONST'");
+            let unresolved = action_edit(
+                code_actions_from_input(input.clone(), params(), features(true), &cancel)
+                    .value
+                    .expect("resolvable actions"),
+            );
+            let resolved = resolve_from_input(input, unresolved, features(true), &cancel)
+                .value
+                .expect("resolved action");
+            (
+                edits(renamed),
+                edits(eager.edit.expect("eager edit")),
+                edits(resolved.edit.expect("resolved edit")),
+            )
+        };
+        let unindexed = all_edits(
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input(),
+        );
+        assert_eq!(unindexed.0.len(), 4, "{:?}", unindexed.0);
+
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut view, cache) = persisting_view(
+            &test_workspace(vec![root.clone()], WorkspaceOptions::default()),
+            store.path(),
+        );
+        let progress = advance(
+            &mut view,
+            &IndexAnchor::Document(uri.clone()),
+            IndexBound::all(),
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 8, "{progress:?}");
+        let input = view.analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let indexed = all_edits(input.clone());
+        assert_eq!(
+            crate::workspace::rename::test_indexed_snapshots(),
+            0,
+            "no edit used index selection"
+        );
+        assert_eq!(indexed, unindexed);
+        references_from_input(
+            input,
+            &uri,
+            Position::new(3, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references");
+        assert_eq!(
+            crate::workspace::rename::test_indexed_snapshots(),
+            1,
+            "the same session's references do use the index"
+        );
+        cache.shutdown();
+    }
+
     /// R9-8 (`.7` AC3): candidate trees past the admitted bytes are one
     /// gap, never a location; a refused declaring unit fails the request
     /// with a retryable error; rename keeps its strict walk.

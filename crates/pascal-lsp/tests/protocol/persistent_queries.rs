@@ -500,6 +500,167 @@ fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
     shutdown(server);
 }
 
+/// Spec §7 (D16): the second server's reuse pass is held at
+/// `PASCAL_LSP_TEST_REUSE_PASS_BARRIER` once `HELD` members were reused.
+/// A request then answers before `complete` with only proven locations and
+/// the "not indexed yet" gap; after `complete` it answers fully.
+#[test]
+fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
+    const HELD: usize = 5;
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SPEC);
+    let shared = root.join("lib/Shared.pas");
+    let not_indexed = |notes: &[String]| {
+        notes
+            .iter()
+            .any(|note| note.contains("units of App.dproj are not indexed yet"))
+    };
+
+    let mut first = launch_labelled(environment.path(), "cache", "reuse-first");
+    first.initialize(&root, Value::Null);
+    open_disk(&mut first, &root, &OPENS);
+    wait_index(&mut first, persisted);
+    settle_background(&mut first);
+    gaps(&mut first);
+    let expected = references(&mut first, &shared, 2, 6);
+    assert_eq!(expected.len(), SPEC.importers + 1, "{expected:?}");
+    assert!(!not_indexed(&gaps(&mut first)));
+    shutdown(first);
+
+    let directory = environment.path().join("reuse-pass-barrier");
+    fs::create_dir_all(&directory).unwrap();
+    let barrier = TestBarrier {
+        entered: directory.join("entered"),
+        release: directory.join("release"),
+    };
+    let spec = format!(
+        "{}|{}|{HELD}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let cache_home = environment.path().join("cache");
+    let mut second = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment.path(),
+        [
+            ("XDG_CACHE_HOME", cache_home.to_str().expect("UTF-8 path")),
+            ("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", spec.as_str()),
+        ],
+    );
+    second.initialize(&root, Value::Null);
+    open_disk(&mut second, &root, &OPENS);
+    barrier.wait_until_entered();
+    gaps(&mut second);
+    let partial = references(&mut second, &shared, 2, 6);
+    let notes = gaps(&mut second);
+    let held = request(&mut second, "pascal/indexStatus", json!({}));
+    assert!(
+        held["contexts"]
+            .as_array()
+            .is_some_and(|contexts| !contexts.iter().any(complete)),
+        "the response arrived before complete: {held}"
+    );
+    assert!(not_indexed(&notes), "{notes:?}");
+    assert!(
+        partial.iter().all(|location| expected.contains(location)),
+        "only proven locations: {partial:?}"
+    );
+
+    fs::write(&barrier.release, b"").unwrap();
+    let done = wait_index(&mut second, complete);
+    assert_eq!(done["extracted"], 0, "{done}");
+    settle_background(&mut second);
+    gaps(&mut second);
+    assert_eq!(references(&mut second, &shared, 2, 6), expected);
+    assert!(!not_indexed(&gaps(&mut second)));
+    shutdown(second);
+}
+
+/// A4: a didOpen whose `text` is `text`, not the file's.
+fn open_text(server: &mut TestServer, path: &Path, text: &str) {
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(path),
+            "languageId": "pascal",
+            "version": 1,
+            "text": text,
+        }}),
+    );
+}
+
+/// A4 over persisted facts: an open buffer of `Importer3.pas` without its
+/// occurrence removes its location, and one of `Other7.pas` that imports
+/// `Shared` and spells `TShared` adds one; an uncached server with the same
+/// buffers gives the same answer.
+#[test]
+fn an_unsaved_buffer_overrides_persisted_postings_both_ways() {
+    const SMALL: FixtureSpec = FixtureSpec {
+        units: 60,
+        importers: 5,
+        with_include_every: 10,
+        unresolved_includes: 0,
+        shared_name: "TShared",
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SMALL);
+    let shared = root.join("lib/Shared.pas");
+    let importer = root.join("lib/Importer3.pas");
+    let other = root.join("lib/Other7.pas");
+    let removed = fs::read_to_string(&importer)
+        .unwrap()
+        .replace("  TShared.Create;\n", "");
+    let added = fs::read_to_string(&other)
+        .unwrap()
+        .replace("type TShared = class end;\n", "uses Shared;\n");
+    assert!(added.contains("uses Shared;") && added.contains("TShared.Create"));
+    let in_file =
+        |location: &(String, u32, u32), name: &str| location.0.ends_with(&format!("/lib/{name}"));
+    let buffered = |server: &mut TestServer| {
+        open_text(server, &importer, &removed);
+        open_text(server, &other, &added);
+        settle_background(server);
+        references(server, &shared, 2, 6)
+    };
+
+    let mut warm = warm_server(environment.path(), &root, &OPENS);
+    let before = references(&mut warm, &shared, 2, 6);
+    assert_eq!(before.len(), SMALL.importers + 1, "{before:?}");
+    assert!(
+        before
+            .iter()
+            .any(|location| in_file(location, "Importer3.pas"))
+    );
+    let found = buffered(&mut warm);
+    shutdown(warm);
+    assert!(
+        !found
+            .iter()
+            .any(|location| in_file(location, "Importer3.pas")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|location| in_file(location, "Other7.pas") && (location.1, location.2) == (6, 2)),
+        "{found:?}"
+    );
+    let unchanged = |locations: &[(String, u32, u32)]| {
+        locations
+            .iter()
+            .filter(|location| {
+                !in_file(location, "Importer3.pas") && !in_file(location, "Other7.pas")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unchanged(&found), unchanged(&before));
+    assert_eq!(found.len(), before.len());
+
+    let mut cold = cold_server(environment.path(), &root, &OPENS);
+    assert_eq!(buffered(&mut cold), found, "the uncached answer");
+    shutdown(cold);
+}
+
 fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();
     let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];

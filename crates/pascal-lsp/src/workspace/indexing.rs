@@ -1441,7 +1441,7 @@ impl PersistSkip {
 /// stamp taken before reuse read it), then one slot per include in slot
 /// order, normalized as `source_slot_paths` does. An include's stamp is
 /// the one reuse took before validating its bytes; without one the member
-/// stays unverified on every request, as for an unresolved include (A7).
+/// stays unverified on every request (A7).
 fn reused_slots(
     path: &Path,
     own_stamp: &PathStamp,
@@ -4575,6 +4575,7 @@ impl Workspace {
                 );
             }
             let mut proven = HashSet::new();
+            let mut unresolved = 0usize;
             for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
                 check_workspace_cancel(Some(cancel))?;
                 let unchanged = recorded.first().is_some_and(|first| first.path == path)
@@ -4594,9 +4595,18 @@ impl Workspace {
                             .into_iter()
                             .map(|member| (member.path, member.stamp)),
                     );
+                } else if unchanged {
+                    // R9-4: an unchanged member whose include does not
+                    // resolve is a coverage gap, not a direct read; its facts
+                    // may lack that include's declarations.
+                    unresolved += 1;
                 } else {
                     unverified.push(path);
                 }
+            }
+            result.unresolved += unresolved;
+            if unresolved > 0 {
+                result.gaps.push(unresolved_gap(unresolved, &display));
             }
             symbols.extend(
                 view_symbols
@@ -5074,6 +5084,10 @@ impl UnverifiedRanking {
         file.take(len).read_to_end(&mut text).ok()?;
         Some(text)
     }
+}
+
+pub(crate) fn unresolved_gap(count: usize, display: &str) -> String {
+    format!("{count} units of {display} have includes that do not resolve; they were not searched")
 }
 
 fn outside_gap(gaps: &mut Vec<String>, outside: usize, display: &str) {
@@ -7443,7 +7457,7 @@ pub(in crate::workspace) mod tests {
     }
 
     #[test]
-    fn an_unresolved_include_makes_a_member_unverified_every_time() {
+    fn an_unchanged_unresolved_include_member_is_a_gap_every_time() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         write(
@@ -7463,7 +7477,10 @@ pub(in crate::workspace) mod tests {
                 Some(&query),
                 &[],
             );
-            assert_eq!(source_names(&found), ["Inc.pas", "Shared.pas", "User.pas"]);
+            assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+            assert_eq!(found.unresolved, 1);
+            assert_eq!(found.gaps, [unresolved_gap(1, "App.dproj")]);
+            assert!(!found.baseline.iter().any(|(path, _)| *path == member));
         }
         assert_eq!(state(&workspace, &key, &member), Some(MemberState::Fresh));
     }

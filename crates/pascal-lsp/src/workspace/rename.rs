@@ -6192,6 +6192,8 @@ pub(crate) struct IndexedSources {
     /// the directories of the catalogues their membership came from.
     pub(crate) baseline: Vec<(PathBuf, Option<PathStamp>)>,
     pub(crate) gaps: Vec<String>,
+    /// Unchanged members left out because an include does not resolve (R9-4).
+    pub(crate) unresolved: usize,
     /// The states of the owners in `sources`, which the snapshot does not
     /// resolve again.
     pub(crate) contexts: HashMap<ContextKey, ContextState>,

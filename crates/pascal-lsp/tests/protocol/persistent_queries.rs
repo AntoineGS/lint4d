@@ -265,7 +265,7 @@ const SPEC: FixtureSpec = FixtureSpec {
 };
 
 #[test]
-#[ignore = "red until l4d-zf1b.9 Task 5"]
+#[ignore = "red until l4d-zf1b.9 Task 7: 92 payload reads > 88 (parses 21 <= 22 pass since Task 5)"]
 fn warm_references_bind_only_the_candidates_and_match_the_uncached_answer() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &SPEC);

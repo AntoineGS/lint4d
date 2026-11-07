@@ -4249,6 +4249,174 @@ mod tests {
         cache.shutdown();
     }
 
+    /// `Shared` declares `SharedValue`, `Importer` uses it, and `Broken`
+    /// spells the name outside an include that does not resolve.
+    struct UnresolvedFixture {
+        _temp: TempDir,
+        shared: PathBuf,
+        importer: PathBuf,
+        broken: PathBuf,
+        input: WorkspaceInput,
+    }
+
+    fn unresolved_fixture(broken_text: &str) -> UnresolvedFixture {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        let importer = root.join("Importer.pas");
+        let broken = root.join("Broken.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            &importer,
+            "unit Importer;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("importer");
+        fs::write(&broken, broken_text).expect("broken");
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        UnresolvedFixture {
+            _temp: temp,
+            shared,
+            importer,
+            broken,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    const BROKEN_SPELLING_SHARED_VALUE: &str = "unit Broken;\ninterface\n{$I Missing.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+
+    fn unresolved_references(
+        fixture: &UnresolvedFixture,
+    ) -> crate::coverage::Partial<Vec<lsp_types::Location>> {
+        references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references")
+    }
+
+    fn indexed_sources() -> Vec<PathBuf> {
+        let mut sources = crate::workspace::rename::test_take_indexed_sources();
+        sources.sort();
+        sources.dedup();
+        sources
+    }
+
+    fn has_unresolved_gap(coverage: &crate::coverage::Coverage, count: usize) -> bool {
+        let suffix = crate::workspace::indexing::unresolved_gap(count, "\0");
+        let (prefix, suffix) = suffix.split_once('\0').expect("display marker");
+        coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.reason.starts_with(prefix) && gap.reason.ends_with(suffix))
+    }
+
+    /// Characterization (l4d-zf1b.9 Task 5): before R9-4 the unchanged
+    /// member whose include does not resolve was read directly, and its
+    /// spelling of `SharedValue` (it never imports `Shared`) was no
+    /// reference; R9-4 leaves it unread, so the answer is the same.
+    #[test]
+    fn an_unresolved_include_member_read_directly_today_contributes_no_location() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        let partial = unresolved_references(&fixture);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.importer), 6, 6),
+                (source_uri(&fixture.shared), 2, 6),
+            ],
+            "{:?}",
+            partial
+        );
+    }
+
+    #[test]
+    fn an_unchanged_member_with_an_unresolved_include_is_a_gap_and_is_not_read() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        crate::workspace::rename::test_take_indexed_sources();
+        let partial = unresolved_references(&fixture);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.importer), 6, 6),
+                (source_uri(&fixture.shared), 2, 6),
+            ],
+        );
+        let indexed = indexed_sources();
+        assert!(!indexed.contains(&fixture.broken), "{indexed:?}");
+        assert!(!partial.coverage.is_complete());
+        assert!(
+            has_unresolved_gap(&partial.coverage, 1),
+            "{:?}",
+            partial.coverage
+        );
+    }
+
+    #[test]
+    fn a_changed_member_with_an_unresolved_include_is_still_read() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        fs::write(
+            &fixture.broken,
+            BROKEN_SPELLING_SHARED_VALUE.replace("Log(", "Log( "),
+        )
+        .expect("rewritten broken");
+        crate::workspace::rename::test_take_indexed_sources();
+        let partial = unresolved_references(&fixture);
+        let indexed = indexed_sources();
+        assert!(indexed.contains(&fixture.broken), "{indexed:?}");
+        assert!(
+            !has_unresolved_gap(&partial.coverage, 1),
+            "{:?}",
+            partial.coverage
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_skip_unresolved_include_members_the_same_way() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n"),
+            ),
+            (
+                "Broken.pas",
+                "unit Broken;\ninterface\n{$I Missing.inc}\nconst SharedValueToo = 2;\nimplementation\nend.\n"
+                    .to_owned(),
+            ),
+            ("Opened.pas", unit_text("Opened", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Shared.pas")));
+        reset_symbol_counters();
+        crate::workspace::rename::test_take_indexed_sources();
+        let found = symbols(&input, "SharedValue");
+        assert_eq!(
+            symbol_names(&found.value),
+            [("SharedValue".to_owned(), "Shared.pas".to_owned())]
+        );
+        assert_eq!(super::test_take_fact_symbols(), 1);
+        let indexed = indexed_sources();
+        assert!(!indexed.contains(&root.join("Broken.pas")), "{indexed:?}");
+        assert!(!found.coverage.is_complete());
+        assert!(
+            has_unresolved_gap(&found.coverage, 1),
+            "{:?}",
+            found.coverage
+        );
+    }
+
     #[test]
     fn references_on_an_unindexed_context_search_unverified_members_directly() {
         let fixture = query_fixture();

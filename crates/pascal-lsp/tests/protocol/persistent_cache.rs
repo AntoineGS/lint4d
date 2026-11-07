@@ -151,7 +151,7 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
         "{status}"
     );
     assert_eq!(status["directory"], directory.to_str().unwrap());
-    assert!(directory.join("analysis-v6.sqlite3").is_file());
+    assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
     let mode = fs::metadata(&directory).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
     open(&mut server, &main, 1, &main_source);
@@ -181,7 +181,7 @@ fn container_header(version: u32) -> Vec<u8> {
     page
 }
 
-/// R9-3 (l4d-zf1b.8, 13c-4, 13d-3): containers of earlier versions keep
+/// R9-3 (l4d-zf1b.8, 13c-4, 13d-3; l4d-zf1b.9): containers of earlier versions keep
 /// their own file names. The server opens its versioned file beside it, with no
 /// user action, and never touches or deletes the old one.
 #[test]
@@ -204,6 +204,7 @@ fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
     let olds = [
         (directory.join("analysis.sqlite3"), 4),
         (directory.join("analysis-v5.sqlite3"), 5),
+        (directory.join("analysis-v6.sqlite3"), 6),
     ];
     let stamp = |old: &std::path::Path| {
         (
@@ -220,7 +221,7 @@ fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
     server.initialize(main.parent().unwrap(), Value::Null);
     let settled = settle(&mut server, true);
     assert_eq!(settled["status"]["state"], "enabled", "{settled}");
-    assert_eq!(pascal_cache::DATABASE_FILE, "analysis-v6.sqlite3");
+    assert_eq!(pascal_cache::DATABASE_FILE, "analysis-v7.sqlite3");
     assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
     open(&mut server, &main, 1, &main_source);
     hover(&mut server, &main, &main_source, "PublicRoutine");

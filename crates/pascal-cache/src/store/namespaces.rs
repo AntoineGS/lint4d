@@ -18,7 +18,7 @@ const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 12] = [
+const RECLAIM_TABLES: [&str; 13] = [
     "lease_holds",
     "process_leases",
     "snapshot_members",
@@ -30,6 +30,7 @@ const RECLAIM_TABLES: [&str; 12] = [
     "observation_content",
     "artifact_rows",
     "artifacts",
+    "scopes",
     "key_manifests",
 ];
 
@@ -230,6 +231,36 @@ pub(crate) fn ensure_live(connection: &Connection, scope: Scope) -> Result<(), B
         .optional()
         .map_err(|error| classify(&error))?;
     live.map(|_| ()).ok_or(Bypass::Fenced)
+}
+
+/// The surrogate artifact rows of `scope` carry, or `None` while no
+/// artifact was ever published in it.
+pub(crate) fn scope_ref(connection: &Connection, scope: Scope) -> Result<Option<i64>, Bypass> {
+    connection
+        .prepare_cached("SELECT scope_ref FROM scopes WHERE namespace_id = ?1 AND reset_epoch = ?2")
+        .and_then(|mut statement| {
+            statement
+                .query_row(
+                    params![scope.namespace.as_bytes().as_slice(), epoch(scope)],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|error| classify(&error))
+}
+
+/// [`scope_ref`], registering the scope first in the caller's write
+/// transaction.
+pub(crate) fn ensure_scope_ref(transaction: &Connection, scope: Scope) -> Result<i64, Bypass> {
+    transaction
+        .prepare_cached(
+            "INSERT INTO scopes (namespace_id, reset_epoch) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![scope.namespace.as_bytes().as_slice(), epoch(scope)])
+        })
+        .map_err(|error| classify(&error))?;
+    scope_ref(transaction, scope)?.ok_or(Bypass::Corrupt)
 }
 
 /// Retire `scope` and move its namespace to the next epoch in one

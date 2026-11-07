@@ -12401,9 +12401,11 @@ end.
                         let metadata = entry.metadata().unwrap();
                         if metadata.is_dir() {
                             stack.push(entry.path());
-                        } else if entry.file_name() == "analysis-v6.sqlite3" {
+                        } else if entry.file_name() == pascal_cache::DATABASE_FILE {
                             database += metadata.len();
-                        } else if entry.file_name() == "analysis-v6.sqlite3-wal" {
+                        } else if entry.file_name().to_str()
+                            == Some(&format!("{}-wal", pascal_cache::DATABASE_FILE))
+                        {
                             wal += metadata.len();
                         }
                     }

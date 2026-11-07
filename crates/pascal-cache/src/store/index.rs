@@ -1,20 +1,23 @@
 use super::Store;
 use super::health::Access;
 use super::limits::MAX_INDEX_PAGE;
-use super::namespaces::{LIVE, ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch, scope_ref};
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use crate::Digest;
 use rusqlite::{TransactionBehavior, params};
 
 /// Keyset-paginated, binary-compared lookup over live artifacts. The partial
-/// index `artifact_rows_by_index_key` serves both the filter and the order
-/// (`CROSS JOIN` keeps it outermost); the artifact's header restricts the
-/// rows to the scope. `pub` only so `test-support` can re-export it; the
-/// module is private.
+/// index `artifact_rows_by_index_key` is led by the scope surrogate `?9`, so
+/// it serves both the filter and the order within one scope and never
+/// visits another scope's rows (`CROSS JOIN` keeps it outermost). The
+/// artifact's header still restricts the rows to the scope: a wrong
+/// surrogate can hide a row, never return another scope's. `pub` only so
+/// `test-support` can re-export it; the module is private.
 pub const INDEX_QUERY: &str = "SELECT a.artifact_id, r.artifact_ref, r.ordinal \
      FROM artifact_rows r CROSS JOIN artifacts a ON a.artifact_ref = r.artifact_ref \
-     WHERE r.row_kind = ?3 AND r.index_key = ?4 AND (r.artifact_ref, r.ordinal) > (?5, ?6) \
+     WHERE r.scope_ref = ?9 AND r.row_kind = ?3 AND r.index_key = ?4 \
+         AND (r.artifact_ref, r.ordinal) > (?5, ?6) \
          AND a.namespace_id = ?1 AND a.reset_epoch = ?2 AND a.lifecycle = ?8 \
      ORDER BY r.artifact_ref, r.ordinal LIMIT ?7";
 
@@ -72,6 +75,14 @@ impl Store {
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             ensure_live(&transaction, self.scope)?;
+            // The scope is registered with its first artifact: without it,
+            // no row of the scope exists.
+            let Some(scope_ref) = scope_ref(&transaction, self.scope)? else {
+                return Ok(IndexPage {
+                    hits: Vec::new(),
+                    next: None,
+                });
+            };
             let mut statement = transaction.prepare_cached(INDEX_QUERY).map_err(fail)?;
             let rows = statement
                 .query_map(
@@ -83,7 +94,8 @@ impl Store {
                         after.artifact_ref,
                         after.ordinal,
                         (limit + 1) as i64,
-                        LIVE
+                        LIVE,
+                        scope_ref
                     ],
                     |row| {
                         Ok((

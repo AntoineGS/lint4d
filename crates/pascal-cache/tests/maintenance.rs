@@ -5,7 +5,7 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    EAGER, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
+    EAGER, NAMESPACE, SEAL, age_past_grace, artifact, binding_evidence, check_invariant, context,
     local_member, member, open, publish_bulk, raw, read_members, read_record, records, sealed,
 };
 use pascal_cache::admin::{self, PruneLimits, PruneOutcome, RecoveryAdvice, StoreStatus};
@@ -1101,24 +1101,52 @@ fn reclaim_writes_nothing_at_the_wal_threshold() {
 #[test]
 fn a_fenced_handle_still_reclaims_whole_retired_scopes() {
     let root = private_tempdir();
+    // Another namespace's live scope, whose rows and `scopes` row stay.
+    let other = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([6; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    artifact(&other, "unit Other;");
+    let other_rows = table_rows(root.path());
     let store = open(root.path());
     artifact(&store, "unit Stray;");
     age_past_grace(&store);
     assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
+    let id = |fingerprint: u8| {
+        *Namespace::new(Digest::from_bytes([fingerprint; 32]))
+            .id()
+            .as_bytes()
+    };
+    let scope_rows = |fingerprint: u8| {
+        raw(root.path())
+            .query_row(
+                "SELECT count(*) FROM scopes WHERE namespace_id = ?1",
+                [id(fingerprint).as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!((scope_rows(NAMESPACE), scope_rows(6)), (1, 1));
     let connection = raw(root.path());
     connection
-        .execute("UPDATE namespaces SET reset_epoch = reset_epoch + 1", [])
+        .execute(
+            "UPDATE namespaces SET reset_epoch = reset_epoch + 1 WHERE namespace_id = ?1",
+            [id(NAMESPACE).as_slice()],
+        )
         .unwrap();
     connection
         .execute(
-            "INSERT INTO retired_scopes SELECT namespace_id, 0 FROM namespaces",
-            [],
+            "INSERT INTO retired_scopes VALUES (?1, 0)",
+            [id(NAMESPACE).as_slice()],
         )
         .unwrap();
     assert_eq!(store.check_scope(), Err(Bypass::Fenced));
     while !store.reclaim(256).unwrap().complete {}
-    assert_eq!(table_rows(root.path()), 0);
+    assert_eq!(table_rows(root.path()), other_rows);
     assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
+    assert_eq!((scope_rows(NAMESPACE), scope_rows(6)), (0, 1));
 }
 
 #[test]

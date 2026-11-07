@@ -8,7 +8,7 @@ use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
     MAX_SUPPLEMENTAL_BYTES,
 };
-use super::namespaces::{LIVE, Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, Scope, ensure_live, ensure_scope_ref, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::sequence::next_publication_seq;
 use super::sqlite::{begin, classify, classify_read};
@@ -336,10 +336,12 @@ pub(crate) fn insert_prepared(
     // The rows hang off the header's surrogate, which nothing outside this
     // container ever sees.
     let artifact_ref = transaction.last_insert_rowid();
+    let scope_ref = ensure_scope_ref(transaction, scope)?;
     let mut insert = transaction
         .prepare_cached(
-            "INSERT INTO artifact_rows (artifact_ref, ordinal, row_kind, index_key, payload) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(fail)?;
     for (ordinal, row) in write.rows.iter().enumerate() {
@@ -347,6 +349,7 @@ pub(crate) fn insert_prepared(
             .execute(params![
                 artifact_ref,
                 ordinal as i64,
+                scope_ref,
                 i64::from(row.row_kind),
                 row.index_key,
                 row.payload

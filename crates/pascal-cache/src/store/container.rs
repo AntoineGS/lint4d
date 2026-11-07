@@ -5,13 +5,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 6;
+pub const CONTAINER_VERSION: i64 = 7;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 6. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 7. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
 /// Spec §6.1 (amended 2026-10-27) adds evidence purposes and the publication sequence.
@@ -24,6 +24,12 @@ const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 /// Container 6 (l4d-zf1b.8, 13d-3) stores no per-row checksum: a read
 /// verifies every row against the artifact's `fact_checksum`, which binds
 /// each row to its artifact and ordinal (spec §6.2).
+/// Container 7 (l4d-zf1b.9, l4d-rpfc) copies an INTEGER surrogate of the
+/// artifact's scope (`scopes`) onto each artifact row and leads the name
+/// index with it, so a lookup never visits another scope's rows. It has no
+/// foreign key: only the publishing transaction writes it, and the lookup
+/// still checks the scope through `artifacts`, so a wrong ref hides a row
+/// and never returns another scope's.
 const SCHEMA: &str = "
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -80,9 +86,17 @@ CREATE TABLE artifacts (
     CHECK ((kind = 2) = (root_key IS NULL))
 ) STRICT;
 
+CREATE TABLE scopes (
+    scope_ref INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace_id BLOB NOT NULL REFERENCES namespaces (namespace_id),
+    reset_epoch INTEGER NOT NULL CHECK (reset_epoch >= 0),
+    UNIQUE (namespace_id, reset_epoch)
+) STRICT;
+
 CREATE TABLE artifact_rows (
     artifact_ref INTEGER NOT NULL REFERENCES artifacts (artifact_ref),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    scope_ref INTEGER NOT NULL,
     row_kind INTEGER NOT NULL CHECK (row_kind BETWEEN 1 AND 255),
     index_key BLOB CHECK (index_key IS NULL OR length(index_key) <= 4096),
     payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
@@ -90,7 +104,7 @@ CREATE TABLE artifact_rows (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX artifact_rows_by_index_key
-    ON artifact_rows (row_kind, index_key, artifact_ref, ordinal)
+    ON artifact_rows (scope_ref, row_kind, index_key, artifact_ref, ordinal)
     WHERE index_key IS NOT NULL;
 
 CREATE INDEX artifacts_by_root
@@ -534,6 +548,7 @@ mod tests {
                 "observation_content",
                 "process_leases",
                 "retired_scopes",
+                "scopes",
                 "snapshot_members",
                 "snapshots",
                 "sqlite_sequence",
@@ -649,7 +664,7 @@ mod tests {
 
     #[test]
     fn older_containers_are_bypassed_not_migrated() {
-        for version in [1, 2, 3, 4, 5] {
+        for version in [1, 2, 3, 4, 5, 6] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("a.sqlite3");
             {
@@ -918,11 +933,11 @@ mod tests {
                 MAX_SUPPLEMENTAL_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES (1, 0, 1, zeroblob(?1), x'')",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, 1, zeroblob(?1), x'')",
                 MAX_INDEX_KEY_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES (1, 0, 1, NULL, zeroblob(?1))",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, 1, NULL, zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
             (

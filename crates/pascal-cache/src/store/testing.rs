@@ -110,6 +110,95 @@ impl Store {
         self.writer().map(|lease| HeldConnection { _lease: lease })
     }
 
+    /// Every content row the store holds (manifests, artifacts and their
+    /// rows, evidence and observations, records and bindings), one line
+    /// each, sorted. Publication order (`publication_seq`) is left out, so
+    /// two stores given the same publications compare equal.
+    pub fn content_for_test(&self) -> Result<Vec<String>, Bypass> {
+        const TABLES: [(&str, &[&str]); 7] = [
+            ("key_manifests", &["kind", "digest", "manifest"]),
+            (
+                "artifacts",
+                &[
+                    "artifact_id",
+                    "kind",
+                    "root_key",
+                    "lifecycle",
+                    "row_count",
+                    "content_bytes",
+                    "fact_checksum",
+                    "supplemental",
+                ],
+            ),
+            (
+                "artifact_rows",
+                &["artifact_id", "ordinal", "row_kind", "index_key", "payload"],
+            ),
+            (
+                "evidence_sets",
+                &[
+                    "evidence_id",
+                    "purpose",
+                    "context_key",
+                    "subject_key",
+                    "artifact_id",
+                    "lifecycle",
+                    "observation_count",
+                    "content_bytes",
+                ],
+            ),
+            (
+                "observations",
+                &["evidence_id", "ordinal", "kind", "path_key", "payload"],
+            ),
+            (
+                "member_records",
+                &[
+                    "record_id",
+                    "lifecycle",
+                    "header",
+                    "source_key",
+                    "artifact_id",
+                    "member_evidence",
+                    "binding_count",
+                    "content_bytes",
+                ],
+            ),
+            (
+                "member_bindings",
+                &[
+                    "record_id",
+                    "ordinal",
+                    "kind",
+                    "outcome",
+                    "target_key",
+                    "evidence_id",
+                    "payload",
+                ],
+            ),
+        ];
+        let reader = self.reader()?;
+        let mut lines = Vec::new();
+        for (table, columns) in TABLES {
+            let row = columns
+                .iter()
+                .map(|column| format!("quote({column})"))
+                .collect::<Vec<_>>()
+                .join(" || ' ' || ");
+            let mut statement = reader
+                .prepare(&format!("SELECT '{table} ' || {row} FROM {table}"))
+                .map_err(|error| classify(&error))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| classify(&error))?;
+            for line in rows {
+                lines.push(line.map_err(|error| classify(&error))?);
+            }
+        }
+        lines.sort();
+        Ok(lines)
+    }
+
     /// Run `hook` inside every write transaction, just before it commits.
     pub fn set_before_commit_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
         *self

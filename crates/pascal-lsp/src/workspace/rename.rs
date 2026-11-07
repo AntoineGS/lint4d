@@ -1662,6 +1662,16 @@ impl Workspace {
         self.input_with(HashMap::new(), HashMap::new())
     }
 
+    /// The input of a parallel extraction worker's view (13c-3): this
+    /// view's editor state, owners and baseline flag, without its reusable
+    /// parses (a baseline view holds none).
+    pub(super) fn worker_view_input(&self) -> WorkspaceInput {
+        WorkspaceInput {
+            baseline: self.baseline,
+            ..self.input_with(self.document_owners.clone(), HashMap::new())
+        }
+    }
+
     fn input_with(
         &self,
         document_owners: HashMap<Url, KnownDocumentOwner>,

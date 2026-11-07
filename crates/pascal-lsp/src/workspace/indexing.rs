@@ -309,6 +309,53 @@ fn member_deadline(path: &Path) -> Instant {
     Instant::now() + MEMBER_DEADLINE
 }
 
+/// Runs where a member's extraction starts, on whichever thread extracts
+/// it, with the flag its load polls.
+#[cfg(test)]
+type ExtractHook = Arc<dyn Fn(&Path, &AtomicBool) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static EXTRACT_HOOK: std::cell::RefCell<Option<ExtractHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_worker_extract_hook(hook: Option<ExtractHook>) {
+    EXTRACT_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// The batch thread's test seams, which its extraction workers run under
+/// (13c-3): thread-locals do not reach a worker by themselves.
+#[cfg(test)]
+#[derive(Clone)]
+struct WorkerSeams {
+    slow: Option<PathBuf>,
+    errors: Vec<PathBuf>,
+    unstampable: Vec<PathBuf>,
+    hook: Option<ExtractHook>,
+}
+
+#[cfg(test)]
+impl WorkerSeams {
+    fn capture() -> Self {
+        Self {
+            slow: SLOW_MEMBER.with(|slot| slot.borrow().clone()),
+            errors: MEMBER_ERROR.with(|slot| slot.borrow().clone()),
+            unstampable: UNSTAMPABLE.with(|slot| slot.borrow().clone()),
+            hook: EXTRACT_HOOK.with(|slot| slot.borrow().clone()),
+        }
+    }
+
+    /// On a worker thread, which has none of its own.
+    fn install(self) {
+        SLOW_MEMBER.with(|slot| *slot.borrow_mut() = self.slow);
+        MEMBER_ERROR.with(|slot| *slot.borrow_mut() = self.errors);
+        UNSTAMPABLE.with(|slot| *slot.borrow_mut() = self.unstampable);
+        EXTRACT_HOOK.with(|slot| *slot.borrow_mut() = self.hook);
+    }
+}
+
 /// What an index batch may do for a member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexMode {
@@ -909,6 +956,8 @@ enum Prefetched {
         epoch: u64,
         stamp: Option<PathStamp>,
         reuse: Option<Box<Validated>>,
+        /// A Full batch's extraction after a reuse miss (13c-3).
+        extracted: Option<Box<Extraction>>,
     },
 }
 
@@ -938,6 +987,8 @@ struct PipelineState {
     done: usize,
     results: HashMap<usize, Prefetched>,
     stopped: bool,
+    /// No member is taken any more; those taken still arrive (13c-3).
+    closed: bool,
     /// Workers started and not yet exited: with none, a member never
     /// taken or never handed over cannot arrive (N2).
     workers: usize,
@@ -1026,7 +1077,7 @@ impl Pipeline {
     ) -> Option<(usize, usize)> {
         let mut state = self.lock();
         loop {
-            if state.stopped || state.next >= members {
+            if state.stopped || state.closed || state.next >= members {
                 return None;
             }
             let allowed = workers();
@@ -1106,6 +1157,18 @@ impl Pipeline {
         }
     }
 
+    /// The batch reached its time bound: the workers take no member, and
+    /// the ones they took (before the returned position) still arrive, to
+    /// be applied. Nothing in flight is tripped.
+    fn close(&self) -> usize {
+        let mut state = self.lock();
+        state.closed = true;
+        let taken = state.next;
+        drop(state);
+        self.changed.notify_all();
+        taken
+    }
+
     fn stop(&self) {
         self.lock().stopped = true;
         self.tripped.store(true, Ordering::Relaxed);
@@ -1158,6 +1221,89 @@ impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
         self.0.stop();
     }
+}
+
+/// A worker's loop (R8-1, 13c-3): it takes members in order through
+/// `pipeline` and starts each only while `may_run` holds and the request is
+/// not cancelled; `find` gives what it found for the member.
+fn prefetch_loop(
+    members: &[PathBuf],
+    pipeline: &Pipeline,
+    worker: usize,
+    validation: ParallelValidation<'_>,
+    cancel: &AtomicBool,
+    mut find: impl FnMut(&Path) -> Prefetched,
+) {
+    while let Some((position, allowed)) =
+        pipeline.take_next(members.len(), worker, validation.workers)
+    {
+        // A worker that panics stops the batch at its member rather than
+        // leave it waiting; the scope then propagates the panic.
+        let in_flight = InFlight { pipeline, position };
+        if cancel.load(Ordering::Relaxed) || !(validation.may_run)() {
+            drop(in_flight);
+            return;
+        }
+        #[cfg(test)]
+        pipeline.note_take(worker, allowed);
+        #[cfg(not(test))]
+        let _ = allowed;
+        let prefetched = find(&members[position]);
+        std::mem::forget(in_flight);
+        pipeline.put(position, prefetched);
+    }
+}
+
+/// A stable refusal, unless the file is gone: then its directory listing
+/// changed, which is no refusal.
+fn refused_unless_vanished(path: &Path, reason: String) -> Extraction {
+    if path_stamp(path).is_none() {
+        Extraction::Vanished
+    } else {
+        Extraction::Refused(reason)
+    }
+}
+
+/// What extracting one member gave, before anything reaches the index or
+/// the store (13c-3): a worker computes it on its own view, and the batch
+/// applies it in member order (`apply_extraction`), as the serial loop
+/// does both at once (`index_member`).
+enum Extraction {
+    /// `index_member`'s `Err`: a cancellation, or a reason the member
+    /// stays pending.
+    Failed(String),
+    Refused(String),
+    /// The file is gone: its directory listing changed.
+    Vanished,
+    Deferred(String),
+    PastDeadline,
+    /// The facts were limited.
+    Limited,
+    /// An unsaved buffer: nothing to publish.
+    Overlay,
+    Facts(Box<ExtractedMember>),
+}
+
+/// A loaded member's facts, slots and stamps, and its prepared publication.
+struct ExtractedMember {
+    member: MemberFacts,
+    stamps: Vec<MemberStamp>,
+    hash: u64,
+    /// `None` when the view could not publish as it extracted.
+    prepared: Option<Result<PreparedPublication, super::persist::PersistError>>,
+    /// What the session read without a capture, when that refused the
+    /// evidence (13c-1).
+    unprovable: Option<(&'static str, String)>,
+}
+
+/// One `prepare_artifact` pass and the reservation of its transient bytes.
+struct PreparedPublication {
+    artifact: super::persist::PreparedArtifact,
+    /// Reserved from the publication pool as a worker prepared it, so the
+    /// bytes are charged while it waits for the batch (`Some(None)`:
+    /// refused, D41); `None` when the serial loop reserves them as it
+    /// publishes, as before 13c-3.
+    transient: Option<Option<crate::project_cache::Reservation>>,
 }
 
 /// Why an extracted member was not persisted. None is an error: the member
@@ -1372,31 +1518,51 @@ impl Workspace {
         // Members this batch tried, skipped ones included, are never untried.
         let mut tried = HashSet::new();
         let mut context_key = super::persist::ContextKeyMemo::default();
-        // Workers validate a Reuse batch's members ahead of it (R8-1); a
-        // batch without a store, or one that extracts, stays serial.
+        // Workers validate a Reuse batch's members ahead of it (R8-1), and
+        // extract a Full batch's (13c-3); a batch without a store stays
+        // serial.
         let parallel = validation.filter(|validation| {
-            validation.threads > 1
-                && bound.mode == IndexMode::Reuse
-                && persisting
-                && self.is_baseline()
-                && pending.len() > 1
+            validation.threads > 1 && persisting && self.is_baseline() && pending.len() > 1
         });
         if let Some(validation) = parallel {
             let members = pending.len();
             // No worker could start: the batch runs serially.
-            if self.reuse_in_parallel(
-                &key,
-                &mut pending,
-                bound,
-                started,
-                before_io,
-                validation,
-                &mut progress,
-                &mut tried,
-                cancel,
-            )? {
-                pending.clear();
-                workers_used = validation.threads.min(members).max(1);
+            match bound.mode {
+                IndexMode::Reuse => {
+                    if self.reuse_in_parallel(
+                        &key,
+                        &mut pending,
+                        bound,
+                        started,
+                        before_io,
+                        validation,
+                        &mut progress,
+                        &mut tried,
+                        cancel,
+                    )? {
+                        pending.clear();
+                        workers_used = validation.threads.min(members).max(1);
+                    }
+                }
+                // Members retrying an earlier refusal come back at the
+                // batch's end, serially, as in the serial loop.
+                IndexMode::Full => {
+                    if let Some(later) = self.extract_in_parallel(
+                        &key,
+                        &pending,
+                        bound,
+                        started,
+                        before_io,
+                        validation,
+                        &mut progress,
+                        &mut tried,
+                        &mut waited_for_room,
+                        cancel,
+                    )? {
+                        pending = later.into();
+                        workers_used = validation.threads.min(members).max(1);
+                    }
+                }
             }
         }
         while let Some(path) = pending.pop_front() {
@@ -1474,16 +1640,7 @@ impl Workspace {
             if asked {
                 before_io()?;
             }
-            // A refusal for room in this batch: wait for the maintenance
-            // it woke, so the members after it publish rather than being
-            // refused in turn.
-            if !waited_for_room && self.project_cache.index_is_awaiting_room(&key) {
-                waited_for_room = true;
-                let may_wait = !self.project_cache.index_room_wait_failed(&key);
-                if self.store_has_room(&key, may_wait, before_io)? {
-                    self.project_cache.restale_awaiting_room(&key);
-                }
-            }
+            self.wait_for_room_once(&key, &mut waited_for_room, before_io)?;
             let retrying = self
                 .project_cache
                 .read_index(&key, |index, _| index.retrying(&path))
@@ -1494,37 +1651,8 @@ impl Workspace {
             self.member_deadline = Some(member_deadline(&path));
             let indexed = self.index_member(&key, &path, own_stamp, cancel);
             self.member_deadline = None;
-            let outcome = match indexed {
-                Ok(outcome) => outcome,
-                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(error) => MemberOutcome::Deferred(error),
-            };
-            // Only an outcome that ends the retry counts: a skipped member
-            // (an unsaved overlay, no member any more) or a memory stop
-            // keeps it, and counting it would requeue the batch forever.
-            if retrying && !matches!(outcome, MemberOutcome::Skipped | MemberOutcome::Memory) {
-                progress.retries_attempted += 1;
-            }
-            match outcome {
-                MemberOutcome::Published { persisted } => {
-                    progress.indexed += 1;
-                    progress.persisted += usize::from(persisted);
-                    if !persisted && !self.persistent_cache().is_enabled() {
-                        self.project_cache.note_index_memory_only(&key, &path);
-                    }
-                }
-                MemberOutcome::Refused => progress.refused += 1,
-                MemberOutcome::Limited => progress.limited += 1,
-                MemberOutcome::Skipped => {}
-                MemberOutcome::Deferred(reason) => {
-                    crate::trace::trace!("  index member {} deferred: {reason}", path.display());
-                    self.project_cache.defer_index_member(&key, &path, &reason);
-                    progress.deferred += 1;
-                }
-                MemberOutcome::Memory => {
-                    progress.memory = true;
-                    break;
-                }
+            if !self.note_member_outcome(&key, &path, indexed, retrying, &mut progress)? {
+                break;
             }
         }
         // The index moved to the key a new selection gives (A8) while the
@@ -1671,60 +1799,52 @@ impl Workspace {
         cancel: &AtomicBool,
     ) {
         let mut context_key = super::persist::ContextKeyMemo::default();
-        while let Some((position, allowed)) =
-            pipeline.take_next(members.len(), worker, validation.workers)
-        {
-            // A worker that panics stops the batch at its member rather
-            // than leave it waiting; the scope then propagates the panic.
-            let in_flight = InFlight { pipeline, position };
-            if cancel.load(Ordering::Relaxed) || !(validation.may_run)() {
-                drop(in_flight);
-                return;
-            }
-            #[cfg(test)]
-            pipeline.note_take(worker, allowed);
-            #[cfg(not(test))]
-            let _ = allowed;
-            let path = &members[position];
-            let prefetched = if self.is_open_member(path) {
-                Prefetched::Open
-            } else {
-                let epoch = self.project_cache.invalidation_epoch();
-                // The stamp precedes the bytes it describes (A7).
-                let stamp = path_stamp(path);
-                let reprove = self.may_publish(key)
-                    && self.persistent_cache().is_enabled()
-                    && !self.project_cache.index_member_has_record(key, path);
-                // A stale member may be refreshed from its stamps: the
-                // batch decides, in order.
-                let refresh = !reprove
-                    && self
-                        .project_cache
-                        .read_index(key, |index, _| {
-                            index.state_of(path) == Some(MemberState::Stale)
-                        })
-                        .unwrap_or(false);
-                let reuse = (stamp.is_some() && !refresh).then(|| {
-                    Box::new(self.validate_reuse(
-                        key,
-                        path,
-                        &mut context_key,
-                        &pipeline.tripped,
-                        cancel,
-                    ))
-                });
-                #[cfg(test)]
-                if matches!(reuse.as_deref(), Some(Validated::Hit(_))) {
-                    pipeline.note_hit(self.project_cache.stats().reserved_facts_bytes);
-                }
-                Prefetched::Member {
-                    epoch,
-                    stamp,
-                    reuse,
-                }
-            };
-            std::mem::forget(in_flight);
-            pipeline.put(position, prefetched);
+        prefetch_loop(members, pipeline, worker, validation, cancel, |path| {
+            self.prefetch_member(key, path, pipeline, &mut context_key, cancel)
+        });
+    }
+
+    /// What a worker finds for one member before the batch applies it: its
+    /// stamp (A7), then the store's proof of its facts, unless it is open
+    /// or a stale member the batch may refresh from its stamps.
+    fn prefetch_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        pipeline: &Pipeline,
+        context_key: &mut super::persist::ContextKeyMemo,
+        cancel: &AtomicBool,
+    ) -> Prefetched {
+        if self.is_open_member(path) {
+            return Prefetched::Open;
+        }
+        let epoch = self.project_cache.invalidation_epoch();
+        // The stamp precedes the bytes it describes (A7).
+        let stamp = path_stamp(path);
+        let reprove = self.may_publish(key)
+            && self.persistent_cache().is_enabled()
+            && !self.project_cache.index_member_has_record(key, path);
+        // A stale member may be refreshed from its stamps: the batch
+        // decides, in order.
+        let refresh = !reprove
+            && self
+                .project_cache
+                .read_index(key, |index, _| {
+                    index.state_of(path) == Some(MemberState::Stale)
+                })
+                .unwrap_or(false);
+        let reuse = (stamp.is_some() && !refresh).then(|| {
+            Box::new(self.validate_reuse(key, path, context_key, &pipeline.tripped, cancel))
+        });
+        #[cfg(test)]
+        if matches!(reuse.as_deref(), Some(Validated::Hit(_))) {
+            pipeline.note_hit(self.project_cache.stats().reserved_facts_bytes);
+        }
+        Prefetched::Member {
+            epoch,
+            stamp,
+            reuse,
+            extracted: None,
         }
     }
 
@@ -1758,6 +1878,7 @@ impl Workspace {
                     epoch,
                     stamp,
                     reuse,
+                    ..
                 } => (epoch, stamp, reuse),
             };
             tried.insert(path_key(path));
@@ -1824,6 +1945,394 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    /// The members of a Full batch, extracted by `validation.threads`
+    /// workers ahead of the batch, each on its own view of the batch's
+    /// input, and applied here in member order with every check the serial
+    /// loop makes (13c-3). A worker tries the store first, as the serial
+    /// loop does, and extracts after a miss: load, facts and the prepared
+    /// publication, nothing that reaches the index or the store. The batch
+    /// publishes, records and counts. `None` when no worker could start;
+    /// otherwise the members retrying an earlier refusal, which the batch
+    /// extracts last.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_in_parallel(
+        &mut self,
+        key: &ContextKey,
+        pending: &std::collections::VecDeque<PathBuf>,
+        bound: IndexBound,
+        started: Instant,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+        validation: ParallelValidation<'_>,
+        progress: &mut IndexProgress,
+        tried: &mut HashSet<String>,
+        waited_for_room: &mut bool,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<PathBuf>>, String> {
+        let Some(state) = self.contexts.get(key).cloned() else {
+            return Ok(None);
+        };
+        // As for reuse (M1): no member the unit bound leaves untried.
+        let untried = bound.units.saturating_sub(tried.len());
+        let members = Vec::from_iter(
+            pending
+                .iter()
+                .take(untried.saturating_add(self.open_documents.len()))
+                .cloned(),
+        );
+        let threads = validation.threads.min(members.len()).max(1);
+        let pipeline = Pipeline::new(threads);
+        let input = self.worker_view_input();
+        #[cfg(test)]
+        let seams = WorkerSeams::capture();
+        // While the batch waits for a member, interactive work or a
+        // cancellation trips the extractions in flight.
+        let may_wait = || (validation.may_run)() && !cancel.load(Ordering::Relaxed);
+        let result = std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&pipeline);
+            let (pipeline, members, input, state) = (&pipeline, &members, &input, &state);
+            let mut spawned = 0;
+            for _ in 0..threads {
+                let worker = spawned;
+                #[cfg(test)]
+                let seams = seams.clone();
+                pipeline.worker_started();
+                let started = crate::server::analysis_thread(&format!("PascalLspExtract{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let _exit = WorkerExit(pipeline);
+                        #[cfg(test)]
+                        seams.install();
+                        let mut view = Workspace::extraction_view(input, key, state);
+                        let mut context_key = super::persist::ContextKeyMemo::default();
+                        prefetch_loop(members, pipeline, worker, validation, cancel, |path| {
+                            view.prefetch_extraction(
+                                key,
+                                path,
+                                pipeline,
+                                &mut context_key,
+                                validation,
+                                cancel,
+                            )
+                        });
+                    });
+                if started.is_ok() {
+                    spawned += 1;
+                } else {
+                    pipeline.worker_exited();
+                }
+            }
+            if spawned == 0 {
+                return Ok(None);
+            }
+            self.apply_extractions(
+                key,
+                members,
+                pipeline,
+                bound,
+                started,
+                before_io,
+                &may_wait,
+                progress,
+                tried,
+                waited_for_room,
+                cancel,
+            )
+            .map(Some)
+        });
+        #[cfg(test)]
+        VALIDATION_PEAK.with(|peak| {
+            peak.set(
+                *pipeline
+                    .peak
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        });
+        #[cfg(test)]
+        VALIDATION_TAKES.with(|takes| {
+            *takes.borrow_mut() = std::mem::take(
+                &mut *pipeline
+                    .takes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        });
+        result
+    }
+
+    /// An extraction worker's view: the batch's input and its context,
+    /// loading as an index build does.
+    fn extraction_view(
+        input: &WorkspaceInput,
+        key: &ContextKey,
+        state: &super::ContextState,
+    ) -> Workspace {
+        let mut view = Workspace::from_analysis_input(input);
+        view.contexts.insert(key.clone(), state.clone());
+        view.index_build = true;
+        view.pinned_context = Some(key.clone());
+        view
+    }
+
+    /// `prefetch_member`, then, after a miss, the member's extraction on
+    /// this worker's view under its own deadline (A4). Interactive work
+    /// found between the two stops the batch there.
+    fn prefetch_extraction(
+        &mut self,
+        key: &ContextKey,
+        path: &Path,
+        pipeline: &Pipeline,
+        context_key: &mut super::persist::ContextKeyMemo,
+        validation: ParallelValidation<'_>,
+        cancel: &AtomicBool,
+    ) -> Prefetched {
+        let prefetched = self.prefetch_member(key, path, pipeline, context_key, cancel);
+        let Prefetched::Member {
+            epoch,
+            stamp: Some(stamp),
+            reuse: Some(reuse),
+            ..
+        } = prefetched
+        else {
+            return prefetched;
+        };
+        if !matches!(
+            *reuse,
+            Validated::Outcome(
+                ReuseOutcome::Missed { .. } | ReuseOutcome::Retry | ReuseOutcome::NoStore
+            )
+        ) {
+            return Prefetched::Member {
+                epoch,
+                stamp: Some(stamp),
+                reuse: Some(reuse),
+                extracted: None,
+            };
+        }
+        if cancel.load(Ordering::Relaxed) || !(validation.may_run)() {
+            return Prefetched::Preempted;
+        }
+        self.member_deadline = Some(member_deadline(path));
+        // The pipeline's trip cancels the load in flight.
+        let extracted = self.extract_member(key, path, stamp.clone(), true, &pipeline.tripped);
+        self.member_deadline = None;
+        #[cfg(test)]
+        if matches!(&extracted, Extraction::Facts(facts) if matches!(facts.prepared, Some(Ok(_)))) {
+            pipeline.note_hit(self.project_cache.stats().reserved_publication_bytes);
+        }
+        Prefetched::Member {
+            epoch,
+            stamp: Some(stamp),
+            reuse: Some(reuse),
+            extracted: Some(Box::new(extracted)),
+        }
+    }
+
+    /// The batch's side of `extract_in_parallel`: the serial loop's checks
+    /// and outcomes, Full mode, in member order. At the time bound the
+    /// workers take no more members, and the ones they took are applied
+    /// (each is done or under way), as the serial loop finishes the member
+    /// it started.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_extractions(
+        &mut self,
+        key: &ContextKey,
+        members: &[PathBuf],
+        pipeline: &Pipeline,
+        bound: IndexBound,
+        started: Instant,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+        may_wait: &(dyn Fn() -> bool + Sync),
+        progress: &mut IndexProgress,
+        tried: &mut HashSet<String>,
+        waited_for_room: &mut bool,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut context_key = super::persist::ContextKeyMemo::default();
+        let mut later = Vec::new();
+        let mut taken = None;
+        for (position, path) in members.iter().enumerate() {
+            if taken.is_some_and(|taken| position >= taken) {
+                break;
+            }
+            if taken.is_none() {
+                if tried.len() >= bound.units {
+                    break;
+                }
+                if bound.time.is_some_and(|limit| started.elapsed() >= limit) {
+                    let end = pipeline.close();
+                    if position >= end {
+                        break;
+                    }
+                    taken = Some(end);
+                }
+            }
+            let (epoch, mut stamp, mut reuse, mut extracted) =
+                match pipeline.take(position, may_wait) {
+                    Prefetched::Preempted => return Err(CANCELLATION_MESSAGE.to_owned()),
+                    Prefetched::Open => continue,
+                    Prefetched::Member {
+                        epoch,
+                        stamp,
+                        reuse,
+                        extracted,
+                    } => (epoch, stamp, reuse, extracted),
+                };
+            #[cfg(test)]
+            if matches!(reuse.as_deref(), Some(Validated::Hit(_)))
+                || matches!(extracted.as_deref(), Some(Extraction::Facts(facts)) if matches!(facts.prepared, Some(Ok(_))))
+            {
+                pipeline.note_applied();
+            }
+            tried.insert(path_key(path));
+            #[cfg(test)]
+            run_hook(&BEFORE_APPLY, path);
+            // A watcher event since the worker's stamp may concern what it
+            // read: the batch indexes the member again itself (M2).
+            if self.project_cache.invalidation_epoch() != epoch {
+                reuse = None;
+                extracted = None;
+                stamp = path_stamp(path);
+            }
+            #[cfg(test)]
+            let stamp = stamp.filter(|_| !UNSTAMPABLE.with(|slot| slot.borrow().contains(path)));
+            before_io()?;
+            let Some(own_stamp) = stamp else {
+                self.project_cache.invalidate_path(path);
+                continue;
+            };
+            let reuse = match reuse.map(|reuse| *reuse) {
+                Some(Validated::Hit(hit)) => self.apply_reuse(key, path, &own_stamp, hit, cancel),
+                Some(Validated::Outcome(outcome)) => outcome,
+                None => {
+                    let reprove = self.may_publish(key)
+                        && self.persistent_cache().is_enabled()
+                        && !self.project_cache.index_member_has_record(key, path);
+                    if !reprove && self.refresh_unchanged_member(key, path, &own_stamp) {
+                        progress.refreshed += 1;
+                        continue;
+                    }
+                    self.reuse_index_member(key, path, &own_stamp, &mut context_key, cancel)
+                }
+            };
+            #[cfg(test)]
+            run_hook(&AFTER_REUSE, path);
+            let asked = !matches!(reuse, ReuseOutcome::NoStore);
+            match reuse {
+                ReuseOutcome::Reused => {
+                    progress.reused += 1;
+                    continue;
+                }
+                ReuseOutcome::Missed { absent } => {
+                    self.project_cache.mark_index_reuse_tried(key, path);
+                    progress.reuse_missed += 1;
+                    progress.reuse_absent += usize::from(absent);
+                }
+                ReuseOutcome::Retry => progress.reuse_deferred += 1,
+                ReuseOutcome::Retrying => {
+                    progress.reuse_retrying += 1;
+                    self.project_cache.mark_index_reuse_tried(key, path);
+                    self.project_cache
+                        .defer_index_member(key, path, RETRYING_REFUSAL);
+                    later.push(path.clone());
+                    continue;
+                }
+                ReuseOutcome::Memory => {
+                    progress.memory = true;
+                    return Ok(Vec::new());
+                }
+                ReuseOutcome::NoStore => {}
+                ReuseOutcome::Cancelled => return Err(CANCELLATION_MESSAGE.to_owned()),
+            }
+            if asked {
+                before_io()?;
+            }
+            self.wait_for_room_once(key, waited_for_room, before_io)?;
+            let retrying = self
+                .project_cache
+                .read_index(key, |index, _| index.retrying(path))
+                .unwrap_or(false);
+            let indexed = match extracted {
+                Some(extraction) => self.apply_extraction(key, path, *extraction, cancel),
+                // Proven again by the batch (M2), or a member the worker
+                // left to it.
+                None => {
+                    self.member_deadline = Some(member_deadline(path));
+                    let indexed = self.index_member(key, path, own_stamp, cancel);
+                    self.member_deadline = None;
+                    indexed
+                }
+            };
+            if !self.note_member_outcome(key, path, indexed, retrying, progress)? {
+                return Ok(Vec::new());
+            }
+        }
+        Ok(later)
+    }
+
+    /// A refusal for room in this batch: wait once for the maintenance it
+    /// woke, so the members after it publish rather than being refused in
+    /// turn.
+    fn wait_for_room_once(
+        &self,
+        key: &ContextKey,
+        waited_for_room: &mut bool,
+        before_io: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !*waited_for_room && self.project_cache.index_is_awaiting_room(key) {
+            *waited_for_room = true;
+            let may_wait = !self.project_cache.index_room_wait_failed(key);
+            if self.store_has_room(key, may_wait, before_io)? {
+                self.project_cache.restale_awaiting_room(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Counts one member's extraction; `false` when the batch stops there
+    /// (the index share is full). A cancellation is the batch's `Err`.
+    fn note_member_outcome(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        indexed: Result<MemberOutcome, String>,
+        retrying: bool,
+        progress: &mut IndexProgress,
+    ) -> Result<bool, String> {
+        let outcome = match indexed {
+            Ok(outcome) => outcome,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error) => MemberOutcome::Deferred(error),
+        };
+        // Only an outcome that ends the retry counts: a skipped member
+        // (an unsaved overlay, no member any more) or a memory stop
+        // keeps it, and counting it would requeue the batch forever.
+        if retrying && !matches!(outcome, MemberOutcome::Skipped | MemberOutcome::Memory) {
+            progress.retries_attempted += 1;
+        }
+        match outcome {
+            MemberOutcome::Published { persisted } => {
+                progress.indexed += 1;
+                progress.persisted += usize::from(persisted);
+                if !persisted && !self.persistent_cache().is_enabled() {
+                    self.project_cache.note_index_memory_only(key, path);
+                }
+            }
+            MemberOutcome::Refused => progress.refused += 1,
+            MemberOutcome::Limited => progress.limited += 1,
+            MemberOutcome::Skipped => {}
+            MemberOutcome::Deferred(reason) => {
+                crate::trace::trace!("  index member {} deferred: {reason}", path.display());
+                self.project_cache.defer_index_member(key, path, &reason);
+                progress.deferred += 1;
+            }
+            MemberOutcome::Memory => {
+                progress.memory = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Whether the store takes writes again. Under pressure a maintenance
@@ -1994,17 +2503,32 @@ impl Workspace {
         own_stamp: crate::workspace::PathStamp,
         cancel: &AtomicBool,
     ) -> Result<MemberOutcome, String> {
+        let extraction = self.extract_member(key, path, own_stamp, false, cancel);
+        self.apply_extraction(key, path, extraction, cancel)
+    }
+
+    /// The half of `index_member` that touches neither the index nor the
+    /// store (13c-3): load, facts, slots and stamps, and the prepared
+    /// publication. An extraction worker runs it on its own view, and
+    /// reserves the publication's transient bytes there (`reserve`).
+    fn extract_member(
+        &mut self,
+        key: &ContextKey,
+        path: &Path,
+        own_stamp: crate::workspace::PathStamp,
+        reserve: bool,
+        cancel: &AtomicBool,
+    ) -> Extraction {
         let Ok(uri) = Url::from_file_path(path) else {
-            return Ok(self.refuse_member(
-                key,
-                path,
-                "the path has no file URI".to_owned(),
-                cancel,
-            ));
+            return Extraction::Refused("the path has no file URI".to_owned());
         };
         #[cfg(test)]
         if MEMBER_ERROR.with(|slot| slot.borrow().iter().any(|failing| failing == path)) {
-            return Err("an injected member error".to_owned());
+            return Extraction::Failed("an injected member error".to_owned());
+        }
+        #[cfg(test)]
+        if let Some(hook) = EXTRACT_HOOK.with(|slot| slot.borrow().clone()) {
+            hook(path, cancel);
         }
         let held = self.index.contains(&uri);
         self.load_refusal = None;
@@ -2019,16 +2543,48 @@ impl Workspace {
                 .is_some_and(|reason| reason.contains(MEMBER_DEADLINE_MESSAGE)),
             Ok(true) => false,
         };
-        let outcome = if past_deadline {
+        let extraction = if past_deadline {
             self.load_refusal = None;
-            self.limit_past_deadline(key, path, cancel)
+            Extraction::PastDeadline
         } else {
-            self.member_loaded(key, path, &uri, loaded, own_stamp, cancel)
+            self.member_loaded(key, path, &uri, loaded, own_stamp, reserve, cancel)
         };
         if !held {
             let _ = self.remove_indexed_with_control(&uri, None, None, false);
         }
-        outcome
+        extraction
+    }
+
+    /// The half of `index_member` that applies an extraction, in member
+    /// order: the index, the store and the member's record.
+    fn apply_extraction(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        extraction: Extraction,
+        cancel: &AtomicBool,
+    ) -> Result<MemberOutcome, String> {
+        match extraction {
+            Extraction::Failed(error) => Err(error),
+            Extraction::Refused(reason) => Ok(self.refuse_member(key, path, reason, cancel)),
+            // Not a refusal: the membership relists it.
+            Extraction::Vanished => {
+                self.project_cache.invalidate_path(path);
+                Ok(MemberOutcome::Skipped)
+            }
+            Extraction::Deferred(reason) => Ok(MemberOutcome::Deferred(reason)),
+            Extraction::PastDeadline => self.limit_past_deadline(key, path, cancel),
+            // Limited facts cannot prove a member irrelevant (§8): it stays a
+            // candidate, read directly, until its file changes.
+            Extraction::Limited => {
+                check_workspace_cancel(Some(cancel))?;
+                self.project_cache.limit_index_member(key, path);
+                self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+                Ok(MemberOutcome::Limited)
+            }
+            Extraction::Overlay => Ok(MemberOutcome::Skipped),
+            Extraction::Facts(extracted) => Ok(self.publish_member(key, path, *extracted, cancel)),
+        }
     }
 
     /// The member's extraction passed its deadline (A4): limited, an
@@ -2054,86 +2610,65 @@ impl Workspace {
         Ok(MemberOutcome::Limited)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn member_loaded(
-        &mut self,
+        &self,
         key: &ContextKey,
         path: &Path,
         uri: &Url,
         loaded: Result<bool, String>,
         own_stamp: crate::workspace::PathStamp,
+        reserve: bool,
         cancel: &AtomicBool,
-    ) -> Result<MemberOutcome, String> {
+    ) -> Extraction {
         match loaded {
-            Err(error) if is_stable_load_refusal(&error) => {
-                Ok(self.refuse_unless_vanished(key, path, error, cancel))
-            }
-            Err(error) => Err(error),
-            Ok(false) => match self.load_refusal.take() {
+            Err(error) if is_stable_load_refusal(&error) => refused_unless_vanished(path, error),
+            Err(error) => Extraction::Failed(error),
+            Ok(false) => match self.load_refusal.clone() {
                 Some(reason) if is_stable_load_refusal(&reason) => {
-                    Ok(self.refuse_unless_vanished(key, path, reason, cancel))
+                    refused_unless_vanished(path, reason)
                 }
                 // No stable reason: the member stays pending (a file that
                 // vanished is relisted by the membership instead).
-                _ if path_stamp(path).is_none() => {
-                    self.project_cache.invalidate_path(path);
-                    Ok(MemberOutcome::Skipped)
-                }
-                reason => {
-                    Ok(MemberOutcome::Deferred(reason.unwrap_or_else(|| {
-                        "the source could not be loaded".to_owned()
-                    })))
-                }
+                _ if path_stamp(path).is_none() => Extraction::Vanished,
+                reason => Extraction::Deferred(
+                    reason.unwrap_or_else(|| "the source could not be loaded".to_owned()),
+                ),
             },
-            Ok(true) => self.publish_member(key, path, uri, own_stamp, cancel),
+            Ok(true) => self.extract_loaded(key, path, uri, own_stamp, reserve, cancel),
         }
     }
 
-    /// A file that is gone is not a refusal: its directory listing changed.
-    fn refuse_unless_vanished(
+    /// The facts of a loaded member, and its publication prepared when this
+    /// view may publish: the one extraction pass serves the index and the
+    /// store.
+    fn extract_loaded(
         &self,
-        key: &ContextKey,
-        path: &Path,
-        reason: String,
-        cancel: &AtomicBool,
-    ) -> MemberOutcome {
-        if path_stamp(path).is_none() {
-            self.project_cache.invalidate_path(path);
-            return MemberOutcome::Skipped;
-        }
-        self.refuse_member(key, path, reason, cancel)
-    }
-
-    fn publish_member(
-        &mut self,
         key: &ContextKey,
         path: &Path,
         uri: &Url,
         own_stamp: crate::workspace::PathStamp,
+        reserve: bool,
         cancel: &AtomicBool,
-    ) -> Result<MemberOutcome, String> {
+    ) -> Extraction {
         let facts = match self.source_facts(
             uri,
             &mut FactBudget::new(pascal_cache::MAX_ARTIFACT_CONTENT_BYTES),
             cancel,
         ) {
             Ok(facts) => facts,
-            Err(FactError::Cancelled) => return Err(CANCELLATION_MESSAGE.to_owned()),
-            Err(error) => return Ok(self.refuse_member(key, path, error.to_string(), cancel)),
+            Err(FactError::Cancelled) => {
+                return Extraction::Failed(CANCELLATION_MESSAGE.to_owned());
+            }
+            Err(error) => return Extraction::Refused(error.to_string()),
         };
         match facts.extracted.persistable {
             Ok(()) => {}
-            // Limited facts cannot prove a member irrelevant (§8): it stays a
-            // candidate, read directly, until its file changes.
-            Err(NotPersistable::Transient) => {
-                check_workspace_cancel(Some(cancel))?;
-                self.project_cache.limit_index_member(key, path);
-                self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
-                return Ok(MemberOutcome::Limited);
-            }
+            Err(NotPersistable::Transient) => return Extraction::Limited,
             // An unsaved buffer is not what the disk holds; the index
             // describes saved files only.
             Err(NotPersistable::OverlayRoot | NotPersistable::OverlayInclude { .. }) => {
-                return Ok(MemberOutcome::Skipped);
+                return Extraction::Overlay;
             }
         }
         let slots = self.source_slot_paths(uri);
@@ -2153,85 +2688,131 @@ impl Workspace {
         let stamps = slot_stamps(path, own_stamp, &slots, observed);
         let member = MemberFacts::from_facts(path, &facts.extracted.facts, slots);
         let hash = facts.root_content_hash.unwrap_or(0);
-        Ok(
-            match self
-                .project_cache
-                .publish_index_member(key, path, member, stamps, hash)
-            {
-                PublishOutcome::Indexed => {
-                    #[cfg(test)]
-                    run_hook(&BEFORE_PERSIST, path);
-                    // These facts exceeded a fixed limit already: the write
-                    // would fail the same way.
-                    if self.known_over_limit(key, path, hash) {
-                        self.record_over_limit(key, path, hash, cancel);
-                        return Ok(MemberOutcome::Published { persisted: false });
+        let (prepared, unprovable) =
+            if self.may_publish(key) && self.persistent_cache().is_enabled() {
+                let prepared = self.prepare_from_facts(uri, facts, cancel).map(|artifact| {
+                    let transient = reserve.then(|| {
+                        self.project_cache
+                            .reserve_publication(artifact.transient_bytes())
+                    });
+                    PreparedPublication {
+                        artifact,
+                        transient,
                     }
-                    // The one extraction pass serves the index and the store.
-                    let persisted = match self.persist_extracted(key, uri, facts, cancel) {
-                        Ok(proof) => self.set_member_record(key, &proof),
-                        Err(skip) => {
-                            if !matches!(skip, PersistSkip::Unavailable) {
-                                crate::trace::trace!(
-                                    "  index member {} not persisted: {skip:?}",
-                                    path.display()
-                                );
-                            }
-                            // Another process's writes pass: the next batch
-                            // proves the member again (reuse, else
-                            // extraction), so no extracted member stays
-                            // without its record and the snapshot can be
-                            // sealed (D33, §6.3).
-                            match skip {
-                                PersistSkip::Store(
-                                    pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering,
-                                ) => self.project_cache.mark_index_stale(key, path),
-                                // Only maintenance makes this room (the
-                                // store woke it): the member waits for a
-                                // batch that finds no pressure rather than
-                                // being extracted into the same refusal.
-                                // `LowDiskSpace` and this store's own
-                                // `ScratchExhausted` are not pressure
-                                // maintenance clears: memory-only.
-                                PersistSkip::Store(
-                                    pascal_cache::Bypass::WalPressure
-                                    | pascal_cache::Bypass::OverBudget,
-                                ) => self.project_cache.note_index_awaiting_room(key, path),
-                                // The same inputs exceed the same fixed limit
-                                // every time: the facts stay indexed here and
-                                // an artifact-less record lists the member, so
-                                // the snapshot seals and the next process
-                                // retries it last instead of failing the same
-                                // write in path order (l4d-kqbb, A1).
-                                skip if skip.over_fixed_limit() => {
-                                    self.record_over_limit(key, path, hash, cancel);
-                                }
-                                // The session read an input its capture did
-                                // not record: no evidence proves it to
-                                // another process. Listed artifact-less and
-                                // counted, never left memory-only, so the
-                                // snapshot seals and the next process
-                                // retries it last (13c-1, l4d-kqbb).
-                                PersistSkip::Prepare(super::persist::PersistError::Evidence(
-                                    super::evidence::EvidenceGap::Uncaptured,
-                                )) => self.record_unprovable(key, path, uri, cancel),
-                                // Not even the publication pool had room: the
-                                // member stays memory-only (a retryable miss,
-                                // never a refusal record), counted with a gap.
-                                PersistSkip::Memory => {
-                                    self.project_cache.note_index_publication_refused(key);
-                                }
-                                _ => {}
-                            }
-                            false
-                        }
-                    };
-                    MemberOutcome::Published { persisted }
+                });
+                let unprovable = matches!(
+                    prepared,
+                    Err(super::persist::PersistError::Evidence(
+                        super::evidence::EvidenceGap::Uncaptured
+                    ))
+                )
+                .then(|| {
+                    self.uncaptured_input(uri)
+                        .unwrap_or(("unknown", String::new()))
+                });
+                (Some(prepared), unprovable)
+            } else {
+                (None, None)
+            };
+        Extraction::Facts(Box::new(ExtractedMember {
+            member,
+            stamps,
+            hash,
+            prepared,
+            unprovable,
+        }))
+    }
+
+    fn publish_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        extracted: ExtractedMember,
+        cancel: &AtomicBool,
+    ) -> MemberOutcome {
+        let ExtractedMember {
+            member,
+            stamps,
+            hash,
+            prepared,
+            unprovable,
+        } = extracted;
+        match self
+            .project_cache
+            .publish_index_member(key, path, member, stamps, hash)
+        {
+            PublishOutcome::Indexed => {
+                #[cfg(test)]
+                run_hook(&BEFORE_PERSIST, path);
+                // These facts exceeded a fixed limit already: the write
+                // would fail the same way.
+                if self.known_over_limit(key, path, hash) {
+                    self.record_over_limit(key, path, hash, cancel);
+                    return MemberOutcome::Published { persisted: false };
                 }
-                PublishOutcome::NotAMember => MemberOutcome::Skipped,
-                PublishOutcome::Memory => MemberOutcome::Memory,
-            },
-        )
+                let persisted = match self.persist_extracted(key, path, prepared, cancel) {
+                    Ok(proof) => self.set_member_record(key, &proof),
+                    Err(skip) => {
+                        if !matches!(skip, PersistSkip::Unavailable) {
+                            crate::trace::trace!(
+                                "  index member {} not persisted: {skip:?}",
+                                path.display()
+                            );
+                        }
+                        // Another process's writes pass: the next batch
+                        // proves the member again (reuse, else
+                        // extraction), so no extracted member stays
+                        // without its record and the snapshot can be
+                        // sealed (D33, §6.3).
+                        match skip {
+                            PersistSkip::Store(
+                                pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering,
+                            ) => self.project_cache.mark_index_stale(key, path),
+                            // Only maintenance makes this room (the
+                            // store woke it): the member waits for a
+                            // batch that finds no pressure rather than
+                            // being extracted into the same refusal.
+                            // `LowDiskSpace` and this store's own
+                            // `ScratchExhausted` are not pressure
+                            // maintenance clears: memory-only.
+                            PersistSkip::Store(
+                                pascal_cache::Bypass::WalPressure
+                                | pascal_cache::Bypass::OverBudget,
+                            ) => self.project_cache.note_index_awaiting_room(key, path),
+                            // The same inputs exceed the same fixed limit
+                            // every time: the facts stay indexed here and
+                            // an artifact-less record lists the member, so
+                            // the snapshot seals and the next process
+                            // retries it last instead of failing the same
+                            // write in path order (l4d-kqbb, A1).
+                            skip if skip.over_fixed_limit() => {
+                                self.record_over_limit(key, path, hash, cancel);
+                            }
+                            // The session read an input its capture did
+                            // not record: no evidence proves it to
+                            // another process. Listed artifact-less and
+                            // counted, never left memory-only, so the
+                            // snapshot seals and the next process
+                            // retries it last (13c-1, l4d-kqbb).
+                            PersistSkip::Prepare(super::persist::PersistError::Evidence(
+                                super::evidence::EvidenceGap::Uncaptured,
+                            )) => self.record_unprovable(key, path, unprovable, cancel),
+                            // Not even the publication pool had room: the
+                            // member stays memory-only (a retryable miss,
+                            // never a refusal record), counted with a gap.
+                            PersistSkip::Memory => {
+                                self.project_cache.note_index_publication_refused(key);
+                            }
+                            _ => {}
+                        }
+                        false
+                    }
+                };
+                MemberOutcome::Published { persisted }
+            }
+            PublishOutcome::NotAMember => MemberOutcome::Skipped,
+            PublishOutcome::Memory => MemberOutcome::Memory,
+        }
     }
 
     fn known_over_limit(&self, key: &ContextKey, path: &Path, hash: u64) -> bool {
@@ -2258,10 +2839,16 @@ impl Workspace {
         self.project_cache.mark_index_over_limit(key, path);
     }
 
-    fn record_unprovable(&self, key: &ContextKey, path: &Path, uri: &Url, cancel: &AtomicBool) {
-        let (kind, input) = self
-            .uncaptured_input(uri)
-            .unwrap_or(("unknown", String::new()));
+    /// `input` is what the extraction found its session read without a
+    /// capture (`uncaptured_input`).
+    fn record_unprovable(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        input: Option<(&'static str, String)>,
+        cancel: &AtomicBool,
+    ) {
+        let (kind, input) = input.unwrap_or(("unknown", String::new()));
         crate::trace::trace!(
             "  index member {} unprovable: {kind} {input}",
             path.display()
@@ -2314,17 +2901,27 @@ impl Workspace {
     /// proves it), then its record, in a baseline view whose context came
     /// from saved files. The transient bytes are reserved first; a refusal
     /// is no error, the next process extracts the member again (D41).
-    pub(crate) fn persist_extracted(
+    fn persist_extracted(
         &self,
         key: &ContextKey,
-        uri: &Url,
-        source: SourceFacts,
+        path: &Path,
+        prepared: Option<Result<PreparedPublication, super::persist::PersistError>>,
         cancel: &AtomicBool,
     ) -> Result<ProvenRecord, PersistSkip> {
         if !self.may_publish(key) || !self.persistent_cache().is_enabled() {
             return Err(PersistSkip::Unavailable);
         }
-        self.publish_extracted(key, uri, source, cancel)
+        // The store was not enabled as the member was extracted: it is
+        // memory-only, and proven once a batch finds the store enabled.
+        let Some(prepared) = prepared else {
+            self.project_cache.note_index_memory_only(key, path);
+            return Err(PersistSkip::Unavailable);
+        };
+        let PreparedPublication {
+            artifact,
+            transient,
+        } = prepared.map_err(PersistSkip::Prepare)?;
+        self.publish_prepared(key, path, artifact, transient, cancel)
             .map(|(proof, _)| proof)
     }
 
@@ -2345,11 +2942,25 @@ impl Workspace {
         let prepared = self
             .prepare_from_facts(uri, source, cancel)
             .map_err(PersistSkip::Prepare)?;
+        self.publish_prepared(key, &path, prepared, None, cancel)
+    }
+
+    /// Publish one prepared artifact and the record it proves for `path`;
+    /// `transient` holds its transient bytes when a worker reserved them
+    /// (`Some(None)`: refused), else they are reserved here.
+    fn publish_prepared(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        prepared: super::persist::PreparedArtifact,
+        transient: Option<Option<crate::project_cache::Reservation>>,
+        cancel: &AtomicBool,
+    ) -> Result<(ProvenRecord, Vec<PathBuf>), PersistSkip> {
         let eligible = self
             .eligible_indexed_member(
                 key,
                 &RecordInputs {
-                    path: &path,
+                    path,
                     facts: Some(&prepared.facts),
                     artifact: Some(prepared.artifact_id()),
                     member_evidence: prepared.member_evidence_id(),
@@ -2361,9 +2972,11 @@ impl Workspace {
         let inputs = prepared.input_paths();
         // From the publication pool, not the parse budget the crawl's pins
         // and leases fill (13b-3, A2).
-        let _transient = self
-            .project_cache
-            .reserve_publication(prepared.transient_bytes())
+        let _transient = transient
+            .unwrap_or_else(|| {
+                self.project_cache
+                    .reserve_publication(prepared.transient_bytes())
+            })
             .ok_or(PersistSkip::Memory)?;
         let job = self
             .persistent_cache()
@@ -2374,7 +2987,7 @@ impl Workspace {
             return Err(PersistSkip::Unavailable);
         }
         #[cfg(test)]
-        if let Some(bypass) = self.persistent_cache().publish_fault_for_test(&path) {
+        if let Some(bypass) = self.persistent_cache().publish_fault_for_test(path) {
             job.observe(&bypass);
             return Err(PersistSkip::Store(bypass));
         }
@@ -9145,6 +9758,500 @@ pub(in crate::workspace) mod tests {
                     "R8-1 shared directories: speedup {:.2}x",
                     times[0].as_secs_f64() / times[1].as_secs_f64()
                 );
+            }
+
+            /// 13c-3: Full (extraction) batches on the free general slots.
+            mod extraction {
+                use super::*;
+
+                const BIG: &str = "d00/Big.pas";
+                const LIMITED: &str = "d01/Lim.pas";
+                const OPEN: &str = "d02/U0002.pas";
+
+                /// `shared_directories_project`'s shape with extraction's
+                /// outcomes: every unit includes `Shared.inc`, every third
+                /// uses its predecessor (a dependency load), `Big.pas` is
+                /// over `maxFileBytes` (refused), `Lim.pas` includes itself
+                /// (limited), and `U0002` is open with an edited buffer in
+                /// the session.
+                fn extraction_project(
+                    root: &Path,
+                    directories: usize,
+                    units: usize,
+                ) -> (Workspace, ContextKey, IndexAnchor) {
+                    let names = directory_names(directories);
+                    write(
+                        &root.join(names.last().unwrap()).join("Shared.inc"),
+                        "const Shared = 1;\n",
+                    );
+                    for index in 0..units {
+                        let directory = &names[index % directories];
+                        let uses = if index % 3 == 1 {
+                            format!("uses U{:04};\n", index - 1)
+                        } else {
+                            String::new()
+                        };
+                        write(
+                            &root.join(directory).join(format!("U{index:04}.pas")),
+                            &format!(
+                                "unit U{index:04};\ninterface\n{uses}{{$I Shared.inc}}\nprocedure P{index};\nimplementation\nprocedure P{index};\nbegin\nend;\nend.\n"
+                            ),
+                        );
+                    }
+                    write(
+                        &root.join(BIG),
+                        &format!(
+                            "unit Big;\n{}\ninterface implementation end.\n",
+                            "{ filler }\n".repeat(400)
+                        ),
+                    );
+                    write(&root.join("d01/x.inc"), "{$I x.inc}\n");
+                    write(
+                        &root.join(LIMITED),
+                        "unit Lim;\ninterface\n{$I x.inc}\nimplementation\nend.\n",
+                    );
+                    project(
+                        root,
+                        &format!(
+                            "<DCC_UnitSearchPath>{}</DCC_UnitSearchPath><DCC_IncludePath>{}</DCC_IncludePath>",
+                            names.join(";"),
+                            names.join(";")
+                        ),
+                        "",
+                    );
+                    pascal_project::backdate_tree_for_test(root);
+                    extraction_session(root)
+                }
+
+                fn directory_names(directories: usize) -> Vec<String> {
+                    (0..directories)
+                        .map(|index| format!("d{index:02}"))
+                        .collect()
+                }
+
+                /// A new session (its own project cache, as a new process
+                /// has) over `extraction_project`'s files.
+                fn extraction_session(root: &Path) -> (Workspace, ContextKey, IndexAnchor) {
+                    let mut options = WorkspaceOptions::default();
+                    options.limits.max_file_bytes = 2_000;
+                    let mut workspace = workspace(root, options);
+                    let anchor = IndexAnchor::Project(root.join("App.dproj"));
+                    let key = context(&mut workspace, anchor.clone());
+                    let open = Url::from_file_path(root.join(OPEN)).unwrap();
+                    workspace
+                        .open_document(
+                            open,
+                            "unit U0002;\ninterface\nprocedure Edited;\nimplementation\nprocedure Edited;\nbegin\nend;\nend.\n".to_owned(),
+                            1,
+                        )
+                        .unwrap();
+                    (workspace, key, anchor)
+                }
+
+                #[derive(Debug, Default, PartialEq, Eq)]
+                struct Sums {
+                    indexed: usize,
+                    refreshed: usize,
+                    refused: usize,
+                    limited: usize,
+                    deferred: usize,
+                    reused: usize,
+                    reuse_missed: usize,
+                    reuse_retrying: usize,
+                    persisted: usize,
+                    retries_attempted: usize,
+                }
+
+                impl Sums {
+                    fn add(&mut self, progress: &IndexProgress) {
+                        self.indexed += progress.indexed;
+                        self.refreshed += progress.refreshed;
+                        self.refused += progress.refused;
+                        self.limited += progress.limited;
+                        self.deferred += progress.deferred;
+                        self.reused += progress.reused;
+                        self.reuse_missed += progress.reuse_missed;
+                        self.reuse_retrying += progress.reuse_retrying;
+                        self.persisted += progress.persisted;
+                        self.retries_attempted += progress.retries_attempted;
+                    }
+                }
+
+                fn extraction_batch(
+                    view: &mut Workspace,
+                    anchor: &IndexAnchor,
+                    bound: IndexBound,
+                    threads: usize,
+                    may_run: &(dyn Fn() -> bool + Sync),
+                    cancel: &AtomicBool,
+                ) -> Result<IndexProgress, String> {
+                    view.advance_workspace_index_with(
+                        anchor,
+                        bound,
+                        &mut || Ok(()),
+                        Some(ParallelValidation {
+                            threads,
+                            may_run,
+                            workers: &move || threads,
+                        }),
+                        cancel,
+                    )
+                }
+
+                /// Full batches of 8 units until the index is complete.
+                fn extract_all(
+                    view: &mut Workspace,
+                    anchor: &IndexAnchor,
+                    threads: usize,
+                ) -> (Sums, IndexProgress) {
+                    let mut sums = Sums::default();
+                    for _ in 0..64 {
+                        let progress = extraction_batch(
+                            view,
+                            anchor,
+                            IndexBound::units(8),
+                            threads,
+                            &|| true,
+                            &AtomicBool::new(false),
+                        )
+                        .expect("batch");
+                        sums.add(&progress);
+                        if progress.complete {
+                            return (sums, progress);
+                        }
+                        assert!(progress.worth_requeue(), "{progress:?}");
+                    }
+                    panic!("never complete: {sums:?}");
+                }
+
+                fn store_content(cache: &PersistentCache) -> Vec<String> {
+                    cache
+                        .job()
+                        .expect("job")
+                        .store()
+                        .content_for_test()
+                        .expect("content")
+                }
+
+                /// What a run leaves: its sums, the index and records, a
+                /// few names' candidates, and the store's content.
+                type Run = (Sums, Vec<String>, Vec<Vec<PathBuf>>, Vec<String>);
+
+                fn run(root: &Path, store: &Path, threads: usize) -> Run {
+                    let (session, key, anchor) = extraction_session(root);
+                    let (key, anchor) = (&key, &anchor);
+                    let (mut view, cache) = persisting_view(&session, store);
+                    let (sums, _) = extract_all(&mut view, anchor, threads);
+                    // Sealed, so the next process holds the snapshot and
+                    // retries its refused and limited members last.
+                    let _ = view.seal_baseline_if_due(key, &mut || Ok(()));
+                    if threads > 1 {
+                        assert!(
+                            !take_validation_takes().is_empty(),
+                            "the batches ran on workers"
+                        );
+                    }
+                    let names = ["P0", "P1", "P3", "P7", "Edited", "Lim"]
+                        .iter()
+                        .map(|name| selected(&view, key, name))
+                        .collect();
+                    let run = (sums, snapshot(&view, key), names, store_content(&cache));
+                    assert_eq!(view.project_cache.stats().reserved_facts_bytes, 0);
+                    assert_eq!(view.project_cache.stats().reserved_publication_bytes, 0);
+                    cache.shutdown();
+                    run
+                }
+
+                /// The store, the index, the records and every outcome
+                /// (refused, limited, an open member from disk, dependency
+                /// loads) are the serial ones; so is a second process,
+                /// which reuses and retries the limited member last.
+                #[test]
+                fn parallel_and_serial_extraction_give_the_same_index_records_and_store() {
+                    const UNITS: usize = 30;
+                    let temp = tempfile::tempdir().unwrap();
+                    extraction_project(temp.path(), 6, UNITS);
+                    let stores = [private_dir(), private_dir()];
+                    let serial = run(temp.path(), stores[0].path(), 1);
+                    let parallel = run(temp.path(), stores[1].path(), 3);
+                    assert_eq!(serial.0.refused, 1, "{:?}", serial.0);
+                    assert_eq!(serial.0.limited, 1, "{:?}", serial.0);
+                    assert_eq!(serial.0.indexed, UNITS + 1, "{:?}", serial.0);
+                    assert_eq!(serial.2[4], Vec::<PathBuf>::new(), "disk, not the buffer");
+                    assert!(!serial.3.is_empty());
+                    assert_eq!(serial.0, parallel.0);
+                    assert_eq!(serial.1, parallel.1);
+                    assert_eq!(serial.2, parallel.2);
+                    assert_eq!(serial.3, parallel.3, "the same store content");
+                    // A second process: reuse first, then the member
+                    // retrying its earlier refusal, last.
+                    let again = [
+                        run(temp.path(), stores[0].path(), 1),
+                        run(temp.path(), stores[1].path(), 3),
+                    ];
+                    assert!(again[0].0.reused >= UNITS, "{:?}", again[0].0);
+                    assert_eq!(again[0].0.retries_attempted, 2, "{:?}", again[0].0);
+                    assert_eq!(again[0], again[1]);
+                }
+
+                /// Without a store a Full batch stays serial: no worker
+                /// starts, and the index is the serial one.
+                #[test]
+                fn without_a_store_extraction_stays_serial() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (_, key, anchor) = extraction_project(temp.path(), 4, 12);
+                    let memory_only = || {
+                        let (session, _, _) = extraction_session(temp.path());
+                        let mut input = session.analysis_input().disk_baseline();
+                        input.persistent_cache = Default::default();
+                        Workspace::from_analysis_input(&input)
+                    };
+                    let (mut serial, mut parallel) = (memory_only(), memory_only());
+                    let one = advance(&mut serial, &anchor, IndexBound::all());
+                    let checks = AtomicUsize::new(0);
+                    let two = extraction_batch(
+                        &mut parallel,
+                        &anchor,
+                        IndexBound::all(),
+                        3,
+                        &|| {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            true
+                        },
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert_eq!(one, two);
+                    assert_eq!(checks.load(Ordering::SeqCst), 0, "no worker started");
+                    assert!(take_validation_takes().is_empty());
+                    assert_eq!(snapshot(&serial, &key), snapshot(&parallel, &key));
+                }
+
+                /// Interactive work stops the workers at their next member;
+                /// nothing started after it is applied, and the next batches
+                /// complete the index.
+                #[test]
+                fn interactive_work_stops_extraction_between_members() {
+                    const UNITS: usize = 24;
+                    const PASSING: usize = 4;
+                    const THREADS: usize = 3;
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, key, anchor) = extraction_project(temp.path(), 4, UNITS);
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let checks = AtomicUsize::new(0);
+                    let gate = || checks.fetch_add(1, Ordering::SeqCst) < PASSING;
+                    let result = extraction_batch(
+                        &mut view,
+                        &anchor,
+                        IndexBound::all(),
+                        THREADS,
+                        &gate,
+                        &AtomicBool::new(false),
+                    );
+                    assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                    let mut order = members(&view, &key);
+                    order.sort_by_key(|path| path_key(path));
+                    let fresh = order
+                        .iter()
+                        .filter(|path| state(&view, &key, path) == Some(MemberState::Fresh))
+                        .count();
+                    assert!(fresh <= PASSING, "{fresh} applied");
+                    assert!(
+                        order[PASSING + THREADS..]
+                            .iter()
+                            .all(|path| state(&view, &key, path) != Some(MemberState::Fresh)),
+                        "a member past the stop was applied"
+                    );
+                    let (sums, progress) = extract_all(&mut view, &anchor, THREADS);
+                    assert!(progress.complete, "{progress:?}");
+                    // The units and `App.dpr`, each indexed once.
+                    assert_eq!(sums.indexed + fresh, UNITS + 1, "{sums:?}");
+                    cache.shutdown();
+                }
+
+                /// A member whose extraction is in flight when interactive
+                /// work arrives is cancelled there (its session sees the
+                /// trip), not run to its end: it stays pending.
+                #[test]
+                fn interactive_work_cancels_the_extraction_in_flight() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, key, anchor) = extraction_project(temp.path(), 4, 12);
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let closed = Arc::new(AtomicBool::new(false));
+                    let tripped = Arc::new(AtomicBool::new(false));
+                    let first = Arc::new(std::sync::Mutex::new(None));
+                    let (gate, seen, target) = (
+                        Arc::clone(&closed),
+                        Arc::clone(&tripped),
+                        Arc::clone(&first),
+                    );
+                    // The first extraction to start closes the gate, then
+                    // waits (bounded, no sleep) until its load's flag trips.
+                    set_worker_extract_hook(Some(Arc::new(move |path, cancel| {
+                        if gate.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
+                        *target.lock().unwrap() = Some(path.to_path_buf());
+                        let started = Instant::now();
+                        while !cancel.load(Ordering::SeqCst)
+                            && started.elapsed() < Duration::from_secs(30)
+                        {
+                            std::thread::yield_now();
+                        }
+                        seen.store(cancel.load(Ordering::SeqCst), Ordering::SeqCst);
+                    })));
+                    let result = extraction_batch(
+                        &mut view,
+                        &anchor,
+                        IndexBound::all(),
+                        2,
+                        &|| !closed.load(Ordering::SeqCst),
+                        &AtomicBool::new(false),
+                    );
+                    set_worker_extract_hook(None);
+                    assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                    assert!(tripped.load(Ordering::SeqCst), "the load saw the trip");
+                    let first = first
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("an extraction started");
+                    assert_eq!(state(&view, &key, &first), Some(MemberState::Unindexed));
+                    let (_, progress) = extract_all(&mut view, &anchor, 2);
+                    assert!(progress.complete, "{progress:?}");
+                    assert_ne!(state(&view, &key, &first), Some(MemberState::Unindexed));
+                    cache.shutdown();
+                }
+
+                /// Cancellation of the batch stops the workers too.
+                #[test]
+                fn cancellation_stops_parallel_extraction() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, key, anchor) = extraction_project(temp.path(), 4, 16);
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let cancel = AtomicBool::new(false);
+                    let checks = AtomicUsize::new(0);
+                    let gate = || {
+                        if checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                        true
+                    };
+                    let result =
+                        extraction_batch(&mut view, &anchor, IndexBound::all(), 3, &gate, &cancel);
+                    assert_eq!(result.unwrap_err(), CANCELLATION_MESSAGE);
+                    let fresh = members(&view, &key)
+                        .iter()
+                        .filter(|path| state(&view, &key, path) == Some(MemberState::Fresh))
+                        .count();
+                    assert!(fresh <= 2, "{fresh} applied after the cancellation");
+                    cache.shutdown();
+                }
+
+                /// Each worker's view has its own per-member deadline: the
+                /// slow member is limited (over its deadline) and the
+                /// members extracted beside it are not.
+                #[test]
+                fn each_worker_extracts_under_its_own_member_deadline() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, key, anchor) = extraction_project(temp.path(), 4, 12);
+                    let slow = temp.path().join("d03/U0003.pas");
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let _slow = slow_member_for_test(&slow);
+                    let (sums, progress) = extract_all(&mut view, &anchor, 3);
+                    assert!(progress.complete, "{progress:?}");
+                    assert_eq!(sums.limited, 2, "Lim and the slow member: {sums:?}");
+                    assert_eq!(state(&view, &key, &slow), Some(MemberState::Limited));
+                    let status = view.project_cache.index_status(&|_| false);
+                    assert_eq!(status[0].counts.over_deadline, 1, "{:?}", status[0]);
+                    let neighbour = temp.path().join("d00/U0004.pas");
+                    assert_eq!(state(&view, &key, &neighbour), Some(MemberState::Fresh));
+                    cache.shutdown();
+                }
+
+                /// The window bounds what the workers hold: at most one
+                /// prepared publication (and its reservation) per thread.
+                #[test]
+                fn parallel_extraction_holds_at_most_one_publication_per_thread() {
+                    const THREADS: usize = 3;
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, _key, anchor) = extraction_project(temp.path(), 4, 24);
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let progress = extraction_batch(
+                        &mut view,
+                        &anchor,
+                        IndexBound::all(),
+                        THREADS,
+                        &|| true,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert!(progress.complete, "{progress:?}");
+                    let peak = take_validation_peak();
+                    assert!(peak.held >= 1 && peak.held <= THREADS, "{peak:?}");
+                    assert!(
+                        peak.reserved_bytes <= THREADS * pascal_cache::MAX_ARTIFACT_CONTENT_BYTES,
+                        "{peak:?}"
+                    );
+                    let stats = view.project_cache.stats();
+                    assert_eq!(stats.reserved_publication_bytes, 0);
+                    assert_eq!(stats.reserved_facts_bytes, 0);
+                    cache.shutdown();
+                }
+
+                /// Release measurement (report-only):
+                /// TMPDIR=$HOME/.cache/l4d-tmp cargo test -p pascal-lsp --release --lib parallel_extraction_speedup -- --ignored --nocapture
+                #[test]
+                #[ignore = "release measurement, run explicitly"]
+                fn parallel_extraction_speedup_on_a_synthetic_project() {
+                    const DIRECTORIES: usize = 40;
+                    const UNITS: usize = 600;
+                    let temp = tempfile::tempdir().unwrap();
+                    extraction_project(temp.path(), DIRECTORIES, UNITS);
+                    let mut times = Vec::new();
+                    let free = crate::server::validation_threads(0);
+                    for threads in [1, free, 3] {
+                        // A new process each: no shared cache entry.
+                        let (session, _, anchor) = extraction_session(temp.path());
+                        let store = private_dir();
+                        let (mut view, cache) = persisting_view(&session, store.path());
+                        let started = Instant::now();
+                        let mut batches = 0;
+                        loop {
+                            let progress = extraction_batch(
+                                &mut view,
+                                &anchor,
+                                IndexBound::extraction(),
+                                threads,
+                                &|| true,
+                                &AtomicBool::new(false),
+                            )
+                            .unwrap();
+                            batches += 1;
+                            if progress.complete || !progress.worth_requeue() {
+                                break;
+                            }
+                        }
+                        let elapsed = started.elapsed();
+                        eprintln!(
+                            "13c-3 extraction: {UNITS} members over {DIRECTORIES} directories, \
+                             {threads} threads: {elapsed:?} in {batches} batches"
+                        );
+                        times.push(elapsed);
+                        cache.shutdown();
+                    }
+                    for (index, threads) in [(1, free), (2, 3)] {
+                        eprintln!(
+                            "13c-3 extraction: speedup with {threads} threads {:.2}x",
+                            times[0].as_secs_f64() / times[index].as_secs_f64()
+                        );
+                    }
+                }
             }
         }
 

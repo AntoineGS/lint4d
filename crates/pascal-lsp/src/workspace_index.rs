@@ -293,12 +293,27 @@ struct Member {
     unprovable: bool,
     /// The Limited member's extraction passed its deadline (13b-5, A4).
     over_deadline: bool,
+    /// The Limited member's compile-time session was refused by this fixed
+    /// admission bound (13d-1).
+    admission_limit: Option<&'static str>,
     /// The proven record of this member's state, set by this process.
     record: Option<Digest>,
 }
 
 /// The deferral reason of a member whose previous refusal is tried again.
 pub(crate) const RETRYING_REFUSAL: &str = "retrying a previous refusal";
+
+/// Why a member is Limited (`WorkspaceIndex::limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitCause {
+    /// Its facts are limited (an incomplete session, the index limits).
+    Facts,
+    /// Its extraction passed its deadline (13b-5, A4).
+    Deadline,
+    /// Its compile-time session was refused by this fixed admission bound,
+    /// which refuses again with the same inputs (13d-1).
+    Admission(&'static str),
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexCounts {
@@ -321,6 +336,10 @@ pub(crate) struct IndexCounts {
     pub(crate) unprovable: usize,
     /// Of `limited`, members whose extraction passed its deadline.
     pub(crate) over_deadline: usize,
+    /// Of `limited`, members refused by a fixed compile-time admission
+    /// bound, and the bound of the first of them in path order.
+    pub(crate) over_admission: usize,
+    pub(crate) first_admission_limit: Option<&'static str>,
     /// Members whose artifact and record are known published in this
     /// process, each counted once: a Fresh member with a record this process
     /// proved (reused members included; `over_limit` and `unprovable`
@@ -600,6 +619,7 @@ impl ContextIndex {
         member.over_limit = false;
         member.unprovable = false;
         member.over_deadline = false;
+        member.admission_limit = None;
         member.record = None;
         for name in posting_ids {
             list_remove(&mut self.postings, name, id);
@@ -831,6 +851,10 @@ impl ContextIndex {
                 MemberState::Limited => {
                     counts.limited += 1;
                     counts.over_deadline += usize::from(member.over_deadline);
+                    if let Some(bound) = member.admission_limit {
+                        counts.over_admission += 1;
+                        counts.first_admission_limit.get_or_insert(bound);
+                    }
                 }
             }
         }
@@ -1035,14 +1059,18 @@ impl ContextIndex {
 
     /// Returns the old charge, `None` if `path` is not a member. The member
     /// keeps no facts and stays an unverified candidate until it is stale.
-    /// `over_deadline` when its extraction passed its deadline.
-    pub(crate) fn limit(&mut self, path: &Path, over_deadline: bool) -> Option<usize> {
+    /// `cause` says why.
+    pub(crate) fn limit(&mut self, path: &Path, cause: LimitCause) -> Option<usize> {
         let id = self.id_of(path)?;
         let old = self.release(id);
         let member = &mut self.members[id.0 as usize];
         member.hash = None;
         member.state = Some(MemberState::Limited);
-        member.over_deadline = over_deadline;
+        member.over_deadline = cause == LimitCause::Deadline;
+        member.admission_limit = match cause {
+            LimitCause::Admission(bound) => Some(bound),
+            LimitCause::Facts | LimitCause::Deadline => None,
+        };
         let path = member.path.clone();
         self.log([path]);
         Some(old)
@@ -1073,6 +1101,7 @@ impl ContextIndex {
                 member.over_limit = false;
                 member.unprovable = false;
                 member.over_deadline = false;
+                member.admission_limit = None;
                 true
             }
             MemberState::Unindexed | MemberState::Stale => false,
@@ -1515,7 +1544,7 @@ mod tests {
         assert_eq!(index.counts().persisted, 4);
         index.mark_stale(a);
         index.refuse(b, "no".into());
-        index.limit(c, false);
+        index.limit(c, LimitCause::Facts);
         assert_eq!(index.record(a), None);
         assert_eq!(index.record(b), None);
         assert_eq!(index.record(c), None);
@@ -1572,6 +1601,8 @@ mod tests {
                 over_limit: 0,
                 unprovable: 0,
                 over_deadline: 0,
+                over_admission: 0,
+                first_admission_limit: None,
                 persisted: 0,
             }
         );

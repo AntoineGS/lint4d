@@ -17,7 +17,7 @@ use crate::navigation::compiled_dcu::project_context_fingerprint;
 use crate::workspace::ContextKey;
 use crate::workspace::rename::OverlayInput;
 use crate::workspace_index::{
-    ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
+    ContextIndex, LimitCause, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
 };
 
 /// Default for the `maxCacheBytes` limit.
@@ -7008,7 +7008,7 @@ impl IndexStatusEntry {
         if counts.refused > 0 {
             gaps.push(format!("{} units could not be indexed", counts.refused));
         }
-        let over_index_limits = counts.limited - counts.over_deadline;
+        let over_index_limits = counts.limited - counts.over_deadline - counts.over_admission;
         if over_index_limits > 0 {
             gaps.push(format!(
                 "{over_index_limits} units exceed the index limits and are not indexed"
@@ -7019,6 +7019,12 @@ impl IndexStatusEntry {
                 "{} units took longer than {} s to extract and are not indexed; the next start retries them last",
                 counts.over_deadline,
                 crate::workspace::indexing::MEMBER_DEADLINE.as_secs()
+            ));
+        }
+        if let Some(bound) = counts.first_admission_limit {
+            gaps.push(format!(
+                "{} units exceed a compile-time limit (first: {bound}) and are not indexed; the next start retries them last",
+                counts.over_admission
             ));
         }
         if counts.over_limit > 0 {
@@ -7104,6 +7110,7 @@ impl IndexStatusEntry {
             "overLimit": counts.over_limit,
             "unprovable": counts.unprovable,
             "overDeadline": counts.over_deadline,
+            "overAdmission": counts.over_admission,
             "membershipComplete": self.membership_complete,
             "complete": self.complete,
             "snapshot": self.snapshot,
@@ -7578,21 +7585,33 @@ impl ProjectCache {
     }
 
     pub(crate) fn limit_index_member(&self, key: &ContextKey, path: &Path) {
-        self.limit_index_member_as(key, path, false);
+        self.limit_index_member_as(key, path, LimitCause::Facts);
     }
 
     /// `limit_index_member` for a member whose extraction passed its
     /// deadline (`IndexCounts::over_deadline`).
     pub(crate) fn limit_index_member_past_deadline(&self, key: &ContextKey, path: &Path) {
-        self.limit_index_member_as(key, path, true);
+        self.limit_index_member_as(key, path, LimitCause::Deadline);
     }
 
-    fn limit_index_member_as(&self, key: &ContextKey, path: &Path, over_deadline: bool) {
+    /// `limit_index_member` for a member whose compile-time session was
+    /// refused by the fixed admission bound `bound`
+    /// (`IndexCounts::over_admission`).
+    pub(crate) fn limit_index_member_over_admission(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        bound: &'static str,
+    ) {
+        self.limit_index_member_as(key, path, LimitCause::Admission(bound));
+    }
+
+    fn limit_index_member_as(&self, key: &ContextKey, path: &Path, cause: LimitCause) {
         let old = self
             .index()
             .contexts
             .get_mut(key)
-            .and_then(|stored| stored.index.limit(path, over_deadline));
+            .and_then(|stored| stored.index.limit(path, cause));
         if let Some(old) = old {
             self.release_index(old);
         }
@@ -8865,7 +8884,9 @@ mod index_tests {
             stored
                 .index
                 .refuse(Path::new("/w/Refused.pas"), "r".to_owned());
-            stored.index.limit(Path::new("/w/Limited.pas"), false);
+            stored
+                .index
+                .limit(Path::new("/w/Limited.pas"), LimitCause::Facts);
             stored.validation_reads = 7;
         }
         let entries = cache.index_status(&|_| false);

@@ -549,6 +549,42 @@ pub(crate) fn is_stable_load_refusal(message: &str) -> bool {
         || message.ends_with(" is not a regular file")
 }
 
+/// The compile-time admission bounds fixed for a session, whatever else
+/// the process holds: one that refuses a member's session refuses it again
+/// with the same inputs. `max_retained_bytes` is not one (the resolver
+/// narrows it by what it already retains), nor is `max_provider_stack_bytes`
+/// (it depends on the caller's stack).
+const DETERMINISTIC_ADMISSION_LIMITS: [&str; 11] = [
+    "max_definitions",
+    "max_fields",
+    "max_variant_alternatives",
+    "max_pending_bytes",
+    "max_scope_depth",
+    "max_type_depth",
+    "max_array_dimensions",
+    "max_branch_states",
+    "max_provider_queries",
+    "max_work",
+    "max_byte_work",
+];
+
+/// The fixed compile-time bound a load failure names (13d-1), as
+/// `pascal_core::compile_time::resolver_error` words a structural
+/// admission failure: such a member is limited after one attempt, not
+/// deferred. `None` for anything that may pass (a budget, a cancellation,
+/// any other reason).
+pub(crate) fn deterministic_admission_limit(message: &str) -> Option<&'static str> {
+    const ADMISSION: &str = "compile-time admission: Limit { name: \"";
+    if message == CANCELLATION_MESSAGE || message.to_ascii_lowercase().contains("budget") {
+        return None;
+    }
+    let rest = &message[message.find(ADMISSION)? + ADMISSION.len()..];
+    let name = &rest[..rest.find('"')?];
+    DETERMINISTIC_ADMISSION_LIMITS
+        .into_iter()
+        .find(|bound| *bound == name)
+}
+
 fn is_unit_source(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
@@ -1291,6 +1327,9 @@ enum Extraction {
     PastDeadline,
     /// The facts were limited.
     Limited,
+    /// The compile-time session was refused by this fixed admission bound
+    /// (13d-1): the same inputs refuse again.
+    OverAdmission(&'static str),
     /// An unsaved buffer: nothing to publish.
     Overlay,
     Facts(Box<ExtractedMember>),
@@ -2593,6 +2632,7 @@ impl Workspace {
             }
             Extraction::Deferred(reason) => Ok(MemberOutcome::Deferred(reason)),
             Extraction::PastDeadline => self.limit_past_deadline(key, path, cancel),
+            Extraction::OverAdmission(bound) => self.limit_over_admission(key, path, bound, cancel),
             // Limited facts cannot prove a member irrelevant (§8): it stays a
             // candidate, read directly, until its file changes.
             Extraction::Limited => {
@@ -2629,6 +2669,28 @@ impl Workspace {
         Ok(MemberOutcome::Limited)
     }
 
+    /// The member's compile-time session was refused by a fixed admission
+    /// bound (13d-1): limited, like a member past its deadline, so the
+    /// context completes and seals with it as a gap, and the next start
+    /// retries it last (R8-3) rather than this process deferring it again.
+    fn limit_over_admission(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        bound: &'static str,
+        cancel: &AtomicBool,
+    ) -> Result<MemberOutcome, String> {
+        check_workspace_cancel(Some(cancel))?;
+        crate::trace::trace!(
+            "  index member {} limited: compile-time limit {bound}",
+            path.display()
+        );
+        self.project_cache
+            .limit_index_member_over_admission(key, path, bound);
+        self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
+        Ok(MemberOutcome::Limited)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn member_loaded(
         &self,
@@ -2641,9 +2703,15 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Extraction {
         match loaded {
+            Err(error) if let Some(bound) = deterministic_admission_limit(&error) => {
+                Extraction::OverAdmission(bound)
+            }
             Err(error) if is_stable_load_refusal(&error) => refused_unless_vanished(path, error),
             Err(error) => Extraction::Failed(error),
             Ok(false) => match self.load_refusal.clone() {
+                Some(reason) if let Some(bound) = deterministic_admission_limit(&reason) => {
+                    Extraction::OverAdmission(bound)
+                }
                 Some(reason) if is_stable_load_refusal(&reason) => {
                     refused_unless_vanished(path, reason)
                 }
@@ -6104,6 +6172,191 @@ pub(in crate::workspace) mod tests {
         assert!(!last.worth_requeue(), "{batches:?}");
         assert!(batches.len() <= 2, "{batches:?}");
         assert!(last.deferred > 0 && last.pending >= 2, "{last:?}");
+    }
+
+    /// A unit whose compile-time session asks whether a name is declared,
+    /// so it compiles the interface of the unit it uses, `BigProvider`,
+    /// whose one declaration is longer than the session's
+    /// `max_pending_bytes` (1 MiB): the same inputs fail its admission on
+    /// every attempt. `BigProvider` itself is a member, limited by its own
+    /// incomplete session.
+    pub(in crate::workspace) fn over_pending_bytes_unit(path: &Path) {
+        write(&path.with_file_name("x.inc"), "const X = 1;\n");
+        write(
+            &path.with_file_name("BigProvider.pas"),
+            &format!(
+                "unit BigProvider;\ninterface\n{{$I x.inc}}\nconst S = '{}';\nimplementation\nend.\n",
+                "x".repeat(1_100_000)
+            ),
+        );
+        let unit = path.file_stem().unwrap().to_string_lossy().into_owned();
+        write(
+            path,
+            &format!(
+                "unit {unit};\ninterface\nuses BigProvider;\n{{$I x.inc}}\n{{$IF Declared(Zed)}}const Y = 1;{{$IFEND}}\nimplementation\nend.\n"
+            ),
+        );
+    }
+
+    /// 13d-1: a member whose compile-time admission refuses a fixed bound
+    /// (`max_pending_bytes`) is limited after one attempt, not deferred:
+    /// the same inputs refuse again, so retrying it in this process cannot
+    /// pass. The context completes, a gap names the bound, and no later
+    /// batch of this process extracts it again.
+    #[test]
+    fn a_member_over_a_compile_time_admission_bound_is_limited_after_one_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 4, WorkspaceOptions::default());
+        let over = root.join("lib/U0.pas");
+        over_pending_bytes_unit(&over);
+        pascal_project::backdate_tree_for_test(root);
+        let progress = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (
+                progress.indexed,
+                progress.limited,
+                progress.deferred,
+                progress.refused
+            ),
+            (3, 2, 0, 0),
+            "{progress:?}"
+        );
+        assert!(
+            progress.complete && !progress.worth_requeue(),
+            "{progress:?}"
+        );
+        assert_eq!(state(&workspace, &key, &over), Some(MemberState::Limited));
+        assert_eq!(
+            state(&workspace, &key, &root.join("lib/BigProvider.pas")),
+            Some(MemberState::Limited)
+        );
+        let status = workspace.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (
+                status[0].counts.limited,
+                status[0].counts.deferred,
+                status[0].counts.over_deadline,
+                status[0].counts.over_admission
+            ),
+            (2, 0, 0, 1),
+            "{:?}",
+            status[0]
+        );
+        assert!(status[0].complete, "{:?}", status[0]);
+        assert!(
+            status[0].gaps.iter().any(|gap| gap
+                == "1 units exceed a compile-time limit (first: max_pending_bytes) and are not indexed; the next start retries them last"),
+            "{:?}",
+            status[0]
+        );
+        assert!(
+            !status[0]
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("retried later")),
+            "{:?}",
+            status[0]
+        );
+        // `BigProvider`'s own limit is the other limited member.
+        assert!(
+            status[0]
+                .gaps
+                .contains(&"1 units exceed the index limits and are not indexed".to_owned()),
+            "{:?}",
+            status[0]
+        );
+        let json = crate::project_cache::index_status_json(&status, Default::default());
+        assert_eq!(json["contexts"][0]["overAdmission"], 1, "{json}");
+        let again = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (again.indexed, again.limited, again.deferred, again.pending),
+            (0, 0, 0, 0),
+            "{again:?}"
+        );
+        // A change makes it pending again; the gap goes with it.
+        workspace.project_cache.invalidate_path(&over);
+        let status = workspace.project_cache.index_status(&|_| false);
+        assert!(
+            !status[0]
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("compile-time limit")),
+            "{:?}",
+            status[0]
+        );
+    }
+
+    /// 13d-1: a deferral whose cause may pass (here an injected load
+    /// error, as a memory budget or a busy store gives) keeps today's
+    /// behaviour: the member stays deferred and a later batch retries it.
+    #[test]
+    fn a_transient_deferral_stays_deferred_and_is_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 3, WorkspaceOptions::default());
+        let failing = root.join("lib/U0.pas");
+        set_member_error(Some(failing.clone()));
+        let first = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (first.indexed, first.deferred, first.limited),
+            (2, 1, 0),
+            "{first:?}"
+        );
+        assert!(!first.complete, "{first:?}");
+        let status = workspace.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (status[0].counts.deferred, status[0].counts.limited),
+            (1, 0),
+            "{:?}",
+            status[0]
+        );
+        assert!(!status[0].complete, "{:?}", status[0]);
+        set_member_error(None);
+        let second = advance(&mut workspace, &anchor, IndexBound::all());
+        assert_eq!(
+            (second.indexed, second.deferred, second.pending),
+            (1, 0, 0),
+            "{second:?}"
+        );
+        assert!(second.complete, "{second:?}");
+        assert_eq!(state(&workspace, &key, &failing), Some(MemberState::Fresh));
+    }
+
+    /// 13d-1: only a named fixed compile-time bound is deterministic for
+    /// a member's inputs; retained bytes depend on what else the resolver
+    /// holds, and a budget or cancellation may pass.
+    #[test]
+    fn only_fixed_compile_time_admission_bounds_are_deterministic() {
+        let message = |name: &str| {
+            format!(
+                "include expansion failed: invalid resolver request: compile-time admission: Limit {{ name: \"{name}\", maximum: 1048576 }}"
+            )
+        };
+        assert_eq!(
+            deterministic_admission_limit(&message("max_pending_bytes")),
+            Some("max_pending_bytes")
+        );
+        assert_eq!(
+            deterministic_admission_limit(&message("max_branch_states")),
+            Some("max_branch_states")
+        );
+        assert_eq!(
+            deterministic_admission_limit(&message("max_retained_bytes")),
+            None
+        );
+        assert_eq!(deterministic_admission_limit(&message("unknown")), None);
+        assert_eq!(
+            deterministic_admission_limit("the source could not be loaded"),
+            None
+        );
+        assert_eq!(deterministic_admission_limit(CANCELLATION_MESSAGE), None);
+        assert_eq!(
+            deterministic_admission_limit(
+                "compile-time admission: Limit { name: \"max_pending_bytes\", maximum: 1 } over the memory budget"
+            ),
+            None
+        );
     }
 
     #[test]

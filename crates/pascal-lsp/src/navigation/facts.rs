@@ -3,7 +3,6 @@
 //! `ParsedDocument` are in analysed coordinates, the include-expanded text
 //! when includes were expanded; the include source map turns them into
 //! source slots. Indexing calls this from `l4d-zf1b.8` on.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::{
     Origin as SymbolOrigin, ParsedDocument, ROOT_SCOPE, Region as SymbolRegion, RoutineKind, Span,

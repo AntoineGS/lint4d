@@ -1,19 +1,19 @@
 //! Persistence eligibility as a typed proof (spec §4.4 amendment
 //! 2026-11-02). The store cannot see editor state and does not check it.
-//! An [`Eligible`] value is built only by [`Workspace::eligible_member`],
+//! An [`Eligible`] value is built only by
 //! [`Workspace::eligible_indexed_member`] and
 //! [`Workspace::eligible_baseline_snapshot`], which derive what they certify
 //! from this session's own analysis, and [`publish_record`],
 //! [`publish_proven`] and [`seal_baseline`] accept nothing else. The
 //! disk-only baseline producer (`l4d-zf1b.8`) is their caller; the phase-7
-//! `eligible_snapshot` and `seal_snapshot` remain for their tests.
+//! `eligible_member`, `eligible_snapshot` and `seal_snapshot` remain for
+//! their tests.
 //!
 //! The proof guards against omission (an unchecked record, an evidence set
 //! no capture produced, an edited member left out of a snapshot), not
 //! against deliberate forging inside this crate. That a binding's outcome
 //! is what its captured lookup actually found is the producer's
 //! (`l4d-zf1b.8`) responsibility.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::capture::CapturedReads;
 use super::evidence::{EvidenceGap, session_evidence};
@@ -23,17 +23,23 @@ use lsp_types::Url;
 use pascal_cache::{
     Binding, BindingKind, BindingOutcome, Bypass, ContextKey as CacheContextKey, CoverageStatus,
     Digest, DiscoveryScope, EvidencePurpose, EvidenceSubject, EvidenceTarget, EvidenceWrite, Hint,
-    IncompleteReason, Lookup, LookupKey, MAX_ROW_BATCH_ROWS, MemberCoverage, MemberError,
-    MemberHeader, MemberRecord, Observation, PublishedRecord, SnapshotCoverage, SnapshotHeader,
-    SnapshotSeal, SourceIdentity, Store, encoded_content_bytes, evidence_id,
+    IncompleteReason, Lookup, MAX_ROW_BATCH_ROWS, MemberCoverage, MemberError, MemberHeader,
+    MemberRecord, Observation, PublishedRecord, SnapshotCoverage, SnapshotHeader, SnapshotSeal,
+    SourceIdentity, Store, evidence_id,
 };
-use pascal_core::facts::{ArtifactFacts, CoverageReason, DeclarationKind, FactBudget};
+#[cfg(all(test, unix))]
+use pascal_cache::{LookupKey, encoded_content_bytes};
+#[cfg(all(test, unix))]
+use pascal_core::facts::FactBudget;
+use pascal_core::facts::{ArtifactFacts, CoverageReason, DeclarationKind};
 use pascal_core::resolver::ResolutionObservation;
 use pascal_project::{ProjectContext, ProjectObservations, ProjectPathProvenance, SourceOrigin};
 #[cfg(all(test, unix))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(all(test, unix))]
+use std::sync::atomic::Ordering;
 
 /// Observations that passed the capture gap checks: no editor state, no
 /// overlay listing, no overflow, no cancellation and nothing uncaptured
@@ -75,6 +81,7 @@ pub(crate) struct Eligible<T> {
 
 #[derive(Debug, Clone)]
 enum PendingEvidence {
+    #[cfg(all(test, unix))]
     Binding(LookupKey, CapturedEvidence),
     Discovery(DiscoveryScope, CapturedEvidence),
 }
@@ -84,6 +91,7 @@ impl<T> Eligible<T> {
         &self.value
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn context(&self) -> &CacheContextKey {
         &self.context
     }
@@ -100,16 +108,21 @@ pub(crate) enum Ineligible {
     NoContext,
     /// The binding's evidence is not the set its capture proves, has no
     /// capture, or a capture was given for a binding that names none.
+    #[cfg(all(test, unix))]
     BindingEvidence {
         ordinal: usize,
     },
     Record(MemberError),
     /// A document of the context has no member in the snapshot.
+    #[cfg(all(test, unix))]
     MissingMember(Url),
     /// A member is no document of the context.
+    #[cfg(all(test, unix))]
     UnexpectedMember(PathBuf),
+    #[cfg(all(test, unix))]
     DuplicateMember(PathBuf),
     /// A member was checked under another context.
+    #[cfg(all(test, unix))]
     OtherContext(PathBuf),
     /// The context's membership lists nothing (D32).
     EmptyMembership,
@@ -122,8 +135,9 @@ pub(crate) enum Ineligible {
     NotAProject,
 }
 
-/// What the workspace does not hold yet for a member record; the producer
-/// (`l4d-zf1b.8`) supplies it.
+/// What the workspace does not hold yet for a member record, supplied by
+/// the phase-7 tests of `eligible_member`.
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone)]
 pub(crate) struct MemberDraft {
     pub(crate) fallback_unit_name: Option<String>,
@@ -132,6 +146,7 @@ pub(crate) struct MemberDraft {
     pub(crate) bindings: Vec<CheckedBinding>,
 }
 
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedBinding {
     pub(crate) binding: Binding,
@@ -216,6 +231,7 @@ impl Workspace {
     /// without an artifact or member evidence and its extraction is
     /// `Incomplete(OverSizeLimit)`. Every other refusal (I/O, cancellation,
     /// budget, editor state) stays ineligible, to be retried.
+    #[cfg(all(test, unix))]
     pub(crate) fn eligible_member(
         &self,
         uri: &Url,
@@ -762,6 +778,7 @@ fn build_baseline(
 fn publish_pending<T>(store: &Store, proof: &Eligible<T>) -> Result<(), Bypass> {
     for pending in &proof.evidence {
         let (target, captured) = match pending {
+            #[cfg(all(test, unix))]
             PendingEvidence::Binding(lookup, captured) => {
                 (EvidenceTarget::Binding(lookup), captured)
             }

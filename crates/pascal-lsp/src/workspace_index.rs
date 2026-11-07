@@ -794,7 +794,6 @@ impl ContextIndex {
     }
 
     /// One entry per member, in path order.
-    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
     pub(crate) fn records(&self) -> Vec<(PathBuf, Option<Digest>)> {
         self.by_path
             .values()

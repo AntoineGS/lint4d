@@ -53,7 +53,7 @@ impl BaselineHint {
         &self.header
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // pascal/indexStatus (l4d-zf1b.8)
+    #[cfg(test)]
     pub(crate) fn records(&self) -> Digest {
         self.records
     }
@@ -510,7 +510,7 @@ impl Workspace {
 
     /// At the first batch of a context in this process: newest sealed
     /// candidate whose discovery evidence validates, held.
-    #[cfg_attr(not(test), allow(dead_code))] // the startup crawl (l4d-zf1b.8)
+    #[cfg(test)]
     pub(crate) fn adopt_baseline_hint(&self, key: &ContextKey, cancel: &AtomicBool) -> Option<()> {
         matches!(self.adopt(key, cancel), Adoption::Adopted).then_some(())
     }

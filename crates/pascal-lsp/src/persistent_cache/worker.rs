@@ -32,6 +32,7 @@ pub(super) type StepResult = Result<StepReport, Bypass>;
 pub(super) enum Command {
     Open,
     /// Run one step now, gate ignored, and reply (tests).
+    #[cfg(any(test, feature = "test-support"))]
     StepNow(crossbeam_channel::Sender<Option<StepResult>>),
     /// Writes were refused for room: schedule the next step now
     /// (`WAKE_SPACING` after the last).
@@ -228,6 +229,7 @@ fn run(weak: &Weak<Inner>, commands: &crossbeam_channel::Receiver<Command>) {
         crossbeam_channel::select! {
             recv(commands) -> command => match command {
                 Ok(Command::Open) => {}
+                #[cfg(any(test, feature = "test-support"))]
                 Ok(Command::StepNow(reply)) => {
                     let result = weak.upgrade().and_then(|inner| step(&inner, &mut cursor));
                     let _ = reply.send(result);

@@ -437,7 +437,7 @@ impl IndexBound {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // the warmer's reuse pass (l4d-zf1b.8)
+    #[cfg(test)]
     pub(crate) fn with_mode(self, mode: IndexMode) -> Self {
         Self { mode, ..self }
     }
@@ -1407,7 +1407,6 @@ struct PreparedPublication {
 /// stays memory-only, and a later process extracts it again. The reasons are
 /// diagnostics (traces).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum PersistSkip {
     /// No baseline view, a context built from unsaved project input, or no
     /// store.
@@ -1416,6 +1415,7 @@ pub(crate) enum PersistSkip {
     /// Neither the publication pool nor `maxCacheBytes` had room for the
     /// publication's transient bytes.
     Memory,
+    #[allow(dead_code)] // read through `Debug` by the "not persisted" trace
     Ineligible(super::eligible::Ineligible),
     Store(pascal_cache::Bypass),
 }

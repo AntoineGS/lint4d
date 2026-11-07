@@ -1,6 +1,5 @@
 //! The workspace's adapter from an indexed source to its compact facts.
 //! Background indexing uses it from `l4d-zf1b.8` on.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::Workspace;
 use crate::navigation::{ExtractedFacts, extract_facts};

@@ -14,7 +14,6 @@
 //! [`PersistentCache::reconfigure`], [`PersistentCache::readmit`] and
 //! [`PersistentCache::shutdown`] (the main loop) never hold a [`CacheJob`]:
 //! the wait would wait for itself, which is why every wait is bounded.
-#![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod counters;
 pub(crate) mod exclusion;
@@ -857,12 +856,14 @@ impl PersistentCache {
             .map_or(CacheState::Disabled, |inner| inner.lock().state.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.lock().generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> Option<&Counters> {
         self.inner.as_ref().map(|inner| &inner.counters)
     }
@@ -995,7 +996,7 @@ impl PersistentCache {
     }
 
     /// Wait up to `timeout` for `predicate` to hold for the state.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn wait_for(
         &self,
         mut predicate: impl FnMut(&CacheState) -> bool,

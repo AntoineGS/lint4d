@@ -8139,7 +8139,7 @@ impl ProjectCache {
             .is_some_and(|stored| stored.index.record(path).is_some())
     }
 
-    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
+    #[cfg(test)]
     pub(crate) fn index_records(
         &self,
         key: &ContextKey,
@@ -8156,7 +8156,7 @@ impl ProjectCache {
         }
     }
 
-    #[allow(dead_code)] // consumed by pascal/indexStatus and the snapshots (l4d-zf1b.8)
+    #[cfg(test)]
     pub(crate) fn index_validation_reads(&self, key: &ContextKey) -> u64 {
         self.index()
             .contexts

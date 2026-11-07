@@ -1,6 +1,5 @@
 //! Publishing a source's facts with the evidence that proves them, and
 //! reusing persisted facts only after current inputs validate (spec §7).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::evidence::EvidenceGap;
 use super::facts::SourceFacts;
@@ -139,6 +138,8 @@ pub(crate) enum PersistError {
     /// The root is outside its context's authorized roots.
     Unauthorized,
     Unreadable(String),
+    /// Context discovery failed (`reuse_persisted_facts`).
+    #[cfg(test)]
     Context(String),
     NotIndexed,
     Cancelled,
@@ -274,8 +275,9 @@ impl PersistError {
             | Self::Evidence(_)
             | Self::Key(_)
             | Self::Unreadable(_)
-            | Self::Context(_)
             | Self::NotIndexed => Ok(Input),
+            #[cfg(test)]
+            Self::Context(_) => Ok(Input),
         }
     }
 }
@@ -385,6 +387,7 @@ impl Workspace {
     /// Publish `uri`'s facts: under its local key when its analysis
     /// consulted nothing but the root, otherwise under its expanded key
     /// with the evidence that proves it (spec §6.2: one transaction).
+    #[cfg(test)]
     pub(crate) fn persist_source(
         &self,
         uri: &Url,
@@ -396,6 +399,7 @@ impl Workspace {
     }
 
     /// Everything `persist_source` checks and builds before it publishes.
+    #[cfg(test)]
     pub(crate) fn prepare_artifact(
         &self,
         uri: &Url,
@@ -538,6 +542,7 @@ impl Workspace {
     /// 2026-11-02). A refused reservation, or facts over the limit, is
     /// `Unproven::Memory`; cancellation, including during context
     /// discovery, is `Unproven::Cancelled` (l4d-ne50). Both are retryable.
+    #[cfg(test)]
     pub(crate) fn reuse_persisted_facts(
         &mut self,
         uri: &Url,
@@ -565,6 +570,7 @@ impl Workspace {
     /// must already be installed. A hit also reports the artifact and
     /// evidence IDs, the stamps taken before each include's bytes were
     /// validated, and the root's content hash.
+    #[cfg(test)]
     pub(crate) fn reuse_in_context(
         &self,
         uri: &Url,

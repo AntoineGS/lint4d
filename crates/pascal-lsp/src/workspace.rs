@@ -18742,6 +18742,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: context.into(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18783,6 +18784,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: Arc::default(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));

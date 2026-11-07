@@ -193,13 +193,84 @@ impl ExpandedSource {
         range: Range<usize>,
         budget: &mut MappingBudget<'_>,
     ) -> Result<VirtualMapping, String> {
-        if range.start >= range.end || range.end > self.text.len() {
+        self.map.map_range(self.text.len(), range, budget)
+    }
+
+    /// What a reuse of a parse of this text needs to report positions in
+    /// their physical files: the map, the root's text `physical` and the
+    /// other `texts` the expansion read.
+    pub(crate) fn projection(
+        &self,
+        root: Url,
+        physical: std::sync::Arc<str>,
+        texts: std::collections::HashMap<Url, String>,
+    ) -> PhysicalProjection {
+        PhysicalProjection {
+            root,
+            physical,
+            texts,
+            map: self.map.clone(),
+            len: self.text.len(),
+        }
+    }
+}
+
+/// The source map of an expanded parse, with the physical texts it maps
+/// into, carried with the reusable parse of an open document (D49).
+#[derive(Debug)]
+pub(crate) struct PhysicalProjection {
+    root: Url,
+    physical: std::sync::Arc<str>,
+    texts: std::collections::HashMap<Url, String>,
+    map: SourceMap,
+    len: usize,
+}
+
+impl PhysicalProjection {
+    /// The root text the expansion read.
+    pub(crate) fn physical(&self) -> &str {
+        &self.physical
+    }
+
+    /// The files other than the root the expansion read.
+    pub(crate) fn included(&self) -> impl Iterator<Item = &Url> {
+        self.texts.keys()
+    }
+
+    /// Where `range` of the expanded text lies: one physical span, with
+    /// the text of its file, or `None` when it is synthetic, spans files or
+    /// has no map entry.
+    pub(crate) fn locate(
+        &self,
+        range: Range<usize>,
+        budget: &mut MappingBudget<'_>,
+    ) -> Result<Option<(PhysicalSpan, &str)>, String> {
+        let VirtualMapping::Exact(span) = self.map.map_range(self.len, range, budget)? else {
+            return Ok(None);
+        };
+        let text = if span.uri == self.root {
+            Some(&*self.physical)
+        } else {
+            self.texts.get(&span.uri).map(String::as_str)
+        };
+        Ok(text.map(|text| (span, text)))
+    }
+}
+
+impl SourceMap {
+    fn map_range(
+        &self,
+        len: usize,
+        range: Range<usize>,
+        budget: &mut MappingBudget<'_>,
+    ) -> Result<VirtualMapping, String> {
+        if range.start >= range.end || range.end > len {
             return Ok(VirtualMapping::Unmapped);
         }
 
         let mut cursor = range.start;
         let mut spans = Vec::new();
-        for segment in &self.map.segments {
+        for segment in &self.segments {
             budget.charge()?;
             if segment.virtual_range.end <= range.start {
                 continue;
@@ -237,7 +308,9 @@ impl ExpandedSource {
             Ok(VirtualMapping::Many(spans))
         }
     }
+}
 
+impl ExpandedSource {
     pub(crate) fn reverse_range(&self, uri: &Url, range: Range<usize>) -> Vec<Range<usize>> {
         let cancel = AtomicBool::new(false);
         let mut budget = MappingBudget::new(&cancel, usize::MAX);

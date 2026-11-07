@@ -3258,13 +3258,7 @@ fn indexed_workspace_symbols(
         for gap in &snapshot.index_gaps {
             coverage.note(None, gap.as_str());
         }
-        found.extend(
-            snapshot
-                .index
-                .workspace_symbols_with_cancel(query, cancel)?
-                .into_iter()
-                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri)),
-        );
+        found.extend(snapshot_workspace_symbols(&snapshot, query, cancel)?);
         snapshot_records(&snapshot)
     };
     let fact_files = facts
@@ -3390,6 +3384,131 @@ fn fact_symbols(
     Ok(result)
 }
 
+/// The readable workspace symbols of `snapshot`. An open document held as
+/// its session's expanded parse reports each declaration in its file
+/// through the source map (D49); if one has no physical position, that
+/// document is answered from a parse of its buffer instead.
+fn snapshot_workspace_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let found = snapshot
+        .index
+        .workspace_symbols_with_cancel(query, cancel)?;
+    if snapshot.projected.is_empty() {
+        return Ok(found
+            .into_iter()
+            .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
+            .collect());
+    }
+    let mut result = Vec::with_capacity(found.len());
+    let mut held = HashMap::<Url, Vec<SymbolInformation>>::new();
+    let mut order = Vec::new();
+    for symbol in found {
+        let uri = &symbol.location.uri;
+        if !snapshot.readable.contains(uri) {
+            continue;
+        }
+        if snapshot.projected.contains_key(uri) {
+            if !held.contains_key(uri) {
+                order.push((result.len(), uri.clone()));
+            }
+            held.entry(uri.clone()).or_default().push(symbol);
+        } else {
+            result.push(symbol);
+        }
+    }
+    // Insert from the back so the recorded positions stay valid.
+    for (at, uri) in order.into_iter().rev() {
+        let symbols = held.remove(&uri).unwrap_or_default();
+        let document = &snapshot.projected[&uri];
+        let placed = match project_symbols(snapshot, &uri, document, symbols, cancel)? {
+            Some(placed) => placed,
+            None => buffer_symbols(snapshot, &uri, document, query, cancel)?,
+        };
+        result.splice(at..at, placed);
+    }
+    Ok(result)
+}
+
+/// `symbols` of the projected document `uri` at their physical positions,
+/// or `None` when one does not map to exactly one span of a known file.
+fn project_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    uri: &Url,
+    document: &super::rename::ProjectedDocument,
+    symbols: Vec<SymbolInformation>,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<SymbolInformation>>, String> {
+    let Some(parsed) = snapshot.index.parsed_document(uri) else {
+        return Ok(None);
+    };
+    let expanded = parsed.source_text();
+    let to_cancel = |()| CANCELLATION_MESSAGE.to_string();
+    let expanded_positions =
+        crate::text::PositionIndex::new_with_cancel(expanded, cancel).map_err(to_cancel)?;
+    let mut budget = crate::include_expansion::MappingBudget::new(cancel, usize::MAX);
+    let mut positions = HashMap::<Url, crate::text::PositionIndex>::new();
+    let mut placed = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        let range = symbol.location.range;
+        let (Some(start), Some(end)) = (
+            expanded_positions.position_to_offset(expanded, range.start),
+            expanded_positions.position_to_offset(expanded, range.end),
+        ) else {
+            return Ok(None);
+        };
+        let Some((span, text)) = document.projection.locate(start..end, &mut budget)? else {
+            return Ok(None);
+        };
+        if !positions.contains_key(&span.uri) {
+            let index =
+                crate::text::PositionIndex::new_with_cancel(text, cancel).map_err(to_cancel)?;
+            positions.insert(span.uri.clone(), index);
+        }
+        let index = &positions[&span.uri];
+        let (Some(start), Some(end)) = (
+            index.offset_to_position(text, span.range.start),
+            index.offset_to_position(text, span.range.end),
+        ) else {
+            return Ok(None);
+        };
+        symbol.location = Location {
+            uri: span.uri,
+            range: Range { start, end },
+        };
+        placed.push(symbol);
+    }
+    Ok(Some(placed))
+}
+
+/// The symbols of a parse of the buffer of `uri` alone, as a snapshot
+/// without the reused parse answers them.
+fn buffer_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    uri: &Url,
+    document: &super::rename::ProjectedDocument,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let Some(source) = snapshot.sources.get(uri) else {
+        return Ok(Vec::new());
+    };
+    let mut index = crate::navigation::NavigationIndex::new();
+    index
+        .update_with_session(
+            uri.clone(),
+            source.clone(),
+            &document.context,
+            None,
+            cancel,
+            None,
+        )
+        .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+    index.workspace_symbols_with_cancel(query, cancel)
+}
+
 fn walked_workspace_symbols(
     input: WorkspaceInput,
     query: &str,
@@ -3425,16 +3544,8 @@ fn walked_workspace_symbols(
         );
     }
 
-    let value = snapshot
-        .index
-        .workspace_symbols_with_cancel(query, cancel)
-        .map(|symbols| Partial {
-            value: symbols
-                .into_iter()
-                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
-                .collect(),
-            coverage,
-        });
+    let value = snapshot_workspace_symbols(&snapshot, query, cancel)
+        .map(|value| Partial { value, coverage });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -6263,6 +6374,215 @@ mod tests {
         assert_eq!(symbol.location.range.start, Position::new(1, 2));
         assert_eq!(symbol.container_name.as_deref(), Some("Provider"));
         assert_eq!(super::test_take_fact_symbols(), 1);
+    }
+
+    /// D49: an open, unchanged document is answered from the session's
+    /// parse, include and all; the second request parses nothing.
+    #[test]
+    fn workspace_symbols_of_an_unchanged_open_document_reuse_its_parse() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Opened.pas",
+                "unit Opened;\ninterface\n{$I Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n"
+                    .to_owned(),
+            ),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            ("Closed.pas", unit_text("Closed", "const ClosedValue = 3;\n")),
+        ]);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        let first = symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let second = symbols(&input, "Value");
+        assert_eq!(second.value, first.value);
+        assert!(
+            symbol_names(&second.value)
+                .contains(&("OpenedValue".to_owned(), "Opened.pas".to_owned())),
+            "{:?}",
+            second.value
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "the open document's parse is reused"
+        );
+        let included = second
+            .value
+            .iter()
+            .find(|symbol| symbol.name == "IncludedValue")
+            .expect("the include's declaration is listed");
+        assert_eq!(included.location.uri, source_uri(&root.join("Decls.inc")));
+        assert_eq!(included.location.range.start, Position::new(1, 2));
+    }
+
+    const OPENED_WITH_INCLUDE: &str =
+        "unit Opened;\ninterface\n{$I Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n";
+
+    fn include_files() -> Vec<(&'static str, String)> {
+        vec![
+            ("Opened.pas", OPENED_WITH_INCLUDE.to_owned()),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            (
+                "Closed.pas",
+                unit_text("Closed", "const ClosedValue = 3;\n"),
+            ),
+        ]
+    }
+
+    /// D49: an open document lists its include's declarations at the
+    /// include file, exactly as the same unit closed lists them from facts.
+    #[test]
+    fn an_open_document_lists_its_include_declarations_as_when_closed() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Closed.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Opened.pas")));
+        reset_symbol_counters();
+        let closed = symbols(&input, "IncludedValue");
+        assert_eq!(super::test_take_fact_symbols(), 1, "{:?}", closed.value);
+
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        reset_symbol_counters();
+        let open = symbols(&input, "IncludedValue");
+        assert_eq!(super::test_take_fact_symbols(), 0);
+        assert_eq!(open.value.len(), 1, "{:?}", open.value);
+        let located = |found: &[lsp_types::SymbolInformation]| {
+            found
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.name.clone(),
+                        symbol.kind,
+                        symbol
+                            .location
+                            .uri
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .map(str::to_owned),
+                        symbol.location.range,
+                        symbol.container_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(located(&open.value), located(&closed.value));
+    }
+
+    /// A4: an open buffer that differs from disk is answered from its own
+    /// text; the reused parse answers only the buffer it was made from.
+    #[test]
+    fn workspace_symbols_of_an_edited_open_document_follow_its_buffer() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        let opened = root.join("Opened.pas");
+        let uri = source_uri(&opened);
+        let edited =
+            OPENED_WITH_INCLUDE.replace("interface\n", "interface\nconst BufferValue = 5;\n");
+        workspace
+            .open_document(uri.clone(), edited.clone(), 1)
+            .expect("open source");
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        let at = |found: &crate::coverage::Partial<Vec<lsp_types::SymbolInformation>>,
+                  name: &str| {
+            found
+                .value
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| (symbol.location.uri.clone(), symbol.location.range.start))
+        };
+        assert_eq!(
+            at(&found, "BufferValue"),
+            Some((uri.clone(), Position::new(2, 6)))
+        );
+        assert_eq!(
+            at(&found, "OpenedValue"),
+            Some((uri.clone(), Position::new(4, 6)))
+        );
+        assert_eq!(
+            at(&found, "IncludedValue"),
+            Some((source_uri(&root.join("Decls.inc")), Position::new(1, 2)))
+        );
+
+        // A buffer the parse was not made from is parsed as it is.
+        let mut changed = input.clone();
+        let renamed = edited.replace("BufferValue", "RenamedValue");
+        changed.overlays.get_mut(&uri).expect("overlay").text = renamed.into();
+        let found = symbols(&changed, "Value");
+        assert_eq!(at(&found, "BufferValue"), None, "{:?}", found.value);
+        assert_eq!(at(&found, "RenamedValue"), Some((uri, Position::new(2, 6))));
+    }
+
+    /// A declaration of the reused parse that spans the include has no
+    /// single physical position: the document is answered from its buffer,
+    /// as without the reuse.
+    #[test]
+    fn an_unmapped_declaration_falls_back_to_the_buffer_parse() {
+        let opened_text =
+            "unit Opened;\ninterface\nconst SpanValue = {$I Val.inc};\nimplementation\nend.\n";
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Opened.pas", opened_text.to_owned()),
+            ("Val.inc", "7".to_owned()),
+            (
+                "Closed.pas",
+                unit_text("Closed", "const ClosedValue = 3;\n"),
+            ),
+        ]);
+        let uri = open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        assert!(
+            input
+                .cached_documents
+                .get(&uri)
+                .is_some_and(|cached| cached.projection.is_some()),
+            "the fixture must reuse an expanded parse"
+        );
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        let mut without = input.clone();
+        without.cached_documents.remove(&uri);
+        let expected = symbols(&without, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "the buffer is parsed"
+        );
+        assert_eq!(found.value, expected.value);
+    }
+
+    /// R9-11: a unit is listed from the facts as a module.
+    #[test]
+    fn workspace_symbols_list_units_from_facts() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n"),
+            ),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Shared.pas")));
+        reset_symbol_counters();
+        let found = symbols(&input, "Shared");
+        assert!(
+            found.value.iter().any(|symbol| symbol.name == "Shared"
+                && symbol.kind == lsp_types::SymbolKind::MODULE
+                && symbol.location.uri == source_uri(&root.join("Shared.pas"))),
+            "{:?}",
+            found.value
+        );
+        assert!(super::test_take_fact_symbols() >= 1);
+        assert_eq!(walks(), 0);
     }
 
     #[test]

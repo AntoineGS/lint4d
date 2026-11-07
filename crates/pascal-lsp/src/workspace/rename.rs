@@ -291,6 +291,9 @@ pub(crate) struct OverlayInput {
 pub(crate) struct CachedDocument {
     pub(crate) context: Arc<ProjectContext>,
     pub(crate) parsed: Arc<ParsedDocument>,
+    /// For an open document whose parse is of its include-expanded buffer:
+    /// how to report that parse's positions in their files (D49).
+    pub(crate) projection: Option<Arc<crate::include_expansion::PhysicalProjection>>,
 }
 
 #[cfg(test)]
@@ -719,12 +722,23 @@ pub(crate) struct RenameSnapshot {
     pub(crate) mode: SnapshotMode,
     /// What an indexed snapshot did not search (l4d-33 §7); empty for a walk.
     pub(crate) index_gaps: Vec<String>,
+    /// Open documents `index` holds as their session's expanded parse
+    /// (workspace symbols only, D49).
+    pub(crate) projected: HashMap<Url, ProjectedDocument>,
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
     _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
     /// The `QueryTrees` charge of the candidate parses no lease charges
     /// (R9-8), held until the snapshot is dropped.
     _hydration: Vec<crate::project_cache::Reservation>,
+}
+
+/// An open document a workspace-symbols snapshot holds as its session's
+/// expanded parse: positions go through `projection`, and `context` parses
+/// the buffer when one does not map.
+pub(crate) struct ProjectedDocument {
+    pub(crate) projection: Arc<crate::include_expansion::PhysicalProjection>,
+    pub(crate) context: ConditionalContext,
 }
 
 #[cfg(test)]
@@ -754,6 +768,7 @@ impl RenameSnapshot {
             baseline_records: Vec::new(),
             mode: SnapshotMode::Assistance,
             index_gaps: Vec::new(),
+            projected: HashMap::new(),
             _cache_leases: HashMap::new(),
             _hydration: Vec::new(),
         }
@@ -1672,10 +1687,47 @@ impl Workspace {
             .filter_map(|(uri, parsed)| {
                 let context_key = self.document_contexts.get(&uri)?;
                 let context = self.contexts.get(context_key)?.context.clone();
-                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
+                let projection = self.open_projection(&uri, context_key, &parsed);
+                Some((
+                    canonical_file_uri(&uri),
+                    CachedDocument {
+                        context,
+                        parsed,
+                        projection,
+                    },
+                ))
             })
             .collect();
         self.input_with(self.document_owners.clone(), cached_documents)
+    }
+
+    /// The projection of an open document's parse when that parse is of
+    /// the include expansion of its current buffer under `context_key`.
+    fn open_projection(
+        &self,
+        uri: &Url,
+        context_key: &ContextKey,
+        parsed: &ParsedDocument,
+    ) -> Option<Arc<crate::include_expansion::PhysicalProjection>> {
+        let text = self.open_documents.get(uri)?.text.as_ref()?;
+        let expansion = self.expansions.get(uri)?;
+        if expansion.context_key != *context_key
+            || expansion.physical_source != **text
+            || **parsed.source_text() != *expansion.expanded.text()
+        {
+            return None;
+        }
+        let texts = expansion
+            .source_texts
+            .iter()
+            .filter(|(source, _)| *source != uri)
+            .map(|(source, text)| (source.clone(), text.clone()))
+            .collect();
+        Some(Arc::new(expansion.expanded.projection(
+            uri.clone(),
+            text.clone(),
+            texts,
+        )))
     }
 
     /// `analysis_input` without the document owners and reusable parses,
@@ -6483,6 +6535,7 @@ fn build_snapshot_with_policy(
                     baseline_records: Vec::new(),
                     mode,
                     index_gaps,
+                    projected: HashMap::new(),
                     _cache_leases: HashMap::new(),
                     _hydration: Vec::new(),
                 });
@@ -6582,6 +6635,7 @@ fn build_snapshot_with_policy(
     let mut indexed_sizes = HashMap::new();
     let mut indexed_stamps = HashMap::new();
     let mut indexed_uris = HashSet::new();
+    let mut projected = HashMap::new();
     let mut retained_files = 0usize;
     let mut retained_bytes = 0usize;
     let mut scanned_bytes = 0usize;
@@ -7010,16 +7064,19 @@ fn build_snapshot_with_policy(
             });
             continue;
         }
-        let cached = input
-            .cached_documents
-            .get(&uri)
-            .filter(|cached| {
-                loader
-                    .contexts
-                    .get(&source_context_key)
-                    .is_some_and(|state| state.context == cached.context)
-            })
-            .map(|cached| cached.parsed.clone());
+        let cached_document = input.cached_documents.get(&uri).filter(|cached| {
+            loader
+                .contexts
+                .get(&source_context_key)
+                .is_some_and(|state| state.context == cached.context)
+        });
+        let cached = cached_document.map(|cached| cached.parsed.clone());
+        // D49: an open document's parse of the expansion of this very
+        // buffer answers workspace symbols through its source map.
+        let projection = cached_document
+            .filter(|_| mode == SnapshotMode::WorkspaceSymbols && record.open)
+            .and_then(|cached| cached.projection.clone())
+            .filter(|projection| projection.physical() == source);
         let hydration_ticket = match hydration.as_mut().map(|admission| {
             admission.admit(
                 indexed_source.len() as u64,
@@ -7072,16 +7129,33 @@ fn build_snapshot_with_policy(
                 }
             })
             .unwrap_or_default();
-        index
-            .update_with_session(
-                uri.clone(),
-                indexed_source.clone(),
-                &conditional_context,
-                cached,
-                cancel,
-                loader.expansions.get(&uri).map(|e| &e.expanded),
-            )
-            .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+        let reused = match (projection, &cached) {
+            (Some(projection), Some(parsed))
+                if index.insert_parsed(uri.clone(), parsed.clone(), &conditional_context) =>
+            {
+                projected.insert(
+                    uri.clone(),
+                    ProjectedDocument {
+                        projection,
+                        context: conditional_context.clone(),
+                    },
+                );
+                true
+            }
+            _ => false,
+        };
+        if !reused {
+            index
+                .update_with_session(
+                    uri.clone(),
+                    indexed_source.clone(),
+                    &conditional_context,
+                    cached,
+                    cancel,
+                    loader.expansions.get(&uri).map(|e| &e.expanded),
+                )
+                .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+        }
         // The snapshot's own index holds the parse: no lease charges it.
         if let (Some(admission), Some(ticket)) = (hydration.as_mut(), hydration_ticket) {
             admission.settle(ticket, false);
@@ -7617,6 +7691,18 @@ fn build_snapshot_with_policy(
             )
         })
         .collect::<Vec<_>>();
+    // A projected document's answer reads its include files.
+    let mut included = projected
+        .values()
+        .flat_map(|document: &ProjectedDocument| document.projection.included())
+        .filter_map(|uri| uri.to_file_path().ok())
+        .collect::<Vec<_>>();
+    included.sort();
+    included.dedup();
+    baseline_records.extend(included.into_iter().filter_map(|path| {
+        let stamp = path_stamp(&path);
+        path_record_at(path, stamp, None, None, None, None, None, false)
+    }));
     for record in &mut baseline_records {
         record.auto_import_provider_observation = record
             .path
@@ -7644,6 +7730,7 @@ fn build_snapshot_with_policy(
         baseline_records,
         mode,
         index_gaps,
+        projected,
         _cache_leases: loader.cache_leases,
         _hydration: hydration
             .map(HydrationAdmission::into_held)

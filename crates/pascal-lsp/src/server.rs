@@ -5397,14 +5397,9 @@ impl AnalysisJobs {
                     .filter(|job| job.priority != AnalysisPriority::Interactive)
                     .count(),
         );
-        // Index batches also wait for running Bulk requests (D33).
-        self.interactive_gate.set_running_bulk(
-            self.pending
-                .values()
-                .filter(|job| job.priority == AnalysisPriority::Bulk)
-                .count(),
-        );
-        // Workspace-wide requests pause the warmer only (l4d-ig6b).
+        // Workspace-wide requests pause the warmer only (l4d-ig6b). Published
+        // before `running_bulk`, so an index turn never sees a running
+        // references as plain Bulk work and yields to the paused crawl (D50).
         let preempting = self
             .pending
             .values()
@@ -5418,6 +5413,13 @@ impl AnalysisJobs {
                 })
                 .count();
         self.interactive_gate.set_warm_busy(preempting);
+        // Index batches also wait for running Bulk requests (D33).
+        self.interactive_gate.set_running_bulk(
+            self.pending
+                .values()
+                .filter(|job| job.priority == AnalysisPriority::Bulk)
+                .count(),
+        );
         // Only work a lent slot can take: queued pull diagnostics would make
         // running diagnostics pause for nothing.
         self.interactive_gate.set_waiting_clients(

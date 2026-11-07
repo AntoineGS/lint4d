@@ -1250,9 +1250,11 @@ impl Warmer {
         // 1. A reuse pass, even while a crawl is queued (D33). Only Bulk work
         // lets the crawl go first: interactive work would pause the crawl as
         // well, so the pass waits for it in `wait_index_turn`. A
-        // workspace-wide request holds the pass back too (D50); a crawl
-        // dispatched meanwhile waits for it, and yields to the due pass at
-        // its first unit boundary.
+        // workspace-wide request holds the pass back too (D50): a running
+        // references or workspace/symbol already does as Bulk work, and
+        // `warm_paused` adds queued ones and a running prepareRename. A
+        // crawl dispatched meanwhile waits for the request, and yields to
+        // the due pass at its first unit boundary.
         if !self.busy
             && (persisting || awaiting_store)
             && !self.reuse_queue.is_empty()
@@ -4173,6 +4175,65 @@ mod tests {
             assert!(warmer.reuse_queue.is_empty(), "{kinds:?}");
             warmer.shutdown();
             workspace.persistent_cache().shutdown();
+        }
+
+        /// D50: a workspace-wide request that does not run as Bulk work
+        /// holds the reuse pass back by `warm_busy` alone; `hold` sets what
+        /// `publish_interactive_load` publishes for it, `release` clears it.
+        fn assert_reuse_pass_held_back_by(
+            hold: impl Fn(&InteractiveGate),
+            release: impl Fn(&InteractiveGate),
+        ) {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = wide_fixture(&gate);
+            hold(&gate);
+            assert!(!gate.bulk_runs());
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let mut events = warmer.poll(&workspace);
+            assert!(
+                warmer.index_in_flight.is_none() && !warmer.reuse_queue.is_empty(),
+                "no reuse pass is dispatched while the request waits or runs: {:?}",
+                warmer.index_in_flight
+            );
+            release(&gate);
+            events.extend(run_until_end_within(
+                &mut warmer,
+                &workspace,
+                Duration::from_secs(20),
+            ));
+            let reuse = position(&events, reuse_progress);
+            assert!(reuse < position(&events, is_end), "{events:?}");
+            warmer.shutdown();
+            workspace.persistent_cache().shutdown();
+        }
+
+        #[test]
+        fn a_queued_references_request_holds_the_reuse_pass_back() {
+            assert_reuse_pass_held_back_by(
+                |gate| {
+                    gate.set_waiting_clients(1);
+                    gate.set_warm_busy(1);
+                },
+                |gate| {
+                    gate.set_waiting_clients(0);
+                    gate.set_warm_busy(0);
+                },
+            );
+        }
+
+        #[test]
+        fn a_running_prepare_rename_holds_the_reuse_pass_back() {
+            assert_reuse_pass_held_back_by(
+                |gate| {
+                    gate.set(1);
+                    gate.set_warm_busy(1);
+                },
+                |gate| {
+                    gate.set(0);
+                    gate.set_warm_busy(0);
+                },
+            );
         }
 
         /// I-1 (c): Bulk work lets the crawl go first; once it ends, the crawl

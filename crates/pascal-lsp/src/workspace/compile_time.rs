@@ -195,10 +195,12 @@ impl pascal_core::SharedIncludeFailures for CachedIncludeFailures {
             return;
         }
         let mut reads = self.capture.restricted_to(&observations);
+        // A read the lookup named may be missing.
+        if reads.overflowed {
+            return;
+        }
         // Session-wide flags are not the lookup's: only editor state it
         // met itself carries over.
-        reads.overflowed = false;
-        reads.dropped = None;
         reads.editor_state = editor_state && !editor_state_before;
         self.cache.put_include_failure(
             self.configuration,

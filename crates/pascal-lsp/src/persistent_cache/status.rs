@@ -24,6 +24,8 @@ pub(crate) struct Reserved {
     pub(crate) pages: usize,
     pub(crate) scratch: usize,
     pub(crate) facts: usize,
+    /// Member publications' transient buffers (13b-3, A2).
+    pub(crate) publication: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +180,7 @@ impl CacheStatus {
                 "pages": reserved.pages,
                 "scratch": reserved.scratch,
                 "facts": reserved.facts,
+                "publication": reserved.publication,
             },
             "store": self.usage.as_ref().map(usage_json),
             "lockWaits": {
@@ -233,6 +236,7 @@ mod tests {
                 pages: usize::MAX,
                 scratch: usize::MAX,
                 facts: usize::MAX,
+                publication: usize::MAX,
             },
             usage: Some(UsageView::maximal()),
             lock_waits: LockWaits {

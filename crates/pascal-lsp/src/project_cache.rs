@@ -17,7 +17,7 @@ use crate::navigation::compiled_dcu::project_context_fingerprint;
 use crate::workspace::ContextKey;
 use crate::workspace::rename::OverlayInput;
 use crate::workspace_index::{
-    ContextIndex, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
+    ContextIndex, LimitCause, MAX_WORKSPACE_UNITS, MemberFacts, MemberStamp, membership_charge,
 };
 
 /// Default for the `maxCacheBytes` limit.
@@ -34,11 +34,36 @@ pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09
 const CATALOGUE_BUDGET_SHARE: usize = 8;
 /// The workspace index may hold a quarter of `maxCacheBytes` (l4d-33).
 const INDEX_BUDGET_SHARE: usize = 4;
+/// Open-file crawl pins may hold half of `maxCacheBytes` (l4d-axsn), so the
+/// index share, interactive parses and persistence transients keep the
+/// other half.
+const PIN_BUDGET_SHARE: usize = 2;
+/// The room an index batch needs to dispatch: one small member's charge.
+/// It publishes no parses (A13), so it needs no room for crawl entries.
+const INDEX_BATCH_DISPATCH_BYTES: usize = 4 * 1024;
 /// Compiled provider interfaces may hold a quarter of `maxCacheBytes`
 /// (l4d-4nbs D29); past it their own least recently used are evicted.
 const PROVIDER_GRAPH_BUDGET_SHARE: usize = 4;
+/// A publication's transient buffers (its encoded facts and evidence) draw
+/// on a pool of their own, the smaller of this and a sixteenth of
+/// `maxCacheBytes` (13b-3, A2): the crawl's pins and leases filling the
+/// parse budget never refuse them. One member's transients are at most
+/// `MAX_ARTIFACT_CONTENT_BYTES` (16 MiB) plus its observations, so a few
+/// publications fit at once; past the pool they ask the budget.
+/// Pooled bytes are outside `maxCacheBytes`: they add at most the pool to
+/// it, and never evict or refuse anything charged to it.
+const PUBLICATION_POOL_BYTES: usize = 64 * 1024 * 1024;
+const PUBLICATION_POOL_SHARE: usize = 16;
 pub(crate) const MAX_INDEXED_CONTEXTS: usize = 8;
 const MAX_INDEX_REQUESTS: usize = 64;
+/// Paths `IndexStore::crawl_published` remembers; past it, it starts over.
+/// Several large closures fit (multidev: about 7,000 units per context). An
+/// entry is about 250 bytes (path, a few pairs, map overhead), so the map
+/// stays under about 8 MiB, plus the reverse input links of the same units.
+const MAX_CRAWL_PUBLISHED: usize = 32_768;
+/// Publications remembered per path, newest last (contexts or contents a
+/// path alternates between).
+const MAX_CRAWL_PUBLICATIONS_PER_PATH: usize = 4;
 const MAX_OWNERS: usize = 4_096;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -79,6 +104,54 @@ struct Witness {
 
 /// Witnesses past this are not recorded; validation reads instead.
 pub(crate) const MAX_WITNESSES: usize = 131_072;
+
+/// A complete directory listing this process read (R8-1): the names the
+/// validator checks editor buffers and deletions against.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) directories: Vec<PathBuf>,
+}
+
+/// How a memoized listing was read: a listing is the same one only under
+/// the same route form and at most the entry limit it was complete under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListedUnder {
+    pub(crate) legacy: bool,
+    pub(crate) entry_limit: usize,
+}
+
+#[derive(Debug)]
+struct ListedWitness {
+    stamp: ProjectReadStamp,
+    under: ListedUnder,
+    listed: Arc<Listed>,
+}
+
+/// Listings memoized at once, in listed paths: about 100 bytes each, so
+/// about 13 MB at worst. This memory is not charged to `maxCacheBytes`
+/// (like the witnesses beside it); the bound is what keeps it small.
+pub(crate) const MAX_LISTED_PATHS: usize = 131_072;
+
+#[derive(Debug, Default)]
+struct Witnesses {
+    proven: HashMap<PathBuf, Witness>,
+    listings: HashMap<PathBuf, ListedWitness>,
+    /// Paths the memoized listings hold, against `MAX_LISTED_PATHS`.
+    listed_paths: usize,
+}
+
+impl Witnesses {
+    fn remove_listing(&mut self, path: &Path) {
+        if let Some(old) = self.listings.remove(path) {
+            self.listed_paths -= old.listed.files.len() + old.listed.directories.len();
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn overlay_content_hash(text: &str) -> u64 {
@@ -209,7 +282,7 @@ pub(crate) fn report_probes(
         probes.pop()
     });
     probes.extend(observed);
-    (probes, dirs)
+    (dedup_probes(probes), dirs)
 }
 
 /// Probes for resolver observations, and the directories whose watches
@@ -269,7 +342,42 @@ pub(crate) fn observation_probes(
     }
     dirs.sort();
     dirs.dedup();
-    (probes, dirs)
+    (dedup_probes(probes), dirs)
+}
+
+/// `probes` with each exact duplicate dropped, in first-seen order: a hit
+/// checks every probe (`probes_hold`), and the resolver observes a
+/// directory once per lookup that consults it (rootcause A4,
+/// l4d-zf1b.8). Probes of one path that differ are all kept.
+pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
+    let mut seen: HashMap<&Path, Vec<usize>> = HashMap::new();
+    let mut kept = Vec::with_capacity(probes.len());
+    for (at, probe) in probes.iter().enumerate() {
+        let path = match probe {
+            Probe::Stamp { path, .. } | Probe::Content { path, .. } => path.as_path(),
+            Probe::Overlay { uri, .. } => Path::new(uri.path()),
+        };
+        let same = seen.entry(path).or_default();
+        if same.iter().any(|&known| probes[known] == *probe) {
+            continue;
+        }
+        same.push(at);
+        kept.push(at);
+    }
+    if kept.len() == probes.len() {
+        return probes;
+    }
+    let mut keep = kept.into_iter().peekable();
+    probes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, probe)| {
+            (keep.peek() == Some(&at)).then(|| {
+                keep.next();
+                probe
+            })
+        })
+        .collect()
 }
 
 /// Every include candidate observed while resolving an expansion, plus the
@@ -452,6 +560,52 @@ mod probe_tests {
         after_removed.checked_delta(&after_empty).unwrap();
     }
 
+    /// Rootcause A4: one Directory observation per lookup is one stamp
+    /// probe per distinct directory and stamp; a directory seen with two
+    /// stamps keeps both probes.
+    #[test]
+    fn repeated_observations_give_one_probe_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = |path: &Path, stamp: Option<ProjectReadStamp>| {
+            pascal_core::ResolutionObservation::Directory {
+                path: path.to_path_buf(),
+                entry: pascal_project::ProjectPathEntry::configured(path.to_path_buf()),
+                stamp,
+                complete: true,
+                listed: true,
+            }
+        };
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut observations = Vec::new();
+        for _ in 0..50 {
+            observations.push(directory(&a, stamp(&a)));
+            observations.push(directory(&b, stamp(&b)));
+        }
+        observations.push(directory(&a, None));
+        let (probes, dirs) = observation_probes(&observations, &mut |_, _| None);
+        assert_eq!(
+            probes,
+            vec![
+                Probe::Stamp {
+                    path: a.clone(),
+                    expected: stamp(&a),
+                },
+                Probe::Stamp {
+                    path: b.clone(),
+                    expected: stamp(&b),
+                },
+                Probe::Stamp {
+                    path: a.clone(),
+                    expected: None,
+                },
+            ]
+        );
+        assert_eq!(dirs.len(), 2);
+    }
+
     #[test]
     fn unchanged_stamp_probe_holds() {
         let temp = tempfile::tempdir().unwrap();
@@ -608,6 +762,41 @@ mod cache_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn crawl_publications_keep_the_newest_per_path_and_forget_dependents() {
+        let cache = ProjectCache::default();
+        let unit = Path::new("/p/lib/U.pas");
+        let include = PathBuf::from("/p/inc/Part.inc");
+        let context = pascal_cache::Digest::from_bytes([1; 32]);
+        for hash in 0..=MAX_CRAWL_PUBLICATIONS_PER_PATH as u64 {
+            cache.note_published(unit, hash, context, std::slice::from_ref(&include));
+        }
+        assert!(
+            !cache.crawl_published(unit, 0, context),
+            "the oldest is dropped"
+        );
+        for hash in 1..=MAX_CRAWL_PUBLICATIONS_PER_PATH as u64 {
+            assert!(cache.crawl_published(unit, hash, context), "{hash}");
+        }
+        assert!(!cache.crawl_published(unit, 1, pascal_cache::Digest::from_bytes([2; 32])));
+        // A bytes-only change of the include drops its dependent.
+        cache.invalidate_file_contents(&include);
+        assert!(!cache.crawl_published(unit, 1, context));
+        // A new file in a directory a publication listed drops it too.
+        cache.note_published(unit, 1, context, &[PathBuf::from("/p/lib")]);
+        cache.invalidate_file_contents(Path::new("/p/lib/New.pas"));
+        assert!(
+            cache.crawl_published(unit, 1, context),
+            "no listing changed"
+        );
+        cache.invalidate_path(Path::new("/p/lib/New.pas"));
+        assert!(!cache.crawl_published(unit, 1, context));
+        // An overflow forgets everything.
+        cache.note_published(unit, 1, context, &[]);
+        cache.invalidate_after_overflow();
+        assert!(!cache.crawl_published(unit, 1, context));
+    }
 
     fn context(name: &str) -> ProjectContext {
         ProjectContext::from_parts(pascal_project::ProjectContextParts {
@@ -1861,10 +2050,12 @@ mod cache_tests {
     fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
         let cache = ProjectCache::new(20);
         let ctx = context("A.dproj");
-        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
-        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
+        // Pinned once ready: an entry stored after its pin is held to the
+        // pin cap (half the budget), which A's two layers exceed.
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill_unit(&cache, "A.pas", &ctx, 1, vec![]);
+        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
+        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
         fill(&cache, "B.pas", &ctx, 1, 9);
 
         cache.unpin(&uri("Open1.pas"));
@@ -2425,11 +2616,11 @@ mod cache_tests {
     fn pinned_entries_at_budget_report_no_room() {
         let cache = ProjectCache::new(10);
         let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
             &uri("Open.pas"),
             vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
         );
-        fill(&cache, "A.pas", &ctx, 1, 10);
 
         assert_eq!(cache.stats().bytes, 10);
         assert!(!cache.has_room());
@@ -2437,14 +2628,104 @@ mod cache_tests {
     }
 
     #[test]
-    fn pinned_entries_over_budget_report_no_room() {
-        let cache = ProjectCache::new(5);
+    fn capped_pins_stay_within_half_the_budget_unpinning_the_oldest_owner_first() {
+        let cache = ProjectCache::new(40);
         let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        for name in ["A.pas", "B.pas", "C.pas", "D.pas", "E.pas"] {
+            fill(&cache, name, &ctx, 1, 8);
+        }
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (uri(name), fingerprint))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            cache
+                .pin_capped(&uri("Old.pas"), keys(&["A.pas", "B.pas"]), &[])
+                .is_empty()
+        );
+        assert_eq!(cache.stats().pinned_bytes, 16);
+
+        // 16 more would pass the cap of 20: the oldest owner goes first.
+        let unpinned = cache.pin_capped(
+            &uri("New.pas"),
+            keys(&["C.pas", "D.pas"]),
+            &[uri("Old.pas"), uri("New.pas")],
+        );
+        assert_eq!(unpinned, vec![uri("Old.pas")]);
+        assert_eq!(cache.stats().pinned_bytes, 16);
+
+        // A closure over the cap on its own keeps what fits, in order.
+        let unpinned = cache.pin_capped(
+            &uri("Big.pas"),
+            keys(&["A.pas", "B.pas", "C.pas", "E.pas"]),
+            &[uri("New.pas"), uri("Big.pas")],
+        );
+        assert_eq!(unpinned, vec![uri("New.pas")]);
+        assert_eq!(cache.stats().pinned_bytes, 16);
+        assert!(cache.stats().pinned_bytes <= cache.max_bytes() / 2);
+        assert!(cache.has_room());
+        fill(&cache, "F.pas", &ctx, 1, 24);
+        assert!(ready(&cache, "A.pas") && ready(&cache, "B.pas"), "pinned");
+        assert!(
+            !ready(&cache, "C.pas"),
+            "unpinned with New.pas, then evicted"
+        );
+    }
+
+    #[test]
+    fn pinned_entries_stored_after_their_pin_stay_within_the_cap() {
+        let cache = ProjectCache::new(40);
+        let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        let names = ["A.pas", "B.pas", "C.pas", "D.pas"];
+        // Nothing is stored yet: every key is admitted at no cost.
+        assert!(
+            cache
+                .pin_capped(
+                    &uri("Open.pas"),
+                    names.iter().map(|name| (uri(name), fingerprint)).collect(),
+                    &[],
+                )
+                .is_empty()
+        );
+        for name in names {
+            fill(&cache, name, &ctx, 1, 8);
+            assert!(
+                cache.stats().pinned_bytes <= cache.max_bytes() / 2,
+                "after {name}: {:?}",
+                cache.stats()
+            );
+        }
+        assert_eq!(
+            cache.stats().pinned_bytes,
+            16,
+            "A and B fit, C and D do not"
+        );
+        fill(&cache, "E.pas", &ctx, 1, 16);
+        assert!(
+            ready(&cache, "A.pas") && ready(&cache, "B.pas"),
+            "still pinned"
+        );
+        assert!(
+            !ready(&cache, "C.pas"),
+            "C was left unpinned and evicted first"
+        );
+    }
+
+    #[test]
+    fn pinned_entries_over_budget_report_no_room() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
             &uri("Open.pas"),
             vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
         );
-        fill(&cache, "A.pas", &ctx, 1, 10);
+        // A smaller budget cannot evict the pinned entry.
+        cache.set_max_bytes(5);
         assert!(!cache.has_room());
         assert!(cache.stats().pinned_over_budget);
         cache.unpin(&uri("Open.pas"));
@@ -2926,6 +3207,36 @@ mod cache_tests {
         })
     }
 
+    /// 13b-2 fix round 1 (M2): a provider interface whose reads may lack
+    /// one it named is not shared, so no session inherits that overflow;
+    /// each compiles it with its own reads instead.
+    #[test]
+    fn a_provider_interface_with_overflowed_reads_is_not_kept() {
+        let cache = ProjectCache::new(1 << 20);
+        let overflowed = crate::workspace::capture::CapturedReads {
+            overflowed: true,
+            ..Default::default()
+        };
+        assert!(!cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(1_000),
+            vec![],
+            overflowed
+        ));
+        assert_eq!(cache.provider_graph_count(), 0);
+        assert_eq!(cache.provider_graph_bytes(), 0);
+        // 13b-3 (N1): the refusal is counted for `pascal/indexStatus`.
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 1);
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(1_000),
+            vec![],
+            Default::default()
+        ));
+    }
+
     /// l4d-4nbs D29: shared provider interfaces are charged to
     /// `maxCacheBytes` and evicted least recently used first past their
     /// share; reuse refreshes an entry.
@@ -3041,6 +3352,188 @@ mod cache_tests {
             "the older interface goes first"
         );
         assert!(ready(&cache, "Old.pas") && ready(&cache, "New.pas"));
+    }
+
+    /// An index batch dispatches when its first member's charge would fit
+    /// once shared provider interfaces give way, as the charge itself does
+    /// (`charge_index`, l4d-4nbs review I2).
+    #[test]
+    fn an_index_batch_dispatches_past_evictable_provider_interfaces() {
+        let cache = ProjectCache::new(24_000);
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(4_000),
+            vec![],
+            Default::default()
+        ));
+        let held = cache.reserve(ReservationKind::Scratch, 18_000).unwrap();
+        assert!(
+            cache.index_batch_fits(),
+            "the interface would give way to the member's charge"
+        );
+        assert!(cache.charge_index(INDEX_BATCH_DISPATCH_BYTES));
+        drop(held);
+    }
+
+    /// 13b-3 (A2): `make_room` and `index_batch_fits` leave the shared
+    /// provider interfaces out of what cannot give way, as `has_room` does:
+    /// with pinned, outstanding and other reserved bytes leaving room, a
+    /// small request evicts the interfaces instead of being refused while
+    /// the budget is over (outstanding bytes counted past it).
+    #[test]
+    fn evictable_provider_interfaces_never_refuse_a_small_request() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(5_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        assert!(graphs > INDEX_BATCH_DISPATCH_BYTES + 100, "{graphs}");
+        let held = cache.reserve(ReservationKind::Scratch, 16_000).unwrap();
+        // Parses evicted while leased: their charge stays outstanding, and
+        // with the interfaces the budget is over.
+        lock(&cache.inner).outstanding_bytes = max - 16_000 - INDEX_BATCH_DISPATCH_BYTES - 100;
+        assert!(cache.has_room(), "{:?}", cache.stats());
+        assert!(cache.index_batch_fits(), "{:?}", cache.stats());
+        let small = cache.reserve(ReservationKind::Scratch, 100);
+        assert!(
+            small.is_some(),
+            "the interface gives way: {:?}",
+            cache.stats()
+        );
+        assert_eq!(cache.provider_graph_count(), 0);
+        drop((small, held));
+    }
+
+    /// 13b-3 fix round 1 (I1): pooled publication bytes are outside the
+    /// budget everywhere: admitting them evicts nothing, and a reservation
+    /// beside them is checked and made room for without them, so it never
+    /// flushes the cache and is then refused.
+    #[test]
+    fn pooled_publication_bytes_are_outside_the_budget() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        let ctx = context("A.dproj");
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(4_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        fill(&cache, "Old.pas", &ctx, 1, 1_000);
+        let held = cache
+            .reserve(ReservationKind::Facts, max - graphs - 1_000)
+            .unwrap();
+        assert_eq!(cache.provider_graph_count(), 1);
+        let pool = cache.publication_pool_bytes();
+        let pooled = cache.reserve_publication(pool).expect("from the pool");
+        assert_eq!(cache.provider_graph_count(), 1, "admission evicts nothing");
+        assert!(ready(&cache, "Old.pas"), "admission evicts nothing");
+        assert!(
+            cache
+                .reserve(ReservationKind::Scratch, graphs + 1_001)
+                .is_none(),
+            "refused before eviction"
+        );
+        assert_eq!(cache.provider_graph_count(), 1, "nothing was flushed");
+        assert!(ready(&cache, "Old.pas"), "nothing was flushed");
+        drop(held);
+        let small = cache
+            .reserve(ReservationKind::Scratch, 1_000)
+            .expect("fits beside the pool");
+        assert_eq!(
+            cache.provider_graph_count(),
+            1,
+            "nothing given way for the pool"
+        );
+        assert!(ready(&cache, "Old.pas"));
+        drop((small, pooled));
+    }
+
+    /// 13b-3 (A2): a publication's transients draw on a small pool of their
+    /// own, so they are admitted while pins, leases and other reservations
+    /// fill the parse budget; past the pool they ask the budget as any
+    /// reservation does. The crawl's and the index's room ignore them.
+    #[test]
+    fn publication_transients_draw_on_their_own_pool() {
+        let max = 160_000;
+        let cache = ProjectCache::new(max);
+        let pool = cache.publication_pool_bytes();
+        assert_eq!(pool, max / PUBLICATION_POOL_SHARE);
+        let full = cache.reserve(ReservationKind::Facts, max).unwrap();
+        assert!(cache.reserve(ReservationKind::Scratch, 1).is_none());
+        let first = cache.reserve_publication(pool / 2).expect("from the pool");
+        let second = cache.reserve_publication(pool / 2).expect("from the pool");
+        assert_eq!(cache.stats().reserved_publication_bytes, pool);
+        assert!(
+            cache.reserve_publication(1).is_none(),
+            "the pool is used up and the budget is full"
+        );
+        drop(full);
+        assert!(cache.has_room() && cache.index_batch_fits());
+        let past = cache
+            .reserve_publication(1)
+            .expect("past the pool, from the budget");
+        drop((first, second, past));
+        assert_eq!(cache.stats().reserved_publication_bytes, 0);
+        let big = cache.reserve_publication(max / 2).expect("from the budget");
+        assert_eq!(cache.stats().reserved_publication_bytes, max / 2);
+        drop(big);
+    }
+
+    /// Evictable provider interfaces do not stop the crawl (l4d-axsn): with
+    /// pins at their half, the index at its quarter and interfaces filling
+    /// the rest, the crawl still has room, and what it stores evicts them.
+    #[test]
+    fn evictable_provider_interfaces_leave_the_crawl_room() {
+        let max = 24_000;
+        let cache = ProjectCache::new(max);
+        let ctx = context("A.dproj");
+        let fingerprint = project_context_fingerprint(&ctx);
+        for name in ["A.pas", "B.pas"] {
+            fill(&cache, name, &ctx, 1, max / 4);
+        }
+        assert!(
+            cache
+                .pin_capped(
+                    &uri("Open.pas"),
+                    vec![(uri("A.pas"), fingerprint), (uri("B.pas"), fingerprint)],
+                    &[],
+                )
+                .is_empty()
+        );
+        assert_eq!(cache.stats().pinned_bytes, max / 2);
+        assert!(cache.charge_index(max / 4));
+        assert!(cache.put_provider_graph(
+            7,
+            provider_key("A"),
+            provider_graph(4_000),
+            vec![],
+            Default::default()
+        ));
+        let graphs = cache.provider_graph_bytes();
+        assert!(graphs > 0 && graphs <= max / 4, "{graphs}");
+        // Whatever the interface's overhead, the quarter is full.
+        let _filler = (graphs < max / 4)
+            .then(|| cache.reserve(ReservationKind::Scratch, max / 4 - graphs))
+            .flatten();
+        assert!(
+            cache.has_room(),
+            "the interfaces would give way: {:?}",
+            cache.stats()
+        );
+
+        fill(&cache, "C.pas", &ctx, 1, 1_000);
+        assert!(ready(&cache, "C.pas"), "the crawl's entry is kept");
+        assert_eq!(cache.provider_graph_count(), 0, "the interface gave way");
+        assert!(ready(&cache, "A.pas") && ready(&cache, "B.pas"), "pinned");
     }
 
     #[test]
@@ -3547,6 +4040,8 @@ struct State {
     /// Held reservations by `ReservationKind::index`. Poison recovery keeps
     /// them: their holders release them on drop.
     reserved: [usize; ReservationKind::COUNT],
+    /// The part of `reserved[Publication]` drawn on the publication pool.
+    publication_pooled: usize,
     watch_counts: HashMap<PathBuf, usize>,
     /// Advances when poison recovery drains `watch_counts`: a catalogue's
     /// watches acquired under an older one were drained and are not released.
@@ -3597,6 +4092,7 @@ impl Default for State {
             leases: HashMap::new(),
             outstanding_bytes: 0,
             reserved: [0; ReservationKind::COUNT],
+            publication_pooled: 0,
             watch_counts: HashMap::new(),
             watch_count_epoch: 0,
             watch_changes: Vec::new(),
@@ -3640,7 +4136,7 @@ struct Inner {
     changed: Condvar,
     watcher: Mutex<WatcherState>,
     /// Never held together with `state` or `watcher`.
-    witnesses: Mutex<HashMap<PathBuf, Witness>>,
+    witnesses: Mutex<Witnesses>,
     /// Never held together with `state`, `watcher` or `witnesses`.
     catalogues: Mutex<CatalogueStore>,
     /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
@@ -3651,6 +4147,12 @@ struct Inner {
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
+    /// Provider interfaces not shared because their reads overflowed
+    /// (13b-2 follow-up N1), for `pascal/indexStatus`.
+    provider_graphs_refused: AtomicU64,
+    /// Provider interfaces handed out by `provider_graph` (tests only).
+    #[cfg(test)]
+    provider_graph_hits: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -3855,6 +4357,8 @@ pub(crate) struct CacheStats {
     pub units: usize,
     pub imports: usize,
     pub bytes: usize,
+    /// Bytes of ready entries some owner pins.
+    pub pinned_bytes: usize,
     /// Bytes of removed values that workers still hold.
     pub outstanding_bytes: usize,
     /// Pinned bytes alone exceed the budget; reserved and outstanding bytes are reported separately.
@@ -3866,6 +4370,7 @@ pub(crate) struct CacheStats {
     pub reserved_catalogue_bytes: usize,
     pub reserved_index_bytes: usize,
     pub reserved_provider_graph_bytes: usize,
+    pub reserved_publication_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3877,6 +4382,7 @@ impl CacheStats {
             .saturating_add(self.reserved_catalogue_bytes)
             .saturating_add(self.reserved_index_bytes)
             .saturating_add(self.reserved_provider_graph_bytes)
+            .saturating_add(self.reserved_publication_bytes)
     }
 }
 
@@ -3901,10 +4407,12 @@ pub(crate) enum ReservationKind {
     /// Compiled provider interfaces (l4d-4nbs D29), held by their store like
     /// the catalogues.
     ProviderGraphs,
+    /// A member publication's transient buffers (`reserve_publication`).
+    Publication,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         match self {
@@ -3914,6 +4422,7 @@ impl ReservationKind {
             Self::Catalogues => 3,
             Self::WorkspaceIndex => 4,
             Self::ProviderGraphs => 5,
+            Self::Publication => 6,
         }
     }
 }
@@ -3928,6 +4437,8 @@ pub(crate) struct Reservation {
     inner: Arc<Inner>,
     kind: ReservationKind,
     bytes: usize,
+    /// Drawn on the publication pool rather than made room for.
+    pooled: bool,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -3956,6 +4467,9 @@ impl Reservation {
         let mut state = lock(&self.inner);
         let reserved = &mut state.reserved[self.kind.index()];
         *reserved = reserved.saturating_sub(self.bytes - bytes);
+        if self.pooled {
+            state.publication_pooled = state.publication_pooled.saturating_sub(self.bytes - bytes);
+        }
         self.bytes = bytes;
     }
 }
@@ -3965,7 +4479,14 @@ impl Drop for Reservation {
         let mut state = lock(&self.inner);
         let reserved = &mut state.reserved[self.kind.index()];
         *reserved = reserved.saturating_sub(self.bytes);
+        if self.pooled {
+            state.publication_pooled = state.publication_pooled.saturating_sub(self.bytes);
+        }
     }
+}
+
+fn publication_pool(state: &State) -> usize {
+    PUBLICATION_POOL_BYTES.min(state.max_bytes / PUBLICATION_POOL_SHARE)
 }
 
 fn reserved_bytes(state: &State) -> usize {
@@ -3975,13 +4496,36 @@ fn reserved_bytes(state: &State) -> usize {
         .fold(0usize, |total, bytes| total.saturating_add(*bytes))
 }
 
+/// Reserved bytes charged to `maxCacheBytes`: all but those drawn on the
+/// publication pool, a budget of its own (13b-3, A2).
+fn budgeted_reserved_bytes(state: &State) -> usize {
+    reserved_bytes(state).saturating_sub(state.publication_pooled)
+}
+
 /// Whether `retained` plus everything outstanding and reserved, plus
 /// `request`, fits the budget.
 fn fits(state: &State, retained: usize, request: usize) -> bool {
     retained
         .checked_add(state.outstanding_bytes)
-        .and_then(|total| total.checked_add(reserved_bytes(state)))
+        .and_then(|total| total.checked_add(budgeted_reserved_bytes(state)))
         .and_then(|total| total.checked_add(request))
+        .is_some_and(|total| total <= state.max_bytes)
+}
+
+/// What no eviction frees: pinned, outstanding and budgeted reserved
+/// bytes, less the shared provider interfaces, a cache that gives way to
+/// every request (l4d-4nbs review I2).
+fn committed_bytes(state: &State) -> usize {
+    state
+        .pinned_bytes
+        .saturating_add(state.outstanding_bytes)
+        .saturating_add(budgeted_reserved_bytes(state).saturating_sub(state.provider_graphs.bytes))
+}
+
+/// Whether `request` fits beside what no eviction frees.
+fn fits_committed(state: &State, request: usize) -> bool {
+    committed_bytes(state)
+        .checked_add(request)
         .is_some_and(|total| total <= state.max_bytes)
 }
 
@@ -3989,10 +4533,10 @@ fn fits(state: &State, retained: usize, request: usize) -> bool {
 /// bytes fit. False when they cannot: pinned, outstanding and reserved bytes
 /// alone leave no room, or nothing is left to evict.
 fn make_room(state: &mut State, request: usize) -> bool {
-    // Shared provider interfaces are a cache: their charge never stands in
-    // the way of a request (l4d-4nbs review I2).
-    let graphs = state.provider_graphs.bytes;
-    if !fits(state, state.pinned_bytes, request.saturating_sub(graphs)) {
+    // The interfaces' charge is checked against `reserved`, not subtracted
+    // from the request (13b-3, A2: a small request was refused before the
+    // interfaces were evicted).
+    if !fits_committed(state, request) {
         return false;
     }
     while !fits(state, state.bytes, request) {
@@ -4240,9 +4784,46 @@ impl ProjectCache {
                     inner: Arc::clone(&self.inner),
                     kind,
                     bytes,
+                    pooled: false,
                 })
                 .collect(),
         )
+    }
+
+    /// Reserve a member publication's transient bytes (13b-3, A2). Up to
+    /// the publication pool they are admitted whatever pins, leases and
+    /// other reservations hold, and evict nothing: the pool is outside
+    /// `maxCacheBytes`, which no check or eviction counts it in. Past the
+    /// pool they are made room for as `reserve` does, or refused.
+    pub(crate) fn reserve_publication(&self, bytes: usize) -> Option<Reservation> {
+        let kind = ReservationKind::Publication;
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let pooled = state
+            .publication_pooled
+            .checked_add(bytes)
+            .is_some_and(|total| total <= publication_pool(&state));
+        if pooled {
+            state.publication_pooled += bytes;
+            state.reserved[kind.index()] += bytes;
+        } else if make_room(&mut state, bytes) {
+            state.reserved[kind.index()] += bytes;
+        } else {
+            self.release(state);
+            return None;
+        }
+        self.release(state);
+        Some(Reservation {
+            inner: Arc::clone(&self.inner),
+            kind,
+            bytes,
+            pooled,
+        })
+    }
+
+    /// The publication pool's size under the current budget.
+    pub(crate) fn publication_pool_bytes(&self) -> usize {
+        publication_pool(&lock(&self.inner))
     }
 
     /// Releases the state lock, then applies the watch changes it queued.
@@ -5020,6 +5601,43 @@ fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String 
 
 const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
 
+/// Removes `pin` from every owner's set, and drops owners left empty.
+fn unpin_key(state: &mut State, pin: &(Url, u64)) {
+    let mut removed = 0usize;
+    state.pins.retain(|_, keys| {
+        removed += usize::from(keys.remove(pin));
+        !keys.is_empty()
+    });
+    for _ in 0..removed {
+        remove_pin(state, pin);
+    }
+}
+
+/// Whether some owner pins `(uri, fingerprint)`.
+fn pin_counted(state: &State, (uri, fingerprint): &(Url, u64)) -> bool {
+    state
+        .pin_counts
+        .get(uri)
+        .is_some_and(|fingerprints| fingerprints.contains_key(fingerprint))
+}
+
+/// The bytes of the ready entries a pin of `(uri, fingerprint)` covers.
+fn pin_key_bytes(state: &State, (uri, fingerprint): &(Url, u64)) -> usize {
+    LAYERS
+        .iter()
+        .filter_map(|&layer| {
+            match state.slots.get(&Key {
+                layer,
+                uri: uri.clone(),
+                fingerprint: *fingerprint,
+            }) {
+                Some(Slot::Ready(entry)) => Some(entry.bytes),
+                _ => None,
+            }
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
 fn is_pinned(state: &State, key: &Key) -> bool {
     state
         .pin_counts
@@ -5077,6 +5695,13 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     state.bytes = state.bytes.saturating_add(entry.bytes);
     if let Some(address) = parse_address(&entry.value) {
         hold_parse(state, address, entry.bytes);
+    }
+    // A pinned key whose entry arrives after its pin keeps the pins within
+    // their cap (l4d-axsn): over it, the key is unpinned for every owner.
+    if is_pinned(state, &key)
+        && state.pinned_bytes.saturating_add(entry.bytes) > state.max_bytes / PIN_BUDGET_SHARE
+    {
+        unpin_key(state, &(key.uri.clone(), key.fingerprint));
     }
     if is_pinned(state, &key) {
         state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
@@ -5335,7 +5960,7 @@ fn evict_to_budget(state: &mut State) {
     while state
         .bytes
         .saturating_add(state.outstanding_bytes)
-        .saturating_add(reserved_bytes(state))
+        .saturating_add(budgeted_reserved_bytes(state))
         > state.max_bytes
     {
         if !evict_oldest(state) {
@@ -5544,6 +6169,77 @@ impl ProjectCache {
         }
     }
 
+    /// `pin` within half of `maxCacheBytes` (l4d-axsn): while `keys` do not
+    /// fit, the owners in `oldest_first` (least recently opened first;
+    /// `owner` is skipped) are unpinned whole, then `owner`'s keys are pinned
+    /// in order, each only if it still fits. Returns the owners unpinned.
+    pub(crate) fn pin_capped(
+        &self,
+        owner: &Url,
+        keys: Vec<(Url, u64)>,
+        oldest_first: &[Url],
+    ) -> Vec<Url> {
+        let mut state = lock(&self.inner);
+        let cap = state.max_bytes / PIN_BUDGET_SHARE;
+        if let Some(previous) = state.pins.remove(owner) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
+        let mut seen = HashSet::new();
+        let keys = keys
+            .into_iter()
+            .filter(|key| seen.insert(key.clone()))
+            .collect::<Vec<_>>();
+        let added = |state: &State, key: &(Url, u64)| {
+            if pin_counted(state, key) {
+                0
+            } else {
+                pin_key_bytes(state, key)
+            }
+        };
+        let mut unpinned = Vec::new();
+        for other in oldest_first.iter().filter(|other| *other != owner) {
+            let wanted = keys.iter().fold(0usize, |total, key| {
+                total.saturating_add(added(&state, key))
+            });
+            if state.pinned_bytes.saturating_add(wanted) <= cap {
+                break;
+            }
+            if let Some(previous) = state.pins.remove(other) {
+                for key in &previous {
+                    remove_pin(&mut state, key);
+                }
+                unpinned.push(other.clone());
+            }
+        }
+        let mut kept = HashSet::new();
+        for key in keys {
+            if state.pinned_bytes.saturating_add(added(&state, &key)) > cap {
+                continue;
+            }
+            add_pin(&mut state, &key);
+            kept.insert(key);
+        }
+        if !kept.is_empty() {
+            state.pins.insert(owner.clone(), kept);
+        }
+        evict_to_budget(&mut state);
+        self.release(state);
+        unpinned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_owners_for_test(&self) -> Vec<Url> {
+        let mut owners = lock(&self.inner).pins.keys().cloned().collect::<Vec<_>>();
+        owners.sort();
+        owners
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        lock(&self.inner).max_bytes
+    }
+
     pub(crate) fn unpin(&self, owner: &Url) {
         let mut state = lock(&self.inner);
         if let Some(previous) = state.pins.remove(owner) {
@@ -5579,6 +6275,7 @@ impl ProjectCache {
     }
 
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
+        self.forget_crawl_published(path, include_parent);
         let mut state = lock(&self.inner);
         let artifact = is_artifact_path(path, &state.artifact_roots);
         let parent = path.parent().filter(|_| include_parent && !artifact);
@@ -5682,11 +6379,7 @@ impl ProjectCache {
         self.release(state);
         self.inner.changed.notify_all();
         // Overflow lost which paths changed: no witness survives it.
-        self.inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.witnesses().clear();
         // Overflow lost which directories changed: no catalogue survives it.
         let removed = self.catalogues().clear();
         self.release_catalogues(removed);
@@ -5710,41 +6403,87 @@ impl ProjectCache {
         if !stamp.settled || !stamp.has_change_identity() {
             return;
         }
-        let mut witnesses = self
-            .inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if witnesses.len() >= MAX_WITNESSES && !witnesses.contains_key(path) {
+        let mut witnesses = self.witnesses();
+        if witnesses.proven.len() >= MAX_WITNESSES && !witnesses.proven.contains_key(path) {
             return;
         }
-        witnesses.insert(path.to_path_buf(), Witness { stamp, proven });
+        witnesses
+            .proven
+            .insert(path.to_path_buf(), Witness { stamp, proven });
     }
 
     /// What this process proved about `path`, if `current` (taken now)
     /// shows it unchanged since.
     pub(crate) fn witness(&self, path: &Path, current: &ProjectReadStamp) -> Option<Proven> {
-        let witnesses = self
-            .inner
-            .witnesses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let witness = witnesses.get(path)?;
+        let witnesses = self.witnesses();
+        let witness = witnesses.proven.get(path)?;
         witness
             .stamp
             .proves_unchanged(current)
             .then(|| witness.proven.clone())
     }
 
-    fn drop_witnesses(&self, path: &Path, include_parent: bool) {
-        let mut witnesses = self
-            .inner
+    /// Remember the complete listing of directory `path` read while it had
+    /// `stamp` (R8-1). A witness like `record_witness`: only a settled stamp
+    /// with a change identity memoizes, and a watcher event for the
+    /// directory or a path in it, or an overflow, forgets it.
+    pub(crate) fn record_listing(
+        &self,
+        path: &Path,
+        stamp: ProjectReadStamp,
+        under: ListedUnder,
+        listed: Arc<Listed>,
+    ) {
+        if !stamp.settled || !stamp.has_change_identity() {
+            return;
+        }
+        let paths = listed.files.len() + listed.directories.len();
+        let mut witnesses = self.witnesses();
+        witnesses.remove_listing(path);
+        if witnesses.listed_paths + paths > MAX_LISTED_PATHS {
+            return;
+        }
+        witnesses.listed_paths += paths;
+        witnesses.listings.insert(
+            path.to_path_buf(),
+            ListedWitness {
+                stamp,
+                under,
+                listed,
+            },
+        );
+    }
+
+    /// The listing of `path` this process read under `under`, if `current`
+    /// (taken now) shows the directory unchanged since.
+    pub(crate) fn listing(
+        &self,
+        path: &Path,
+        current: &ProjectReadStamp,
+        under: ListedUnder,
+    ) -> Option<Arc<Listed>> {
+        let witnesses = self.witnesses();
+        let witness = witnesses.listings.get(path)?;
+        (witness.under.legacy == under.legacy
+            && witness.under.entry_limit <= under.entry_limit
+            && witness.stamp.proves_unchanged(current))
+        .then(|| Arc::clone(&witness.listed))
+    }
+
+    fn witnesses(&self) -> std::sync::MutexGuard<'_, Witnesses> {
+        self.inner
             .witnesses
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        witnesses.remove(path);
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn drop_witnesses(&self, path: &Path, include_parent: bool) {
+        let mut witnesses = self.witnesses();
+        witnesses.proven.remove(path);
+        witnesses.remove_listing(path);
         if let Some(parent) = path.parent().filter(|_| include_parent) {
-            witnesses.remove(parent);
+            witnesses.proven.remove(parent);
+            witnesses.remove_listing(parent);
         }
     }
 
@@ -5770,14 +6509,24 @@ impl ProjectCache {
         self.inner.changed.notify_all();
     }
 
+    /// Whether an index batch may dispatch: its first member's charge fits
+    /// next to pinned, outstanding and reserved bytes, evicting unpinned
+    /// entries (l4d-axsn). Unlike `has_room`, which gates the crawl, it
+    /// asks for no room for parses (A13). Shared provider interfaces give
+    /// way as they do to the charge itself (`make_room`).
+    pub(crate) fn index_batch_fits(&self) -> bool {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        fits_committed(&state, INDEX_BATCH_DISPATCH_BYTES)
+    }
+
+    /// Whether the crawl may dispatch. Shared provider interfaces are not
+    /// counted: what the crawl stores evicts them (`evict_to_budget`,
+    /// l4d-4nbs review I2), so they never stop it (l4d-axsn).
     pub(crate) fn has_room(&self) -> bool {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
-        state
-            .pinned_bytes
-            .saturating_add(state.outstanding_bytes)
-            .saturating_add(reserved_bytes(&state))
-            < state.max_bytes
+        committed_bytes(&state) < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -5798,6 +6547,7 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
+            pinned_bytes: state.pinned_bytes,
             outstanding_bytes: state.outstanding_bytes,
             pinned_over_budget: state.pinned_bytes > state.max_bytes,
             reserved_facts_bytes: state.reserved[ReservationKind::Facts.index()],
@@ -5806,6 +6556,7 @@ impl ProjectCache {
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
+            reserved_publication_bytes: state.reserved[ReservationKind::Publication.index()],
         }
     }
 
@@ -6200,7 +6951,17 @@ impl ProjectCache {
         let tick = state.clock;
         state.provider_graphs.touch(&full, tick);
         self.release(state);
+        #[cfg(test)]
+        self.inner
+            .provider_graph_hits
+            .fetch_add(1, Ordering::Relaxed);
         Some(hit)
+    }
+
+    /// How many provider interfaces `provider_graph` handed out.
+    #[cfg(test)]
+    pub(crate) fn provider_graph_hits_for_test(&self) -> u64 {
+        self.inner.provider_graph_hits.load(Ordering::Relaxed)
     }
 
     /// Keep a compiled provider interface, charged to `maxCacheBytes` within
@@ -6220,6 +6981,19 @@ impl ProjectCache {
             .saturating_add(graph.retained_bytes)
             .saturating_add(probes_bytes(&probes))
             .saturating_add(reads.retained_bytes());
+        // A read it named may be missing: a session reusing it could only
+        // inherit the overflow, never prove its inputs. It compiles the
+        // provider itself instead, capturing its own reads.
+        if reads.overflowed {
+            self.inner
+                .provider_graphs_refused
+                .fetch_add(1, Ordering::Relaxed);
+            crate::trace::trace!(
+                "  provider interface {} not shared: its reads overflowed",
+                key.source.as_str()
+            );
+            return false;
+        }
         let full = (configuration, key);
         let mut state = lock(&self.inner);
         let share = state.max_bytes / PROVIDER_GRAPH_BUDGET_SHARE;
@@ -6392,6 +7166,9 @@ pub(crate) struct IndexMembership {
     pub(crate) limit: Option<String>,
     pub(crate) packages: bool,
     pub(crate) owner_pending: usize,
+    /// The cache digest of the context the members belong to: the crawl's
+    /// publications under it count as the members' (`IndexCounts::persisted`).
+    pub(crate) context: Option<pascal_cache::Digest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6412,11 +7189,317 @@ struct StoredIndex {
     /// `index.bytes()`.
     charged: usize,
     memory_exhausted: bool,
+    /// Store reads spent validating members of this context.
+    validation_reads: u64,
+    /// The snapshot this context's index started from or last sealed (D40).
+    baseline: Option<crate::workspace::baseline::BaselineHint>,
+    /// When this process last sealed, or found nothing new to seal.
+    last_seal: Option<std::time::Instant>,
+    /// Whether this process looked for a sealed snapshot to start from.
+    hint_tried: bool,
+    /// Members a batch indexed while the store was not enabled: they have
+    /// no record until the next persisting batch proves them again. Only
+    /// these, never other members that lack a record (13c-2).
+    memory_only: HashSet<PathBuf>,
+    /// Members whose publication was refused for room (the WAL at its
+    /// threshold, the disk budget): they stay memory-only until the store
+    /// reports no pressure, then a batch proves them again. Only these,
+    /// never other members that lack a record (13c-2).
+    awaiting_room: HashSet<PathBuf>,
+    /// A batch's wait for maintenance found no room; cleared by room.
+    room_wait_failed: bool,
+    /// Extracted members whose publication found no memory for its
+    /// transient buffers in this process: they stay memory-only, without a
+    /// record, and the next start extracts them again (13b-3).
+    publications_refused: u64,
+    /// The kind of input the first `unprovable` member of this process
+    /// read without a capture (`Workspace::uncaptured_input`).
+    unprovable_kind: Option<&'static str>,
 }
 
 impl StoredIndex {
     fn total_charge(&self) -> usize {
         self.charged.saturating_add(self.index.bytes())
+    }
+
+    /// The members of `set` still fresh without a record.
+    fn unrecorded_fresh_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        if set.is_empty() {
+            return Vec::new();
+        }
+        self.index
+            .records()
+            .into_iter()
+            .filter(|(path, record)| {
+                record.is_none()
+                    && set.contains(path)
+                    && self.index.state_of(path) == Some(crate::workspace_index::MemberState::Fresh)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    }
+}
+
+/// The longest anchor URI `pascal/indexStatus` reports.
+const STATUS_ANCHOR_BYTES: usize = 512;
+/// At most this many gaps per context, each at most `STATUS_GAP_BYTES`.
+const STATUS_GAPS: usize = 4;
+const STATUS_GAP_BYTES: usize = 160;
+/// The whole `pascal/indexStatus` document.
+const STATUS_DOCUMENT_BYTES: usize = 8192;
+
+fn truncate_utf8(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// One context of `pascal/indexStatus`: counts, never member paths.
+#[derive(Debug, Clone)]
+pub(crate) struct IndexStatusEntry {
+    /// The anchor URI, at most `STATUS_ANCHOR_BYTES` bytes.
+    pub(crate) anchor: String,
+    pub(crate) anchor_is_project: bool,
+    pub(crate) anchor_truncated: bool,
+    pub(crate) counts: crate::workspace_index::IndexCounts,
+    pub(crate) membership_complete: bool,
+    /// The membership is complete, current, and no member that can be
+    /// indexed now is pending. Members retried after a refusal are not
+    /// counted against it: they are reported as a gap. Neither are open
+    /// members still pending, which are answered from their buffers.
+    pub(crate) complete: bool,
+    /// `"sealed"`: a snapshot this process sealed is the baseline. `"held"`:
+    /// the baseline was adopted from an earlier process's snapshot. `"none"`:
+    /// no baseline hint.
+    pub(crate) snapshot: &'static str,
+    pub(crate) validation_reads: u64,
+    /// `StoredIndex::publications_refused`.
+    pub(crate) publications_refused: u64,
+    pub(crate) gaps: Vec<String>,
+}
+
+impl IndexStatusEntry {
+    fn of(
+        stored: &StoredIndex,
+        crawl_published: &HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+        is_open: &dyn Fn(&Path) -> bool,
+    ) -> Self {
+        let counts = match stored.membership.context {
+            Some(context) => stored.index.counts_with(&|path, hash| {
+                crawl_published.get(path).is_some_and(|published| {
+                    published
+                        .iter()
+                        .any(|&(h, c)| c == context && hash.is_none_or(|hash| hash == h))
+                })
+            }),
+            None => stored.index.counts(),
+        };
+        let (anchor_is_project, uri) = match &stored.anchor {
+            IndexAnchor::Document(uri) => (false, uri.to_string()),
+            IndexAnchor::Project(path) => (
+                true,
+                Url::from_file_path(path)
+                    .map_or_else(|()| path.to_string_lossy().into_owned(), String::from),
+            ),
+        };
+        let (anchor, anchor_truncated) = truncate_utf8(&uri, STATUS_ANCHOR_BYTES);
+        let membership = &stored.membership;
+        let membership_complete = membership.complete && !stored.dirty;
+        // An open member is answered from the editor's buffer: while the
+        // store is off it is never indexed (l4d-33), so it is not work the
+        // index waits for. With the store on, the baseline view indexes it
+        // from disk and it is counted as any other member.
+        let open_pending = if counts.pending > counts.retrying {
+            stored
+                .index
+                .pending(usize::MAX)
+                .iter()
+                .filter(|path| !stored.index.retrying(path) && is_open(path))
+                .count()
+        } else {
+            0
+        };
+        let eligible_pending = counts
+            .pending
+            .saturating_sub(counts.retrying)
+            .saturating_sub(open_pending);
+        let mut gaps = Vec::new();
+        match &membership.limit {
+            Some(limit) => gaps.push(format!("{limit}; the rest are not indexed")),
+            None if !membership.complete => {
+                gaps.push("membership is incomplete; some units are not indexed".to_owned());
+            }
+            None => {}
+        }
+        if membership.packages {
+            gaps.push("units provided through runtime packages are not indexed".to_owned());
+        }
+        if counts.refused > 0 {
+            gaps.push(format!("{} units could not be indexed", counts.refused));
+        }
+        let over_index_limits = counts.limited - counts.over_deadline - counts.over_admission;
+        if over_index_limits > 0 {
+            gaps.push(format!(
+                "{over_index_limits} units exceed the index limits and are not indexed"
+            ));
+        }
+        if counts.over_deadline > 0 {
+            gaps.push(format!(
+                "{} units took longer than {} s to extract and are not indexed; the next start retries them last",
+                counts.over_deadline,
+                crate::workspace::indexing::MEMBER_DEADLINE.as_secs()
+            ));
+        }
+        if let Some(bound) = counts.first_admission_limit {
+            gaps.push(format!(
+                "{} units exceed a compile-time limit (first: {bound}) and are not indexed; the next start retries them last",
+                counts.over_admission
+            ));
+        }
+        if counts.over_limit > 0 {
+            gaps.push(format!(
+                "{} members are too large to store and are extracted again by the next start",
+                counts.over_limit
+            ));
+        }
+        if counts.unprovable > 0 {
+            gaps.push(format!(
+                "{} members read an input the cache cannot prove (first: {}) and are extracted again by the next start",
+                counts.unprovable,
+                stored.unprovable_kind.unwrap_or("unknown")
+            ));
+        }
+        if stored.publications_refused > 0 {
+            gaps.push(format!(
+                "{} members found no memory to publish and are extracted again by the next start",
+                stored.publications_refused
+            ));
+        }
+        if counts.deferred > 0 {
+            gaps.push(format!(
+                "{} units failed to load for the index and are retried later",
+                counts.deferred
+            ));
+        }
+        if counts.retrying > 0 {
+            gaps.push(format!(
+                "{} members retried after a previous refusal",
+                counts.retrying
+            ));
+        }
+        if stored.memory_exhausted {
+            gaps.push("the workspace index memory share is exhausted".to_owned());
+        }
+        gaps.truncate(STATUS_GAPS);
+        for gap in &mut gaps {
+            let (kept, _) = truncate_utf8(gap, STATUS_GAP_BYTES);
+            let kept = kept.len();
+            gap.truncate(kept);
+        }
+        Self {
+            anchor: anchor.to_owned(),
+            anchor_is_project,
+            anchor_truncated,
+            counts,
+            membership_complete,
+            complete: membership_complete && eligible_pending == 0,
+            snapshot: match stored.baseline.as_ref() {
+                None => "none",
+                Some(hint) if hint.sealed() => "sealed",
+                Some(_) => "held",
+            },
+            validation_reads: stored.validation_reads,
+            publications_refused: stored.publications_refused,
+            gaps,
+        }
+    }
+
+    fn to_json(&self, anchor_bytes: usize) -> serde_json::Value {
+        let (anchor, cut) = truncate_utf8(&self.anchor, anchor_bytes);
+        let key = if self.anchor_is_project {
+            "project"
+        } else {
+            "document"
+        };
+        let counts = &self.counts;
+        serde_json::json!({
+            "anchor": {key: anchor},
+            "anchorTruncated": self.anchor_truncated || cut,
+            "members": counts.members,
+            "fresh": counts.fresh,
+            "reused": counts.reused,
+            "extracted": counts.extracted,
+            "pending": counts.pending,
+            "reusePending": counts.reuse_pending,
+            "refused": counts.refused,
+            "limited": counts.limited,
+            "deferred": counts.deferred,
+            "persisted": counts.persisted,
+            "retrying": counts.retrying,
+            "overLimit": counts.over_limit,
+            "unprovable": counts.unprovable,
+            "overDeadline": counts.over_deadline,
+            "overAdmission": counts.over_admission,
+            "membershipComplete": self.membership_complete,
+            "complete": self.complete,
+            "snapshot": self.snapshot,
+            "validationReads": self.validation_reads,
+            "publicationsRefused": self.publications_refused,
+            "gaps": self.gaps,
+        })
+    }
+}
+
+/// What `pascal/indexStatus` counts for the whole process, not per context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IndexProcessCounts {
+    /// Units the warm crawl published (R8-2/D42).
+    pub(crate) crawl_published: u64,
+    /// Crawl publications that found no room, left to the index batch.
+    pub(crate) crawl_deferred: u64,
+    /// Provider interfaces not shared because their reads overflowed.
+    pub(crate) provider_graphs_refused: u64,
+}
+
+/// The `pascal/indexStatus` result. It never exceeds
+/// `STATUS_DOCUMENT_BYTES`: when the entries do not fit, gaps are dropped
+/// from the least recently used contexts first, then anchors are cut.
+pub(crate) fn index_status_json(
+    entries: &[IndexStatusEntry],
+    process: IndexProcessCounts,
+) -> serde_json::Value {
+    let mut entries = entries.to_vec();
+    let mut anchor_bytes = STATUS_ANCHOR_BYTES;
+    loop {
+        let document = serde_json::json!({
+            "schema": 1,
+            "crawlPublished": process.crawl_published,
+            "crawlDeferred": process.crawl_deferred,
+            "providerGraphsRefused": process.provider_graphs_refused,
+            "contexts": entries
+                .iter()
+                .map(|entry| entry.to_json(anchor_bytes))
+                .collect::<Vec<_>>(),
+        });
+        if document.to_string().len() <= STATUS_DOCUMENT_BYTES {
+            return document;
+        }
+        match entries
+            .iter_mut()
+            .rev()
+            .find(|entry| !entry.gaps.is_empty())
+        {
+            Some(entry) => {
+                entry.gaps.pop();
+            }
+            None if anchor_bytes > 16 => anchor_bytes /= 2,
+            None => return document,
+        }
     }
 }
 
@@ -6431,6 +7514,33 @@ struct IndexStore {
     claim_generation: u64,
     requests: Vec<IndexAnchor>,
     unit_limit: usize,
+    /// Holds of evicted contexts' snapshots, released by the next index
+    /// batch that has a store job (D40): eviction runs under the index lock,
+    /// where no store call may.
+    released: Vec<pascal_cache::SnapshotId>,
+    /// What the warm crawl published in this process: per path, the content
+    /// hash and context digest of each publication. Bounded by
+    /// `MAX_CRAWL_PUBLISHED` paths; an invalidated path is forgotten.
+    crawl_published: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+    /// For each path a crawl publication's evidence names, the published
+    /// units that read it: a change to it makes them publishable again.
+    crawl_dependents: HashMap<PathBuf, HashSet<PathBuf>>,
+    /// Per path, the content hash and context digest of each extraction in
+    /// this process whose publication exceeded a fixed limit
+    /// (`PersistSkip::over_fixed_limit`): the same write would fail again,
+    /// so neither the crawl nor the index attempts it. Bounded like
+    /// `crawl_published`; a change to the path forgets it. A change to
+    /// another input does not: the member then stays unpublished in this
+    /// process, which is never a wrong publication.
+    over_limit: HashMap<PathBuf, Vec<(u64, pascal_cache::Digest)>>,
+    /// Units the warm crawl published in this process (13b-3, A2).
+    crawl_published_count: u64,
+    /// Units whose crawl publication found no room and were left to the
+    /// index batch, which extracts and publishes them (13b-3, A2).
+    crawl_deferred_count: u64,
+    /// The paths the warm crawl published, in publication order.
+    #[cfg(test)]
+    published_by_crawl: Vec<PathBuf>,
 }
 
 impl Default for IndexStore {
@@ -6443,6 +7553,14 @@ impl Default for IndexStore {
             claim_generation: 0,
             requests: Vec::new(),
             unit_limit: MAX_WORKSPACE_UNITS,
+            released: Vec::new(),
+            crawl_published: HashMap::new(),
+            crawl_dependents: HashMap::new(),
+            over_limit: HashMap::new(),
+            crawl_published_count: 0,
+            crawl_deferred_count: 0,
+            #[cfg(test)]
+            published_by_crawl: Vec::new(),
         }
     }
 }
@@ -6471,6 +7589,9 @@ impl IndexStore {
             .map(|(key, _)| key.clone())?;
         let stored = self.contexts.remove(&victim)?;
         self.owners.retain(|_, owner| *owner != victim);
+        if let Some(hint) = stored.baseline.as_ref().filter(|hint| hint.held()) {
+            self.released.push(hint.header().id());
+        }
         Some(stored.total_charge())
     }
 }
@@ -6586,8 +7707,9 @@ impl ProjectCache {
         key: ContextKey,
         anchor: IndexAnchor,
         mut membership: IndexMembership,
+        limit: usize,
     ) {
-        let limit = self.index().unit_limit;
+        let limit = limit.min(self.index().unit_limit);
         if membership.paths.len() > limit {
             membership.paths.truncate(limit);
             membership.complete = false;
@@ -6636,8 +7758,24 @@ impl ProjectCache {
                     last_used: clock,
                     charged: 0,
                     memory_exhausted: false,
+                    validation_reads: 0,
+                    baseline: None,
+                    last_seal: None,
+                    hint_tried: false,
+                    memory_only: HashSet::new(),
+                    awaiting_room: HashSet::new(),
+                    room_wait_failed: false,
+                    publications_refused: 0,
+                    unprovable_kind: None,
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
+            let index = &stored.index;
+            stored
+                .awaiting_room
+                .retain(|path| index.state_of(path).is_some());
+            stored
+                .memory_only
+                .retain(|path| index.state_of(path).is_some());
             stored.membership = membership;
             stored.anchor = anchor;
             stored.dirty = false;
@@ -6668,6 +7806,32 @@ impl ProjectCache {
         facts: MemberFacts,
         stamps: Vec<MemberStamp>,
         content_hash: u64,
+    ) -> PublishOutcome {
+        self.publish_member(key, path, facts, stamps, content_hash, false)
+    }
+
+    /// `publish_index_member` for facts from the store: the member is
+    /// marked reused under the same lock, so no status reads it as
+    /// extracted.
+    pub(crate) fn publish_reused_index_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+    ) -> PublishOutcome {
+        self.publish_member(key, path, facts, stamps, content_hash, true)
+    }
+
+    fn publish_member(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        facts: MemberFacts,
+        stamps: Vec<MemberStamp>,
+        content_hash: u64,
+        reused: bool,
     ) -> PublishOutcome {
         // The charge covers the names the context does not hold yet, so it
         // is computed under the lock and checked again before inserting.
@@ -6701,7 +7865,14 @@ impl ProjectCache {
                     .index
                     .insert_paid(path, facts, stamps, content_hash, bytes);
                 if old.is_some() {
+                    // Indexed again: a refusal of an earlier extraction
+                    // does not describe this one.
+                    stored.awaiting_room.remove(path);
+                    stored.memory_only.remove(path);
                     stored.memory_exhausted = false;
+                    if reused {
+                        stored.index.mark_reused(path);
+                    }
                 }
                 old
             });
@@ -6748,11 +7919,33 @@ impl ProjectCache {
     }
 
     pub(crate) fn limit_index_member(&self, key: &ContextKey, path: &Path) {
+        self.limit_index_member_as(key, path, LimitCause::Facts);
+    }
+
+    /// `limit_index_member` for a member whose extraction passed its
+    /// deadline (`IndexCounts::over_deadline`).
+    pub(crate) fn limit_index_member_past_deadline(&self, key: &ContextKey, path: &Path) {
+        self.limit_index_member_as(key, path, LimitCause::Deadline);
+    }
+
+    /// `limit_index_member` for a member whose compile-time session was
+    /// refused by the fixed admission bound `bound`
+    /// (`IndexCounts::over_admission`).
+    pub(crate) fn limit_index_member_over_admission(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        bound: &'static str,
+    ) {
+        self.limit_index_member_as(key, path, LimitCause::Admission(bound));
+    }
+
+    fn limit_index_member_as(&self, key: &ContextKey, path: &Path, cause: LimitCause) {
         let old = self
             .index()
             .contexts
             .get_mut(key)
-            .and_then(|stored| stored.index.limit(path));
+            .and_then(|stored| stored.index.limit(path, cause));
         if let Some(old) = old {
             self.release_index(old);
         }
@@ -6764,10 +7957,417 @@ impl ProjectCache {
         }
     }
 
+    pub(crate) fn reuse_pending_index_members(
+        &self,
+        key: &ContextKey,
+        limit: usize,
+    ) -> Vec<PathBuf> {
+        self.index()
+            .contexts
+            .get(key)
+            .map(|stored| stored.index.reuse_pending(limit))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn mark_index_reuse_tried(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_reuse_tried(path);
+        }
+    }
+
+    /// The warm crawl published `path`'s facts (R8-2/D42): every context
+    /// index asks the store for them again before it extracts the member.
+    /// Nothing enters an index here.
+    /// `hash` and `context` (the context's cache digest) say what was
+    /// published, so the crawl does not publish it again in this process;
+    /// `inputs` are the other paths its evidence names, whose change makes
+    /// it publishable again.
+    pub(crate) fn note_published(
+        &self,
+        path: &Path,
+        hash: u64,
+        context: pascal_cache::Digest,
+        inputs: &[PathBuf],
+    ) {
+        let mut index = self.index();
+        index.crawl_published_count = index.crawl_published_count.saturating_add(1);
+        for stored in index.contexts.values_mut() {
+            stored.index.clear_reuse_tried(path);
+        }
+        if index.crawl_published.len() >= MAX_CRAWL_PUBLISHED
+            && !index.crawl_published.contains_key(path)
+        {
+            index.crawl_published.clear();
+            index.crawl_dependents.clear();
+        }
+        let published = index.crawl_published.entry(path.to_path_buf()).or_default();
+        if !published.contains(&(hash, context)) {
+            if published.len() >= MAX_CRAWL_PUBLICATIONS_PER_PATH {
+                published.remove(0);
+            }
+            published.push((hash, context));
+        }
+        for input in inputs {
+            index
+                .crawl_dependents
+                .entry(input.clone())
+                .or_default()
+                .insert(path.to_path_buf());
+        }
+        #[cfg(test)]
+        index.published_by_crawl.push(path.to_path_buf());
+    }
+
+    /// The warm crawl found no room to publish `path` (13b-3, A2). Nothing
+    /// is dropped: each context index with `path` as a member still holds
+    /// it pending, so its next Full batch extracts and publishes it; this
+    /// counts the deferral.
+    pub(crate) fn note_crawl_deferred(&self, path: &Path) {
+        let mut index = self.index();
+        index.crawl_deferred_count = index.crawl_deferred_count.saturating_add(1);
+        crate::trace::trace!(
+            "  crawl unit {} deferred to the index batch: no room for its publication",
+            path.display()
+        );
+    }
+
+    /// The process-wide counts `pascal/indexStatus` reports beside its
+    /// contexts.
+    pub(crate) fn index_process_counts(&self) -> IndexProcessCounts {
+        let provider_graphs_refused = self.inner.provider_graphs_refused.load(Ordering::Relaxed);
+        let index = self.index();
+        IndexProcessCounts {
+            crawl_published: index.crawl_published_count,
+            crawl_deferred: index.crawl_deferred_count,
+            provider_graphs_refused,
+        }
+    }
+
+    /// Whether the crawl published `path` from the bytes hashed `hash` under
+    /// `context` in this process.
+    pub(crate) fn crawl_published(
+        &self,
+        path: &Path,
+        hash: u64,
+        context: pascal_cache::Digest,
+    ) -> bool {
+        self.index()
+            .crawl_published
+            .get(path)
+            .is_some_and(|published| published.contains(&(hash, context)))
+    }
+
+    /// `path`'s facts from the bytes hashed `hash`, under the context with
+    /// cache digest `context`, exceed a fixed limit of the store.
+    pub(crate) fn note_over_limit(&self, path: &Path, hash: u64, context: pascal_cache::Digest) {
+        let mut index = self.index();
+        if index.over_limit.len() >= MAX_CRAWL_PUBLISHED && !index.over_limit.contains_key(path) {
+            index.over_limit.clear();
+        }
+        let noted = index.over_limit.entry(path.to_path_buf()).or_default();
+        if !noted.contains(&(hash, context)) {
+            if noted.len() >= MAX_CRAWL_PUBLICATIONS_PER_PATH {
+                noted.remove(0);
+            }
+            noted.push((hash, context));
+        }
+    }
+
+    /// Whether `note_over_limit` noted these facts in this process.
+    pub(crate) fn over_limit(&self, path: &Path, hash: u64, context: pascal_cache::Digest) -> bool {
+        self.index()
+            .over_limit
+            .get(path)
+            .is_some_and(|noted| noted.contains(&(hash, context)))
+    }
+
+    /// `key`'s Fresh member `path` is too large to store.
+    pub(crate) fn mark_index_over_limit(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_over_limit(path);
+        }
+    }
+
+    /// `key`'s Fresh member `path` read an input of `kind` that no capture
+    /// recorded, so it cannot be proven to another process.
+    pub(crate) fn mark_index_unprovable(&self, key: &ContextKey, path: &Path, kind: &'static str) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.index.mark_unprovable(path);
+            stored.unprovable_kind.get_or_insert(kind);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published_by_crawl_for_test(&self) -> Vec<PathBuf> {
+        self.index().published_by_crawl.clone()
+    }
+
+    /// Whether some context index holds `path` indexed from the bytes
+    /// hashed `hash`, with a record this process proved: its facts are in
+    /// the store already.
+    pub(crate) fn index_member_is_proven(&self, path: &Path, hash: u64) -> bool {
+        self.index()
+            .contexts
+            .values()
+            .any(|stored| stored.index.proven_with_hash(path, hash))
+    }
+
+    /// `context` is the cache digest of the context the caller indexes
+    /// under (`CacheContextKey::new(&state.context)`); a proof made under
+    /// another context is refused.
+    pub(crate) fn set_index_record(
+        &self,
+        key: &ContextKey,
+        proof: &crate::workspace::eligible::ProvenRecord,
+        context: pascal_cache::Digest,
+    ) -> bool {
+        proof.context() == context
+            && self.index().contexts.get_mut(key).is_some_and(|stored| {
+                let recorded = stored.index.set_record(proof.path(), proof.record_id());
+                if recorded {
+                    stored.awaiting_room.remove(proof.path());
+                    stored.memory_only.remove(proof.path());
+                }
+                recorded
+            })
+    }
+
+    pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.index.record(path).is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_records(
+        &self,
+        key: &ContextKey,
+    ) -> Option<Vec<(PathBuf, Option<pascal_cache::Digest>)>> {
+        self.index()
+            .contexts
+            .get(key)
+            .map(|stored| stored.index.records())
+    }
+
+    pub(crate) fn add_index_validation_reads(&self, key: &ContextKey, reads: u64) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.validation_reads = stored.validation_reads.saturating_add(reads);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_validation_reads(&self, key: &ContextKey) -> u64 {
+        self.index()
+            .contexts
+            .get(key)
+            .map_or(0, |stored| stored.validation_reads)
+    }
+
+    /// One entry per stored context, most recently used first (at most
+    /// `MAX_INDEXED_CONTEXTS`), read under the index lock without IO or
+    /// touching any context's recency.
+    /// `is_open` names the open members a memory-only index leaves to
+    /// their buffers.
+    pub(crate) fn index_status(&self, is_open: &dyn Fn(&Path) -> bool) -> Vec<IndexStatusEntry> {
+        let store = self.index();
+        let mut stored: Vec<&StoredIndex> = store.contexts.values().collect();
+        stored.sort_by_key(|stored| std::cmp::Reverse(stored.last_used));
+        stored
+            .into_iter()
+            .take(MAX_INDEXED_CONTEXTS)
+            .map(|stored| IndexStatusEntry::of(stored, &store.crawl_published, is_open))
+            .collect()
+    }
+
+    /// A batch indexed `path`, a member of `key`, while the store was not
+    /// enabled.
+    pub(crate) fn note_index_memory_only(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.memory_only.insert(path.to_path_buf());
+        }
+    }
+
+    /// Once: marks the members `note_index_memory_only` named that are
+    /// still fresh without a record stale, so the next batches prove them
+    /// again (the reprove path). Returns how many.
+    pub(crate) fn restale_memory_only_members(&self, key: &ContextKey) -> usize {
+        let mut store = self.index();
+        let Some(stored) = store
+            .contexts
+            .get_mut(key)
+            .filter(|stored| !stored.memory_only.is_empty())
+        else {
+            return 0;
+        };
+        let named = std::mem::take(&mut stored.memory_only);
+        let unrecorded = stored.unrecorded_fresh_among(&named);
+        for path in &unrecorded {
+            stored.index.mark_stale(path);
+        }
+        unrecorded.len()
+    }
+
+    /// The publication of `path`, a member of `key`, was refused for room.
+    pub(crate) fn note_index_awaiting_room(&self, key: &ContextKey, path: &Path) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.awaiting_room.insert(path.to_path_buf());
+        }
+    }
+
+    /// An extracted member of `key` found no memory to publish (13b-3).
+    pub(crate) fn note_index_publication_refused(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.publications_refused = stored.publications_refused.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn index_room_wait_failed(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.room_wait_failed)
+    }
+
+    pub(crate) fn set_index_room_wait_failed(&self, key: &ContextKey, failed: bool) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.room_wait_failed = failed;
+        }
+    }
+
+    pub(crate) fn index_is_awaiting_room(&self, key: &ContextKey) -> bool {
+        self.index().contexts.get(key).is_some_and(|stored| {
+            !stored
+                .unrecorded_fresh_among(&stored.awaiting_room)
+                .is_empty()
+        })
+    }
+
+    /// The members `note_index_awaiting_room` named that are still fresh
+    /// without a record (0 when none).
+    pub(crate) fn index_awaiting_room(&self, key: &ContextKey) -> usize {
+        self.index().contexts.get(key).map_or(0, |stored| {
+            stored.unrecorded_fresh_among(&stored.awaiting_room).len()
+        })
+    }
+
+    /// Once the store has room again: marks the members
+    /// `index_awaiting_room` counts stale, so the next batches prove them
+    /// (reuse, else extraction). Returns how many.
+    pub(crate) fn restale_awaiting_room(&self, key: &ContextKey) -> usize {
+        let mut store = self.index();
+        let Some(stored) = store
+            .contexts
+            .get_mut(key)
+            .filter(|stored| !stored.awaiting_room.is_empty())
+        else {
+            return 0;
+        };
+        let named = std::mem::take(&mut stored.awaiting_room);
+        let unrecorded = stored.unrecorded_fresh_among(&named);
+        for path in &unrecorded {
+            stored.index.mark_stale(path);
+        }
+        unrecorded.len()
+    }
+
     pub(crate) fn mark_index_stale(&self, key: &ContextKey, path: &Path) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
             stored.index.mark_stale(path);
+            stored.awaiting_room.remove(path);
+            stored.memory_only.remove(path);
         }
+    }
+
+    /// The membership is recomputed by the next batch.
+    pub(crate) fn mark_index_membership_dirty(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.dirty = true;
+        }
+    }
+
+    pub(crate) fn baseline_hint(
+        &self,
+        key: &ContextKey,
+    ) -> Option<crate::workspace::baseline::BaselineHint> {
+        self.index()
+            .contexts
+            .get(key)
+            .and_then(|stored| stored.baseline.clone())
+    }
+
+    /// Install `hint` as `key`'s baseline and return the one it replaces;
+    /// `None` when `key` holds no index any more, so the caller still owns
+    /// the hint's hold.
+    pub(crate) fn set_baseline_hint(
+        &self,
+        key: &ContextKey,
+        hint: crate::workspace::baseline::BaselineHint,
+    ) -> Option<Option<crate::workspace::baseline::BaselineHint>> {
+        self.index()
+            .contexts
+            .get_mut(key)
+            .map(|stored| stored.baseline.replace(hint))
+    }
+
+    /// Drop `key`'s baseline if it is still snapshot `id`; returns it.
+    pub(crate) fn drop_baseline_hint(
+        &self,
+        key: &ContextKey,
+        id: pascal_cache::SnapshotId,
+    ) -> Option<crate::workspace::baseline::BaselineHint> {
+        let mut store = self.index();
+        let stored = store.contexts.get_mut(key)?;
+        if stored
+            .baseline
+            .as_ref()
+            .is_some_and(|hint| hint.header().id() == id)
+        {
+            stored.baseline.take()
+        } else {
+            None
+        }
+    }
+
+    /// Whether `key` was not sealed (or found unchanged) within `interval`
+    /// before `now`.
+    pub(crate) fn baseline_seal_due(
+        &self,
+        key: &ContextKey,
+        now: std::time::Instant,
+        interval: std::time::Duration,
+    ) -> bool {
+        self.index().contexts.get(key).is_some_and(|stored| {
+            stored
+                .last_seal
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+        })
+    }
+
+    pub(crate) fn note_baseline_seal(&self, key: &ContextKey, now: std::time::Instant) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.last_seal = Some(now);
+        }
+    }
+
+    /// Whether this process looked for a snapshot to start `key`'s index
+    /// from; `true` when `key` holds no index (nothing to start).
+    pub(crate) fn baseline_adoption_tried(&self, key: &ContextKey) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_none_or(|stored| stored.hint_tried)
+    }
+
+    pub(crate) fn note_baseline_adoption_tried(&self, key: &ContextKey) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.hint_tried = true;
+        }
+    }
+
+    /// The holds evicted contexts left, for a store job to release.
+    pub(crate) fn take_released_holds(&self) -> Vec<pascal_cache::SnapshotId> {
+        std::mem::take(&mut self.index().released)
     }
 
     /// `read` runs under the index lock: it must not call back into the cache.
@@ -6786,6 +8386,64 @@ impl ProjectCache {
     /// Whether the store holds an index of `key`; its use is not recorded.
     pub(crate) fn holds_index(&self, key: &ContextKey) -> bool {
         self.index().contexts.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_index_membership_context_for_test(
+        &self,
+        key: &ContextKey,
+        context: pascal_cache::Digest,
+    ) {
+        if let Some(stored) = self.index().contexts.get_mut(key) {
+            stored.membership.context = Some(context);
+        }
+    }
+
+    /// Whether no index is stored under `key` but one is stored under a key
+    /// that differs from it only in the runtime selection (A8): `key`'s
+    /// context resolved again under another selection.
+    pub(crate) fn index_moved_by_selection(&self, key: &ContextKey) -> bool {
+        let store = self.index();
+        !store.contexts.contains_key(key)
+            && store
+                .contexts
+                .keys()
+                .any(|old| old.differs_only_in_selection(key))
+    }
+
+    /// A8: when no index is stored under `key`, the most recently used
+    /// index stored under a key that differs from it only in the runtime
+    /// selection (the same project resolved before `pascal/selectProject`
+    /// selected it) moves to `key` instead of being built again, provided
+    /// its membership was computed for the persisted context `context`.
+    /// Otherwise it is left to eviction. The directory owners recorded
+    /// against the old key are forgotten, as on eviction. Returns whether
+    /// an index moved.
+    pub(crate) fn rekey_index_selection(
+        &self,
+        key: &ContextKey,
+        context: pascal_cache::Digest,
+    ) -> bool {
+        let mut store = self.index();
+        if store.contexts.contains_key(key) {
+            return false;
+        }
+        let Some(old) = store
+            .contexts
+            .iter()
+            .filter(|(old, _)| old.differs_only_in_selection(key))
+            .max_by_key(|(_, stored)| stored.last_used)
+            .filter(|(_, stored)| stored.membership.context == Some(context))
+            .map(|(old, _)| old.clone())
+        else {
+            return false;
+        };
+        let Some(stored) = store.contexts.remove(&old) else {
+            return false;
+        };
+        store.contexts.insert(key.clone(), stored);
+        store.owners.retain(|_, owner| *owner != old);
+        true
     }
 
     /// Whether the store holds an index built for `anchor`.
@@ -6907,8 +8565,28 @@ impl ProjectCache {
         }
     }
 
+    /// `path` changed: neither it nor a crawl publication whose evidence
+    /// names it (or, for a listing change, its directory) is known
+    /// published any more.
+    fn forget_crawl_published(&self, path: &Path, include_parent: bool) {
+        let mut store = self.index();
+        let store = &mut *store;
+        store.crawl_published.remove(path);
+        store.over_limit.remove(path);
+        let changed = std::iter::once(path).chain(path.parent().filter(|_| include_parent));
+        for changed in changed {
+            for dependent in store.crawl_dependents.remove(changed).unwrap_or_default() {
+                store.crawl_published.remove(&dependent);
+            }
+        }
+    }
+
     fn invalidate_index_all(&self) {
         let mut store = self.index();
+        // Overflow lost which paths changed: nothing is known published.
+        store.crawl_published.clear();
+        store.crawl_dependents.clear();
+        store.over_limit.clear();
         let mut anchors = Vec::new();
         for stored in store.contexts.values_mut() {
             stored.index.mark_all_stale();
@@ -7327,6 +9005,314 @@ mod index_tests {
     }
 
     #[test]
+    fn the_largest_index_status_fits_eight_kibibytes() {
+        let cache = ProjectCache::new(1 << 30);
+        for index in 0..MAX_INDEXED_CONTEXTS {
+            let name = format!("k{index}");
+            let mut limited = membership(&["/w/A.pas"]);
+            limited.complete = false;
+            limited.packages = true;
+            limited.limit = Some("x".repeat(400));
+            cache.set_index_membership(
+                key(&name),
+                IndexAnchor::Project(PathBuf::from(format!("/{}/{name}", "d".repeat(4096)))),
+                limited,
+                usize::MAX,
+            );
+        }
+        let entries = cache.index_status(&|_| false);
+        assert_eq!(entries.len(), MAX_INDEXED_CONTEXTS);
+        for entry in &entries {
+            assert!(entry.anchor_truncated);
+            assert!(entry.gaps.len() <= 4, "{:?}", entry.gaps);
+            assert!(entry.gaps.iter().all(|gap| gap.len() <= 160));
+            assert!(!entry.complete);
+        }
+        let text = index_status_json(&entries, Default::default()).to_string();
+        assert!(text.len() <= 8192, "{} bytes", text.len());
+        assert!(text.contains("\"anchorTruncated\":true"), "{text}");
+        assert!(!text.contains("/w/A.pas"));
+    }
+
+    /// 13b-3 (A2, N1): the process's crawl publications, crawl deferrals to
+    /// the index batch and provider interfaces refused for overflowed reads
+    /// are reported beside the contexts.
+    #[test]
+    fn index_status_reports_crawl_publications_and_deferrals() {
+        let cache = ProjectCache::new(1 << 30);
+        let digest = pascal_cache::Digest::from_bytes([3; 32]);
+        cache.note_published(Path::new("/w/A.pas"), 1, digest, &[]);
+        cache.note_published(Path::new("/w/B.pas"), 1, digest, &[]);
+        cache.note_crawl_deferred(Path::new("/w/C.pas"));
+        let counts = cache.index_process_counts();
+        assert_eq!(
+            (counts.crawl_published, counts.crawl_deferred),
+            (2, 1),
+            "{counts:?}"
+        );
+        let json = index_status_json(&cache.index_status(&|_| false), counts);
+        assert_eq!(json["crawlPublished"], 2, "{json}");
+        assert_eq!(json["crawlDeferred"], 1, "{json}");
+        assert_eq!(json["providerGraphsRefused"], 0, "{json}");
+    }
+
+    fn membership_under(paths: &[&str], context: pascal_cache::Digest) -> IndexMembership {
+        IndexMembership {
+            context: Some(context),
+            ..membership(paths)
+        }
+    }
+
+    /// 13b-4 (A3): `persisted` counts the members of the context whose
+    /// units the crawl published under its digest, before any index batch.
+    #[test]
+    fn persisted_counts_crawl_publications_of_the_context() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let mine = pascal_cache::Digest::from_bytes([3; 32]);
+        let other = pascal_cache::Digest::from_bytes([4; 32]);
+        let paths = ["/w/A.pas", "/w/B.pas", "/w/C.pas", "/w/D.pas"];
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership_under(&paths, mine),
+            usize::MAX,
+        );
+        cache.note_published(Path::new("/w/A.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/B.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/C.pas"), 1, other, &[]);
+        cache.note_published(Path::new("/w/NotMember.pas"), 1, mine, &[]);
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!(counts.persisted, 2, "{counts:?}");
+        assert_eq!(counts.pending, 4, "{counts:?}");
+    }
+
+    /// 13b-4: a member published by both the index and the crawl counts
+    /// once; a Fresh member whose crawl publication is of other bytes, and
+    /// an over-limit member (no artifact), do not count.
+    #[test]
+    fn persisted_counts_each_member_once_and_only_with_an_artifact() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let mine = pascal_cache::Digest::from_bytes([3; 32]);
+        let paths = ["/w/Both.pas", "/w/OtherBytes.pas", "/w/Big.pas"];
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership_under(&paths, mine),
+            usize::MAX,
+        );
+        for path in paths {
+            assert_eq!(publish(&cache, &k, path), PublishOutcome::Indexed);
+        }
+        {
+            let mut store = cache.index();
+            let index = &mut store.contexts.get_mut(&k).unwrap().index;
+            assert!(index.set_record(
+                Path::new("/w/Both.pas"),
+                pascal_cache::Digest::from_bytes([9; 32])
+            ));
+            assert!(index.set_record(
+                Path::new("/w/Big.pas"),
+                pascal_cache::Digest::from_bytes([8; 32])
+            ));
+            index.mark_over_limit(Path::new("/w/Big.pas"));
+        }
+        cache.note_published(Path::new("/w/Both.pas"), 1, mine, &[]);
+        cache.note_published(Path::new("/w/OtherBytes.pas"), 2, mine, &[]);
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!(counts.persisted, 1, "{counts:?}");
+        assert_eq!(counts.over_limit, 1, "{counts:?}");
+    }
+
+    /// Task 10b: a member reused from the store is never counted as
+    /// extracted, not even between its publication and its mark: the
+    /// status reads the index between the two (protocol tests
+    /// `a_second_server_fills_the_index_from_the_store_without_extracting`,
+    /// `two_servers_index_the_same_workspace`).
+    #[test]
+    fn a_reused_member_is_published_reused() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        cache.set_index_membership(
+            k.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        assert_eq!(
+            cache.publish_reused_index_member(
+                &k,
+                Path::new("/w/A.pas"),
+                facts("/w/A.pas"),
+                stamps(),
+                1
+            ),
+            PublishOutcome::Indexed
+        );
+        let counts = cache.index_status(&|_| false)[0].counts;
+        assert_eq!((counts.reused, counts.extracted), (1, 0), "{counts:?}");
+    }
+
+    /// A8 (13b-6 fix round 1): an index re-keyed for a new selection moves
+    /// only when its membership was computed for the same persisted
+    /// context, and the most recently used of several candidates moves.
+    #[test]
+    fn a_selection_rekey_checks_the_context_and_takes_the_latest_index() {
+        let cache = ProjectCache::new(1 << 30);
+        let base = key("a");
+        let selected = base
+            .clone()
+            .with_selection_for_test(Path::new("/w"), Path::new("/w/A.dproj"));
+        let older = base
+            .clone()
+            .with_selection_for_test(Path::new("/w"), Path::new("/w/Old.dproj"));
+        let context = pascal_cache::Digest::from_bytes([1; 32]);
+        let with_context = |paths: &[&str]| IndexMembership {
+            context: Some(context),
+            ..membership(paths)
+        };
+        cache.set_index_membership(
+            older.clone(),
+            anchor("a"),
+            with_context(&["/w/O.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            base.clone(),
+            anchor("a"),
+            with_context(&["/w/U.pas"]),
+            usize::MAX,
+        );
+        assert!(cache.index_moved_by_selection(&selected));
+        assert!(!cache.rekey_index_selection(&selected, pascal_cache::Digest::from_bytes([2; 32])));
+        assert!(cache.holds_index(&base) && !cache.holds_index(&selected));
+        assert!(cache.rekey_index_selection(&selected, context));
+        assert!(
+            !cache.holds_index(&base),
+            "the most recently used index moved"
+        );
+        assert!(cache.holds_index(&older));
+        let moved = cache
+            .read_index(&selected, |index, _| index.member_paths())
+            .unwrap();
+        assert_eq!(moved, [PathBuf::from("/w/U.pas")]);
+        assert!(!cache.index_moved_by_selection(&selected));
+    }
+
+    #[test]
+    fn index_status_counts_members_by_state() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let paths = [
+            "/w/Fresh.pas",
+            "/w/Refused.pas",
+            "/w/Limited.pas",
+            "/w/Pending.pas",
+        ];
+        cache.set_index_membership(k.clone(), anchor("a"), membership(&paths), usize::MAX);
+        assert_eq!(publish(&cache, &k, "/w/Fresh.pas"), PublishOutcome::Indexed);
+        {
+            let mut store = cache.index();
+            let stored = store.contexts.get_mut(&k).unwrap();
+            stored
+                .index
+                .refuse(Path::new("/w/Refused.pas"), "r".to_owned());
+            stored
+                .index
+                .limit(Path::new("/w/Limited.pas"), LimitCause::Facts);
+            stored.validation_reads = 7;
+        }
+        let entries = cache.index_status(&|_| false);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(
+            (
+                entry.counts.members,
+                entry.counts.fresh,
+                entry.counts.refused,
+                entry.counts.limited,
+                entry.counts.pending
+            ),
+            (4, 1, 1, 1, 1)
+        );
+        assert_eq!(entry.validation_reads, 7);
+        assert_eq!(entry.snapshot, "none");
+        assert!(entry.membership_complete);
+        assert!(!entry.complete, "a pending member is not complete");
+        assert!(
+            entry
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("1 units could not be indexed")),
+            "{:?}",
+            entry.gaps
+        );
+        let json = index_status_json(&entries, Default::default());
+        let context = &json["contexts"][0];
+        assert_eq!(json["schema"], 1);
+        assert_eq!(context["anchor"]["project"], "file:///anchors/a");
+        assert_eq!(context["anchorTruncated"], false);
+        assert_eq!(context["members"], 4);
+        assert_eq!(context["pending"], 1);
+        assert_eq!(context["refused"], 1);
+        assert_eq!(context["limited"], 1);
+        assert_eq!(context["snapshot"], "none");
+        assert_eq!(context["validationReads"], 7);
+        assert!(!json.to_string().contains("Fresh.pas"));
+    }
+
+    /// Without persistence an open member is answered from its buffer and
+    /// never indexed (l4d-33): it does not hold `complete` back, or a
+    /// memory-only index with an open member would never be complete
+    /// (protocol test `runtime_disable_is_acknowledged_then_performs_no_cache_io`).
+    #[test]
+    fn index_status_does_not_wait_for_open_members() {
+        let cache = ProjectCache::new(1 << 30);
+        let k = key("a");
+        let paths = ["/w/Fresh.pas", "/w/Open.pas", "/w/Pending.pas"];
+        cache.set_index_membership(k.clone(), anchor("a"), membership(&paths), usize::MAX);
+        assert_eq!(publish(&cache, &k, "/w/Fresh.pas"), PublishOutcome::Indexed);
+        let is_open = |path: &Path| path == Path::new("/w/Open.pas");
+        let entry = &cache.index_status(&is_open)[0];
+        assert_eq!(entry.counts.pending, 2);
+        assert!(!entry.complete, "Pending.pas is still to index");
+        assert_eq!(
+            publish(&cache, &k, "/w/Pending.pas"),
+            PublishOutcome::Indexed
+        );
+        let entry = &cache.index_status(&is_open)[0];
+        assert_eq!(entry.counts.pending, 1, "the count stays the index's own");
+        assert!(entry.complete, "only the open member is pending");
+        assert!(!cache.index_status(&|_| false)[0].complete);
+    }
+
+    #[test]
+    fn index_status_lists_the_most_recently_used_context_first() {
+        let cache = ProjectCache::new(1 << 30);
+        for name in ["a", "b"] {
+            cache.set_index_membership(
+                key(name),
+                anchor(name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
+        }
+        cache.read_index(&key("a"), |_, _| ());
+        let entries = cache.index_status(&|_| false);
+        assert_eq!(entries[0].anchor, "file:///anchors/a");
+        assert_eq!(entries[1].anchor, "file:///anchors/b");
+        assert!(!entries[0].complete, "the member is still pending");
+        assert_eq!(entries[0].counts.pending, 1);
+        assert!(
+            index_status_json(&[], Default::default())["contexts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn index_bytes_are_charged_before_insertion_and_released_on_removal() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
@@ -7334,6 +9320,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let base = cache.stats().reserved_index_bytes;
         assert_eq!(base, membership_cost(&["/w/A.pas", "/w/B.pas"]));
@@ -7346,12 +9333,17 @@ mod index_tests {
         assert_eq!(cache.stats().reserved_index_bytes, base + expected);
         assert_eq!(cache.stats().reserved_bytes(), base + expected);
         // A's names stay with the context until its interner is compacted.
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/B.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/B.pas"]),
+            usize::MAX,
+        );
         assert_eq!(
             cache.stats().reserved_index_bytes,
             membership_cost(&["/w/B.pas"]) + names(&facts("/w/A.pas"))
         );
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&[]), usize::MAX);
         assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
 
@@ -7359,7 +9351,12 @@ mod index_tests {
     fn a_member_over_the_quarter_share_is_left_unindexed_with_a_gap() {
         let cache = ProjectCache::new(4096);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let held = cache.stats().reserved_index_bytes;
         let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
         assert_eq!(
@@ -7379,11 +9376,21 @@ mod index_tests {
         let cache = ProjectCache::new(share * 4);
         let (a, b, third) = (key("a"), key("b"), key("c"));
         for (key, name) in [(&a, "a"), (&b, "b")] {
-            cache.set_index_membership(key.clone(), anchor(name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key.clone(),
+                anchor(name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
             assert_eq!(publish(&cache, key, "/w/A.pas"), PublishOutcome::Indexed);
         }
         cache.read_index(&a, |_, _| ());
-        cache.set_index_membership(third.clone(), anchor("c"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            third.clone(),
+            anchor("c"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(cache.indexed_context_count(), 3);
         assert_eq!(publish(&cache, &third, "/w/A.pas"), PublishOutcome::Indexed);
         assert_eq!(cache.indexed_context_count(), 2);
@@ -7406,7 +9413,12 @@ mod index_tests {
         let cache = ProjectCache::new(1 << 30);
         for index in 0..=MAX_INDEXED_CONTEXTS {
             let name = format!("k{index}");
-            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key(&name),
+                anchor(&name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
         }
         assert_eq!(cache.indexed_context_count(), MAX_INDEXED_CONTEXTS);
         assert!(cache.read_index(&key("k0"), |_, _| ()).is_none());
@@ -7421,8 +9433,18 @@ mod index_tests {
     fn two_contexts_sharing_a_document_each_charge_their_member() {
         let cache = ProjectCache::new(1 << 30);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         let c = charge(&facts("/w/A.pas"));
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
@@ -7442,7 +9464,12 @@ mod index_tests {
     fn a_successful_publish_clears_the_memory_gap() {
         let cache = ProjectCache::new(4096);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let big = facts_with("/w/A.pas", &"x".repeat(2048), Vec::new());
         assert_eq!(
             cache.publish_index_member(&a, Path::new("/w/A.pas"), big, stamps(), 1),
@@ -7457,7 +9484,12 @@ mod index_tests {
     fn a_membership_that_cannot_be_charged_records_the_gap() {
         let cache = ProjectCache::new(256);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert!(cache.index_memory_exhausted(&a));
         assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
@@ -7468,7 +9500,12 @@ mod index_tests {
         let c = charge(&facts("/w/A.pas"));
         let cache = ProjectCache::new((m + c + 16) * INDEX_BUDGET_SHARE);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
         let held = cache.stats().reserved_index_bytes;
         let grown = (0..20)
@@ -7476,7 +9513,7 @@ mod index_tests {
             .chain(["/w/A.pas".to_owned()])
             .collect::<Vec<_>>();
         let grown = grown.iter().map(String::as_str).collect::<Vec<_>>();
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown));
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&grown), usize::MAX);
         let (paths, complete, members) = cache
             .read_index(&a, |index, membership| {
                 (
@@ -7500,7 +9537,12 @@ mod index_tests {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::NotAMember);
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         assert_eq!(publish(&cache, &a, "/w/Z.pas"), PublishOutcome::NotAMember);
         assert_eq!(cache.stats().reserved_index_bytes, base);
@@ -7510,7 +9552,12 @@ mod index_tests {
     fn refusing_and_replacing_a_member_releases_its_old_charge() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         let base = cache.stats().reserved_index_bytes;
         publish(&cache, &a, "/w/A.pas");
         publish(&cache, &a, "/w/A.pas");
@@ -7533,6 +9580,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let base = cache.stats().reserved_index_bytes;
         publish(&cache, &a, "/w/A.pas");
@@ -7553,7 +9601,12 @@ mod index_tests {
     fn invalidating_a_member_path_marks_it_stale_and_bumps_the_generation() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         publish(&cache, &a, "/w/A.pas");
         assert!(unverified(&cache, &a).is_empty());
         cache.take_index_requests();
@@ -7575,7 +9628,7 @@ mod index_tests {
             (&b, "b", "/w/A.pas"),
             (&other, "o", "/w/O.pas"),
         ] {
-            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]));
+            cache.set_index_membership(key.clone(), anchor(name), membership(&[path]), usize::MAX);
             publish(&cache, key, path);
         }
         cache.take_index_requests();
@@ -7617,7 +9670,7 @@ mod index_tests {
         let a = key("a");
         let mut recorded = membership(&["/w/A.pas"]);
         recorded.scopes = vec![(scope, generation)];
-        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        cache.set_index_membership(a.clone(), anchor("a"), recorded, usize::MAX);
         assert!(cache.index_membership_current(&a));
         cache.invalidate_file_contents(&dir.join("New.pas"));
         assert!(
@@ -7642,7 +9695,7 @@ mod index_tests {
         let a = key("a");
         let mut recorded = membership(&["/w/A.pas"]);
         recorded.scopes = vec![(scope, generation)];
-        cache.set_index_membership(a.clone(), anchor("a"), recorded);
+        cache.set_index_membership(a.clone(), anchor("a"), recorded, usize::MAX);
         // Keep the catalogue current so only the membership's flag decides.
         cache.invalidate_index(&dir, true);
         assert!(!cache.index_membership_current(&a));
@@ -7652,7 +9705,12 @@ mod index_tests {
     fn a_listing_change_leaves_unrelated_memberships_current() {
         let cache = ProjectCache::new(1 << 30);
         let a = key("a");
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert!(cache.index_membership_current(&a));
         cache.invalidate_path(Path::new("/elsewhere/New.pas"));
         assert!(cache.index_membership_current(&a));
@@ -7666,6 +9724,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas"]),
+            usize::MAX,
         );
         let slots = vec![None, Some(PathBuf::from("/w/shared.inc"))];
         let with_include = facts_with("/w/A.pas", "thing", slots);
@@ -7679,8 +9738,18 @@ mod index_tests {
     fn overflow_marks_every_member_stale_and_clears_owners() {
         let cache = ProjectCache::new(1 << 30);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&["/w/B.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/B.pas"]),
+            usize::MAX,
+        );
         publish(&cache, &a, "/w/A.pas");
         publish(&cache, &b, "/w/B.pas");
         cache.remember_owner(PathBuf::from("/w"), a.clone());
@@ -7720,6 +9789,7 @@ mod index_tests {
             a.clone(),
             anchor("a"),
             membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+            usize::MAX,
         );
         let (count, limited, complete) = cache
             .read_index(&a, |index, membership| {
@@ -7738,18 +9808,64 @@ mod index_tests {
     }
 
     #[test]
+    fn max_workspace_units_bounds_the_membership() {
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas", "/w/B.pas", "/w/C.pas"]),
+            2,
+        );
+        let (paths, limit, complete) = cache
+            .read_index(&a, |index, membership| {
+                (
+                    index.member_paths().len(),
+                    membership.limit.clone(),
+                    membership.complete,
+                )
+            })
+            .unwrap();
+        assert_eq!(paths, 2);
+        assert!(!complete);
+        assert_eq!(limit.as_deref(), Some("more than 2 documents"));
+        cache.set_index_unit_limit_for_test(1);
+        let b = key("b");
+        cache.set_index_membership(
+            b.clone(),
+            anchor("b"),
+            membership(&["/w/A.pas", "/w/B.pas"]),
+            5,
+        );
+        assert_eq!(
+            cache.read_index(&b, |index, _| index.member_paths().len()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn the_index_lock_is_never_held_with_state() {
         let cache = ProjectCache::new(1 << 20);
         let (a, b) = (key("a"), key("b"));
-        cache.set_index_membership(a.clone(), anchor("a"), membership(&["/w/A.pas"]));
+        cache.set_index_membership(
+            a.clone(),
+            anchor("a"),
+            membership(&["/w/A.pas"]),
+            usize::MAX,
+        );
         assert_eq!(publish(&cache, &a, "/w/A.pas"), PublishOutcome::Indexed);
         cache.invalidate_path(Path::new("/w/A.pas"));
         cache.invalidate_after_overflow();
         for index in 0..=MAX_INDEXED_CONTEXTS {
             let name = format!("k{index}");
-            cache.set_index_membership(key(&name), anchor(&name), membership(&["/w/A.pas"]));
+            cache.set_index_membership(
+                key(&name),
+                anchor(&name),
+                membership(&["/w/A.pas"]),
+                usize::MAX,
+            );
         }
-        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]));
+        cache.set_index_membership(b.clone(), anchor("b"), membership(&[]), usize::MAX);
         assert!(
             cache
                 .read_index(&b, |_, _| HELD_INDEX.with(std::cell::Cell::get))

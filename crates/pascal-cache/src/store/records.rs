@@ -420,44 +420,7 @@ impl Store {
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             ensure_live(&transaction, self.scope)?;
-            let stored = match read_record_row(&transaction, self.scope, id) {
-                Ok(Some(stored)) => stored,
-                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-                Err(error) => return classify_read(&error).map(Lookup::Miss),
-            };
-            if stored.lifecycle != LIVE {
-                return Ok(Lookup::Miss(Miss::Retired));
-            }
-            let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Member)));
-            let (Ok(binding_count), Ok(content_bytes)) = (
-                u64::try_from(stored.binding_count),
-                u64::try_from(stored.content_bytes),
-            ) else {
-                return malformed;
-            };
-            if binding_count > MAX_MEMBER_BINDINGS as u64
-                || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
-                || stored.header.len() > MAX_MANIFEST_BYTES
-            {
-                return malformed;
-            }
-            let Ok(member) = decode_member_header(&stored.header) else {
-                return malformed;
-            };
-            if path_key(&member.source.canonical) != stored.source_key
-                || digest_column(member.artifact) != stored.artifact_id
-                || digest_column(member.member_evidence) != stored.member_evidence
-            {
-                return malformed;
-            }
-            Ok(Lookup::Hit(MemberRecordHeader {
-                scope: self.scope,
-                record_id: id,
-                member,
-                encoded_header: stored.header,
-                binding_count,
-                content_bytes,
-            }))
+            member_record_header(&transaction, self.scope, id)
         })
     }
 
@@ -477,6 +440,54 @@ impl Store {
             },
         ))
     }
+}
+
+/// `Store::open_member_record` within a transaction that checked the scope
+/// is live.
+pub(super) fn member_record_header(
+    transaction: &Connection,
+    scope: Scope,
+    id: Digest,
+) -> Result<Lookup<MemberRecordHeader>, Bypass> {
+    super::count_record_open();
+    let stored = match read_record_row(transaction, scope, id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+        Err(error) => return classify_read(&error).map(Lookup::Miss),
+    };
+    if stored.lifecycle != LIVE {
+        return Ok(Lookup::Miss(Miss::Retired));
+    }
+    let malformed = Ok(Lookup::Miss(Miss::Malformed(Malformed::Member)));
+    let (Ok(binding_count), Ok(content_bytes)) = (
+        u64::try_from(stored.binding_count),
+        u64::try_from(stored.content_bytes),
+    ) else {
+        return malformed;
+    };
+    if binding_count > MAX_MEMBER_BINDINGS as u64
+        || content_bytes > MAX_ARTIFACT_CONTENT_BYTES as u64
+        || stored.header.len() > MAX_MANIFEST_BYTES
+    {
+        return malformed;
+    }
+    let Ok(member) = decode_member_header(&stored.header) else {
+        return malformed;
+    };
+    if path_key(&member.source.canonical) != stored.source_key
+        || digest_column(member.artifact) != stored.artifact_id
+        || digest_column(member.member_evidence) != stored.member_evidence
+    {
+        return malformed;
+    }
+    Ok(Lookup::Hit(MemberRecordHeader {
+        scope,
+        record_id: id,
+        member,
+        encoded_header: stored.header,
+        binding_count,
+        content_bytes,
+    }))
 }
 
 /// The rows of one record: bindings whose `kind`, `outcome`, `target_key`

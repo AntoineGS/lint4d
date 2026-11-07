@@ -4,7 +4,7 @@ mod common;
 use common::private_tempdir;
 
 use pascal_cache::{
-    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, ExpandedArtifactKey,
+    ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest, ExpandedArtifactKey,
     IncludeOccurrence, IncludeOutcome, Integrity, LocalArtifactKey, Lookup, MAX_MANIFEST_BYTES,
     MAX_WAIT, Malformed, Mismatch, Miss, Namespace, Published, RootMismatch, SourceContent, Store,
     StoreLimits, TooLarge,
@@ -32,7 +32,7 @@ fn key(text: &str) -> LocalArtifactKey {
 }
 
 fn raw(directory: &Path) -> Connection {
-    let connection = Connection::open(directory.join("analysis.sqlite3")).unwrap();
+    let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }

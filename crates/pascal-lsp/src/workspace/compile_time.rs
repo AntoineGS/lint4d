@@ -117,7 +117,13 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
         if !shareable {
             return;
         }
-        let reads = self.capture.snapshot().restricted_to(&graph.observations);
+        let probes = crate::project_cache::dedup_probes(probes);
+        // The trace's directories too: a reusing session reports them
+        // (`replay_trace`), so its evidence needs their listings even when
+        // this session's report had deduplicated them away (rootcause2 U1).
+        let reads = self
+            .capture
+            .restricted_to(graph.observations.iter().chain(graph.trace.iter()));
         self.cache
             .put_provider_graph(self.configuration, key, graph, probes, reads);
     }
@@ -154,7 +160,9 @@ impl pascal_core::SharedIncludeFailures for CachedIncludeFailures {
                 (!overflowed).then(|| (key.clone(), editor_state));
             return None;
         };
-        self.capture.replay_distinct(&hit.reads);
+        // Stored with no overflow, so the replay adds only the reads this
+        // session lacks (D29 dedup) and never copies an overflow.
+        self.capture.replay(&hit.reads);
         Some(hit.failure)
     }
 
@@ -181,16 +189,19 @@ impl pascal_core::SharedIncludeFailures for CachedIncludeFailures {
             shareable = false;
             None
         });
-        let session = self.capture.snapshot();
+        let (overflowed, editor_state) = self.capture.flags();
         // An overflowed capture may lack what the lookup listed.
-        if !shareable || session.overflowed {
+        if !shareable || overflowed {
             return;
         }
-        let mut reads = session.restricted_to(&observations);
+        let mut reads = self.capture.restricted_to(&observations);
+        // A read the lookup named may be missing.
+        if reads.overflowed {
+            return;
+        }
         // Session-wide flags are not the lookup's: only editor state it
         // met itself carries over.
-        reads.overflowed = false;
-        reads.editor_state = session.editor_state && !editor_state_before;
+        reads.editor_state = editor_state && !editor_state_before;
         self.cache.put_include_failure(
             self.configuration,
             Arc::clone(&self.context),
@@ -249,6 +260,8 @@ fn provider_graph_configuration(
 struct Control<'a> {
     cancel: &'a AtomicBool,
     budget: Option<&'a ReconciliationBudget>,
+    /// An index member's extraction deadline (`Workspace::member_deadline`).
+    deadline: Option<std::time::Instant>,
 }
 
 #[cfg(test)]
@@ -280,6 +293,11 @@ impl Control<'_> {
         }
         if self.cancel.load(Ordering::Relaxed) {
             Err(super::CANCELLATION_MESSAGE.into())
+        } else if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            Err(super::indexing::MEMBER_DEADLINE_MESSAGE.into())
         } else {
             Ok(())
         }
@@ -666,6 +684,7 @@ pub(super) fn selected_import_header(
     let control = Control {
         cancel,
         budget: None,
+        deadline: None,
     };
     control.check()?;
     let input = workspace.analysis_input();
@@ -980,7 +999,11 @@ pub(super) fn expand_with_limits(
 ) -> Result<ExpansionResult, String> {
     let directory_limit = limits.directory_entries;
     let limits = limits.expansion;
-    let control = Control { cancel, budget };
+    let control = Control {
+        cancel,
+        budget,
+        deadline: workspace.member_deadline,
+    };
     control.check()?;
     #[cfg(test)]
     if TEST_EXPANSION_FAILURE.with(|value| {
@@ -1021,7 +1044,7 @@ pub(super) fn expand_with_limits(
         .get(key)
         .ok_or("project context was not retained")?;
     let context = state.context.clone();
-    let input = workspace.analysis_input();
+    let input = workspace.session_source_input();
     let source_hash = if input.overlays.contains_key(uri) {
         crate::project_cache::overlay_content_hash(source)
     } else {
@@ -1516,6 +1539,87 @@ mod tests {
     use crate::NavigationTarget;
     use lsp_types::Position;
     use pascal_project::delphi_overrides::OverrideSession;
+
+    /// 13c-1 review: a read the capture bound dropped and only the graph's
+    /// trace names still makes the graph's reads overflowed (`put` stores
+    /// the reads of observations and trace), so `put_provider_graph`
+    /// refuses it; no later session reuses it and each compiles the
+    /// provider itself.
+    #[test]
+    fn a_read_dropped_by_the_capture_bound_and_named_by_the_trace_refuses_the_graph() {
+        use pascal_core::SourceId;
+        use pascal_core::compile_time::{ProviderGraphKey, SharedProviderGraph};
+        use pascal_core::resolver::{DirectoryListing, ResolutionObservation};
+        let directory = |path: &str| ResolutionObservation::Directory {
+            path: path.into(),
+            entry: pascal_project::ProjectPathEntry::configured(path.into()),
+            stamp: None,
+            complete: true,
+            listed: true,
+        };
+        let listing = DirectoryListing {
+            files: Vec::new(),
+            directories: Vec::new(),
+            stamp: None,
+            complete: true,
+        };
+        let key = ProviderGraphKey {
+            source: SourceId::new("/p/Prov.pas"),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        };
+        let graph = |trace: Vec<ResolutionObservation>| {
+            Arc::new(SharedProviderGraph {
+                occurrence: OccurrenceId(1),
+                graph: None,
+                observations: Arc::new(vec![directory("/w/obs")]),
+                warnings: Default::default(),
+                dependencies: Default::default(),
+                scanned: Default::default(),
+                children: Default::default(),
+                trace: Arc::new(trace),
+                revision: pascal_core::SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 1,
+                },
+                lookup: (0, 0),
+                names: None,
+                retained_bytes: 100,
+            })
+        };
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let capture = Arc::new(crate::workspace::capture::ReadCapture::default());
+        crate::workspace::capture::set_capture_bound_for_test(Some(1));
+        // The first read fits; `/w/gen` is dropped.
+        capture.listed(std::path::Path::new("/w/obs"), &listing, false);
+        capture.listed(std::path::Path::new("/w/gen"), &listing, false);
+        crate::workspace::capture::set_capture_bound_for_test(None);
+        assert!(capture.snapshot().overflowed);
+        let graphs = CachedProviderGraphs {
+            cache: cache.clone(),
+            configuration: 3,
+            overlays: Default::default(),
+            capture: Arc::clone(&capture),
+        };
+        use pascal_core::compile_time::SharedProviderGraphs;
+        // Named by observations alone, the dropped read is not missing.
+        graphs.put(key.clone(), graph(Vec::new()));
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 0);
+        // Named by the trace, it is: the graph is refused and counted.
+        let traced = ProviderGraphKey {
+            source: SourceId::new("/p/Traced.pas"),
+            ..key.clone()
+        };
+        graphs.put(traced.clone(), graph(vec![directory("/w/gen")]));
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 1);
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert!(graphs.get(&traced).is_none(), "the consumer compiles it");
+        assert!(graphs.get(&key).is_some());
+    }
 
     fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
@@ -2047,6 +2151,86 @@ mod tests {
         );
     }
 
+    /// Rootcause A1: a provider whose interface looks up many units over a
+    /// search path is replayed with one listing per directory, so a session
+    /// that reuses it captures every directory once.
+    #[test]
+    fn a_reused_provider_replays_one_listing_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>s1;s2;s3</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .unwrap();
+        for directory in ["s1", "s2", "s3"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let units: Vec<String> = (0..12).map(|n| format!("B{n}")).collect();
+        for unit in &units {
+            std::fs::write(
+                root.join("s3").join(format!("{unit}.pas")),
+                format!("unit {unit}; interface const {unit}Value = 1; implementation end."),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("s3/A.pas"),
+            format!(
+                "unit A; interface uses {}; const Flag = 8; implementation end.",
+                units.join(", ")
+            ),
+        )
+        .unwrap();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ENDIF} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let first = expand_main(&workspace, &uri, source, &key);
+        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        let second = expand_main(&workspace, &uri, source, &key);
+        for result in [&first, &second] {
+            let reads = result.expanded.reads.as_ref().unwrap();
+            assert!(!reads.overflowed);
+            for (n, listing) in reads.listings.iter().enumerate() {
+                assert!(
+                    !reads.listings[..n].contains(listing),
+                    "{listing:?} twice in {:?}",
+                    reads.listings
+                );
+            }
+            for (n, payload) in reads.payloads.iter().enumerate() {
+                assert!(!reads.payloads[..n].contains(payload), "{payload:?} twice");
+            }
+        }
+        let directories = |result: &ExpansionResult| {
+            let mut listed: Vec<_> = result
+                .expanded
+                .reads
+                .as_ref()
+                .unwrap()
+                .listings
+                .iter()
+                .map(|listing| listing.directory.clone())
+                .collect();
+            listed.sort();
+            listed
+        };
+        assert_eq!(directories(&first), directories(&second));
+        assert!(
+            directories(&first)
+                .iter()
+                .any(|directory| directory.ends_with("s1")),
+            "{:?}",
+            directories(&first)
+        );
+    }
+
     /// l4d-4nbs D44: a cached expansion keeps a compact projection of its
     /// session, not the declaration state and provider graphs it compiled, so
     /// what it retains is a small multiple of the source it covers.
@@ -2543,5 +2727,61 @@ mod tests {
                 .any(|gap| gap.reason.contains("include expansion is incomplete"))
         );
         assert!(partial.value.iter().all(|location| location.uri == main));
+    }
+
+    /// 13b-5 (A4): a passed member deadline stops the session as
+    /// cancellation does, under its own message; cancellation comes first,
+    /// so a cancelled member is never taken for one past its deadline.
+    #[test]
+    fn a_passed_member_deadline_stops_the_session_after_cancellation() {
+        let cancel = AtomicBool::new(false);
+        let passed = Control {
+            cancel: &cancel,
+            budget: None,
+            deadline: Some(std::time::Instant::now()),
+        };
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::indexing::MEMBER_DEADLINE_MESSAGE
+        );
+        assert!(passed.is_cancelled());
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::CANCELLATION_MESSAGE
+        );
+        let running = AtomicBool::new(false);
+        let ahead = Control {
+            cancel: &running,
+            budget: None,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3_600)),
+        };
+        assert!(ahead.check().is_ok());
+        assert!(!ahead.is_cancelled());
+    }
+
+    /// 13b-5 (A4): an expansion in a view with a passed member deadline
+    /// fails with the deadline's message; without a deadline it succeeds.
+    #[test]
+    fn an_expansion_past_the_member_deadline_fails_with_its_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("x.inc"), "const X = 1;\n").unwrap();
+        let source = "unit Main; interface {$I x.inc} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let limits = workspace.include_expansion_limits();
+        let cancel = AtomicBool::new(false);
+        workspace.member_deadline = Some(std::time::Instant::now());
+        let error = expand(&workspace, &uri, source, &key, limits, &cancel, None).unwrap_err();
+        assert_eq!(error, super::super::indexing::MEMBER_DEADLINE_MESSAGE);
+        workspace.member_deadline = None;
+        assert!(expand(&workspace, &uri, source, &key, limits, &cancel, None).is_ok());
     }
 }

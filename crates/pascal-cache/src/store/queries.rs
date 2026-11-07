@@ -10,6 +10,7 @@ use super::health::Access;
 use super::limits::{MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE};
 use super::namespaces::{LIVE, ensure_live, epoch};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
+use super::records::{MemberRecordHeader, member_record_header};
 use super::snapshots::{SnapshotHeader, SnapshotMember, snapshot_ineligible};
 use super::sqlite::{begin, classify_read};
 use crate::Digest;
@@ -73,6 +74,30 @@ impl Store {
         snapshot: &SnapshotHeader,
         source: &Path,
     ) -> Result<Lookup<SnapshotMember>, Bypass> {
+        self.with_member(snapshot, source, |_, member| Ok(member))
+    }
+
+    /// `find_member`, then `open_member_record` of the member's record, in
+    /// one read transaction (13f: a restart through a held snapshot looks
+    /// up every member this way).
+    pub fn find_member_record(
+        &self,
+        snapshot: &SnapshotHeader,
+        source: &Path,
+    ) -> Result<Lookup<(SnapshotMember, Lookup<MemberRecordHeader>)>, Bypass> {
+        self.with_member(snapshot, source, |transaction, member| {
+            let record = member_record_header(transaction, self.scope, member.record_id)?;
+            Ok((member, record))
+        })
+    }
+
+    /// `then` over the member `find_member` finds, in its transaction.
+    fn with_member<T>(
+        &self,
+        snapshot: &SnapshotHeader,
+        source: &Path,
+        then: impl FnOnce(&rusqlite::Connection, SnapshotMember) -> Result<T, Bypass>,
+    ) -> Result<Lookup<T>, Bypass> {
         self.guarded(Access::Read, || {
             if snapshot.scope != self.scope {
                 return Err(Bypass::Fenced);
@@ -90,49 +115,63 @@ impl Store {
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             ensure_live(&transaction, self.scope)?;
-            if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
-                return Ok(Lookup::Miss(miss));
+            match self.member_in(&transaction, snapshot, source)? {
+                Lookup::Hit(member) => then(&transaction, member).map(Lookup::Hit),
+                Lookup::Miss(miss) => Ok(Lookup::Miss(miss)),
             }
-            let row = transaction
-                .prepare_cached(MEMBER_QUERY)
-                .and_then(|mut statement| {
-                    statement
-                        .query_row(
-                            params![
-                                self.scope.namespace.as_bytes().as_slice(),
-                                epoch(self.scope),
-                                snapshot.id.as_bytes().as_slice(),
-                                path_key(source),
-                                LIVE
-                            ],
-                            |row| {
-                                let record = record_id(row, 1)?;
-                                let length = row.get::<_, i64>(3)?;
-                                let source_key = usize::try_from(length)
-                                    .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
-                                    .then(|| row.get::<_, Vec<u8>>(4))
-                                    .transpose()?;
-                                Ok((row.get::<_, i64>(0)?, record, source_key))
-                            },
-                        )
-                        .optional()
-                });
-            let (ordinal, record, source_key) = match row {
-                Ok(Some(row)) => row,
-                Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
-                Err(error) => return classify_read(&error).map(Lookup::Miss),
-            };
-            let (Ok(ordinal), Some(record), Some(source_key)) =
-                (u64::try_from(ordinal), record, source_key)
-            else {
-                return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
-            };
-            Ok(Lookup::Hit(SnapshotMember {
-                ordinal,
-                record_id: Digest::from_bytes(record),
-                source_key,
-            }))
         })
+    }
+
+    /// The member of `snapshot` at `source`, in a transaction that checked
+    /// the scope is live.
+    fn member_in(
+        &self,
+        transaction: &rusqlite::Connection,
+        snapshot: &SnapshotHeader,
+        source: &Path,
+    ) -> Result<Lookup<SnapshotMember>, Bypass> {
+        if let Some(miss) = snapshot_ineligible(transaction, self.scope, snapshot.id)? {
+            return Ok(Lookup::Miss(miss));
+        }
+        let row = transaction
+            .prepare_cached(MEMBER_QUERY)
+            .and_then(|mut statement| {
+                statement
+                    .query_row(
+                        params![
+                            self.scope.namespace.as_bytes().as_slice(),
+                            epoch(self.scope),
+                            snapshot.id.as_bytes().as_slice(),
+                            path_key(source),
+                            LIVE
+                        ],
+                        |row| {
+                            let record = record_id(row, 1)?;
+                            let length = row.get::<_, i64>(3)?;
+                            let source_key = usize::try_from(length)
+                                .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
+                                .then(|| row.get::<_, Vec<u8>>(4))
+                                .transpose()?;
+                            Ok((row.get::<_, i64>(0)?, record, source_key))
+                        },
+                    )
+                    .optional()
+            });
+        let (ordinal, record, source_key) = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return Ok(Lookup::Miss(Miss::Absent)),
+            Err(error) => return classify_read(&error).map(Lookup::Miss),
+        };
+        let (Ok(ordinal), Some(record), Some(source_key)) =
+            (u64::try_from(ordinal), record, source_key)
+        else {
+            return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot)));
+        };
+        Ok(Lookup::Hit(SnapshotMember {
+            ordinal,
+            record_id: Digest::from_bytes(record),
+            source_key,
+        }))
     }
 
     /// The members of `snapshot` with a precise binding to the canonical

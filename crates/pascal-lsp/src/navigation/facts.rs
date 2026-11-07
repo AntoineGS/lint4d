@@ -3,7 +3,6 @@
 //! `ParsedDocument` are in analysed coordinates, the include-expanded text
 //! when includes were expanded; the include source map turns them into
 //! source slots. Indexing calls this from `l4d-zf1b.8` on.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::{
     Origin as SymbolOrigin, ParsedDocument, ROOT_SCOPE, Region as SymbolRegion, RoutineKind, Span,
@@ -554,7 +553,14 @@ fn includes(
     facts: &mut ArtifactFacts,
 ) -> Result<(), FactError> {
     for (index, slot) in slots.iter().enumerate() {
-        budget.charge(size_of::<IncludeFact>())?;
+        let source = match &slot.outcome {
+            IncludeSlotOutcome::Expanded { source, .. } => Some(source.path.clone()),
+            IncludeSlotOutcome::Unresolved(_) => None,
+        };
+        budget.charge(
+            size_of::<IncludeFact>()
+                .saturating_add(source.as_ref().map_or(0, |path| path.as_os_str().len())),
+        )?;
         facts.includes.push(IncludeFact {
             slot: length(index + 1)?,
             parent: slot.parent,
@@ -563,6 +569,7 @@ fn includes(
                 IncludeSlotOutcome::Expanded { .. } => IncludeExpansion::Expanded,
                 IncludeSlotOutcome::Unresolved(_) => IncludeExpansion::Unresolved,
             },
+            source,
         });
     }
     Ok(())

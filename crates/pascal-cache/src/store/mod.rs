@@ -42,16 +42,14 @@ mod testing;
 mod waits;
 mod wal;
 
-pub use artifacts::{
-    ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
-};
+pub use artifacts::{ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT};
 pub use evidence::{
     EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite, ObservationBatch,
     PublishedEvidence, PublishedSet,
 };
 #[cfg(feature = "test-support")]
 pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
-pub use index::{IndexHit, IndexPage};
+pub use index::{IndexCursor, IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use maintenance::{Maintenance, Phase, StepBudget, StepReport};
@@ -73,9 +71,16 @@ pub use testing::FaultPoint;
 #[cfg(feature = "test-support")]
 pub(crate) use testing::count_operation;
 #[cfg(feature = "test-support")]
-pub use testing::store_operations_for_test;
+pub(crate) use testing::count_record_open;
+#[cfg(feature = "test-support")]
+pub use testing::{
+    record_opens_on_this_thread_for_test, store_operations_for_test,
+    store_operations_on_this_thread_for_test,
+};
 #[cfg(not(feature = "test-support"))]
 pub(crate) fn count_operation() {}
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn count_record_open() {}
 pub use waits::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 
 pub use budget::{

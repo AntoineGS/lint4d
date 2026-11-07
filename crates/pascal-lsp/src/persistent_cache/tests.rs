@@ -711,6 +711,32 @@ fn a_scheduled_cache_steps_after_the_open() {
     assert_eq!(live_leases(root.path()), 0);
 }
 
+/// Task 11 fix round 1: a write refused for WAL pressure wakes the
+/// scheduled maintenance, so a step (its checkpoint) follows at once
+/// instead of at the next idle interval (60 s).
+#[test]
+fn a_wal_pressure_refusal_wakes_the_scheduled_maintenance() {
+    let root = private_dir();
+    let project_cache = ProjectCache::new(64 << 20);
+    let cache = PersistentCache::start_with(
+        options(root.path()),
+        project_cache.clone(),
+        Arc::default(),
+        namespace(),
+    );
+    assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
+    let inner = cache.inner.as_ref().unwrap();
+    let shared = inner.wait_while(inner.lock(), SETTLE, |shared| shared.steps == 0);
+    let steps = shared.steps;
+    drop(shared);
+    assert!(steps >= 1, "the step after the open");
+    cache.job().unwrap().observe(&Bypass::WalPressure);
+    let shared = inner.wait_while(inner.lock(), SETTLE, |shared| shared.steps == steps);
+    assert!(shared.steps > steps, "no step followed the wake");
+    drop(shared);
+    cache.shutdown();
+}
+
 /// I1: a zero wait still tries each lock once, so closing deletes the lease.
 #[test]
 fn a_zero_wait_cache_enables_and_closing_deletes_its_lease() {
@@ -773,6 +799,10 @@ fn record_reuse_counts_each_outcome_once_and_a_fenced_reuse_reopens() {
         },
         via: ReuseVia::Local,
         reads: 0,
+        artifact: pascal_cache::Digest::from_bytes([0; 32]),
+        evidence: None,
+        include_stamps: Vec::new(),
+        root_hash: 0,
     }));
     job.record_reuse(&Ok(Reuse::Miss(ReuseMiss::Open)));
     job.record_reuse(&Err(PersistError::Cancelled));
@@ -812,7 +842,7 @@ fn the_exclusion_follows_the_active_options() {
     cache.reconfigure(options(root.path()));
     assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
     let exclusion = cache.exclusion().expect("enabled: excluded");
-    assert!(exclusion.contains(&root.path().join("analysis.sqlite3-wal")));
+    assert!(exclusion.contains(&root.path().join("analysis-v6.sqlite3-wal")));
     // A reopen keeps it.
     cache.readmit();
     assert_eq!(cache.settle(SETTLE), CacheState::Enabled);

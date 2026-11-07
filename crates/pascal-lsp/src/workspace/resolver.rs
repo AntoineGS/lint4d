@@ -1455,7 +1455,8 @@ fn source_id_for_path(path: &Path) -> SourceId {
     ))
 }
 
-fn path_key(path: &Path) -> String {
+/// What `path_equivalent` compares: equal keys name one path.
+pub(super) fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(&absolute_path(path.to_path_buf())).replace('\\', "/")
 }
 

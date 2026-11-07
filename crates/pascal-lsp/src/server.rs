@@ -861,22 +861,58 @@ impl ProtocolConnection {
             .and_then(|receiver| receiver.try_recv().ok())
     }
 
-    /// Waits on both lanes: a control frame can reach the priority lane after
-    /// it was last polled, and the ordinary lane alone would never wake for it.
-    fn recv_timeout(&self, timeout: Duration) -> Result<Message, RecvTimeoutError> {
-        let Some(priority) = self.priority_receiver.as_ref() else {
-            return self.receiver().recv_timeout(timeout);
-        };
-        crossbeam_channel::select_biased! {
-            recv(priority) -> message => match message {
-                Ok(message) => Ok(message),
-                // No priority sender remains, so only the ordinary lane can wake.
-                Err(_) => self.receiver().recv_timeout(timeout),
-            },
-            recv(self.receiver()) -> message => {
-                message.map_err(|_| RecvTimeoutError::Disconnected)
+    /// Waits on both client lanes and the warmer's events: a control frame
+    /// can reach the priority lane after it was last polled, and the
+    /// ordinary lane alone would never wake for it. A ready warmer event
+    /// returns `Timeout`, leaving the event for the warmer's poll (l4d-axsn:
+    /// a crawl's end waited for the next client message). A disconnected
+    /// priority lane, or a warmer lane once `warm_running` is false, stops
+    /// waking the receive; a spurious wake-up only selects again.
+    fn recv_timeout_or_warm(
+        &self,
+        timeout: Duration,
+        warm: &Receiver<crate::warmer::WarmEvent>,
+        warm_running: &dyn Fn() -> bool,
+    ) -> Result<Message, RecvTimeoutError> {
+        if !warm.is_empty() {
+            return Err(RecvTimeoutError::Timeout);
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        let mut priority = self.priority_receiver.as_ref();
+        let mut warm = Some(warm);
+        loop {
+            let mut select = crossbeam_channel::Select::new_biased();
+            let priority_index = priority.map(|receiver| select.recv(receiver));
+            let ordinary_index = select.recv(self.receiver());
+            let warm_index = warm.map(|receiver| select.recv(receiver));
+            let ready = match deadline {
+                Some(deadline) => select
+                    .ready_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| RecvTimeoutError::Timeout)?,
+                None => select.ready(),
+            };
+            if Some(ready) == priority_index {
+                match priority.map(Receiver::try_recv) {
+                    Some(Ok(message)) => return Ok(message),
+                    // No priority sender remains: only the other lanes wake.
+                    Some(Err(TryRecvError::Disconnected)) => priority = None,
+                    _ => {}
+                }
+            } else if ready == ordinary_index {
+                match self.receiver().try_recv() {
+                    Ok(message) => return Ok(message),
+                    Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+                    Err(TryRecvError::Empty) => {}
+                }
+            } else if Some(ready) == warm_index
+                && let Some(receiver) = warm
+            {
+                match warm_lane_on_wake(!receiver.is_empty(), warm_running()) {
+                    WarmLane::Wake => return Err(RecvTimeoutError::Timeout),
+                    WarmLane::Keep => {}
+                    WarmLane::Drop => warm = None,
+                }
             }
-            default(timeout) => Err(RecvTimeoutError::Timeout),
         }
     }
 
@@ -897,6 +933,28 @@ impl ProtocolConnection {
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
         self.flush()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WarmLane {
+    /// An event is ready: the loop's tick handles it.
+    Wake,
+    /// A spurious wake-up: select again with the lane.
+    Keep,
+    /// Ready but empty after the warmer thread ended: disconnected.
+    Drop,
+}
+
+/// What a ready warmer lane means: `select` may wake spuriously, so an
+/// empty lane is only dropped once the warmer thread has ended.
+fn warm_lane_on_wake(has_event: bool, warm_running: bool) -> WarmLane {
+    if has_event {
+        WarmLane::Wake
+    } else if warm_running {
+        WarmLane::Keep
+    } else {
+        WarmLane::Drop
     }
 }
 
@@ -5330,7 +5388,18 @@ impl AnalysisJobs {
             })
             .count();
         self.interactive_gate.set(running + queued);
-        // Workspace-wide requests pause the warmer only (l4d-ig6b).
+        // The general slots in use, as `worker_admission` counts them.
+        self.interactive_gate.set_running_general(
+            self.diagnostics.len()
+                + self
+                    .pending
+                    .values()
+                    .filter(|job| job.priority != AnalysisPriority::Interactive)
+                    .count(),
+        );
+        // Workspace-wide requests pause the warmer only (l4d-ig6b). Published
+        // before `running_bulk`, so an index turn never sees a running
+        // references as plain Bulk work and yields to the paused crawl (D50).
         let preempting = self
             .pending
             .values()
@@ -5344,6 +5413,13 @@ impl AnalysisJobs {
                 })
                 .count();
         self.interactive_gate.set_warm_busy(preempting);
+        // Index batches also wait for running Bulk requests (D33).
+        self.interactive_gate.set_running_bulk(
+            self.pending
+                .values()
+                .filter(|job| job.priority == AnalysisPriority::Bulk)
+                .count(),
+        );
         // Only work a lent slot can take: queued pull diagnostics would make
         // running diagnostics pause for nothing.
         self.interactive_gate.set_waiting_clients(
@@ -10402,6 +10478,24 @@ fn send_diagnostic_server_cancelled(
 /// costs only address space until touched.
 pub const ANALYSIS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
+/// The workers a reuse batch validates on (R8-1) while `running_general`
+/// jobs hold the general analysis slots: the free general slots, at least
+/// one (the warmer's own thread works meanwhile only to apply results), and
+/// never more than the CPUs. The interactive-reserved slot is never taken.
+pub(crate) fn validation_threads(running_general: usize) -> usize {
+    validation_threads_for(
+        running_general,
+        thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+fn validation_threads_for(running_general: usize, cpus: usize) -> usize {
+    MAX_GENERAL_ANALYSIS_JOBS
+        .saturating_sub(running_general)
+        .max(1)
+        .min(cpus.max(1))
+}
+
 /// A builder for a thread that runs analysis, with its explicit stack.
 pub(crate) fn analysis_thread(name: &str) -> thread::Builder {
     thread::Builder::new()
@@ -10737,6 +10831,7 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
 #[cfg(feature = "test-support")]
 const TEST_ANALYSIS_METRICS_METHOD: &str = "pascal/testAnalysisMetrics";
 const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
+const INDEX_STATUS_METHOD: &str = "pascal/indexStatus";
 #[cfg(feature = "test-support")]
 const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
 
@@ -10959,6 +11054,9 @@ struct WorkspaceFileNotificationWorker {
     join: Option<JoinHandle<()>>,
     /// The revision the worker took the workspace at.
     revision: WorkspaceRevision,
+    /// The taken workspace's project cache, for warmer events handled
+    /// while the worker holds the workspace (l4d-axsn).
+    project_cache: crate::project_cache::ProjectCache,
 }
 
 impl WorkspaceFileNotificationWorker {
@@ -11140,6 +11238,7 @@ fn spawn_workspace_file_notification(
         fenced: revision.fenced || precommit_fence,
         ..revision
     };
+    let project_cache = workspace.project_cache().clone();
     let owned_workspace = std::mem::take(workspace);
     let join = analysis_thread("PascalLspWorkspaceMutation")
         .spawn(move || {
@@ -11196,6 +11295,7 @@ fn spawn_workspace_file_notification(
         deadline,
         join: Some(join),
         revision,
+        project_cache,
     }
 }
 
@@ -11297,6 +11397,9 @@ fn event_loop(
     #[cfg(feature = "test-support")] analysis_metrics_endpoint: bool,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
+    // A file-notification worker takes the workspace while it runs; the
+    // status request is answered from this handle to the same cache.
+    let index_status_cache = workspace.project_cache().clone();
     let mut deferred_configuration_messages = VecDeque::new();
     let mut deferred_workspace_messages = VecDeque::new();
     let mut deferred_workspace_message_bytes = 0usize;
@@ -11526,6 +11629,16 @@ fn event_loop(
             }
         }
         let workspace_busy = file_notification_worker.is_some();
+        if let Some(worker) = file_notification_worker.as_ref() {
+            drain_warm_events_while_busy(
+                connection,
+                &worker.project_cache,
+                &mut warmer,
+                &mut warm_progress,
+                &mut swept_fingerprints,
+                &mut semantic_tokens_refresh,
+            )?;
+        }
         if !workspace_busy {
             maintain_warmer(
                 connection,
@@ -11655,11 +11768,22 @@ fn event_loop(
                 Some(DeferredConfigurationMessage::Notification(notification)) => {
                     Message::Notification(notification)
                 }
-                None => match connection.recv_timeout(timeout) {
+                None => match connection
+                    .recv_timeout_or_warm(timeout, warmer.events(), &|| warmer.is_running())
+                {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         drain_watch_events(workspace, &watch_events, &mut rewarm);
-                        if !workspace_busy {
+                        if let Some(worker) = file_notification_worker.as_ref() {
+                            drain_warm_events_while_busy(
+                                connection,
+                                &worker.project_cache,
+                                &mut warmer,
+                                &mut warm_progress,
+                                &mut swept_fingerprints,
+                                &mut semantic_tokens_refresh,
+                            )?;
+                        } else {
                             maintain_warmer(
                                 connection,
                                 workspace,
@@ -11702,11 +11826,21 @@ fn event_loop(
                 },
             }
         } else {
-            match connection.recv_timeout(timeout) {
+            match connection.recv_timeout_or_warm(timeout, warmer.events(), &|| warmer.is_running())
+            {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     drain_watch_events(workspace, &watch_events, &mut rewarm);
-                    if !workspace_busy {
+                    if let Some(worker) = file_notification_worker.as_ref() {
+                        drain_warm_events_while_busy(
+                            connection,
+                            &worker.project_cache,
+                            &mut warmer,
+                            &mut warm_progress,
+                            &mut swept_fingerprints,
+                            &mut semantic_tokens_refresh,
+                        )?;
+                    } else {
                         maintain_warmer(
                             connection,
                             workspace,
@@ -11801,6 +11935,27 @@ fn event_loop(
                 if request.method == CACHE_STATUS_METHOD && !shutdown_received =>
             {
                 send_ok(connection, request.id, persistent.status().to_json())?;
+            }
+            // Unordered like the cache status: a bounded read of the index
+            // store, answered ahead of deferred workspace work.
+            Message::Request(request)
+                if request.method == INDEX_STATUS_METHOD && !shutdown_received =>
+            {
+                // While the store is enabled the baseline view indexes open
+                // members from disk; only a memory-only index leaves them.
+                let memory_only = !persistent.is_enabled();
+                let is_open = |path: &Path| {
+                    memory_only
+                        && Url::from_file_path(path).is_ok_and(|uri| {
+                            warmer.is_open(&uri)
+                                || warmer.is_open(&crate::workspace::canonical_file_uri(&uri))
+                        })
+                };
+                let status = crate::project_cache::index_status_json(
+                    &index_status_cache.index_status(&is_open),
+                    index_status_cache.index_process_counts(),
+                );
+                send_ok(connection, request.id, status)?;
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
@@ -12479,33 +12634,17 @@ fn maintain_warmer(
     for anchor in cache.take_index_requests() {
         warmer.request_index(anchor);
     }
-    for event in warmer.poll(workspace) {
-        if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event
-            && workspace.is_open(uri)
-        {
-            semantic_tokens_refresh.request(connection)?;
-        }
-        if let crate::warmer::WarmEvent::End {
-            uri,
-            fingerprint,
-            pins,
-            ..
-        } = &event
-            && workspace.is_open(uri)
-        {
-            cache.pin(uri, pins.clone());
-            if let Some(fingerprint) = fingerprint {
-                swept_fingerprints.insert(*fingerprint);
-            }
-        }
-        let paused_will_retry = match &event {
-            crate::warmer::WarmEvent::Paused { uri, .. } => workspace.is_open(uri),
-            _ => true,
-        };
-        warm_progress
-            .handle_with_retry(connection, &event, paused_will_retry)
-            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-    }
+    let events = warmer.poll(workspace);
+    handle_warm_events(
+        connection,
+        cache,
+        &|uri| workspace.is_open(uri),
+        warmer,
+        events,
+        warm_progress,
+        swept_fingerprints,
+        semantic_tokens_refresh,
+    )?;
     if *sweep_pending && (warmer.is_idle() || !cache.has_room()) {
         cache.retain_fingerprints(swept_fingerprints);
         *sweep_pending = false;
@@ -12517,6 +12656,73 @@ fn maintain_warmer(
         *budget_warned = true;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_warm_events(
+    connection: &dyn ProtocolSender,
+    cache: &crate::project_cache::ProjectCache,
+    is_open: &dyn Fn(&Url) -> bool,
+    warmer: &crate::warmer::Warmer,
+    events: Vec<crate::warmer::WarmEvent>,
+    warm_progress: &mut crate::warmer::WarmProgress,
+    swept_fingerprints: &mut HashSet<u64>,
+    semantic_tokens_refresh: &mut RefreshRequests,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for event in events {
+        if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event
+            && is_open(uri)
+        {
+            semantic_tokens_refresh.request(connection)?;
+        }
+        if let crate::warmer::WarmEvent::End {
+            uri,
+            fingerprint,
+            pins,
+            ..
+        } = &event
+            && is_open(uri)
+        {
+            warmer.pin_crawl(cache, uri, pins.clone());
+            if let Some(fingerprint) = fingerprint {
+                swept_fingerprints.insert(*fingerprint);
+            }
+        }
+        let paused_will_retry = match &event {
+            crate::warmer::WarmEvent::Paused { uri, .. } => is_open(uri),
+            _ => true,
+        };
+        warm_progress
+            .handle_with_retry(connection, &event, paused_will_retry)
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+    }
+    Ok(())
+}
+
+/// Handles the warmer's finished jobs while a mutation worker holds the
+/// workspace (l4d-axsn): events are accepted and their pins applied to the
+/// taken workspace's cache, with the warmer's own record of open files;
+/// dispatch waits until the workspace is back.
+fn drain_warm_events_while_busy(
+    connection: &dyn ProtocolSender,
+    cache: &crate::project_cache::ProjectCache,
+    warmer: &mut crate::warmer::Warmer,
+    warm_progress: &mut crate::warmer::WarmProgress,
+    swept_fingerprints: &mut HashSet<u64>,
+    semantic_tokens_refresh: &mut RefreshRequests,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let events = warmer.drain_events(cache);
+    let warmer = &*warmer;
+    handle_warm_events(
+        connection,
+        cache,
+        &|uri| warmer.is_open(uri),
+        warmer,
+        events,
+        warm_progress,
+        swept_fingerprints,
+        semantic_tokens_refresh,
+    )
 }
 
 fn event_loop_receive_timeout(
@@ -17884,14 +18090,136 @@ mod tests {
             )))
             .expect("queue priority shutdown");
 
+        let (_warm_sender, warm_events) = crossbeam_channel::unbounded();
         let started = Instant::now();
-        let received = protocol.recv_timeout(Duration::from_secs(2));
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(2), &warm_events, &|| true);
 
         assert!(
             matches!(&received, Ok(Message::Request(request)) if request.method == "shutdown"),
             "expected the priority shutdown, got {received:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Multidev run A (l4d-axsn): the crawl's End waited 88 s for a client
+    /// message, because a cache full of pins made the loop's receive block
+    /// for a day.
+    #[test]
+    fn a_ready_warmer_event_wakes_a_blocking_receive_without_consuming_it() {
+        let (server, _client) = Connection::memory();
+        let (_priority_sender, priority_receiver) = crossbeam_channel::unbounded();
+        let protocol = super::ProtocolConnection::new(
+            server,
+            priority_receiver,
+            &TestBarrierConfig::disabled(),
+        );
+        let (warm_sender, warm_events) = crossbeam_channel::unbounded();
+        warm_sender
+            .send(crate::warmer::WarmEvent::Paused {
+                uri: Url::parse("file:///ws/Main.pas").unwrap(),
+                generation: 0,
+                open_epoch: 1,
+            })
+            .unwrap();
+
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events, &|| true);
+
+        assert!(
+            matches!(received, Err(RecvTimeoutError::Timeout)),
+            "{received:?}"
+        );
+        assert_eq!(warm_events.len(), 1, "the warmer's poll takes the event");
+    }
+
+    #[test]
+    fn a_dropped_warmer_or_priority_lane_does_not_wake_the_receive() {
+        let (server, client) = Connection::memory();
+        let (priority_sender, priority_receiver) = crossbeam_channel::unbounded::<Message>();
+        drop(priority_sender);
+        let protocol = super::ProtocolConnection::new(
+            server,
+            priority_receiver,
+            &TestBarrierConfig::disabled(),
+        );
+        let (warm_sender, warm_events) = crossbeam_channel::unbounded::<crate::warmer::WarmEvent>();
+        drop(warm_sender);
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "initialized".to_string(),
+                serde_json::json!({}),
+            )))
+            .unwrap();
+
+        let received =
+            protocol.recv_timeout_or_warm(Duration::from_secs(86_400), &warm_events, &|| false);
+
+        assert!(
+            matches!(&received, Ok(Message::Notification(notification)) if notification.method == "initialized"),
+            "{received:?}"
+        );
+    }
+
+    #[test]
+    fn a_spurious_warmer_wake_up_keeps_the_lane() {
+        use super::WarmLane;
+        assert_eq!(super::warm_lane_on_wake(true, true), WarmLane::Wake);
+        assert_eq!(super::warm_lane_on_wake(true, false), WarmLane::Wake);
+        assert_eq!(
+            super::warm_lane_on_wake(false, true),
+            WarmLane::Keep,
+            "ready but empty while the warmer runs: select again"
+        );
+        assert_eq!(super::warm_lane_on_wake(false, false), WarmLane::Drop);
+    }
+
+    #[test]
+    fn warm_events_are_handled_while_the_workspace_is_busy() {
+        let (server, _client) = Connection::memory();
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let main = Url::parse("file:///ws/Main.pas").unwrap();
+        let mut warmer =
+            crate::warmer::Warmer::start(Arc::new(crate::warmer::InteractiveGate::default()));
+        warmer.open(main.clone());
+        let (sender, events) = crossbeam_channel::unbounded();
+        warmer.replace_events_for_test(events);
+        sender
+            .send(crate::warmer::WarmEvent::End {
+                uri: main.clone(),
+                fingerprint: Some(7),
+                pins: vec![(main.clone(), 7)],
+                generation: warmer.generation(),
+                open_epoch: warmer.open_epoch_for_test(&main),
+            })
+            .unwrap();
+        let mut progress = crate::warmer::WarmProgress::new(false);
+        let mut swept = std::collections::HashSet::new();
+        let mut refresh = super::RefreshRequests::new(
+            false,
+            "workspace/semanticTokens/refresh",
+            super::SEMANTIC_TOKENS_REFRESH_REQUEST_PREFIX,
+        );
+
+        super::drain_warm_events_while_busy(
+            &server,
+            &cache,
+            &mut warmer,
+            &mut progress,
+            &mut swept,
+            &mut refresh,
+        )
+        .unwrap();
+
+        assert!(swept.contains(&7), "the End was handled");
+        assert!(
+            warmer.has_index_request_for_test(&crate::project_cache::IndexAnchor::Document(
+                main.clone()
+            )),
+            "the End asked for the document's index"
+        );
+        assert_eq!(cache.pinned_owners_for_test(), vec![main]);
     }
 
     #[test]
@@ -19567,6 +19895,82 @@ mod tests {
         );
         jobs.publish_interactive_load();
         assert_eq!(jobs.interactive_gate.waiting_clients_for_tests(), 1);
+    }
+
+    #[test]
+    fn running_bulk_requests_hold_index_batches_back() {
+        let mut jobs = AnalysisJobs::new();
+        let cancel = AtomicBool::new(false);
+        jobs.publish_interactive_load();
+        assert!(jobs.interactive_gate.index_may_run(&cancel));
+        jobs.pending.insert(
+            AnalysisComputationId(31_000),
+            super::PendingAnalysis {
+                cancellation: Arc::new(AtomicBool::new(false)),
+                handle: thread::spawn(|| {}),
+                recipients: Vec::new(),
+                key: None,
+                priority: AnalysisPriority::Bulk,
+                preempts_background: false,
+            },
+        );
+        jobs.publish_interactive_load();
+        assert!(!jobs.interactive_gate.index_may_run(&cancel));
+        assert!(
+            jobs.interactive_gate.try_wait_idle(&cancel),
+            "the crawl does not wait for Bulk requests"
+        );
+        jobs.pending.clear();
+        jobs.publish_interactive_load();
+        assert!(jobs.interactive_gate.index_may_run(&cancel));
+    }
+
+    #[test]
+    fn reuse_validation_takes_only_the_free_general_slots() {
+        use super::{MAX_GENERAL_ANALYSIS_JOBS, validation_threads_for};
+        assert_eq!(MAX_GENERAL_ANALYSIS_JOBS, 2);
+        assert_eq!(validation_threads_for(0, 8), 2);
+        assert_eq!(validation_threads_for(1, 8), 1);
+        // At least one; never the interactive slot, never past the CPUs.
+        assert_eq!(validation_threads_for(2, 8), 1);
+        assert_eq!(validation_threads_for(5, 8), 1);
+        assert_eq!(validation_threads_for(0, 1), 1);
+        assert_eq!(validation_threads_for(0, 0), 1);
+    }
+
+    #[test]
+    fn running_diagnostics_shrink_the_reuse_validation_threads() {
+        let mut jobs = AnalysisJobs::new();
+        jobs.publish_interactive_load();
+        let free = jobs.interactive_gate.validation_threads();
+        assert!((1..=2).contains(&free), "{free}");
+        let running = |priority| super::PendingAnalysis {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            handle: thread::spawn(|| {}),
+            recipients: Vec::new(),
+            key: None,
+            priority,
+            preempts_background: false,
+        };
+        jobs.pending.insert(
+            AnalysisComputationId(31_100),
+            running(AnalysisPriority::Interactive),
+        );
+        jobs.publish_interactive_load();
+        assert_eq!(
+            jobs.interactive_gate.validation_threads(),
+            free,
+            "interactive work holds its own slot"
+        );
+        jobs.pending.insert(
+            AnalysisComputationId(31_101),
+            running(AnalysisPriority::Diagnostics),
+        );
+        jobs.publish_interactive_load();
+        assert_eq!(jobs.interactive_gate.validation_threads(), 1);
+        jobs.pending.clear();
+        jobs.publish_interactive_load();
+        assert_eq!(jobs.interactive_gate.validation_threads(), free);
     }
 
     #[test]
@@ -21737,6 +22141,10 @@ mod tests {
                 !jobs.interactive_gate.try_wait_warm_idle(&idle()),
                 "a queued {label} must pause the warmer"
             );
+            assert!(
+                !jobs.interactive_gate.index_may_run_now(),
+                "a queued {label} must hold index batches back (D50)"
+            );
             let interactive = priority == AnalysisPriority::Interactive;
             assert_eq!(
                 jobs.interactive_gate.try_wait_idle(&idle()),
@@ -21760,6 +22168,10 @@ mod tests {
                 !jobs.interactive_gate.try_wait_warm_idle(&idle()),
                 "a running {label} must pause the warmer"
             );
+            assert!(
+                !jobs.interactive_gate.index_may_run_now(),
+                "a running {label} must hold index batches back (D50)"
+            );
             assert_eq!(
                 jobs.interactive_gate.try_wait_idle(&idle()),
                 !interactive,
@@ -21774,6 +22186,7 @@ mod tests {
             jobs.publish_interactive_load();
             assert!(jobs.interactive_gate.try_wait_warm_idle(&idle()));
             assert!(jobs.interactive_gate.try_wait_idle(&idle()));
+            assert!(jobs.interactive_gate.index_may_run_now());
         }
     }
 

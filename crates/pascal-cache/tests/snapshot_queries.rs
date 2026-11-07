@@ -160,6 +160,63 @@ fn binding_targets_resolve_by_canonical_path_not_spelling() {
     );
 }
 
+/// 13f: `find_member_record` answers what `find_member` then
+/// `open_member_record` answer, in one transaction.
+#[test]
+fn a_member_and_its_record_are_found_together() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "target", "/w/Target0.pas");
+    let target = records(&store, "Target", 1)[0];
+    let importer = store
+        .publish_member_record(&member("/w/Main.pas", &["/w/Target0.pas"], evidence))
+        .unwrap()
+        .record_id;
+    let header = sealed(&store, &[target, importer]);
+    for path in ["/w/Target0.pas", "/w/Main.pas"] {
+        let Lookup::Hit(member) = store.find_member(&header, Path::new(path)).unwrap() else {
+            panic!("{path} is a member")
+        };
+        let record = store.open_member_record(member.record_id).unwrap();
+        assert!(matches!(record, Lookup::Hit(_)), "{path}");
+        assert_eq!(
+            store.find_member_record(&header, Path::new(path)).unwrap(),
+            Lookup::Hit((member, record)),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        store
+            .find_member_record(&header, Path::new("/lib/System.pas"))
+            .unwrap(),
+        Lookup::Miss(Miss::Absent)
+    );
+    // A stored header that disagrees with its columns: the member is
+    // found, its record is malformed, as `open_member_record` says.
+    raw(directory.path())
+        .execute(
+            "UPDATE member_records SET artifact_id = zeroblob(32) WHERE record_id = ?1",
+            [importer.as_bytes().as_slice()],
+        )
+        .unwrap();
+    let Lookup::Hit((found, record)) = store
+        .find_member_record(&header, Path::new("/w/Main.pas"))
+        .unwrap()
+    else {
+        panic!("the member is still listed")
+    };
+    assert_eq!(found.record_id, importer);
+    assert_eq!(record, store.open_member_record(importer).unwrap());
+    assert_eq!(record, Lookup::Miss(Miss::Malformed(Malformed::Member)));
+    assert!(store.retire_snapshot(header.id()).unwrap());
+    assert_eq!(
+        store
+            .find_member_record(&header, Path::new("/w/Target0.pas"))
+            .unwrap(),
+        Lookup::Miss(Miss::Retired)
+    );
+}
+
 #[test]
 fn queries_on_a_retired_or_vanished_snapshot_are_a_miss() {
     let directory = private_tempdir();

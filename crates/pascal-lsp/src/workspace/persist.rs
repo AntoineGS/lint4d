@@ -1,12 +1,13 @@
 //! Publishing a source's facts with the evidence that proves them, and
 //! reusing persisted facts only after current inputs validate (spec §7).
-#![cfg_attr(not(test), allow(dead_code))]
 
-use super::Workspace;
 use super::evidence::EvidenceGap;
+use super::facts::SourceFacts;
+use super::indexing::{ReusePhase, timed};
 use super::validate::{
     CurrentInputs, EvidenceCheck, Stale, Unproven, Validator, validate_evidence,
 };
+use super::{ContextKey, PathStamp, Workspace};
 use crate::persistent_cache::counters::MissCause;
 use crate::project_cache::{Reservation, ReservationKind};
 use lsp_types::Url;
@@ -19,6 +20,7 @@ use pascal_cache::{
 use pascal_core::facts::{ArtifactFacts, FactBudget, FactError, NotPersistable, include_slots};
 use pascal_core::resolver::ResolverLimits;
 use pascal_project::{ProjectContext, ProjectPathProvenance, ProjectWorkBudget, SourceOrigin};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -55,6 +57,36 @@ impl PreparedArtifact {
 
     pub(crate) fn artifact_id(&self) -> Digest {
         self.key().digest()
+    }
+
+    /// What preparing this artifact holds beyond its facts' own charge:
+    /// the facts' encoded content and the observations' encoded sizes.
+    pub(crate) fn transient_bytes(&self) -> usize {
+        let facts = pascal_cache::encoded_content_bytes(&self.facts).unwrap_or(usize::MAX);
+        let observations = self.expanded.as_ref().map_or(0, |expanded| {
+            expanded
+                .observations
+                .iter()
+                .fold(0usize, |sum, observation| {
+                    sum.saturating_add(observation.encoded().len())
+                })
+        });
+        facts.saturating_add(observations)
+    }
+
+    /// The paths the evidence names besides the root: what a change to
+    /// makes this artifact stale. A local artifact names none.
+    pub(crate) fn input_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.expanded.as_ref().map_or_else(Vec::new, |expanded| {
+            expanded
+                .observations
+                .iter()
+                .map(|observation| super::absolute_path(observation.path().to_path_buf()))
+                .collect()
+        });
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// The ID `Store::publish_facts_with_evidence` gives this artifact's
@@ -106,6 +138,8 @@ pub(crate) enum PersistError {
     /// The root is outside its context's authorized roots.
     Unauthorized,
     Unreadable(String),
+    /// Context discovery failed (`reuse_persisted_facts`).
+    #[cfg(test)]
     Context(String),
     NotIndexed,
     Cancelled,
@@ -121,6 +155,16 @@ pub(crate) enum Reuse {
         /// candidates rejected before the hit. A cost measure, not a
         /// property of the facts returned.
         reads: usize,
+        /// The loaded artifact's ID: the local key's digest, or the
+        /// evidence header's `artifact_id()`.
+        artifact: Digest,
+        /// The validated header's `evidence_id()`; `None` via `Local`.
+        evidence: Option<Digest>,
+        /// The stamp taken before each include payload that held, in
+        /// check order; the root is not listed.
+        include_stamps: Vec<(PathBuf, PathStamp)>,
+        /// `content_hash_bytes` of the root bytes this call read.
+        root_hash: u64,
     },
     Miss(ReuseMiss),
 }
@@ -153,7 +197,11 @@ impl PartialEq for AdmittedFacts {
 impl Eq for AdmittedFacts {}
 
 /// Keep `charge` at what decoding `facts` used.
-fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) -> AdmittedFacts {
+pub(super) fn admitted(
+    facts: ArtifactFacts,
+    budget: &FactBudget,
+    mut charge: Reservation,
+) -> AdmittedFacts {
     charge.shrink_to(budget.used());
     AdmittedFacts {
         facts: Arc::new(facts),
@@ -163,7 +211,7 @@ fn admitted(facts: ArtifactFacts, budget: &FactBudget, mut charge: Reservation) 
 
 /// A decoder refusal for size is a memory miss; any other bypass stays an
 /// error.
-fn decoded(
+pub(super) fn decoded(
     result: Result<Lookup<ArtifactFacts>, Bypass>,
 ) -> Result<Result<Lookup<ArtifactFacts>, ReuseMiss>, PersistError> {
     match result {
@@ -179,6 +227,13 @@ pub(crate) enum ReuseVia {
     Local,
     /// Evidence validated against current inputs.
     Evidence,
+    /// The record a held baseline snapshot lists for the member, its
+    /// evidence (or local key) validated against current inputs (D31).
+    /// `record` is that record, found live and authorized, and the
+    /// snapshot, when this process's lease held it (13f).
+    Snapshot {
+        record: Option<(pascal_cache::SnapshotId, Digest)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,15 +275,107 @@ impl PersistError {
             | Self::Evidence(_)
             | Self::Key(_)
             | Self::Unreadable(_)
-            | Self::Context(_)
             | Self::NotIndexed => Ok(Input),
+            #[cfg(test)]
+            Self::Context(_) => Ok(Input),
         }
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static REUSE_IN_CONTEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `reuse_in_context` calls on this thread (the evidence-candidate search).
+#[cfg(test)]
+pub(crate) fn reuse_in_context_calls_for_test() -> usize {
+    REUSE_IN_CONTEXT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reuse_in_context_calls_for_test() {
+    REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(0));
+}
+
+/// How many contexts a `SharedContextKey` remembers.
+const SHARED_CONTEXT_KEYS: usize = 8;
+
+/// The store's key of one installed context, encoded once (A5: the reuse
+/// pass looks up every member of a context).
+#[derive(Default)]
+pub(crate) struct ContextKeyMemo(Option<(Arc<ProjectContext>, CacheContextKey)>);
+
+impl ContextKeyMemo {
+    fn key_of(&mut self, context: &Arc<ProjectContext>) -> &CacheContextKey {
+        if !self
+            .0
+            .as_ref()
+            .is_some_and(|(held, _)| Arc::ptr_eq(held, context))
+        {
+            self.0 = Some((Arc::clone(context), CacheContextKey::new(context)));
+        }
+        &self.0.as_ref().expect("just set").1
+    }
+}
+
+/// The store's keys of the contexts a view last asked for, shared by its
+/// threads (13f): a context is immutable behind its `Arc`, so a batch
+/// encodes its key once, not once per member it proves. The crawl
+/// alternates contexts per unit, so the memo keeps the most recently used
+/// `SHARED_CONTEXT_KEYS`. Contexts are held weakly, so the memo keeps no
+/// context alive; each held allocation keeps its address from being reused
+/// by another context.
+#[derive(Default)]
+pub(crate) struct SharedContextKey {
+    /// Most recently used first.
+    memo: std::sync::Mutex<Vec<(std::sync::Weak<ProjectContext>, CacheContextKey)>>,
+    #[cfg(test)]
+    encodings: std::sync::atomic::AtomicUsize,
+}
+
+impl SharedContextKey {
+    pub(crate) fn key_of(&self, context: &Arc<ProjectContext>) -> CacheContextKey {
+        let mut memo = self
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = memo
+            .iter()
+            .position(|(held, _)| std::ptr::eq(held.as_ptr(), Arc::as_ptr(context)))
+        {
+            memo[..=position].rotate_right(1);
+            return memo[0].1.clone();
+        }
+        #[cfg(test)]
+        self.encodings.fetch_add(1, Ordering::Relaxed);
+        let key = CacheContextKey::new(context);
+        memo.retain(|(held, _)| held.strong_count() > 0);
+        memo.truncate(SHARED_CONTEXT_KEYS - 1);
+        memo.insert(0, (Arc::downgrade(context), key.clone()));
+        key
+    }
+
+    /// How many keys this memo encoded.
+    #[cfg(test)]
+    pub(crate) fn encodings(&self) -> usize {
+        self.encodings.load(Ordering::Relaxed)
+    }
+}
+
 impl Workspace {
+    /// The store's key of `context`, encoded once per installed context.
+    pub(crate) fn cache_context_key(&self, context: &Arc<ProjectContext>) -> CacheContextKey {
+        self.cache_context_key.key_of(context)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_context_key_encodings(&self) -> usize {
+        self.cache_context_key.encodings()
+    }
+
     /// The saved root bytes of `uri`, read under `context`'s current policy.
-    fn saved_root_bytes(
+    pub(super) fn saved_root_bytes(
         &self,
         uri: &Url,
         context: &ProjectContext,
@@ -250,6 +397,7 @@ impl Workspace {
     /// Publish `uri`'s facts: under its local key when its analysis
     /// consulted nothing but the root, otherwise under its expanded key
     /// with the evidence that proves it (spec §6.2: one transaction).
+    #[cfg(test)]
     pub(crate) fn persist_source(
         &self,
         uri: &Url,
@@ -261,6 +409,7 @@ impl Workspace {
     }
 
     /// Everything `persist_source` checks and builds before it publishes.
+    #[cfg(test)]
     pub(crate) fn prepare_artifact(
         &self,
         uri: &Url,
@@ -279,6 +428,17 @@ impl Workspace {
         let source = self
             .source_facts(uri, budget, cancel)
             .map_err(PersistError::Fact)?;
+        self.prepare_from_facts(uri, source, cancel)
+    }
+
+    /// `prepare_artifact` over facts already extracted, so one extraction
+    /// pass serves a member's publication and its own accounting.
+    pub(crate) fn prepare_from_facts(
+        &self,
+        uri: &Url,
+        source: SourceFacts,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedArtifact, PersistError> {
         source
             .extracted
             .persistable
@@ -337,7 +497,7 @@ impl Workspace {
         let observations = self
             .source_evidence(uri, cancel)
             .map_err(PersistError::Evidence)?;
-        let context = CacheContextKey::new(&state.context);
+        let context = self.cache_context_key(&state.context);
         let expanded = if source.extracted.provider_dependent {
             ExpandedArtifactKey::dependent_from_slots(
                 &local,
@@ -392,6 +552,7 @@ impl Workspace {
     /// 2026-11-02). A refused reservation, or facts over the limit, is
     /// `Unproven::Memory`; cancellation, including during context
     /// discovery, is `Unproven::Cancelled` (l4d-ne50). Both are retryable.
+    #[cfg(test)]
     pub(crate) fn reuse_persisted_facts(
         &mut self,
         uri: &Url,
@@ -400,9 +561,7 @@ impl Workspace {
         decode_limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Reuse, PersistError> {
-        let overlays = self.overlay_inputs();
-        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
-        let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
+        uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
         if self.root_is_session_private(uri) {
             return Ok(Reuse::Miss(ReuseMiss::Open));
         }
@@ -413,19 +572,71 @@ impl Workspace {
             }
             Err(message) => return Err(PersistError::Context(message)),
         };
+        self.reuse_in_context(uri, &key, store, work, decode_limit, cancel)
+    }
+
+    /// `reuse_persisted_facts` under `key`, the context that lists `uri`
+    /// (an index context), without discovering `uri`'s own owner. `key`
+    /// must already be installed. A hit also reports the artifact and
+    /// evidence IDs, the stamps taken before each include's bytes were
+    /// validated, and the root's content hash.
+    #[cfg(test)]
+    pub(crate) fn reuse_in_context(
+        &self,
+        uri: &Url,
+        key: &ContextKey,
+        store: &Store,
+        work: &dyn ProjectWorkBudget,
+        decode_limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Reuse, PersistError> {
+        self.reuse_in_context_with(
+            uri,
+            key,
+            &mut ContextKeyMemo::default(),
+            store,
+            work,
+            decode_limit,
+            cancel,
+        )
+    }
+
+    /// `reuse_in_context`, encoding the store's context key once for all
+    /// the calls that share `memo` and the same installed context.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reuse_in_context_with(
+        &self,
+        uri: &Url,
+        key: &ContextKey,
+        memo: &mut ContextKeyMemo,
+        store: &Store,
+        work: &dyn ProjectWorkBudget,
+        decode_limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Reuse, PersistError> {
+        #[cfg(test)]
+        REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let path = uri.to_file_path().map_err(|()| PersistError::NotIndexed)?;
+        if self.root_is_session_private(uri) {
+            return Ok(Reuse::Miss(ReuseMiss::Open));
+        }
         let context = Arc::clone(
             &self
                 .contexts
-                .get(&key)
+                .get(key)
                 .ok_or(PersistError::NotIndexed)?
                 .context,
         );
-        let bytes = self.saved_root_bytes(uri, &context)?;
-        let local = LocalArtifactKey::new(
-            &SourceContent::from_bytes(&bytes),
-            &super::conditional_context_for_uri(&context, uri),
-            context.source_origin(&path),
-        );
+        let (root_hash, local) = timed(ReusePhase::ReadHash, || {
+            let bytes = self.saved_root_bytes(uri, &context)?;
+            let root_hash = pascal_project::content_hash_bytes(&bytes);
+            let local = LocalArtifactKey::new(
+                &SourceContent::from_bytes(&bytes),
+                &super::conditional_context_for_uri(&context, uri),
+                context.source_origin(&path),
+            );
+            Ok::<_, PersistError>((root_hash, local))
+        })?;
         let Some(charge) = self
             .project_cache
             .reserve(ReservationKind::Facts, decode_limit)
@@ -433,28 +644,38 @@ impl Workspace {
             return Ok(Reuse::Miss(ReuseMiss::Unproven(Unproven::Memory)));
         };
         let mut budget = FactBudget::new(decode_limit);
-        match decoded(store.load_facts(ArtifactKeyRef::local(&local), &mut budget))? {
+        match decoded(timed(ReusePhase::Decode, || {
+            store.load_facts(ArtifactKeyRef::local(&local), &mut budget)
+        }))? {
             Ok(Lookup::Hit(facts)) => {
                 return Ok(Reuse::Hit {
                     facts: admitted(facts, &budget, charge),
                     via: ReuseVia::Local,
                     reads: 0,
+                    artifact: local.digest(),
+                    evidence: None,
+                    include_stamps: Vec::new(),
+                    root_hash,
                 });
             }
             Ok(Lookup::Miss(_)) => {}
             Err(miss) => return Ok(Reuse::Miss(miss)),
         }
-        let context_key = CacheContextKey::new(&context);
-        let headers = match store
-            .find_evidence(&context_key, &local)
-            .map_err(PersistError::Store)?
+        let context_key = memo.key_of(&context);
+        let headers = match timed(ReusePhase::Lookup, || {
+            store.find_evidence(context_key, &local)
+        })
+        .map_err(PersistError::Store)?
         {
             Lookup::Hit(headers) => headers,
             Lookup::Miss(miss) => return Ok(Reuse::Miss(ReuseMiss::Store(miss))),
         };
+        // Only a member with candidates pays for the editor state (A5).
+        let overlays = self.overlay_inputs();
+        let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
         let mut validator = Validator::new(
             CurrentInputs {
-                context: &context_key,
+                context: context_key,
                 read_policy: context.read_policy(),
                 overlays: &overlays,
                 deleted: &deleted,
@@ -471,7 +692,12 @@ impl Workspace {
                 last = ReuseMiss::Store(Miss::Malformed(Malformed::Evidence));
                 continue;
             };
-            match validate_evidence(store, header, &mut validator).map_err(PersistError::Store)? {
+            let held_before = validator.held_payloads().len();
+            match timed(ReusePhase::Validation, || {
+                validate_evidence(store, header, &mut validator)
+            })
+            .map_err(PersistError::Store)?
+            {
                 EvidenceCheck::Holds => {}
                 EvidenceCheck::Stale(stale) => {
                     last = ReuseMiss::Stale(stale);
@@ -485,12 +711,23 @@ impl Workspace {
                     continue;
                 }
             }
+            let include_stamps = validator.held_payloads()[held_before..]
+                .iter()
+                .filter(|(held, _)| !super::resolver::path_equivalent(held, &path))
+                .cloned()
+                .collect();
             return Ok(
-                match decoded(store.load_facts_by_id(artifact, &mut budget))? {
+                match decoded(timed(ReusePhase::Decode, || {
+                    store.load_facts_by_id(artifact, &mut budget)
+                }))? {
                     Ok(Lookup::Hit(facts)) => Reuse::Hit {
                         facts: admitted(facts, &budget, charge),
                         via: ReuseVia::Evidence,
                         reads: validator.reads(),
+                        artifact,
+                        evidence: Some(header.evidence_id()),
+                        include_stamps,
+                        root_hash,
                     },
                     Ok(Lookup::Miss(miss)) => Reuse::Miss(ReuseMiss::Store(miss)),
                     Err(miss) => Reuse::Miss(miss),
@@ -597,6 +834,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_context_key_memo_encodes_once_per_installed_context() {
+        let one = Arc::new(ProjectContext::default());
+        let other = Arc::new(ProjectContext::default());
+        let mut memo = ContextKeyMemo::default();
+        assert_eq!(*memo.key_of(&one), CacheContextKey::new(&one));
+        assert!(
+            memo.0
+                .as_ref()
+                .is_some_and(|(held, _)| Arc::ptr_eq(held, &one))
+        );
+        assert_eq!(*memo.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(*memo.key_of(&other), CacheContextKey::new(&other));
+        assert!(
+            memo.0
+                .as_ref()
+                .is_some_and(|(held, _)| Arc::ptr_eq(held, &other)),
+            "another installed context is encoded again"
+        );
+    }
+
+    #[test]
+    fn a_shared_context_key_encodes_once_per_installed_context() {
+        let shared = SharedContextKey::default();
+        let one = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(shared.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(shared.encodings(), 1);
+        let other = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&other), CacheContextKey::new(&other));
+        assert_eq!(shared.encodings(), 2, "another installed context");
+        // The memo holds the context weakly: once dropped, a context
+        // installed later is encoded again, never given the old key.
+        drop(other);
+        let later = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&later), CacheContextKey::new(&later));
+        assert_eq!(shared.encodings(), 3);
+    }
+
+    /// The crawl alternates contexts per unit (final review Minor 7): each
+    /// live context keeps its key, up to `SHARED_CONTEXT_KEYS` of them, and
+    /// the least recently used one is encoded again past that.
+    #[test]
+    fn a_shared_context_key_keeps_alternating_contexts() {
+        let shared = SharedContextKey::default();
+        let contexts: Vec<_> = (0..SHARED_CONTEXT_KEYS)
+            .map(|_| Arc::new(ProjectContext::default()))
+            .collect();
+        for _ in 0..3 {
+            for context in &contexts {
+                assert_eq!(shared.key_of(context), CacheContextKey::new(context));
+            }
+        }
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS, "one per context");
+        // Touch every context but the first, then add one more: the first
+        // (least recently used) is evicted, the others stay.
+        for context in &contexts[1..] {
+            shared.key_of(context);
+        }
+        let extra = Arc::new(ProjectContext::default());
+        shared.key_of(&extra);
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 1);
+        for context in &contexts[1..] {
+            shared.key_of(context);
+        }
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 1, "kept");
+        assert_eq!(
+            shared.key_of(&contexts[0]),
+            CacheContextKey::new(&contexts[0])
+        );
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 2, "evicted");
+    }
+
+    #[test]
     fn reuse_misses_map_to_their_diagnostic_causes() {
         use crate::persistent_cache::counters::MissCause::*;
         use pascal_cache::{Malformed, Mismatch, Miss};
@@ -665,6 +975,7 @@ pub(crate) mod tests {
             match expected_via {
                 ReuseVia::Local => assert_eq!(persisted, Persisted::Local(Published::Inserted)),
                 ReuseVia::Evidence => assert_eq!(persisted, Persisted::Expanded(inserted)),
+                ReuseVia::Snapshot { .. } => unreachable!("no snapshot is held"),
             }
             let expected = indexed.facts(name).extracted.facts;
             drop(store);
@@ -678,6 +989,170 @@ pub(crate) mod tests {
                 miss => panic!("{name}: {miss:?}"),
             }
         }
+    }
+
+    /// D31: a library unit whose discovered owner is another context is reused
+    /// under the index context that lists it, never under its own owner.
+    #[test]
+    fn reuse_in_context_reports_ids_stamps_and_root_hash() {
+        let indexed = index(
+            &[
+                ("Main.pas", MAIN.as_bytes()),
+                ("Types.inc", TYPES.as_bytes()),
+                ("Nested.inc", NESTED.as_bytes()),
+            ],
+            &["Main.pas"],
+        );
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        persist(&indexed, "Main.pas", &store);
+        let uri = indexed.uri("Main.pas");
+        let key = indexed.workspace.document_contexts[&uri].clone();
+        let mut restarted = restart(&indexed);
+        restarted.context_for_uri_with_cancel(&uri, None).unwrap();
+        assert!(restarted.contexts.contains_key(&key));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = ReconciliationBudget::new(Arc::clone(&cancel));
+        let reuse = restarted
+            .reuse_in_context(&uri, &key, &store, &work, DECODE_LIMIT, &cancel)
+            .unwrap();
+        let Reuse::Hit {
+            evidence,
+            include_stamps,
+            via,
+            artifact,
+            root_hash,
+            ..
+        } = reuse
+        else {
+            panic!("{reuse:?}")
+        };
+        assert_eq!(via, ReuseVia::Evidence);
+        let prepared = indexed
+            .workspace
+            .prepare_artifact(&uri, &mut FactBudget::new(1 << 26), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(evidence, prepared.member_evidence_id());
+        assert!(evidence.is_some());
+        assert_eq!(artifact, prepared.artifact_id());
+        let observations = &prepared.expanded.as_ref().unwrap().observations;
+        assert!(!observations.is_empty());
+        assert_eq!(
+            prepared.transient_bytes(),
+            pascal_cache::encoded_content_bytes(&prepared.facts).unwrap()
+                + observations
+                    .iter()
+                    .map(|observation| observation.encoded().len())
+                    .sum::<usize>()
+        );
+        let bytes = std::fs::read(indexed.root.join("Main.pas")).unwrap();
+        assert_eq!(root_hash, pascal_project::content_hash_bytes(&bytes));
+        let mut stamped: Vec<_> = include_stamps
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        stamped.sort();
+        assert_eq!(
+            stamped,
+            vec![
+                indexed.root.join("Nested.inc"),
+                indexed.root.join("Types.inc")
+            ]
+        );
+        assert!(
+            restarted.index.parsed_document(&uri).is_none(),
+            "nothing was parsed"
+        );
+    }
+
+    /// D31: `Main.pas` is analysed and persisted under the project context
+    /// `App.dproj`; a restarted workspace without that project discovers
+    /// another owner for it. `reuse_in_context` reuses it under the project
+    /// key it is given, and `reuse_persisted_facts` (the discovered owner)
+    /// cannot.
+    #[test]
+    fn reuse_in_context_uses_the_given_context_not_the_discovered_owner() {
+        use crate::project_cache::IndexAnchor;
+        use crate::workspace::WorkspaceOptions;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for (name, bytes) in [
+            ("lib/Main.pas", MAIN.as_bytes()),
+            ("lib/Types.inc", TYPES.as_bytes()),
+            ("lib/Nested.inc", NESTED.as_bytes()),
+            (
+                "app/App.dproj",
+                b"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>"
+                    as &[u8],
+            ),
+            ("app/App.dpr", b"program App; begin end.\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let uri = Url::from_file_path(root.join("lib/Main.pas")).unwrap();
+        let session = || OverrideSession::new(None);
+        let configured = Workspace::with_override_session(
+            vec![root.clone()],
+            WorkspaceOptions {
+                project_file: Some("app/App.dproj".into()),
+                ..WorkspaceOptions::default()
+            },
+            session(),
+        );
+        let mut analysed = Workspace::from_analysis_input(&configured.analysis_input());
+        analysed
+            .warm_with_cancel(&uri, &AtomicBool::new(false))
+            .unwrap();
+        let project_key = analysed.document_contexts[&uri].clone();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        analysed
+            .persist_source(
+                &uri,
+                &store,
+                &mut FactBudget::new(1 << 26),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        let plain = Workspace::with_override_session(
+            vec![root.clone()],
+            WorkspaceOptions::default(),
+            session(),
+        );
+        let mut restarted = Workspace::from_analysis_input(&plain.analysis_input());
+        let installed = restarted
+            .index_context_for(
+                &IndexAnchor::Project(root.join("app/App.dproj")),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(installed, project_key, "the same project context");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = ReconciliationBudget::new(Arc::clone(&cancel));
+        let reuse = restarted
+            .reuse_in_context(&uri, &project_key, &store, &work, DECODE_LIMIT, &cancel)
+            .unwrap();
+        assert!(
+            matches!(
+                reuse,
+                Reuse::Hit {
+                    via: ReuseVia::Evidence,
+                    ..
+                }
+            ),
+            "{reuse:?}"
+        );
+        assert!(restarted.index.parsed_document(&uri).is_none());
+        let discovered = restarted.context_for_uri_with_cancel(&uri, None).unwrap();
+        assert_ne!(discovered, project_key, "another owner is discovered");
+        let owner_reuse = restarted
+            .reuse_persisted_facts(&uri, &store, &work, DECODE_LIMIT, &cancel)
+            .unwrap();
+        assert!(matches!(owner_reuse, Reuse::Miss(_)), "{owner_reuse:?}");
     }
 
     #[test]
@@ -978,7 +1453,7 @@ pub(crate) mod tests {
 /// `l4d-zf1b.5` acceptance criteria, each against a real store and a
 /// restarted workspace.
 #[cfg(all(test, unix))]
-mod acceptance {
+pub(in crate::workspace) mod acceptance {
     use super::tests::*;
     use super::*;
     use crate::workspace::facts::tests::{CONDITIONAL, Indexed, MAIN, NESTED, TYPES, index};
@@ -1038,7 +1513,7 @@ mod acceptance {
 
     /// A same-size rewrite that keeps the modification time, as one within
     /// one timestamp tick or a restoring tool would.
-    fn rewrite_keeping_the_stamp(path: &Path, bytes: &[u8]) {
+    pub(in crate::workspace) fn rewrite_keeping_the_stamp(path: &Path, bytes: &[u8]) {
         let metadata = std::fs::metadata(path).unwrap();
         assert_eq!(metadata.len(), bytes.len() as u64, "same size");
         std::fs::write(path, bytes).unwrap();

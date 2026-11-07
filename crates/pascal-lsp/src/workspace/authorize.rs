@@ -6,7 +6,6 @@
 //! database are refused to a narrower requester. Authorization is not
 //! freshness: member and binding evidence are still validated, and the
 //! validator authorizes every payload it reads.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use pascal_cache::{
     Binding, BindingOutcome, Bypass, Digest, ImporterHit, Lookup, MemberRecord, MemberRecordHeader,
@@ -44,6 +43,7 @@ impl RecordSource for MemberRecordHeader {
 }
 
 /// A query hit, which names only its record.
+#[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
 pub(crate) trait RecordHit {
     fn record_id(&self) -> Digest;
 }
@@ -74,10 +74,12 @@ impl<T> Authorized<T> {
 
     /// The requester's own entry for the source, under which its payload
     /// is read and validated.
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
     pub(crate) fn entry(&self) -> &ProjectPathEntry {
         &self.entry
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
     pub(crate) fn into_inner(self) -> T {
         self.value
     }
@@ -99,7 +101,9 @@ pub(crate) enum Refused {
         reason: Box<Refused>,
     },
     /// The hit's record is no longer readable.
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
     Store(Miss),
+    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
     Bypass(Bypass),
 }
 
@@ -143,6 +147,7 @@ pub(crate) fn authorize_record<T: RecordSource>(
 /// header is opened (its source is part of the verified header) and its
 /// source authorized. Its bindings are unusable until the full record is
 /// read and passed to `authorize_record`.
+#[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.9: query hits (spec §7)
 pub(crate) fn authorize_hit<H: RecordHit>(
     store: &Store,
     hit: &H,

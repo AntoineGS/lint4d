@@ -4,8 +4,8 @@ mod common;
 use common::private_tempdir;
 
 use pascal_cache::{
-    Bypass, Digest, LimitsError, LocationIssue, MAX_WAIT, Namespace, Reclaimed, RetireReport,
-    Store, StoreLimits,
+    Bypass, DATABASE_FILE, Digest, LimitsError, LocationIssue, MAX_WAIT, Namespace, Reclaimed,
+    RetireReport, Store, StoreLimits,
 };
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -20,7 +20,7 @@ fn open(directory: &Path, byte: u8) -> Store {
 }
 
 fn raw(directory: &Path) -> Connection {
-    let connection = Connection::open(directory.join("analysis.sqlite3")).unwrap();
+    let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }
@@ -42,7 +42,7 @@ fn opening_creates_the_store_and_registers_the_namespace() {
     let store = open(&directory, 1);
     assert_eq!(store.scope().namespace, namespace(1).id());
     assert_eq!(store.scope().reset_epoch, 0);
-    assert!(directory.join("analysis.sqlite3").is_file());
+    assert!(directory.join(DATABASE_FILE).is_file());
     assert!(store.location().namespace_lock(namespace(1).id()).is_file());
     assert_eq!(state(&directory, 1), Some((0, 1)));
     assert_eq!(store.check_scope(), Ok(()));
@@ -66,7 +66,7 @@ fn invalid_limits_are_a_configuration_bypass() {
         Store::open(root.path(), &namespace(1), limits).err(),
         Some(Bypass::InvalidLimits(LimitsError::Readers))
     );
-    assert!(!root.path().join("analysis.sqlite3").exists());
+    assert!(!root.path().join(DATABASE_FILE).exists());
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO artifacts VALUES (?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'', 1)",
+                "INSERT INTO artifacts VALUES (NULL, ?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'', 1)",
                 params![
                     ns.as_bytes().as_slice(),
                     id.as_slice(),
@@ -175,17 +175,12 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
                 ],
             )
             .unwrap();
+        let artifact_ref = connection.last_insert_rowid();
         for ordinal in 0..rows {
             connection
                 .execute(
-                    "INSERT INTO artifact_rows VALUES (?1, ?5, ?2, ?3, 1, NULL, x'', ?4)",
-                    params![
-                        ns.as_bytes().as_slice(),
-                        id.as_slice(),
-                        ordinal,
-                        [0u8; 32].as_slice(),
-                        epoch
-                    ],
+                    "INSERT INTO artifact_rows VALUES (?1, ?2, 1, NULL, x'')",
+                    params![artifact_ref, ordinal],
                 )
                 .unwrap();
         }
@@ -251,9 +246,12 @@ fn reclaim_spares_a_namespace_that_is_live_again_at_a_later_epoch() {
     let connection = raw(root.path());
     let epochs = |table: &str| -> Vec<i64> {
         let mut statement = connection
-            .prepare(&format!(
-                "SELECT DISTINCT reset_epoch FROM {table} ORDER BY 1"
-            ))
+            .prepare(
+                &format!("SELECT DISTINCT reset_epoch FROM {table} ORDER BY 1").replace(
+                    "FROM artifact_rows",
+                    "FROM artifact_rows JOIN artifacts USING (artifact_ref)",
+                ),
+            )
             .unwrap();
         statement
             .query_map([], |row| row.get(0))
@@ -319,9 +317,8 @@ fn a_symlinked_database_is_bypassed() {
     let root = private_tempdir();
     let directory = root.path().join("cache");
     drop(open(&directory, 1));
-    std::fs::rename(directory.join("analysis.sqlite3"), root.path().join("real")).unwrap();
-    std::os::unix::fs::symlink(root.path().join("real"), directory.join("analysis.sqlite3"))
-        .unwrap();
+    std::fs::rename(directory.join(DATABASE_FILE), root.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(root.path().join("real"), directory.join(DATABASE_FILE)).unwrap();
     assert_eq!(
         Store::open(&directory, &namespace(1), StoreLimits::default()).err(),
         Some(Bypass::Location(LocationIssue::Symlink))
@@ -352,7 +349,7 @@ fn corrupt_and_unsupported_containers_are_bypassed() {
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(corrupt.join("analysis.sqlite3"), vec![0x5a; 8192]).unwrap();
+    std::fs::write(corrupt.join(DATABASE_FILE), vec![0x5a; 8192]).unwrap();
     assert_eq!(
         Store::open(&corrupt, &namespace(1), StoreLimits::default()).err(),
         Some(Bypass::Corrupt)

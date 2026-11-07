@@ -282,6 +282,19 @@ pub(crate) struct CachedDocument {
     pub(crate) parsed: Arc<ParsedDocument>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Document owner entries `analysis_input` copied on this thread.
+    static OWNERS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The document owner entries `analysis_input` copied on this thread since
+/// the last take.
+#[cfg(test)]
+pub(crate) fn take_owners_copied_for_test() -> usize {
+    OWNERS_COPIED.with(|copied| copied.replace(0))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceInput {
     pub(crate) roots: Vec<PathBuf>,
@@ -308,6 +321,58 @@ pub(crate) struct WorkspaceInput {
     pub(crate) source_generation: u64,
     pub(crate) request_generation: u64,
     pub(crate) configuration_generation: u64,
+    /// The disk-only producer view (`disk_baseline`).
+    pub(crate) baseline: bool,
+    /// `path_key` of every path the session holds overlaid or deleted,
+    /// paths only: a baseline view uses it to refuse publishing a context
+    /// built from an unsaved project file, never for analysis.
+    pub(crate) session_private_paths: Arc<HashSet<String>>,
+}
+
+impl WorkspaceInput {
+    /// The same project with none of the session's editor state: no
+    /// overlays, reusable parses, rejected documents, versions or deletion
+    /// overrides, so everything analysed from it reads saved files only
+    /// (spec §4.4, D37). Roots, options, selections, owners, caches and
+    /// generations are kept.
+    pub(crate) fn disk_baseline(&self) -> WorkspaceInput {
+        // An open buffer equal to its saved file is no private input of a
+        // context (controller ruling, l4d-zf1b.8); member roots stay
+        // session-private while open (`root_is_session_private`).
+        let edited = self
+            .overlays
+            .iter()
+            .filter_map(|(uri, overlay)| Some((uri.to_file_path().ok()?, overlay)))
+            .filter(|(path, overlay)| overlay_differs_from_disk(path, &overlay.text))
+            .map(|(path, _)| path);
+        let deleted = self
+            .deleted_overrides
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok());
+        let session_private_paths = edited
+            .chain(deleted)
+            .map(|path| path_key(&absolute_path(path)))
+            .chain(self.session_private_paths.iter().cloned())
+            .collect();
+        WorkspaceInput {
+            session_private_paths: Arc::new(session_private_paths),
+            overlays: HashMap::new(),
+            cached_documents: HashMap::new(),
+            rejected_documents: HashSet::new(),
+            rejection_reasons: HashMap::new(),
+            document_versions: HashMap::new(),
+            deleted_overrides: HashMap::new(),
+            baseline: true,
+            ..self.clone()
+        }
+    }
+}
+
+/// Whether `text` is not exactly the bytes saved at `path`; a file that
+/// cannot be read differs. The length is compared before anything is read.
+pub(crate) fn overlay_differs_from_disk(path: &Path, text: &str) -> bool {
+    let same_length = fs::metadata(path).is_ok_and(|metadata| metadata.len() == text.len() as u64);
+    !same_length || fs::read(path).map_or(true, |bytes| bytes != text.as_bytes())
 }
 
 /// The small portion of a workspace snapshot needed to revalidate a retained
@@ -1575,6 +1640,45 @@ impl Workspace {
     }
 
     pub(crate) fn analysis_input(&self) -> WorkspaceInput {
+        #[cfg(test)]
+        OWNERS_COPIED.with(|copied| copied.set(copied.get() + self.document_owners.len()));
+        let cached_documents = self
+            .index
+            .reusable_documents()
+            .into_iter()
+            .filter_map(|(uri, parsed)| {
+                let context_key = self.document_contexts.get(&uri)?;
+                let context = self.contexts.get(context_key)?.context.clone();
+                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
+            })
+            .collect();
+        self.input_with(self.document_owners.clone(), cached_documents)
+    }
+
+    /// `analysis_input` without the document owners and reusable parses,
+    /// which grow with every document the workspace loads: only for a
+    /// compile-time session's source store and provider configuration,
+    /// which read neither. A batch's member sessions then cost no more for
+    /// the members loaded before them (13b-5, A4).
+    pub(super) fn session_source_input(&self) -> WorkspaceInput {
+        self.input_with(HashMap::new(), HashMap::new())
+    }
+
+    /// The input of a parallel extraction worker's view (13c-3): this
+    /// view's editor state, owners and baseline flag, without its reusable
+    /// parses (a baseline view holds none).
+    pub(super) fn worker_view_input(&self) -> WorkspaceInput {
+        WorkspaceInput {
+            baseline: self.baseline,
+            ..self.input_with(self.document_owners.clone(), HashMap::new())
+        }
+    }
+
+    fn input_with(
+        &self,
+        document_owners: HashMap<Url, KnownDocumentOwner>,
+        cached_documents: HashMap<Url, CachedDocument>,
+    ) -> WorkspaceInput {
         let overlays = self
             .open_documents
             .iter()
@@ -1611,16 +1715,6 @@ impl Workspace {
             .iter()
             .map(|(uri, document)| (canonical_file_uri(uri), document.version))
             .collect();
-        let cached_documents = self
-            .index
-            .reusable_documents()
-            .into_iter()
-            .filter_map(|(uri, parsed)| {
-                let context_key = self.document_contexts.get(&uri)?;
-                let context = self.contexts.get(context_key)?.context.clone();
-                Some((canonical_file_uri(&uri), CachedDocument { context, parsed }))
-            })
-            .collect();
         WorkspaceInput {
             roots: self.roots.iter().map(|root| root.path.clone()).collect(),
             options: self.options.clone(),
@@ -1628,7 +1722,7 @@ impl Workspace {
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
             build_selections: self.build_selections.clone(),
-            document_owners: self.document_owners.clone(),
+            document_owners,
             overlays,
             cached_documents,
             project_cache: self.project_cache.clone(),
@@ -1648,6 +1742,8 @@ impl Workspace {
             source_generation: self.source_generation,
             request_generation: self.request_generation,
             configuration_generation: self.configuration_generation,
+            baseline: false,
+            session_private_paths: Arc::clone(&self.session_private_paths),
         }
     }
 

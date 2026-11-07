@@ -24,7 +24,7 @@ pub use artifact_key::{
     SessionDependence,
 };
 pub use context_key::ContextKey;
-pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, SOURCE_DIGEST_CONTEXT};
+pub use digest::{Digest, MANIFEST_DIGEST_CONTEXT, RecordListDigest, SOURCE_DIGEST_CONTEXT};
 pub use encoding::{CanonicalEncode, ENCODING_VERSION, Encoder};
 pub use evidence::{
     EvidencePurpose, EvidenceSubject, LISTING_DIGEST_CONTEXT, OBSERVATIONS_DIGEST_CONTEXT,
@@ -62,18 +62,18 @@ pub use store::{
     APPLICATION_ID, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow, ArtifactWrite,
     BindingBatch, Bypass, CONNECTION_OVERHEAD_BYTES, CONTAINER_VERSION, Checkpointed,
     DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite,
-    FACT_CHECKSUM_CONTEXT, Hint, HintStats, ImporterHit, ImporterPage, IndexHit, IndexPage,
-    Integrity, JOURNAL_SIZE_LIMIT_BYTES, LEASE_EXPIRY, LEASE_RENEWAL, LOW_SPACE_MARGIN_BYTES,
-    LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS,
-    MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_HEALTH_BACKOFF, MAX_INDEX_KEY_BYTES,
-    MAX_INDEX_PAGE, MAX_LEASE_HOLDS, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT,
-    MAX_PAGE_CACHE_BYTES, MAX_PENDING_HINTS, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS,
-    MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES,
-    MAX_WAIT, MIN_BUDGET_TO_WAL_RATIO, MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_HEALTH_BACKOFF,
-    MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, Maintenance, MaintenanceLimits,
-    MaintenanceLimitsError, Malformed, MemberBatch, MemberRecordHeader, MemberRecordReader, Miss,
-    ObservationBatch, Phase, PolicyError, PolicyState, Pressure, Published, PublishedEvidence,
-    PublishedRecord, PublishedSet, ROW_CHECKSUM_CONTEXT, ROW_OVERHEAD_BYTES, Reclaimed,
+    FACT_CHECKSUM_CONTEXT, Hint, HintStats, ImporterHit, ImporterPage, IndexCursor, IndexHit,
+    IndexPage, Integrity, JOURNAL_SIZE_LIMIT_BYTES, LEASE_EXPIRY, LEASE_RENEWAL,
+    LOW_SPACE_MARGIN_BYTES, LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES,
+    MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_HEALTH_BACKOFF,
+    MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_LEASE_HOLDS, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS,
+    MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_PENDING_HINTS, MAX_READERS, MAX_ROW_BATCH_BYTES,
+    MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS,
+    MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_BUDGET_TO_WAL_RATIO, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    MIN_HEALTH_BACKOFF, MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, Maintenance,
+    MaintenanceLimits, MaintenanceLimitsError, Malformed, MemberBatch, MemberRecordHeader,
+    MemberRecordReader, Miss, ObservationBatch, Phase, PolicyError, PolicyState, Pressure,
+    Published, PublishedEvidence, PublishedRecord, PublishedSet, ROW_OVERHEAD_BYTES, Reclaimed,
     RetireReport, RetireStep, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal,
     SnapshotBuilder, SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader, SnapshotSeal,
     StepBudget, StepReport, Store, StoreLimits, StoreLocation, StorePolicy, StoredRow, TooLarge,
@@ -86,8 +86,11 @@ pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
 pub use store::INDEX_QUERY_FOR_TEST;
 #[cfg(feature = "test-support")]
-pub use store::store_operations_for_test;
-#[cfg(feature = "test-support")]
 pub use store::{HeldConnection, MaintenanceLockHold, ScratchHold};
 #[cfg(feature = "test-support")]
 pub use store::{IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY_FOR_TEST};
+#[cfg(feature = "test-support")]
+pub use store::{
+    record_opens_on_this_thread_for_test, store_operations_for_test,
+    store_operations_on_this_thread_for_test,
+};

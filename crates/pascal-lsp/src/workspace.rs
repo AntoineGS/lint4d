@@ -118,13 +118,14 @@ fn warn_exclude_glob(message: String) {
 
 pub(crate) mod admitted;
 mod authorize;
+pub(crate) mod baseline;
 pub(crate) mod capture;
 mod catalogues;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
-mod eligible;
+pub(crate) mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
@@ -2274,6 +2275,45 @@ impl ContextKey {
         }
     }
 
+    /// `self` resolved under the runtime selection `scope` → `project`.
+    #[cfg(test)]
+    pub(crate) fn with_selection_for_test(mut self, scope: &Path, project: &Path) -> Self {
+        self.selection_scope = Some(scope.to_path_buf());
+        self.selection_project = Some(project.to_path_buf());
+        self
+    }
+
+    /// Whether `self` and `other` differ at most in the runtime selection
+    /// current when each was resolved (A8). That is provenance, not
+    /// context: a selection that changes the resolved context also changes
+    /// `project_file` or `context_fingerprint`.
+    pub(crate) fn differs_only_in_selection(&self, other: &Self) -> bool {
+        let Self {
+            project_file,
+            installation_id,
+            workspace_root,
+            project_scope,
+            selection_scope: _,
+            selection_project: _,
+            config,
+            platform,
+            build_selection_modes,
+            conditional_context,
+            context_fingerprint,
+            overrides,
+        } = self;
+        *project_file == other.project_file
+            && *installation_id == other.installation_id
+            && *workspace_root == other.workspace_root
+            && *project_scope == other.project_scope
+            && *config == other.config
+            && *platform == other.platform
+            && *build_selection_modes == other.build_selection_modes
+            && *context_fingerprint == other.context_fingerprint
+            && *conditional_context == other.conditional_context
+            && *overrides == other.overrides
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -3261,6 +3301,23 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
+    /// The disk-only producer view: no editor state (`WorkspaceInput::disk_baseline`).
+    baseline: bool,
+    /// `WorkspaceInput::session_private_paths`.
+    session_private_paths: Arc<HashSet<String>>,
+    /// The warm crawl publishes the disk-proven units it analyses
+    /// (R8-2/D42). Only the warmer sets it, while the store is enabled.
+    crawl_persists: bool,
+    /// Set when the crawl met a context built from unsaved project input:
+    /// it publishes nothing, and the warmer interleaves extraction.
+    crawl_private: Arc<AtomicBool>,
+    /// Whether each context the crawl met came from saved project files.
+    /// A job's input does not change, so one answer per context holds.
+    crawl_disk_contexts: HashMap<ContextKey, bool>,
+    /// The store's key of the context last proven against (13f).
+    cache_context_key: persist::SharedContextKey,
+    /// The units the crawl considered for publication.
+    crawl_considered: HashSet<Url>,
     /// The store directory as `persistent_cache` gives it (l4d-vrw0).
     cache_base: Option<CacheExclusion>,
     /// `cache_base` in every form a walk of the roots can reach it through
@@ -3285,6 +3342,10 @@ pub struct Workspace {
     /// `true` in an index build view: loads then drop their cache claim
     /// instead of publishing the parse (l4d-33 A13).
     pub(crate) index_build: bool,
+    /// While an index batch extracts one member, when its extraction is
+    /// over: compile-time sessions stop at it as at a cancellation (13b-5,
+    /// A4). `None` for every other analysis, the crawl's included.
+    pub(crate) member_deadline: Option<Instant>,
     /// The context an index build is working in: no prune drops it.
     pinned_context: Option<ContextKey>,
     /// Why the last load that returned `Ok(false)` skipped its file: a read
@@ -3887,8 +3948,45 @@ impl Workspace {
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
+            baseline: input.baseline,
+            session_private_paths: Arc::clone(&input.session_private_paths),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn is_baseline(&self) -> bool {
+        self.baseline
+    }
+
+    /// Whether every project metadata file `key`'s context consulted is
+    /// saved: none is deleted, or open with a buffer that differs from its
+    /// saved bytes, in this workspace or, for a baseline view, in the
+    /// session it was derived from (spec §4.4; an unedited open buffer is
+    /// no private input, controller ruling l4d-zf1b.8).
+    pub(crate) fn context_inputs_are_disk_only(&self, key: &ContextKey) -> bool {
+        let Some(state) = self.contexts.get(key) else {
+            return false;
+        };
+        let deleted = resolver::deletion_overrides_by_path(&self.deleted_overrides);
+        state
+            .context_observations
+            .metadata_files
+            .iter()
+            .map(|path| absolute_path(path.clone()))
+            .all(|path| {
+                let Ok(uri) = Url::from_file_path(&path) else {
+                    return false;
+                };
+                let edited = [&uri, &canonical_file_uri(&uri)]
+                    .into_iter()
+                    .filter_map(|uri| self.open_documents.get(uri)?.text.as_ref())
+                    .any(|text| rename::overlay_differs_from_disk(&path, text));
+                !self
+                    .session_private_paths
+                    .contains(&rename::path_key(&path))
+                    && !resolver::deletion_applies(&deleted, &path)
+                    && !edited
+            })
     }
 
     pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
@@ -7957,8 +8055,10 @@ impl Workspace {
             // Background work over a whole closure gives way to interactive
             // requests between units.
             #[cfg(feature = "test-support")]
-            if index == 1 && crate::warmer::has_background_gate_on_this_thread() {
-                wait_at_background_walk_test_barrier();
+            if crate::warmer::has_background_gate_on_this_thread() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER", index);
+            } else if self.dependency_hook.is_some() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_WARM_CRAWL_BARRIER", index);
             }
             if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -8044,6 +8144,11 @@ impl Workspace {
                     if !dependencies.contains(&dependency_uri) {
                         dependencies.push(dependency_uri.clone());
                     }
+                    self.publish_crawled_unit(
+                        &dependency_uri,
+                        &dependency.source.revision,
+                        cancel.unwrap_or(&no_cancel),
+                    );
                 }
             }
             if let Some(hook) = &self.dependency_hook {
@@ -8192,6 +8297,16 @@ impl Workspace {
 
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
         self.dependency_hook = Some(hook);
+    }
+
+    /// The warm crawl publishes the disk-proven units it analyses (R8-2/D42).
+    pub(crate) fn set_crawl_persists(&mut self, persists: bool) {
+        self.crawl_persists = persists;
+    }
+
+    /// Set once the crawl meets a context built from unsaved project input.
+    pub(crate) fn crawl_private_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.crawl_private)
     }
 
     /// Loads `uri` and every direct import into the shared cache.
@@ -14341,7 +14456,6 @@ impl Workspace {
         &self.project_cache
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
     pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
         &self.persistent_cache
     }
@@ -16803,18 +16917,30 @@ fn wait_at_import_claim_test_barrier() {
     }
 }
 
-/// Holds background work (diagnostics) after the first unit of a closure
-/// walk, so protocol tests can issue interactive work while it runs.
+/// Holds a closure walk before its unit `index` when `variable` is
+/// `entered|release[|units]` and `index == units` (default 1): background
+/// work (diagnostics, `PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER`) so protocol
+/// tests can issue interactive work while it runs, or the warm crawl
+/// (`PASCAL_LSP_TEST_WARM_CRAWL_BARRIER`) once it has analysed and published
+/// exactly `units` units.
 #[cfg(feature = "test-support")]
-fn wait_at_background_walk_test_barrier() {
+fn wait_at_walk_test_barrier(variable: &str, index: usize) {
     use std::io::Write as _;
 
-    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER") else {
+    let Ok(spec) = std::env::var(variable) else {
         return;
     };
-    let Some((entered, release)) = spec.split_once('|') else {
+    let mut fields = spec.split('|');
+    let (Some(entered), Some(release)) = (fields.next(), fields.next()) else {
         return;
     };
+    let units = fields
+        .next()
+        .and_then(|units| units.parse::<usize>().ok())
+        .unwrap_or(1);
+    if index != units {
+        return;
+    }
     if let Ok(mut marker) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -25749,10 +25875,14 @@ BDS = '/fake/37'
         assert_eq!(options.limits.max_cache_bytes, 1_048_576);
 
         let workspace = test_workspace(vec![temp.path().to_path_buf()], options);
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
         store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[test]
@@ -25839,10 +25969,14 @@ BDS = '/fake/37'
         .expect("prepared runtime options");
 
         assert!(workspace.apply_prepared_runtime_options(prepared));
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
         store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[cfg(unix)]
@@ -26164,6 +26298,8 @@ BDS = '/fake/37'
             source_generation: 0,
             request_generation: 0,
             configuration_generation: 0,
+            baseline: false,
+            session_private_paths: Default::default(),
         };
         let entry = ProjectPathEntry {
             path: root.clone(),

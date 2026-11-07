@@ -551,10 +551,11 @@ pub(crate) fn is_stable_load_refusal(message: &str) -> bool {
 
 /// The compile-time admission bounds fixed for a session, whatever else
 /// the process holds: one that refuses a member's session refuses it again
-/// with the same inputs. `max_retained_bytes` is not one (the resolver
-/// narrows it by what it already retains), nor is `max_provider_stack_bytes`
-/// (it depends on the caller's stack).
-const DETERMINISTIC_ADMISSION_LIMITS: [&str; 11] = [
+/// with the same inputs (the expression bounds are constants of
+/// pascal-core's operand parser). `max_retained_bytes` is not one (the
+/// resolver narrows it by what it already retains), nor is
+/// `max_provider_stack_bytes` (it depends on the caller's stack).
+const DETERMINISTIC_ADMISSION_LIMITS: [&str; 13] = [
     "max_definitions",
     "max_fields",
     "max_variant_alternatives",
@@ -566,6 +567,8 @@ const DETERMINISTIC_ADMISSION_LIMITS: [&str; 11] = [
     "max_provider_queries",
     "max_work",
     "max_byte_work",
+    "max_expression_bytes",
+    "max_expression_tokens",
 ];
 
 /// The fixed compile-time bound a load failure names (13d-1), as
@@ -6341,6 +6344,9 @@ pub(in crate::workspace) mod tests {
             deterministic_admission_limit(&message("max_branch_states")),
             Some("max_branch_states")
         );
+        for fixed in ["max_expression_bytes", "max_expression_tokens"] {
+            assert_eq!(deterministic_admission_limit(&message(fixed)), Some(fixed));
+        }
         assert_eq!(
             deterministic_admission_limit(&message("max_retained_bytes")),
             None

@@ -1471,6 +1471,70 @@ mod cache_tests {
         ));
     }
 
+    /// l4d-ig6b: a references request (a bulk client request) must not wait
+    /// behind the background warmer's claim; it takes the claim over as
+    /// interactive work does, and still reuses what the warmer stored.
+    #[test]
+    fn client_request_lookup_takes_over_a_yielding_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::yielding(Arc::new(AtomicBool::new(false))),
+        );
+        let client = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::client(Arc::new(AtomicBool::new(false))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // The warmer holds its claim until told otherwise: a lookup that
+        // waited for it would never answer here.
+        let lookup = client.recv_timeout(Duration::from_secs(5));
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let Ok(Lookup::Compute(claim)) = lookup else {
+            panic!("the client request must take the warmer's claim over, not wait for it")
+        };
+        assert!(!claim.is_detached(), "the take-over claims the slot");
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    /// l4d-ig6b: what the warmer finished is reused, not computed again.
+    #[test]
+    fn client_request_lookup_reuses_a_unit_the_warmer_stored() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::yielding(Arc::new(AtomicBool::new(false))),
+        );
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let client = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::client(Arc::new(AtomicBool::new(false))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            client.recv_timeout(Duration::from_secs(5)),
+            Ok(Lookup::Hit(_))
+        ));
+    }
+
     #[test]
     fn interactive_unit_waits_on_a_roleless_owner_are_bounded() {
         let cache = ProjectCache::new(1 << 20);
@@ -3377,6 +3441,10 @@ pub(crate) struct ClaimRole {
     /// Interactive work takes this work's claims over instead of waiting:
     /// the warmer pauses for interactive requests and runs at low priority.
     yields_to_interactive: bool,
+    /// The work answers a client request that is not interactive
+    /// (references, rename, ...): like interactive work it takes the
+    /// warmer's claims over instead of waiting behind them (l4d-ig6b).
+    preempts_yielding: bool,
     /// How long the work waits for a slot that a thread without a role
     /// (the main thread) computes, before computing it without caching:
     /// such a claim can be neither cancelled nor taken over. Claims of
@@ -3392,6 +3460,7 @@ impl ClaimRole {
             interactive: true,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            preempts_yielding: false,
             roleless_claim_wait: Some(roleless_claim_wait),
         }
     }
@@ -3401,7 +3470,16 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            preempts_yielding: false,
             roleless_claim_wait: None,
+        }
+    }
+
+    /// A client request that is not interactive (references, rename, ...).
+    pub(crate) fn client(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            preempts_yielding: true,
+            ..Self::job(cancel)
         }
     }
 
@@ -3410,6 +3488,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: true,
+            preempts_yielding: false,
             roleless_claim_wait: None,
         }
     }
@@ -3557,6 +3636,9 @@ struct Inner {
     catalogues: Mutex<CatalogueStore>,
     /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
     index: Mutex<IndexStore>,
+    /// Include lookups that found nothing (l4d-ig6b). Never held together
+    /// with another lock.
+    include_failures: Mutex<IncludeFailureStore>,
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
@@ -3567,6 +3649,32 @@ struct Inner {
     /// Told each time a lookup starts waiting for a claim.
     #[cfg(test)]
     every_wait_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// How many include failures the cache keeps, and how many bytes of their
+/// observations (at most this share of `maxCacheBytes`), before it starts
+/// again from empty (l4d-ig6b).
+const MAX_INCLUDE_FAILURES: usize = 1024;
+const MAX_INCLUDE_FAILURE_BYTES: usize = 8 << 20;
+const INCLUDE_FAILURE_BUDGET_SHARE: usize = 16;
+
+#[derive(Default)]
+struct IncludeFailureStore {
+    entries: HashMap<(u64, pascal_core::IncludeFailureKey), IncludeFailureEntry>,
+    bytes: usize,
+}
+
+struct IncludeFailureEntry {
+    failure: Arc<pascal_core::IncludeFailure>,
+    probes: Arc<Vec<Probe>>,
+    reads: Arc<crate::workspace::capture::CapturedReads>,
+    bytes: usize,
+}
+
+/// A reusable include failure and what its lookup read, to replay.
+pub(crate) struct IncludeFailureHit {
+    pub(crate) failure: Arc<pascal_core::IncludeFailure>,
+    pub(crate) reads: Arc<crate::workspace::capture::CapturedReads>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4594,7 +4702,8 @@ impl ProjectCache {
                     // the slot over.
                     if *claimed_input == input_hash
                         && (owner.role.cancelled()
-                            || (role.interactive && owner.role.yields_to_interactive))
+                            || ((role.interactive || role.preempts_yielding)
+                                && owner.role.yields_to_interactive))
                     {
                         taking_over = true;
                         break;
@@ -5830,6 +5939,111 @@ impl ProjectCache {
     /// The provider interface compiled under resolver configuration
     /// `configuration` for `key`, if its probes still hold (l4d-4nbs D29). A
     /// stale entry is dropped.
+    /// The include failure stored for `key` under `configuration`, while
+    /// every directory and candidate its lookup observed is unchanged
+    /// (l4d-ig6b).
+    pub(crate) fn include_failure(
+        &self,
+        configuration: u64,
+        key: &pascal_core::IncludeFailureKey,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<IncludeFailureHit> {
+        let full = (configuration, key.clone());
+        let (failure, probes, reads) = {
+            let store = self
+                .inner
+                .include_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = store.entries.get(&full)?;
+            (
+                Arc::clone(&entry.failure),
+                Arc::clone(&entry.probes),
+                Arc::clone(&entry.reads),
+            )
+        };
+        if probes_hold(&probes, overlays) {
+            return Some(IncludeFailureHit { failure, reads });
+        }
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store
+            .entries
+            .get(&full)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.failure, &failure))
+            && let Some(entry) = store.entries.remove(&full)
+        {
+            store.bytes = store.bytes.saturating_sub(entry.bytes);
+        }
+        None
+    }
+
+    pub(crate) fn put_include_failure(
+        &self,
+        configuration: u64,
+        key: pascal_core::IncludeFailureKey,
+        failure: Arc<pascal_core::IncludeFailure>,
+        probes: Vec<Probe>,
+        reads: crate::workspace::capture::CapturedReads,
+    ) {
+        let bytes = std::mem::size_of::<IncludeFailureEntry>()
+            .saturating_add(key.owner_directory.as_os_str().len())
+            .saturating_add(key.requested_name.len())
+            .saturating_add(
+                failure
+                    .observations
+                    .iter()
+                    .map(|(payload, _)| {
+                        payload.saturating_add(std::mem::size_of::<(
+                            usize,
+                            pascal_core::ResolutionObservation,
+                        )>())
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(probes_bytes(&probes))
+            .saturating_add(reads.retained_bytes());
+        let state = lock(&self.inner);
+        let limit = MAX_INCLUDE_FAILURE_BYTES.min(state.max_bytes / INCLUDE_FAILURE_BUDGET_SHARE);
+        self.release(state);
+        if bytes > limit {
+            return;
+        }
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store.entries.len() >= MAX_INCLUDE_FAILURES || store.bytes.saturating_add(bytes) > limit
+        {
+            store.entries.clear();
+            store.bytes = 0;
+        }
+        let entry = IncludeFailureEntry {
+            failure,
+            probes: Arc::new(probes),
+            reads: Arc::new(reads),
+            bytes,
+        };
+        if let Some(old) = store.entries.insert((configuration, key), entry) {
+            store.bytes = store.bytes.saturating_sub(old.bytes);
+        }
+        store.bytes = store.bytes.saturating_add(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_failure_count(&self) -> usize {
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
+
     pub(crate) fn provider_graph(
         &self,
         configuration: u64,

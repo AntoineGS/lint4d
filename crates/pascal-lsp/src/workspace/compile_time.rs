@@ -123,6 +123,49 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
     }
 }
 
+/// Include lookups that found nothing, shared through the project cache
+/// (l4d-ig6b) by every analysis under one resolver configuration. A reuse
+/// replays into this session's capture what the lookup listed.
+struct CachedIncludeFailures {
+    cache: crate::project_cache::ProjectCache,
+    configuration: u64,
+    overlays: Arc<std::collections::HashMap<Url, super::rename::OverlayInput>>,
+    capture: Arc<super::capture::ReadCapture>,
+}
+
+impl pascal_core::SharedIncludeFailures for CachedIncludeFailures {
+    fn get(
+        &self,
+        key: &pascal_core::IncludeFailureKey,
+    ) -> Option<Arc<pascal_core::IncludeFailure>> {
+        let hit = self
+            .cache
+            .include_failure(self.configuration, key, &self.overlays)?;
+        self.capture.replay(&hit.reads);
+        Some(hit.failure)
+    }
+
+    fn put(&self, key: pascal_core::IncludeFailureKey, failure: Arc<pascal_core::IncludeFailure>) {
+        let observations = failure
+            .observations
+            .iter()
+            .map(|(_, observation)| observation.clone())
+            .collect::<Vec<_>>();
+        // A miss reads no payload; one that did is not shared.
+        let mut shareable = true;
+        let (probes, _) = crate::project_cache::observation_probes(&observations, &mut |_, _| {
+            shareable = false;
+            None
+        });
+        if !shareable {
+            return;
+        }
+        let reads = self.capture.snapshot().restricted_to(&observations);
+        self.cache
+            .put_include_failure(self.configuration, key, failure, probes, reads);
+    }
+}
+
 /// What a provider interface compiled for `context` depends on besides its
 /// key: the lookup configuration and the editor state that shapes listings.
 fn provider_graph_configuration(
@@ -983,10 +1026,17 @@ pub(super) fn expand_with_limits(
         control: &control,
     };
     let configuration = provider_graph_configuration(workspace, &context, &input, &resolver_limits);
+    let overlays = workspace.overlay_inputs();
     let shared = Arc::new(CachedProviderGraphs {
         cache: workspace.project_cache.clone(),
         configuration,
-        overlays: workspace.overlay_inputs(),
+        overlays: Arc::clone(&overlays),
+        capture: Arc::clone(&capture),
+    });
+    let include_failures = Arc::new(CachedIncludeFailures {
+        cache: workspace.project_cache.clone(),
+        configuration,
+        overlays,
         capture: Arc::clone(&capture),
     });
     let mut resolver = UnitResolver::new(
@@ -996,7 +1046,8 @@ pub(super) fn expand_with_limits(
         resolver_limits,
     )
     .with_context_observations(&state.context_observations)
-    .with_shared_provider_graphs(shared);
+    .with_shared_provider_graphs(shared)
+    .with_shared_include_failures(include_failures);
     let root = control.finish(resolver.load_source(
         &path,
         route.as_ref(),
@@ -1460,6 +1511,125 @@ mod tests {
         let session = result.expanded.session.as_ref().unwrap();
         assert!(session.root.complete, "{:?}", session.reasons);
         result
+    }
+
+    /// `count` units in `root/lib` that each include `Missing.inc`, which
+    /// is on no search path.
+    fn missing_include_workspace(
+        root: &std::path::Path,
+        count: usize,
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mut units = Vec::new();
+        for n in 0..count {
+            let source = format!(
+                "unit U{n}; interface {{$I Missing.inc}} const C{n} = {n}; implementation end."
+            );
+            std::fs::write(lib.join(format!("U{n}.pas")), &source).unwrap();
+            units.push((
+                Url::from_file_path(lib.join(format!("U{n}.pas"))).unwrap(),
+                source,
+            ));
+        }
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let units = units
+            .into_iter()
+            .map(|(uri, source)| {
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                (uri, source, key)
+            })
+            .collect();
+        (workspace, units)
+    }
+
+    fn expand_unit(
+        workspace: &Workspace,
+        uri: &Url,
+        source: &str,
+        key: &ContextKey,
+    ) -> ExpansionResult {
+        expand(
+            workspace,
+            uri,
+            source,
+            key,
+            workspace.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// What an expansion reports, for comparing two of them.
+    fn outcome(result: &ExpansionResult) -> impl PartialEq + std::fmt::Debug {
+        let session = result.expanded.session.as_ref().unwrap();
+        (
+            result.complete,
+            result.errors.clone(),
+            result.expanded.text().to_string(),
+            session.root.complete,
+            session.reasons.clone(),
+            session.observations.clone(),
+            result.expanded.reads.clone(),
+        )
+    }
+
+    /// l4d-ig6b: units of one directory that include a file missing from
+    /// their search path search for it once, not once per unit; the others
+    /// replay that failure and report exactly what a search reports.
+    #[test]
+    fn units_including_one_missing_file_search_for_it_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 5);
+        pascal_core::take_include_searches();
+        let replayed = units
+            .iter()
+            .map(|(uri, source, key)| expand_unit(&workspace, uri, source, key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pascal_core::take_include_searches(),
+            1,
+            "one search for the directory and name"
+        );
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        // A workspace that shares nothing searches for each unit and must
+        // report the same.
+        for ((uri, source, _), replayed) in units.iter().zip(&replayed) {
+            let (mut fresh, _) = missing_include_workspace(temp.path(), 0);
+            let key = fresh.context_for_uri_with_cancel(uri, None).unwrap();
+            let searched = expand_unit(&fresh, uri, source, &key);
+            assert_eq!(outcome(&searched), outcome(replayed), "{uri}");
+        }
+    }
+
+    /// l4d-ig6b: a remembered failure does not hide an include file created
+    /// after it: the directory it would be found in changed.
+    #[test]
+    fn an_include_created_after_a_failed_lookup_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 2);
+        let (uri, source, key) = &units[0];
+        let failed = expand_unit(&workspace, uri, source, key);
+        assert!(!failed.expanded.text().contains("FromInclude"));
+        std::fs::write(
+            temp.path().join("lib").join("Missing.inc"),
+            "const FromInclude = 1;",
+        )
+        .unwrap();
+        pascal_core::take_include_searches();
+        let (uri, source, key) = &units[1];
+        let found = expand_unit(&workspace, uri, source, key);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+        assert!(
+            found.expanded.text().contains("FromInclude"),
+            "{}",
+            found.expanded.text()
+        );
     }
 
     fn work(result: &ExpansionResult) -> usize {

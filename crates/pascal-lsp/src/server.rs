@@ -964,6 +964,13 @@ enum AnalysisPriority {
     Bulk,
 }
 
+/// References walk the closures the background warmer walks: the warmer
+/// pauses while one runs or waits instead of computing the same units
+/// alongside it (l4d-ig6b).
+fn preempts_background(request: &AnalysisRequest) -> bool {
+    matches!(request, AnalysisRequest::References { .. })
+}
+
 impl AnalysisPriority {
     fn for_request(request: &AnalysisRequest) -> Self {
         match request {
@@ -5062,6 +5069,8 @@ struct PendingAnalysis {
     recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
     priority: AnalysisPriority,
+    /// The background warmer pauses while it runs (l4d-ig6b).
+    preempts_background: bool,
 }
 
 struct PendingDiagnostic {
@@ -5278,7 +5287,7 @@ impl AnalysisJobs {
         let running = self
             .pending
             .values()
-            .filter(|job| job.priority == AnalysisPriority::Interactive)
+            .filter(|job| job.priority == AnalysisPriority::Interactive || job.preempts_background)
             .count();
         let queued = self
             .queue
@@ -5289,6 +5298,7 @@ impl AnalysisJobs {
                     QueuedAnalysis::Client(job)
                         if AnalysisPriority::for_request(&job.request)
                             == AnalysisPriority::Interactive
+                            || preempts_background(&job.request)
                 )
             })
             .count();
@@ -5524,6 +5534,7 @@ impl AnalysisJobs {
                 recipients: Vec::new(),
                 key: None,
                 priority,
+                preempts_background: false,
             });
         }
         let input = workspace.analysis_input();
@@ -5720,6 +5731,10 @@ impl AnalysisJobs {
                             Arc::clone(&worker_cancellation),
                             INTERACTIVE_ROLELESS_CLAIM_WAIT,
                         )
+                    } else if priority == AnalysisPriority::Bulk {
+                        // A client request such as references must not wait
+                        // behind the background warmer (l4d-ig6b).
+                        crate::project_cache::ClaimRole::client(Arc::clone(&worker_cancellation))
                     } else {
                         crate::project_cache::ClaimRole::job(Arc::clone(&worker_cancellation))
                     },
@@ -6687,6 +6702,7 @@ impl AnalysisJobs {
             recipients: Vec::new(),
             key: None,
             priority,
+            preempts_background: false,
         })
     }
 
@@ -7024,6 +7040,7 @@ impl AnalysisJobs {
             recipients: Vec::new(),
             key: None,
             priority,
+            preempts_background: false,
         })
     }
 
@@ -7881,6 +7898,7 @@ impl AnalysisJobs {
                 QueuedAnalysis::Client(job) => {
                     let primary_id = job.id;
                     let priority = AnalysisPriority::for_request(&job.request);
+                    let preempts_background = preempts_background(&job.request);
                     self.test_barriers.record_dispatch(priority);
                     match self.spawn(
                         AnalysisJobId::Client(primary_id),
@@ -7892,6 +7910,7 @@ impl AnalysisJobs {
                             analysis.recipients = job.recipients;
                             analysis.key = job.key;
                             analysis.priority = priority;
+                            analysis.preempts_background = preempts_background;
                             self.pending.insert(primary_id, analysis);
                             if admission.lent && priority != AnalysisPriority::Interactive {
                                 self.lent.insert(primary_id);
@@ -16479,6 +16498,7 @@ mod tests {
                         recipients: Vec::new(),
                         key: None,
                         priority: AnalysisPriority::Diagnostics,
+                        preempts_background: false,
                     },
                 },
             );
@@ -17197,6 +17217,7 @@ mod tests {
                     recipients: Vec::new(),
                     key: None,
                     priority: AnalysisPriority::Diagnostics,
+                    preempts_background: false,
                 },
             },
         );
@@ -17243,6 +17264,7 @@ mod tests {
                     recipients: Vec::new(),
                     key: None,
                     priority: AnalysisPriority::Diagnostics,
+                    preempts_background: false,
                 },
             },
         );
@@ -19343,6 +19365,7 @@ mod tests {
                         recipients: Vec::new(),
                         key: None,
                         priority: AnalysisPriority::Diagnostics,
+                        preempts_background: false,
                     },
                 );
                 release
@@ -20295,6 +20318,7 @@ mod tests {
                 }],
                 key: Some(attached_key),
                 priority: AnalysisPriority::Interactive,
+                preempts_background: false,
             },
         );
 
@@ -21628,6 +21652,64 @@ mod tests {
         );
     }
 
+    /// l4d-ig6b: a references request pauses the background warmer, as
+    /// interactive requests do, while it waits for a worker and while it runs,
+    /// though it keeps the bulk slot.
+    #[test]
+    fn a_references_request_pauses_the_warmer() {
+        let mut jobs = AnalysisJobs::new();
+        let computation_id = AnalysisComputationId(1);
+        let request = AnalysisRequest::References {
+            uri: Url::parse("file:///Main.pas").unwrap(),
+            position: Position::new(0, 0),
+            include_declaration: false,
+        };
+        assert_eq!(
+            AnalysisPriority::for_request(&request),
+            AnalysisPriority::Bulk
+        );
+        jobs.queue.push(
+            AnalysisPriority::Bulk,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: computation_id,
+                request,
+                features: symbol_client_features(),
+                recipients: Vec::new(),
+                key: None,
+            }),
+        );
+        jobs.publish_interactive_load();
+        assert!(
+            !jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)),
+            "a queued references request must pause the warmer"
+        );
+        jobs.queue.remove_first(|_| true);
+        jobs.pending.insert(
+            computation_id,
+            PendingAnalysis {
+                cancellation: Arc::new(AtomicBool::new(false)),
+                handle: std::thread::spawn(|| {}),
+                recipients: Vec::new(),
+                key: None,
+                priority: AnalysisPriority::Bulk,
+                preempts_background: true,
+            },
+        );
+        jobs.publish_interactive_load();
+        assert!(
+            !jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)),
+            "a running references request must pause the warmer"
+        );
+        jobs.pending
+            .remove(&computation_id)
+            .unwrap()
+            .handle
+            .join()
+            .unwrap();
+        jobs.publish_interactive_load();
+        assert!(jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)));
+    }
+
     #[test]
     fn reverse_hierarchy_requests_do_not_take_the_interactive_slot() {
         let uri = Url::parse("file:///Main.pas").unwrap();
@@ -22701,6 +22783,7 @@ mod tests {
                 recipients: Vec::new(),
                 key: None,
                 priority: AnalysisPriority::Interactive,
+                preempts_background: false,
             },
         );
 

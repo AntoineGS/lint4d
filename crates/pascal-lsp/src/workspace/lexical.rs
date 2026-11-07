@@ -55,7 +55,8 @@ pub(crate) fn is_byte_text(text: &[u8]) -> bool {
 /// that is not an ASCII letter, digit or `_` separates, non-ASCII bytes
 /// included) equals a needle, ASCII case-insensitively. This is the scan
 /// the snapshot itself filters its sources with; comments and strings
-/// count.
+/// count. Like that filter it does not split a run a lexer would split
+/// after a number (`1e5Name`, `$FFName`).
 pub(crate) fn holds_identifier(text: &[u8], needles: &[String]) -> bool {
     identifier_runs(text).any(|run| {
         needles

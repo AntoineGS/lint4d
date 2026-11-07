@@ -5012,14 +5012,12 @@ struct UnverifiedRanking {
     /// absent when one of them does not occur.
     symbols: bool,
     bytes_left: u64,
-    /// The resolver each context's analysis resolves includes with, for
-    /// this request only.
-    resolvers: HashMap<ContextKey, pascal_core::UnitResolver<super::resolver::LspSourceStore>>,
-    /// Per context and include path key: the baseline proving the include
-    /// and everything it includes cannot hold a name, or `None`.
-    includes: HashMap<(ContextKey, String), Option<Vec<BaselineEntry>>>,
-    /// What every include lookup observed, proven or not: a later lookup the
-    /// resolver answers from its own cache observes nothing.
+    /// Per context, include path key and whether the include passes a
+    /// legacy route to its own includes: what proves the include and
+    /// everything it includes cannot hold a name, or `None`.
+    includes: HashMap<(ContextKey, String, bool), Option<ProvenInclude>>,
+    /// What every include lookup observed, proven or not: a proof reusing
+    /// another member's (`includes`) observes nothing itself.
     observed: Vec<BaselineEntry>,
 }
 
@@ -5029,6 +5027,38 @@ struct UnverifiedRanking {
 struct Absent {
     members: Vec<BaselineEntry>,
     includes: Vec<BaselineEntry>,
+}
+
+/// What proves one include, and everything it includes, cannot hold a name:
+/// their stamps and resolver observations, and per file reached whether it
+/// passed a legacy route to its own includes.
+#[derive(Clone)]
+struct ProvenInclude {
+    baseline: Vec<BaselineEntry>,
+    routes: Vec<(String, bool)>,
+}
+
+/// One member's include walk.
+struct IncludeWalk<'a> {
+    key: &'a ContextKey,
+    context: &'a pascal_project::ProjectContext,
+    /// The path keys being followed: a cycle proves nothing.
+    active: Vec<String>,
+    /// Per path key reached, whether it passed a legacy route.
+    routes: HashMap<String, bool>,
+}
+
+impl IncludeWalk<'_> {
+    /// Adds `routes`; `None` when a file is reached both with and without
+    /// a legacy route.
+    fn merge_routes(&mut self, routes: &[(String, bool)]) -> Option<()> {
+        for (path, routed) in routes {
+            if *self.routes.entry(path.clone()).or_insert(*routed) != *routed {
+                return None;
+            }
+        }
+        Some(())
+    }
 }
 
 /// The context whose analysis of the ranked members a references proof
@@ -5085,7 +5115,6 @@ impl UnverifiedRanking {
             units,
             symbols,
             bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
-            resolvers: HashMap::new(),
             includes: HashMap::new(),
             observed: Vec::new(),
         }
@@ -5222,21 +5251,19 @@ impl UnverifiedRanking {
         }
         let state = scope.workspace.contexts.get(scope.key)?;
         let context = Arc::clone(&state.context);
-        let mut resolver = match self.resolvers.remove(scope.key) {
-            Some(resolver) => resolver,
-            None => {
-                let mut limits = pascal_core::ResolverLimits::default();
-                limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
-                super::resolver::resolver_for_context_with_limits(
-                    Arc::clone(&context),
-                    &state.context_observations,
-                    scope.input.roots.clone(),
-                    scope.input,
-                    limits,
-                )
-            }
-        };
-        let proof = (|| {
+        // A fresh resolver per member, as each member's analysis has: a
+        // resolver keeps the first load of a file, with the provenance of
+        // the search entry that found it, for every later lookup.
+        let mut limits = pascal_core::ResolverLimits::default();
+        limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
+        let mut resolver = super::resolver::resolver_for_context_with_limits(
+            Arc::clone(&context),
+            &state.context_observations,
+            scope.input.roots.clone(),
+            scope.input,
+            limits,
+        );
+        (|| {
             let uri = Url::from_file_path(path).ok()?;
             let route = scope
                 .workspace
@@ -5258,40 +5285,50 @@ impl UnverifiedRanking {
                 return None;
             }
             let route = resolver.legacy_route_for_source(&root, None);
+            let mut walk = IncludeWalk {
+                key: scope.key,
+                context: &context,
+                active: vec![path_key(&root.path)],
+                routes: HashMap::new(),
+            };
             let mut baseline = Vec::new();
             self.follow(
                 &mut resolver,
-                scope.key,
+                &mut walk,
                 &root.path,
                 requests,
                 route,
-                &mut vec![path_key(&root.path)],
                 &mut baseline,
                 cancel,
             )?;
             Some(baseline)
-        })();
-        self.resolvers.insert(scope.key.clone(), resolver);
-        proof
+        })()
     }
 
     /// Follows the include `requests` of the file `including`, loaded under
-    /// `route`, adding what proves them to `baseline`; `active` holds the
-    /// path keys being followed (a cycle proves nothing).
+    /// `route`, adding what proves them to `baseline`.
+    ///
+    /// The session analysing the member passes no route for an include and
+    /// recovers the one registered for the including file instead, so a
+    /// file reached once with a legacy route resolves its own includes with
+    /// that route on every reach. The proof follows each reach under the
+    /// route it was found with, and so refuses when the two could differ:
+    /// a file reached both with and without a route, or one without a
+    /// route whose directory is not among its own include search entries
+    /// (a route would search it first).
     #[allow(clippy::too_many_arguments)]
     fn follow(
         &mut self,
         resolver: &mut pascal_core::UnitResolver<super::resolver::LspSourceStore>,
-        key: &ContextKey,
+        walk: &mut IncludeWalk<'_>,
         including: &Path,
         requests: Vec<super::lexical::IncludeRequest>,
         route: Option<pascal_core::LegacyRoute>,
-        active: &mut Vec<String>,
         baseline: &mut Vec<BaselineEntry>,
         cancel: &AtomicBool,
     ) -> Option<()> {
         for request in requests {
-            if active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
+            if walk.active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
                 return None;
             }
             let outcome = resolver
@@ -5319,16 +5356,32 @@ impl UnverifiedRanking {
                 return None;
             };
             let child_key = path_key(&child.path);
-            if active.contains(&child_key) {
+            if walk.active.contains(&child_key) {
                 return None;
             }
-            let memo = (key.clone(), child_key.clone());
+            let child_route = resolver.legacy_route_for_source(&child, route.as_ref());
+            let routed = child_route.is_some();
+            let memo = (walk.key.clone(), child_key.clone(), routed);
             if let Some(proven) = self.includes.get(&memo) {
-                baseline.extend(proven.clone()?);
+                let proven = proven.clone()?;
+                walk.merge_routes(&proven.routes)?;
+                baseline.extend(proven.baseline);
                 continue;
             }
-            self.charge(child.bytes.len())?;
+            let outer = std::mem::take(&mut walk.routes);
             let proven = (|| {
+                let owner = child.path.parent()?;
+                if !routed
+                    && !walk
+                        .context
+                        .include_search_entries(&child.path)
+                        .iter()
+                        .any(|entry| path_key(&entry.path) == path_key(owner))
+                {
+                    return None;
+                }
+                walk.routes.insert(child_key.clone(), routed);
+                self.charge(child.bytes.len())?;
                 let (stamp, bytes) = self.read(&child.path)?;
                 stamp.as_ref()?;
                 if pascal_project::content_hash_bytes(&bytes) != content_hash
@@ -5338,24 +5391,29 @@ impl UnverifiedRanking {
                     return None;
                 }
                 let requests = super::lexical::include_requests(&bytes)?;
-                let route = resolver.legacy_route_for_source(&child, route.as_ref());
-                let mut proven = vec![(child.path.clone(), stamp)];
-                active.push(child_key);
+                let mut baseline = vec![(child.path.clone(), stamp)];
+                walk.active.push(child_key);
                 let followed = self.follow(
                     resolver,
-                    key,
+                    walk,
                     &child.path,
                     requests,
-                    route,
-                    active,
-                    &mut proven,
+                    child_route,
+                    &mut baseline,
                     cancel,
                 );
-                active.pop();
-                followed.map(|()| proven)
+                walk.active.pop();
+                followed?;
+                Some(ProvenInclude {
+                    baseline,
+                    routes: walk.routes.drain().collect(),
+                })
             })();
+            walk.routes = outer;
             self.includes.insert(memo, proven.clone());
-            baseline.extend(proven?);
+            let proven = proven?;
+            walk.merge_routes(&proven.routes)?;
+            baseline.extend(proven.baseline);
         }
         Some(())
     }
@@ -8218,6 +8276,193 @@ pub(in crate::workspace) mod tests {
             ["Dated.pas", "Missing.pas", "Shared.pas", "User.pas"]
         );
         assert!(!baselined(&found, &missing) && !baselined(&found, &dated));
+    }
+
+    fn references_of_shared_value(
+        workspace: &mut Workspace,
+        key: &ContextKey,
+        anchor: &IndexAnchor,
+    ) -> IndexedSources {
+        let input = workspace.analysis_input();
+        indexed(
+            workspace,
+            &input,
+            &one_target(key, anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        )
+    }
+
+    /// Review fix 1: one include reached with two provenances. `A.pas`
+    /// reaches `d/Defs.inc` through its legacy owner directory, so the file
+    /// carries a legacy route and its `{$I Sub.inc}` finds `d/Sub.inc`:
+    /// proven. `B.pas` reaches it through a mapped include path, without a
+    /// route, so its `{$I Sub.inc}` does not search `d` and does not
+    /// resolve: B's proof must neither reuse A's nor see A's load of the
+    /// file. `C.pas` reaches a file the same way.
+    #[test]
+    fn an_include_reached_with_two_provenances_proves_each_reach_on_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let outside = temp.path().join("outside");
+        let a = root.join("lib/A.pas");
+        let b = root.join("lib/B.pas");
+        write(
+            &a,
+            "unit A;\n{$I ..\\..\\outside\\d\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &b,
+            "unit B;\n{$I ..\\d\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&outside.join("d/Defs.inc"), "{$I Sub.inc}\n");
+        write(&outside.join("d/Sub.inc"), "{$DEFINE QUIET}\n");
+        write(&outside.join("m/Sub.inc"), "const Copy = SharedValue;\n");
+        let c = root.join("lib/C.pas");
+        write(
+            &c,
+            "unit C;\n{$I ..\\e\\Lone.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&outside.join("e/Lone.inc"), "{$I Quiet.inc}\n");
+        write(&outside.join("m/Quiet.inc"), "{$DEFINE QUIET}\n");
+        let (mut workspace, key, anchor) = shared_project(&root, WorkspaceOptions::default());
+        let state = workspace.contexts.get_mut(&key).expect("context");
+        let mut parts = (*state.context).clone().into_parts();
+        parts
+            .include_path_entries
+            .push(pascal_project::ProjectPathEntry {
+                path: outside.join("m"),
+                provenance: pascal_project::ProjectPathProvenance::Mapped {
+                    root: outside.clone(),
+                },
+            });
+        state.context = Arc::new(pascal_project::ProjectContext::from_parts(parts));
+        for path in [&a, &b, &c] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"A.pas".to_owned()), "{names:?}");
+        assert!(baselined(&found, &outside.join("d/Sub.inc")));
+        assert!(names.contains(&"B.pas".to_owned()), "{names:?}");
+        assert!(!baselined(&found, &b), "{:?}", found.baseline);
+        assert!(names.contains(&"C.pas".to_owned()), "{names:?}");
+    }
+
+    /// Minor 4: an include open in the editor is read from its buffer, not
+    /// the disk the proof reads: it proves nothing.
+    #[test]
+    fn an_open_include_proves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        workspace
+            .open_document(
+                Url::from_file_path(&defs).unwrap(),
+                "const Copy = SharedValue;\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        retry_member(&workspace, &key, &guarded);
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert!(
+            source_names(&found).contains(&"Guarded.pas".to_owned()),
+            "{:?}",
+            found.sources
+        );
+        assert!(!baselined(&found, &guarded), "{:?}", found.baseline);
+    }
+
+    /// Minor 4: nested includes are followed. Without the name at any
+    /// level the member is excluded with every level's stamp; the name in
+    /// the innermost include keeps it bound.
+    #[test]
+    fn nested_includes_are_followed_to_the_innermost() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outer = root.join("lib/Outer.pas");
+        let deep = root.join("lib/Deep.pas");
+        write(
+            &outer,
+            "unit Outer;\n{$I One.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/One.inc"), "{$I Two.inc}\n");
+        write(&root.join("lib/Two.inc"), "{$DEFINE TWO}\n");
+        write(
+            &deep,
+            "unit Deep;\n{$I Three.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/Three.inc"), "{$I Four.inc}\n");
+        write(&root.join("lib/Four.inc"), "const Copy = SharedValue;\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&outer, &deep] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"Outer.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Deep.pas".to_owned()), "{names:?}");
+        for name in ["Outer.pas", "One.inc", "Two.inc"] {
+            assert!(
+                baselined(&found, &root.join("lib").join(name)),
+                "{name}: {:?}",
+                found.baseline
+            );
+        }
+    }
+
+    /// Minor 4: past `MAX_LEXICAL_INCLUDE_DEPTH`, or around a cycle, the
+    /// proof stops and the member is bound; exactly at the limit it holds.
+    #[test]
+    fn the_include_depth_limit_and_cycles_prove_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lib = root.join("lib");
+        let chain = |prefix: &str, levels: usize| {
+            for level in 0..levels {
+                let text = if level + 1 < levels {
+                    format!("{{$I {prefix}{}.inc}}\n", level + 1)
+                } else {
+                    "{$DEFINE LAST}\n".to_owned()
+                };
+                write(&lib.join(format!("{prefix}{level}.inc")), &text);
+            }
+        };
+        chain("Ok", MAX_LEXICAL_INCLUDE_DEPTH);
+        chain("Deep", MAX_LEXICAL_INCLUDE_DEPTH + 1);
+        let within = lib.join("Within.pas");
+        let past = lib.join("Past.pas");
+        let cyclic = lib.join("Cyclic.pas");
+        write(
+            &within,
+            "unit Within;\n{$I Ok0.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &past,
+            "unit Past;\n{$I Deep0.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &cyclic,
+            "unit Cyclic;\n{$I Ping.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&lib.join("Ping.inc"), "{$I Pong.inc}\n");
+        write(&lib.join("Pong.inc"), "{$I Ping.inc}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&within, &past, &cyclic] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"Within.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Past.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Cyclic.pas".to_owned()), "{names:?}");
     }
 
     #[test]

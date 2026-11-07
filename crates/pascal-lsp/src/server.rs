@@ -964,6 +964,41 @@ enum AnalysisPriority {
     Bulk,
 }
 
+/// Workspace-wide requests the user waits on (references, workspace
+/// symbols, rename) walk the closures the background warmer walks: the
+/// warmer pauses while one runs or waits instead of computing the same units
+/// alongside it, and the request takes over the claims it leaves (l4d-ig6b).
+/// Diagnostics and cache maintenance are not paused for them.
+fn preempts_background(request: &AnalysisRequest) -> bool {
+    matches!(
+        request,
+        AnalysisRequest::References { .. }
+            | AnalysisRequest::WorkspaceSymbols { .. }
+            | AnalysisRequest::Rename { .. }
+            | AnalysisRequest::Prepare { .. }
+    )
+}
+
+/// How an analysis worker takes part in cache claims: only requests that
+/// pause the warmer take its claims over; other bulk requests wait for them.
+fn analysis_claim_role(
+    priority: AnalysisPriority,
+    preempts_background: bool,
+    cancel: Arc<AtomicBool>,
+) -> crate::project_cache::ClaimRole {
+    match priority {
+        AnalysisPriority::Interactive => {
+            crate::project_cache::ClaimRole::interactive(cancel, INTERACTIVE_ROLELESS_CLAIM_WAIT)
+        }
+        AnalysisPriority::Bulk if preempts_background => {
+            crate::project_cache::ClaimRole::client(cancel)
+        }
+        AnalysisPriority::Bulk | AnalysisPriority::Diagnostics => {
+            crate::project_cache::ClaimRole::job(cancel)
+        }
+    }
+}
+
 impl AnalysisPriority {
     fn for_request(request: &AnalysisRequest) -> Self {
         match request {
@@ -5062,6 +5097,8 @@ struct PendingAnalysis {
     recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
     priority: AnalysisPriority,
+    /// The background warmer pauses while it runs (l4d-ig6b).
+    preempts_background: bool,
 }
 
 struct PendingDiagnostic {
@@ -5293,6 +5330,20 @@ impl AnalysisJobs {
             })
             .count();
         self.interactive_gate.set(running + queued);
+        // Workspace-wide requests pause the warmer only (l4d-ig6b).
+        let preempting = self
+            .pending
+            .values()
+            .filter(|job| job.preempts_background)
+            .count()
+            + self
+                .queue
+                .iter()
+                .filter(|queued| {
+                    matches!(queued, QueuedAnalysis::Client(job) if preempts_background(&job.request))
+                })
+                .count();
+        self.interactive_gate.set_warm_busy(preempting);
         // Only work a lent slot can take: queued pull diagnostics would make
         // running diagnostics pause for nothing.
         self.interactive_gate.set_waiting_clients(
@@ -5455,6 +5506,7 @@ impl AnalysisJobs {
             return self.spawn_project_operation(id, request);
         }
         let priority = AnalysisPriority::for_request(&request);
+        let preempts = preempts_background(&request);
         if let AnalysisRequest::CompiledContent { snapshot, symbols } = request {
             // Keep the admission-time generations. A queued request must not
             // adopt the post-edit generations when it finally gets a worker.
@@ -5524,6 +5576,7 @@ impl AnalysisJobs {
                 recipients: Vec::new(),
                 key: None,
                 priority,
+                preempts_background: false,
             });
         }
         let input = workspace.analysis_input();
@@ -5714,16 +5767,11 @@ impl AnalysisJobs {
                         crate::trace::short(format!("{request:?}"), 240)
                     )
                 });
-                crate::project_cache::set_claim_role_on_this_thread(
-                    if priority == AnalysisPriority::Interactive {
-                        crate::project_cache::ClaimRole::interactive(
-                            Arc::clone(&worker_cancellation),
-                            INTERACTIVE_ROLELESS_CLAIM_WAIT,
-                        )
-                    } else {
-                        crate::project_cache::ClaimRole::job(Arc::clone(&worker_cancellation))
-                    },
-                );
+                crate::project_cache::set_claim_role_on_this_thread(analysis_claim_role(
+                    priority,
+                    preempts,
+                    Arc::clone(&worker_cancellation),
+                ));
                 // Diagnostics walk whole import closures; they pause between
                 // units while interactive requests run or wait, or other
                 // client requests wait for a worker (lending them their
@@ -6687,6 +6735,7 @@ impl AnalysisJobs {
             recipients: Vec::new(),
             key: None,
             priority,
+            preempts_background: false,
         })
     }
 
@@ -7024,6 +7073,7 @@ impl AnalysisJobs {
             recipients: Vec::new(),
             key: None,
             priority,
+            preempts_background: false,
         })
     }
 
@@ -7881,6 +7931,7 @@ impl AnalysisJobs {
                 QueuedAnalysis::Client(job) => {
                     let primary_id = job.id;
                     let priority = AnalysisPriority::for_request(&job.request);
+                    let preempts_background = preempts_background(&job.request);
                     self.test_barriers.record_dispatch(priority);
                     match self.spawn(
                         AnalysisJobId::Client(primary_id),
@@ -7892,6 +7943,7 @@ impl AnalysisJobs {
                             analysis.recipients = job.recipients;
                             analysis.key = job.key;
                             analysis.priority = priority;
+                            analysis.preempts_background = preempts_background;
                             self.pending.insert(primary_id, analysis);
                             if admission.lent && priority != AnalysisPriority::Interactive {
                                 self.lent.insert(primary_id);
@@ -16479,6 +16531,7 @@ mod tests {
                         recipients: Vec::new(),
                         key: None,
                         priority: AnalysisPriority::Diagnostics,
+                        preempts_background: false,
                     },
                 },
             );
@@ -17197,6 +17250,7 @@ mod tests {
                     recipients: Vec::new(),
                     key: None,
                     priority: AnalysisPriority::Diagnostics,
+                    preempts_background: false,
                 },
             },
         );
@@ -17243,6 +17297,7 @@ mod tests {
                     recipients: Vec::new(),
                     key: None,
                     priority: AnalysisPriority::Diagnostics,
+                    preempts_background: false,
                 },
             },
         );
@@ -19343,6 +19398,7 @@ mod tests {
                         recipients: Vec::new(),
                         key: None,
                         priority: AnalysisPriority::Diagnostics,
+                        preempts_background: false,
                     },
                 );
                 release
@@ -20295,6 +20351,7 @@ mod tests {
                 }],
                 key: Some(attached_key),
                 priority: AnalysisPriority::Interactive,
+                preempts_background: false,
             },
         );
 
@@ -21628,6 +21685,145 @@ mod tests {
         );
     }
 
+    fn workspace_wide_requests() -> Vec<AnalysisRequest> {
+        let uri = Url::parse("file:///Main.pas").unwrap();
+        vec![
+            AnalysisRequest::References {
+                uri: uri.clone(),
+                position: Position::new(0, 0),
+                include_declaration: false,
+            },
+            AnalysisRequest::WorkspaceSymbols {
+                query: "TThing".to_string(),
+            },
+            AnalysisRequest::Rename {
+                uri: uri.clone(),
+                position: Position::new(0, 0),
+                new_name: "TOther".to_string(),
+                new_uri: None,
+            },
+            AnalysisRequest::Prepare {
+                uri,
+                position: Position::new(0, 0),
+            },
+        ]
+    }
+
+    /// l4d-ig6b (I3, I4): a workspace-wide request the user waits on
+    /// (references, workspace symbols, rename) pauses the background warmer
+    /// while it waits for a worker and while it runs. Diagnostics and cache
+    /// maintenance, which wait on the interactive gate, are not throttled
+    /// by it.
+    #[test]
+    fn workspace_wide_requests_pause_the_warmer_only() {
+        for request in workspace_wide_requests() {
+            let label = format!("{request:?}");
+            let priority = AnalysisPriority::for_request(&request);
+            let mut jobs = AnalysisJobs::new();
+            let computation_id = AnalysisComputationId(1);
+            jobs.queue.push(
+                priority,
+                super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                    id: computation_id,
+                    request,
+                    features: symbol_client_features(),
+                    recipients: Vec::new(),
+                    key: None,
+                }),
+            );
+            jobs.publish_interactive_load();
+            let idle = || AtomicBool::new(false);
+            assert!(
+                !jobs.interactive_gate.try_wait_warm_idle(&idle()),
+                "a queued {label} must pause the warmer"
+            );
+            let interactive = priority == AnalysisPriority::Interactive;
+            assert_eq!(
+                jobs.interactive_gate.try_wait_idle(&idle()),
+                !interactive,
+                "a queued {label} throttles diagnostics only if interactive"
+            );
+            jobs.queue.remove_first(|_| true);
+            jobs.pending.insert(
+                computation_id,
+                PendingAnalysis {
+                    cancellation: Arc::new(AtomicBool::new(false)),
+                    handle: std::thread::spawn(|| {}),
+                    recipients: Vec::new(),
+                    key: None,
+                    priority,
+                    preempts_background: true,
+                },
+            );
+            jobs.publish_interactive_load();
+            assert!(
+                !jobs.interactive_gate.try_wait_warm_idle(&idle()),
+                "a running {label} must pause the warmer"
+            );
+            assert_eq!(
+                jobs.interactive_gate.try_wait_idle(&idle()),
+                !interactive,
+                "a running {label} throttles diagnostics only if interactive"
+            );
+            jobs.pending
+                .remove(&computation_id)
+                .unwrap()
+                .handle
+                .join()
+                .unwrap();
+            jobs.publish_interactive_load();
+            assert!(jobs.interactive_gate.try_wait_warm_idle(&idle()));
+            assert!(jobs.interactive_gate.try_wait_idle(&idle()));
+        }
+    }
+
+    /// l4d-ig6b (I3): other bulk requests neither pause the warmer nor take
+    /// its claims over.
+    #[test]
+    fn other_bulk_requests_leave_the_warmer_alone() {
+        let request = AnalysisRequest::FoldingRanges {
+            uri: Url::parse("file:///Main.pas").unwrap(),
+        };
+        assert_eq!(
+            AnalysisPriority::for_request(&request),
+            AnalysisPriority::Bulk
+        );
+        assert!(!super::preempts_background(&request));
+        let mut jobs = AnalysisJobs::new();
+        jobs.queue.push(
+            AnalysisPriority::Bulk,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: AnalysisComputationId(1),
+                request,
+                features: symbol_client_features(),
+                recipients: Vec::new(),
+                key: None,
+            }),
+        );
+        jobs.publish_interactive_load();
+        assert!(
+            jobs.interactive_gate
+                .try_wait_warm_idle(&AtomicBool::new(false))
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            !super::analysis_claim_role(AnalysisPriority::Bulk, false, cancel.clone())
+                .preempts_yielding_for_tests(),
+            "a bulk request that does not pause the warmer must not take its claims"
+        );
+        assert!(
+            super::analysis_claim_role(AnalysisPriority::Bulk, true, cancel.clone())
+                .preempts_yielding_for_tests()
+        );
+        assert!(
+            !super::analysis_claim_role(AnalysisPriority::Diagnostics, false, cancel)
+                .preempts_yielding_for_tests()
+        );
+        for request in workspace_wide_requests() {
+            assert!(super::preempts_background(&request), "{request:?}");
+        }
+    }
+
     #[test]
     fn reverse_hierarchy_requests_do_not_take_the_interactive_slot() {
         let uri = Url::parse("file:///Main.pas").unwrap();
@@ -22701,6 +22897,7 @@ mod tests {
                 recipients: Vec::new(),
                 key: None,
                 priority: AnalysisPriority::Interactive,
+                preempts_background: false,
             },
         );
 

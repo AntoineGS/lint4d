@@ -195,6 +195,40 @@ impl ReadCapture {
         }
     }
 
+    /// Record what a reused include failure read (l4d-ig6b): its listings
+    /// and payloads that this session has not already captured, and its own
+    /// editor state. Overflow is this capture's own.
+    pub(crate) fn replay_distinct(&self, reads: &CapturedReads) {
+        let mut target = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.editor_state |= reads.editor_state;
+        for listing in &reads.listings {
+            if target.listings.contains(listing) {
+                continue;
+            }
+            if target.listings.len() + target.payloads.len() >= MAX_CAPTURED_READS {
+                target.overflowed = true;
+                return;
+            }
+            target.listings.push(listing.clone());
+        }
+        for payload in &reads.payloads {
+            if target.payloads.contains(payload) {
+                continue;
+            }
+            if target.listings.len() + target.payloads.len() >= MAX_CAPTURED_READS {
+                target.overflowed = true;
+                return;
+            }
+            target.payloads.push(payload.clone());
+        }
+    }
+
+    /// Whether the capture overflowed, and whether it met editor state.
+    pub(crate) fn flags(&self) -> (bool, bool) {
+        let reads = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        (reads.overflowed, reads.editor_state)
+    }
+
     pub(crate) fn snapshot(&self) -> CapturedReads {
         self.0
             .lock()

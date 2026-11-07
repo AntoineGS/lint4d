@@ -271,6 +271,17 @@ pub(crate) const MEMBER_DEADLINE: Duration = Duration::from_secs(10);
 /// never stored as refused.
 pub(crate) const MEMBER_DEADLINE_MESSAGE: &str = "the member's extraction passed its deadline";
 
+/// The largest member file a parallel extraction worker extracts (13d-2).
+/// A larger one is extracted by the batch's own thread, in member order, as
+/// the serial loop does. An extraction's transient memory (parse, session,
+/// facts) is about a hundred times its source and is charged nowhere; with
+/// workers, every worker could hold a large member's at once, and each
+/// worker thread's allocator arena keeps its high-water mark resident
+/// afterwards. Kept on the batch's thread, large members cost what they cost
+/// without a store, and workers add at most `threads` times about 25 MiB.
+/// About 1 % of multidev's units are larger.
+pub(crate) const WORKER_MEMBER_BYTES: u64 = 256 * 1024;
+
 #[cfg(test)]
 thread_local! {
     /// The member whose extraction deadline has passed when it starts, as
@@ -354,6 +365,29 @@ impl WorkerSeams {
         UNSTAMPABLE.with(|slot| *slot.borrow_mut() = self.unstampable);
         EXTRACT_HOOK.with(|slot| *slot.borrow_mut() = self.hook);
     }
+}
+
+/// Report-only heap measurements (13d-2): what each view dropped after a
+/// batch freed, with how many members it took.
+#[cfg(test)]
+static VIEW_FREED: std::sync::Mutex<Vec<(&'static str, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_view_freed(kind: &'static str, freed: usize, members: usize) {
+    VIEW_FREED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((kind, freed, members));
+}
+
+#[cfg(test)]
+fn take_view_freed() -> Vec<(&'static str, usize, usize)> {
+    std::mem::take(
+        &mut *VIEW_FREED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// What an index batch may do for a member.
@@ -2066,7 +2100,13 @@ impl Workspace {
                         seams.install();
                         let mut view = Workspace::extraction_view(input, key, state);
                         let mut context_key = super::persist::ContextKeyMemo::default();
+                        #[cfg(test)]
+                        let mut taken = 0;
                         prefetch_loop(members, pipeline, worker, validation, cancel, |path| {
+                            #[cfg(test)]
+                            {
+                                taken += 1;
+                            }
                             view.prefetch_extraction(
                                 key,
                                 path,
@@ -2076,6 +2116,11 @@ impl Workspace {
                                 cancel,
                             )
                         });
+                        #[cfg(test)]
+                        if crate::heap_count::counting() {
+                            let freed = crate::heap_count::freed_during(|| drop(view));
+                            note_view_freed("worker", freed, taken);
+                        }
                     });
                 if started.is_ok() {
                     spawned += 1;
@@ -2163,7 +2208,9 @@ impl Workspace {
             Validated::Outcome(
                 ReuseOutcome::Missed { .. } | ReuseOutcome::Retry | ReuseOutcome::NoStore
             )
-        ) {
+        ) || stamp.bytes > WORKER_MEMBER_BYTES
+        {
+            // A large member is extracted by the batch (13d-2).
             return Prefetched::Member {
                 epoch,
                 stamp: Some(stamp),
@@ -10590,6 +10637,63 @@ pub(in crate::workspace) mod tests {
                     cache.shutdown();
                 }
 
+                /// 13d-2: a member over `WORKER_MEMBER_BYTES` is extracted by
+                /// the batch's thread, as the serial loop (and a run without
+                /// a store) does, so no worker holds the transient memory
+                /// of a large member, in flight or kept free by its thread's
+                /// allocator arena; the others still run on workers, and the
+                /// index and store are the serial ones.
+                #[test]
+                fn a_member_over_the_worker_bound_is_extracted_by_the_batch() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path();
+                    extraction_project(root, 4, 12);
+                    let large = root.join("d01/Large.pas");
+                    write(
+                        &large,
+                        &format!(
+                            "unit Large;\ninterface\n{{$I Shared.inc}}\nprocedure PLarge;\nimplementation\n{}procedure PLarge;\nbegin\nend;\nend.\n",
+                            "{ filler }\n".repeat(WORKER_MEMBER_BYTES as usize / 10 + 1)
+                        ),
+                    );
+                    pascal_project::backdate_tree_for_test(root);
+                    let anchor = IndexAnchor::Project(root.join("App.dproj"));
+                    let run = |threads: usize, store: &Path| {
+                        let mut session = workspace(root, WorkspaceOptions::default());
+                        let key = context(&mut session, anchor.clone());
+                        let (mut view, cache) = persisting_view(&session, store);
+                        let threads_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let seen = Arc::clone(&threads_seen);
+                        set_worker_extract_hook(Some(Arc::new(move |path, _| {
+                            let name = std::thread::current().name().map(str::to_owned);
+                            seen.lock().unwrap().push((path.to_path_buf(), name));
+                        })));
+                        let (sums, _) = extract_all(&mut view, &anchor, threads);
+                        set_worker_extract_hook(None);
+                        let outcome = (sums, snapshot(&view, &key), store_content(&cache));
+                        cache.shutdown();
+                        let seen = std::mem::take(&mut *threads_seen.lock().unwrap());
+                        (outcome, seen)
+                    };
+                    let stores = [private_dir(), private_dir()];
+                    let (serial, _) = run(1, stores[0].path());
+                    let (parallel, seen) = run(3, stores[1].path());
+                    let this = std::thread::current().name().map(str::to_owned);
+                    let on = |path: &Path| {
+                        seen.iter()
+                            .filter(|(seen, _)| seen == path)
+                            .map(|(_, thread)| thread.clone())
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(on(&large), vec![this.clone()], "{seen:?}");
+                    assert!(
+                        seen.iter().any(|(_, thread)| thread != &this),
+                        "the other members ran on workers: {seen:?}"
+                    );
+                    assert!(serial.0.indexed >= 13, "{:?}", serial.0);
+                    assert_eq!(serial, parallel);
+                }
+
                 /// The window bounds what the workers hold: at most one
                 /// prepared publication (and its reservation) per thread.
                 #[test]
@@ -10667,6 +10771,334 @@ pub(in crate::workspace) mod tests {
                             "13c-3 extraction: speedup with {threads} threads {:.2}x",
                             times[0].as_secs_f64() / times[index].as_secs_f64()
                         );
+                    }
+                }
+
+                /// A multidev-shaped project (13d-2): `core` provider units
+                /// in chains of five (each reads its predecessor's constant in
+                /// a conditional) spread over the directories, and `units`
+                /// members, each reading eight providers' constants in
+                /// conditionals and using a member in another directory,
+                /// with a shared and a per-directory include.
+                fn multidev_shaped_project(
+                    root: &Path,
+                    directories: usize,
+                    core: usize,
+                    units: usize,
+                ) {
+                    // Providers per member, and the length of each chain.
+                    const PROVIDERS: usize = 8;
+                    const CHAIN: usize = 5;
+                    const MEMBER_METHODS: usize = 120;
+                    const HEAVY_EVERY: usize = 40;
+                    const HEAVY_METHODS: usize = 5_000;
+                    let names = directory_names(directories);
+                    write(
+                        &root.join(names.last().unwrap()).join("Shared.inc"),
+                        "const Shared = 1;\n",
+                    );
+                    for name in &names {
+                        write(
+                            &root.join(name).join(format!("{name}.inc")),
+                            &format!("const Dir_{name} = 2;\n"),
+                        );
+                    }
+                    let methods = |prefix: &str, count: usize| {
+                        let declarations = (0..count)
+                            .map(|m| {
+                                format!(
+                                    "    procedure {prefix}M{m}(A: Integer; const B: string);\n"
+                                )
+                            })
+                            .collect::<String>();
+                        let bodies = (0..count)
+                            .map(|m| {
+                                format!(
+                                    "procedure T{prefix}.{prefix}M{m}(A: Integer; const B: string);\nvar X: Integer;\nbegin\n  X := A + {m};\n  if X > 1 then X := X * 2;\nend;\n"
+                                )
+                            })
+                            .collect::<String>();
+                        (declarations, bodies)
+                    };
+                    for index in 0..core {
+                        let directory = &names[index % directories];
+                        let uses = if index % CHAIN > 0 {
+                            format!("uses C{:03};\n", index - 1)
+                        } else {
+                            String::new()
+                        };
+                        let prefix = format!("C{index:03}");
+                        let (declarations, bodies) = methods(&prefix, 30);
+                        let functions = (0..20)
+                            .map(|f| format!("function {prefix}F{f}(A: Integer): Integer;\n"))
+                            .collect::<String>();
+                        let function_bodies = (0..20)
+                            .map(|f| {
+                                format!("function {prefix}F{f}(A: Integer): Integer;\nbegin\n  Result := A + {f};\nend;\n")
+                            })
+                            .collect::<String>();
+                        // A provider chain: each interface's conditional
+                        // reads its predecessor's constant.
+                        let chain = if index % CHAIN > 0 {
+                            format!(
+                                "{{$IF C{0:03}.Flag{0:03} >= 0}}\nconst Chain{index:03} = 1;\n{{$ENDIF}}\n",
+                                index - 1
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let constants = (0..200)
+                            .map(|k| format!("  {prefix}K{k} = {k};\n"))
+                            .collect::<String>();
+                        write(
+                            &root.join(directory).join(format!("{prefix}.pas")),
+                            &format!(
+                                "unit {prefix};\ninterface\n{uses}{{$I Shared.inc}}\n{chain}const\n  Flag{prefix_number:03} = {index};\n{constants}type\n  T{prefix} = class\n  public\n    FValue: Integer;\n{declarations}  end;\n{functions}implementation\n{bodies}{function_bodies}end.\n",
+                                prefix_number = index
+                            ),
+                        );
+                    }
+                    for index in 0..units {
+                        let directory = &names[index % directories];
+                        let mut providers = (0..PROVIDERS)
+                            .map(|n| (index * (2 * n + 1) + n * 17) % core)
+                            .collect::<Vec<_>>();
+                        providers.sort_unstable();
+                        providers.dedup();
+                        let mut uses = providers
+                            .iter()
+                            .map(|provider| format!("C{provider:03}"))
+                            .collect::<Vec<_>>();
+                        if index >= directories {
+                            uses.push(format!("U{:04}", index - directories));
+                        }
+                        let prefix = format!("U{index:04}");
+                        // A few heavy members, as multidev's large units.
+                        let count = if index % HEAVY_EVERY == HEAVY_EVERY - 1 {
+                            HEAVY_METHODS
+                        } else {
+                            MEMBER_METHODS
+                        };
+                        let (declarations, bodies) = methods(&prefix, count);
+                        let conditionals = providers
+                            .iter()
+                            .map(|provider| {
+                                format!(
+                                    "{{$IF C{provider:03}.Flag{provider:03} >= 0}}\nconst {prefix}From{provider:03} = 1;\n{{$ENDIF}}\n"
+                                )
+                            })
+                            .collect::<String>();
+                        write(
+                            &root.join(directory).join(format!("{prefix}.pas")),
+                            &format!(
+                                "unit {prefix};\ninterface\nuses {};\n{{$I Shared.inc}}\n{{$I {directory}.inc}}\n{conditionals}type\n  T{prefix} = class\n{declarations}  end;\nimplementation\n{bodies}end.\n",
+                                uses.join(", ")
+                            ),
+                        );
+                    }
+                    project(
+                        root,
+                        &format!(
+                            "<DCC_UnitSearchPath>{}</DCC_UnitSearchPath><DCC_IncludePath>{}</DCC_IncludePath>",
+                            names.join(";"),
+                            names.join(";")
+                        ),
+                        "",
+                    );
+                    pascal_project::backdate_tree_for_test(root);
+                }
+
+                /// Peak and retained heap of one indexing run, over the
+                /// live heap before it.
+                #[derive(Debug)]
+                struct HeapRun {
+                    peak: isize,
+                    /// The largest batch peak over the live heap before it.
+                    transient: isize,
+                    retained: isize,
+                    batches: usize,
+                    sums: Sums,
+                }
+
+                /// Indexes the whole context in production batches
+                /// (`IndexBound::extraction()` or the reuse pass), each on a
+                /// new view as the warmer runs them.
+                fn heap_run(
+                    session: &Workspace,
+                    anchor: &IndexAnchor,
+                    cache: Option<&PersistentCache>,
+                    mode: IndexMode,
+                    threads: usize,
+                ) -> HeapRun {
+                    let base = crate::heap_count::live();
+                    let mut overall = base;
+                    let mut sums = Sums::default();
+                    let mut batches = 0;
+                    let bound = match mode {
+                        IndexMode::Full => IndexBound::extraction(),
+                        IndexMode::Reuse => IndexBound::reuse_pass(),
+                    };
+                    let mut transient = 0;
+                    loop {
+                        let before = crate::heap_count::live();
+                        crate::heap_count::reset_peak();
+                        let mut view = match cache {
+                            Some(cache) => view_with(session, cache),
+                            None => {
+                                let mut input = session.analysis_input().disk_baseline();
+                                input.persistent_cache = Default::default();
+                                Workspace::from_analysis_input(&input)
+                            }
+                        };
+                        let progress = extraction_batch(
+                            &mut view,
+                            anchor,
+                            bound,
+                            threads,
+                            &|| true,
+                            &AtomicBool::new(false),
+                        )
+                        .unwrap();
+                        let freed = crate::heap_count::freed_during(|| drop(view));
+                        note_view_freed("batch", freed, progress.indexed + progress.reused);
+                        // No maintenance runs in this harness: checkpoint
+                        // as it would, so no publication meets WalPressure.
+                        if let Some(job) = cache.and_then(PersistentCache::job) {
+                            let _ = job.store().checkpoint();
+                        }
+                        sums.add(&progress);
+                        batches += 1;
+                        transient = transient.max(crate::heap_count::peak() - before);
+                        overall = overall.max(crate::heap_count::peak());
+                        if progress.complete || !progress.worth_requeue() {
+                            break;
+                        }
+                    }
+                    let views = take_view_freed();
+                    for kind in ["batch", "worker"] {
+                        let of_kind = views.iter().filter(|view| view.0 == kind);
+                        let (count, bytes, members, max) =
+                            of_kind.fold((0, 0, 0, 0), |(count, bytes, members, max), view| {
+                                (count + 1, bytes + view.1, members + view.2, max.max(view.1))
+                            });
+                        if count > 0 {
+                            eprintln!(
+                                "13d-2 heap:   {count} {kind} views: mean {:.2} MiB, max {:.2} MiB, {:.1} KiB per member",
+                                bytes as f64 / count as f64 / 1048576.0,
+                                max as f64 / 1048576.0,
+                                bytes as f64 / members.max(1) as f64 / 1024.0
+                            );
+                        }
+                    }
+                    HeapRun {
+                        peak: overall - base,
+                        transient,
+                        retained: crate::heap_count::live() - base,
+                        batches,
+                        sums,
+                    }
+                }
+
+                /// Release measurement (report-only, 13d-2):
+                /// TMPDIR=$HOME/.cache/l4d-tmp cargo test -p pascal-lsp --release --lib indexing_heap_by_configuration -- --ignored --nocapture --test-threads=1
+                #[test]
+                #[ignore = "release measurement, run explicitly"]
+                fn indexing_heap_by_configuration() {
+                    const DIRECTORIES: usize = 40;
+                    const CORE: usize = 120;
+                    const UNITS: usize = 1_200;
+                    crate::heap_count::start();
+                    let temp = tempfile::tempdir().unwrap();
+                    multidev_shaped_project(temp.path(), DIRECTORIES, CORE, UNITS);
+                    let anchor = IndexAnchor::Project(temp.path().join("App.dproj"));
+                    let session = || {
+                        let mut workspace = workspace(temp.path(), WorkspaceOptions::default());
+                        context(&mut workspace, anchor.clone());
+                        workspace
+                    };
+                    let mib = |bytes: isize| bytes as f64 / (1024.0 * 1024.0);
+                    let report = |name: &str, run: &HeapRun| {
+                        eprintln!(
+                            "13d-2 heap: {name}: peak {:.1} MiB, batch transient {:.1} MiB, retained {:.1} MiB, {} batches, {:?}",
+                            mib(run.peak),
+                            mib(run.transient),
+                            mib(run.retained),
+                            run.batches,
+                            run.sums
+                        );
+                    };
+                    // One configuration per process (`L4D_13D2_CONFIG` = off,
+                    // serial, parallel or reuse), for its RSS; all by default.
+                    let only = std::env::var("L4D_13D2_CONFIG").ok();
+                    let wanted = |name: &str| only.as_deref().is_none_or(|only| only == name);
+                    let rss = |field: &str| {
+                        std::fs::read_to_string("/proc/self/status")
+                            .unwrap()
+                            .lines()
+                            .find_map(|line| line.strip_prefix(field).map(str::to_owned))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned()
+                    };
+                    eprintln!(
+                        "13d-2 heap: before: VmRSS {}, VmHWM {}",
+                        rss("VmRSS:"),
+                        rss("VmHWM:")
+                    );
+                    let threads = 2;
+                    if wanted("off") {
+                        let session = session();
+                        let run = heap_run(&session, &anchor, None, IndexMode::Full, threads);
+                        report("serial, persistence off", &run);
+                    }
+                    if wanted("serial") {
+                        let session = session();
+                        let store = private_dir();
+                        let (_, cache) = persisting_view(&session, store.path());
+                        let run = heap_run(&session, &anchor, Some(&cache), IndexMode::Full, 1);
+                        report("serial, persistence on", &run);
+                        cache.shutdown();
+                    }
+                    let store = private_dir();
+                    if wanted("parallel") || wanted("reuse") {
+                        let session = session();
+                        let (_, cache) = persisting_view(&session, store.path());
+                        let run =
+                            heap_run(&session, &anchor, Some(&cache), IndexMode::Full, threads);
+                        if wanted("parallel") {
+                            report("parallel (2), persistence on", &run);
+                        }
+                        cache.shutdown();
+                    }
+                    if wanted("reuse") {
+                        if only.is_some() {
+                            eprintln!(
+                                "13d-2 heap: after the extraction that fills the store: VmRSS {}, VmHWM {}",
+                                rss("VmRSS:"),
+                                rss("VmHWM:")
+                            );
+                        }
+                        let session = session();
+                        let (_, cache) = persisting_view(&session, store.path());
+                        let run =
+                            heap_run(&session, &anchor, Some(&cache), IndexMode::Reuse, threads);
+                        report("reuse only (2)", &run);
+                        cache.shutdown();
+                    }
+                    eprintln!(
+                        "13d-2 heap: after: VmRSS {}, VmHWM {}, live {:.1} MiB",
+                        rss("VmRSS:"),
+                        rss("VmHWM:"),
+                        mib(crate::heap_count::live())
+                    );
+                    // What the allocator keeps free in its arenas.
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    {
+                        // SAFETY: malloc_trim only returns free pages to the system.
+                        unsafe {
+                            libc::malloc_trim(0);
+                        }
+                        eprintln!("13d-2 heap: after malloc_trim: VmRSS {}", rss("VmRSS:"));
                     }
                 }
             }

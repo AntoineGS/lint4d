@@ -10,6 +10,8 @@ mod catalogue;
 pub(crate) mod configuration;
 pub(crate) mod coverage;
 pub(crate) mod file_watch;
+#[cfg(test)]
+pub(crate) mod heap_count;
 pub(crate) mod include_expansion;
 pub mod navigation;
 pub(crate) mod persistent_cache;

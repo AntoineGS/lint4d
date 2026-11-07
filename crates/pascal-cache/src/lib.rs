@@ -61,7 +61,7 @@ pub use store::admin;
 pub use store::{
     APPLICATION_ID, ArtifactHeader, ArtifactKeyRef, ArtifactReader, ArtifactRow, ArtifactWrite,
     BindingBatch, Bypass, CONNECTION_OVERHEAD_BYTES, CONTAINER_VERSION, Checkpointed,
-    DATABASE_FILE, EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite,
+    DATABASE_FILE, Dependency, EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite,
     FACT_CHECKSUM_CONTEXT, Hint, HintStats, ImporterHit, ImporterPage, IndexCursor, IndexHit,
     IndexPage, Integrity, JOURNAL_SIZE_LIMIT_BYTES, LEASE_EXPIRY, LEASE_RENEWAL,
     LOW_SPACE_MARGIN_BYTES, LimitsError, LocationIssue, Lookup, MAX_ARTIFACT_CONTENT_BYTES,

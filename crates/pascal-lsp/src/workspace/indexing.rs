@@ -4535,6 +4535,7 @@ impl Workspace {
                     key,
                     &open,
                     &deleted,
+                    &|_| false,
                     &mut taken,
                     &mut unverified_left,
                     &mut result.sources,
@@ -4563,6 +4564,7 @@ impl Workspace {
                 limit,
                 packages,
                 owner_pending,
+                retrying,
                 ..
             } = view;
 
@@ -4626,11 +4628,15 @@ impl Workspace {
             }
             // A target searched for its facts reads no unverified member.
             let mut none_left = 0;
+            // Members retrying a previous refusal are counted by the
+            // "retried later" gap below, not again as not indexed yet.
+            let deferral_gap = searched && coverage.first_deferral.is_some();
             let (skipped, read) = take_unverified(
                 unverified,
                 key,
                 &open,
                 &deleted,
+                &|path_key| deferral_gap && retrying.contains(path_key),
                 &mut taken,
                 if searched {
                     &mut unverified_left
@@ -4805,6 +4811,8 @@ struct TargetView {
     limit: Option<String>,
     packages: bool,
     owner_pending: usize,
+    /// Path keys of the unverified members retrying a previous refusal.
+    retrying: HashSet<String>,
 }
 
 /// What a request reads of each target's index.
@@ -4865,6 +4873,12 @@ fn target_view(
             }
         }
     };
+    let retrying = candidates
+        .unverified
+        .iter()
+        .filter(|path| index.retrying(path))
+        .map(|path| path_key(path))
+        .collect();
     let recorded = candidates
         .excluded
         .iter()
@@ -4887,6 +4901,7 @@ fn target_view(
         limit: membership.limit.clone(),
         packages: membership.packages,
         owner_pending: membership.owner_pending,
+        retrying,
     }
 }
 
@@ -4900,12 +4915,15 @@ struct MembershipListing {
 
 /// Adds `unverified` (path order) to `sources` while the request-wide bound
 /// lasts; open buffers are always read (A4) and do not use it. Returns how
-/// many were skipped and how many used the bound.
+/// many were skipped, leaving out those whose path key is `reported`
+/// elsewhere, and how many used the bound.
+#[allow(clippy::too_many_arguments)]
 fn take_unverified(
     unverified: Vec<PathBuf>,
     key: &ContextKey,
     open: &HashSet<String>,
     deleted: &dyn Fn(&Path) -> bool,
+    reported: &dyn Fn(&str) -> bool,
     taken: &mut HashSet<String>,
     left: &mut usize,
     sources: &mut Vec<(PathBuf, ContextKey)>,
@@ -4918,7 +4936,7 @@ fn take_unverified(
         }
         if !open.contains(&path_key) {
             if *left == 0 {
-                skipped += 1;
+                skipped += usize::from(!reported(&path_key));
                 continue;
             }
             *left -= 1;
@@ -8059,6 +8077,40 @@ pub(in crate::workspace) mod tests {
             &[],
         );
         assert_eq!(references.sources.len(), 5, "references keep their bound");
+    }
+
+    /// Members retrying a previous refusal are the "retried later" gap; the
+    /// "not indexed yet" count leaves them out, and they still use the
+    /// direct-search bound (final review Minor 5).
+    #[test]
+    fn retrying_members_are_not_counted_again_as_not_indexed_yet() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(2));
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
+            .expect("indexed symbols");
+        for name in ["U2.pas", "U3.pas"] {
+            workspace.project_cache.defer_index_member(
+                &key,
+                &root.join("lib").join(name),
+                RETRYING_REFUSAL,
+            );
+        }
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["App.dpr", "U0.pas"]);
+        assert_eq!(
+            sources.gaps,
+            [
+                "1 units of App.dproj are not indexed yet; 2 were searched directly",
+                "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal",
+            ]
+        );
     }
 
     /// `P1` (its `U.pas` open) and `P2`, each with `U`, `V` and `W` naming

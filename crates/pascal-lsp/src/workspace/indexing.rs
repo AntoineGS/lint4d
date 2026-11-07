@@ -12244,9 +12244,9 @@ end.
                         let metadata = entry.metadata().unwrap();
                         if metadata.is_dir() {
                             stack.push(entry.path());
-                        } else if entry.file_name() == "analysis-v5.sqlite3" {
+                        } else if entry.file_name() == "analysis-v6.sqlite3" {
                             database += metadata.len();
-                        } else if entry.file_name() == "analysis-v5.sqlite3-wal" {
+                        } else if entry.file_name() == "analysis-v6.sqlite3-wal" {
                             wal += metadata.len();
                         }
                     }
@@ -12271,10 +12271,11 @@ end.
             /// Task 11 fix round 1: past the WAL threshold, the production
             /// schedule (the worker woken by the refusal) checkpoints, and
             /// the refused members are proven by later batches: a cold run
-            /// persists every member and seals, with no hand-run step.
+            /// persists every member and seals, with no hand-run step. Sized
+            /// so container 6 rows (13d-3) still pass the 8 MiB minimum.
             #[test]
             fn a_cold_index_past_the_wal_threshold_persists_every_member_and_seals() {
-                const UNITS: usize = 60;
+                const UNITS: usize = 90;
                 let temp = tempfile::tempdir().unwrap();
                 let root = temp.path();
                 let store = private_dir();

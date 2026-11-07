@@ -164,7 +164,7 @@ mod tests {
         let exclusion = CacheExclusion::new(Path::new("/home/user/.cache/lint4d/analysis"));
         assert!(exclusion.contains(Path::new("/home/user/.cache/lint4d/analysis")));
         assert!(exclusion.contains(Path::new(
-            "/home/user/.cache/lint4d/analysis/analysis-v5.sqlite3-wal"
+            "/home/user/.cache/lint4d/analysis/analysis-v6.sqlite3-wal"
         )));
         assert!(!exclusion.contains(Path::new("/home/user/.cache/lint4d")));
         assert!(!exclusion.contains(Path::new("/home/user/.cache/lint4d/analysis2")));
@@ -190,7 +190,7 @@ mod tests {
         let exclusion = CacheExclusion::new(&real.join("cache/lint4d/analysis"));
         assert!(!exclusion.contains(&link.join("cache/lint4d/analysis")));
         let seen = exclusion.seen_from([link.as_path()]);
-        assert!(seen.contains(&link.join("cache/lint4d/analysis/analysis-v5.sqlite3")));
+        assert!(seen.contains(&link.join("cache/lint4d/analysis/analysis-v6.sqlite3")));
         assert!(!seen.contains(&link.join("cache/lint4d")));
     }
 
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(check_dedicated(&temp.path().join("absent")), Ok(()));
         let store = temp.path().join("analysis");
         std::fs::create_dir_all(store.join("namespaces")).unwrap();
-        std::fs::write(store.join("analysis-v5.sqlite3"), b"").unwrap();
+        std::fs::write(store.join("analysis-v6.sqlite3"), b"").unwrap();
         std::fs::write(store.join("namespaces/0123.lock"), b"").unwrap();
         assert_eq!(check_dedicated(&store), Ok(()));
     }

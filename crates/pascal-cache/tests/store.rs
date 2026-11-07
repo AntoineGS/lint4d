@@ -179,8 +179,8 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
         for ordinal in 0..rows {
             connection
                 .execute(
-                    "INSERT INTO artifact_rows VALUES (?1, ?2, 1, NULL, x'', ?3)",
-                    params![artifact_ref, ordinal, [0u8; 32].as_slice()],
+                    "INSERT INTO artifact_rows VALUES (?1, ?2, 1, NULL, x'')",
+                    params![artifact_ref, ordinal],
                 )
                 .unwrap();
         }

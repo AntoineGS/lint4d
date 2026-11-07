@@ -135,12 +135,14 @@ fn measure() -> (f64, f64) {
 /// Container 4 measured 408.4 bytes per artifact row and 441.9 per
 /// observation on this store (l4d-zf1b.8, 13c-4). The INTEGER artifact
 /// surrogate with its slim name index, and observations shared by
-/// content, must keep well under those.
+/// content, must keep well under those. Container 5 measured 177.8 per
+/// row; container 6 (13d-3) stores no 32-byte checksum per row.
 #[test]
 fn records_take_a_fraction_of_the_container_4_size() {
     let (per_row, per_observation) = measure();
     eprintln!("bytes per artifact row {per_row:.1}, per observation {per_observation:.1}");
     assert!(per_row < 0.55 * 408.4, "per artifact row {per_row:.1}");
+    assert!(per_row < 177.8 - 30.0, "per artifact row {per_row:.1}");
     assert!(
         per_observation < 0.15 * 441.9,
         "per observation {per_observation:.1}"

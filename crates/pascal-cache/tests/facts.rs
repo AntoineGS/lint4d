@@ -659,6 +659,37 @@ mod store {
         assert_eq!(budget.used(), 0);
     }
 
+    /// The rows reach the decoder before the fact checksum is checked, so
+    /// a corrupted row is reported as the checksum miss it is, whatever
+    /// the decoder made of it and whatever the budget.
+    #[test]
+    fn a_corrupted_row_is_a_checksum_miss_whatever_the_decoder_makes_of_it() {
+        let root = private_tempdir();
+        let store = open(root.path(), StoreLimits::default());
+        let key = key("unit A;");
+        store
+            .publish_facts(ArtifactKeyRef::local(&key), &sample())
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(root.path().join(pascal_cache::DATABASE_FILE)).unwrap();
+        connection
+            .execute(
+                "UPDATE artifact_rows SET payload = x'ffffffff' WHERE ordinal = 0",
+                [],
+            )
+            .unwrap();
+        for limit in [1 << 26, 64] {
+            let mut budget = FactBudget::new(limit);
+            assert_eq!(
+                store.load_facts(ArtifactKeyRef::local(&key), &mut budget),
+                Ok(Lookup::Miss(Miss::ChecksumMismatch)),
+                "budget {limit}"
+            );
+            assert_eq!(budget.used(), 0);
+            assert_eq!(store.scratch_in_use(), 0);
+        }
+    }
+
     #[test]
     fn decoded_facts_are_charged_before_they_are_retained() {
         let root = private_tempdir();

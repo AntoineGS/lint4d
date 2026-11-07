@@ -73,11 +73,11 @@ pub use store::{
     MIN_HEALTH_BACKOFF, MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, Maintenance,
     MaintenanceLimits, MaintenanceLimitsError, Malformed, MemberBatch, MemberRecordHeader,
     MemberRecordReader, Miss, ObservationBatch, Phase, PolicyError, PolicyState, Pressure,
-    Published, PublishedEvidence, PublishedRecord, PublishedSet, ROW_CHECKSUM_CONTEXT,
-    ROW_OVERHEAD_BYTES, Reclaimed, RetireReport, RetireStep, RootMismatch, RowBatch,
-    SQLITE_LENGTH_LIMIT, Scope, SealRefusal, SnapshotBuilder, SnapshotHeader, SnapshotId,
-    SnapshotMember, SnapshotReader, SnapshotSeal, StepBudget, StepReport, Store, StoreLimits,
-    StoreLocation, StorePolicy, StoredRow, TooLarge, Unhealthy, Usage, default_directory,
+    Published, PublishedEvidence, PublishedRecord, PublishedSet, ROW_OVERHEAD_BYTES, Reclaimed,
+    RetireReport, RetireStep, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal,
+    SnapshotBuilder, SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader, SnapshotSeal,
+    StepBudget, StepReport, Store, StoreLimits, StoreLocation, StorePolicy, StoredRow, TooLarge,
+    Unhealthy, Usage, default_directory,
 };
 pub use store::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 

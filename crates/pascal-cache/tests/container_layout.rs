@@ -2,7 +2,9 @@
 //! Container 5 (l4d-zf1b.8, 13c-4): the container version is in the file
 //! name, artifact rows hang off an INTEGER surrogate and observations are
 //! stored once per content and shared by the evidence sets that list them.
-//! Identities, checksums and integrity checks are those of container 4.
+//! Container 6 (13d-3) stores no per-row checksum: the fact checksum of the
+//! whole artifact verifies its rows. Identities, fact checksums and
+//! integrity checks are those of container 4.
 
 mod common;
 
@@ -96,34 +98,45 @@ fn read_set(store: &Store, id: Digest) -> Result<Vec<Observation>, Miss> {
 
 #[test]
 fn the_database_file_name_carries_the_container_version() {
-    assert_eq!(CONTAINER_VERSION, 5);
+    assert_eq!(CONTAINER_VERSION, 6);
+    assert_eq!(DATABASE_FILE, "analysis-v6.sqlite3");
     assert_eq!(
         DATABASE_FILE,
         format!("analysis-v{CONTAINER_VERSION}.sqlite3")
     );
 }
 
-/// R9-3: an older container stays where it is, untouched, and the store
-/// opens its own file beside it; nobody has to do anything.
+/// R9-3: older containers stay where they are, untouched, and the store
+/// opens its own file beside them; nobody has to do anything.
 #[test]
-fn a_previous_container_file_beside_is_left_untouched() {
+fn previous_container_files_beside_are_left_untouched() {
     let root = private_tempdir();
-    let old = root.path().join("analysis.sqlite3");
-    {
-        let connection = Connection::open(&old).unwrap();
+    let olds = [
+        (root.path().join("analysis.sqlite3"), 4),
+        (root.path().join("analysis-v5.sqlite3"), 5),
+    ];
+    let mut before = Vec::new();
+    for (old, version) in &olds {
+        let connection = Connection::open(old).unwrap();
         connection
-            .execute_batch(
-                "PRAGMA application_id = 1278493763; PRAGMA user_version = 4;
-                 CREATE TABLE store_state (singleton INTEGER PRIMARY KEY);",
-            )
+            .execute_batch(&format!(
+                "PRAGMA application_id = 1278493763; PRAGMA user_version = {version};
+                 CREATE TABLE store_state (singleton INTEGER PRIMARY KEY);"
+            ))
             .unwrap();
+        drop(connection);
+        before.push(std::fs::read(old).unwrap());
     }
-    let before = std::fs::read(&old).unwrap();
     let store = open(root.path());
     assert_eq!(store.check_scope(), Ok(()));
     assert!(root.path().join(DATABASE_FILE).is_file());
     drop(store);
-    assert_eq!(std::fs::read(&old).unwrap(), before);
+    for ((old, _), before) in olds.iter().zip(&before) {
+        assert_eq!(&std::fs::read(old).unwrap(), before, "{}", old.display());
+        let mut wal = old.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(!Path::new(&wal).exists(), "{}", old.display());
+    }
 }
 
 #[test]
@@ -274,9 +287,10 @@ fn a_reset_reclaims_shared_content_and_rows_of_the_old_scope() {
     }
 }
 
-/// Stored identities and checksums, as container 4 computed them: the
-/// layout change leaves every artifact ID, fact checksum, row and evidence
-/// ID as it was.
+/// Stored identities and fact checksums, as container 4 computed them: the
+/// layout changes of containers 5 and 6 leave every artifact ID, fact
+/// checksum and evidence ID as it was. Only the storage projection
+/// changed: container 6 drops the per-row checksum column.
 #[test]
 fn identities_and_checksums_are_those_of_container_4() {
     let root = private_tempdir();
@@ -318,18 +332,50 @@ fn identities_and_checksums_are_those_of_container_4() {
         digest, "21e1a4b28576229aea09975f4010693e0eb0d8e5c2d1e3ababd116a0bc88e761",
         "{lines:#?}"
     );
-    let checksums: Vec<String> = raw(root.path())
-        .prepare("SELECT hex(row_checksum) FROM artifact_rows ORDER BY ordinal")
+    assert_eq!(
+        columns(root.path(), "artifact_rows"),
+        [
+            "artifact_ref",
+            "ordinal",
+            "row_kind",
+            "index_key",
+            "payload"
+        ]
+    );
+}
+
+fn columns(directory: &Path, table: &str) -> Vec<String> {
+    raw(directory)
+        .prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The fact checksum of the whole artifact is the only stored checksum:
+/// no fact table repeats one per row.
+#[test]
+fn only_the_artifact_header_stores_a_checksum() {
+    let root = private_tempdir();
+    drop(open(root.path()));
+    let tables: Vec<String> = raw(root.path())
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(
-        checksums,
-        [
-            "E69FE5815A23ADB7D1BAE47698D82F7F932B948C799EACE6ED04067B12200870",
-            "8F0B36F422090DF3753EA658DAA0DFAFCC78849EEF43DD300B489B759A1243A5"
-        ]
-    );
+    let mut checksums = Vec::new();
+    for table in tables {
+        for column in columns(root.path(), &table) {
+            if column.contains("checksum") {
+                checksums.push(format!("{table}.{column}"));
+            }
+        }
+    }
+    assert_eq!(checksums, ["artifacts.fact_checksum"]);
 }

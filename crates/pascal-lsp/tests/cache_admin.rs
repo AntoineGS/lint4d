@@ -282,7 +282,7 @@ fn reset_fences_a_live_store_without_touching_its_files() {
     let directory = private_directory(environment.path(), "store");
     let store = Store::open(&directory, Namespace::current(), StoreLimits::default()).unwrap();
     let inodes = || -> Vec<u64> {
-        ["analysis-v5.sqlite3", "analysis-v5.sqlite3-wal"]
+        ["analysis-v6.sqlite3", "analysis-v6.sqlite3-wal"]
             .iter()
             .map(|name| std::fs::metadata(directory.join(name)).unwrap().ino())
             .collect()
@@ -303,9 +303,9 @@ fn reset_fences_a_live_store_without_touching_its_files() {
 fn a_corrupt_store_is_reported_and_left_in_place() {
     let environment = tempfile::tempdir().unwrap();
     let directory = private_directory(environment.path(), "store");
-    std::fs::write(directory.join("analysis-v5.sqlite3"), vec![0x5a; 8192]).unwrap();
+    std::fs::write(directory.join("analysis-v6.sqlite3"), vec![0x5a; 8192]).unwrap();
     std::fs::set_permissions(
-        directory.join("analysis-v5.sqlite3"),
+        directory.join("analysis-v6.sqlite3"),
         std::fs::Permissions::from_mode(0o600),
     )
     .unwrap();

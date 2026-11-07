@@ -5,13 +5,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 5;
+pub const CONTAINER_VERSION: i64 = 6;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 5. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 6. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
 /// Spec §6.1 (amended 2026-10-27) adds evidence purposes and the publication sequence.
@@ -21,6 +21,9 @@ const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 /// surrogate of their artifact and stores each distinct observation once
 /// per scope, listed by the evidence sets through `evidence_observations`.
 /// The surrogates are internal: no identity, record or snapshot holds one.
+/// Container 6 (l4d-zf1b.8, 13d-3) stores no per-row checksum: a read
+/// verifies every row against the artifact's `fact_checksum`, which binds
+/// each row to its artifact and ordinal (spec §6.2).
 const SCHEMA: &str = "
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -83,7 +86,6 @@ CREATE TABLE artifact_rows (
     row_kind INTEGER NOT NULL CHECK (row_kind BETWEEN 1 AND 255),
     index_key BLOB CHECK (index_key IS NULL OR length(index_key) <= 4096),
     payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
-    row_checksum BLOB NOT NULL CHECK (length(row_checksum) = 32),
     PRIMARY KEY (artifact_ref, ordinal)
 ) STRICT, WITHOUT ROWID;
 
@@ -647,7 +649,7 @@ mod tests {
 
     #[test]
     fn older_containers_are_bypassed_not_migrated() {
-        for version in [1, 2, 3, 4] {
+        for version in [1, 2, 3, 4, 5] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("a.sqlite3");
             {
@@ -916,11 +918,11 @@ mod tests {
                 MAX_SUPPLEMENTAL_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES (1, 0, 1, zeroblob(?1), x'', zeroblob(32))",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, zeroblob(?1), x'')",
                 MAX_INDEX_KEY_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES (1, 0, 1, NULL, zeroblob(?1), zeroblob(32))",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, NULL, zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
             (

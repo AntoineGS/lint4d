@@ -42,9 +42,7 @@ mod testing;
 mod waits;
 mod wal;
 
-pub use artifacts::{
-    ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT, ROW_CHECKSUM_CONTEXT,
-};
+pub use artifacts::{ArtifactHeader, ArtifactRow, ArtifactWrite, FACT_CHECKSUM_CONTEXT};
 pub use evidence::{
     EvidenceHeader, EvidenceReader, EvidenceTarget, EvidenceWrite, ObservationBatch,
     PublishedEvidence, PublishedSet,

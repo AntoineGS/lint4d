@@ -224,9 +224,9 @@ impl ArtifactReader<'_> {
         ensure_live(&transaction, scope)?;
         // GC between batches is a miss, never a silent gap (spec §9). The
         // rows are found through the header's surrogate, resolved in the
-        // batch's own transaction: surrogates are never reused, and the row
-        // checksums bind the artifact ID, so rows of another artifact
-        // could not verify anyway.
+        // batch's own transaction: surrogates are never reused, and the fact
+        // checksum binds the artifact ID and each ordinal, so rows of
+        // another artifact, or out of place, could not verify anyway.
         let header: Option<(i64, i64)> = transaction
             .query_row(
                 "SELECT artifact_ref, lifecycle FROM artifacts \
@@ -247,7 +247,7 @@ impl ArtifactReader<'_> {
         };
         let mut statement = transaction
             .prepare_cached(
-                "SELECT ordinal, row_kind, index_key, payload, row_checksum FROM artifact_rows \
+                "SELECT ordinal, row_kind, index_key, payload FROM artifact_rows \
                  WHERE artifact_ref = ?1 AND ordinal >= ?2 ORDER BY ordinal LIMIT ?3",
             )
             .map_err(|error| classify(&error))?;
@@ -286,10 +286,9 @@ impl ArtifactReader<'_> {
                     row.get::<_, i64>(1)?,
                     row.get_ref(2)?.as_blob_or_null()?,
                     row.get_ref(3)?.as_blob()?,
-                    row.get_ref(4)?.as_blob()?,
                 ))
             })();
-            let (ordinal, row_kind, index_key, payload, checksum) = match decoded {
+            let (ordinal, row_kind, index_key, payload) = match decoded {
                 Ok(values) => values,
                 Err(error) => return classify_read(&error).and_then(|miss| self.fail(miss)),
             };
@@ -306,7 +305,7 @@ impl ArtifactReader<'_> {
             if bytes + size > MAX_ROW_BATCH_BYTES {
                 break;
             }
-            let computed = hash_row(
+            hash_row(
                 &mut hasher,
                 artifact_id,
                 next_ordinal,
@@ -314,9 +313,6 @@ impl ArtifactReader<'_> {
                 index_key,
                 payload,
             );
-            if computed.as_bytes().as_slice() != checksum {
-                return self.fail(Miss::ChecksumMismatch);
-            }
             bytes += size;
             content_bytes += size as u64;
             batch.push(StoredRow {

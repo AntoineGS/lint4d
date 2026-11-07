@@ -151,7 +151,7 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
         "{status}"
     );
     assert_eq!(status["directory"], directory.to_str().unwrap());
-    assert!(directory.join("analysis-v5.sqlite3").is_file());
+    assert!(directory.join("analysis-v6.sqlite3").is_file());
     let mode = fs::metadata(&directory).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
     open(&mut server, &main, 1, &main_source);
@@ -163,7 +163,7 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
 }
 
 /// An empty one-page SQLite database whose header says lint4d container 4.
-fn container_4_header() -> Vec<u8> {
+fn container_header(version: u32) -> Vec<u8> {
     let mut page = vec![0u8; 4096];
     page[..16].copy_from_slice(b"SQLite format 3\0");
     page[16..18].copy_from_slice(&4096u16.to_be_bytes());
@@ -172,7 +172,7 @@ fn container_4_header() -> Vec<u8> {
     page[28..32].copy_from_slice(&1u32.to_be_bytes());
     page[44..48].copy_from_slice(&4u32.to_be_bytes());
     page[56..60].copy_from_slice(&1u32.to_be_bytes());
-    page[60..64].copy_from_slice(&4u32.to_be_bytes());
+    page[60..64].copy_from_slice(&version.to_be_bytes());
     page[68..72].copy_from_slice(&0x4C34_4443u32.to_be_bytes());
     page[92..96].copy_from_slice(&1u32.to_be_bytes());
     page[96..100].copy_from_slice(&3_051_003u32.to_be_bytes());
@@ -181,8 +181,8 @@ fn container_4_header() -> Vec<u8> {
     page
 }
 
-/// R9-3 (l4d-zf1b.8, 13c-4): a container of an earlier version keeps its
-/// own file name. The server opens its versioned file beside it, with no
+/// R9-3 (l4d-zf1b.8, 13c-4, 13d-3): containers of earlier versions keep
+/// their own file names. The server opens its versioned file beside it, with no
 /// user action, and never touches or deletes the old one.
 #[test]
 fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
@@ -201,28 +201,36 @@ fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
     )
     .unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-    let old = directory.join("analysis.sqlite3");
-    fs::write(&old, container_4_header()).unwrap();
-    let before = (
-        fs::read(&old).unwrap(),
-        fs::metadata(&old).unwrap().modified().unwrap(),
-    );
+    let olds = [
+        (directory.join("analysis.sqlite3"), 4),
+        (directory.join("analysis-v5.sqlite3"), 5),
+    ];
+    let stamp = |old: &std::path::Path| {
+        (
+            fs::read(old).unwrap(),
+            fs::metadata(old).unwrap().modified().unwrap(),
+        )
+    };
+    let mut before = Vec::new();
+    for (old, version) in &olds {
+        fs::write(old, container_header(*version)).unwrap();
+        before.push(stamp(old));
+    }
     let mut server = launch(environment.path());
     server.initialize(main.parent().unwrap(), Value::Null);
     let settled = settle(&mut server, true);
     assert_eq!(settled["status"]["state"], "enabled", "{settled}");
+    assert_eq!(pascal_cache::DATABASE_FILE, "analysis-v6.sqlite3");
     assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
     open(&mut server, &main, 1, &main_source);
     hover(&mut server, &main, &main_source, "PublicRoutine");
     server.shutdown();
-    assert_eq!(
-        (
-            fs::read(&old).unwrap(),
-            fs::metadata(&old).unwrap().modified().unwrap()
-        ),
-        before
-    );
-    assert!(!directory.join("analysis.sqlite3-wal").exists());
+    for ((old, _), before) in olds.iter().zip(&before) {
+        assert_eq!(&stamp(old), before, "{}", old.display());
+        let mut wal = old.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(!std::path::Path::new(&wal).exists(), "{}", old.display());
+    }
 }
 
 #[test]

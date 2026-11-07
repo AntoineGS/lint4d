@@ -27,11 +27,27 @@ pub(crate) fn test_set_limit(limit: Option<usize>) {
     TEST_LIMIT.with(|cell| cell.set(limit));
 }
 
+#[cfg(test)]
+fn test_limit() -> Option<usize> {
+    TEST_LIMIT.with(std::cell::Cell::get)
+}
+
+/// The protocol tests' override: `PASCAL_LSP_TEST_HYDRATION_LIMIT_BYTES`.
+#[cfg(all(feature = "test-support", not(test)))]
+fn test_limit() -> Option<usize> {
+    std::env::var("PASCAL_LSP_TEST_HYDRATION_LIMIT_BYTES")
+        .ok()?
+        .parse()
+        .ok()
+}
+
 pub(crate) struct HydrationAdmission {
     cache: ProjectCache,
     held: Vec<Reservation>,
     refused: usize,
-    /// Bytes of the tickets not yet settled and of `held`.
+    /// Bytes of the tickets not yet settled and of `held`, for the test
+    /// limit.
+    #[cfg(any(test, feature = "test-support"))]
     admitted: usize,
 }
 
@@ -54,6 +70,7 @@ impl HydrationAdmission {
             cache,
             held: Vec::new(),
             refused: 0,
+            #[cfg(any(test, feature = "test-support"))]
             admitted: 0,
         }
     }
@@ -61,7 +78,8 @@ impl HydrationAdmission {
     /// Reserve `len × RETAINED_BYTES_PER_SOURCE_BYTE` of `QueryTrees` before
     /// a source of `len` bytes is parsed; `charged` (a parse already in
     /// memory is reused) reserves nothing. `Err(HydrationRefused)` for a
-    /// refused required source.
+    /// refused required source. A later, smaller candidate may still be
+    /// admitted after a refusal: each refusal is counted in the gap.
     pub(crate) fn admit(
         &mut self,
         len: u64,
@@ -74,20 +92,23 @@ impl HydrationAdmission {
         let bytes = usize::try_from(len)
             .unwrap_or(usize::MAX)
             .saturating_mul(RETAINED_BYTES_PER_SOURCE_BYTE);
-        #[cfg(test)]
-        let within_test_limit = TEST_LIMIT.with(std::cell::Cell::get).is_none_or(|limit| {
+        #[cfg(any(test, feature = "test-support"))]
+        let within_test_limit = test_limit().is_none_or(|limit| {
             self.admitted
                 .checked_add(bytes)
                 .is_some_and(|total| total <= limit)
         });
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let within_test_limit = true;
         let reservation = within_test_limit
             .then(|| self.cache.reserve(ReservationKind::QueryTrees, bytes))
             .flatten();
         match reservation {
             Some(reservation) => {
-                self.admitted = self.admitted.saturating_add(bytes);
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    self.admitted = self.admitted.saturating_add(bytes);
+                }
                 Ok(Admitted::Reserved(HydrationTicket(reservation)))
             }
             None if required => Err(HydrationRefused),
@@ -102,7 +123,10 @@ impl HydrationAdmission {
     /// the reservation is dropped; one whose lease was refused keeps it.
     pub(crate) fn settle(&mut self, ticket: HydrationTicket, leased: bool) {
         if leased {
-            self.admitted = self.admitted.saturating_sub(ticket.0.bytes());
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                self.admitted = self.admitted.saturating_sub(ticket.0.bytes());
+            }
         } else {
             self.held.push(ticket.0);
         }

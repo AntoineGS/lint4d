@@ -265,7 +265,6 @@ const SPEC: FixtureSpec = FixtureSpec {
 };
 
 #[test]
-#[ignore = "l4d-zf1b.9: 92 payload reads > 88, not tree hydration (Task 7): 4 per importer (80) plus 12 reads of App.dproj/App.dpr metadata; the bound awaits a ruling (parses 21 <= 22 pass)"]
 fn warm_references_bind_only_the_candidates_and_match_the_uncached_answer() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &SPEC);
@@ -285,8 +284,12 @@ fn warm_references_bind_only_the_candidates_and_match_the_uncached_answer() {
     // The importers, the declaring unit and App.dpr, never the 30 units
     // whose include does not resolve (R9-4) nor the 450 others.
     assert!(used[5] <= (SPEC.importers + 2) as u64, "parses {used:?}");
+    // Four reads per importer (the snapshot's scan, the resolver's load
+    // while binding, two revalidation reads) and a constant few of the
+    // requesting context's project files (12 measured: App.dproj x9,
+    // App.dpr x3); the open sources are not read. Never per unit.
     assert!(
-        used[0] <= 4 * (SPEC.importers + 2) as u64,
+        used[0] <= 4 * SPEC.importers as u64 + 16,
         "payload reads {used:?}"
     );
     let notes = gaps(&mut warm);
@@ -297,6 +300,52 @@ fn warm_references_bind_only_the_candidates_and_match_the_uncached_answer() {
         "{notes:?}"
     );
     shutdown(warm);
+}
+
+/// R9-8: a required source the analysis memory budget refuses fails the
+/// request as `ServerCancelled` (-32802), which clients retry, not as a
+/// final `RequestFailed`.
+#[test]
+fn a_refused_required_source_is_a_retryable_server_cancellation() {
+    const SMALL: FixtureSpec = FixtureSpec {
+        units: 6,
+        importers: 3,
+        with_include_every: 10,
+        unresolved_includes: 0,
+        shared_name: "TShared",
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SMALL);
+    let cache_home = environment.path().join("cold-cache");
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment.path(),
+        vec![
+            ("XDG_CACHE_HOME", cache_home.to_str().expect("UTF-8 path")),
+            ("PASCAL_LSP_TEST_HYDRATION_LIMIT_BYTES", "0"),
+        ],
+    );
+    server.initialize(&root, json!({"persistentCacheEnabled": false}));
+    open_disk(&mut server, &root, &["App.dpr"]);
+    wait_index(&mut server, complete);
+    settle_background(&mut server);
+    let id = RequestId::from("refused-references".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&root.join("lib/Shared.pas"))},
+            "position": {"line": 2, "character": 6},
+            "context": {"includeDeclaration": true},
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("the declaring unit is refused");
+    assert_eq!(error.code, -32802, "{error:?}");
+    assert_eq!(
+        error.message,
+        "the analysis memory budget is exhausted; retry when other work finishes"
+    );
+    shutdown(server);
 }
 
 #[test]

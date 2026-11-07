@@ -10434,6 +10434,8 @@ fn send_analysis_error(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let code = if error == rename::CANCELLATION_MESSAGE {
         ErrorCode::RequestCanceled
+    } else if error == crate::workspace::hydration::HYDRATION_REFUSED {
+        ErrorCode::ServerCancelled
     } else {
         ErrorCode::RequestFailed
     };

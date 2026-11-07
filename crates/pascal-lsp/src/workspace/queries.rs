@@ -4276,7 +4276,15 @@ mod tests {
             )
             .value
         };
+        let query_trees = || {
+            fixture
+                .input
+                .project_cache
+                .stats()
+                .reserved_query_trees_bytes
+        };
         let walked = references().expect("references");
+        assert_eq!(query_trees(), 0, "released with the snapshot");
         assert!(walked.coverage.is_complete(), "{:?}", walked.coverage);
         assert_eq!(walked.value.len(), 21);
         let walked = located(&walked.value);
@@ -4286,6 +4294,7 @@ mod tests {
         let importer_bytes = len(&fixture.importers[0]) * RETAINED_BYTES_PER_SOURCE_BYTE;
         test_set_limit(Some(shared_bytes + 5 * importer_bytes));
         let partial = references().expect("a partial answer, not a refusal");
+        assert_eq!(query_trees(), 0, "released with the snapshot");
         let found = located(&partial.value);
         assert_eq!(found.len(), 6, "the declaring unit and 5 importers");
         assert!(
@@ -4319,6 +4328,7 @@ mod tests {
 
         test_set_limit(Some(shared_bytes - 1));
         assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
+        assert_eq!(query_trees(), 0, "released by the refused request");
     }
 
     /// `Shared` declares `SharedValue`, `Importer` uses it, and `Broken`

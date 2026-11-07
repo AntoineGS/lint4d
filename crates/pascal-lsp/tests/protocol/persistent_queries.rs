@@ -396,6 +396,110 @@ fn a_settled_warm_server_counts_nothing_without_a_request() {
     shutdown(warm);
 }
 
+/// The index contexts `pascal/indexStatus` reports, polled until they
+/// satisfy `predicate`.
+fn wait_contexts(server: &mut TestServer, predicate: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let deadline = Instant::now() + IDLE_DEADLINE;
+    loop {
+        let status = request(server, "pascal/indexStatus", json!({}));
+        let contexts = status["contexts"].as_array().cloned().unwrap_or_default();
+        if predicate(&contexts) {
+            return contexts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index did not reach the expected state: {status}"
+        );
+    }
+}
+
+/// AC4 (R9-6): the eight one-unit projects `others/p1..p8` fill the
+/// index store, evicting App.dproj's context index. A request on it then
+/// answers partially, the members past the bound of direct reads being the
+/// "not indexed yet" gap, and queues its reuse pass; once that pass has
+/// reloaded every member from the store, the same request answers fully.
+#[test]
+fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
+    const EVICTED: FixtureSpec = FixtureSpec {
+        units: 300,
+        importers: 5,
+        with_include_every: 10,
+        unresolved_includes: 0,
+        shared_name: "TShared",
+    };
+    const OTHERS: usize = 8;
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &EVICTED);
+    for index in 1..=OTHERS {
+        let project = root.join(format!("others/p{index}"));
+        write_file(
+            &project.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write_file(&project.join("App.dpr"), "program App;\nbegin\nend.\n");
+    }
+    pascal_project::backdate_tree_for_test(&root);
+    let shared = root.join("lib/Shared.pas");
+    let is_app = |context: &Value| context["members"].as_u64().unwrap() > 1;
+
+    let mut server = launch_labelled(environment.path(), "cache", "evicted");
+    server.initialize(&root, Value::Null);
+    open_disk(&mut server, &root, &OPENS);
+    wait_index(&mut server, persisted);
+    settle_background(&mut server);
+    gaps(&mut server);
+    let expected = references(&mut server, &shared, 2, 6);
+    assert_eq!(expected.len(), EVICTED.importers + 1, "{expected:?}");
+    assert_eq!(gaps(&mut server), Vec::<String>::new());
+
+    let others = (1..=OTHERS)
+        .map(|index| format!("others/p{index}/App.dpr"))
+        .collect::<Vec<_>>();
+    open_disk(
+        &mut server,
+        &root,
+        &others.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    wait_contexts(&mut server, |contexts| {
+        contexts.len() == OTHERS && contexts.iter().all(complete) && !contexts.iter().any(is_app)
+    });
+    settle_background(&mut server);
+    assert!(
+        wait_contexts(&mut server, |_| true)
+            .iter()
+            .all(|context| !is_app(context)),
+        "nothing indexes App.dproj again until a request needs it"
+    );
+
+    gaps(&mut server);
+    let partial = references(&mut server, &shared, 2, 6);
+    let notes = gaps(&mut server);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("units of App.dproj are not indexed yet")),
+        "{notes:?}"
+    );
+    assert!(
+        partial.iter().all(|location| expected.contains(location)),
+        "{partial:?}"
+    );
+
+    let reloaded = wait_contexts(&mut server, |contexts| {
+        contexts
+            .iter()
+            .any(|context| is_app(context) && complete(context))
+    });
+    let reloaded = reloaded.into_iter().find(is_app).unwrap();
+    assert_eq!(reloaded["extracted"], 0, "{reloaded}");
+    assert_eq!(reloaded["reused"], reloaded["members"], "{reloaded}");
+    settle_background(&mut server);
+    gaps(&mut server);
+    assert_eq!(references(&mut server, &shared, 2, 6), expected);
+    assert_eq!(gaps(&mut server), Vec::<String>::new());
+    shutdown(server);
+}
+
 fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();
     let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];

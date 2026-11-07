@@ -8852,6 +8852,177 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// Release's child configurations of `configured_project`: with
+        /// Debug and Release they are one more context than the index store
+        /// holds (`MAX_INDEXED_CONTEXTS`).
+        const RELEASE_CHILDREN: usize = crate::project_cache::MAX_INDEXED_CONTEXTS - 1;
+
+        /// One `.dproj` whose Debug and Release configurations select
+        /// different units through their defines and search paths: App.dpr
+        /// uses `UA` (`debug/`) under DEBUG and `UB` (`release/`) otherwise,
+        /// both declaring `Shared`. `Release1`.. inherit Release.
+        fn configured_project(root: &Path) {
+            let mut groups = String::new();
+            let mut items = String::new();
+            for child in 1..=RELEASE_CHILDREN {
+                let key = child + 2;
+                groups.push_str(&format!(
+                    "  <PropertyGroup Condition=\"'$(Config)'=='Release{child}' or '$(Cfg_{key})'!=''\"><Cfg_{key}>true</Cfg_{key}><CfgParent>Cfg_1</CfgParent><Cfg_1>true</Cfg_1><Base>true</Base></PropertyGroup>\n"
+                ));
+                items.push_str(&format!(
+                    "    <BuildConfiguration Include=\"Release{child}\"><Key>Cfg_{key}</Key><CfgParent>Cfg_1</CfgParent></BuildConfiguration>\n"
+                ));
+            }
+            write(
+                &root.join("App.dproj"),
+                &format!(
+                    r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Debug</Config>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+{groups}  <PropertyGroup Condition="'$(Cfg_1)'!=''"><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>release</DCC_UnitSearchPath></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>debug</DCC_UnitSearchPath></PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+{items}  </ItemGroup>
+</Project>"#
+                ),
+            );
+            write(
+                &root.join("App.dpr"),
+                "program App;\n{$IFDEF DEBUG}uses UA;{$ELSE}uses UB;{$ENDIF}\nbegin\n  Shared;\nend.\n",
+            );
+            named_unit(&root.join("debug/UA.pas"), "Shared");
+            named_unit(&root.join("release/UB.pas"), "Shared");
+            pascal_project::backdate_tree_for_test(root);
+        }
+
+        fn build_configuration(root: &Path, config: &str) -> WorkspaceOptions {
+            WorkspaceOptions {
+                project_file: Some(root.join("App.dproj")),
+                build_config: Some(config.to_owned()),
+                ..WorkspaceOptions::default()
+            }
+        }
+
+        /// `base`'s caches seen under the build configuration `config`.
+        fn switched_to(base: &Workspace, cache: &PersistentCache, config: &str) -> Workspace {
+            let mut input = base.analysis_input().disk_baseline();
+            input.persistent_cache = cache.clone();
+            input.options = build_configuration(&input.roots[0], config);
+            Workspace::from_analysis_input(&input)
+        }
+
+        /// AC4 (R9-6, and the Debug/Release A/B/A reuse of `.8` AC2): Debug,
+        /// then Release and its children, evict Debug's context index;
+        /// switching back reloads Debug from the store, lazily and without a
+        /// parse, with the first Debug answer.
+        #[test]
+        fn an_a_b_a_switch_reloads_a_from_the_store_without_parsing() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            configured_project(root);
+            let ua = Url::from_file_path(root.join("debug/UA.pas")).unwrap();
+            let anchor = IndexAnchor::Project(root.join("App.dproj"));
+            let release_only = |sources: &[PathBuf]| {
+                sources
+                    .iter()
+                    .filter(|path| path.starts_with(root.join("release")))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let references = |view: &Workspace| {
+                crate::workspace::rename::test_take_indexed_sources();
+                let found = crate::workspace::queries::references_from_input(
+                    view.analysis_input(),
+                    &ua,
+                    lsp_types::Position::new(2, 10),
+                    true,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("references");
+                assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+                let indexed = crate::workspace::rename::test_take_indexed_sources();
+                assert_eq!(release_only(&indexed), Vec::<PathBuf>::new(), "{indexed:?}");
+                let mut located = found
+                    .value
+                    .iter()
+                    .map(|location| {
+                        (
+                            location.uri.clone(),
+                            location.range.start.line,
+                            location.range.start.character,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                located.sort();
+                located
+            };
+
+            let base = workspace(root, build_configuration(root, "Debug"));
+            let (mut debug, cache) = persisting_view(&base, store.path());
+            let progress = advance(&mut debug, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            let a = progress.key.clone().unwrap();
+            let a_members = members(&debug, &a);
+            assert_eq!(
+                a_members,
+                vec![root.join("App.dpr"), root.join("debug/UA.pas")]
+            );
+            assert_eq!(progress.persisted, a_members.len(), "{progress:?}");
+            let first = references(&debug);
+            assert_eq!(first.len(), 3, "{first:?}");
+
+            let mut release = switched_to(&base, &cache, "Release");
+            let progress = advance(&mut release, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            let b = progress.key.clone().unwrap();
+            assert_ne!(a, b);
+            assert_eq!(
+                members(&release, &b),
+                vec![root.join("App.dpr"), root.join("release/UB.pas")]
+            );
+            // Release's children fill the store: Debug, the least recently
+            // used, is evicted by the last.
+            for child in 1..=RELEASE_CHILDREN {
+                assert!(release.project_cache.holds_index(&a), "Release{child}");
+                let mut view = switched_to(&base, &cache, &format!("Release{child}"));
+                assert!(advance(&mut view, &anchor, IndexBound::all()).complete);
+            }
+            assert!(!release.project_cache.holds_index(&a), "Debug is evicted");
+            assert!(release.project_cache.holds_index(&b));
+
+            let mut back = switched_to(&base, &cache, "Debug");
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut back,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(
+                crate::navigation::test_document_parse_count(),
+                0,
+                "no member was parsed"
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.key.as_ref(), Some(&a));
+            assert_eq!(progress.reused, a_members.len(), "{progress:?}");
+            assert_eq!((progress.indexed, progress.persisted), (0, 0));
+            assert_eq!(members(&back, &a), a_members);
+            assert!(!back.project_cache.holds_index(&b), "Release is evicted");
+            assert_eq!(references(&back), first, "the first Debug answer");
+            cache.shutdown();
+        }
+
         /// H1: an invalidation drops the record, so an unchanged member is
         /// proven again through the store instead of only refreshed.
         #[test]

@@ -129,6 +129,7 @@ pub(crate) mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+pub(crate) mod hydration;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;

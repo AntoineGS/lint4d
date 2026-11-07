@@ -4721,7 +4721,11 @@ impl Workspace {
                 continue;
             };
             let path_key = path_key(&path);
-            if deleted(&path) || taken.contains(&path_key) {
+            if deleted(&path) {
+                continue;
+            }
+            result.required.insert(path_key.clone());
+            if taken.contains(&path_key) {
                 continue;
             }
             let member_of = targets.contexts.iter().map(|(key, _)| key).find(|key| {

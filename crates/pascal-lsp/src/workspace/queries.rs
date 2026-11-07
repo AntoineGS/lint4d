@@ -4249,6 +4249,78 @@ mod tests {
         cache.shutdown();
     }
 
+    /// R9-8 (`.7` AC3): candidate trees past the admitted bytes are one
+    /// gap, never a location; a refused declaring unit fails the request
+    /// with a retryable error; rename keeps its strict walk.
+    #[test]
+    fn hydration_beyond_the_budget_is_a_gap_and_rename_stays_strict() {
+        use crate::project_cache::RETAINED_BYTES_PER_SOURCE_BYTE;
+        use crate::workspace::hydration::{HYDRATION_REFUSED, hydration_gap, test_set_limit};
+        struct Unlimited;
+        impl Drop for Unlimited {
+            fn drop(&mut self) {
+                test_set_limit(None);
+            }
+        }
+        let _unlimited = Unlimited;
+        let fixture = many_units(20, 0);
+        let shared = source_uri(&fixture.shared);
+        build_index_for(&fixture.input, &shared);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &shared,
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+        };
+        let walked = references().expect("references");
+        assert!(walked.coverage.is_complete(), "{:?}", walked.coverage);
+        assert_eq!(walked.value.len(), 21);
+        let walked = located(&walked.value);
+
+        let len = |path: &Path| fs::metadata(path).expect("source").len() as usize;
+        let shared_bytes = len(&fixture.shared) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        let importer_bytes = len(&fixture.importers[0]) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        test_set_limit(Some(shared_bytes + 5 * importer_bytes));
+        let partial = references().expect("a partial answer, not a refusal");
+        let found = located(&partial.value);
+        assert_eq!(found.len(), 6, "the declaring unit and 5 importers");
+        assert!(
+            found.iter().all(|location| walked.contains(location)),
+            "{found:?}"
+        );
+        let gap = hydration_gap(15);
+        assert!(
+            partial.coverage.gaps.iter().any(|g| g.reason == gap),
+            "{:?}",
+            partial.coverage
+        );
+
+        let rename = crate::workspace::rename::rename_from_input(
+            fixture.input.clone(),
+            &shared,
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        if let Ok(edit) = rename.value {
+            let changes = edit.changes.expect("plain changes");
+            assert_eq!(
+                changes.len(),
+                21,
+                "never a partial edit: {:?}",
+                changes.keys()
+            );
+        }
+
+        test_set_limit(Some(shared_bytes - 1));
+        assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
+    }
+
     /// `Shared` declares `SharedValue`, `Importer` uses it, and `Broken`
     /// spells the name outside an include that does not resolve.
     struct UnresolvedFixture {

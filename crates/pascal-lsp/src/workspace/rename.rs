@@ -7,6 +7,9 @@
 //! cache or the filesystem.
 
 use super::catalogues::CatalogueScope;
+use super::hydration::{
+    Admitted, HYDRATION_REFUSED, HydrationAdmission, HydrationRefused, hydration_gap,
+};
 use super::resolver as shared_resolver;
 use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
@@ -719,6 +722,9 @@ pub(crate) struct RenameSnapshot {
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
     _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
+    /// The `QueryTrees` charge of the candidate parses no lease charges
+    /// (R9-8), held until the snapshot is dropped.
+    _hydration: Vec<crate::project_cache::Reservation>,
 }
 
 #[cfg(test)]
@@ -749,6 +755,7 @@ impl RenameSnapshot {
             mode: SnapshotMode::Assistance,
             index_gaps: Vec::new(),
             _cache_leases: HashMap::new(),
+            _hydration: Vec::new(),
         }
     }
 }
@@ -1430,6 +1437,11 @@ impl Enumeration {
     }
 
     fn sort_paths(&mut self, priority: &[Url]) {
+        self.sort_paths_required_first(priority, &HashSet::new());
+    }
+
+    /// `sort_paths`, with the `required` path keys right after `priority`.
+    fn sort_paths_required_first(&mut self, priority: &[Url], required: &HashSet<String>) {
         self.paths.sort_by(|left, right| {
             left.path
                 .to_string_lossy()
@@ -1440,10 +1452,13 @@ impl Enumeration {
             .filter_map(|uri| uri.to_file_path().ok().map(absolute_path))
             .collect::<Vec<_>>();
         self.paths.sort_by_key(|source| {
-            priority_paths
-                .iter()
-                .position(|priority| paths_equal_ci(priority, &source.path))
-                .unwrap_or(priority_paths.len())
+            (
+                priority_paths
+                    .iter()
+                    .position(|priority| paths_equal_ci(priority, &source.path))
+                    .unwrap_or(priority_paths.len()),
+                required.is_empty() || !required.contains(&path_key(&source.path)),
+            )
         });
         self.path_indices.clear();
         for (index, source) in self.paths.iter().enumerate() {
@@ -6194,6 +6209,9 @@ pub(crate) struct IndexedSources {
     pub(crate) gaps: Vec<String>,
     /// Unchanged members left out because an include does not resolve (R9-4).
     pub(crate) unresolved: usize,
+    /// The path keys of the sources the request cannot answer without (its
+    /// `must_include`): never left out for the memory budget (R9-8).
+    pub(crate) required: HashSet<String>,
     /// The states of the owners in `sources`, which the snapshot does not
     /// resolve again.
     pub(crate) contexts: HashMap<ContextKey, ContextState>,
@@ -6402,13 +6420,17 @@ fn build_snapshot_with_policy(
             }
         }
     }
-    let index_gaps = match &mut scope {
-        SnapshotScope::Walk => Vec::new(),
+    let (mut index_gaps, mut hydration, required) = match &mut scope {
+        SnapshotScope::Walk => (Vec::new(), None, HashSet::new()),
         SnapshotScope::Indexed(sources) => {
             for (key, state) in std::mem::take(&mut sources.contexts) {
                 loader.contexts.entry(key).or_insert(state);
             }
-            std::mem::take(&mut sources.gaps)
+            (
+                std::mem::take(&mut sources.gaps),
+                Some(HydrationAdmission::new(input.project_cache.clone())),
+                std::mem::take(&mut sources.required),
+            )
         }
     };
     let indexed = matches!(scope, SnapshotScope::Indexed(_));
@@ -6462,6 +6484,7 @@ fn build_snapshot_with_policy(
                     mode,
                     index_gaps,
                     _cache_leases: HashMap::new(),
+                    _hydration: Vec::new(),
                 });
             }
             contexts
@@ -6507,7 +6530,7 @@ fn build_snapshot_with_policy(
         &mut enumeration,
         cancel,
     )?;
-    enumeration.sort_paths(&priority);
+    enumeration.sort_paths_required_first(&priority, &required);
     crate::trace::trace!("  snapshot enumerated {} paths", enumeration.paths.len());
     let auto_import_complete = enumeration.auto_import_complete;
     let paths = enumeration.paths;
@@ -6987,6 +7010,28 @@ fn build_snapshot_with_policy(
             });
             continue;
         }
+        let cached = input
+            .cached_documents
+            .get(&uri)
+            .filter(|cached| {
+                loader
+                    .contexts
+                    .get(&source_context_key)
+                    .is_some_and(|state| state.context == cached.context)
+            })
+            .map(|cached| cached.parsed.clone());
+        let hydration_ticket = match hydration.as_mut().map(|admission| {
+            admission.admit(
+                indexed_source.len() as u64,
+                cached.is_some(),
+                is_priority || required.contains(&path_key(&path)),
+            )
+        }) {
+            None | Some(Ok(Admitted::Charged)) => None,
+            Some(Ok(Admitted::Reserved(ticket))) => Some(ticket),
+            Some(Ok(Admitted::Refused)) => continue,
+            Some(Err(HydrationRefused)) => return Err(HYDRATION_REFUSED.to_owned()),
+        };
 
         if !contexts.contains_key(&uri) {
             let context_key = source_context_key.clone();
@@ -7027,16 +7072,6 @@ fn build_snapshot_with_policy(
                 }
             })
             .unwrap_or_default();
-        let cached = input
-            .cached_documents
-            .get(&uri)
-            .filter(|cached| {
-                loader
-                    .contexts
-                    .get(&source_context_key)
-                    .is_some_and(|state| state.context == cached.context)
-            })
-            .map(|cached| cached.parsed.clone());
         index
             .update_with_session(
                 uri.clone(),
@@ -7047,6 +7082,10 @@ fn build_snapshot_with_policy(
                 loader.expansions.get(&uri).map(|e| &e.expanded),
             )
             .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+        // The snapshot's own index holds the parse: no lease charges it.
+        if let (Some(admission), Some(ticket)) = (hydration.as_mut(), hydration_ticket) {
+            admission.settle(ticket, false);
+        }
         retained_files = retained_files.saturating_add(1);
         retained_bytes = retained_bytes.saturating_add(source_bytes);
         indexed_uris.insert(uri.clone());
@@ -7068,6 +7107,13 @@ fn build_snapshot_with_policy(
         return Err(
             "rename workspace source scan was empty; no Pascal sources were retained".to_string(),
         );
+    }
+    if let Some(refused) = hydration
+        .as_ref()
+        .map(HydrationAdmission::refused)
+        .filter(|refused| *refused > 0)
+    {
+        index_gaps.push(hydration_gap(refused));
     }
     for providers in auto_import_unit_providers.values_mut() {
         providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -7599,6 +7645,9 @@ fn build_snapshot_with_policy(
         mode,
         index_gaps,
         _cache_leases: loader.cache_leases,
+        _hydration: hydration
+            .map(HydrationAdmission::into_held)
+            .unwrap_or_default(),
     })
 }
 

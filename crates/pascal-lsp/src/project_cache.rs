@@ -4371,6 +4371,7 @@ pub(crate) struct CacheStats {
     pub reserved_index_bytes: usize,
     pub reserved_provider_graph_bytes: usize,
     pub reserved_publication_bytes: usize,
+    pub reserved_query_trees_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4383,6 +4384,7 @@ impl CacheStats {
             .saturating_add(self.reserved_index_bytes)
             .saturating_add(self.reserved_provider_graph_bytes)
             .saturating_add(self.reserved_publication_bytes)
+            .saturating_add(self.reserved_query_trees_bytes)
     }
 }
 
@@ -4409,10 +4411,13 @@ pub(crate) enum ReservationKind {
     ProviderGraphs,
     /// A member publication's transient buffers (`reserve_publication`).
     Publication,
+    /// Candidate trees an indexed query parses that no cache lease charges
+    /// (`workspace::hydration`, R9-8).
+    QueryTrees,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     fn index(self) -> usize {
         match self {
@@ -4423,6 +4428,7 @@ impl ReservationKind {
             Self::WorkspaceIndex => 4,
             Self::ProviderGraphs => 5,
             Self::Publication => 6,
+            Self::QueryTrees => 7,
         }
     }
 }
@@ -6557,6 +6563,7 @@ impl ProjectCache {
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
             reserved_publication_bytes: state.reserved[ReservationKind::Publication.index()],
+            reserved_query_trees_bytes: state.reserved[ReservationKind::QueryTrees.index()],
         }
     }
 

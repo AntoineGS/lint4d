@@ -1609,7 +1609,7 @@ least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
 | `directory` | The store directory, cut at 4,096 escaped bytes |
 | `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
 | `resetEpoch` | The namespace's reset counter while open |
-| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
+| `reservedBytes` | `pages`, `scratch`, `facts` and `queryTrees` (the candidate parses of the running references and workspace-symbol requests) charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
 | `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
 | `lockWaits` | Process-wide `poolWaits`, `lockWaits`, their `*Micros` totals and `busy` outcomes. Waits inside a statement after `BEGIN` are not measured |
 | `counters` | `hits`, `decodedBytes`, `misses` by cause (`input`, `version`, `freshness`, `budget`, `authorization`, `integrity`), non-zero `bypasses` by name, and `maintenance` (`steps`, `cycles`, `rows`, `skipped`) |

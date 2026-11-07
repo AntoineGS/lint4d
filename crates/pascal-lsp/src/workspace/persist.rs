@@ -298,6 +298,9 @@ pub(crate) fn reset_reuse_in_context_calls_for_test() {
     REUSE_IN_CONTEXT_CALLS.with(|calls| calls.set(0));
 }
 
+/// How many contexts a `SharedContextKey` remembers.
+const SHARED_CONTEXT_KEYS: usize = 8;
+
 /// The store's key of one installed context, encoded once (A5: the reuse
 /// pass looks up every member of a context).
 #[derive(Default)]
@@ -316,14 +319,17 @@ impl ContextKeyMemo {
     }
 }
 
-/// The store's key of the context a view last asked for, shared by its
+/// The store's keys of the contexts a view last asked for, shared by its
 /// threads (13f): a context is immutable behind its `Arc`, so a batch
-/// encodes its key once, not once per member it proves. The context is
-/// held weakly, so the memo keeps no context alive; the held allocation
-/// keeps its address from being reused by another context.
+/// encodes its key once, not once per member it proves. The crawl
+/// alternates contexts per unit, so the memo keeps the most recently used
+/// `SHARED_CONTEXT_KEYS`. Contexts are held weakly, so the memo keeps no
+/// context alive; each held allocation keeps its address from being reused
+/// by another context.
 #[derive(Default)]
 pub(crate) struct SharedContextKey {
-    memo: std::sync::Mutex<Option<(std::sync::Weak<ProjectContext>, CacheContextKey)>>,
+    /// Most recently used first.
+    memo: std::sync::Mutex<Vec<(std::sync::Weak<ProjectContext>, CacheContextKey)>>,
     #[cfg(test)]
     encodings: std::sync::atomic::AtomicUsize,
 }
@@ -334,15 +340,19 @@ impl SharedContextKey {
             .memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((held, key)) = memo.as_ref()
-            && std::ptr::eq(held.as_ptr(), Arc::as_ptr(context))
+        if let Some(position) = memo
+            .iter()
+            .position(|(held, _)| std::ptr::eq(held.as_ptr(), Arc::as_ptr(context)))
         {
-            return key.clone();
+            memo[..=position].rotate_right(1);
+            return memo[0].1.clone();
         }
         #[cfg(test)]
         self.encodings.fetch_add(1, Ordering::Relaxed);
         let key = CacheContextKey::new(context);
-        *memo = Some((Arc::downgrade(context), key.clone()));
+        memo.retain(|(held, _)| held.strong_count() > 0);
+        memo.truncate(SHARED_CONTEXT_KEYS - 1);
+        memo.insert(0, (Arc::downgrade(context), key.clone()));
         key
     }
 
@@ -860,6 +870,40 @@ pub(crate) mod tests {
         let later = Arc::new(ProjectContext::default());
         assert_eq!(shared.key_of(&later), CacheContextKey::new(&later));
         assert_eq!(shared.encodings(), 3);
+    }
+
+    /// The crawl alternates contexts per unit (final review Minor 7): each
+    /// live context keeps its key, up to `SHARED_CONTEXT_KEYS` of them, and
+    /// the least recently used one is encoded again past that.
+    #[test]
+    fn a_shared_context_key_keeps_alternating_contexts() {
+        let shared = SharedContextKey::default();
+        let contexts: Vec<_> = (0..SHARED_CONTEXT_KEYS)
+            .map(|_| Arc::new(ProjectContext::default()))
+            .collect();
+        for _ in 0..3 {
+            for context in &contexts {
+                assert_eq!(shared.key_of(context), CacheContextKey::new(context));
+            }
+        }
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS, "one per context");
+        // Touch every context but the first, then add one more: the first
+        // (least recently used) is evicted, the others stay.
+        for context in &contexts[1..] {
+            shared.key_of(context);
+        }
+        let extra = Arc::new(ProjectContext::default());
+        shared.key_of(&extra);
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 1);
+        for context in &contexts[1..] {
+            shared.key_of(context);
+        }
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 1, "kept");
+        assert_eq!(
+            shared.key_of(&contexts[0]),
+            CacheContextKey::new(&contexts[0])
+        );
+        assert_eq!(shared.encodings(), SHARED_CONTEXT_KEYS + 2, "evicted");
     }
 
     #[test]

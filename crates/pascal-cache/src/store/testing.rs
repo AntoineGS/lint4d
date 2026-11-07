@@ -442,10 +442,33 @@ static STORE_OPERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 pub(crate) fn count_operation() {
     STORE_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_OPERATIONS.with(|operations| operations.set(operations.get() + 1));
+}
+
+thread_local! {
+    static THREAD_OPERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `store_operations_for_test` made on this thread.
+pub fn store_operations_on_this_thread_for_test() -> u64 {
+    THREAD_OPERATIONS.with(std::cell::Cell::get)
 }
 
 /// Store operations of this process: opens, connection leases, maintenance
 /// locks and administration calls.
 pub fn store_operations_for_test() -> u64 {
     STORE_OPERATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static RECORD_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn count_record_open() {
+    RECORD_OPENS.with(|opens| opens.set(opens.get() + 1));
+}
+
+/// `Store::open_member_record` calls made on this thread.
+pub fn record_opens_on_this_thread_for_test() -> u64 {
+    RECORD_OPENS.with(std::cell::Cell::get)
 }

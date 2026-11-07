@@ -18,9 +18,8 @@ use crate::persistent_cache::CacheJob;
 use crate::project_cache::ReservationKind;
 use lsp_types::Url;
 use pascal_cache::{
-    Bypass, ContextKey as CacheContextKey, Digest, DiscoveryInputs, DiscoveryScope,
-    EvidencePurpose, LocalArtifactKey, Lookup, Miss, RecordListDigest, ScannedDirectory,
-    SnapshotHeader, SnapshotId, SourceContent, Store,
+    Bypass, Digest, DiscoveryInputs, DiscoveryScope, EvidencePurpose, LocalArtifactKey, Lookup,
+    Miss, RecordListDigest, ScannedDirectory, SnapshotHeader, SnapshotId, SourceContent, Store,
 };
 use pascal_core::facts::FactBudget;
 use pascal_core::resolver::{
@@ -569,7 +568,7 @@ impl Workspace {
             return (Adoption::None, "no store");
         };
         let store = job.store();
-        let context = CacheContextKey::new(&state.context);
+        let context = self.cache_context_key(&state.context);
         let candidates = match store.find_snapshots(&context) {
             Ok(Lookup::Hit(candidates)) => candidates,
             Ok(Lookup::Miss(_)) => return (Adoption::None, "no snapshot"),
@@ -719,15 +718,12 @@ impl Workspace {
         if self.root_is_session_private(uri) {
             return Ok(HintReuse::Fallback);
         }
-        let member = match timed(ReusePhase::Lookup, || store.find_member(&hint.header, path))? {
-            Lookup::Hit(member) => member,
-            Lookup::Miss(Miss::Retired | Miss::Vanished) => return Ok(HintReuse::Gone),
-            Lookup::Miss(_) => return Ok(HintReuse::Fallback),
-        };
-        let record = match timed(ReusePhase::Lookup, || {
-            store.open_member_record(member.record_id)
+        let (member, record) = match timed(ReusePhase::Lookup, || {
+            store.find_member_record(&hint.header, path)
         })? {
-            Lookup::Hit(record) => record,
+            Lookup::Hit((member, Lookup::Hit(record))) => (member, record),
+            Lookup::Hit((_, Lookup::Miss(_))) => return Ok(HintReuse::Fallback),
+            Lookup::Miss(Miss::Retired | Miss::Vanished) => return Ok(HintReuse::Gone),
             Lookup::Miss(_) => return Ok(HintReuse::Fallback),
         };
         let Ok(record) = authorize_record(record, &state.context) else {
@@ -768,7 +764,7 @@ impl Workspace {
                 }
                 let overlays = self.overlay_inputs();
                 let deleted = super::resolver::deletion_overrides_by_path(&self.deleted_overrides);
-                let context = CacheContextKey::new(&state.context);
+                let context = self.cache_context_key(&state.context);
                 let mut validator = Validator::new(
                     CurrentInputs {
                         context: &context,
@@ -824,7 +820,9 @@ impl Workspace {
                 HINT_REUSES.with(|count| count.set(count.get() + 1));
                 HintReuse::Done(Reuse::Hit {
                     facts: admitted(facts, &budget, charge),
-                    via: ReuseVia::Snapshot,
+                    via: ReuseVia::Snapshot {
+                        record: hint.held.then_some((hint.header.id(), member.record_id)),
+                    },
                     reads,
                     artifact,
                     evidence,

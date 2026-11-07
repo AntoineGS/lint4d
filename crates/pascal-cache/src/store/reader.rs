@@ -115,6 +115,9 @@ pub struct ArtifactReader<'a> {
     content_bytes: u64,
     hasher: FactHasher,
     state: State,
+    /// The last batch's query ran out of rows: it read every row at or
+    /// past its start in its transaction, so none lies past the count.
+    exhausted: bool,
 }
 
 impl Store {
@@ -126,6 +129,7 @@ impl Store {
             next_ordinal: 0,
             content_bytes: 0,
             state: State::Reading,
+            exhausted: false,
         }
     }
 
@@ -198,7 +202,9 @@ impl ArtifactReader<'_> {
             State::Reading => {}
         }
         if self.next_ordinal == self.header.row_count {
-            if let Some(miss) = self.trailing_rows()? {
+            if !self.exhausted
+                && let Some(miss) = self.trailing_rows()?
+            {
                 return self.fail(miss);
             }
             if self.content_bytes == self.header.content_bytes
@@ -266,6 +272,7 @@ impl ArtifactReader<'_> {
         let mut content_bytes = self.content_bytes;
         let mut batch = Vec::new();
         let mut bytes = 0usize;
+        let mut exhausted = false;
         let fault = store.take_row_fault();
         loop {
             if fault == Some(batch.len()) {
@@ -275,7 +282,10 @@ impl ArtifactReader<'_> {
             }
             let row = match rows.next() {
                 Ok(Some(row)) => row,
-                Ok(None) => break,
+                Ok(None) => {
+                    exhausted = batch.len() < MAX_ROW_BATCH_ROWS;
+                    break;
+                }
                 Err(error) => return classify_read(&error).and_then(|miss| self.fail(miss)),
             };
             // Borrow the values in place, so an oversized row is refused
@@ -334,6 +344,7 @@ impl ArtifactReader<'_> {
         self.hasher = hasher;
         self.next_ordinal = next_ordinal;
         self.content_bytes = content_bytes;
+        self.exhausted = exhausted;
         Ok(Lookup::Hit(Some(RowBatch {
             rows: batch,
             _scratch: scratch,

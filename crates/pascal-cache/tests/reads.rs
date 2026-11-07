@@ -310,6 +310,26 @@ fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
     );
 }
 
+/// 13f: a batch whose query ran out of rows read every row at or past its
+/// start, so it already showed there is none past the count: the reader
+/// verifies without another transaction. A full batch still asks.
+#[test]
+fn a_last_batch_that_ran_out_of_rows_needs_no_trailing_query() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    for (count, leases) in [(10, 1), (256, 2), (300, 2)] {
+        let header = publish(&store, &key(&format!("unit A{count};")), &small(count));
+        let before = pascal_cache::store_operations_on_this_thread_for_test();
+        let sizes = read_all(&store, &header).unwrap();
+        assert_eq!(sizes.iter().sum::<usize>(), count);
+        assert_eq!(
+            pascal_cache::store_operations_on_this_thread_for_test() - before,
+            leases,
+            "{count} rows"
+        );
+    }
+}
+
 fn publish_named(store: &Store, text: &str, names: &[&[u8]]) -> Digest {
     let key = key(text);
     let rows: Vec<ArtifactRow<'_>> = names

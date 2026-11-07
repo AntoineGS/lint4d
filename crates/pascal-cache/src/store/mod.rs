@@ -71,9 +71,16 @@ pub use testing::FaultPoint;
 #[cfg(feature = "test-support")]
 pub(crate) use testing::count_operation;
 #[cfg(feature = "test-support")]
-pub use testing::store_operations_for_test;
+pub(crate) use testing::count_record_open;
+#[cfg(feature = "test-support")]
+pub use testing::{
+    record_opens_on_this_thread_for_test, store_operations_for_test,
+    store_operations_on_this_thread_for_test,
+};
 #[cfg(not(feature = "test-support"))]
 pub(crate) fn count_operation() {}
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn count_record_open() {}
 pub use waits::{LOCK_WAIT_THRESHOLD, LockWaits, lock_waits};
 
 pub use budget::{

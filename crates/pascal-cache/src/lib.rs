@@ -86,8 +86,11 @@ pub use store::FaultPoint;
 #[cfg(feature = "test-support")]
 pub use store::INDEX_QUERY_FOR_TEST;
 #[cfg(feature = "test-support")]
-pub use store::store_operations_for_test;
-#[cfg(feature = "test-support")]
 pub use store::{HeldConnection, MaintenanceLockHold, ScratchHold};
 #[cfg(feature = "test-support")]
 pub use store::{IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY_FOR_TEST};
+#[cfg(feature = "test-support")]
+pub use store::{
+    record_opens_on_this_thread_for_test, store_operations_for_test,
+    store_operations_on_this_thread_for_test,
+};

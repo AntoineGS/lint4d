@@ -1005,6 +1005,9 @@ struct ReuseHit {
     evidence: Option<pascal_cache::Digest>,
     include_stamps: Vec<(PathBuf, PathStamp)>,
     root_hash: u64,
+    /// The held snapshot and the live record it listed for the member
+    /// (13f).
+    record: Option<(pascal_cache::SnapshotId, pascal_cache::Digest)>,
 }
 
 /// Bounded parallel validation of a reuse batch (R8-1): up to `threads`
@@ -2982,8 +2985,11 @@ impl Workspace {
 
     fn known_over_limit(&self, key: &ContextKey, path: &Path, hash: u64) -> bool {
         self.contexts.get(key).is_some_and(|state| {
-            self.project_cache
-                .over_limit(path, hash, CacheContextKey::new(&state.context).digest())
+            self.project_cache.over_limit(
+                path,
+                hash,
+                self.cache_context_key(&state.context).digest(),
+            )
         })
     }
 
@@ -2997,7 +3003,7 @@ impl Workspace {
             self.project_cache.note_over_limit(
                 path,
                 hash,
-                CacheContextKey::new(&state.context).digest(),
+                self.cache_context_key(&state.context).digest(),
             );
         }
         self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
@@ -3057,7 +3063,7 @@ impl Workspace {
             self.project_cache.set_index_record(
                 key,
                 proof,
-                CacheContextKey::new(&state.context).digest(),
+                self.cache_context_key(&state.context).digest(),
             )
         })
     }
@@ -3228,7 +3234,7 @@ impl Workspace {
         let Some(context) = self
             .contexts
             .get(&key)
-            .map(|state| CacheContextKey::new(&state.context).digest())
+            .map(|state| self.cache_context_key(&state.context).digest())
         else {
             return;
         };
@@ -3282,12 +3288,14 @@ impl Workspace {
     }
 
     /// Prove the record `inputs` derive for a member the index holds: found
-    /// live in the store, else published. Without a proof the member only
-    /// delays the context's snapshot.
+    /// live in the store (`live` when it is the held snapshot's record the
+    /// batch already opened), else published. Without a proof the member
+    /// only delays the context's snapshot.
     fn prove_member(
         &self,
         key: &ContextKey,
         inputs: &RecordInputs<'_>,
+        live: Option<pascal_cache::Digest>,
         cancel: &AtomicBool,
     ) -> bool {
         if !self.may_publish(key) {
@@ -3310,7 +3318,7 @@ impl Workspace {
         if stopped() {
             return false;
         }
-        let proof = match prove_existing(job.store(), &eligible) {
+        let proof = match prove_existing(job.store(), &eligible, live) {
             Ok(Some(proof)) => Ok(proof),
             Ok(None) if stopped() => return false,
             Ok(None) => publish_proven(job.store(), &eligible),
@@ -3349,6 +3357,7 @@ impl Workspace {
                 origin: state.context.source_origin(path),
                 unindexed: Some(unindexed),
             },
+            None,
             cancel,
         );
     }
@@ -3447,16 +3456,30 @@ impl Workspace {
         if cancel.load(Ordering::Relaxed) {
             return Validated::Outcome(ReuseOutcome::Cancelled);
         }
-        let (facts, reads, artifact, evidence, include_stamps, root_hash) = match result {
+        let (facts, reads, artifact, evidence, include_stamps, root_hash, record) = match result {
             Ok(Reuse::Hit {
                 facts,
+                via,
                 reads,
                 artifact,
                 evidence,
                 include_stamps,
                 root_hash,
-                ..
-            }) => (facts, reads, artifact, evidence, include_stamps, root_hash),
+            }) => {
+                let record = match via {
+                    super::persist::ReuseVia::Snapshot { record } => record,
+                    _ => None,
+                };
+                (
+                    facts,
+                    reads,
+                    artifact,
+                    evidence,
+                    include_stamps,
+                    root_hash,
+                    record,
+                )
+            }
             Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => {
                 return Validated::Outcome(ReuseOutcome::Retry);
             }
@@ -3484,6 +3507,7 @@ impl Workspace {
             evidence,
             include_stamps,
             root_hash,
+            record,
         })
     }
 
@@ -3504,6 +3528,7 @@ impl Workspace {
             evidence,
             include_stamps,
             root_hash,
+            record,
         } = hit;
         self.project_cache
             .add_index_validation_reads(key, u64::try_from(reads).unwrap_or(u64::MAX));
@@ -3513,6 +3538,15 @@ impl Workspace {
             self.project_cache
                 .publish_reused_index_member(key, path, member, stamps, root_hash)
         });
+        // The record proves the member only while the snapshot that
+        // listed it is still held (a dropped hint released its hold).
+        let live = record
+            .filter(|(snapshot, _)| {
+                self.project_cache
+                    .baseline_hint(key)
+                    .is_some_and(|hint| hint.held() && hint.header().id() == *snapshot)
+            })
+            .map(|(_, record)| record);
         let outcome = match published {
             PublishOutcome::Indexed => {
                 if let Some(state) = self.contexts.get(key) {
@@ -3527,6 +3561,7 @@ impl Workspace {
                                 origin: state.context.source_origin(path),
                                 unindexed: None,
                             },
+                            live,
                             cancel,
                         );
                     });
@@ -3617,7 +3652,7 @@ impl Workspace {
             && let Some(state) = self.contexts.get(&key)
             && self
                 .project_cache
-                .rekey_index_selection(&key, CacheContextKey::new(&state.context).digest())
+                .rekey_index_selection(&key, self.cache_context_key(&state.context).digest())
         {
             crate::trace::trace!("  index of {descriptor:?} moved to the current selection");
         }
@@ -12390,6 +12425,76 @@ end.
             #[test]
             fn an_unchanged_restart_parses_nothing() {
                 run(300, false);
+            }
+
+            /// 13f: on a restart through a held snapshot, each member's
+            /// record is opened once (the hint's lookup authorizes it, and
+            /// proves the identical rebuilt record), and the context's
+            /// store key is encoded once, not once per member.
+            #[test]
+            fn a_hinted_restart_opens_each_record_once() {
+                const UNITS: usize = 40;
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (session, key, anchor) = synthetic_project(root, UNITS);
+                let (mut first, cache) = scheduled_view(&session, store.path());
+                let mut totals = Totals::default();
+                batches(
+                    &mut first,
+                    &anchor,
+                    IndexBound::extraction(),
+                    None,
+                    &mut || Ok(()),
+                    &mut totals,
+                )
+                .unwrap();
+                assert_eq!(
+                    first.seal_baseline_if_due(&key, &mut || Ok(())),
+                    SealOutcome::Sealed
+                );
+                let expected = recorded(&first, &key);
+                cache.shutdown();
+                drop(first);
+
+                let (mut second, cache) =
+                    scheduled_view(&workspace(root, WorkspaceOptions::default()), store.path());
+                let cancel = AtomicBool::new(false);
+                second.index_context_for(&anchor, &cancel).unwrap();
+                second
+                    .ensure_index_membership(&key, &anchor, &cancel)
+                    .unwrap();
+                assert_eq!(second.adopt_baseline_hint(&key, &cancel), Some(()));
+                assert!(second.project_cache.baseline_hint(&key).unwrap().held());
+                let opens = pascal_cache::record_opens_on_this_thread_for_test();
+                let encodings = second.cache_context_key_encodings();
+                let mut two = Totals::default();
+                batches(
+                    &mut second,
+                    &anchor,
+                    IndexBound::reuse_pass(),
+                    None,
+                    &mut || Ok(()),
+                    &mut two,
+                )
+                .unwrap();
+                assert_eq!(two.reused, UNITS, "{two:?}");
+                assert_eq!(
+                    pascal_cache::record_opens_on_this_thread_for_test() - opens,
+                    UNITS as u64,
+                    "one record open per member"
+                );
+                assert_eq!(
+                    second.cache_context_key_encodings() - encodings,
+                    1,
+                    "the context's key is encoded once"
+                );
+                assert_eq!(recorded(&second, &key), expected);
+                assert_eq!(
+                    second.seal_baseline_if_due(&key, &mut || Ok(())),
+                    SealOutcome::Unchanged
+                );
+                cache.shutdown();
             }
 
             /// Release measurement (run explicitly, numbers go into the

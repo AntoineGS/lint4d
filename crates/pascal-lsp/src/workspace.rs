@@ -3314,6 +3314,8 @@ pub struct Workspace {
     /// Whether each context the crawl met came from saved project files.
     /// A job's input does not change, so one answer per context holds.
     crawl_disk_contexts: HashMap<ContextKey, bool>,
+    /// The store's key of the context last proven against (13f).
+    cache_context_key: persist::SharedContextKey,
     /// The units the crawl considered for publication.
     crawl_considered: HashSet<Url>,
     /// The store directory as `persistent_cache` gives it (l4d-vrw0).

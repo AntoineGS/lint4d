@@ -228,7 +228,11 @@ pub(crate) enum ReuseVia {
     Evidence,
     /// The record a held baseline snapshot lists for the member, its
     /// evidence (or local key) validated against current inputs (D31).
-    Snapshot,
+    /// `record` is that record, found live and authorized, and the
+    /// snapshot, when this process's lease held it (13f).
+    Snapshot {
+        record: Option<(pascal_cache::SnapshotId, Digest)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +314,54 @@ impl ContextKeyMemo {
     }
 }
 
+/// The store's key of the context a view last asked for, shared by its
+/// threads (13f): a context is immutable behind its `Arc`, so a batch
+/// encodes its key once, not once per member it proves. The context is
+/// held weakly, so the memo keeps no context alive; the held allocation
+/// keeps its address from being reused by another context.
+#[derive(Default)]
+pub(crate) struct SharedContextKey {
+    memo: std::sync::Mutex<Option<(std::sync::Weak<ProjectContext>, CacheContextKey)>>,
+    #[cfg(test)]
+    encodings: std::sync::atomic::AtomicUsize,
+}
+
+impl SharedContextKey {
+    pub(crate) fn key_of(&self, context: &Arc<ProjectContext>) -> CacheContextKey {
+        let mut memo = self
+            .memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held, key)) = memo.as_ref()
+            && std::ptr::eq(held.as_ptr(), Arc::as_ptr(context))
+        {
+            return key.clone();
+        }
+        #[cfg(test)]
+        self.encodings.fetch_add(1, Ordering::Relaxed);
+        let key = CacheContextKey::new(context);
+        *memo = Some((Arc::downgrade(context), key.clone()));
+        key
+    }
+
+    /// How many keys this memo encoded.
+    #[cfg(test)]
+    pub(crate) fn encodings(&self) -> usize {
+        self.encodings.load(Ordering::Relaxed)
+    }
+}
+
 impl Workspace {
+    /// The store's key of `context`, encoded once per installed context.
+    pub(crate) fn cache_context_key(&self, context: &Arc<ProjectContext>) -> CacheContextKey {
+        self.cache_context_key.key_of(context)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_context_key_encodings(&self) -> usize {
+        self.cache_context_key.encodings()
+    }
+
     /// The saved root bytes of `uri`, read under `context`'s current policy.
     pub(super) fn saved_root_bytes(
         &self,
@@ -432,7 +483,7 @@ impl Workspace {
         let observations = self
             .source_evidence(uri, cancel)
             .map_err(PersistError::Evidence)?;
-        let context = CacheContextKey::new(&state.context);
+        let context = self.cache_context_key(&state.context);
         let expanded = if source.extracted.provider_dependent {
             ExpandedArtifactKey::dependent_from_slots(
                 &local,
@@ -788,6 +839,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_shared_context_key_encodes_once_per_installed_context() {
+        let shared = SharedContextKey::default();
+        let one = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(shared.key_of(&one), CacheContextKey::new(&one));
+        assert_eq!(shared.encodings(), 1);
+        let other = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&other), CacheContextKey::new(&other));
+        assert_eq!(shared.encodings(), 2, "another installed context");
+        // The memo holds the context weakly: once dropped, a context
+        // installed later is encoded again, never given the old key.
+        drop(other);
+        let later = Arc::new(ProjectContext::default());
+        assert_eq!(shared.key_of(&later), CacheContextKey::new(&later));
+        assert_eq!(shared.encodings(), 3);
+    }
+
+    #[test]
     fn reuse_misses_map_to_their_diagnostic_causes() {
         use crate::persistent_cache::counters::MissCause::*;
         use pascal_cache::{Malformed, Mismatch, Miss};
@@ -856,7 +925,7 @@ pub(crate) mod tests {
             match expected_via {
                 ReuseVia::Local => assert_eq!(persisted, Persisted::Local(Published::Inserted)),
                 ReuseVia::Evidence => assert_eq!(persisted, Persisted::Expanded(inserted)),
-                ReuseVia::Snapshot => unreachable!("no snapshot is held"),
+                ReuseVia::Snapshot { .. } => unreachable!("no snapshot is held"),
             }
             let expected = indexed.facts(name).extracted.facts;
             drop(store);

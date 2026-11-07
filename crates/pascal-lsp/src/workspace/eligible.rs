@@ -249,7 +249,7 @@ impl Workspace {
                 (None, None, state.context.source_origin(&path))
             }
         };
-        let context = CacheContextKey::new(&state.context);
+        let context = self.cache_context_key(&state.context);
         let mut bindings = Vec::with_capacity(draft.bindings.len());
         let mut evidence = Vec::new();
         for (ordinal, checked) in draft.bindings.into_iter().enumerate() {
@@ -303,7 +303,7 @@ impl Workspace {
         record.validate().map_err(Ineligible::Record)?;
         Ok(Eligible {
             value: record,
-            context: CacheContextKey::new(&state.context),
+            context: self.cache_context_key(&state.context),
             evidence: Vec::new(),
         })
     }
@@ -367,7 +367,7 @@ impl Workspace {
         draft: SnapshotDraft,
     ) -> Result<Eligible<EligibleSnapshot>, Ineligible> {
         let state = self.contexts.get(context).ok_or(Ineligible::NoContext)?;
-        let cache_context = CacheContextKey::new(&state.context);
+        let cache_context = self.cache_context_key(&state.context);
         let mut membership = BTreeMap::new();
         for (uri, key) in &self.document_contexts {
             if key != context {
@@ -434,7 +434,7 @@ impl Workspace {
         discovery: (DiscoveryScope, CapturedEvidence),
     ) -> Result<Eligible<BaselineSnapshot>, Ineligible> {
         let records = self.baseline_records(key)?;
-        let cache_context = CacheContextKey::new(&self.contexts[key].context);
+        let cache_context = self.cache_context_key(&self.contexts[key].context);
         let (scope, captured) = discovery;
         let discovery = evidence_id(
             &subject(
@@ -646,24 +646,26 @@ pub(crate) fn publish_proven(
 }
 
 /// Prove without writing when the record is already live (a restart).
+/// `live` is a record this batch already found live and authorized for the
+/// member through the snapshot its lease holds (13f): when it is the
+/// record's ID, it is not opened a second time.
 pub(crate) fn prove_existing(
     store: &Store,
     record: &Eligible<MemberRecord>,
+    live: Option<Digest>,
 ) -> Result<Option<ProvenRecord>, Bypass> {
     let Ok(id) = record.value.id() else {
         return Ok(None);
     };
-    match store.open_member_record(id)? {
-        Lookup::Hit(_) => {
-            store.hint_used(Hint::Record(id));
-            Ok(Some(ProvenRecord {
-                record_id: id,
-                path: record.value.header.source.canonical.clone(),
-                context: record.context.digest(),
-            }))
-        }
-        Lookup::Miss(_) => Ok(None),
+    if live != Some(id) && matches!(store.open_member_record(id)?, Lookup::Miss(_)) {
+        return Ok(None);
     }
+    store.hint_used(Hint::Record(id));
+    Ok(Some(ProvenRecord {
+        record_id: id,
+        path: record.value.header.source.canonical.clone(),
+        context: record.context.digest(),
+    }))
 }
 
 /// Publish an eligible record: first the binding evidence it was checked
@@ -1593,15 +1595,33 @@ pub(in crate::workspace) mod tests {
         assert_eq!(rebuilt.value(), extracted.value());
         assert_eq!(rebuilt.value().id().unwrap(), proven.record_id());
         assert_eq!(
-            prove_existing(&store, &rebuilt).unwrap(),
+            prove_existing(&store, &rebuilt, None).unwrap(),
             Some(proven.clone())
         );
         let other = private_dir();
         let empty = open_store(other.path());
         assert_eq!(
-            prove_existing(&empty, &rebuilt).unwrap(),
+            prove_existing(&empty, &rebuilt, None).unwrap(),
             None,
             "a record the store does not hold is not proven"
+        );
+        // 13f: a live record the caller found is the proof only when it is
+        // the rebuilt record's ID; any other is opened as before.
+        let opens = pascal_cache::record_opens_on_this_thread_for_test();
+        assert_eq!(
+            prove_existing(&store, &rebuilt, Some(proven.record_id())).unwrap(),
+            Some(proven.clone())
+        );
+        assert_eq!(pascal_cache::record_opens_on_this_thread_for_test(), opens);
+        let other_id = Digest::from_bytes([7; 32]);
+        assert_eq!(
+            prove_existing(&empty, &rebuilt, Some(other_id)).unwrap(),
+            None,
+            "another live record proves nothing"
+        );
+        assert_eq!(
+            pascal_cache::record_opens_on_this_thread_for_test(),
+            opens + 1
         );
     }
 

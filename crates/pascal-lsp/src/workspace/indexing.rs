@@ -8410,6 +8410,23 @@ pub(in crate::workspace) mod tests {
                 "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal",
             ]
         );
+        // Every member spells `p`, so none is excluded lexically: within
+        // the bound the retrying members are read, and only the "retried
+        // later" line counts them.
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(5));
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(
+            source_names(&sources),
+            ["App.dpr", "U0.pas", "U1.pas", "U2.pas", "U3.pas"]
+        );
+        assert_eq!(
+            sources.gaps,
+            [
+                "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
+            ]
+        );
     }
 
     /// l4d-1nfk: a retrying member is an unverified member like any other,
@@ -8477,6 +8494,25 @@ pub(in crate::workspace) mod tests {
             .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
             .expect("indexed symbols");
         assert_eq!(source_names(&sources), ["U3.pas"]);
+
+        // Past the bound, a retrying member spelling the query is the
+        // "retried later" gap, never a silent drop.
+        named_unit(&root.join("lib/U2.pas"), "P1Two");
+        for name in ["U2.pas", "U3.pas"] {
+            retry(&mut workspace, name);
+        }
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(1));
+        let input = workspace.analysis_input();
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["U2.pas"]);
+        assert_eq!(
+            sources.gaps,
+            [
+                "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
+            ]
+        );
     }
 
     /// `P1` (its `U.pas` open) and `P2`, each with `U`, `V` and `W` naming

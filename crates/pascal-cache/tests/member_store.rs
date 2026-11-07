@@ -4,15 +4,17 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    NAMESPACE, artifact, binding_evidence, context, identity, member, open, raw, read_record,
+    NAMESPACE, ambiguous, artifact, binding_evidence, context, identity, member, open, raw,
+    read_record,
 };
 use pascal_cache::{
     Binding, BindingKind, BindingOutcome, Bypass, Digest, DiscoveryInputs, DiscoveryScope,
     EvidenceTarget, EvidenceWrite, IncompleteReason, Integrity, Lookup, MAX_MEMBER_BINDINGS,
     MAX_ROW_BATCH_BYTES, Malformed, MemberError, MemberHeader, MemberRecord, Miss, Namespace,
-    Published, PublishedRecord, Store, StoreLimits, TooLarge,
+    Published, PublishedRecord, Store, StoreLimits, TooLarge, path_key,
 };
 use rusqlite::Connection;
+use std::path::Path;
 
 #[test]
 fn a_member_record_publishes_once_and_reads_back_verified() {
@@ -470,4 +472,131 @@ fn an_identical_republish_takes_the_next_sequence() {
         Published::AlreadyPresent
     );
     assert!(sequence() > first, "the republish committed its recency");
+}
+
+fn target_rows(directory: &Path, record: Digest) -> Vec<(i64, Vec<u8>, i64)> {
+    let connection = raw(directory);
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, target_key, dependency FROM binding_targets \
+             WHERE record_id = ?1 ORDER BY ordinal, target_key",
+        )
+        .unwrap();
+    statement
+        .query_map([record.as_bytes().as_slice()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn every_binding_kind_derives_its_reverse_dependency_rows() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/T.pas");
+    let precise = store
+        .publish_member_record(&member("/w/P.pas", &["/w/T.pas"], evidence))
+        .unwrap()
+        .record_id;
+    let ambiguous_id = store
+        .publish_member_record(&ambiguous(
+            "/w/A.pas",
+            &["/w/x/T.pas", "/w/y/T.pas"],
+            false,
+            evidence,
+        ))
+        .unwrap()
+        .record_id;
+    let overflowed = {
+        let many: Vec<String> = (0..16).map(|i| format!("/w/d{i}/T.pas")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        store
+            .publish_member_record(&ambiguous("/w/O.pas", &many, true, evidence))
+            .unwrap()
+            .record_id
+    };
+    let mut incomplete = member("/w/I.pas", &[], evidence);
+    for occurrence in 0..3 {
+        incomplete.bindings.push(Binding {
+            kind: BindingKind::Import,
+            occurrence,
+            outcome: BindingOutcome::Incomplete(IncompleteReason::Unsupported),
+            evidence: None,
+        });
+    }
+    let incomplete = store.publish_member_record(&incomplete).unwrap().record_id;
+    // What `.8` publishes for every import (D36).
+    let mut not_recorded = member("/w/R.pas", &[], evidence);
+    not_recorded.bindings.push(Binding {
+        kind: BindingKind::Import,
+        occurrence: 0,
+        outcome: BindingOutcome::Incomplete(IncompleteReason::NotRecorded),
+        evidence: None,
+    });
+    let not_recorded = store
+        .publish_member_record(&not_recorded)
+        .unwrap()
+        .record_id;
+    let mut unavailable = member("/w/U.pas", &[], evidence);
+    unavailable.bindings.push(Binding {
+        kind: BindingKind::Import,
+        occurrence: 0,
+        outcome: BindingOutcome::Unavailable,
+        evidence: Some(evidence),
+    });
+    let unavailable = store.publish_member_record(&unavailable).unwrap().record_id;
+
+    assert_eq!(
+        target_rows(directory.path(), precise),
+        [(0, path_key(Path::new("/w/T.pas")), 1)]
+    );
+    assert_eq!(
+        target_rows(directory.path(), ambiguous_id),
+        [
+            (0, path_key(Path::new("/w/x/T.pas")), 2),
+            (0, path_key(Path::new("/w/y/T.pas")), 2),
+        ]
+    );
+    let rows = target_rows(directory.path(), overflowed);
+    assert_eq!(rows.iter().filter(|row| row.2 == 2).count(), 16);
+    assert_eq!(
+        rows.iter().filter(|row| row.2 == 3).collect::<Vec<_>>(),
+        [&(0, Vec::new(), 3)]
+    );
+    assert_eq!(
+        target_rows(directory.path(), incomplete),
+        [(0, Vec::new(), 3)],
+        "one per record"
+    );
+    assert_eq!(
+        target_rows(directory.path(), not_recorded),
+        [(0, Vec::new(), 3)],
+        "D36"
+    );
+    assert!(
+        target_rows(directory.path(), unavailable).is_empty(),
+        "R9-2"
+    );
+}
+
+#[test]
+fn a_republished_record_with_missing_target_rows_is_an_integrity_failure() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/T.pas");
+    let record = member("/w/P.pas", &["/w/T.pas"], evidence);
+    let id = store.publish_member_record(&record).unwrap().record_id;
+    raw(directory.path())
+        .execute(
+            "DELETE FROM binding_targets WHERE record_id = ?1",
+            [id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.publish_member_record(&record),
+        Err(Bypass::Integrity(Integrity::ConflictingRecord)),
+        "never accepted as a duplicate"
+    );
 }

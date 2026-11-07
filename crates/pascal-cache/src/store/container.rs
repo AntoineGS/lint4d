@@ -224,9 +224,21 @@ CREATE TABLE member_bindings (
     CHECK ((outcome = 1) = (target_key IS NOT NULL))
 ) STRICT;
 
-CREATE INDEX member_bindings_by_target
-    ON member_bindings (namespace_id, reset_epoch, target_key, record_id, ordinal)
-    WHERE target_key IS NOT NULL;
+CREATE TABLE binding_targets (
+    namespace_id BLOB NOT NULL,
+    reset_epoch INTEGER NOT NULL,
+    record_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    target_key BLOB NOT NULL CHECK (length(target_key) <= 4096),
+    dependency INTEGER NOT NULL CHECK (dependency IN (1, 2, 3)),
+    PRIMARY KEY (namespace_id, reset_epoch, record_id, ordinal, target_key),
+    FOREIGN KEY (namespace_id, reset_epoch, record_id, ordinal)
+        REFERENCES member_bindings (namespace_id, reset_epoch, record_id, ordinal),
+    CHECK ((dependency = 3) = (length(target_key) = 0))
+) STRICT;
+
+CREATE INDEX binding_targets_by_target
+    ON binding_targets (namespace_id, reset_epoch, target_key, record_id, ordinal);
 
 CREATE INDEX member_bindings_by_evidence
     ON member_bindings (namespace_id, reset_epoch, evidence_id, record_id)
@@ -538,6 +550,7 @@ mod tests {
             [
                 "artifact_rows",
                 "artifacts",
+                "binding_targets",
                 "evidence_observations",
                 "evidence_sets",
                 "key_manifests",

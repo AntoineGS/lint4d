@@ -32,15 +32,17 @@ pub const MEMBER_QUERY: &str = "SELECT m.ordinal, length(m.record_id), m.record_
      AND r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.record_id = m.record_id \
      AND r.lifecycle = ?5";
 
-/// Precise bindings to a target key whose record is a member of one
-/// snapshot (checked sealed by the caller), keyset-paginated over
+/// Precise bindings (`binding_targets.dependency = 1`) to a target key
+/// whose record is a member of one snapshot (checked sealed by the
+/// caller), keyset-paginated over
 /// `(record_id, ordinal)`. Retired records are excluded, as `read_snapshot`
 /// treats them as a miss. The record ID's length comes first, as in
 /// `MEMBER_QUERY`. `CROSS JOIN` pins the order:
-/// `member_bindings_by_target` drives and serves the sort.
+/// `binding_targets_by_target` drives and serves the sort.
 pub const IMPORTERS_QUERY: &str = "SELECT length(b.record_id), b.record_id, b.ordinal, m.ordinal \
-     FROM member_bindings b CROSS JOIN snapshot_members m CROSS JOIN member_records r \
+     FROM binding_targets b CROSS JOIN snapshot_members m CROSS JOIN member_records r \
      WHERE b.namespace_id = ?1 AND b.reset_epoch = ?2 AND b.target_key = ?4 \
+     AND b.dependency = 1 \
      AND (b.record_id, b.ordinal) > (?5, ?6) \
      AND m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.record_id = b.record_id \
      AND m.snapshot_id = ?3 \

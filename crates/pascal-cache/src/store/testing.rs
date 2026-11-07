@@ -118,7 +118,7 @@ impl Store {
         // `(label, rows, columns)`: rows keyed by a surrogate show the
         // identity it stands for, and the surrogates themselves, which
         // depend on publication order, are left out.
-        const TABLES: [(&str, &str, &[&str]); 7] = [
+        const TABLES: [(&str, &str, &[&str]); 8] = [
             (
                 "key_manifests",
                 "key_manifests",
@@ -201,6 +201,11 @@ impl Store {
                     "evidence_id",
                     "payload",
                 ],
+            ),
+            (
+                "binding_targets",
+                "binding_targets",
+                &["record_id", "ordinal", "target_key", "dependency"],
             ),
         ];
         let reader = self.reader()?;

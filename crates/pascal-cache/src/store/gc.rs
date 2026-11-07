@@ -271,7 +271,7 @@ macro_rules! unlisted_by {
 /// publisher finds or inserts content and lists it in one write
 /// transaction, and the sweep runs in another, so content is never deleted
 /// while a committed or committing set lists it.
-pub(crate) const DELETE_STEPS: [&str; 11] = [
+pub(crate) const DELETE_STEPS: [&str; 12] = [
     children_of_retired!("lease_holds", "snapshots", "state = 3", "snapshot_id"),
     children_of_retired!("snapshot_members", "snapshots", "state = 3", "snapshot_id"),
     concat!(
@@ -282,6 +282,12 @@ pub(crate) const DELETE_STEPS: [&str; 11] = [
         " LIMIT ?3)"
     ),
     children_of_retired!(
+        "binding_targets",
+        "member_records",
+        "lifecycle = 2",
+        "record_id"
+    ),
+    children_of_retired!(
         "member_bindings",
         "member_records",
         "lifecycle = 2",
@@ -290,6 +296,7 @@ pub(crate) const DELETE_STEPS: [&str; 11] = [
     concat!(
         "DELETE FROM member_records WHERE rowid IN (SELECT p.rowid FROM member_records p \
          WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
+        unnamed_by!("binding_targets", "record_id", "record_id"),
         unnamed_by!("member_bindings", "record_id", "record_id"),
         unnamed_by!("snapshot_members", "record_id", "record_id"),
         " LIMIT ?3)"
@@ -549,7 +556,7 @@ mod tests {
         )
         .unwrap();
         let writer = store.writer().unwrap();
-        let expected: [(&str, &[&str]); 16] = [
+        let expected: [(&str, &[&str]); 17] = [
             (DELETE_STEPS[0], &["snapshot_id=?", "state=?"]),
             (DELETE_STEPS[1], &["snapshot_id=?", "state=?"]),
             (
@@ -557,13 +564,14 @@ mod tests {
                 &["snapshot_id=?", "snapshot_id=?", "state=?"],
             ),
             (DELETE_STEPS[3], &["lifecycle=?", "record_id=?"]),
+            (DELETE_STEPS[4], &["lifecycle=?", "record_id=?"]),
             (
-                DELETE_STEPS[4],
-                &["lifecycle=?", "record_id=?", "record_id=?"],
+                DELETE_STEPS[5],
+                &["lifecycle=?", "record_id=?", "record_id=?", "record_id=?"],
             ),
-            (DELETE_STEPS[5], &["evidence_ref=?", "lifecycle=?"]),
+            (DELETE_STEPS[6], &["evidence_ref=?", "lifecycle=?"]),
             (
-                DELETE_STEPS[6],
+                DELETE_STEPS[7],
                 &[
                     "discovery_evidence=?",
                     "evidence_id=?",
@@ -573,10 +581,10 @@ mod tests {
                 ],
             ),
             // Unlisted content is found by visiting the scope's content.
-            (DELETE_STEPS[7], &["observation=?", "reset_epoch=?"]),
-            (DELETE_STEPS[8], &["artifact_ref=?", "lifecycle=?"]),
+            (DELETE_STEPS[8], &["observation=?", "reset_epoch=?"]),
+            (DELETE_STEPS[9], &["artifact_ref=?", "lifecycle=?"]),
             (
-                DELETE_STEPS[9],
+                DELETE_STEPS[10],
                 &[
                     "artifact_id=?",
                     "artifact_id=?",
@@ -586,7 +594,7 @@ mod tests {
             ),
             // Orphan manifests are found by visiting the scope's manifests.
             (
-                DELETE_STEPS[10],
+                DELETE_STEPS[11],
                 &[
                     "artifact_id=?",
                     "context_key=?",

@@ -787,6 +787,7 @@ fn table_rows(directory: &Path) -> i64 {
     [
         "snapshot_members",
         "snapshots",
+        "binding_targets",
         "member_bindings",
         "member_records",
         "evidence_observations",
@@ -833,6 +834,11 @@ fn retired_rows_inside_the_live_scope_are_deleted_children_first_in_bounded_batc
         }
         assert!(passes < 200, "deletion must progress");
     }
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM binding_targets"),
+        0,
+        "targets go before their bindings"
+    );
     assert_eq!(table_rows(root.path()), 0, "everything was unreferenced");
     assert_eq!(store.check_scope(), Ok(()), "the live scope itself stays");
     assert_eq!(
@@ -1081,6 +1087,15 @@ fn reclaim_writes_nothing_at_the_wal_threshold() {
     let root = private_tempdir();
     let store = open(root.path());
     artifact(&store, "unit Stray;");
+    let stray_evidence = binding_evidence(&store, "t", "/w/T.pas");
+    store
+        .publish_member_record(&member("/w/Stray.pas", &["/w/T.pas"], stray_evidence))
+        .unwrap();
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM binding_targets"),
+        1,
+        "the retired scope has a reverse-dependency row"
+    );
     age_past_grace(&store);
     assert_eq!(store.retire_step(RetireStep::Artifacts, &EAGER), Ok(1));
     store
@@ -1145,6 +1160,11 @@ fn a_fenced_handle_still_reclaims_whole_retired_scopes() {
     assert_eq!(store.check_scope(), Err(Bypass::Fenced));
     while !store.reclaim(256).unwrap().complete {}
     assert_eq!(table_rows(root.path()), other_rows);
+    assert_eq!(
+        count(root.path(), "SELECT count(*) FROM binding_targets"),
+        0,
+        "reclaimed with its scope"
+    );
     assert_eq!(count(root.path(), "SELECT count(*) FROM retired_scopes"), 0);
     assert_eq!((scope_rows(NAMESPACE), scope_rows(6)), (0, 1));
 }

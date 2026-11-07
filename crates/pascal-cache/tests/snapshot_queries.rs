@@ -457,8 +457,8 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
             .lines()
             .next()
             .is_some_and(|step| step.starts_with("SEARCH b ")
-                && step.contains("INDEX member_bindings_by_target ")),
-        "member_bindings drives through its target index: {importers}"
+                && step.contains("INDEX binding_targets_by_target ")),
+        "binding_targets drives through its target index: {importers}"
     );
     assert!(!importers.contains("SCAN"), "{importers}");
     assert!(!importers.contains("TEMP B-TREE"), "{importers}");
@@ -581,7 +581,12 @@ fn an_over_long_stored_record_id_is_a_malformed_snapshot() {
         .pragma_update(None, "ignore_check_constraints", "ON")
         .unwrap();
     let long = vec![7u8; 5000];
-    for table in ["member_records", "member_bindings", "snapshot_members"] {
+    for table in [
+        "member_records",
+        "member_bindings",
+        "binding_targets",
+        "snapshot_members",
+    ] {
         connection
             .execute(
                 &format!("UPDATE {table} SET record_id = ?1 WHERE record_id = ?2"),

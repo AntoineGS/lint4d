@@ -19,8 +19,8 @@ use super::stream::{Expected, ManifestReader, RowError, RowSource};
 use crate::evidence::path_key;
 use crate::record::RecordHasher;
 use crate::{
-    Binding, Digest, EvidencePurpose, MemberError, MemberHeader, MemberRecord, decode_binding,
-    decode_member_header,
+    Binding, BindingOutcome, Digest, EvidencePurpose, MemberError, MemberHeader, MemberRecord,
+    decode_binding, decode_member_header,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -37,6 +37,60 @@ struct EncodedBinding {
     target_key: Option<Vec<u8>>,
     evidence: Option<Digest>,
     payload: Vec<u8>,
+}
+
+/// The `binding_targets` key of a record that depends on every file (an
+/// incomplete or overflowed binding). No path key is empty.
+pub(crate) const UNBOUNDED_TARGET_KEY: &[u8] = b"";
+
+const PRECISE_DEPENDENCY: i64 = 1;
+const AMBIGUOUS_DEPENDENCY: i64 = 2;
+const UNBOUNDED_DEPENDENCY: i64 = 3;
+
+/// One derived reverse-dependency row: what a binding's outcome makes its
+/// record depend on. `Unavailable` bindings depend on nothing (R9-2).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TargetRow {
+    ordinal: i64,
+    key: Vec<u8>,
+    dependency: i64,
+}
+
+fn derive_targets(record: &MemberRecord) -> Vec<TargetRow> {
+    let mut rows = BTreeSet::new();
+    let mut unbounded = false;
+    for (ordinal, binding) in record.bindings.iter().enumerate() {
+        let ordinal = ordinal as i64;
+        let mut row = |key: Vec<u8>, dependency| {
+            rows.insert(TargetRow {
+                ordinal,
+                key,
+                dependency,
+            });
+        };
+        let mut needs_unbounded = false;
+        match &binding.outcome {
+            BindingOutcome::Precise { target } => {
+                row(path_key(&target.canonical), PRECISE_DEPENDENCY);
+            }
+            BindingOutcome::Ambiguous {
+                candidates,
+                overflow,
+            } => {
+                for candidate in candidates {
+                    row(path_key(&candidate.canonical), AMBIGUOUS_DEPENDENCY);
+                }
+                needs_unbounded = *overflow;
+            }
+            BindingOutcome::Incomplete(_) => needs_unbounded = true,
+            BindingOutcome::Unavailable => {}
+        }
+        if needs_unbounded && !unbounded {
+            unbounded = true;
+            row(UNBOUNDED_TARGET_KEY.to_vec(), UNBOUNDED_DEPENDENCY);
+        }
+    }
+    rows.into_iter().collect()
 }
 
 struct EncodedRecord {
@@ -231,6 +285,7 @@ fn insert_record(
     scope: Scope,
     encoded: &EncodedRecord,
     expected: &StoredRecord,
+    targets: &[TargetRow],
     sequence: i64,
 ) -> Result<(), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
@@ -276,6 +331,24 @@ fn insert_record(
                 binding.target_key,
                 digest_column(binding.evidence),
                 binding.payload
+            ])
+            .map_err(fail)?;
+    }
+    let mut insert = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO binding_targets (namespace_id, reset_epoch, record_id, \
+             ordinal, target_key, dependency) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(fail)?;
+    for target in targets {
+        insert
+            .execute(params![
+                namespace,
+                reset_epoch,
+                id,
+                target.ordinal,
+                target.key,
+                target.dependency
             ])
             .map_err(fail)?;
     }
@@ -335,6 +408,7 @@ impl Store {
                 (encoded.header.len() + encoded.source_key.len()) as u64 + encoded.content_bytes,
             );
             let expected = expected_row(record, &encoded);
+            let targets = derive_targets(record);
             let fail = |error: rusqlite::Error| classify(&error);
             let mut writer = self.writer()?;
             let transaction = begin(&mut writer, TransactionBehavior::Immediate)?;
@@ -344,7 +418,9 @@ impl Store {
                 WriteEstimate {
                     bytes: (encoded.header.len() + encoded.source_key.len()) as u64
                         + encoded.content_bytes,
-                    rows: (encoded.bindings.len() as u64).saturating_add(1),
+                    rows: (encoded.bindings.len() as u64)
+                        .saturating_add(targets.len() as u64)
+                        .saturating_add(1),
                 },
             )?;
             if let Some(artifact) = record.header.artifact {
@@ -382,7 +458,24 @@ impl Store {
                     // Only the record row is compared: the ID is the digest of the
                     // header and every binding, so the same ID means the same
                     // bindings, and stored rows that disagree fail every read.
+                    // The derived target rows have no checksum, so their count
+                    // is checked: a missing row is never proof of absence.
                     Some(stored) if stored == expected => {
+                        let stored_targets: i64 = transaction
+                            .query_row(
+                                "SELECT count(*) FROM binding_targets WHERE namespace_id = ?1 \
+                                 AND reset_epoch = ?2 AND record_id = ?3",
+                                params![
+                                    self.scope.namespace.as_bytes().as_slice(),
+                                    epoch(self.scope),
+                                    encoded.id.as_bytes().as_slice()
+                                ],
+                                |row| row.get(0),
+                            )
+                            .map_err(fail)?;
+                        if stored_targets != targets.len() as i64 {
+                            return Err(Bypass::Integrity(Integrity::ConflictingRecord));
+                        }
                         transaction
                             .execute(
                                 "UPDATE member_records SET publication_seq = ?4 \
@@ -399,7 +492,14 @@ impl Store {
                     }
                     Some(_) => return Err(Bypass::Integrity(Integrity::ConflictingRecord)),
                     None => {
-                        insert_record(&transaction, self.scope, &encoded, &expected, sequence)?;
+                        insert_record(
+                            &transaction,
+                            self.scope,
+                            &encoded,
+                            &expected,
+                            &targets,
+                            sequence,
+                        )?;
                         Published::Inserted
                     }
                 };

@@ -504,6 +504,10 @@ pub(crate) struct IndexProgress {
     /// disk budget, free space), to prove once the store has room; they
     /// hold `complete` back.
     pub(crate) awaiting_room: usize,
+    /// Members over `WORKER_MEMBER_BYTES` that the parallel workers left to
+    /// the batch's thread to extract (13d-2), and their source bytes.
+    pub(crate) left_large: usize,
+    pub(crate) left_large_bytes: u64,
 }
 
 impl IndexProgress {
@@ -532,6 +536,8 @@ impl IndexProgress {
             retrying: 0,
             retries_attempted: 0,
             awaiting_room: 0,
+            left_large: 0,
+            left_large_bytes: 0,
         }
     }
 
@@ -2293,6 +2299,20 @@ impl Workspace {
             {
                 pipeline.note_applied();
             }
+            // A member the worker left for its size (13d-2), noted before
+            // the epoch check may drop the worker's results.
+            let left_large = stamp.as_ref().map(|stamp| stamp.bytes).filter(|bytes| {
+                *bytes > WORKER_MEMBER_BYTES
+                    && extracted.is_none()
+                    && matches!(
+                        reuse.as_deref(),
+                        Some(Validated::Outcome(
+                            ReuseOutcome::Missed { .. }
+                                | ReuseOutcome::Retry
+                                | ReuseOutcome::NoStore
+                        ))
+                    )
+            });
             tried.insert(path_key(path));
             #[cfg(test)]
             run_hook(&BEFORE_APPLY, path);
@@ -2366,6 +2386,10 @@ impl Workspace {
                 // Proven again by the batch (M2), or a member the worker
                 // left to it.
                 None => {
+                    if let Some(bytes) = left_large {
+                        progress.left_large += 1;
+                        progress.left_large_bytes += bytes;
+                    }
                     self.member_deadline = Some(member_deadline(path));
                     let indexed = self.index_member(key, path, own_stamp, cancel);
                     self.member_deadline = None;
@@ -10668,16 +10692,37 @@ pub(in crate::workspace) mod tests {
                             let name = std::thread::current().name().map(str::to_owned);
                             seen.lock().unwrap().push((path.to_path_buf(), name));
                         })));
-                        let (sums, _) = extract_all(&mut view, &anchor, threads);
+                        let mut sums = Sums::default();
+                        let mut left = (0, 0);
+                        loop {
+                            let progress = extraction_batch(
+                                &mut view,
+                                &anchor,
+                                IndexBound::units(8),
+                                threads,
+                                &|| true,
+                                &AtomicBool::new(false),
+                            )
+                            .expect("batch");
+                            sums.add(&progress);
+                            left.0 += progress.left_large;
+                            left.1 += progress.left_large_bytes;
+                            if progress.complete {
+                                break;
+                            }
+                        }
                         set_worker_extract_hook(None);
                         let outcome = (sums, snapshot(&view, &key), store_content(&cache));
                         cache.shutdown();
                         let seen = std::mem::take(&mut *threads_seen.lock().unwrap());
-                        (outcome, seen)
+                        (outcome, seen, left)
                     };
                     let stores = [private_dir(), private_dir()];
-                    let (serial, _) = run(1, stores[0].path());
-                    let (parallel, seen) = run(3, stores[1].path());
+                    let (serial, _, serial_left) = run(1, stores[0].path());
+                    let (parallel, seen, left) = run(3, stores[1].path());
+                    // Counted where a worker left it, never by the serial loop.
+                    assert_eq!(serial_left, (0, 0));
+                    assert_eq!(left, (1, std::fs::metadata(&large).unwrap().len()));
                     let this = std::thread::current().name().map(str::to_owned);
                     let on = |path: &Path| {
                         seen.iter()

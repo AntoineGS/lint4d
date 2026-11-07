@@ -1610,7 +1610,7 @@ fn run_index_job(
     match result {
         Ok(progress) => {
             crate::trace::trace!(
-                "index batch {anchor:?} mode={mode:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} reused={} reuse_pending={} persisted={} complete={} memory={} elapsed_ms={:.1} reserved_index_bytes={}",
+                "index batch {anchor:?} mode={mode:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} reused={} reuse_pending={} persisted={} complete={} memory={} left_large={} left_large_bytes={} elapsed_ms={:.1} reserved_index_bytes={}",
                 progress.indexed,
                 progress.refreshed,
                 progress.refused,
@@ -1623,6 +1623,8 @@ fn run_index_job(
                 progress.persisted,
                 progress.complete,
                 progress.memory,
+                progress.left_large,
+                progress.left_large_bytes,
                 started.elapsed().as_secs_f64() * 1000.0,
                 workspace.project_cache().stats().reserved_index_bytes,
             );

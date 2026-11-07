@@ -53,6 +53,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // Counted as a new block before the old one is freed, as a moving
+        // realloc holds both: the peak may read one block's size high even
+        // when the allocator grows the block in place.
         grow(size);
         shrink(layout.size());
         unsafe { System.realloc(ptr, layout, size) }

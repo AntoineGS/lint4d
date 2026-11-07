@@ -12,7 +12,7 @@ use super::evidence::EvidenceGap;
 use super::indexing::{ReusePhase, timed};
 use super::persist::{PersistError, Reuse, ReuseMiss, ReuseVia, admitted, decoded};
 use super::validate::{CurrentInputs, EvidenceCheck, Validator, validate_evidence};
-use super::{ContextKey, PathStamp, Workspace};
+use super::{ContextKey, ContextState, PathStamp, Workspace};
 use crate::catalogue::CatalogueKey;
 use crate::persistent_cache::CacheJob;
 use crate::project_cache::ReservationKind;
@@ -541,7 +541,7 @@ impl Workspace {
             .context
             .project_file()
             .map_or_else(String::new, |path| path.display().to_string());
-        let (adoption, reason) = self.adopt_candidate(key, cancel);
+        let (adoption, reason) = self.adopt_candidate(key, state, cancel);
         // Every outcome is traced: a skipped candidate leaves no other sign.
         crate::trace::trace!(
             "  baseline adoption {project}: {} ({reason})",
@@ -555,8 +555,12 @@ impl Workspace {
     }
 
     /// The adoption and why: the last candidate's reason for a skip.
-    fn adopt_candidate(&self, key: &ContextKey, cancel: &AtomicBool) -> (Adoption, &'static str) {
-        let state = &self.contexts[key];
+    fn adopt_candidate(
+        &self,
+        key: &ContextKey,
+        state: &ContextState,
+        cancel: &AtomicBool,
+    ) -> (Adoption, &'static str) {
         let Ok(directories) = self.membership_directories(key) else {
             return (Adoption::None, "no membership directories");
         };
@@ -630,8 +634,12 @@ impl Workspace {
             }
             match validate_evidence(store, &evidence, &mut validator) {
                 Ok(EvidenceCheck::Holds) => {}
-                Ok(EvidenceCheck::Stale(_) | EvidenceCheck::Store(_)) => {
+                Ok(EvidenceCheck::Stale(_)) => {
                     reason = "stale evidence";
+                    continue;
+                }
+                Ok(EvidenceCheck::Store(_)) => {
+                    reason = "evidence unreadable";
                     continue;
                 }
                 Ok(EvidenceCheck::Unproven(_)) => return (Adoption::Retry, "unproven evidence"),

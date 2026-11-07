@@ -17,8 +17,9 @@ fn usage_error(error: impl std::fmt::Display) -> ! {
 
 fn main() {
     // Before any thread exists: two glibc arenas instead of up to eight per
-    // core (post-crawl high water mark 7.0 -> 5.4 GiB on an 8,670-member
-    // project); an explicit MALLOC_ARENA_MAX wins.
+    // core (post-crawl high water mark 7,017 -> 5,412 MiB on an 8,670-member
+    // project, measured with MALLOC_ARENA_MAX=2); an explicit
+    // MALLOC_ARENA_MAX wins.
     pascal_lsp::allocator::limit_malloc_arenas();
     let arguments: Vec<String> = env::args_os()
         .skip(1)

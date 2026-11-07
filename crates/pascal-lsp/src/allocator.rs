@@ -5,10 +5,10 @@
 //! what a thread freed in its arena. Each parallel index batch runs its
 //! extraction on new scoped threads, so a long indexing run spreads its
 //! working set over dozens of arenas that stay resident. Two arenas bound
-//! that: on a 8,670-member project with persistence on, the post-crawl high
-//! water mark fell from 7.0 to 5.4 GiB at equal progress (below the
-//! persistence-off run), at a 5-10 % cost in extraction throughput
-//! (l4d-zf1b.8, root-cause pass 3).
+//! that: on an 8,670-member project with persistence on, the post-crawl
+//! high water mark fell from 7,017 to 5,412 MiB at equal progress (measured
+//! with `MALLOC_ARENA_MAX=2`), below the persistence-off run, at a 5-10 %
+//! cost in extraction throughput (l4d-zf1b.8, root-cause pass 3).
 
 use std::ffi::OsString;
 

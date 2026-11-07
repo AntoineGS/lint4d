@@ -36,16 +36,32 @@ pub fn arena_limit(lookup: impl Fn(&str) -> Option<OsString>) -> Option<i32> {
     Some(ARENA_MAX)
 }
 
-/// Applies [`arena_limit`] for this process's environment. Call it before
-/// any thread starts.
+/// Applies [`arena_limit`] for this process's environment and traces the
+/// decision (`PASCAL_LSP_TRACE` only: stdout is the LSP channel). Call it
+/// first: arenas that threads already created are not given back.
 pub fn limit_malloc_arenas() {
+    let limit = arena_limit(|name| std::env::var_os(name));
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if let Some(arenas) = arena_limit(|name| std::env::var_os(name)) {
-        // SAFETY: `mallopt` only changes the allocator's tuning; it is
-        // called before the process starts other threads.
+    if let Some(arenas) = limit {
+        // SAFETY: glibc's `mallopt` takes the allocator's own lock, so it
+        // is sound from any thread at any time; it only changes tuning.
+        // Calling it before other threads start is what makes it
+        // effective, not what makes it safe.
         unsafe {
             libc::mallopt(libc::M_ARENA_MAX, arenas);
         }
+    }
+    crate::trace::trace!("{}", arena_decision(limit));
+}
+
+/// The startup trace line for an [`arena_limit`] outcome.
+fn arena_decision(limit: Option<i32>) -> String {
+    match limit {
+        Some(arenas) => format!("malloc arenas: {arenas}"),
+        None if cfg!(all(target_os = "linux", target_env = "gnu")) => {
+            "malloc arenas: skipped: MALLOC_ARENA_MAX or glibc.malloc.arena_max set".to_owned()
+        }
+        None => "malloc arenas: skipped: not glibc".to_owned(),
     }
 }
 
@@ -92,5 +108,12 @@ mod tests {
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     fn other_allocators_are_left_alone() {
         assert_eq!(arena_limit(environment(&[])), None);
+    }
+
+    #[test]
+    fn the_trace_line_names_the_decision() {
+        assert_eq!(arena_decision(Some(2)), "malloc arenas: 2");
+        let skipped = arena_decision(None);
+        assert!(skipped.starts_with("malloc arenas: skipped: "), "{skipped}");
     }
 }

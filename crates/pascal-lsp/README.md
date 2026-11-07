@@ -1693,6 +1693,8 @@ from 7,017 to 5,412 MiB at equal progress (measured with
 extraction throughput. An explicit `MALLOC_ARENA_MAX`, or a
 `glibc.malloc.arena_max` entry in `GLIBC_TUNABLES`, wins: the server then
 leaves the setting alone. Other allocators and platforms are not changed.
+With `PASCAL_LSP_TRACE` set to a file, a startup line records the decision
+(`malloc arenas: 2`, or `malloc arenas: skipped: ...` with the reason).
 
 ## Symbols, References and Highlights
 

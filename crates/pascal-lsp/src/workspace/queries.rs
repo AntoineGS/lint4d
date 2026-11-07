@@ -4848,6 +4848,205 @@ mod tests {
         }
     }
 
+    /// `limited_view` whose `retrying` members retry a previous refusal.
+    fn retrying_view(
+        workspace: &Workspace,
+        root: &Path,
+        store: Option<&Path>,
+        retrying: &[&str],
+        open: &[&str],
+    ) -> (Workspace, Option<crate::persistent_cache::PersistentCache>) {
+        let (mut view, cache) = limited_view(workspace, root, store, &[], open);
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let key = view
+            .index_context_for(&anchor, &AtomicBool::new(false))
+            .expect("context");
+        for name in retrying {
+            let path = root.join(name);
+            view.project_cache.mark_index_stale(&key, &path);
+            view.project_cache.defer_index_member(
+                &key,
+                &path,
+                crate::workspace_index::RETRYING_REFUSAL,
+            );
+        }
+        (view, cache)
+    }
+
+    const GUARDED: &str = "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n";
+
+    /// R9-5 amended, both persistence modes: a retrying member whose text
+    /// and resolved include cannot hold `SharedValue` is not bound, and the
+    /// answer is the walk's.
+    #[test]
+    fn a_retrying_member_whose_includes_cannot_hold_the_name_is_excluded() {
+        let extra = [
+            ("Guarded.pas", GUARDED.as_bytes().to_vec()),
+            (
+                "Defs.inc",
+                b"{$DEFINE GUARDED}\n// GetSharedValue\n".to_vec(),
+            ),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                !indexed.contains(&root.join("Guarded.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            assert_eq!(found.value.len(), 2, "persist {persist}");
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// The name is spelled only in the include: the member is bound and the
+    /// location in the include is the walk's.
+    #[test]
+    fn a_name_spelled_only_in_an_include_keeps_the_member_bound() {
+        let extra = [
+            (
+                "Spelled.pas",
+                b"unit Spelled;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n"
+                    .to_vec(),
+            ),
+            ("Body.inc", b"  Log(SharedValue);\n".to_vec()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            assert!(
+                walked
+                    .value
+                    .iter()
+                    .any(|location| location.uri == source_uri(&root.join("Body.inc"))),
+                "{:?}",
+                walked.value
+            );
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Spelled.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            assert!(
+                indexed_sources().contains(&root.join("Spelled.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Workspace symbols read raw text without expanding includes, so a
+    /// retrying member with an include whose raw text lacks a query piece
+    /// is not read, and the answer is the walk's.
+    #[test]
+    fn workspace_symbols_exclude_a_member_with_includes_by_its_raw_text() {
+        let extra = [
+            ("Guarded.pas", GUARDED.as_bytes().to_vec()),
+            ("Defs.inc", b"const DialogsValue = 1;\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = symbols(&workspace.analysis_input(), "DialogsValue");
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&view.analysis_input(), "DialogsValue");
+            assert!(
+                !indexed_sources().contains(&root.join("Guarded.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_symbols_still_read_when_the_raw_text_holds_the_query_piece() {
+        let extra = [
+            (
+                "Guarded.pas",
+                GUARDED
+                    .replace("interface\n", "interface\nconst GuardedValue = 1;\n")
+                    .into_bytes(),
+            ),
+            ("Defs.inc", b"{$DEFINE GUARDED}\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = symbols(&workspace.analysis_input(), "GuardedValue");
+            assert_eq!(
+                symbol_names(&walked.value),
+                [("GuardedValue".to_owned(), "Guarded.pas".to_owned())]
+            );
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&view.analysis_input(), "GuardedValue");
+            assert!(
+                indexed_sources().contains(&root.join("Guarded.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
     /// Workspace symbols match a substring of the display: a dotted unit
     /// name and a method (display `Bar`, owner `TFoo`) held by Limited
     /// members are found for every query the walk answers, while a member

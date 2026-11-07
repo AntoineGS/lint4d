@@ -4784,7 +4784,10 @@ impl<S: SourceStore> UnitResolver<S> {
             .map(|_| ProjectPathEntry::legacy(canonical_path(path)))
     }
 
-    fn legacy_route_for_source(
+    /// The legacy route `source`, loaded under `inherited`, passes to its own
+    /// includes: the one a compile-time session registers for a loaded
+    /// include (and derives for a disk root).
+    pub fn legacy_route_for_source(
         &self,
         source: &LoadedSource,
         inherited: Option<&LegacyRoute>,

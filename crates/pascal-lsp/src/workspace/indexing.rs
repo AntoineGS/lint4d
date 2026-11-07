@@ -4533,10 +4533,16 @@ impl Workspace {
                             open.contains(&key) || taken.contains(&key) || deleted(path)
                         },
                         &|_| true,
+                        Some(&IncludeScope {
+                            workspace: self,
+                            input,
+                            key,
+                        }),
                         cancel,
                     );
-                    lexically_excluded += absent.len();
-                    result.baseline.extend(absent);
+                    lexically_excluded += absent.members.len();
+                    result.baseline.extend(absent.members);
+                    result.baseline.extend(absent.includes);
                 }
                 let (skipped, searched) = take_unverified(
                     paths,
@@ -4641,10 +4647,16 @@ impl Workspace {
                         open.contains(&key) || taken.contains(&key) || deleted(path)
                     },
                     &|_| true,
+                    Some(&IncludeScope {
+                        workspace: self,
+                        input,
+                        key,
+                    }),
                     cancel,
                 );
-                lexically_excluded += absent.len();
-                result.baseline.extend(absent);
+                lexically_excluded += absent.members.len();
+                result.baseline.extend(absent.members);
+                result.baseline.extend(absent.includes);
             }
 
             for path in selected {
@@ -4987,6 +4999,11 @@ fn take_unverified(
 const MAX_UNVERIFIED_RANKING_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_UNVERIFIED_RANKING_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The deepest include nesting the references proof follows.
+const MAX_LEXICAL_INCLUDE_DEPTH: usize = 16;
+
+type BaselineEntry = (PathBuf, Option<PathStamp>);
+
 /// What one request has left for ranking unverified members.
 struct UnverifiedRanking {
     names: Vec<String>,
@@ -4995,6 +5012,31 @@ struct UnverifiedRanking {
     /// absent when one of them does not occur.
     symbols: bool,
     bytes_left: u64,
+    /// The resolver each context's analysis resolves includes with, for
+    /// this request only.
+    resolvers: HashMap<ContextKey, pascal_core::UnitResolver<super::resolver::LspSourceStore>>,
+    /// Per context and include path key: the baseline proving the include
+    /// and everything it includes cannot hold a name, or `None`.
+    includes: HashMap<(ContextKey, String), Option<Vec<BaselineEntry>>>,
+    /// What every include lookup observed, proven or not: a later lookup the
+    /// resolver answers from its own cache observes nothing.
+    observed: Vec<BaselineEntry>,
+}
+
+/// The members a ranking proved absent, each with the stamp taken before
+/// its bytes were read, and what proves the includes they resolve current.
+#[derive(Debug, Default)]
+struct Absent {
+    members: Vec<BaselineEntry>,
+    includes: Vec<BaselineEntry>,
+}
+
+/// The context whose analysis of the ranked members a references proof
+/// follows includes in.
+struct IncludeScope<'a> {
+    workspace: &'a Workspace,
+    input: &'a WorkspaceInput,
+    key: &'a ContextKey,
 }
 
 impl UnverifiedRanking {
@@ -5023,12 +5065,7 @@ impl UnverifiedRanking {
             list.sort();
             list.dedup();
         }
-        Self {
-            names,
-            units,
-            symbols: false,
-            bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
-        }
+        Self::with(names, units, false)
     }
 
     /// The ranking of a workspace-symbol request: its needles are the
@@ -5039,19 +5076,28 @@ impl UnverifiedRanking {
         if names.iter().any(|piece| !piece.is_ascii()) {
             names.clear();
         }
+        Self::with(names, Vec::new(), true)
+    }
+
+    fn with(names: Vec<String>, units: Vec<String>, symbols: bool) -> Self {
         Self {
             names,
-            units: Vec::new(),
-            symbols: true,
+            units,
+            symbols,
             bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
+            resolvers: HashMap::new(),
+            includes: HashMap::new(),
+            observed: Vec::new(),
         }
     }
 
-    /// Removes from `paths` the members whose raw text proves the names
-    /// absent (R9-5, `lexical::proves_absent`) and returns them, each with
-    /// the stamp taken before its bytes were read, so a write racing the
-    /// read fails revalidation. Only members `provable` selects are
-    /// excluded.
+    /// Removes from `paths` the members proven absent (R9-5,
+    /// `lexical::proves_absent`) and returns them, each with the stamp
+    /// taken before its bytes were read, so a write racing the read fails
+    /// revalidation. Only members `provable` selects are excluded. For
+    /// references the proof also covers every include the member's text
+    /// resolves, followed in `scope` (`includes_absent`); without a scope
+    /// a member with an include is not proven.
     ///
     /// Then orders the rest (in path order) so the members likely to hold
     /// an occurrence come first: those whose text spells a name and, for
@@ -5063,7 +5109,7 @@ impl UnverifiedRanking {
     /// saves binds. Paths `unread` selects (open, deleted or already
     /// taken) do not use the bound, so they are neither read nor excluded.
     ///
-    /// The scan is a byte search over the raw file: a UTF-16 file, or an
+    /// The ranking is a byte search over the raw file: a UTF-16 file, or an
     /// importer spelling the name only through an include, ranks last.
     fn rank(
         &mut self,
@@ -5071,15 +5117,17 @@ impl UnverifiedRanking {
         left: usize,
         unread: &dyn Fn(&Path) -> bool,
         provable: &dyn Fn(&Path) -> bool,
+        scope: Option<&IncludeScope<'_>>,
         cancel: &AtomicBool,
-    ) -> Vec<(PathBuf, Option<PathStamp>)> {
+    ) -> Absent {
         if self.names.is_empty() {
-            return Vec::new();
+            return Absent::default();
         }
         let started = std::time::Instant::now();
         let order = paths.iter().filter(|path| !unread(path)).count() > left;
         let mut likely = 0usize;
         let mut tiers = Vec::with_capacity(paths.len());
+        let mut includes = Vec::new();
         for path in paths.iter() {
             let tier = if unread(path) || cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 Ok(2)
@@ -5087,10 +5135,23 @@ impl UnverifiedRanking {
                 match self.read(path) {
                     None => Ok(2),
                     Some((stamp, text)) => {
-                        if stamp.is_some()
+                        let proof = (stamp.is_some()
                             && provable(path)
-                            && super::lexical::proves_absent(&text, &self.names, self.symbols)
-                        {
+                            && super::lexical::proves_absent(&text, &self.names, self.symbols))
+                        .then(|| {
+                            if self.symbols {
+                                Some(Vec::new())
+                            } else if let Some(scope) = scope {
+                                self.includes_absent(scope, path, &text, cancel)
+                            } else {
+                                super::lexical::include_requests(&text)
+                                    .filter(Vec::is_empty)
+                                    .map(|_| Vec::new())
+                            }
+                        })
+                        .flatten();
+                        if let Some(proof) = proof {
+                            includes.extend(proof);
                             Err(stamp)
                         } else {
                             let mentions =
@@ -5115,12 +5176,12 @@ impl UnverifiedRanking {
             }
             tiers.push(tier);
         }
-        let mut absent = Vec::new();
+        let mut members = Vec::new();
         let mut ranked = Vec::with_capacity(paths.len());
         for (path, tier) in std::mem::take(paths).into_iter().zip(tiers) {
             match tier {
                 Ok(tier) => ranked.push((path, tier)),
-                Err(stamp) => absent.push((path, stamp)),
+                Err(stamp) => members.push((path, stamp)),
             }
         }
         if order {
@@ -5129,11 +5190,181 @@ impl UnverifiedRanking {
         crate::trace::trace!(
             "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms",
             ranked.len(),
-            absent.len(),
+            members.len(),
             started.elapsed().as_secs_f64() * 1000.0
         );
         paths.extend(ranked.into_iter().map(|(path, _)| path));
-        absent
+        if !members.is_empty() {
+            includes.append(&mut self.observed);
+        }
+        Absent { members, includes }
+    }
+
+    /// What proves that no include `text` (the bytes of the member `path`)
+    /// resolves can hold a name, or `None` (R9-5 amended): the analysed
+    /// text is the raw text with each include replaced by the included
+    /// file's (conditional compilation only removes text), so every
+    /// include, resolved by the resolver the member's analysis uses in
+    /// `scope`, must resolve to a disk file that is not UTF-16, holds no
+    /// needle as an identifier and whose own includes do the same, at most
+    /// `MAX_LEXICAL_INCLUDE_DEPTH` deep. Each include read counts against
+    /// the byte budget and is proven by the stamp taken before its read.
+    fn includes_absent(
+        &mut self,
+        scope: &IncludeScope<'_>,
+        path: &Path,
+        text: &[u8],
+        cancel: &AtomicBool,
+    ) -> Option<Vec<BaselineEntry>> {
+        let requests = super::lexical::include_requests(text)?;
+        if requests.is_empty() {
+            return Some(Vec::new());
+        }
+        let state = scope.workspace.contexts.get(scope.key)?;
+        let context = Arc::clone(&state.context);
+        let mut resolver = match self.resolvers.remove(scope.key) {
+            Some(resolver) => resolver,
+            None => {
+                let mut limits = pascal_core::ResolverLimits::default();
+                limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
+                super::resolver::resolver_for_context_with_limits(
+                    Arc::clone(&context),
+                    &state.context_observations,
+                    scope.input.roots.clone(),
+                    scope.input,
+                    limits,
+                )
+            }
+        };
+        let proof = (|| {
+            let uri = Url::from_file_path(path).ok()?;
+            let route = scope
+                .workspace
+                .legacy_route_for_resolver(&uri, path, scope.key, &context);
+            let root = resolver
+                .load_source(
+                    path,
+                    route.as_ref(),
+                    pascal_core::resolver::SourceKind::Unit,
+                    cancel,
+                )
+                .ok()?;
+            let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = root.revision
+            else {
+                return None;
+            };
+            self.charge(root.bytes.len())?;
+            if content_hash != pascal_project::content_hash_bytes(text) {
+                return None;
+            }
+            let route = resolver.legacy_route_for_source(&root, None);
+            let mut baseline = Vec::new();
+            self.follow(
+                &mut resolver,
+                scope.key,
+                &root.path,
+                requests,
+                route,
+                &mut vec![path_key(&root.path)],
+                &mut baseline,
+                cancel,
+            )?;
+            Some(baseline)
+        })();
+        self.resolvers.insert(scope.key.clone(), resolver);
+        proof
+    }
+
+    /// Follows the include `requests` of the file `including`, loaded under
+    /// `route`, adding what proves them to `baseline`; `active` holds the
+    /// path keys being followed (a cycle proves nothing).
+    #[allow(clippy::too_many_arguments)]
+    fn follow(
+        &mut self,
+        resolver: &mut pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        key: &ContextKey,
+        including: &Path,
+        requests: Vec<super::lexical::IncludeRequest>,
+        route: Option<pascal_core::LegacyRoute>,
+        active: &mut Vec<String>,
+        baseline: &mut Vec<BaselineEntry>,
+        cancel: &AtomicBool,
+    ) -> Option<()> {
+        for request in requests {
+            if active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
+                return None;
+            }
+            let outcome = resolver
+                .try_resolve_include(
+                    pascal_core::IncludeResolveRequest {
+                        including_path: including,
+                        byte_range: request.range,
+                        requested_name: &request.name,
+                        legacy_route: route.as_ref(),
+                    },
+                    cancel,
+                )
+                .ok()?;
+            self.observed.extend(
+                outcome
+                    .observations
+                    .iter()
+                    .filter_map(super::rename::resolver_observation_baseline),
+            );
+            let pascal_core::Resolution::Found(child) = outcome.result else {
+                return None;
+            };
+            let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = child.revision
+            else {
+                return None;
+            };
+            let child_key = path_key(&child.path);
+            if active.contains(&child_key) {
+                return None;
+            }
+            let memo = (key.clone(), child_key.clone());
+            if let Some(proven) = self.includes.get(&memo) {
+                baseline.extend(proven.clone()?);
+                continue;
+            }
+            self.charge(child.bytes.len())?;
+            let proven = (|| {
+                let (stamp, bytes) = self.read(&child.path)?;
+                stamp.as_ref()?;
+                if pascal_project::content_hash_bytes(&bytes) != content_hash
+                    || !super::lexical::is_byte_text(&bytes)
+                    || super::lexical::holds_identifier(&bytes, &self.names)
+                {
+                    return None;
+                }
+                let requests = super::lexical::include_requests(&bytes)?;
+                let route = resolver.legacy_route_for_source(&child, route.as_ref());
+                let mut proven = vec![(child.path.clone(), stamp)];
+                active.push(child_key);
+                let followed = self.follow(
+                    resolver,
+                    key,
+                    &child.path,
+                    requests,
+                    route,
+                    active,
+                    &mut proven,
+                    cancel,
+                );
+                active.pop();
+                followed.map(|()| proven)
+            })();
+            self.includes.insert(memo, proven.clone());
+            baseline.extend(proven?);
+        }
+        Some(())
+    }
+
+    /// Takes `bytes` from the budget; `None` past it.
+    fn charge(&mut self, bytes: usize) -> Option<()> {
+        let bytes = u64::try_from(bytes).ok()?;
+        self.bytes_left = self.bytes_left.checked_sub(bytes)?;
+        Some(())
     }
 
     /// The stamp, taken before the read, and the bytes of `path` within
@@ -5260,9 +5491,10 @@ pub(in crate::workspace) mod tests {
             1,
             &|path: &Path| path_key(path) == taken,
             &|path: &Path| *path != b,
+            None,
             &AtomicBool::new(false),
         );
-        assert!(absent.is_empty(), "{absent:?}");
+        assert!(absent.members.is_empty(), "{absent:?}");
         let c_at = paths.iter().position(|path| *path == c).unwrap();
         let b_at = paths.iter().position(|path| *path == b).unwrap();
         assert!(c_at < b_at, "{paths:?}");
@@ -7561,9 +7793,10 @@ pub(in crate::workspace) mod tests {
         let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
         let _caps = override_caps(|caps| caps.unverified = Some(3));
         let input = workspace.analysis_input();
-        // Every member spells `P`, so none is excluded lexically (R9-5).
+        // Every member spells `end` as an identifier, so none is excluded
+        // lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P".to_owned()],
+            names: vec!["end".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };
@@ -7849,6 +8082,167 @@ pub(in crate::workspace) mod tests {
         );
     }
 
+    fn retry_member(workspace: &Workspace, key: &ContextKey, path: &Path) {
+        workspace.project_cache.mark_index_stale(key, path);
+        workspace
+            .project_cache
+            .defer_index_member(key, path, RETRYING_REFUSAL);
+    }
+
+    fn baseline_stamp(found: &IndexedSources, path: &Path) -> Option<PathStamp> {
+        found
+            .baseline
+            .iter()
+            .find(|(baselined, _)| baselined == path)
+            .and_then(|(_, stamp)| stamp.clone())
+    }
+
+    /// R9-5 amended: the proof follows resolved includes. A retrying member
+    /// whose text and include cannot hold `SharedValue` is left out, with
+    /// both stamps in the baseline.
+    #[test]
+    fn a_retrying_member_whose_includes_cannot_hold_the_name_is_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\nconst GetSharedValues = 1;\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &guarded);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &guarded), "{:?}", found.baseline);
+        assert!(baselined(&found, &defs), "{:?}", found.baseline);
+    }
+
+    /// A write to an include after the proof read it fails revalidation:
+    /// its baseline stamp is the one taken before the read.
+    #[test]
+    fn an_include_edited_after_the_proof_is_caught_by_revalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        pascal_project::backdate_tree_for_test(root);
+        let before = path_stamp(&defs).expect("stamp");
+        retry_member(&workspace, &key, &guarded);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        let proved = baseline_stamp(&found, &defs).expect("the include is in the baseline");
+        assert!(proved.proves_unchanged(&before));
+        write(&defs, "const Copy = SharedValue;\n");
+        let now = path_stamp(&defs).expect("stamp");
+        assert!(!proved.proves_unchanged(&now));
+    }
+
+    /// The include spells the name: the member is bound.
+    #[test]
+    fn a_name_spelled_only_in_an_include_keeps_the_member_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let spelled = root.join("lib/Spelled.pas");
+        write(
+            &spelled,
+            "unit Spelled;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n",
+        );
+        write(&root.join("lib/Body.inc"), "  WriteLn(SharedValue);\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &spelled);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Shared.pas", "Spelled.pas", "User.pas"]
+        );
+    }
+
+    /// An include that does not resolve, or whose name is computed, proves
+    /// nothing: the member is bound as before.
+    #[test]
+    fn an_unresolved_or_computed_include_proves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let missing = root.join("lib/Missing.pas");
+        let dated = root.join("lib/Dated.pas");
+        write(
+            &missing,
+            "unit Missing;\n{$I Missing.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &dated,
+            "unit Dated;\ninterface\nconst Built = {$I %DATE%};\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&missing, &dated] {
+            retry_member(&workspace, &key, path);
+        }
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Dated.pas", "Missing.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(!baselined(&found, &missing) && !baselined(&found, &dated));
+    }
+
+    #[test]
+    fn a_substring_of_a_longer_identifier_does_not_hold_the_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let getter = root.join("lib/Getter.pas");
+        write(
+            &getter,
+            "unit Getter;\ninterface\nfunction GetSharedValue: Integer;\nimplementation\nfunction GetSharedValue: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &getter);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &getter), "{:?}", found.baseline);
+    }
+
     /// The symbol needles are the query's identifier pieces: a Limited
     /// member lacking one is left out, one spelling them all is read, and a
     /// non-ASCII query reads its unverified member.
@@ -7914,11 +8308,12 @@ pub(in crate::workspace) mod tests {
             MAX_INTERACTIVE_UNVERIFIED_CANDIDATES,
             &|_| false,
             &|_| true,
+            None,
             &AtomicBool::new(false),
         );
         assert!(paths.is_empty(), "{paths:?}");
-        assert_eq!(absent.len(), 1);
-        let (path, stamp) = &absent[0];
+        assert_eq!(absent.members.len(), 1);
+        let (path, stamp) = &absent.members[0];
         assert_eq!(*path, plain);
         assert!(stamp.as_ref().expect("stamp").proves_unchanged(&before));
     }
@@ -8292,9 +8687,10 @@ pub(in crate::workspace) mod tests {
         workspace.project_cache = crate::project_cache::ProjectCache::new(64);
         let _caps = override_caps(|caps| caps.unverified = Some(2));
         let input = workspace.analysis_input();
-        // Every member spells `P`, so none is excluded lexically (R9-5).
+        // Every member spells `end` as an identifier, so none is excluded
+        // lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P".to_owned()],
+            names: vec!["end".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };

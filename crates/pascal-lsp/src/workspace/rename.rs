@@ -8619,6 +8619,36 @@ fn add_baseline_path_with_stamp(
     baseline.add_path(path, stamp);
 }
 
+/// The path and stamp a resolver observation adds to a request's baseline.
+pub(super) fn resolver_observation_baseline(
+    observation: &pascal_core::resolver::ResolutionObservation,
+) -> Option<(PathBuf, Option<PathStamp>)> {
+    match observation {
+        pascal_core::resolver::ResolutionObservation::Directory { path, stamp, .. } => {
+            Some((path.clone(), stamp.clone()))
+        }
+        pascal_core::resolver::ResolutionObservation::Candidate {
+            path,
+            stamp,
+            present,
+            ..
+        } => {
+            // A denied candidate may still exist on disk (for example, a
+            // configured symlink outside the requester roots). Its presence
+            // must not stale the request, while an actually missing
+            // candidate remains an observed precedence input and must stale
+            // if it appears.
+            (*present || stamp.is_some() || !path.exists()).then(|| (path.clone(), stamp.clone()))
+        }
+        pascal_core::resolver::ResolutionObservation::Payload {
+            path,
+            revision: pascal_core::resolver::SourceRevision::Disk { stamp, .. },
+            ..
+        } => Some((path.clone(), Some(stamp.clone()))),
+        _ => None,
+    }
+}
+
 /// Why a snapshot walk of `catalogue` is incomplete, in the old walk's words.
 fn snapshot_catalogue_gap(
     catalogue: &Catalogue,
@@ -9621,31 +9651,8 @@ impl IncludeAuditor<'_> {
     ) {
         self.loader.merge_resolution_report(context_key, report);
         for observation in &report.observations {
-            match observation {
-                pascal_core::resolver::ResolutionObservation::Directory { path, stamp, .. } => {
-                    add_baseline_path_with_stamp(self.baseline, path.clone(), stamp.clone())
-                }
-                pascal_core::resolver::ResolutionObservation::Candidate {
-                    path,
-                    stamp,
-                    present,
-                    ..
-                } => {
-                    // A denied candidate may still exist on disk (for
-                    // example, a configured symlink outside the requester
-                    // roots). Its presence must not stale the request, while
-                    // an actually missing candidate remains an observed
-                    // precedence input and must stale if it appears.
-                    if *present || stamp.is_some() || !path.exists() {
-                        add_baseline_path_with_stamp(self.baseline, path.clone(), stamp.clone());
-                    }
-                }
-                pascal_core::resolver::ResolutionObservation::Payload {
-                    path,
-                    revision: pascal_core::resolver::SourceRevision::Disk { stamp, .. },
-                    ..
-                } => add_baseline_path_with_stamp(self.baseline, path.clone(), Some(stamp.clone())),
-                _ => {}
+            if let Some((path, stamp)) = resolver_observation_baseline(observation) {
+                add_baseline_path_with_stamp(self.baseline, path, stamp);
             }
         }
     }

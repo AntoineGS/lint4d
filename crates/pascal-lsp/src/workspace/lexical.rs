@@ -1,30 +1,32 @@
-//! Lexical proofs over raw source bytes (R9-5): a member whose bytes cannot
-//! hold a candidate name is excluded without binding it.
+//! Lexical proofs over raw source bytes (R9-5): a member whose bytes, and
+//! for references the bytes of the includes they resolve, cannot hold a
+//! candidate name is excluded without binding it.
 
 use crate::navigation::text_mentions_name;
+use pascal_core::facts::{identifier_runs, is_identifier_byte};
+use std::ops::Range;
 
 /// UTF-8 encodings of the characters whose Unicode lowercase holds an
 /// ASCII letter (`İ` → `i̇`, the Kelvin sign → `k`): a display spelling one
 /// may match an ASCII query piece the bytes do not hold.
 const ASCII_LOWERCASING: [&[u8]; 2] = ["\u{130}".as_bytes(), "\u{212A}".as_bytes()];
 
-/// Whether raw source bytes prove that no candidate name occurs in the
-/// analysed text (R9-5): no include directive, not UTF-16, and no
-/// case-insensitive ASCII occurrence of any needle. `needles` are
-/// non-empty ASCII last segments (references) or the identifier pieces of
-/// the lowercased query (workspace symbols); an empty or non-ASCII needle
-/// list proves nothing. References: absent when no needle occurs. Symbols:
-/// the caller passes `any_piece_missing = true` (absent when some piece
-/// does not occur).
+/// Whether raw source bytes prove that no candidate name occurs in their
+/// own text (R9-5): not UTF-16, and no occurrence of any needle. `needles`
+/// are non-empty ASCII last segments (references) or the identifier pieces
+/// of the lowercased query (workspace symbols); an empty or non-ASCII
+/// needle list proves nothing. References (`any_piece_missing = false`):
+/// absent when no needle is a whole identifier (`holds_identifier`); the
+/// caller must still follow the include directives (`include_requests`).
+/// Symbols (`any_piece_missing = true`): absent when some piece is not a
+/// substring; the symbol read parses the raw text without expanding its
+/// includes, so they do not matter.
 pub(crate) fn proves_absent(text: &[u8], needles: &[String], any_piece_missing: bool) -> bool {
     if needles.is_empty()
         || needles
             .iter()
             .any(|needle| needle.is_empty() || !needle.is_ascii())
-        || text.starts_with(&[0xff, 0xfe])
-        || text.starts_with(&[0xfe, 0xff])
-        || text.contains(&0)
-        || has_include_directive(text)
+        || !is_byte_text(text)
     {
         return false;
     }
@@ -39,43 +41,109 @@ pub(crate) fn proves_absent(text: &[u8], needles: &[String], any_piece_missing: 
             .iter()
             .any(|needle| !text_mentions_name(text, needle))
     } else {
-        !needles
-            .iter()
-            .any(|needle| text_mentions_name(text, needle))
+        !holds_identifier(text, needles)
     }
 }
 
-/// `{$I name}`, `{$INCLUDE name}`, `(*$I name*)`, `(*$INCLUDE name*)`,
-/// case-insensitive; `{$I+}` and `{$I-}` (the I/O-check switch) and longer
-/// directive names (`{$IF`, `{$IFDEF`, `{$IMPLICITBUILD`) are not includes.
-pub(crate) fn has_include_directive(text: &[u8]) -> bool {
-    let mut at = 0;
-    while at < text.len() {
-        let start = match text[at..]
+/// Not UTF-16 (no byte-order mark, no NUL byte): a byte search sees the
+/// identifiers the analysis reads.
+pub(crate) fn is_byte_text(text: &[u8]) -> bool {
+    !(text.starts_with(&[0xff, 0xfe]) || text.starts_with(&[0xfe, 0xff]) || text.contains(&0))
+}
+
+/// Whether some identifier run of `text` (`identifier_runs`: every byte
+/// that is not an ASCII letter, digit or `_` separates, non-ASCII bytes
+/// included) equals a needle, ASCII case-insensitively. This is the scan
+/// the snapshot itself filters its sources with; comments and strings
+/// count.
+pub(crate) fn holds_identifier(text: &[u8], needles: &[String]) -> bool {
+    identifier_runs(text).any(|run| {
+        needles
             .iter()
-            .position(|byte| matches!(byte, b'{' | b'('))
-        {
-            Some(offset) => at + offset,
-            None => return false,
-        };
-        let opener: &[u8] = if text[start] == b'{' { b"{$" } else { b"(*$" };
+            .any(|needle| text[run.clone()].eq_ignore_ascii_case(needle.as_bytes()))
+    })
+}
+
+/// An include directive of a member's raw text: its byte range and the file
+/// name the resolver looks up (`pascal_core::resolver::include_name`).
+#[derive(Debug)]
+pub(crate) struct IncludeRequest {
+    pub(crate) range: Range<usize>,
+    pub(crate) name: String,
+}
+
+/// The include directives of `text`, or `None` when one cannot be followed.
+/// Every `{$...}` and `(*$...*)` is read, also inside comments and strings
+/// (more includes to follow, never fewer), and is an include when its
+/// keyword is `I` or `INCLUDE` as the conditional scanner splits it
+/// (`{$I+}`, `{$IFDEF}` are not). `None`: an include whose name is not a
+/// literal file name (`{$I %DATE%}`, a macro, no name), an unterminated
+/// one, a non-UTF-8 directive that may be one (decoded as ANSI, a leading
+/// non-ASCII byte may be white space), or an include touching an
+/// identifier byte, which the included text could extend.
+pub(crate) fn include_requests(text: &[u8]) -> Option<Vec<IncludeRequest>> {
+    let include = |keyword: &[u8]| {
+        keyword.eq_ignore_ascii_case(b"I") || keyword.eq_ignore_ascii_case(b"INCLUDE")
+    };
+    let mut requests = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = text[at..]
+        .iter()
+        .position(|byte| matches!(byte, b'{' | b'('))
+    {
+        let start = at + offset;
         at = start + 1;
+        let (opener, closer): (&[u8], &[u8]) = if text[start] == b'{' {
+            (b"{$", b"}")
+        } else {
+            (b"(*$", b"*)")
+        };
         if !text[start..].starts_with(opener) {
             continue;
         }
-        let name_start = start + opener.len();
-        let name_end = text[name_start..]
-            .iter()
-            .position(|byte| !byte.is_ascii_alphabetic())
-            .map_or(text.len(), |offset| name_start + offset);
-        let name = &text[name_start..name_end];
-        if name.eq_ignore_ascii_case(b"INCLUDE")
-            || (name.eq_ignore_ascii_case(b"I") && !matches!(text.get(name_end), Some(b'+' | b'-')))
-        {
-            return true;
+        let body_start = start + opener.len();
+        let body_end = text[body_start..]
+            .windows(closer.len())
+            .position(|window| window == closer)
+            .map(|offset| body_start + offset);
+        let body = &text[body_start..body_end.unwrap_or(text.len())];
+        let Ok(body) = std::str::from_utf8(body) else {
+            let keyword = body.trim_ascii_start();
+            if keyword.first().is_some_and(|byte| !byte.is_ascii())
+                || include(
+                    keyword
+                        .split(|byte| byte.is_ascii_whitespace() || *byte == b':')
+                        .next()
+                        .unwrap_or_default(),
+                )
+            {
+                return None;
+            }
+            continue;
+        };
+        let keyword = body
+            .trim_start()
+            .split(|character: char| character.is_ascii_whitespace() || character == ':')
+            .next()
+            .unwrap_or_default();
+        if !include(keyword.as_bytes()) {
+            continue;
         }
+        let end = body_end? + closer.len();
+        let name =
+            pascal_core::resolver::include_name(body).filter(|name| !name.starts_with('%'))?;
+        let touches = |byte: Option<&u8>| byte.is_some_and(|byte| is_identifier_byte(*byte));
+        if touches(start.checked_sub(1).and_then(|before| text.get(before)))
+            || touches(text.get(end))
+        {
+            return None;
+        }
+        requests.push(IncludeRequest {
+            range: start..end,
+            name,
+        });
     }
-    false
+    Some(requests)
 }
 
 /// The needles of a workspace-symbol query: the non-empty pieces of the
@@ -98,17 +166,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn include_directives_are_recognised_and_switches_are_not() {
-        assert!(has_include_directive(b"{$I Spring.inc}"));
-        assert!(has_include_directive(b"{$i spring.inc}"));
-        assert!(has_include_directive(b"(*$INCLUDE a.inc*)"));
-        assert!(has_include_directive(b"{$INCLUDE 'a b.inc'}"));
-        assert!(!has_include_directive(
-            b"{$I+} {$I-} {$IFDEF X}{$ENDIF} {$IF CompilerVersion > 20}{$IFEND} {$IMPLICITBUILD OFF}"
-        ));
-    }
-
-    #[test]
     fn absence_requires_every_condition() {
         let needles = vec!["tshared".to_owned()];
         assert!(proves_absent(
@@ -121,12 +178,8 @@ mod tests {
             "case-insensitive"
         );
         assert!(
-            !proves_absent(b"var x: TSharedEx;", &needles, false),
-            "substring, no word boundary"
-        );
-        assert!(
-            !proves_absent(b"{$I x.inc} unit A;", &needles, false),
-            "an include may spell it"
+            proves_absent(b"var x: TSharedEx;", &needles, false),
+            "a longer identifier does not hold it"
         );
         assert!(
             !proves_absent(b"\xFF\xFEu\0n\0i\0t\0", &needles, false),
@@ -209,5 +262,90 @@ mod tests {
     #[test]
     fn a_nul_byte_proves_nothing() {
         assert!(!proves_absent(b"u\0n\0i\0t\0", &["x".to_owned()], false));
+    }
+
+    /// References match whole identifiers: runs of ASCII letters, digits
+    /// and `_`, every other byte (non-ASCII ones included) separating them;
+    /// comments and strings still count.
+    #[test]
+    fn references_match_whole_identifiers_only() {
+        let needles = vec!["tdatabaseinfo".to_owned()];
+        assert!(proves_absent(
+            b"function GetDatabaseInfo: Integer;",
+            &needles,
+            false
+        ));
+        assert!(proves_absent(b"TDatabaseInfo_2 := 1;", &needles, false));
+        for spelled in [
+            "var x: TDatabaseInfo;",
+            "x := (TDatabaseInfo)",
+            "&TDatabaseInfo := 1;",
+            "{ tdatabaseinfo in a comment }",
+            "s := 'TDATABASEINFO';",
+            "TDatabaseInfo\u{c4}",
+            "\u{c4}TDatabaseInfo",
+        ] {
+            assert!(
+                !proves_absent(spelled.as_bytes(), &needles, false),
+                "{spelled}"
+            );
+        }
+    }
+
+    /// The symbol path reads raw text without expanding includes, so an
+    /// include directive does not keep its proof.
+    #[test]
+    fn symbol_mode_ignores_include_directives() {
+        let pieces = symbol_needles("vcl.dialogs");
+        assert!(proves_absent(
+            b"unit A;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+            &pieces,
+            true
+        ));
+    }
+
+    fn requested(text: &str) -> Option<Vec<String>> {
+        include_requests(text.as_bytes())
+            .map(|requests| requests.into_iter().map(|request| request.name).collect())
+    }
+
+    #[test]
+    fn include_requests_name_every_literal_include() {
+        assert_eq!(
+            requested("{$I Defs.inc}\n(*$INCLUDE 'a b.inc'*) {$i ..\\x.inc} {$ I Spaced.inc}"),
+            Some(vec![
+                "Defs.inc".to_owned(),
+                "a b.inc".to_owned(),
+                "../x.inc".to_owned(),
+                "Spaced.inc".to_owned(),
+            ])
+        );
+        assert_eq!(
+            requested("{$I+} {$I-} {$IFDEF X}{$ENDIF} {$IF A}{$IFEND} {$IMPLICITBUILD OFF}"),
+            Some(Vec::new())
+        );
+        let request = &include_requests(b"ab {$I x.inc} cd").unwrap()[0];
+        assert_eq!(request.range, 3..13);
+    }
+
+    /// A directive the proof cannot follow refuses it: a computed or
+    /// macro name, no name, an unterminated or non-UTF-8 directive, or one
+    /// touching an identifier byte that the included text could extend.
+    #[test]
+    fn include_requests_refuse_what_they_cannot_follow() {
+        for text in [
+            "{$I %DATE%}",
+            "{$I $(Root)\\x.inc}",
+            "{$I}",
+            "{$INCLUDE x.inc",
+            "Foo{$I x.inc}",
+            "{$I x.inc}Bar",
+        ] {
+            assert_eq!(requested(text), None, "{text}");
+        }
+        assert_eq!(include_requests(b"{$I \xff.inc}").map(|r| r.len()), None);
+        // Decoded as ANSI, a leading non-ASCII byte may be white space.
+        assert_eq!(include_requests(b"{$\xa0I x.inc}").map(|r| r.len()), None);
+        assert_eq!(include_requests(b"{$R \xff.res}").map(|r| r.len()), Some(0));
     }
 }

@@ -113,8 +113,15 @@ impl<'a> CompletionAccumulator<'a> {
         }
     }
 
+    /// Whether `canonical_name(&symbol.name)` starts with the prefix,
+    /// without allocating it.
     fn matches(&self, symbol: &Symbol) -> bool {
-        canonical_name(&symbol.name).starts_with(&self.prefix)
+        symbol
+            .name
+            .trim_start_matches('&')
+            .as_bytes()
+            .get(..self.prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(self.prefix.as_bytes()))
     }
 
     fn take_scan_slot(&mut self, cancel: &AtomicBool) -> Result<bool, String> {
@@ -585,8 +592,10 @@ impl NavigationIndex {
                     cancel,
                 )?;
                 let auto_import = completion_candidate.auto_import.clone();
-                let detail =
-                    completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
+                let detail = completion_detail(
+                    display.map(|display| self.completion_excerpt(candidate, display.excerpt)),
+                    auto_import.as_ref(),
+                );
                 budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
                 let snippet = if matches!(call_context, CompletionCallContext::Callable)
                     && symbol.kind == SymbolKind::Routine
@@ -1032,7 +1041,7 @@ impl NavigationIndex {
                     cancel,
                     &mut budget,
                 )?
-                .map(|display| display.excerpt);
+                .map(|display| self.completion_excerpt(&seed.candidate, display.excerpt));
             completion_detail(declaration, seed.auto_import.as_ref())
         } else {
             None
@@ -1595,12 +1604,19 @@ impl NavigationIndex {
 
             if !suppress_unqualified_globals {
                 let region = current_document.region_at(offset);
-                for index in current_document
+                let root_indices = current_document
                     .scope_symbol_indices
                     .get(&super::ROOT_SCOPE)
-                    .into_iter()
-                    .flatten()
-                {
+                    .map_or(&[][..], Vec::as_slice);
+                if accumulator.prefix.is_empty() {
+                    // Without a prefix nearly every scanned symbol is a
+                    // candidate: size the map once instead of rehashing it.
+                    accumulator.candidates.reserve(root_indices.len().min(
+                        MAX_COMPLETION_SCANNED_SYMBOLS
+                            - accumulator.scanned.min(MAX_COMPLETION_SCANNED_SYMBOLS),
+                    ));
+                }
+                for index in root_indices {
                     check_cancel(cancel)?;
                     if !accumulator.take_scan_slot(cancel)? {
                         break;
@@ -1609,7 +1625,7 @@ impl NavigationIndex {
                         continue;
                     };
                     if symbol.scope != super::ROOT_SCOPE
-                        || symbol.owner_type.is_some()
+                        || !current_document.has_unqualified_owner(*index, symbol)
                         || symbol.local_only
                         || !symbol_visible_in_region(symbol, region)
                     {
@@ -1708,32 +1724,39 @@ impl NavigationIndex {
             accumulator.is_incomplete = true;
         }
         let ambiguous_signatures = accumulator.ambiguous_signatures;
-        let mut candidates = std::mem::take(&mut accumulator.candidates)
+        // Order by name (case-insensitive, then spelling), declaring URI and
+        // index. The names are looked up once, and only the items that can
+        // be rendered, plus one to signal truncation, are sorted and kept.
+        let collected = std::mem::take(&mut accumulator.candidates);
+        let mut last_document: Option<(&Url, &Document)> = None;
+        let mut keyed = Vec::with_capacity(collected.len());
+        for (key, (candidate, _)) in &collected {
+            let uri = &candidate.candidate.uri;
+            let document = match last_document {
+                Some((last_uri, document)) if last_uri == uri => Some(document),
+                _ => self.documents.get(uri).inspect(|document| {
+                    last_document = Some((uri, document));
+                }),
+            };
+            let name = document
+                .and_then(|document| document.symbols.get(candidate.candidate.index))
+                .map(|symbol| symbol.name.as_str());
+            keyed.push((name, key, candidate));
+        }
+        let kept = MAX_COMPLETION_ITEMS + 1;
+        if keyed.len() > kept {
+            keyed.select_nth_unstable_by(kept - 1, completion_order);
+            keyed.truncate(kept);
+        }
+        keyed.sort_unstable_by(completion_order);
+        let candidates = keyed
             .into_iter()
-            .map(|(key, (mut candidate, _))| {
-                candidate.signature_ambiguous = ambiguous_signatures.contains(&key);
+            .map(|(_, key, candidate)| {
+                let mut candidate = candidate.clone();
+                candidate.signature_ambiguous = ambiguous_signatures.contains(key);
                 candidate
             })
             .collect::<Vec<CompletionCandidate>>();
-        candidates.sort_by(|left, right| {
-            let left_symbol = self.symbol(&left.candidate);
-            let right_symbol = self.symbol(&right.candidate);
-            left_symbol
-                .map(|symbol| canonical_name(&symbol.name))
-                .cmp(&right_symbol.map(|symbol| canonical_name(&symbol.name)))
-                .then_with(|| {
-                    left_symbol
-                        .map(|symbol| symbol.name.as_str())
-                        .cmp(&right_symbol.map(|symbol| symbol.name.as_str()))
-                })
-                .then_with(|| {
-                    left.candidate
-                        .uri
-                        .as_str()
-                        .cmp(right.candidate.uri.as_str())
-                })
-                .then_with(|| left.candidate.index.cmp(&right.candidate.index))
-        });
         Ok((candidates, accumulator.is_incomplete))
     }
 
@@ -1963,7 +1986,7 @@ impl NavigationIndex {
                 continue;
             };
             if symbol.scope != scope
-                || symbol.owner_type.is_some()
+                || !document.has_unqualified_owner(*index, symbol)
                 || symbol.local_only
                 || symbol.kind == SymbolKind::Unit
             {
@@ -2009,7 +2032,7 @@ impl NavigationIndex {
             let Some(symbol) = document.symbols.get(*index) else {
                 continue;
             };
-            if symbol.owner_type.is_some()
+            if !document.has_unqualified_owner(*index, symbol)
                 || symbol.kind == SymbolKind::Unit
                 || symbol.local_only
                 || !(symbol.region == Region::Interface
@@ -2133,7 +2156,7 @@ impl NavigationIndex {
                 let Some(symbol) = document.symbols.get(*index) else {
                     continue;
                 };
-                if symbol.owner_type.is_some()
+                if !document.has_unqualified_owner(*index, symbol)
                     || symbol.kind == SymbolKind::Unit
                     || symbol.local_only
                     || symbol.region != Region::Interface
@@ -2411,7 +2434,10 @@ impl NavigationIndex {
         auto_import: Option<AutoImportCandidate>,
     ) -> Result<(), String> {
         check_cancel(cancel)?;
-        let Some(symbol) = self.symbol(&candidate) else {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return Ok(());
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
             return Ok(());
         };
         if !completion_symbol_kind_supported(symbol.kind)
@@ -2420,12 +2446,23 @@ impl NavigationIndex {
         {
             return Ok(());
         }
-        if self.candidate_is_conditionally_unknown(&candidate) {
+        // `candidate_is_conditionally_unknown`, on the document at hand.
+        if document
+            .conditional_unknown_symbols
+            .get(candidate.index)
+            .copied()
+            .unwrap_or(true)
+        {
             accumulator.mark_uncertain(&symbol.key, precedence);
             return Ok(());
         }
-        let Some(current_document) = self.documents.get(current_uri) else {
-            return Ok(());
+        let current_document = if candidate.uri == *current_uri {
+            document
+        } else {
+            let Some(current_document) = self.documents.get(current_uri) else {
+                return Ok(());
+            };
+            current_document
         };
         let access = if accumulator.completion_is_declaration
             && candidate.uri == *current_uri
@@ -2442,6 +2479,15 @@ impl NavigationIndex {
             offset,
         ) {
             return Ok(());
+        } else if symbol.owner_type.is_none()
+            || matches!(
+                symbol.visibility,
+                super::Visibility::Public | super::Visibility::Published
+            )
+        {
+            // What `candidate_access_decision_with_budget` answers once the
+            // symbol is available, without its lookups.
+            super::AccessDecision::Visible
         } else {
             let mut access_state = super::ResolutionState::new();
             match self.candidate_access_decision_with_budget(
@@ -3385,6 +3431,42 @@ impl NavigationIndex {
             .into_values()
             .chain(other_candidates.into_values())
             .collect()
+    }
+
+    /// The completion detail for a declaration excerpt: an enum value's
+    /// excerpt is only the value, so its enumerated type qualifies it
+    /// (l4d-qssj).
+    fn completion_excerpt(&self, candidate: &Candidate, excerpt: String) -> String {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return excerpt;
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return excerpt;
+        };
+        if symbol.kind != SymbolKind::EnumValue {
+            return excerpt;
+        }
+        // The enumerated type shares the value's scope and its declaration
+        // encloses the value, at top level, in a routine or nested in a type.
+        let enumerated = symbol.owner_type.as_ref().is_some_and(|owner| {
+            document
+                .symbol_indices_by_scope_key
+                .get(&(symbol.scope, owner.clone()))
+                .into_iter()
+                .flatten()
+                .any(|index| {
+                    document.symbols.get(*index).is_some_and(|owner| {
+                        owner.kind == SymbolKind::Type
+                            && owner.type_kind == super::TypeKind::Enum
+                            && owner.declaration_span.start <= symbol.span.start
+                            && symbol.span.end <= owner.declaration_span.end
+                    })
+                })
+        });
+        match symbol.owner_type_name.as_deref() {
+            Some(type_name) if enumerated => format!("{type_name}.{excerpt}"),
+            _ => excerpt,
+        }
     }
 
     fn declaration_display(
@@ -5354,6 +5436,32 @@ fn uses_clause_syntax_is_safe(
         return false;
     }
     !expect_entry && !expect_path && saw_import && import_index == import_spans.len()
+}
+
+/// Completion order: `canonical_name` (compared without allocating it),
+/// then spelling, declaring URI and symbol index.
+fn completion_order(
+    left: &(Option<&str>, &String, &CompletionCandidate),
+    right: &(Option<&str>, &String, &CompletionCandidate),
+) -> std::cmp::Ordering {
+    fn canonical(name: &str) -> impl Iterator<Item = u8> + '_ {
+        name.trim_start_matches('&')
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+    }
+    match (left.0, right.0) {
+        (Some(left), Some(right)) => canonical(left).cmp(canonical(right)),
+        (left, right) => left.is_some().cmp(&right.is_some()),
+    }
+    .then_with(|| left.0.cmp(&right.0))
+    .then_with(|| {
+        left.2
+            .candidate
+            .uri
+            .as_str()
+            .cmp(right.2.candidate.uri.as_str())
+    })
+    .then_with(|| left.2.candidate.index.cmp(&right.2.candidate.index))
 }
 
 fn completion_kind(kind: SymbolKind) -> CompletionItemKind {

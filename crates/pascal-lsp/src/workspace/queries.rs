@@ -4417,6 +4417,312 @@ mod tests {
         );
     }
 
+    const LEXICAL_IMPORTER: &str = "unit Importer;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+
+    /// `Shared` (declaring `SharedValue`), `Importer` (using it), `Plain`
+    /// (never spelling it) and `extra`, with settled stamps.
+    fn lexical_workspace(extra: &[(&str, Vec<u8>)]) -> (TempDir, PathBuf, Workspace) {
+        let mut files = vec![
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n").into_bytes(),
+            ),
+            ("Importer.pas", LEXICAL_IMPORTER.as_bytes().to_vec()),
+            ("Plain.pas", unit_text("Plain", "").into_bytes()),
+        ];
+        files.extend(extra.iter().cloned());
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        for (name, bytes) in &files {
+            fs::write(root.join(name), bytes).expect("source");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        (temp, root, workspace)
+    }
+
+    /// A view of `workspace` (with a store under `store` when given) whose
+    /// index of the context owning `Shared.pas` is built, then `limited`
+    /// members made Limited and `open` opened.
+    fn limited_view(
+        workspace: &Workspace,
+        root: &Path,
+        store: Option<&Path>,
+        limited: &[&str],
+        open: &[&str],
+    ) -> (Workspace, Option<crate::persistent_cache::PersistentCache>) {
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::persisting_view;
+        let (mut view, cache) = match store {
+            Some(store) => {
+                let (view, cache) = persisting_view(workspace, store);
+                (view, Some(cache))
+            }
+            None => (
+                Workspace::from_analysis_input(&workspace.analysis_input()),
+                None,
+            ),
+        };
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let progress = advance(&mut view, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        let key = view
+            .index_context_for(&anchor, &AtomicBool::new(false))
+            .expect("context");
+        for name in limited {
+            view.project_cache
+                .limit_index_member(&key, &root.join(name));
+        }
+        for name in open {
+            open_source(&mut view, &root.join(name));
+        }
+        (view, cache)
+    }
+
+    fn lexical_references(
+        input: WorkspaceInput,
+        root: &Path,
+    ) -> crate::coverage::Partial<Vec<lsp_types::Location>> {
+        references_from_input(
+            input,
+            &source_uri(&root.join("Shared.pas")),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references")
+    }
+
+    /// R9-5, both persistence modes: a Limited member whose bytes cannot
+    /// hold `SharedValue` is not bound, and the answer is complete and the
+    /// walk's.
+    #[test]
+    fn a_limited_member_without_the_name_is_excluded_lexically() {
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&[]);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Plain.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                !indexed.contains(&root.join("Plain.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert!(
+                found.coverage.is_complete(),
+                "persist {persist}: {:?}",
+                found.coverage
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            assert_eq!(found.value.len(), 2, "persist {persist}");
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_limited_member_spelling_the_name_is_still_bound() {
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&[]);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Importer.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            crate::navigation::test_reset_bound_documents();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                indexed.contains(&root.join("Importer.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert!(
+                bound_documents().contains(&source_uri(&root.join("Importer.pas"))),
+                "persist {persist}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// A member saved as UTF-16 LE spelling `SharedValue` is read, as the
+    /// walk reads it; a symbol query for `Ärger` reads its unverified
+    /// member.
+    #[test]
+    fn non_ascii_names_and_utf16_files_are_never_excluded_lexically() {
+        let mut wide = vec![0xff, 0xfe];
+        wide.extend(
+            LEXICAL_IMPORTER
+                .replace("unit Importer", "unit Wide")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let extra = [
+            ("Wide.pas", wide),
+            (
+                "Umlaut.pas",
+                unit_text("Umlaut", "const Ärger = 1;\n").into_bytes(),
+            ),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let walked_symbols = {
+                let mut open = lexical_workspace_closed(&root);
+                open_source(&mut open, &root.join("Opened.pas"));
+                symbols(&open.analysis_input(), "Ärger")
+            };
+            // The source store refuses UTF-16 (a coverage gap of the walk
+            // too), so what R9-5 must keep is the read, not a location.
+            let utf16_gap = |coverage: &crate::coverage::Coverage| {
+                coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.reason.contains("Wide.pas uses unsupported UTF-16LE"))
+            };
+            assert!(utf16_gap(&walked.coverage), "{:?}", walked.coverage);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Wide.pas", "Umlaut.pas"],
+                &["Opened.pas"],
+            );
+            let input = view.analysis_input();
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(input.clone(), &root);
+            assert!(
+                indexed_sources().contains(&root.join("Wide.pas")),
+                "persist {persist}"
+            );
+            assert!(
+                utf16_gap(&found.coverage),
+                "persist {persist}: {:?}",
+                found.coverage
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&input, "Ärger");
+            assert!(
+                indexed_sources().contains(&root.join("Umlaut.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked_symbols.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Workspace symbols match a substring of the display: a dotted unit
+    /// name and a method (display `Bar`, owner `TFoo`) held by Limited
+    /// members are found for every query the walk answers, while a member
+    /// lacking a query piece is not read.
+    #[test]
+    fn workspace_symbols_never_exclude_a_member_spelling_a_matching_display() {
+        let extra = [
+            (
+                "Vcl.Forms.pas",
+                "unit Vcl.Forms;\ninterface\nimplementation\nend.\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "Methods.pas",
+                unit_text(
+                    "Methods",
+                    "type\n  TFoo = class\n    procedure Bar;\n  end;\n",
+                )
+                .replace(
+                    "implementation\n",
+                    "implementation\nprocedure TFoo.Bar;\nbegin\nend;\n",
+                )
+                .into_bytes(),
+            ),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, mut workspace) = lexical_workspace(&extra);
+            open_source(&mut workspace, &root.join("Opened.pas"));
+            let walk_input = workspace.analysis_input();
+            let queries = ["vcl.forms", "forms", "bar", "TFoo", "foo.bar"];
+            let walked = queries.map(|query| symbol_names(&symbols(&walk_input, query).value));
+            assert!(walked[0].contains(&("Vcl.Forms".to_owned(), "Vcl.Forms.pas".to_owned())));
+            assert!(walked[1].contains(&("Vcl.Forms".to_owned(), "Vcl.Forms.pas".to_owned())));
+            assert!(
+                walked[2]
+                    .iter()
+                    .any(|(name, file)| name == "Bar" && file == "Methods.pas")
+            );
+            let workspace = lexical_workspace_closed(&root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Vcl.Forms.pas", "Methods.pas", "Plain.pas"],
+                &["Opened.pas"],
+            );
+            let input = view.analysis_input();
+            for (query, walked) in queries.iter().zip(&walked) {
+                crate::workspace::rename::test_take_indexed_sources();
+                let found = symbols(&input, query);
+                let mut names = symbol_names(&found.value);
+                let mut walked = walked.clone();
+                names.sort();
+                walked.sort();
+                assert_eq!(names, walked, "persist {persist}: {query}");
+                assert!(
+                    !indexed_sources().contains(&root.join("Plain.pas")),
+                    "persist {persist}: {query}"
+                );
+            }
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    fn lexical_workspace_closed(root: &Path) -> Workspace {
+        test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default())
+    }
+
     #[test]
     fn references_on_an_unindexed_context_search_unverified_members_directly() {
         let fixture = query_fixture();
@@ -4489,8 +4795,8 @@ mod tests {
 
     /// l4d-jeh4: 300 unverified units that never mention the name sort
     /// before the 20 importers that do. References read at most the
-    /// interactive bound directly, the members that spell the name first,
-    /// and report the rest as a gap; rename keeps the complete walk.
+    /// interactive bound directly; since R9-5 the 300 are excluded by their
+    /// bytes, so every importer is read; rename keeps the complete walk.
     #[test]
     fn references_read_a_bounded_set_of_unverified_members_likely_ones_first() {
         let temp = tempfile::tempdir().expect("temporary workspace");
@@ -4536,17 +4842,9 @@ mod tests {
         );
         let partial = computed.value.expect("a partial result, not a refusal");
         assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
-        let bound = crate::workspace::indexing::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
-        assert!(
-            partial.coverage.gaps.iter().any(|gap| gap.reason
-                == format!(
-                    "{} units of {} are not indexed yet; {bound} were searched directly",
-                    321 - bound,
-                    shared.display()
-                )),
-            "{:?}",
-            partial.coverage
-        );
+        // R9-5: the 300 never spell the name, so their bytes prove them
+        // absent and the bound reads every importer: no gap is left.
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
         let mut expected = importers
             .iter()
             .map(|path| (source_uri(path), 6, 6))

@@ -132,6 +132,7 @@ mod facts;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
+pub(crate) mod lexical;
 #[cfg(test)]
 mod navigation_walk_tests;
 #[cfg(test)]

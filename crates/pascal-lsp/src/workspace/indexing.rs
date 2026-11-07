@@ -4333,8 +4333,13 @@ impl Workspace {
         };
         let mut ranking = match selection {
             Selection::Candidates(Some(query)) => Some(UnverifiedRanking::new(query)),
+            Selection::Symbols {
+                query,
+                direct: true,
+            } => Some(UnverifiedRanking::for_symbols(query)),
             _ => None,
         };
+        let mut lexically_excluded = 0usize;
         let mut refused = 0usize;
         let mut first_refusal = None::<Box<str>>;
         let mut memory = false;
@@ -4520,15 +4525,18 @@ impl Workspace {
                 let outside = drop_outside(self, key, &mut paths);
                 outside_gap(&mut result.gaps, outside, &display);
                 if let Some(ranking) = ranking.as_mut() {
-                    ranking.rank(
+                    let absent = ranking.rank(
                         &mut paths,
                         unverified_left,
                         &|path: &Path| {
                             let key = path_key(path);
                             open.contains(&key) || taken.contains(&key) || deleted(path)
                         },
+                        &|_| true,
                         cancel,
                     );
+                    lexically_excluded += absent.len();
+                    result.baseline.extend(absent);
                 }
                 let (skipped, searched) = take_unverified(
                     paths,
@@ -4619,16 +4627,22 @@ impl Workspace {
             let outside =
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
             outside_gap(&mut result.gaps, outside, &display);
+            // A member retrying a previous refusal stays counted by the
+            // "retried later" gap, so it is bound, not excluded (l4d-1nfk).
+            let deferral_gap = searched && coverage.first_deferral.is_some();
             if searched && let Some(ranking) = ranking.as_mut() {
-                ranking.rank(
+                let absent = ranking.rank(
                     &mut unverified,
                     unverified_left,
                     &|path: &Path| {
                         let key = path_key(path);
                         open.contains(&key) || taken.contains(&key) || deleted(path)
                     },
+                    &|path: &Path| !(deferral_gap && retrying.contains(&path_key(path))),
                     cancel,
                 );
+                lexically_excluded += absent.len();
+                result.baseline.extend(absent);
             }
 
             for path in selected {
@@ -4640,7 +4654,6 @@ impl Workspace {
             let mut none_left = 0;
             // Members retrying a previous refusal are counted by the
             // "retried later" gap below, not again as not indexed yet.
-            let deferral_gap = searched && coverage.first_deferral.is_some();
             let (skipped, read) = take_unverified(
                 unverified,
                 key,
@@ -4754,6 +4767,11 @@ impl Workspace {
             ));
         }
 
+        if lexically_excluded > 0 {
+            crate::trace::trace!(
+                "  index sources: {lexically_excluded} unverified members lexically excluded"
+            );
+        }
         if refused > 0 {
             result.gaps.push(format!(
                 "{refused} units could not be indexed: {}",
@@ -4967,6 +4985,9 @@ const MAX_UNVERIFIED_RANKING_FILE_BYTES: u64 = 16 * 1024 * 1024;
 struct UnverifiedRanking {
     names: Vec<String>,
     units: Vec<String>,
+    /// `names` are the pieces of a workspace-symbol query: a member is
+    /// absent when one of them does not occur.
+    symbols: bool,
     bytes_left: u64,
 }
 
@@ -4999,18 +5020,42 @@ impl UnverifiedRanking {
         Self {
             names,
             units,
+            symbols: false,
             bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
         }
     }
 
-    /// Orders `paths` (in path order) so the members likely to hold an
-    /// occurrence come first: those whose text spells a name and, for
+    /// The ranking of a workspace-symbol request: its needles are the
+    /// identifier pieces of `query` (`lexical::symbol_needles`); a query
+    /// with a non-ASCII piece, or none, reads nothing.
+    fn for_symbols(query: &str) -> Self {
+        let mut names = super::lexical::symbol_needles(query);
+        if names.iter().any(|piece| !piece.is_ascii()) {
+            names.clear();
+        }
+        Self {
+            names,
+            units: Vec::new(),
+            symbols: true,
+            bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
+        }
+    }
+
+    /// Removes from `paths` the members whose raw text proves the names
+    /// absent (R9-5, `lexical::proves_absent`) and returns them, each with
+    /// the stamp taken before its bytes were read, so a write racing the
+    /// read fails revalidation. Only members `provable` selects are
+    /// excluded.
+    ///
+    /// Then orders the rest (in path order) so the members likely to hold
+    /// an occurrence come first: those whose text spells a name and, for
     /// top-level members, a name of a declaring unit (an importer); then
-    /// those spelling a name; then the unread; then the rest. Only the
-    /// order changes, never the set, so the bound alone decides what is
-    /// left out. Nothing is read when `left` already covers every path.
-    /// Paths `unread` selects (open, deleted or already taken) do not use
-    /// the bound, so they are neither read nor counted.
+    /// those spelling a name; then the unread; then the rest. The ordering
+    /// never changes the set, so the bound alone decides what is left out.
+    /// Every path is read, within the byte budget, even when `left`
+    /// covers them all: the bound decides what is bound, the proof only
+    /// saves binds. Paths `unread` selects (open, deleted or already
+    /// taken) do not use the bound, so they are neither read nor excluded.
     ///
     /// The scan is a byte search over the raw file: a UTF-16 file, or an
     /// importer spelling the name only through an include, ranks last.
@@ -5019,61 +5064,77 @@ impl UnverifiedRanking {
         paths: &mut Vec<PathBuf>,
         left: usize,
         unread: &dyn Fn(&Path) -> bool,
+        provable: &dyn Fn(&Path) -> bool,
         cancel: &AtomicBool,
-    ) {
-        if self.names.is_empty() || paths.iter().filter(|path| !unread(path)).count() <= left {
-            return;
+    ) -> Vec<(PathBuf, Option<PathStamp>)> {
+        if self.names.is_empty() {
+            return Vec::new();
         }
         let started = std::time::Instant::now();
+        let order = paths.iter().filter(|path| !unread(path)).count() > left;
         let mut likely = 0usize;
         let mut tiers = Vec::with_capacity(paths.len());
         for path in paths.iter() {
-            let tier = if unread(path)
-                || likely >= left
-                || cancel.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                2
+            let tier = if unread(path) || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                Ok(2)
             } else {
                 match self.read(path) {
-                    None => 2,
-                    Some(text) => {
-                        let named = self
-                            .names
-                            .iter()
-                            .any(|name| crate::navigation::text_mentions_name(&text, name));
-                        let imports = self.units.is_empty()
-                            || self
-                                .units
-                                .iter()
-                                .any(|unit| crate::navigation::text_mentions_name(&text, unit));
-                        match (named, imports) {
-                            (true, true) => 0,
-                            (true, false) => 1,
-                            (false, _) => 3,
+                    None => Ok(2),
+                    Some((stamp, text)) => {
+                        if stamp.is_some()
+                            && provable(path)
+                            && super::lexical::proves_absent(&text, &self.names, self.symbols)
+                        {
+                            Err(stamp)
+                        } else {
+                            let mentions =
+                                |name: &String| crate::navigation::text_mentions_name(&text, name);
+                            let named = if self.symbols {
+                                self.names.iter().all(mentions)
+                            } else {
+                                self.names.iter().any(mentions)
+                            };
+                            let imports = self.units.is_empty() || self.units.iter().any(mentions);
+                            Ok(match (named, imports) {
+                                (true, true) => 0,
+                                (true, false) => 1,
+                                (false, _) => 3,
+                            })
                         }
                     }
                 }
             };
-            if tier == 0 {
+            if matches!(tier, Ok(0)) {
                 likely += 1;
             }
             tiers.push(tier);
         }
-        let mut ranked = std::mem::take(paths)
-            .into_iter()
-            .zip(tiers)
-            .collect::<Vec<_>>();
-        ranked.sort_by_key(|(_, tier)| *tier);
+        let mut absent = Vec::new();
+        let mut ranked = Vec::with_capacity(paths.len());
+        for (path, tier) in std::mem::take(paths).into_iter().zip(tiers) {
+            match tier {
+                Ok(tier) => ranked.push((path, tier)),
+                Err(stamp) => absent.push((path, stamp)),
+            }
+        }
+        if order {
+            ranked.sort_by_key(|(_, tier)| *tier);
+        }
         crate::trace::trace!(
-            "  unverified ranking: {} members, {likely} likely, bound {left}, {:.1} ms",
+            "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms",
             ranked.len(),
+            absent.len(),
             started.elapsed().as_secs_f64() * 1000.0
         );
         paths.extend(ranked.into_iter().map(|(path, _)| path));
+        absent
     }
 
-    fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
+    /// The stamp, taken before the read, and the bytes of `path` within
+    /// the budget.
+    fn read(&mut self, path: &Path) -> Option<(Option<PathStamp>, Vec<u8>)> {
         use std::io::Read;
+        let stamp = path_stamp(path);
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
         if len > MAX_UNVERIFIED_RANKING_FILE_BYTES || len > self.bytes_left {
@@ -5082,7 +5143,7 @@ impl UnverifiedRanking {
         self.bytes_left -= len;
         let mut text = Vec::with_capacity(len as usize);
         file.take(len).read_to_end(&mut text).ok()?;
-        Some(text)
+        Some((stamp, text))
     }
 }
 
@@ -5188,12 +5249,14 @@ pub(in crate::workspace) mod tests {
         });
         let mut paths = vec![a.clone(), b.clone(), c.clone()];
         let taken = path_key(&a);
-        ranking.rank(
+        let absent = ranking.rank(
             &mut paths,
             1,
             &|path: &Path| path_key(path) == taken,
+            &|path: &Path| *path != b,
             &AtomicBool::new(false),
         );
+        assert!(absent.is_empty(), "{absent:?}");
         let c_at = paths.iter().position(|path| *path == c).unwrap();
         let b_at = paths.iter().position(|path| *path == b).unwrap();
         assert!(c_at < b_at, "{paths:?}");
@@ -7492,8 +7555,9 @@ pub(in crate::workspace) mod tests {
         let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
         let _caps = override_caps(|caps| caps.unverified = Some(3));
         let input = workspace.analysis_input();
+        // Every member spells `P`, so none is excluded lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P0".to_owned()],
+            names: vec!["P".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };
@@ -7640,6 +7704,186 @@ pub(in crate::workspace) mod tests {
         );
         assert_eq!(source_names(&found), ["Plain.pas"]);
         assert_eq!(workspace.project_cache.take_index_requests(), [anchor]);
+    }
+
+    fn baselined(found: &IndexedSources, path: &Path) -> bool {
+        found
+            .baseline
+            .iter()
+            .any(|(baselined, stamp)| baselined == path && stamp.is_some())
+    }
+
+    /// R9-5: a Limited member whose bytes cannot hold `SharedValue` is
+    /// proved current by its stamp instead of read, although the bound
+    /// would have read it.
+    #[test]
+    fn a_limited_member_without_the_name_is_left_out_with_its_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.limit_index_member(&key, &plain);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+        assert!(baselined(&found, &plain), "{:?}", found.baseline);
+        assert_eq!(state(&workspace, &key, &plain), Some(MemberState::Limited));
+    }
+
+    #[test]
+    fn a_limited_member_spelling_the_name_is_still_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let user = root.join("lib/User.pas");
+        workspace.project_cache.limit_index_member(&key, &user);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(!baselined(&found, &user), "{:?}", found.baseline);
+    }
+
+    /// An include may spell the name, a UTF-16 file hides it from a byte
+    /// search, and a non-ASCII name has no byte spelling: none is excluded.
+    #[test]
+    fn includes_utf16_files_and_non_ascii_names_are_never_excluded_lexically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let included = root.join("lib/Included.pas");
+        write(
+            &included,
+            "unit Included;\ninterface\n{$I Values.inc}\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/Values.inc"), "const Copy = SharedValue;\n");
+        let wide = root.join("lib/Wide.pas");
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(
+            USER.replace("unit User", "unit Wide")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        fs::write(&wide, bytes).unwrap();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        for path in [&included, &wide, &plain] {
+            workspace.project_cache.mark_index_stale(&key, path);
+        }
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        let names = source_names(&found);
+        assert!(names.contains(&"Included.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Wide.pas".to_owned()), "{names:?}");
+        assert!(!names.contains(&"Plain.pas".to_owned()), "{names:?}");
+
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&CandidateQuery {
+                names: vec!["Ärger".to_owned()],
+                top_level_units: None,
+                aliases: Vec::new(),
+            }),
+            &[],
+        );
+        assert!(
+            source_names(&found).contains(&"Plain.pas".to_owned()),
+            "{:?}",
+            found.sources
+        );
+    }
+
+    /// The symbol needles are the query's identifier pieces: a Limited
+    /// member lacking one is left out, one spelling them all is read, and a
+    /// non-ASCII query reads its unverified member.
+    #[test]
+    fn a_symbols_request_leaves_out_unverified_members_lacking_a_query_piece() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let forms = root.join("lib/Vcl.Forms.pas");
+        write(
+            &forms,
+            "unit Vcl.Forms;\ninterface\nconst Ärger = 1;\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.mark_index_stale(&key, &forms);
+        workspace.project_cache.limit_index_member(&key, &plain);
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let symbols = |workspace: &mut Workspace, query: &str| {
+            workspace
+                .indexed_symbols(
+                    &input,
+                    &one_target(&key, &anchor),
+                    query,
+                    true,
+                    &[],
+                    &cancel,
+                )
+                .expect("indexed symbols")
+                .0
+        };
+        for query in ["vcl.forms", "Forms", "s.f"] {
+            let found = symbols(&mut workspace, query);
+            assert_eq!(source_names(&found), ["Vcl.Forms.pas"], "{query}");
+            assert!(baselined(&found, &plain), "{query}: {:?}", found.baseline);
+            assert!(found.gaps.is_empty(), "{query}: {:?}", found.gaps);
+        }
+        let found = symbols(&mut workspace, "Ärger");
+        assert_eq!(
+            source_names(&found),
+            ["Plain.pas", "Vcl.Forms.pas"],
+            "{:?}",
+            found.baseline
+        );
+        let found = symbols(&mut workspace, "vcl.dialogs");
+        assert!(source_names(&found).is_empty(), "{:?}", found.sources);
+        assert!(baselined(&found, &forms) && baselined(&found, &plain));
+    }
+
+    /// The stamp that proves an excluded member current is the one taken
+    /// before its bytes were read.
+    #[test]
+    fn a_lexical_exclusion_carries_the_stamp_taken_before_the_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("Plain.pas");
+        write(&plain, PLAIN);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let before = path_stamp(&plain).expect("stamp");
+        let mut ranking = UnverifiedRanking::new(&shared_query(None));
+        let mut paths = vec![plain.clone()];
+        let absent = ranking.rank(
+            &mut paths,
+            MAX_INTERACTIVE_UNVERIFIED_CANDIDATES,
+            &|_| false,
+            &|_| true,
+            &AtomicBool::new(false),
+        );
+        assert!(paths.is_empty(), "{paths:?}");
+        assert_eq!(absent.len(), 1);
+        let (path, stamp) = &absent[0];
+        assert_eq!(*path, plain);
+        assert!(stamp.as_ref().expect("stamp").proves_unchanged(&before));
     }
 
     fn lib_scope(root: &Path) -> crate::catalogue::CatalogueKey {
@@ -8011,8 +8255,9 @@ pub(in crate::workspace) mod tests {
         workspace.project_cache = crate::project_cache::ProjectCache::new(64);
         let _caps = override_caps(|caps| caps.unverified = Some(2));
         let input = workspace.analysis_input();
+        // Every member spells `P`, so none is excluded lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P0".to_owned()],
+            names: vec!["P".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };
@@ -8204,9 +8449,10 @@ pub(in crate::workspace) mod tests {
         let (mut workspace, requesting, p1, _) = two_projects(root);
         let _caps = override_caps(|caps| caps.small_sources = Some(0));
         let sources = references_of_target(&mut workspace, &requesting);
+        // P1.dpr never spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
-            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas"]
+            ["P1/U.pas", "P1/V.pas", "P1/W.pas"]
         );
         assert!(
             sources.gaps.contains(
@@ -8230,9 +8476,10 @@ pub(in crate::workspace) mod tests {
         let _ = workspace.project_cache.take_index_requests();
         let _caps = override_caps(|caps| caps.small_sources = Some(0));
         let sources = references_of_target(&mut workspace, &requesting);
+        // P1.dpr never spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
-            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas"]
+            ["P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas"]
         );
         assert!(
             sources.gaps.contains(
@@ -8250,17 +8497,11 @@ pub(in crate::workspace) mod tests {
         let root = temp.path();
         let (mut workspace, requesting, p1, p2) = two_projects(root);
         let sources = references_of_target(&mut workspace, &requesting);
+        // Neither .dpr spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
             [
-                "P1/P1.dpr",
-                "P1/U.pas",
-                "P1/V.pas",
-                "P1/W.pas",
-                "P2/P2.dpr",
-                "P2/U.pas",
-                "P2/V.pas",
-                "P2/W.pas"
+                "P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas", "P2/V.pas", "P2/W.pas"
             ]
         );
         let requests = workspace.project_cache.take_index_requests();

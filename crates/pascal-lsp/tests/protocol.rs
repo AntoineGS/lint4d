@@ -10655,6 +10655,63 @@ fn completion_offers_imported_and_auto_imported_unscoped_enum_values() {
     server.shutdown();
 }
 
+/// l4d-qssj fix round 1 (dcc 37.0 `1qta-r1/P1-P3`, `P5-P7`): the values of
+/// an enum nested in a non-public class or record section are unit-scope
+/// names importers can use, so auto-import offers them with a `uses` edit.
+#[test]
+fn completion_auto_imports_non_public_nested_enum_values() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider_path = temp.path().join("NestedProvider.pas");
+    let main_path = temp.path().join("NestedMain.pas");
+    let provider_source = "unit NestedProvider;\ninterface\ntype\n  TC = class\n  strict private\n    type TE = (npOne, npTwo);\n  public\n    F: TE;\n  end;\n  TR = record\n  private\n    type TQ = (nrOne);\n  end;\nimplementation\nend.\n";
+    let main_source = "unit NestedMain;\ninterface\nimplementation\nprocedure Run;\nbegin\n  Log(np);\n  Log(nr);\nend;\nend.\n";
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (id, needle, expected) in [
+        ("nested-private", "Log(np", vec!["npOne", "npTwo"]),
+        ("nested-record", "Log(nr", vec!["nrOne"]),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(main_source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        let mut items = result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .map(|item| {
+                (
+                    item["label"].as_str().unwrap_or_default().to_owned(),
+                    item["additionalTextEdits"][0]["newText"]
+                        .as_str()
+                        .map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>();
+        items.sort();
+        assert_eq!(
+            items,
+            expected
+                .into_iter()
+                .map(|label| (label.to_owned(), Some("uses NestedProvider;\n".to_owned())))
+                .collect::<Vec<_>>(),
+            "{needle}"
+        );
+    }
+    server.shutdown();
+}
+
 #[test]
 fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
     let temp = tempfile::tempdir().expect("temporary workspace");

@@ -17984,10 +17984,13 @@ fn completion_offers_nested_enum_values_as_unit_scope_names() {
         (&consumer_uri, consumer, "CN.kB", "kBranch"),
     ] {
         let list = completion_after(&index, uri, text, needle, 0);
-        assert!(
-            completion_item(&list, label).is_some(),
-            "{needle}: {:?}",
-            list.items
+        let item =
+            completion_item(&list, label).unwrap_or_else(|| panic!("{needle}: {:?}", list.items));
+        // l4d-qssj fix round 1: a nested enum type qualifies its values too.
+        assert_eq!(
+            item.detail.as_deref(),
+            Some(format!("TKind.{label}").as_str()),
+            "{needle}"
         );
     }
 }
@@ -18006,11 +18009,8 @@ fn completion_omits_routine_local_enum_values_before_their_declaration() {
         before.items
     );
     let after = completion_after(&index, &source_uri, source, "L := lA", 0);
-    assert!(
-        completion_item(&after, "lAlpha").is_some(),
-        "{:?}",
-        after.items
-    );
+    let item = completion_item(&after, "lAlpha").unwrap_or_else(|| panic!("{:?}", after.items));
+    assert_eq!(item.detail.as_deref(), Some("TL.lAlpha"));
 }
 
 /// l4d-qssj: anonymous enum values stay unqualified under SCOPEDENUMS ON
@@ -18043,6 +18043,115 @@ fn completion_marks_unknown_scoping_enum_values_uncertain() {
         completion_item(&list, "Green").is_none(),
         "{:?}",
         list.items
+    );
+    assert!(list.is_incomplete);
+}
+
+/// l4d-qssj fix round 1 (dcc 37.0 `~/.cache/l4d-tmp/1qta-r1/` P1-P3, P5-P7,
+/// with `PV.pas`, `PW.pas`): the values of an enum nested in a private,
+/// strict private, protected or strict protected class section, or in a
+/// record's private section, are unit-scope names an importer can use,
+/// unqualified and as `Unit.Value`; only the qualified `TC.TE.pB` is E2361.
+const NON_PUBLIC_NESTED_PROVIDER: &str = "unit PV;\ninterface\ntype\n  TC = class\n  private\n    type TE = (pvA, pvB);\n  public\n    F: TE;\n  end;\n  TS = class\n  strict private\n    type TE2 = (xsA, xsB);\n  public\n    G: TE2;\n  end;\n  TP = class\n  protected\n    type TE3 = (ptA, ptB);\n  strict protected\n    type TE4 = (qsA, qsB);\n  end;\n  TR = record\n  private\n    type TQ = (rpA, rpB);\n  end;\nimplementation\nprocedure Local;\nvar O: TC; S: TS;\nbegin\n  O.F := pvA;\n  S.G := xsA;\nend;\nend.\n";
+
+#[test]
+fn nested_enum_values_in_non_public_sections_bind_from_importers() {
+    let provider = NON_PUBLIC_NESTED_PROVIDER;
+    let consumer = "unit PUse;\ninterface\nuses PV;\nimplementation\nprocedure Run;\nvar N: Integer;\nbegin\n  N := Ord(pvB);\n  N := Ord(xsB);\n  N := Ord(ptB);\n  N := Ord(qsB);\n  N := Ord(rpB);\n  N := Ord(PV.pvB) + Ord(PV.xsB) + Ord(PV.qsB) + Ord(PV.rpB);\nend;\nend.\n";
+    let provider_uri = uri("PV");
+    let consumer_uri = uri("PUse");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("PV", &provider_uri)])],
+    );
+    for (name, occurrence) in [
+        ("pvB", 0),
+        ("xsB", 0),
+        ("ptB", 0),
+        ("qsB", 0),
+        ("rpB", 0),
+        ("pvB", 1),
+        ("xsB", 1),
+        ("qsB", 1),
+        ("rpB", 1),
+    ] {
+        let declaration = position_of(provider, &format!(" {name})"), 0);
+        let declaration = Position::new(declaration.line, declaration.character + 1);
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, name, occurrence),
+            vec![(provider_uri.clone(), declaration)],
+            "{name} #{occurrence}"
+        );
+    }
+    // In the declaring unit, outside the class (PV.pas `Local`).
+    assert_eq!(
+        declaration_of(&index, &provider_uri, provider, "pvA", 1),
+        vec![(provider_uri.clone(), position_of(provider, "pvA", 0))]
+    );
+}
+
+#[test]
+fn completion_offers_non_public_nested_enum_values_to_importers() {
+    let provider = NON_PUBLIC_NESTED_PROVIDER;
+    let consumer = "unit PUse;\ninterface\nuses PV;\nimplementation\nprocedure Run;\nbegin\n  Log(xs);\n  Log(PV.rp);\nend;\nend.\n";
+    let provider_uri = uri("PV");
+    let consumer_uri = uri("PUse");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("PV", &provider_uri)])],
+    );
+    for (needle, expected) in [("Log(xs", ["xsA", "xsB"]), ("PV.rp", ["rpA", "rpB"])] {
+        let list = completion_after(&index, &consumer_uri, consumer, needle, 0);
+        let mut labels = list
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        assert_eq!(labels, expected, "{needle}");
+        assert!(!list.is_incomplete, "{needle}");
+    }
+}
+
+/// l4d-qssj fix round 1: past `MAX_COMPLETION_ITEMS` (256) completion keeps
+/// the first items in name order (case-insensitive, then exact spelling)
+/// and reports the list incomplete.
+#[test]
+fn completion_past_the_item_cap_keeps_the_first_items_in_name_order() {
+    let mut source = String::from("unit CO;\ninterface\ntype\n");
+    let mut names = Vec::new();
+    for enumeration in 0..30 {
+        let values = (0..20)
+            .map(|value| {
+                // Interleave declaration order and case against name order.
+                let number = (value * 37 + enumeration * 11) % 600;
+                let name = if number % 2 == 0 {
+                    format!("vX{number:03}e{enumeration}")
+                } else {
+                    format!("Vx{number:03}e{enumeration}")
+                };
+                names.push(name.clone());
+                name
+            })
+            .collect::<Vec<_>>();
+        writeln!(source, "  TE{enumeration} = ({});", values.join(", ")).expect("write");
+    }
+    source.push_str("implementation\nprocedure Run;\nbegin\n  vx;\nend;\nend.\n");
+    let source_uri = uri("CO");
+    let index = indexed(&[(&source_uri, &source)], &[]);
+    let list = completion_after(&index, &source_uri, &source, "  vx", 0);
+    names.sort_by(|left, right| {
+        left.to_ascii_lowercase()
+            .cmp(&right.to_ascii_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    names.truncate(256);
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>(),
+        names
     );
     assert!(list.is_incomplete);
 }

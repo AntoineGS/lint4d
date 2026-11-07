@@ -1562,6 +1562,11 @@ fn run_index_job(
             IndexMode::Reuse => return stopped(!job.cancel.load(Ordering::Relaxed)),
         }
     }
+    // Like the crawl's, an index batch's slot claims yield to interactive
+    // work rather than inherit the role the thread's last job set.
+    crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::yielding(
+        job.cancel.clone(),
+    ));
     let _span = crate::trace::Span::new(|| format!("warm index {anchor:?} ({mode:?})"));
     let started = Instant::now();
     let mut workspace = Workspace::from_analysis_input(&job.job_input(persisting));
@@ -1583,7 +1588,12 @@ fn run_index_job(
     // A reuse pass validates on the free general analysis slots (R8-1);
     // its workers stop at their next member once interactive work arrives,
     // and the extra ones as diagnostics take the slots.
-    let may_run = || gate.index_may_run_now() && !job.cancel.load(Ordering::Relaxed);
+    // Extraction workers also stop for a queued crawl, as `before_io` does.
+    let may_run = || {
+        gate.index_may_run_now()
+            && !job.cancel.load(Ordering::Relaxed)
+            && (mode == IndexMode::Reuse || !crawl_pending.load(Ordering::Relaxed))
+    };
     let workers = || gate.validation_threads();
     let validation = crate::workspace::indexing::ParallelValidation {
         threads: gate.validation_threads(),

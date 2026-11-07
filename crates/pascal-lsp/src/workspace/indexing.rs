@@ -963,7 +963,10 @@ enum Prefetched {
 
 /// The hand-off between a parallel reuse batch and its workers. Members are
 /// taken in order and at most `window` past the one the batch applies, so
-/// at most `window` members' facts are alive at once (D41).
+/// at most `window` members' results (decoded facts, or a prepared
+/// publication and its reservation) are alive at once, the one the batch
+/// applies included: a worker takes member `n` only while
+/// `n < done + window` (D41).
 struct Pipeline {
     state: std::sync::Mutex<PipelineState>,
     changed: std::sync::Condvar,
@@ -1234,6 +1237,12 @@ fn prefetch_loop(
     cancel: &AtomicBool,
     mut find: impl FnMut(&Path) -> Prefetched,
 ) {
+    // Its slot claims yield to interactive work, as the warmer's do, and
+    // count as cancelled once the batch stops or interactive work trips it:
+    // an interactive lookup takes them over rather than wait (13c-3 I1).
+    crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::yielding(
+        Arc::clone(&pipeline.tripped),
+    ));
     while let Some((position, allowed)) =
         pipeline.take_next(members.len(), worker, validation.workers)
     {
@@ -1273,7 +1282,10 @@ enum Extraction {
     /// stays pending.
     Failed(String),
     Refused(String),
-    /// The file is gone: its directory listing changed.
+    /// The file is gone: its directory listing changed. Seen by the
+    /// worker after the load, as the serial loop sees it; the batch only
+    /// invalidates the path, so a file back by then is relisted and
+    /// extracted by a later batch.
     Vanished,
     Deferred(String),
     PastDeadline,
@@ -1956,6 +1968,13 @@ impl Workspace {
     /// publishes, records and counts. `None` when no worker could start;
     /// otherwise the members retrying an earlier refusal, which the batch
     /// extracts last.
+    ///
+    /// Memory: each worker's view holds what a serial batch's view holds
+    /// for the members it loads (their dependencies' parses and sessions,
+    /// under the parse budget's reservations and leases), so the views hold
+    /// at most `threads` times a serial batch's; the views themselves (the
+    /// owners copied, maps) are not charged to `maxCacheBytes`, as the
+    /// batch's own view is not. They drop with the batch.
     #[allow(clippy::too_many_arguments)]
     fn extract_in_parallel(
         &mut self,
@@ -2688,32 +2707,36 @@ impl Workspace {
         let stamps = slot_stamps(path, own_stamp, &slots, observed);
         let member = MemberFacts::from_facts(path, &facts.extracted.facts, slots);
         let hash = facts.root_content_hash.unwrap_or(0);
-        let (prepared, unprovable) =
-            if self.may_publish(key) && self.persistent_cache().is_enabled() {
-                let prepared = self.prepare_from_facts(uri, facts, cancel).map(|artifact| {
-                    let transient = reserve.then(|| {
-                        self.project_cache
-                            .reserve_publication(artifact.transient_bytes())
-                    });
-                    PreparedPublication {
-                        artifact,
-                        transient,
-                    }
+        // Facts known over a fixed limit are never written: the batch
+        // records them artifact-less without a prepared publication.
+        let (prepared, unprovable) = if self.may_publish(key)
+            && self.persistent_cache().is_enabled()
+            && !self.known_over_limit(key, path, hash)
+        {
+            let prepared = self.prepare_from_facts(uri, facts, cancel).map(|artifact| {
+                let transient = reserve.then(|| {
+                    self.project_cache
+                        .reserve_publication(artifact.transient_bytes())
                 });
-                let unprovable = matches!(
-                    prepared,
-                    Err(super::persist::PersistError::Evidence(
-                        super::evidence::EvidenceGap::Uncaptured
-                    ))
-                )
-                .then(|| {
-                    self.uncaptured_input(uri)
-                        .unwrap_or(("unknown", String::new()))
-                });
-                (Some(prepared), unprovable)
-            } else {
-                (None, None)
-            };
+                PreparedPublication {
+                    artifact,
+                    transient,
+                }
+            });
+            let unprovable = matches!(
+                prepared,
+                Err(super::persist::PersistError::Evidence(
+                    super::evidence::EvidenceGap::Uncaptured
+                ))
+            )
+            .then(|| {
+                self.uncaptured_input(uri)
+                    .unwrap_or(("unknown", String::new()))
+            });
+            (Some(prepared), unprovable)
+        } else {
+            (None, None)
+        };
         Extraction::Facts(Box::new(ExtractedMember {
             member,
             stamps,
@@ -10067,6 +10090,141 @@ pub(in crate::workspace) mod tests {
                     assert!(progress.complete, "{progress:?}");
                     // The units and `App.dpr`, each indexed once.
                     assert_eq!(sums.indexed + fresh, UNITS + 1, "{sums:?}");
+                    cache.shutdown();
+                }
+
+                /// Fix round 1 (I1): an extraction worker's slot claims yield
+                /// to interactive work, as the warmer's do: an interactive
+                /// lookup of a slot a worker computes takes the claim over
+                /// rather than waiting or computing it detached.
+                #[test]
+                fn an_interactive_lookup_takes_over_an_extraction_workers_claim() {
+                    use crate::project_cache::{ClaimRole, Lookup, set_claim_role_on_this_thread};
+                    let temp = tempfile::tempdir().unwrap();
+                    let (session, key, anchor) = extraction_project(temp.path(), 4, 6);
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let context = Arc::clone(&session.contexts.get(&key).unwrap().context);
+                    let project_cache = view.project_cache().clone();
+                    let probe = Url::from_file_path(temp.path().join("Probe.pas")).unwrap();
+                    let taken = Arc::new(std::sync::Mutex::new(None));
+                    let (once, outcome) = (Arc::new(AtomicBool::new(false)), Arc::clone(&taken));
+                    let batch = std::thread::current().id();
+                    set_worker_extract_hook(Some(Arc::new(move |_, _| {
+                        if std::thread::current().id() == batch || once.swap(true, Ordering::SeqCst)
+                        {
+                            return;
+                        }
+                        // The worker claims a slot it computes...
+                        let no = AtomicBool::new(false);
+                        let Lookup::Compute(claim) =
+                            project_cache.unit(&probe, &context, 1, &HashMap::new(), &no)
+                        else {
+                            panic!("the worker claims the probe slot");
+                        };
+                        assert!(!claim.is_detached());
+                        // ...and an interactive lookup meets the claim.
+                        let (cache, context, probe) =
+                            (project_cache.clone(), Arc::clone(&context), probe.clone());
+                        let detached = std::thread::spawn(move || {
+                            set_claim_role_on_this_thread(ClaimRole::interactive(
+                                Arc::new(AtomicBool::new(false)),
+                                Duration::ZERO,
+                            ));
+                            match cache.unit(
+                                &probe,
+                                &context,
+                                1,
+                                &HashMap::new(),
+                                &AtomicBool::new(false),
+                            ) {
+                                Lookup::Compute(claim) => Some(claim.is_detached()),
+                                _ => None,
+                            }
+                        })
+                        .join()
+                        .unwrap();
+                        *outcome.lock().unwrap() = Some(detached);
+                        drop(claim);
+                    })));
+                    let progress = extraction_batch(
+                        &mut view,
+                        &anchor,
+                        IndexBound::all(),
+                        2,
+                        &|| true,
+                        &AtomicBool::new(false),
+                    );
+                    set_worker_extract_hook(None);
+                    assert!(progress.unwrap().complete);
+                    assert_eq!(
+                        *taken.lock().unwrap(),
+                        Some(Some(false)),
+                        "the interactive lookup took the worker's claim over"
+                    );
+                    cache.shutdown();
+                }
+
+                /// Fix round 1 (I2), M2 on the extraction path: a member a
+                /// worker extracted, rewritten (another size) and invalidated
+                /// before the batch applies it, is extracted again by the
+                /// batch: the index and the record hold the new content, and
+                /// the store holds what a serial run of the new tree does.
+                #[test]
+                fn an_event_after_a_workers_extraction_is_extracted_again_by_the_batch() {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (_, key, anchor) = extraction_project(temp.path(), 4, 12);
+                    let edited = temp.path().join("d03/U0003.pas");
+                    let (session, _, _) = extraction_session(temp.path());
+                    let store = private_dir();
+                    let (mut view, cache) = persisting_view(&session, store.path());
+                    let project_cache = view.project_cache().clone();
+                    let target = edited.clone();
+                    let rewritten = Rc::new(Cell::new(false));
+                    let flag = Rc::clone(&rewritten);
+                    set_before_apply_hook(Some(Box::new(move |path| {
+                        if path == target && !flag.replace(true) {
+                            write(
+                                &target,
+                                "unit U0003;\ninterface\n{$I Shared.inc}\nprocedure Rewritten3;\nimplementation\nprocedure Rewritten3;\nbegin\nend;\nend.\n",
+                            );
+                            project_cache.invalidate_path(&target);
+                        }
+                    })));
+                    let progress = extraction_batch(
+                        &mut view,
+                        &anchor,
+                        IndexBound::all(),
+                        3,
+                        &|| true,
+                        &AtomicBool::new(false),
+                    );
+                    set_before_apply_hook(None);
+                    let progress = progress.unwrap();
+                    assert!(rewritten.get());
+                    assert!(
+                        !take_validation_takes().is_empty(),
+                        "the batch ran on workers"
+                    );
+                    assert!(progress.complete, "{progress:?}");
+                    assert_eq!(state(&view, &key, &edited), Some(MemberState::Fresh));
+                    assert_eq!(selected(&view, &key, "Rewritten3"), vec![edited.clone()]);
+                    assert!(selected(&view, &key, "P3").is_empty());
+                    assert!(
+                        records(&view, &key)
+                            .iter()
+                            .any(|(path, record)| *path == edited && record.is_some()),
+                        "the new content is recorded"
+                    );
+                    let parallel = store_content(&cache);
+                    cache.shutdown();
+                    // A serial run of the rewritten tree publishes the same
+                    // store: nothing of the old bytes was published.
+                    let (session, _, _) = extraction_session(temp.path());
+                    let other = private_dir();
+                    let (mut serial, cache) = persisting_view(&session, other.path());
+                    assert!(advance(&mut serial, &anchor, IndexBound::all()).complete);
+                    assert_eq!(parallel, store_content(&cache));
                     cache.shutdown();
                 }
 

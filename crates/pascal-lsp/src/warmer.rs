@@ -20,6 +20,10 @@ const MAX_INDEX_ANCHORS: usize = 16;
 #[derive(Default)]
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
+    /// Workspace-wide client requests the user waits on (references,
+    /// workspace symbols, rename), queued or running: the warmer alone pauses
+    /// for them; diagnostics and cache maintenance do not (l4d-ig6b).
+    warm_busy: std::sync::atomic::AtomicUsize,
     idle: Condvar,
     /// Queued Interactive and Bulk client requests, which wait for a worker
     /// and could take a lent slot (queued pull diagnostics are not counted).
@@ -42,7 +46,42 @@ impl InteractiveGate {
         }
     }
 
+    pub(crate) fn set_warm_busy(&self, busy: usize) {
+        self.warm_busy.store(busy, Ordering::Relaxed);
+        if busy == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn warm_may_run(&self, busy: usize) -> bool {
+        busy == 0 && self.warm_busy.load(Ordering::Relaxed) == 0
+    }
+
+    /// `wait_idle` for the warmer: it also waits while a workspace-wide
+    /// client request runs or waits.
+    pub(crate) fn wait_warm_idle(&self, cancel: &AtomicBool) -> bool {
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.warm_may_run(*busy) {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            busy = self
+                .idle
+                .wait_timeout(busy, Duration::from_millis(25))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !cancel.load(Ordering::Relaxed)
+    }
+
+    /// `try_wait_idle` for the warmer, as `wait_warm_idle`.
+    pub(crate) fn try_wait_warm_idle(&self, cancel: &AtomicBool) -> bool {
+        self.try_wait_idle(cancel)
+            && self.warm_may_run(*self.busy.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Returns `false` if cancelled while interactive work was pending.
+    #[cfg(test)]
     pub(crate) fn wait_idle(&self, cancel: &AtomicBool) -> bool {
         let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
         while *busy > 0 {
@@ -958,7 +997,7 @@ fn run_index_job(
             generation: job.generation,
         });
     };
-    if !gate.wait_idle(&job.cancel) {
+    if !gate.wait_warm_idle(&job.cancel) {
         return stopped(!job.cancel.load(Ordering::Relaxed));
     }
     let _span = crate::trace::Span::new(|| format!("warm index {anchor:?}"));
@@ -968,7 +1007,7 @@ fn run_index_job(
         &anchor,
         IndexBound::units(INDEX_BATCH_UNITS),
         &mut || {
-            if !crawl_pending.load(Ordering::Relaxed) && gate.try_wait_idle(&job.cancel) {
+            if !crawl_pending.load(Ordering::Relaxed) && gate.try_wait_warm_idle(&job.cancel) {
                 Ok(())
             } else {
                 Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
@@ -1034,7 +1073,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             open_epoch,
         });
     };
-    if !gate.wait_idle(&job.cancel) {
+    if !gate.wait_warm_idle(&job.cancel) {
         return end(None, Vec::new());
     }
     crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::yielding(
@@ -1069,7 +1108,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
         }
         crate::trace::trace!("  warm unit {done}/{total} {}", unit_name(unit));
         // Pause between units while interactive requests run.
-        if done == total || hook_gate.try_wait_idle(&hook_cancel) {
+        if done == total || hook_gate.try_wait_warm_idle(&hook_cancel) {
             Ok(())
         } else {
             if !hook_cancel.load(Ordering::Relaxed) {

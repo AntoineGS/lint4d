@@ -6743,8 +6743,30 @@ impl<S: SourceStore> UnitResolver<S> {
             && self.include_bytes < self.limits.max_include_bytes
             && let Some(failure) = store.get(key)
         {
+            // Charge what the search was charged, so a replay stops where a
+            // search would: past the entry limit it searches instead (M1).
+            let scanned = self.scanned_entries.saturating_add(failure.scanned_entries);
+            if scanned > self.limits.max_directory_entries {
+                return self.search_include_counted(request, cancel);
+            }
+            let usage = self.store_usage();
             for (payload, observation) in &failure.observations {
                 self.record_observation_build(*payload, cancel, || observation.clone())?;
+            }
+            self.scanned_entries = scanned;
+            let replayed = self.store_usage();
+            if let Some(mut budget) = self.store_budget(cancel) {
+                budget
+                    .charge(
+                        failure
+                            .work
+                            .saturating_sub(replayed.work.saturating_sub(usage.work)),
+                        failure
+                            .byte_work
+                            .saturating_sub(replayed.byte_work.saturating_sub(usage.byte_work)),
+                        0,
+                    )
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
             }
             return Ok(Resolution::Unavailable {
                 reason: self.include_reason_build(
@@ -6767,7 +6789,10 @@ impl<S: SourceStore> UnitResolver<S> {
         let outer_trace = self.include_failure_trace.replace(Vec::new());
         let messages = self.report_messages;
         let complete = self.report.complete;
+        let scanned = self.scanned_entries;
+        let usage = self.store_usage();
         let result = self.search_include(request, cancel);
+        let usage_after = self.store_usage();
         let trace =
             std::mem::replace(&mut self.include_failure_trace, outer_trace).unwrap_or_default();
         if let Some(outer) = self.include_failure_trace.as_mut() {
@@ -6784,10 +6809,32 @@ impl<S: SourceStore> UnitResolver<S> {
                 key,
                 Arc::new(IncludeFailure {
                     observations: trace,
+                    scanned_entries: self.scanned_entries.saturating_sub(scanned),
+                    work: usage_after.work.saturating_sub(usage.work),
+                    byte_work: usage_after.byte_work.saturating_sub(usage.byte_work),
                 }),
             );
         }
         result
+    }
+
+    /// A search that is not shared: counted for tests.
+    fn search_include_counted(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<ResolvedSource>, ResolverError> {
+        INCLUDE_SEARCHES.with(|searches| searches.set(searches.get() + 1));
+        self.search_include(request, cancel)
+    }
+
+    /// What the current compile-time root has been charged; zero outside
+    /// one.
+    fn store_usage(&self) -> crate::compile_time::BudgetSnapshot {
+        self.compile_time_store
+            .as_ref()
+            .map(|root| root.view.budget_snapshot())
+            .unwrap_or_default()
     }
 
     fn search_include(
@@ -9154,6 +9201,11 @@ impl LegacyRouteAuthority {
 #[derive(Debug)]
 pub struct IncludeFailure {
     pub observations: Vec<(usize, ResolutionObservation)>,
+    /// Directory entries the search listed (`max_directory_entries`).
+    pub scanned_entries: usize,
+    /// Compile-time work and byte work the search was charged.
+    pub work: usize,
+    pub byte_work: usize,
 }
 
 /// Include lookups that found nothing, shared across sessions (l4d-ig6b):

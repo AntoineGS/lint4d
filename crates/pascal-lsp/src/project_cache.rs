@@ -3475,6 +3475,11 @@ impl ClaimRole {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn preempts_yielding_for_tests(&self) -> bool {
+        self.preempts_yielding
+    }
+
     /// A client request that is not interactive (references, rename, ...).
     pub(crate) fn client(cancel: Arc<AtomicBool>) -> Self {
         Self {
@@ -3557,6 +3562,9 @@ struct State {
     invalidation_log: std::collections::VecDeque<InvalidationRecord>,
     /// Epochs below this have no complete record in `invalidation_log`.
     invalidation_log_floor: u64,
+    /// Set when an entry is evicted for room; the include failures, kept
+    /// outside the reservations, are then dropped too (l4d-ig6b).
+    evicted_for_room: bool,
     /// Workspace roots, for recognizing tool state below them.
     artifact_roots: Vec<PathBuf>,
     /// The slot each thread waits for, to find waits that would close a
@@ -3596,6 +3604,7 @@ impl Default for State {
             closure_misses: HashMap::new(),
             invalidation_log: std::collections::VecDeque::new(),
             invalidation_log_floor: 0,
+            evicted_for_room: false,
             artifact_roots: Vec::new(),
             waiting: HashMap::new(),
             #[cfg(test)]
@@ -3664,8 +3673,44 @@ struct IncludeFailureStore {
     bytes: usize,
 }
 
+impl IncludeFailureStore {
+    /// Drops every failure that observed `path`, a path under it, or
+    /// (`include_parent`) its parent directory, whose listing changed.
+    fn invalidate(&mut self, path: &Path, include_parent: bool) {
+        let parent = path.parent().filter(|_| include_parent);
+        let mut freed = 0usize;
+        self.entries.retain(|_, entry| {
+            let touched = entry.probes.iter().any(|probe| {
+                let Probe::Stamp { path: probed, .. } = probe else {
+                    return true;
+                };
+                probed.starts_with(path) || parent.is_some_and(|parent| probed == parent)
+            });
+            if touched {
+                freed = freed.saturating_add(entry.bytes);
+            }
+            !touched
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+}
+
+/// Whether every stamp probe is proven unchanged now: a settled stamp equal
+/// to the current one, or an absence that still holds (l4d-ig6b, spec §7).
+fn settled_probes_hold(probes: &[Probe]) -> bool {
+    probes.iter().all(|probe| match probe {
+        Probe::Stamp { path, expected } => match (expected, current_stamp(path)) {
+            (Some(expected), Ok(Some(now))) => expected.proves_unchanged(&now),
+            (None, Ok(None)) => true,
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 struct IncludeFailureEntry {
     failure: Arc<pascal_core::IncludeFailure>,
+    context: Arc<ProjectContext>,
     probes: Arc<Vec<Probe>>,
     reads: Arc<crate::workspace::capture::CapturedReads>,
     bytes: usize,
@@ -3961,6 +4006,7 @@ fn make_room(state: &mut State, request: usize) -> bool {
 /// Evicts the least recently used unpinned unit entry or shared provider
 /// interface, whichever is older. False when neither is left.
 fn evict_oldest(state: &mut State) -> bool {
+    state.evicted_for_room = true;
     let unit = state.lru.first_key_value().map(|(tick, _)| *tick);
     let graph = state
         .provider_graphs
@@ -4200,9 +4246,13 @@ impl ProjectCache {
     }
 
     /// Releases the state lock, then applies the watch changes it queued.
-    fn release(&self, state: MutexGuard<'_, State>) {
+    fn release(&self, mut state: MutexGuard<'_, State>) {
         let changed = !state.watch_changes.is_empty();
+        let pressure = std::mem::take(&mut state.evicted_for_room);
         drop(state);
+        if pressure {
+            self.clear_include_failures();
+        }
         if changed {
             self.sync_watches();
         }
@@ -5596,6 +5646,11 @@ impl ProjectCache {
             release_graph_bytes(&mut state, freed);
             self.release(state);
         }
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .invalidate(path, include_parent);
         self.invalidate_index(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
@@ -5641,6 +5696,8 @@ impl ProjectCache {
             release_graph_bytes(&mut state, freed);
             self.release(state);
         }
+        // Overflow lost which directories changed: no failure survives it.
+        self.clear_include_failures();
         // Overflow lost which paths changed: every member is suspect.
         self.invalidate_index_all();
     }
@@ -5936,17 +5993,16 @@ impl ProjectCache {
         self.release(state);
     }
 
-    /// The provider interface compiled under resolver configuration
-    /// `configuration` for `key`, if its probes still hold (l4d-4nbs D29). A
-    /// stale entry is dropped.
-    /// The include failure stored for `key` under `configuration`, while
-    /// every directory and candidate its lookup observed is unchanged
-    /// (l4d-ig6b).
+    /// The include failure stored for `key` under `configuration` and
+    /// `context` (the whole project context, as unit slots compare it), while
+    /// every directory and candidate its lookup observed is proven unchanged:
+    /// settled stamps equal to stamps taken now (l4d-ig6b). A stale entry is
+    /// dropped.
     pub(crate) fn include_failure(
         &self,
         configuration: u64,
+        context: &ProjectContext,
         key: &pascal_core::IncludeFailureKey,
-        overlays: &HashMap<Url, OverlayInput>,
     ) -> Option<IncludeFailureHit> {
         let full = (configuration, key.clone());
         let (failure, probes, reads) = {
@@ -5956,13 +6012,16 @@ impl ProjectCache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = store.entries.get(&full)?;
+            if *entry.context != *context {
+                return None;
+            }
             (
                 Arc::clone(&entry.failure),
                 Arc::clone(&entry.probes),
                 Arc::clone(&entry.reads),
             )
         };
-        if probes_hold(&probes, overlays) {
+        if settled_probes_hold(&probes) {
             return Some(IncludeFailureHit { failure, reads });
         }
         let mut store = self
@@ -5981,9 +6040,12 @@ impl ProjectCache {
         None
     }
 
+    /// Keeps a failure whose stamps are all settled; others prove nothing
+    /// later and are not kept.
     pub(crate) fn put_include_failure(
         &self,
         configuration: u64,
+        context: Arc<ProjectContext>,
         key: pascal_core::IncludeFailureKey,
         failure: Arc<pascal_core::IncludeFailure>,
         probes: Vec<Probe>,
@@ -6006,6 +6068,12 @@ impl ProjectCache {
             )
             .saturating_add(probes_bytes(&probes))
             .saturating_add(reads.retained_bytes());
+        if !probes.iter().all(|probe| match probe {
+            Probe::Stamp { expected, .. } => expected.as_ref().is_none_or(|stamp| stamp.settled),
+            _ => false,
+        }) {
+            return;
+        }
         let state = lock(&self.inner);
         let limit = MAX_INCLUDE_FAILURE_BYTES.min(state.max_bytes / INCLUDE_FAILURE_BUDGET_SHARE);
         self.release(state);
@@ -6024,6 +6092,7 @@ impl ProjectCache {
         }
         let entry = IncludeFailureEntry {
             failure,
+            context,
             probes: Arc::new(probes),
             reads: Arc::new(reads),
             bytes,
@@ -6032,6 +6101,42 @@ impl ProjectCache {
             store.bytes = store.bytes.saturating_sub(old.bytes);
         }
         store.bytes = store.bytes.saturating_add(bytes);
+    }
+
+    /// Makes every stored failure claim `scanned_entries` listed entries.
+    #[cfg(test)]
+    pub(crate) fn inflate_include_failures_for_tests(&self, scanned_entries: usize) {
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in store.entries.values_mut() {
+            entry.failure = Arc::new(pascal_core::IncludeFailure {
+                observations: entry.failure.observations.clone(),
+                scanned_entries,
+                work: entry.failure.work,
+                byte_work: entry.failure.byte_work,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_failure_charges_for_tests(&self) -> Vec<(usize, usize, usize)> {
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.failure.scanned_entries,
+                    entry.failure.work,
+                    entry.failure.byte_work,
+                )
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -6044,6 +6149,20 @@ impl ProjectCache {
             .len()
     }
 
+    /// Drops every include failure (memory pressure, watcher overflow).
+    fn clear_include_failures(&self) {
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.entries.clear();
+        store.bytes = 0;
+    }
+
+    /// The provider interface compiled under resolver configuration
+    /// `configuration` for `key`, if its probes still hold (l4d-4nbs D29). A
+    /// stale entry is dropped.
     pub(crate) fn provider_graph(
         &self,
         configuration: u64,

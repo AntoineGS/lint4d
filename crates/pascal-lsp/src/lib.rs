@@ -4,6 +4,7 @@
 //! [`pascal_project`]. This crate retains workspace orchestration, overlays,
 //! package/index lookup, and the stateful include/rename resolver.
 
+pub mod allocator;
 pub mod analysis_metrics;
 pub mod cache_admin;
 mod catalogue;

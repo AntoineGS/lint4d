@@ -1677,6 +1677,18 @@ A directory that fails the location checks is left untouched.
 - It does not bound process memory. Only the pages, scratch and decoded facts
   are charged to `maxCacheBytes`; see the unaccounted list in
   `docs/shared-resolver-architecture.md`.
+
+#### Allocator arenas
+
+On glibc the server limits malloc to two arenas at startup
+(`mallopt(M_ARENA_MAX, 2)`), before it starts any thread. Index batches with
+persistence on extract on short-lived worker threads, and glibc's default
+(up to eight arenas per core) keeps each thread's freed memory resident in
+its own arena. On an 8,670-member project the post-crawl high water mark fell
+from 7.0 to 5.4 GiB at equal progress, below the persistence-off run, at a
+5-10 % cost in extraction throughput. An explicit `MALLOC_ARENA_MAX`, or a
+`glibc.malloc.arena_max` entry in `GLIBC_TUNABLES`, wins: the server then
+leaves the setting alone. Other allocators and platforms are not changed.
 - Only the workspace index is persisted; other features gain nothing before
   `l4d-zf1b.9`. There is no network or team-shared cache and no Windows
   support yet.

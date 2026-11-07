@@ -1444,9 +1444,8 @@ validated, so the snapshot is never proof.
 - **Persistence off.** The memory-only index is kept with the same results;
   only the scheduling differs.
 
-Known limitations: an unsaved open `.dproj` gives the index a different
-context key, so its facts are not shared with the saved project; a relative
-`projectFile` gets no project anchor.
+Known limitation: an unsaved open `.dproj` gives the index a different
+context key, so its facts are not shared with the saved project.
 
 `pascal/indexStatus` takes no parameters, performs no IO and returns at most
 8 KiB. It never contains member paths.

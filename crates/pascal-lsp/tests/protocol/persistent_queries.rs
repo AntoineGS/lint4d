@@ -117,6 +117,7 @@ pub(super) fn warm_server(environment: &Path, root: &Path, opens: &[&str]) -> Te
     open_disk(&mut second, root, opens);
     let done = wait_index(&mut second, complete);
     assert_eq!(done["extracted"], 0, "{done}");
+    settle_background(&mut second);
     second
 }
 
@@ -126,7 +127,29 @@ pub(super) fn cold_server(environment: &Path, root: &Path, opens: &[&str]) -> Te
     server.initialize(root, json!({"persistentCacheEnabled": false}));
     open_disk(&mut server, root, opens);
     wait_index(&mut server, complete);
+    settle_background(&mut server);
     server
+}
+
+const IDLE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Waits until `pascal/testBackgroundIdle` reports no warmer crawl or index
+/// batch, no analysis job and no diagnostic deadline: `complete` is
+/// reported before the warm `Full` pass and the open documents' crawls
+/// have settled. Nothing schedules new background work until the next
+/// client message.
+pub(super) fn settle_background(server: &mut TestServer) {
+    let deadline = Instant::now() + IDLE_DEADLINE;
+    loop {
+        let state = request(server, "pascal/testBackgroundIdle", json!({}));
+        if state["idle"] == true {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background work did not settle: {state}"
+        );
+    }
 }
 
 /// The names of the `pascal/testAnalysisMetrics` counters, in the order of
@@ -146,8 +169,11 @@ const METRICS: [&str; 12] = [
     "projectCacheProbeNanos",
 ];
 
-/// The process's analysis counters, indexed as `Metric`.
+/// The process's analysis counters, indexed as `Metric`, once background
+/// work has settled: a window between two calls holds the requests sent in
+/// it and the background work they caused, nothing earlier.
 pub(super) fn metrics(server: &mut TestServer) -> [u64; 12] {
+    settle_background(server);
     let result = request(server, "pascal/testAnalysisMetrics", json!({}));
     assert_eq!(result["schema"], 1, "{result}");
     let counters = result["counters"].as_object().expect("counters");
@@ -156,7 +182,14 @@ pub(super) fn metrics(server: &mut TestServer) -> [u64; 12] {
 }
 
 pub(super) fn delta(after: [u64; 12], before: [u64; 12]) -> [u64; 12] {
-    std::array::from_fn(|index| after[index] - before[index])
+    std::array::from_fn(|index| {
+        after[index].checked_sub(before[index]).unwrap_or_else(|| {
+            panic!(
+                "{} went down from {} to {}: counters are monotonic within a process",
+                METRICS[index], before[index], after[index]
+            )
+        })
+    })
 }
 
 /// The sorted `(uri, line, character)` starts of the references of the
@@ -295,6 +328,25 @@ fn warm_workspace_symbols_answer_from_facts_without_parsing() {
     shutdown(warm);
 }
 
+/// The harness's windows are isolated: with background work settled and no
+/// request sent, nothing is counted.
+#[test]
+fn a_settled_warm_server_counts_nothing_without_a_request() {
+    const SMALL: FixtureSpec = FixtureSpec {
+        units: 50,
+        importers: 5,
+        with_include_every: 10,
+        unresolved_includes: 5,
+        shared_name: "TShared",
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SMALL);
+    let mut warm = warm_server(environment.path(), &root, &OPENS);
+    let before = metrics(&mut warm);
+    assert_eq!(delta(metrics(&mut warm), before), [0; 12]);
+    shutdown(warm);
+}
+
 fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();
     let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];
@@ -323,7 +375,9 @@ fn synthetic_warm_query_latency() {
         .map(|_| {
             let started = Instant::now();
             references(&mut warm, &shared, 2, 6);
-            started.elapsed()
+            let taken = started.elapsed();
+            gaps(&mut warm);
+            taken
         })
         .collect();
     let symbols_taken = (0..RUNS)

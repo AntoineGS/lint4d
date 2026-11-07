@@ -10834,6 +10834,10 @@ const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
 const INDEX_STATUS_METHOD: &str = "pascal/indexStatus";
 #[cfg(feature = "test-support")]
 const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
+/// Whether the server has background work: a warmer crawl or index batch,
+/// an analysis job or a diagnostic deadline. Answered in message order.
+#[cfg(feature = "test-support")]
+const TEST_BACKGROUND_IDLE_METHOD: &str = "pascal/testBackgroundIdle";
 
 fn run_connection(
     connection: &ProtocolConnection,
@@ -12019,6 +12023,26 @@ fn event_loop(
                     }),
                 )?;
             }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if request.method == TEST_BACKGROUND_IDLE_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let warmer_idle = warmer.is_idle();
+                let jobs_idle = jobs.is_empty();
+                let diagnostics_due = workspace.next_diagnostic_timeout().is_some();
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({
+                        "idle": warmer_idle && jobs_idle && !diagnostics_due,
+                        "warmer": warmer_idle,
+                        "jobs": jobs_idle,
+                        "diagnosticsDue": diagnostics_due,
+                    }),
+                )?;
+            }
             Message::Request(request) => {
                 if shutdown_received {
                     send_error(
@@ -12820,7 +12844,7 @@ fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToke
 
 fn request_requires_configuration(method: &str) -> bool {
     #[cfg(feature = "test-support")]
-    if method == TEST_CACHE_SETTLE_METHOD {
+    if method == TEST_CACHE_SETTLE_METHOD || method == TEST_BACKGROUND_IDLE_METHOD {
         return true;
     }
     matches!(

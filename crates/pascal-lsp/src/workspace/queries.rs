@@ -4176,6 +4176,79 @@ mod tests {
         assert_eq!(bound, expected);
     }
 
+    /// AC1 with persisted facts (l4d-zf1b.9): a restarted view filled from
+    /// the store without parsing binds only the importers and the declaring
+    /// unit, with the answer of the same fixture indexed without a store.
+    #[test]
+    fn restarted_references_bind_only_the_importing_units() {
+        use crate::workspace::indexing::IndexMode;
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::{persisting_view, restarted_view};
+        let fixture = many_units(20, 479);
+        let root = fixture.shared.parent().unwrap().to_path_buf();
+        let shared = source_uri(&fixture.shared);
+        let anchor = IndexAnchor::Document(shared.clone());
+        let references = |input: WorkspaceInput| {
+            references_from_input(
+                input,
+                &shared,
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+
+        let uncached_input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        build_index_for(&uncached_input, &shared);
+        let uncached = references(uncached_input);
+        assert!(uncached.coverage.is_complete(), "{:?}", uncached.coverage);
+
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut first, cache) = persisting_view(
+            &Workspace::from_analysis_input(&fixture.input),
+            store.path(),
+        );
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 500, "{progress:?}");
+        cache.shutdown();
+
+        let (mut second, cache) = restarted_view(&root, store.path());
+        crate::navigation::test_reset_document_parse_count();
+        let progress = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.reused, 500, "{progress:?}");
+
+        crate::navigation::test_reset_bound_documents();
+        crate::workspace::rename::test_take_indexed_sources();
+        let cached = references(second.analysis_input());
+        assert!(cached.coverage.is_complete(), "{:?}", cached.coverage);
+        assert_eq!(located(&cached.value), located(&uncached.value));
+        assert_eq!(cached.value.len(), 21);
+        let mut candidates = fixture.importers.clone();
+        candidates.push(fixture.shared.clone());
+        candidates.sort();
+        let mut indexed = crate::workspace::rename::test_take_indexed_sources();
+        indexed.sort();
+        indexed.dedup();
+        assert_eq!(
+            indexed, candidates,
+            "the snapshot holds only the candidates"
+        );
+        let mut expected = candidates.iter().map(|p| source_uri(p)).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(bound_documents(), expected);
+        cache.shutdown();
+    }
+
     #[test]
     fn references_on_an_unindexed_context_search_unverified_members_directly() {
         let fixture = query_fixture();

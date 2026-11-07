@@ -111,6 +111,8 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static TEST_SOURCE_OWNER_DISCOVERIES: Cell<usize> = const { Cell::new(0) };
     static TEST_INDEXED_SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
+    static TEST_INDEXED_SOURCES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static TEST_FAIL_REFERENCE_TARGETS: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -136,6 +138,12 @@ pub(crate) fn test_fail_reference_targets() -> TestReferenceTargetsFailure {
 #[cfg(test)]
 pub(crate) fn test_indexed_snapshots() -> usize {
     TEST_INDEXED_SNAPSHOTS.with(Cell::get)
+}
+
+/// The sources of every indexed snapshot built since the last call.
+#[cfg(test)]
+pub(crate) fn test_take_indexed_sources() -> Vec<PathBuf> {
+    TEST_INDEXED_SOURCES.with(|sources| std::mem::take(&mut *sources.borrow_mut()))
 }
 
 /// Enumerated sources whose owner the snapshot had to discover, since the
@@ -6259,8 +6267,13 @@ fn build_snapshot_with_policy(
         TEST_WORKSPACE_SNAPSHOTS.with(|count| count.set(count.get().saturating_add(1)));
     }
     #[cfg(test)]
-    if matches!(scope, SnapshotScope::Indexed(_)) {
+    if let SnapshotScope::Indexed(sources) = &scope {
         TEST_INDEXED_SNAPSHOTS.with(|count| count.set(count.get().saturating_add(1)));
+        TEST_INDEXED_SOURCES.with(|recorded| {
+            recorded
+                .borrow_mut()
+                .extend(sources.sources.iter().map(|(path, _)| path.clone()));
+        });
     }
     let _span = crate::trace::Span::new(|| {
         format!(

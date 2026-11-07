@@ -17078,3 +17078,1080 @@ fn program_uses_with_explicit_paths_and_anonymous_methods_stay_navigable() {
             .is_empty()
     );
 }
+
+const METHOD_HEADING_SOURCE: &str = r#"unit Heading;
+interface
+type
+  TFoo = class
+    procedure Bar;
+    constructor Create(A: Integer);
+    destructor Destroy; override;
+    class function Make: Integer;
+  end;
+  TOuter = class
+  type
+    TInner = class
+      function Method: Integer;
+    end;
+  end;
+  TList<T> = class
+    procedure Add(const Item: T);
+  end;
+  TRec = record
+    class operator Add(const A, B: TRec): TRec;
+  end;
+implementation
+procedure TFoo.Bar;
+begin
+end;
+constructor TFoo.Create(A: Integer);
+begin
+end;
+destructor TFoo.Destroy;
+begin
+  inherited;
+end;
+class function TFoo.Make: Integer;
+begin
+  Result := 0;
+end;
+function TOuter.TInner.Method: Integer;
+begin
+  Result := 0;
+end;
+procedure TList<T>.Add(const Item: T);
+begin
+end;
+class operator TRec.Add(const A, B: TRec): TRec;
+begin
+end;
+end.
+"#;
+
+fn method_heading_index() -> (NavigationIndex, Url) {
+    let source_uri = uri("Heading");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), METHOD_HEADING_SOURCE.to_owned())
+        .expect("method heading source parses");
+    (index, source_uri)
+}
+
+/// Position of `name` inside the first occurrence of `heading`.
+fn heading_position(heading: &str, name: &str) -> Position {
+    let mut position = position_of(METHOD_HEADING_SOURCE, heading, 0);
+    position.character += heading.find(name).expect("name in heading") as u32;
+    position
+}
+
+#[test]
+fn method_heading_class_names_navigate_to_their_type_declarations() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    for (heading, name, declaration) in [
+        ("procedure TFoo.Bar;", "TFoo", "TFoo = class"),
+        ("constructor TFoo.Create", "TFoo", "TFoo = class"),
+        ("destructor TFoo.Destroy", "TFoo", "TFoo = class"),
+        ("class function TFoo.Make", "TFoo", "TFoo = class"),
+        ("function TOuter.TInner.Method", "TOuter", "TOuter = class"),
+        ("function TOuter.TInner.Method", "TInner", "TInner = class"),
+        ("procedure TList<T>.Add", "TList", "TList<T> = class"),
+        ("class operator TRec.Add", "TRec", "TRec = record"),
+    ] {
+        for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+            let locations = index.navigate(&source_uri, heading_position(heading, name), target);
+            assert_eq!(
+                locations.len(),
+                1,
+                "{name} in {heading:?} ({target:?}): {locations:?}"
+            );
+            assert_location_start(
+                &locations[0],
+                &source_uri,
+                position_of(source, declaration, 0),
+            );
+        }
+    }
+}
+
+#[test]
+fn method_heading_method_names_navigate_to_their_member_declarations() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    for (heading, name, declaration) in [
+        ("procedure TFoo.Bar;", "Bar", "procedure Bar;"),
+        ("destructor TFoo.Destroy", "Destroy", "destructor Destroy;"),
+        (
+            "function TOuter.TInner.Method",
+            "Method",
+            "function Method:",
+        ),
+        ("procedure TList<T>.Add", "Add", "procedure Add("),
+        ("class operator TRec.Add", "Add", "class operator Add("),
+    ] {
+        let locations = index.navigate(
+            &source_uri,
+            heading_position(heading, name),
+            NavigationTarget::Declaration,
+        );
+        assert_eq!(locations.len(), 1, "{name} in {heading:?}: {locations:?}");
+        let mut expected = position_of(source, declaration, 0);
+        expected.character += declaration.find(name).expect("name in declaration") as u32;
+        assert_location_start(&locations[0], &source_uri, expected);
+    }
+}
+
+#[test]
+fn method_heading_class_names_are_references_of_their_types() {
+    let (index, source_uri) = method_heading_index();
+    let source = METHOD_HEADING_SOURCE;
+    let starts = |position: Position| {
+        let mut starts = index
+            .binding_locations(&source_uri, position, false)
+            .expect("type references are available")
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        starts
+    };
+    let headings = [
+        "procedure TFoo.Bar;",
+        "constructor TFoo.Create",
+        "destructor TFoo.Destroy",
+        "class function TFoo.Make",
+    ];
+    let expected = headings
+        .iter()
+        .map(|heading| heading_position(heading, "TFoo"))
+        .collect::<Vec<_>>();
+    assert_eq!(starts(position_of(source, "TFoo = class", 0)), expected);
+    assert_eq!(
+        starts(heading_position("destructor TFoo.Destroy", "TFoo")),
+        expected
+    );
+    assert_eq!(
+        starts(position_of(source, "TInner = class", 0)),
+        vec![heading_position("function TOuter.TInner.Method", "TInner")]
+    );
+    assert_eq!(
+        starts(position_of(source, "TOuter = class", 0)),
+        vec![heading_position("function TOuter.TInner.Method", "TOuter")]
+    );
+    let rec_starts = starts(position_of(source, "TRec = record", 0));
+    assert!(
+        rec_starts.contains(&heading_position("class operator TRec.Add", "TRec")),
+        "{rec_starts:?}"
+    );
+    assert_eq!(
+        starts(position_of(source, "TList<T> = class", 0)),
+        vec![heading_position("procedure TList<T>.Add", "TList")]
+    );
+    // A method body is one of the method's declaration sites.
+    let mut bar = position_of(source, "procedure Bar;", 0);
+    bar.character += "procedure ".len() as u32;
+    let method_starts = index
+        .binding_locations(&source_uri, bar, true)
+        .expect("method references are available")
+        .into_iter()
+        .map(|location| location.range.start)
+        .collect::<Vec<_>>();
+    assert!(
+        method_starts.contains(&heading_position("procedure TFoo.Bar;", "Bar")),
+        "{method_starts:?}"
+    );
+}
+
+#[test]
+fn method_heading_class_names_hover_as_their_types() {
+    let (index, source_uri) = method_heading_index();
+    let hover = index
+        .hover(
+            &source_uri,
+            heading_position("destructor TFoo.Destroy", "TFoo"),
+        )
+        .expect("hover on a heading's class name");
+    let text = hover_text(&hover);
+    assert!(text.contains("TFoo = class"), "{text}");
+}
+
+#[test]
+fn method_heading_owner_segments_bind_only_declared_nested_types() {
+    let source = r#"unit HeadingOwners;
+interface
+type
+  TOther = class
+    procedure Run;
+  end;
+  TFoo = class
+    procedure Run;
+  end;
+implementation
+procedure TFoo.TOther.Run;
+begin
+end;
+procedure TMissing.Run;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("HeadingOwners");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("heading owner source parses");
+    for (needle, occurrence) in [("TOther", 1), ("TMissing", 0)] {
+        let locations = index.navigate(
+            &source_uri,
+            position_of(source, needle, occurrence),
+            NavigationTarget::Declaration,
+        );
+        assert!(locations.is_empty(), "{needle}: {locations:?}");
+    }
+    let foo = index.navigate(
+        &source_uri,
+        position_of(source, "TFoo", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(foo.len(), 1);
+    assert_location_start(&foo[0], &source_uri, position_of(source, "TFoo", 0));
+}
+
+fn heading_program_source(keyword: &str) -> String {
+    format!(
+        r#"{keyword} Heading{keyword};
+type
+  TFoo = class
+    procedure Bar;
+  end;
+procedure TFoo.Bar;
+begin
+end;
+begin
+end.
+"#
+    )
+}
+
+#[test]
+fn method_heading_class_names_resolve_in_programs_and_libraries() {
+    for keyword in ["program", "library"] {
+        let source = heading_program_source(keyword);
+        let source_uri = Url::parse(&format!("file:///workspace/Heading{keyword}.dpr"))
+            .expect("valid program URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(source_uri.clone(), source.clone())
+            .expect("program heading source parses");
+        let heading = position_of(&source, "TFoo", 1);
+        let declaration = position_of(&source, "TFoo", 0);
+        for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+            let locations = index.navigate(&source_uri, heading, target);
+            assert_eq!(locations.len(), 1, "{keyword} {target:?}: {locations:?}");
+            assert_location_start(&locations[0], &source_uri, declaration);
+        }
+        let hover = index
+            .hover(&source_uri, heading)
+            .unwrap_or_else(|| panic!("{keyword}: hover on a heading's class name"));
+        assert!(hover_text(&hover).contains("TFoo = class"), "{keyword}");
+        let references = index
+            .binding_locations(&source_uri, declaration, false)
+            .expect("program type references are available")
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        assert_eq!(references, vec![heading], "{keyword}");
+        let edits = index
+            .rename_edits(&source_uri, heading, "TBar")
+            .unwrap_or_else(|error| panic!("{keyword}: rename fails: {error}"));
+        let mut starts = edits[&source_uri]
+            .iter()
+            .map(|edit| edit.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        assert_eq!(starts, vec![declaration, heading], "{keyword}");
+    }
+}
+
+#[test]
+fn method_heading_owner_fails_closed_for_conditionally_unknown_nested_types() {
+    let source = r#"unit HeadingUnknown;
+interface
+type
+  TOuter = class
+  type
+{$IFDEF MAYBE}
+    TInner = class
+      procedure M;
+    end;
+{$ENDIF}
+  end;
+implementation
+procedure TOuter.TInner.M;
+begin
+end;
+end.
+"#;
+    let source_uri = uri("HeadingUnknown");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("conditional heading source parses");
+    let locations = index.navigate(
+        &source_uri,
+        position_of(source, "TInner", 1),
+        NavigationTarget::Declaration,
+    );
+    assert!(locations.is_empty(), "{locations:?}");
+}
+
+#[test]
+fn method_heading_owner_is_never_a_type_from_a_used_unit() {
+    let provider = "unit HeadingProvider;\ninterface\ntype\n  TFoo = class\n    procedure Bar;\n  end;\nimplementation\nprocedure TFoo.Bar;\nbegin\nend;\nend.\n";
+    let consumer = "unit HeadingConsumer;\ninterface\nuses HeadingProvider;\nimplementation\nprocedure TFoo.Bar;\nbegin\nend;\nend.\n";
+    let provider_uri = uri("HeadingProvider");
+    let consumer_uri = uri("HeadingConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("HeadingProvider".to_owned(), provider_uri.clone())],
+    );
+    for target in [NavigationTarget::Declaration, NavigationTarget::Definition] {
+        let locations = index.navigate(&consumer_uri, position_of(consumer, "TFoo", 0), target);
+        assert!(locations.is_empty(), "{target:?}: {locations:?}");
+    }
+    // The consumer's heading is invalid Delphi; strict references refuse
+    // rather than bind it to the provider's type or drop it silently.
+    let references =
+        index.binding_locations(&provider_uri, position_of(provider, "TFoo", 0), false);
+    assert!(
+        references
+            .as_ref()
+            .is_err_and(|error| error.contains("unresolved rename reference")),
+        "{references:?}"
+    );
+}
+
+#[test]
+fn method_resolution_clause_binds_its_interface_from_a_used_unit() {
+    let provider = "unit ClauseProvider;\ninterface\ntype\n  IFoo = interface\n    procedure Bar;\n  end;\nimplementation\nend.\n";
+    let consumer = "unit ClauseConsumer;\ninterface\nuses ClauseProvider;\ntype\n  TImpl = class(TInterfacedObject, IFoo)\n    procedure IFoo.Bar = Baz;\n    procedure Baz;\n  end;\nimplementation\nprocedure TImpl.Baz;\nbegin\nend;\nend.\n";
+    let provider_uri = uri("ClauseProvider");
+    let consumer_uri = uri("ClauseConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ClauseProvider".to_owned(), provider_uri.clone())],
+    );
+    let locations = index.navigate(
+        &consumer_uri,
+        position_of(consumer, "IFoo", 1),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_location_start(
+        &locations[0],
+        &provider_uri,
+        position_of(provider, "IFoo", 0),
+    );
+}
+
+const GENERIC_HEADING_SOURCE: &str = r#"unit HeadingGenerics;
+interface
+type
+  TList = class
+    procedure Add;
+  end;
+  TList<T> = class
+    procedure Add(const Item: T);
+  end;
+  TOuter<T> = class
+  type
+    TInner<U> = class
+      procedure M;
+    end;
+  end;
+implementation
+procedure TList.Add;
+begin
+end;
+procedure TList<T>.Add(const Item: T);
+begin
+end;
+procedure TOuter<T>.TInner<U>.M;
+begin
+end;
+end.
+"#;
+
+/// Pins current behaviour: a heading cannot tell `TList` from `TList<T>`
+/// (both are keyed `tlist`), so navigation lists both and strict references
+/// and rename refuse; a nested generic owner navigates, and its references
+/// and rename refuse rather than guess.
+#[test]
+fn method_heading_generic_owners_pin_ambiguity_and_nested_generics() {
+    let source = GENERIC_HEADING_SOURCE;
+    let source_uri = uri("HeadingGenerics");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("generic heading source parses");
+    let starts = |locations: Vec<Location>| {
+        let mut starts = locations
+            .into_iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>();
+        starts.sort_by_key(|start| (start.line, start.character));
+        starts
+    };
+    let both_lists = vec![
+        position_of(source, "TList", 0),
+        position_of(source, "TList", 1),
+    ];
+    for occurrence in [2, 3] {
+        let heading = position_of(source, "TList", occurrence);
+        assert_eq!(
+            starts(index.navigate(&source_uri, heading, NavigationTarget::Declaration)),
+            both_lists
+        );
+        let references = index.binding_locations(&source_uri, heading, true);
+        assert!(
+            references
+                .as_ref()
+                .is_err_and(|error| error.contains("unresolved or ambiguous")),
+            "{references:?}"
+        );
+        assert!(index.rename_edits(&source_uri, heading, "TZ").is_err());
+    }
+    for occurrence in [0, 1] {
+        let references =
+            index.binding_locations(&source_uri, position_of(source, "TList", occurrence), true);
+        assert!(
+            references
+                .as_ref()
+                .is_err_and(|error| error.contains("ambiguous rename reference")),
+            "{references:?}"
+        );
+    }
+
+    let outer = position_of(source, "TOuter", 1);
+    assert_eq!(
+        starts(index.navigate(&source_uri, outer, NavigationTarget::Declaration)),
+        vec![position_of(source, "TOuter", 0)]
+    );
+    let outer_sites = vec![position_of(source, "TOuter", 0), outer];
+    assert_eq!(
+        starts(
+            index
+                .binding_locations(&source_uri, outer, true)
+                .expect("outer references")
+        ),
+        outer_sites
+    );
+    let edits = index
+        .rename_edits(&source_uri, outer, "TZ")
+        .expect("outer rename");
+    let mut edit_starts = edits[&source_uri]
+        .iter()
+        .map(|edit| edit.range.start)
+        .collect::<Vec<_>>();
+    edit_starts.sort_by_key(|start| (start.line, start.character));
+    assert_eq!(edit_starts, outer_sites);
+
+    let inner = position_of(source, "TInner", 1);
+    assert_eq!(
+        starts(index.navigate(&source_uri, inner, NavigationTarget::Declaration)),
+        vec![position_of(source, "TInner", 0)]
+    );
+    let references = index.binding_locations(&source_uri, inner, true);
+    assert!(
+        references
+            .as_ref()
+            .is_err_and(|error| error.contains("inherited class lookup")),
+        "{references:?}"
+    );
+    assert!(index.rename_edits(&source_uri, inner, "TZ").is_err());
+}
+
+fn declaration_of(
+    index: &NavigationIndex,
+    source_uri: &Url,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> Vec<(Url, Position)> {
+    locations_at(
+        index,
+        source_uri,
+        source,
+        needle,
+        occurrence,
+        NavigationTarget::Declaration,
+    )
+    .into_iter()
+    .map(|location| (location.uri, location.range.start))
+    .collect()
+}
+
+/// l4d-1qta: without `{$SCOPEDENUMS ON}` an enumerated type's values enter
+/// the enclosing scope, and the qualified spelling names them as well.
+#[test]
+fn unscoped_enum_values_bind_unqualified_and_qualified() {
+    let source = "unit Colors;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Green;\n  C := TColor.Green;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    let declaration = vec![(source_uri.clone(), position_of(source, "Green", 0))];
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 1),
+        declaration
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        declaration
+    );
+}
+
+/// l4d-1qta: the values of an enumerated type declared under
+/// `{$SCOPEDENUMS ON}` are reached only qualified, so an unqualified `Green`
+/// is the constant; `{$SCOPEDENUMS OFF}` restores unqualified values.
+#[test]
+fn scoped_enum_values_bind_only_qualified() {
+    let source = "unit Colors;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TColor = (Red, Green);\n{$SCOPEDENUMS OFF}\n  TShade = (Light, Dark);\nconst Green = 5;\nimplementation\nprocedure Run;\nvar C: TColor; S: TShade; N: Integer;\nbegin\n  N := Green;\n  C := TColor.Green;\n  S := Dark;\nend;\nend.\n";
+    let source_uri = uri("Colors");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("source parses");
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        vec![(source_uri.clone(), position_of(source, "Green", 1))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 3),
+        vec![(source_uri.clone(), position_of(source, "Green", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Dark", 1),
+        vec![(source_uri.clone(), position_of(source, "Dark", 0))]
+    );
+}
+
+/// l4d-1qta: an imported unit's scoped values do not enter the importer's
+/// scope, so `Yes` is only the other unit's constant; an unscoped value is
+/// an imported candidate as well.
+#[test]
+fn an_imported_scoped_enum_exports_no_unqualified_values() {
+    for (directive, scoped) in [("{$SCOPEDENUMS ON}\n", true), ("", false)] {
+        let provider = format!(
+            "unit Provider;\ninterface\n{directive}type\n  TState = (Maybe, Yes);\nimplementation\nend.\n"
+        );
+        let other = "unit Other;\ninterface\nconst Yes = 1;\nimplementation\nend.\n";
+        let consumer = "unit Consumer;\ninterface\nuses Other, Provider;\nimplementation\nprocedure Run;\nbegin\n  Log(Yes);\n  Log(TState.Yes);\nend;\nend.\n";
+        let provider_uri = uri("Provider");
+        let other_uri = uri("Other");
+        let consumer_uri = uri("Consumer");
+        let mut index = NavigationIndex::new();
+        for (name, text) in [
+            (&provider_uri, provider.as_str()),
+            (&other_uri, other),
+            (&consumer_uri, consumer),
+        ] {
+            index
+                .update(name.clone(), text.to_owned())
+                .expect("source parses");
+        }
+        index.bind_imports(
+            &consumer_uri,
+            [
+                ("Provider".to_owned(), provider_uri.clone()),
+                ("Other".to_owned(), other_uri.clone()),
+            ],
+        );
+        let value = (provider_uri.clone(), position_of(&provider, "Yes", 0));
+        let constant = (other_uri.clone(), position_of(other, "Yes", 0));
+        // Both imports declare an unqualified `Yes` when unscoped; the
+        // binder reports every imported candidate.
+        let expected = if scoped {
+            vec![constant]
+        } else {
+            vec![constant, value.clone()]
+        };
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 0),
+            expected,
+            "{directive:?}"
+        );
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, "Yes", 1),
+            vec![value],
+            "{directive:?}"
+        );
+    }
+}
+
+fn indexed(sources: &[(&Url, &str)], imports: &[(&Url, &[(&str, &Url)])]) -> NavigationIndex {
+    let mut index = NavigationIndex::new();
+    for (name, text) in sources {
+        index
+            .update((*name).clone(), (*text).to_owned())
+            .expect("source parses");
+    }
+    for (consumer, bindings) in imports {
+        index.bind_imports(
+            consumer,
+            bindings
+                .iter()
+                .map(|(unit, uri)| ((*unit).to_owned(), (*uri).clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    index
+}
+
+/// l4d-1qta fix round 1 (C1, dcc 37.0 `O1.dpr`): a routine-local enum value
+/// is declared in order, so `lA` in `Inner`, before `type TL`, is the unit
+/// constant.
+#[test]
+fn routine_local_enum_values_follow_declaration_order() {
+    let source = "unit P11;\ninterface\nconst lA = 1;\nimplementation\nprocedure Outer;\n  procedure Inner;\n  var N: Integer;\n  begin\n    N := lA;\n  end;\ntype TL = (lA, lB);\nvar L: TL;\nbegin\n  L := lA;\nend;\nend.\n";
+    let source_uri = uri("P11");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "lA", 1),
+        vec![(source_uri.clone(), position_of(source, "lA", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "lA", 3),
+        vec![(source_uri.clone(), position_of(source, "lA", 2))]
+    );
+}
+
+const NESTED_UNIT: &str = "unit NU;\ninterface\ntype\n  TC = class\n  type TE = (cA, cB);\n  var F: TE;\n  end;\n  TR = record\n  type TQ = (qA, qB);\n  var G: TQ;\n  procedure M;\n  end;\nimplementation\nprocedure TR.M;\nbegin\n  G := qA;\nend;\nprocedure Run;\nvar R: TR;\nbegin\n  R.G := qB;\nend;\nend.\n";
+
+/// l4d-1qta fix round 1 (I1, dcc 37.0 `T2`/`T2c`/`N1`/`N2`): the values of an
+/// enum nested in a class or record are unqualified names of the unit, in
+/// the type's methods, in the unit and in an importer, also unit-qualified.
+#[test]
+fn nested_enum_values_are_unit_scope_names() {
+    let unit_uri = uri("NU");
+    let consumer = "unit Consumer;\ninterface\nuses NU;\nimplementation\nprocedure Run;\nvar O: TC; Q: TR.TQ;\nbegin\n  O.F := cA;\n  Q := qB;\n  O.F := NU.cB;\nend;\nend.\n";
+    let consumer_uri = uri("Consumer");
+    let index = indexed(
+        &[(&unit_uri, NESTED_UNIT), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("NU", &unit_uri)])],
+    );
+    let at = |needle: &str| vec![(unit_uri.clone(), position_of(NESTED_UNIT, needle, 0))];
+    assert_eq!(
+        declaration_of(&index, &unit_uri, NESTED_UNIT, "qA", 1),
+        at("qA")
+    );
+    assert_eq!(
+        declaration_of(&index, &unit_uri, NESTED_UNIT, "qB", 1),
+        at("qB")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "cA", 0),
+        at("cA")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "qB", 0),
+        at("qB")
+    );
+    assert_eq!(
+        declaration_of(&index, &consumer_uri, consumer, "cB", 0),
+        at("cB")
+    );
+}
+
+/// l4d-1qta fix round 1 (I1, dcc 37.0 `S1.dpr`, `S2.dpr`): a record-nested
+/// value is a candidate for `qB` beside another unit's constant; dcc takes
+/// the last unit used, which the binder reports as both candidates. Declared
+/// in the consumer itself, the nested value is the binding.
+#[test]
+fn nested_enum_values_shadow_an_imported_constant() {
+    let sa = "unit SA;\ninterface\ntype\n  TR = record\n  type TQ = (qA, qB);\n  end;\nimplementation\nend.\n";
+    let sb = "unit SB;\ninterface\nconst qB = 7;\nimplementation\nend.\n";
+    let s1 = "unit S1;\ninterface\nuses SB, SA;\nimplementation\nprocedure Run;\nvar Q: TR.TQ;\nbegin\n  Q := qB;\nend;\nend.\n";
+    let s2 = "unit S2;\ninterface\nuses SB;\ntype\n  TR = record\n  type TQ = (qA, qB);\n  end;\nimplementation\nprocedure Run;\nvar Q: TR.TQ;\nbegin\n  Q := qB;\nend;\nend.\n";
+    let (sa_uri, sb_uri, s1_uri, s2_uri) = (uri("SA"), uri("SB"), uri("S1"), uri("S2"));
+    let index = indexed(
+        &[(&sa_uri, sa), (&sb_uri, sb), (&s1_uri, s1), (&s2_uri, s2)],
+        &[
+            (&s1_uri, &[("SA", &sa_uri), ("SB", &sb_uri)]),
+            (&s2_uri, &[("SB", &sb_uri)]),
+        ],
+    );
+    let candidates = declaration_of(&index, &s1_uri, s1, "qB", 0);
+    assert!(
+        candidates.contains(&(sa_uri.clone(), position_of(sa, "qB", 0))),
+        "{candidates:?}"
+    );
+    assert_eq!(
+        declaration_of(&index, &s2_uri, s2, "qB", 1),
+        vec![(s2_uri.clone(), position_of(s2, "qB", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (I1): a scoped nested enum's values are named only
+/// through the enum type, never unqualified.
+#[test]
+fn scoped_nested_enum_values_are_not_unqualified_names() {
+    let source = "unit SN;\ninterface\nconst rA = 5;\n{$SCOPEDENUMS ON}\ntype\n  TR = record\n  type TE = (rA, rB);\n  var F: TE;\n  end;\n{$SCOPEDENUMS OFF}\nimplementation\nprocedure Run;\nvar N: Integer;\nbegin\n  N := rA;\nend;\nend.\n";
+    let source_uri = uri("SN");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "rA", 2),
+        vec![(source_uri.clone(), position_of(source, "rA", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (I2): `Unit.Value` names an unscoped enum value.
+#[test]
+fn unit_qualified_enum_values_resolve() {
+    let colors = "unit Colors;\ninterface\ntype\n  TColor = (Red, Blue);\nimplementation\nend.\n";
+    let cons = "unit Cons;\ninterface\nuses Colors;\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Colors.Red;\nend;\nend.\n";
+    let (colors_uri, cons_uri) = (uri("Colors"), uri("Cons"));
+    let index = indexed(
+        &[(&colors_uri, colors), (&cons_uri, cons)],
+        &[(&cons_uri, &[("Colors", &colors_uri)])],
+    );
+    assert_eq!(
+        declaration_of(&index, &cons_uri, cons, "Red", 0),
+        vec![(colors_uri.clone(), position_of(colors, "Red", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (M1, dcc 37.0 `T3.dpr`, `T6.dpr`): the values of an
+/// anonymous enumerated type are unqualified names under SCOPEDENUMS ON too.
+#[test]
+fn anonymous_enum_values_stay_unqualified_under_scopedenums() {
+    let source = "unit AN;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TS = set of (sA, sB);\nvar\n  X: (aA, aB);\n  S: TS;\nimplementation\nprocedure Run;\nbegin\n  X := aA;\n  S := [sA];\nend;\nend.\n";
+    let source_uri = uri("AN");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "aA", 1),
+        vec![(source_uri.clone(), position_of(source, "aA", 0))]
+    );
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "sA", 1),
+        vec![(source_uri.clone(), position_of(source, "sA", 0))]
+    );
+}
+
+/// l4d-1qta fix round 1 (M4): a local variable shadows an unscoped enum
+/// value, and hover on an unqualified value shows the value.
+#[test]
+fn unqualified_enum_values_shadow_and_hover() {
+    let source = "unit SH;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar Green: Integer; C: TColor;\nbegin\n  Green := 1;\n  C := Red;\nend;\nend.\n";
+    let source_uri = uri("SH");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    assert_eq!(
+        declaration_of(&index, &source_uri, source, "Green", 2),
+        vec![(source_uri.clone(), position_of(source, "Green", 1))]
+    );
+    let hover = index
+        .hover(&source_uri, position_of(source, "Red", 1))
+        .expect("hover on an unqualified enum value");
+    assert!(format!("{:?}", hover.contents).contains("Red"), "{hover:?}");
+}
+
+fn completion_after(
+    index: &NavigationIndex,
+    source_uri: &Url,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> lsp_types::CompletionList {
+    index
+        .completion(source_uri, position_after(source, needle, occurrence))
+        .expect("completion")
+}
+
+fn completion_item<'a>(
+    list: &'a lsp_types::CompletionList,
+    label: &str,
+) -> Option<&'a lsp_types::CompletionItem> {
+    list.items.iter().find(|item| item.label == label)
+}
+
+/// l4d-qssj: completion offers an unscoped enum value unqualified, as an
+/// enum member whose detail names its type, consistent with the binder
+/// (l4d-1qta).
+#[test]
+fn completion_offers_unscoped_enum_values_unqualified() {
+    let source = "unit CE;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Gr;\nend;\nend.\n";
+    let source_uri = uri("CE");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let list = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    let item = completion_item(&list, "Green")
+        .unwrap_or_else(|| panic!("Green is offered: {:?}", list.items));
+    assert_eq!(item.kind, Some(CompletionItemKind::ENUM_MEMBER));
+    assert_eq!(item.detail.as_deref(), Some("TColor.Green"), "{item:?}");
+}
+
+/// l4d-qssj: a value of an enum declared under `{$SCOPEDENUMS ON}` is not an
+/// unqualified name, so only `TEnum.` completion offers it; `TEnum.` offers
+/// an unscoped type's values too.
+#[test]
+fn completion_offers_scoped_enum_values_only_qualified() {
+    let source = "unit CS;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TColor = (Red, Green);\n{$SCOPEDENUMS OFF}\n  TShade = (Light, Dark);\nimplementation\nprocedure Run;\nvar C: TColor; S: TShade;\nbegin\n  C := Gr;\n  C := TColor.Gr;\n  S := TShade.Da;\nend;\nend.\n";
+    let source_uri = uri("CS");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let unqualified = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    assert!(
+        completion_item(&unqualified, "Green").is_none(),
+        "{:?}",
+        unqualified.items
+    );
+    let qualified = completion_after(&index, &source_uri, source, "TColor.Gr", 0);
+    assert!(
+        completion_item(&qualified, "Green").is_some(),
+        "{:?}",
+        qualified.items
+    );
+    let unscoped = completion_after(&index, &source_uri, source, "TShade.Da", 0);
+    assert!(
+        completion_item(&unscoped, "Dark").is_some(),
+        "{:?}",
+        unscoped.items
+    );
+}
+
+/// l4d-qssj: an imported unit's unscoped values are offered unqualified and
+/// after `Unit.`; its scoped values are not.
+#[test]
+fn completion_offers_imported_unscoped_enum_values() {
+    let provider = "unit CProv;\ninterface\ntype\n  TState = (stMaybe, stYes);\n{$SCOPEDENUMS ON}\n  TMode = (moFast, moSlow);\nimplementation\nend.\n";
+    let consumer = "unit CCons;\ninterface\nuses CProv;\nimplementation\nprocedure Run;\nbegin\n  Log(st);\n  Log(mo);\n  Log(CProv.st);\n  Log(CProv.mo);\nend;\nend.\n";
+    let provider_uri = uri("CProv");
+    let consumer_uri = uri("CCons");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("CProv", &provider_uri)])],
+    );
+    let labels = |needle: &str| {
+        let list = completion_after(&index, &consumer_uri, consumer, needle, 0);
+        let mut labels = list
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    };
+    assert_eq!(labels("Log(st"), ["stMaybe", "stYes"]);
+    assert!(
+        labels("Log(mo")
+            .iter()
+            .all(|label| !label.starts_with("mo"))
+    );
+    assert_eq!(labels("CProv.st"), ["stMaybe", "stYes"]);
+    assert!(labels("CProv.mo").is_empty());
+}
+
+/// l4d-qssj: the values of an enum nested in a class are unit-scope names
+/// of the declaring unit (dcc 37.0, l4d-1qta): offered at unit level, in the
+/// class's methods, and after `Unit.` in an importer.
+#[test]
+fn completion_offers_nested_enum_values_as_unit_scope_names() {
+    let source = "unit CN;\ninterface\ntype\n  TC = class\n  public type\n    TKind = (kLeaf, kBranch);\n    procedure M;\n  end;\nimplementation\nprocedure TC.M;\nvar K: TKind;\nbegin\n  K := kL;\nend;\nprocedure Run;\nvar N: Integer;\nbegin\n  N := Ord(kB);\nend;\nend.\n";
+    let consumer = "unit CNUse;\ninterface\nuses CN;\nimplementation\nprocedure Run;\nbegin\n  Log(kL);\n  Log(CN.kB);\nend;\nend.\n";
+    let source_uri = uri("CN");
+    let consumer_uri = uri("CNUse");
+    let index = indexed(
+        &[(&source_uri, source), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("CN", &source_uri)])],
+    );
+    for (uri, text, needle, label) in [
+        (&source_uri, source, "K := kL", "kLeaf"),
+        (&source_uri, source, "Ord(kB", "kBranch"),
+        (&consumer_uri, consumer, "Log(kL", "kLeaf"),
+        (&consumer_uri, consumer, "CN.kB", "kBranch"),
+    ] {
+        let list = completion_after(&index, uri, text, needle, 0);
+        let item =
+            completion_item(&list, label).unwrap_or_else(|| panic!("{needle}: {:?}", list.items));
+        // l4d-qssj fix round 1: a nested enum type qualifies its values too.
+        assert_eq!(
+            item.detail.as_deref(),
+            Some(format!("TKind.{label}").as_str()),
+            "{needle}"
+        );
+    }
+}
+
+/// l4d-qssj: a routine-local enum value is declared in order, so completion
+/// before its type declaration does not offer it (dcc 37.0 `O1.dpr`).
+#[test]
+fn completion_omits_routine_local_enum_values_before_their_declaration() {
+    let source = "unit CL;\ninterface\nimplementation\nprocedure Outer;\n  procedure Inner; var N: Integer; begin N := lA; end;\ntype TL = (lAlpha, lBeta);\nvar L: TL;\nbegin\n  L := lA;\nend;\nend.\n";
+    let source_uri = uri("CL");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let before = completion_after(&index, &source_uri, source, "N := lA", 0);
+    assert!(
+        completion_item(&before, "lAlpha").is_none(),
+        "{:?}",
+        before.items
+    );
+    let after = completion_after(&index, &source_uri, source, "L := lA", 0);
+    let item = completion_item(&after, "lAlpha").unwrap_or_else(|| panic!("{:?}", after.items));
+    assert_eq!(item.detail.as_deref(), Some("TL.lAlpha"));
+}
+
+/// l4d-qssj: anonymous enum values stay unqualified under SCOPEDENUMS ON
+/// (dcc 37.0 `T3.dpr`, `T6.dpr`).
+#[test]
+fn completion_offers_anonymous_enum_values_under_scopedenums() {
+    let source = "unit CA;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TS = set of (sAlpha, sBeta);\nvar\n  X: (aAlpha, aBeta);\n  S: TS;\nimplementation\nprocedure Run;\nbegin\n  X := aA;\n  S := [sA];\nend;\nend.\n";
+    let source_uri = uri("CA");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    for (needle, label) in [("X := aA", "aAlpha"), ("S := [sA", "sAlpha")] {
+        let list = completion_after(&index, &source_uri, source, needle, 0);
+        assert!(
+            completion_item(&list, label).is_some(),
+            "{needle}: {:?}",
+            list.items
+        );
+    }
+}
+
+/// l4d-qssj: with the `{$SCOPEDENUMS}` state unknown, an enum value's
+/// binding is unknown; completion treats it like other conditionally
+/// unknown declarations: it is withheld and the list is incomplete.
+#[test]
+fn completion_marks_unknown_scoping_enum_values_uncertain() {
+    let source = "unit CU;\ninterface\n{$IFDEF MAYBE}{$SCOPEDENUMS ON}{$ENDIF}\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Gr;\nend;\nend.\n";
+    let source_uri = uri("CU");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let list = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    assert!(
+        completion_item(&list, "Green").is_none(),
+        "{:?}",
+        list.items
+    );
+    assert!(list.is_incomplete);
+}
+
+/// l4d-qssj fix round 1 (dcc 37.0 `~/.cache/l4d-tmp/1qta-r1/` P1-P3, P5-P7,
+/// with `PV.pas`, `PW.pas`): the values of an enum nested in a private,
+/// strict private, protected or strict protected class section, or in a
+/// record's private section, are unit-scope names an importer can use,
+/// unqualified and as `Unit.Value`; only the qualified `TC.TE.pB` is E2361.
+const NON_PUBLIC_NESTED_PROVIDER: &str = "unit PV;\ninterface\ntype\n  TC = class\n  private\n    type TE = (pvA, pvB);\n  public\n    F: TE;\n  end;\n  TS = class\n  strict private\n    type TE2 = (xsA, xsB);\n  public\n    G: TE2;\n  end;\n  TP = class\n  protected\n    type TE3 = (ptA, ptB);\n  strict protected\n    type TE4 = (qsA, qsB);\n  end;\n  TR = record\n  private\n    type TQ = (rpA, rpB);\n  end;\nimplementation\nprocedure Local;\nvar O: TC; S: TS;\nbegin\n  O.F := pvA;\n  S.G := xsA;\nend;\nend.\n";
+
+#[test]
+fn nested_enum_values_in_non_public_sections_bind_from_importers() {
+    let provider = NON_PUBLIC_NESTED_PROVIDER;
+    let consumer = "unit PUse;\ninterface\nuses PV;\nimplementation\nprocedure Run;\nvar N: Integer;\nbegin\n  N := Ord(pvB);\n  N := Ord(xsB);\n  N := Ord(ptB);\n  N := Ord(qsB);\n  N := Ord(rpB);\n  N := Ord(PV.pvB) + Ord(PV.xsB) + Ord(PV.qsB) + Ord(PV.rpB);\nend;\nend.\n";
+    let provider_uri = uri("PV");
+    let consumer_uri = uri("PUse");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("PV", &provider_uri)])],
+    );
+    for (name, occurrence) in [
+        ("pvB", 0),
+        ("xsB", 0),
+        ("ptB", 0),
+        ("qsB", 0),
+        ("rpB", 0),
+        ("pvB", 1),
+        ("xsB", 1),
+        ("qsB", 1),
+        ("rpB", 1),
+    ] {
+        let declaration = position_of(provider, &format!(" {name})"), 0);
+        let declaration = Position::new(declaration.line, declaration.character + 1);
+        assert_eq!(
+            declaration_of(&index, &consumer_uri, consumer, name, occurrence),
+            vec![(provider_uri.clone(), declaration)],
+            "{name} #{occurrence}"
+        );
+    }
+    // In the declaring unit, outside the class (PV.pas `Local`).
+    assert_eq!(
+        declaration_of(&index, &provider_uri, provider, "pvA", 1),
+        vec![(provider_uri.clone(), position_of(provider, "pvA", 0))]
+    );
+}
+
+#[test]
+fn completion_offers_non_public_nested_enum_values_to_importers() {
+    let provider = NON_PUBLIC_NESTED_PROVIDER;
+    let consumer = "unit PUse;\ninterface\nuses PV;\nimplementation\nprocedure Run;\nbegin\n  Log(xs);\n  Log(PV.rp);\nend;\nend.\n";
+    let provider_uri = uri("PV");
+    let consumer_uri = uri("PUse");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("PV", &provider_uri)])],
+    );
+    for (needle, expected) in [("Log(xs", ["xsA", "xsB"]), ("PV.rp", ["rpA", "rpB"])] {
+        let list = completion_after(&index, &consumer_uri, consumer, needle, 0);
+        let mut labels = list
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        assert_eq!(labels, expected, "{needle}");
+        assert!(!list.is_incomplete, "{needle}");
+    }
+}
+
+/// l4d-qssj fix round 1: past `MAX_COMPLETION_ITEMS` (256) completion keeps
+/// the first items in name order (case-insensitive, then exact spelling)
+/// and reports the list incomplete.
+#[test]
+fn completion_past_the_item_cap_keeps_the_first_items_in_name_order() {
+    let mut source = String::from("unit CO;\ninterface\ntype\n");
+    let mut names = Vec::new();
+    for enumeration in 0..30 {
+        let values = (0..20)
+            .map(|value| {
+                // Interleave declaration order and case against name order.
+                let number = (value * 37 + enumeration * 11) % 600;
+                let name = if number % 2 == 0 {
+                    format!("vX{number:03}e{enumeration}")
+                } else {
+                    format!("Vx{number:03}e{enumeration}")
+                };
+                names.push(name.clone());
+                name
+            })
+            .collect::<Vec<_>>();
+        writeln!(source, "  TE{enumeration} = ({});", values.join(", ")).expect("write");
+    }
+    source.push_str("implementation\nprocedure Run;\nbegin\n  vx;\nend;\nend.\n");
+    let source_uri = uri("CO");
+    let index = indexed(&[(&source_uri, &source)], &[]);
+    let list = completion_after(&index, &source_uri, &source, "  vx", 0);
+    names.sort_by(|left, right| {
+        left.to_ascii_lowercase()
+            .cmp(&right.to_ascii_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    names.truncate(256);
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+    assert!(list.is_incomplete);
+}

@@ -967,7 +967,14 @@ pub(super) fn scalar_query(
             }
         }
         ExpressionQuery::Declared(name, _) => {
-            let mut known = lookup(state, site, name, budget)?.is_some();
+            let binding = lookup(state, site, name, budget)?;
+            if let Some(Binding::Declaration(decl)) = &binding
+                && super::bindings::is_member_blocker(decl)
+            {
+                // A member may or may not declare it.
+                return Ok(None);
+            }
+            let mut known = binding.is_some();
             if !known && qualifier_blocked(state, site, name, budget)? {
                 return Ok(None);
             }

@@ -1192,8 +1192,12 @@ pub(crate) fn references_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     let records = snapshot_records(&snapshot);
-    let (mut coverage, withheld) = match read_only_reference_coverage(&snapshot, &uri) {
-        Ok(coverage) => coverage,
+    let ReferenceWithholding {
+        mut coverage,
+        withheld,
+        guard,
+    } = match read_only_reference_coverage(&snapshot, &uri) {
+        Ok(withholding) => withholding,
         Err(error) => {
             return with_records(
                 source_generation,
@@ -1210,7 +1214,14 @@ pub(crate) fn references_from_input(
         return cancelled(source_generation, configuration_generation);
     }
     let value = snapshot
-        .binding_locations(&uri, position, include_declaration, cancel, &mut coverage)
+        .binding_locations(
+            &uri,
+            position,
+            include_declaration,
+            cancel,
+            &mut coverage,
+            guard.as_ref(),
+        )
         .map(|mut locations| {
             locations.retain(|location| !withheld.contains(&location.uri));
             Partial {
@@ -1842,10 +1853,20 @@ fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), St
 /// must be proven, so a failure there still rejects the request. Elsewhere,
 /// units whose include audit or project context is unproven are returned
 /// for withholding, and they and an incomplete discovery become gaps.
+/// What read-only references must leave out of an answer.
+struct ReferenceWithholding {
+    coverage: Coverage,
+    /// Units, and the files they include, none of whose occurrences is
+    /// proven.
+    withheld: HashSet<Url>,
+    /// Requesting documents only a dependency gap would withhold.
+    guard: Option<crate::navigation::DependencyGuard>,
+}
+
 fn read_only_reference_coverage(
     snapshot: &RenameSnapshot,
     uri: &Url,
-) -> Result<(Coverage, HashSet<Url>), String> {
+) -> Result<ReferenceWithholding, String> {
     if !snapshot.records.contains_key(uri) {
         return Err(format!(
             "reference document was not retained in the workspace snapshot: {uri}"
@@ -1928,6 +1949,24 @@ fn read_only_reference_coverage(
         ));
     }
 
+    if snapshot.incomplete_context_sources.contains(uri) {
+        return Err(format!(
+            "reference workspace scan incomplete: project context is ambiguous or incomplete for {uri}"
+        ));
+    }
+    // The requesting document and the owners including it are audited
+    // strictly, so only a dependency gap can still withhold them.
+    let requesting = std::iter::once(uri)
+        .chain(
+            snapshot
+                .expansions
+                .iter()
+                .filter(|(_, expansion)| expansion.dependencies.contains(uri))
+                .map(|(owner, _)| owner),
+        )
+        .cloned()
+        .collect::<HashSet<_>>();
+
     let mut coverage = Coverage::default();
     let mut withheld = HashSet::new();
     for owner in &snapshot.unsupported_directive_owners {
@@ -1978,18 +2017,35 @@ fn read_only_reference_coverage(
     // One level is enough: a Pascal unit sees only the interface of the
     // units it uses itself, never what those use in turn, so a failed
     // unit's declarations reach no unit beyond its direct importers.
+    // The decision reads every failed unit, not the gaps retained for
+    // display (l4d-mayy).
     let dependency_gaps = &snapshot.dependency_coverage;
-    let mut unattributed = dependency_gaps.omitted > 0;
-    let mut failed = HashSet::new();
+    let failed = &dependency_gaps.units;
+    if let Some(owner) = requesting.iter().find(|owner| failed.contains(*owner)) {
+        return Err(format!(
+            "reference workspace scan incomplete: the analysis of {owner} failed"
+        ));
+    }
     for gap in &dependency_gaps.gaps {
         coverage.note(gap.uri.as_ref(), gap.reason.as_str());
-        match &gap.uri {
-            Some(owner) => {
-                failed.insert(owner.clone());
-            }
-            None => unattributed = true,
-        }
     }
+    let mut unlisted = failed
+        .iter()
+        .filter(|owner| {
+            !dependency_gaps
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(*owner))
+        })
+        .collect::<Vec<_>>();
+    unlisted.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for owner in unlisted {
+        coverage.note(Some(owner), "the unit could not be analyzed");
+    }
+    // Units only a dependency gap withholds: a requesting one among them is
+    // guarded instead, its occurrences withheld only where an unproven unit
+    // can reach them (`NavigationIndex::dependency_gap_reaches`).
+    let mut gap_withheld = HashSet::new();
     if !failed.is_empty() {
         for importer in snapshot.sources.keys() {
             let imports_failed = snapshot.index.imports(importer).iter().any(|import| {
@@ -1999,17 +2055,19 @@ fn read_only_reference_coverage(
                     .is_some_and(|provider| failed.contains(provider))
             });
             if imports_failed && !failed.contains(importer) {
-                coverage.note(
-                    Some(importer),
-                    "a unit it uses could not be analyzed, so its bindings are unproven",
-                );
-                withheld.insert(importer.clone());
+                if !requesting.contains(importer) {
+                    coverage.note(
+                        Some(importer),
+                        "a unit it uses could not be analyzed, so its bindings are unproven",
+                    );
+                }
+                gap_withheld.insert(importer.clone());
             }
         }
-        withheld.extend(failed);
+        withheld.extend(failed.iter().cloned());
     }
-    if unattributed {
-        withheld.extend(
+    if dependency_gaps.unattributed {
+        gap_withheld.extend(
             snapshot
                 .sources
                 .iter()
@@ -2019,6 +2077,16 @@ fn read_only_reference_coverage(
                 .map(|(owner, _)| owner.clone()),
         );
     }
+    let guarded = gap_withheld
+        .iter()
+        .filter(|owner| requesting.contains(*owner) && !withheld.contains(*owner))
+        .cloned()
+        .collect::<HashSet<_>>();
+    withheld.extend(
+        gap_withheld
+            .into_iter()
+            .filter(|owner| !guarded.contains(owner)),
+    );
     // Include files are reported under their own URIs; a withheld owner
     // withholds what it includes.
     let included = withheld
@@ -2027,6 +2095,40 @@ fn read_only_reference_coverage(
         .flat_map(|expansion| expansion.dependencies.iter().cloned())
         .collect::<Vec<_>>();
     withheld.extend(included);
+    // A requested include file another owner withholds would lose its
+    // proven occurrences; never answer without them (l4d-mayy).
+    if withheld.contains(uri) {
+        let owner = snapshot
+            .expansions
+            .iter()
+            .filter(|(owner, expansion)| {
+                withheld.contains(*owner) && expansion.dependencies.contains(uri)
+            })
+            .map(|(owner, _)| owner.as_str())
+            .min()
+            .unwrap_or(uri.as_str());
+        return Err(format!(
+            "reference workspace scan incomplete: {uri} is included by {owner}, whose analysis is unproven"
+        ));
+    }
+    // A requesting document that uses a unit withheld for any reason, not
+    // only a failed one, is guarded too: what that unit declares, helpers
+    // included, is unproven (l4d-mayy fix round 2).
+    let mut guarded = guarded;
+    for owner in &requesting {
+        if withheld.contains(owner) || guarded.contains(owner) {
+            continue;
+        }
+        let uses_withheld = snapshot.index.imports(owner).iter().any(|import| {
+            snapshot
+                .index
+                .import_provider_uri(owner, &import.name)
+                .is_some_and(|provider| withheld.contains(provider))
+        });
+        if uses_withheld {
+            guarded.insert(owner.clone());
+        }
+    }
     if !snapshot.complete {
         coverage.note(
             None,
@@ -2036,7 +2138,19 @@ fn read_only_reference_coverage(
                 .unwrap_or("bounded source discovery did not finish"),
         );
     }
-    Ok((coverage, withheld))
+    let guard = (!guarded.is_empty()).then(|| crate::navigation::DependencyGuard {
+        unproven: withheld
+            .iter()
+            .filter(|unit| !guarded.contains(*unit))
+            .cloned()
+            .collect(),
+        documents: guarded,
+    });
+    Ok(ReferenceWithholding {
+        coverage,
+        withheld,
+        guard,
+    })
 }
 
 fn ensure_document_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -4411,6 +4525,439 @@ mod tests {
             input,
             &source_uri(&downstream),
             Position::new(6, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(computed.value.is_err(), "{:?}", computed.value);
+    }
+
+    /// `Environment.pas` declares `EnvValue` and holds a harmless
+    /// `{$IFDEF}`; forty units using it fail their include audit.
+    fn environment_with_failing_importers(root: &Path, environment_include: &str) -> PathBuf {
+        let environment = root.join("Environment.pas");
+        fs::write(
+            &environment,
+            format!(
+                "unit Environment;\ninterface\nconst EnvValue = 1;\nimplementation\n{environment_include}procedure Run;\nbegin\n{{$IFDEF DEBUG}}\n{{$ENDIF}}\n  Log(EnvValue);\nend;\nend.\n"
+            ),
+        )
+        .expect("environment");
+        for index in 0..40 {
+            fs::write(
+                root.join(format!("Consumer{index:03}.pas")),
+                format!(
+                    "unit Consumer{index:03};\ninterface\nuses Environment;\n{{$I Missing.inc}}\nimplementation\nprocedure Run;\nbegin\n  Log(EnvValue);\nend;\nend.\n"
+                ),
+            )
+            .expect("consumer");
+        }
+        environment
+    }
+
+    /// l4d-mayy: the gaps past the display cap are still attributed, so
+    /// forty failing importers withhold only themselves; the requesting
+    /// document, whose `{$IFDEF}` is harmless, keeps its proven occurrences.
+    #[test]
+    fn more_dependency_gaps_than_are_displayed_do_not_withhold_the_requesting_document() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let environment = environment_with_failing_importers(&root, "");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let computed = references_from_input(
+            input.clone(),
+            &source_uri(&environment),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
+        assert!(partial.coverage.omitted > 0, "{:?}", partial.coverage);
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&root.join("Consumer000.pas")))),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&environment), 2, 6),
+                (source_uri(&environment), 8, 6),
+            ]
+        );
+        // Rename keeps the strict, complete walk.
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let rename = crate::workspace::rename::rename_from_input(
+            input,
+            &source_uri(&environment),
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 0);
+        assert!(rename.value.is_err(), "{:?}", rename.value);
+    }
+
+    /// l4d-mayy: the requesting document's own audit failing refuses the
+    /// references, however many dependency gaps there are.
+    #[test]
+    fn a_requesting_document_whose_own_audit_fails_refuses_references() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let environment = environment_with_failing_importers(&root, "{$I Missing.inc}\n");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let computed = references_from_input(
+            input,
+            &source_uri(&environment),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(computed.value.is_err(), "{:?}", computed.value);
+    }
+
+    /// `Downstream.pas` uses `Failing.pas`, whose analysis fails, and
+    /// declares `TDownInfo`, used in a plain routine (also through a `with`
+    /// receiver), in a method of a class derived from `Failing`'s
+    /// `TFailBase` and in a method of a class derived from nothing unproven.
+    fn downstream_of_a_failing_ancestor(root: &Path) -> PathBuf {
+        fs::write(
+            root.join("Failing.pas"),
+            "unit Failing;\ninterface\n{$I Missing.inc}\ntype\n  TFailBase = class\n  end;\nimplementation\nend.\n",
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            concat!(
+                "unit Downstream;\n",                    // 0
+                "interface\n",                           // 1
+                "uses Failing;\n",                       // 2
+                "type\n",                                // 3
+                "  TDownInfo = class\n",                 // 4
+                "  end;\n",                              // 5
+                "  TThing = class(TFailBase)\n",         // 6
+                "    procedure Run;\n",                  // 7
+                "  end;\n",                              // 8
+                "  TLocal = class\n",                    // 9
+                "    procedure Run;\n",                  // 10
+                "  end;\n",                              // 11
+                "implementation\n",                      // 12
+                "procedure Plain;\n",                    // 13
+                "var Info: TDownInfo;\n",                // 14
+                "begin\n",                               // 15
+                "  with Info do Log(TDownInfo(nil));\n", // 16
+                "end;\n",                                // 17
+                "procedure TThing.Run;\n",               // 18
+                "var Info: TDownInfo;\n",                // 19
+                "begin\n",                               // 20
+                "end;\n",                                // 21
+                "procedure TLocal.Run;\n",               // 22
+                "var Info: TDownInfo;\n",                // 23
+                "begin\n",                               // 24
+                "end;\n",                                // 25
+                "end.\n",
+            ),
+        )
+        .expect("downstream");
+        downstream
+    }
+
+    /// l4d-mayy: a unit's own top-level declaration shadows every import,
+    /// so a dependency gap in a unit it uses withholds none of its
+    /// occurrences, except inside a method of a class whose ancestry the
+    /// gap leaves unproven, where an inherited member may shadow it.
+    #[test]
+    fn a_dependency_gap_withholds_only_the_requesting_documents_occurrences_an_unproven_ancestor_may_shadow()
+     {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let downstream = downstream_of_a_failing_ancestor(&root);
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_target_error(false);
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        // Without the index the best-effort local snapshot audits the
+        // providers relaxed, so Failing.pas is a dependency gap.
+        crate::workspace::indexing::test_set_target_error(true);
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(0));
+        let computed = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(4, 2),
+            true,
+            &AtomicBool::new(false),
+        );
+        let partial = computed.value.expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&root.join("Failing.pas")))),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("helper")),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("with statement")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&downstream), 4, 2),
+                (source_uri(&downstream), 14, 10),
+            ]
+        );
+    }
+
+    /// Runs references from `uri` on the best-effort local snapshot that
+    /// answers without the index, where an import's failure is a gap.
+    fn references_without_the_index(
+        root: &Path,
+        uri: &Url,
+        position: Position,
+    ) -> Result<crate::coverage::Partial<Vec<lsp_types::Location>>, String> {
+        let input =
+            test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default()).analysis_input();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::workspace::indexing::test_set_target_error(false);
+                crate::workspace::indexing::test_set_small_workspace_sources(None);
+            }
+        }
+        let _reset = Reset;
+        crate::workspace::indexing::test_set_target_error(true);
+        crate::workspace::indexing::test_set_small_workspace_sources(Some(0));
+        references_from_input(input, uri, position, true, &AtomicBool::new(false)).value
+    }
+
+    /// l4d-mayy fix round 1: a helper an unproven import declares, even for
+    /// `TObject`, extends the members a method of an own class resolves
+    /// first, so the occurrence there is withheld; a plain routine has no
+    /// Self and keeps its occurrence.
+    #[test]
+    fn a_helper_an_unproven_import_may_declare_withholds_occurrences_inside_methods() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Failing.pas"),
+            concat!(
+                "unit Failing;\n",
+                "interface\n",
+                "type\n",
+                "  TObjHelper = class helper for TObject\n",
+                "{$I Missing.inc}\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+        )
+        .expect("failing");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            concat!(
+                "unit Downstream;\n",      // 0
+                "interface\n",             // 1
+                "uses Failing;\n",         // 2
+                "type\n",                  // 3
+                "  TLocal = class\n",      // 4
+                "    procedure Run;\n",    // 5
+                "  end;\n",                // 6
+                "procedure Marker;\n",     // 7
+                "implementation\n",        // 8
+                "procedure Marker;\n",     // 9
+                "begin\n",                 // 10
+                "end;\n",                  // 11
+                "procedure Plain;\n",      // 12
+                "begin\n",                 // 13
+                "  Marker;\n",             // 14
+                "end;\n",                  // 15
+                "procedure TLocal.Run;\n", // 16
+                "begin\n",                 // 17
+                "  Marker;\n",             // 18
+                "end;\n",                  // 19
+                "end.\n",
+            ),
+        )
+        .expect("downstream");
+        let partial =
+            references_without_the_index(&root, &source_uri(&downstream), Position::new(7, 10))
+                .expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("helper")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&downstream), 7, 10),
+                (source_uri(&downstream), 9, 10),
+                (source_uri(&downstream), 14, 2),
+            ]
+        );
+    }
+
+    /// l4d-mayy fix round 2: a used unit withheld for its own unsupported
+    /// directive is as unproven as one whose analysis failed. Occurrences
+    /// inside the requesting document's methods are withheld, since a
+    /// helper it declares may capture them; plain routines and the owner
+    /// qualifier of an implementation heading, bound in the unit itself,
+    /// keep theirs.
+    #[test]
+    fn a_used_unit_withheld_for_its_own_directive_withholds_occurrences_inside_methods() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("Partial.pas"),
+            "unit Partial;\ninterface\n{$POINTERMATH ON}\ntype\n  TState = (Maybe, Yes);\nimplementation\nend.\n",
+        )
+        .expect("partial");
+        let downstream = root.join("Downstream.pas");
+        fs::write(
+            &downstream,
+            concat!(
+                "unit Downstream;\n",      // 0
+                "interface\n",             // 1
+                "uses Partial;\n",         // 2
+                "type\n",                  // 3
+                "  TLocal = class\n",      // 4
+                "    procedure Run;\n",    // 5
+                "  end;\n",                // 6
+                "  TDownInfo = class\n",   // 7
+                "  end;\n",                // 8
+                "implementation\n",        // 9
+                "procedure Plain;\n",      // 10
+                "var Info: TDownInfo;\n",  // 11
+                "begin\n",                 // 12
+                "end;\n",                  // 13
+                "procedure TLocal.Run;\n", // 14
+                "var Info: TDownInfo;\n",  // 15
+                "begin\n",                 // 16
+                "end;\n",                  // 17
+                "end.\n",
+            ),
+        )
+        .expect("downstream");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let partial = references_from_input(
+            input.clone(),
+            &source_uri(&downstream),
+            Position::new(7, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("a partial result, not a refusal");
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&root.join("Partial.pas")))),
+            "{:?}",
+            partial.coverage
+        );
+        assert!(
+            partial
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&source_uri(&downstream))
+                    && gap.reason.contains("helper")),
+            "{:?}",
+            partial.coverage
+        );
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&downstream), 7, 2),
+                (source_uri(&downstream), 11, 10),
+            ]
+        );
+        let owner = references_from_input(
+            input,
+            &source_uri(&downstream),
+            Position::new(4, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("a partial result, not a refusal");
+        assert_eq!(
+            located(&owner.value),
+            vec![
+                (source_uri(&downstream), 4, 2),
+                (source_uri(&downstream), 14, 10)
+            ]
+        );
+    }
+
+    /// l4d-mayy fix round 1: a requested include file whose other owner is
+    /// withheld for its own unsupported directive would lose the
+    /// occurrences it holds, so references refuse rather than answer
+    /// without them.
+    #[test]
+    fn a_requested_include_withheld_through_another_owner_refuses_references() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.inc");
+        fs::write(&shared, "const IncValue = 1;\n").expect("include");
+        fs::write(
+            root.join("Good.pas"),
+            "unit Good;\ninterface\n{$I Shared.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(IncValue);\nend;\nend.\n",
+        )
+        .expect("good");
+        fs::write(
+            root.join("Bad.pas"),
+            "unit Bad;\ninterface\n{$POINTERMATH ON}\n{$I Shared.inc}\nimplementation\nend.\n",
+        )
+        .expect("bad");
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        let computed = references_from_input(
+            input,
+            &source_uri(&shared),
+            Position::new(0, 6),
             true,
             &AtomicBool::new(false),
         );

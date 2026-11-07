@@ -45,6 +45,9 @@ pub(super) struct Scope {
     /// Some declarations of this statement scope were not admitted. Only
     /// queries from inside it can be affected; they are never proven.
     opaque: bool,
+    /// The type a method implementation belongs to, as its heading spells
+    /// it: its members bind before the enclosing scopes (l4d-wwmg).
+    pub(super) owner: Option<Box<str>>,
 }
 #[derive(Clone, Copy, Debug, Hash)]
 struct AnonymousHeader {
@@ -85,6 +88,9 @@ pub struct CompileTimeState {
     pub(super) settings: pascal_project::LayoutSettings,
     pub(super) settings_stack: Vec<Option<pascal_project::LayoutSettings>>,
     pub(super) settings_history: Vec<super::records::LayoutChange>,
+    /// The `{$SCOPEDENUMS}` state that an enumerated type declared now
+    /// takes (l4d-1qta).
+    pub(super) scoped_enums: Truth,
     spans: Vec<Span>,
     pub(super) sequence: Sequence,
     logical: usize,
@@ -103,6 +109,17 @@ pub struct CompileTimeState {
     composite_depth: usize,
     rhs: bool,
     pending_class: bool,
+    /// The previous word of a declaration's right-hand side was `of`: an
+    /// `object` here ends a method-pointer type (`procedure of object`),
+    /// it opens no body.
+    after_of: bool,
+    /// Where the statement that just admitted a procedural-type declaration
+    /// ended, with its section and scope: only a statement starting there
+    /// can be its calling convention.
+    procedural_tail: Option<(Section, ScopeId, usize)>,
+    /// The previous token was `=` (or `= packed`): a `class` here is a
+    /// type, also inside a composite body (a nested class).
+    after_eq: bool,
     /// A composite header's heritage list opened at this paren level
     /// (`class(Exception)`): a `;` right after it ends a bodiless class.
     class_heritage: Option<usize>,
@@ -229,6 +246,7 @@ impl CompileTimeState {
                 parent: None,
                 kind: ScopeKind::Root,
                 opaque: false,
+                owner: None,
             }],
             stack: vec![ScopeId(0)],
             declarations: Vec::new(),
@@ -239,6 +257,7 @@ impl CompileTimeState {
             settings: context.layout.defaults.clone(),
             settings_stack: Vec::new(),
             settings_history: Vec::new(),
+            scoped_enums: Truth::False,
             spans: Vec::new(),
             sequence: Sequence(0),
             logical: 0,
@@ -254,6 +273,9 @@ impl CompileTimeState {
             composite_depth: 0,
             rhs: false,
             pending_class: false,
+            after_of: false,
+            after_eq: false,
+            procedural_tail: None,
             class_heritage: None,
             parens: 0,
             implementation: false,
@@ -462,6 +484,7 @@ impl CompileTimeState {
         self.pending_start = self.logical;
         self.rhs = false;
         self.pending_class = false;
+        self.after_of = false;
         self.class_heritage = None;
     }
 
@@ -544,6 +567,9 @@ impl CompileTimeState {
             return Ok(());
         }
         self.flush_word(budget)?;
+        if !ch.is_whitespace() {
+            self.after_eq = ch == '=';
+        }
         self.escaped_word = matches!(ch, '@' | '&');
         if ch == ';'
             && let Some(header) = &mut self.anonymous_header
@@ -620,6 +646,7 @@ impl CompileTimeState {
             parent: self.stack.last().copied(),
             kind,
             opaque: false,
+            owner: None,
         });
         self.stack.push(id);
         self.section = Section::None;
@@ -697,6 +724,19 @@ impl CompileTimeState {
         }
     }
 
+    /// The type of the innermost method implementation enclosing `site`.
+    pub(super) fn method_owner_at(&self, site: &BindingSite) -> Option<&str> {
+        let mut scope = Some(site.scope);
+        while let Some(id) = scope {
+            let entry = self.scopes.get(id.0 as usize)?;
+            if let Some(owner) = &entry.owner {
+                return Some(owner);
+            }
+            scope = entry.parent;
+        }
+        None
+    }
+
     /// Whether a query from `site` may miss a declaration of an opaque scope.
     pub(super) fn hidden_at(
         &self,
@@ -728,11 +768,13 @@ impl CompileTimeState {
         }
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
+        let after_eq = std::mem::take(&mut self.after_eq);
         let result = if std::mem::take(&mut self.escaped_word) {
             Ok(())
         } else {
-            self.process_word(&word, budget)
+            self.process_word(&word, after_eq, budget)
         };
+        self.after_eq = after_eq && word == "packed";
         drop(word);
         budget.release(std::mem::replace(&mut self.word_backing, 0));
         result
@@ -741,6 +783,7 @@ impl CompileTimeState {
     fn process_word(
         &mut self,
         word: &str,
+        after_eq: bool,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
         if self.root_ended {
@@ -794,6 +837,7 @@ impl CompileTimeState {
         ) && self.rhs
             && word != "asm"
         {
+            let after_of = std::mem::replace(&mut self.after_of, word == "of");
             if self.pending_class {
                 if matches!(word, "abstract" | "sealed") {
                     return Ok(());
@@ -805,8 +849,14 @@ impl CompileTimeState {
                     return Ok(());
                 }
             }
-            if matches!(word, "record" | "object" | "interface" | "dispinterface")
-                || (word == "class" && self.composite_depth == 0)
+            // In a composite body `class` also prefixes members (`class
+            // function`); after `=` it is a nested class type.
+            // `of object` ends a method-pointer type: with an initialiser
+            // (`P: procedure of object = nil;`) no `;` follows it to close
+            // a body (Classes.pas 7.0 AddDataModule, l4d-rrzi).
+            if matches!(word, "record" | "interface" | "dispinterface")
+                || (word == "object" && !after_of)
+                || (word == "class" && (self.composite_depth == 0 || after_eq))
             {
                 self.composite_depth += 1;
                 self.pending_class = true;
@@ -918,6 +968,30 @@ impl CompileTimeState {
         &mut self,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
+        let section = self.section;
+        let admitted = self.declarations.len();
+        let continuation = self.procedural_directive_continuation(budget)?;
+        let result = if continuation {
+            Ok(())
+        } else {
+            self.admit_statement_inner(budget)
+        };
+        let scope = self.site().scope;
+        self.procedural_tail =
+            (matches!(section, Section::Vars | Section::Consts | Section::Types)
+                && (continuation
+                    || (self.declarations.len() > admitted
+                        && self.declarations.last().is_some_and(|last| {
+                            last.site.scope == scope && procedural_type(&last.ty)
+                        }))))
+            .then_some((section, scope, self.logical));
+        result
+    }
+
+    fn admit_statement_inner(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
         if self.section == Section::None && self.unit_name.is_none() && self.sequence.0 == 0 {
             let suffix = " interface implementation end.";
             let len = self.pending.len() + suffix.len();
@@ -1021,6 +1095,10 @@ impl CompileTimeState {
                 self.admit_node(decl, source.as_bytes(), prefix.len(), false, true, budget)?;
                 if self.implementation {
                     self.push_scope(ScopeKind::Routine, budget)?;
+                    if let Some(owner) = method_owner(decl, source.as_bytes(), budget)? {
+                        let id = self.site().scope.0 as usize;
+                        self.scopes[id].owner = Some(owner);
+                    }
                     self.admit_arguments(decl, source.as_bytes(), prefix.len(), budget)?;
                 }
                 self.section = Section::None;
@@ -1043,6 +1121,45 @@ impl CompileTimeState {
             self.section = Section::None;
         }
         result
+    }
+
+    /// A calling convention after a procedural type ends with its own `;`
+    /// (`F: function: Integer; stdcall = Init;`, SysUtils'
+    /// GetFileAttributesExFunc). It and the variable's or typed constant's
+    /// initializer declare nothing: the declaration admitted right before
+    /// it, in the same section and scope, stands.
+    fn procedural_directive_continuation(
+        &self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        if !matches!(
+            self.section,
+            Section::Vars | Section::Consts | Section::Types
+        ) {
+            return Ok(false);
+        }
+        budget.charge(1, self.pending.len(), 0)?;
+        let text = self.pending.trim();
+        let end = text
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(text.len());
+        let word = &text[..end];
+        if ![
+            "stdcall", "cdecl", "pascal", "register", "safecall", "winapi", "varargs",
+        ]
+        .iter()
+        .any(|directive| word.eq_ignore_ascii_case(directive))
+        {
+            return Ok(false);
+        }
+        let Some(rest) = text[end..].trim().strip_suffix(';') else {
+            return Ok(false);
+        };
+        let rest = rest.trim();
+        if !(rest.is_empty() || (self.section != Section::Types && rest.starts_with('='))) {
+            return Ok(false);
+        }
+        Ok(self.procedural_tail == Some((self.section, self.site().scope, self.pending_start)))
     }
 
     fn admit_imports(
@@ -1135,6 +1252,21 @@ impl CompileTimeState {
                 if node.kind() == "declProc" && matches!(name.kind(), "genericDot" | "genericTpl") {
                     continue;
                 }
+                if node.kind() == "declType"
+                    && valid
+                    && name.kind() == "genericTpl"
+                    && name
+                        .child_by_field_name("entity")
+                        .is_some_and(|entity| entity.kind() == "identifier")
+                {
+                    // A generic type declares no plain name: it shadows
+                    // neither `CompilerVersion` nor an earlier constant, and
+                    // `Declared` and `SizeOf` do not see it. The values of
+                    // an enumerated type nested in it are unit-scope names
+                    // (dcc 37.0 G1..G7, l4d-wwmg).
+                    self.admit_generic_type(node, bytes, prefix, type_sequence, budget)?;
+                    continue;
+                }
                 self.unknown = true;
                 continue;
             }
@@ -1202,6 +1334,11 @@ impl CompileTimeState {
             if strong && let TypeExpr::Named(name) = ty {
                 ty = TypeExpr::StrongAlias(name);
             }
+            if matches!(ty, TypeExpr::Enum(_)) && self.scoped_enums == Truth::Unknown {
+                // Whether the values enter the scope is unknown, like a
+                // declaration under unknown conditional activity.
+                self.unknown = true;
+            }
             self.sequence.0 = self
                 .sequence
                 .0
@@ -1216,6 +1353,12 @@ impl CompileTimeState {
             let anchor =
                 self.anchor_at(logical_name, name.end_byte() - name.start_byte(), budget)?;
             let provenance = self.provenance(self.pending_start, self.logical, budget)?;
+            let shape = match ty_node {
+                Some(ty_node) if is_type && valid => {
+                    class_shape(ty_node, bytes, budget)?.map(std::sync::Arc::new)
+                }
+                _ => None,
+            };
             self.declarations.push(Declaration {
                 name: name_text.to_ascii_lowercase(),
                 key: DefinitionKey {
@@ -1239,10 +1382,175 @@ impl CompileTimeState {
                 provenance,
                 initializer: initializer.map(str::to_owned),
                 initializer_logical,
+                shape,
             });
+            if is_type
+                && valid
+                && let Some(ty_node) = ty_node
+                && matches!(
+                    ty_node.kind(),
+                    "declClass" | "declIntf" | "declHelper" | "type"
+                )
+            {
+                self.admit_nested_enums(
+                    ty_node,
+                    bytes,
+                    prefix,
+                    type_sequence,
+                    &mut definition_count,
+                    &mut field_count,
+                    &mut variant_count,
+                    budget,
+                )?;
+            }
             self.definition_count = definition_count;
             self.field_count = field_count;
             self.variant_count = variant_count;
+        }
+        Ok(())
+    }
+
+    /// A generic type declaration: only the enumerated types nested in it
+    /// are admitted, as for any composite type.
+    fn admit_generic_type(
+        &mut self,
+        node: Node<'_>,
+        bytes: &[u8],
+        prefix: usize,
+        type_sequence: Sequence,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        let mut cursor = node.walk();
+        let Some(ty_node) = node.children_by_field_name("type", &mut cursor).last() else {
+            return Ok(());
+        };
+        if !matches!(
+            ty_node.kind(),
+            "declClass" | "declIntf" | "declHelper" | "type"
+        ) {
+            return Ok(());
+        }
+        // Nested values come after whatever an earlier query could see.
+        self.sequence.0 = self
+            .sequence
+            .0
+            .checked_add(1)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let mut definition_count = self.definition_count;
+        let mut field_count = self.field_count;
+        let mut variant_count = self.variant_count;
+        self.admit_nested_enums(
+            ty_node,
+            bytes,
+            prefix,
+            type_sequence,
+            &mut definition_count,
+            &mut field_count,
+            &mut variant_count,
+            budget,
+        )?;
+        self.definition_count = definition_count;
+        self.field_count = field_count;
+        self.variant_count = variant_count;
+        Ok(())
+    }
+
+    /// The values of an enumerated type nested in a class or record are
+    /// unqualified names of the scope that declares the outer type (dcc 37.0,
+    /// l4d-1qta). Each nested enumerated type is admitted as a type
+    /// declaration whose name no query can spell, so only its values bind.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_nested_enums(
+        &mut self,
+        outer: Node<'_>,
+        bytes: &[u8],
+        prefix: usize,
+        type_sequence: Sequence,
+        definition_count: &mut usize,
+        field_count: &mut usize,
+        variant_count: &mut usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        let mut pending = vec![outer];
+        while let Some(node) = pending.pop() {
+            budget.charge(1, 0, 0)?;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                pending.push(child);
+            }
+            if node.kind() != "declType" {
+                continue;
+            }
+            let Some(wrapper) = node.child_by_field_name("type") else {
+                continue;
+            };
+            let enumeration = if wrapper.kind() == "declEnum" {
+                Some(wrapper)
+            } else if wrapper.kind() == "type" && wrapper.named_child_count() == 1 {
+                wrapper.named_child(0).filter(|n| n.kind() == "declEnum")
+            } else {
+                None
+            };
+            if enumeration.is_none() {
+                continue;
+            }
+            let Some(name) = node
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "identifier")
+            else {
+                self.unknown = true;
+                continue;
+            };
+            let raw = wrapper
+                .utf8_text(bytes)
+                .map_err(|_| IncompleteReason::MalformedSource)?;
+            budget.charge(1, raw.len(), size_of::<Declaration>() + 1)?;
+            let ty = type_expr(
+                self,
+                type_sequence,
+                prefix,
+                Some(wrapper),
+                bytes,
+                raw,
+                false,
+                1,
+                definition_count,
+                field_count,
+                variant_count,
+                budget,
+            )?;
+            if self.scoped_enums == Truth::Unknown {
+                self.unknown = true;
+            }
+            let site = self.site();
+            let logical_name = name
+                .start_byte()
+                .checked_sub(prefix)
+                .and_then(|n| self.pending_start.checked_add(n))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let anchor =
+                self.anchor_at(logical_name, name.end_byte() - name.start_byte(), budget)?;
+            let provenance = self.provenance(self.pending_start, self.logical, budget)?;
+            self.declarations.push(Declaration {
+                // A space never occurs in a queried name.
+                name: " ".to_owned(),
+                key: DefinitionKey {
+                    anchor,
+                    scope: site.scope,
+                },
+                site: site.clone(),
+                type_site: site.clone(),
+                ty,
+                is_type: true,
+                exported: self.in_interface && !self.implementation && site.scope == ScopeId(0),
+                is_constant: false,
+                is_routine: false,
+                settings: self.settings_at_logical(logical_name, budget)?.clone(),
+                provenance,
+                initializer: None,
+                initializer_logical: None,
+                shape: None,
+            });
         }
         Ok(())
     }
@@ -1540,6 +1848,7 @@ impl CompileTimeState {
         self.settings.hash(&mut h);
         self.settings_stack.hash(&mut h);
         self.settings_history.hash(&mut h);
+        self.scoped_enums.hash(&mut h);
         self.logical.hash(&mut h);
         self.pending_start.hash(&mut h);
         self.pending.hash(&mut h);
@@ -1559,7 +1868,9 @@ impl CompileTimeState {
         self.unknown.hash(&mut h);
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
+        self.after_of.hash(&mut h);
         self.class_heritage.hash(&mut h);
+        self.procedural_tail.hash(&mut h);
         self.failure.hash(&mut h);
         self.option_stack.len().hash(&mut h);
         for saved in &self.option_stack {
@@ -1590,6 +1901,7 @@ impl CompileTimeState {
             d.settings.hash(&mut h);
             d.initializer.hash(&mut h);
             d.initializer_logical.hash(&mut h);
+            d.shape.hash(&mut h);
         }
         h.finish()
     }
@@ -1671,6 +1983,9 @@ impl CompileTimeState {
                 .ok_or("context metadata overflow")?,
         )?;
         visit(self.scopes.len() * size_of::<Scope>())?;
+        for scope in &self.scopes {
+            visit(scope.owner.as_ref().map_or(0, |owner| owner.len()))?;
+        }
         visit(self.stack.len() * size_of::<ScopeId>())?;
         visit(self.settings_stack.len() * size_of::<Option<pascal_project::LayoutSettings>>())?;
         visit(self.settings_history.len() * size_of::<super::records::LayoutChange>())?;
@@ -1706,6 +2021,9 @@ impl CompileTimeState {
             visit_type_payload(&d.ty, visit)?;
             if let Some(text) = &d.initializer {
                 visit(text.len())?;
+            }
+            if let Some(shape) = &d.shape {
+                visit(shape.retained_bytes())?;
             }
             for a in &d.provenance {
                 visit(size_of::<SourceAnchor>())?;
@@ -1808,6 +2126,156 @@ fn push_continuation_char(
     }
     text.push(ch);
     Ok(())
+}
+
+/// A procedural type: `procedure`, `function` or `reference to`.
+fn procedural_type(ty: &TypeExpr) -> bool {
+    matches!(ty, TypeExpr::Unsupported(text) if {
+        let text = text.trim_start();
+        let head = text
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .map_or(text, |n| &text[..n]);
+        ["procedure", "function", "reference"]
+            .iter()
+            .any(|keyword| head.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// The type a qualified method implementation heading names (`TC` in
+/// `procedure TC.M`), lowercased; `None` for a plain routine. A nested or
+/// generic owner keeps its `.` or `<`, which no lookup resolves.
+fn method_owner(
+    decl: Node<'_>,
+    bytes: &[u8],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Box<str>>, IncompleteReason> {
+    budget.charge(1, 0, 0)?;
+    let Some(name) = decl.child_by_field_name("name") else {
+        return Ok(None);
+    };
+    if name.kind() != "genericDot" {
+        return Ok(None);
+    }
+    let Some(lhs) = name.child_by_field_name("lhs") else {
+        return Ok(Some("<".into()));
+    };
+    let text = lhs
+        .utf8_text(bytes)
+        .map_err(|_| IncompleteReason::MalformedSource)?;
+    budget.charge(1, text.len(), text.len())?;
+    let mut owner: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    owner.make_ascii_lowercase();
+    if lhs.kind() != "identifier" && !owner.contains(['.', '<']) {
+        owner.push('<');
+    }
+    Ok(Some(owner.into_boxed_str()))
+}
+
+/// Every identifier of a composite type body that is not inside a type
+/// reference, a parameter list, an initializer, a GUID or an attribute,
+/// none of which declares a member: an over-approximation of the members
+/// the body declares. `None` when an identifier could equal an ASCII one
+/// under case folding.
+fn member_names(
+    node: Node<'_>,
+    bytes: &[u8],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Vec<Box<str>>>, IncompleteReason> {
+    let mut names = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        budget.charge(1, 0, 0)?;
+        match node.kind() {
+            "typeref" | "declArgs" | "declPropArgs" | "defaultValue" | "guid"
+            | "rttiAttributes" => continue,
+            "identifier" => {
+                let text = node
+                    .utf8_text(bytes)
+                    .map_err(|_| IncompleteReason::MalformedSource)?;
+                let text = text.strip_prefix('&').unwrap_or(text);
+                if text
+                    .chars()
+                    .any(|ch| !ch.is_ascii() && super::names::folds_to_ascii(ch))
+                {
+                    return Ok(None);
+                }
+                budget.charge(1, text.len(), size_of::<Box<str>>() + text.len())?;
+                names.push(text.to_ascii_lowercase().into_boxed_str());
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            pending.push(child);
+        }
+    }
+    Ok(Some(names))
+}
+
+/// The member scope of a composite type body (l4d-wwmg): what its active
+/// text could declare, its heritage list and, for a helper, the helped
+/// type. A forward declaration has none.
+fn class_shape(
+    node: Node<'_>,
+    bytes: &[u8],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<super::bindings::ClassShape>, IncompleteReason> {
+    use super::bindings::{ClassShape, ShapeKind};
+    let node = if node.kind() == "type" && node.named_child_count() == 1 {
+        node.named_child(0).unwrap_or(node)
+    } else {
+        node
+    };
+    let mut kind = match node.kind() {
+        "declIntf" => ShapeKind::Interface,
+        "declHelper" => ShapeKind::Helper,
+        "declClass" => ShapeKind::Class,
+        _ => return Ok(None),
+    };
+    let mut body = false;
+    let mut parents = Vec::new();
+    let mut helped = None;
+    for index in 0..node.child_count() {
+        budget.charge(1, 0, 0)?;
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "kRecord" if node.kind() == "declClass" => kind = ShapeKind::Record,
+            "kObject" if node.kind() == "declClass" => kind = ShapeKind::Object,
+            "kEnd" => body = true,
+            "typeref" => {
+                let text = child
+                    .utf8_text(bytes)
+                    .map_err(|_| IncompleteReason::MalformedSource)?;
+                budget.charge(1, text.len(), size_of::<String>() + text.len())?;
+                let mut text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                text.make_ascii_lowercase();
+                if node.kind() == "declHelper"
+                    && node.field_name_for_child(index as u32) != Some("parent")
+                {
+                    helped = Some(text);
+                } else {
+                    parents.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !body && parents.is_empty() {
+        return Ok(None);
+    }
+    let names = member_names(node, bytes, budget)?.map(super::InterfaceNames::new);
+    let shape = ClassShape {
+        kind,
+        names,
+        parents,
+        helped,
+    };
+    // The names and the heritage list above charged their own bytes.
+    budget.charge(1, 0, size_of::<ClassShape>())?;
+    Ok(Some(shape))
 }
 
 fn find_node<'a>(
@@ -2023,6 +2491,7 @@ pub(super) fn type_expr(
                 value,
                 value_logical,
                 key,
+                scoped: state.scoped_enums == Truth::True,
             });
         }
         Ok(TypeExpr::Enum(members))

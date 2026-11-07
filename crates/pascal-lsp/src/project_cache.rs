@@ -1660,6 +1660,70 @@ mod cache_tests {
         ));
     }
 
+    /// l4d-ig6b: a references request (a bulk client request) must not wait
+    /// behind the background warmer's claim; it takes the claim over as
+    /// interactive work does, and still reuses what the warmer stored.
+    #[test]
+    fn client_request_lookup_takes_over_a_yielding_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::yielding(Arc::new(AtomicBool::new(false))),
+        );
+        let client = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::client(Arc::new(AtomicBool::new(false))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // The warmer holds its claim until told otherwise: a lookup that
+        // waited for it would never answer here.
+        let lookup = client.recv_timeout(Duration::from_secs(5));
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let Ok(Lookup::Compute(claim)) = lookup else {
+            panic!("the client request must take the warmer's claim over, not wait for it")
+        };
+        assert!(!claim.is_detached(), "the take-over claims the slot");
+        cache.store_unit(claim, main_unit_value(), 1, &no_cancel());
+        assert!(matches!(
+            cache.unit(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    /// l4d-ig6b: what the warmer finished is reused, not computed again.
+    #[test]
+    fn client_request_lookup_reuses_a_unit_the_warmer_stored() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let (finish, owner) = spawn_owner(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::yielding(Arc::new(AtomicBool::new(false))),
+        );
+        finish.send(true).unwrap();
+        owner.join().unwrap();
+        let client = spawn_lookup(
+            &cache,
+            &main,
+            &ctx,
+            ClaimRole::client(Arc::new(AtomicBool::new(false))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            client.recv_timeout(Duration::from_secs(5)),
+            Ok(Lookup::Hit(_))
+        ));
+    }
+
     #[test]
     fn interactive_unit_waits_on_a_roleless_owner_are_bounded() {
         let cache = ProjectCache::new(1 << 20);
@@ -3138,6 +3202,7 @@ mod cache_tests {
                 content_hash: 1,
             },
             lookup: (0, 0),
+            names: None,
             retained_bytes: bytes,
         })
     }
@@ -3869,6 +3934,10 @@ pub(crate) struct ClaimRole {
     /// Interactive work takes this work's claims over instead of waiting:
     /// the warmer pauses for interactive requests and runs at low priority.
     yields_to_interactive: bool,
+    /// The work answers a client request that is not interactive
+    /// (references, rename, ...): like interactive work it takes the
+    /// warmer's claims over instead of waiting behind them (l4d-ig6b).
+    preempts_yielding: bool,
     /// How long the work waits for a slot that a thread without a role
     /// (the main thread) computes, before computing it without caching:
     /// such a claim can be neither cancelled nor taken over. Claims of
@@ -3884,6 +3953,7 @@ impl ClaimRole {
             interactive: true,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            preempts_yielding: false,
             roleless_claim_wait: Some(roleless_claim_wait),
         }
     }
@@ -3893,7 +3963,21 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: false,
+            preempts_yielding: false,
             roleless_claim_wait: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preempts_yielding_for_tests(&self) -> bool {
+        self.preempts_yielding
+    }
+
+    /// A client request that is not interactive (references, rename, ...).
+    pub(crate) fn client(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            preempts_yielding: true,
+            ..Self::job(cancel)
         }
     }
 
@@ -3902,6 +3986,7 @@ impl ClaimRole {
             interactive: false,
             cancel: Some(cancel),
             yields_to_interactive: true,
+            preempts_yielding: false,
             roleless_claim_wait: None,
         }
     }
@@ -3972,6 +4057,9 @@ struct State {
     invalidation_log: std::collections::VecDeque<InvalidationRecord>,
     /// Epochs below this have no complete record in `invalidation_log`.
     invalidation_log_floor: u64,
+    /// Set when an entry is evicted for room; the include failures, kept
+    /// outside the reservations, are then dropped too (l4d-ig6b).
+    evicted_for_room: bool,
     /// Workspace roots, for recognizing tool state below them.
     artifact_roots: Vec<PathBuf>,
     /// The slot each thread waits for, to find waits that would close a
@@ -4012,6 +4100,7 @@ impl Default for State {
             closure_misses: HashMap::new(),
             invalidation_log: std::collections::VecDeque::new(),
             invalidation_log_floor: 0,
+            evicted_for_room: false,
             artifact_roots: Vec::new(),
             waiting: HashMap::new(),
             #[cfg(test)]
@@ -4052,6 +4141,9 @@ struct Inner {
     catalogues: Mutex<CatalogueStore>,
     /// Never held together with `state`, `watcher`, `witnesses` or `catalogues`.
     index: Mutex<IndexStore>,
+    /// Include lookups that found nothing (l4d-ig6b). Never held together
+    /// with another lock.
+    include_failures: Mutex<IncludeFailureStore>,
     /// Advances whenever the watcher's registrations are lost (a new watcher,
     /// poisoned-state recovery): catalogue watches of an older epoch are gone.
     watch_epoch: AtomicU64,
@@ -4068,6 +4160,68 @@ struct Inner {
     /// Told each time a lookup starts waiting for a claim.
     #[cfg(test)]
     every_wait_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// How many include failures the cache keeps, and how many bytes of their
+/// observations (at most this share of `maxCacheBytes`), before it starts
+/// again from empty (l4d-ig6b).
+const MAX_INCLUDE_FAILURES: usize = 1024;
+const MAX_INCLUDE_FAILURE_BYTES: usize = 8 << 20;
+const INCLUDE_FAILURE_BUDGET_SHARE: usize = 16;
+
+#[derive(Default)]
+struct IncludeFailureStore {
+    entries: HashMap<(u64, pascal_core::IncludeFailureKey), IncludeFailureEntry>,
+    bytes: usize,
+}
+
+impl IncludeFailureStore {
+    /// Drops every failure that observed `path`, a path under it, or
+    /// (`include_parent`) its parent directory, whose listing changed.
+    fn invalidate(&mut self, path: &Path, include_parent: bool) {
+        let parent = path.parent().filter(|_| include_parent);
+        let mut freed = 0usize;
+        self.entries.retain(|_, entry| {
+            let touched = entry.probes.iter().any(|probe| {
+                let Probe::Stamp { path: probed, .. } = probe else {
+                    return true;
+                };
+                probed.starts_with(path) || parent.is_some_and(|parent| probed == parent)
+            });
+            if touched {
+                freed = freed.saturating_add(entry.bytes);
+            }
+            !touched
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+}
+
+/// Whether every stamp probe is proven unchanged now: a settled stamp equal
+/// to the current one, or an absence that still holds (l4d-ig6b, spec §7).
+fn settled_probes_hold(probes: &[Probe]) -> bool {
+    probes.iter().all(|probe| match probe {
+        Probe::Stamp { path, expected } => match (expected, current_stamp(path)) {
+            (Some(expected), Ok(Some(now))) => expected.proves_unchanged(&now),
+            (None, Ok(None)) => true,
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+struct IncludeFailureEntry {
+    failure: Arc<pascal_core::IncludeFailure>,
+    context: Arc<ProjectContext>,
+    probes: Arc<Vec<Probe>>,
+    reads: Arc<crate::workspace::capture::CapturedReads>,
+    bytes: usize,
+}
+
+/// A reusable include failure and what its lookup read, to replay.
+pub(crate) struct IncludeFailureHit {
+    pub(crate) failure: Arc<pascal_core::IncludeFailure>,
+    pub(crate) reads: Arc<crate::workspace::capture::CapturedReads>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4396,6 +4550,7 @@ fn make_room(state: &mut State, request: usize) -> bool {
 /// Evicts the least recently used unpinned unit entry or shared provider
 /// interface, whichever is older. False when neither is left.
 fn evict_oldest(state: &mut State) -> bool {
+    state.evicted_for_room = true;
     let unit = state.lru.first_key_value().map(|(tick, _)| *tick);
     let graph = state
         .provider_graphs
@@ -4672,9 +4827,13 @@ impl ProjectCache {
     }
 
     /// Releases the state lock, then applies the watch changes it queued.
-    fn release(&self, state: MutexGuard<'_, State>) {
+    fn release(&self, mut state: MutexGuard<'_, State>) {
         let changed = !state.watch_changes.is_empty();
+        let pressure = std::mem::take(&mut state.evicted_for_room);
         drop(state);
+        if pressure {
+            self.clear_include_failures();
+        }
         if changed {
             self.sync_watches();
         }
@@ -5174,7 +5333,8 @@ impl ProjectCache {
                     // the slot over.
                     if *claimed_input == input_hash
                         && (owner.role.cancelled()
-                            || (role.interactive && owner.role.yields_to_interactive))
+                            || ((role.interactive || role.preempts_yielding)
+                                && owner.role.yields_to_interactive))
                     {
                         taking_over = true;
                         break;
@@ -6183,6 +6343,11 @@ impl ProjectCache {
             release_graph_bytes(&mut state, freed);
             self.release(state);
         }
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .invalidate(path, include_parent);
         self.invalidate_index(path, include_parent);
         if !affected.is_empty() {
             crate::trace::trace!("  evicted entries of {} uris", affected.len());
@@ -6224,6 +6389,8 @@ impl ProjectCache {
             release_graph_bytes(&mut state, freed);
             self.release(state);
         }
+        // Overflow lost which directories changed: no failure survives it.
+        self.clear_include_failures();
         // Overflow lost which paths changed: every member is suspect.
         self.invalidate_index_all();
     }
@@ -6575,6 +6742,173 @@ impl ProjectCache {
             }
         }
         self.release(state);
+    }
+
+    /// The include failure stored for `key` under `configuration` and
+    /// `context` (the whole project context, as unit slots compare it), while
+    /// every directory and candidate its lookup observed is proven unchanged:
+    /// settled stamps equal to stamps taken now (l4d-ig6b). A stale entry is
+    /// dropped.
+    pub(crate) fn include_failure(
+        &self,
+        configuration: u64,
+        context: &ProjectContext,
+        key: &pascal_core::IncludeFailureKey,
+    ) -> Option<IncludeFailureHit> {
+        let full = (configuration, key.clone());
+        let (failure, probes, reads) = {
+            let store = self
+                .inner
+                .include_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = store.entries.get(&full)?;
+            if *entry.context != *context {
+                return None;
+            }
+            (
+                Arc::clone(&entry.failure),
+                Arc::clone(&entry.probes),
+                Arc::clone(&entry.reads),
+            )
+        };
+        if settled_probes_hold(&probes) {
+            return Some(IncludeFailureHit { failure, reads });
+        }
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store
+            .entries
+            .get(&full)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.failure, &failure))
+            && let Some(entry) = store.entries.remove(&full)
+        {
+            store.bytes = store.bytes.saturating_sub(entry.bytes);
+        }
+        None
+    }
+
+    /// Keeps a failure whose stamps are all settled; others prove nothing
+    /// later and are not kept.
+    pub(crate) fn put_include_failure(
+        &self,
+        configuration: u64,
+        context: Arc<ProjectContext>,
+        key: pascal_core::IncludeFailureKey,
+        failure: Arc<pascal_core::IncludeFailure>,
+        probes: Vec<Probe>,
+        reads: crate::workspace::capture::CapturedReads,
+    ) {
+        let bytes = std::mem::size_of::<IncludeFailureEntry>()
+            .saturating_add(key.owner_directory.as_os_str().len())
+            .saturating_add(key.requested_name.len())
+            .saturating_add(
+                failure
+                    .observations
+                    .iter()
+                    .map(|(payload, _)| {
+                        payload.saturating_add(std::mem::size_of::<(
+                            usize,
+                            pascal_core::ResolutionObservation,
+                        )>())
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(probes_bytes(&probes))
+            .saturating_add(reads.retained_bytes());
+        if !probes.iter().all(|probe| match probe {
+            Probe::Stamp { expected, .. } => expected.as_ref().is_none_or(|stamp| stamp.settled),
+            _ => false,
+        }) {
+            return;
+        }
+        let state = lock(&self.inner);
+        let limit = MAX_INCLUDE_FAILURE_BYTES.min(state.max_bytes / INCLUDE_FAILURE_BUDGET_SHARE);
+        self.release(state);
+        if bytes > limit {
+            return;
+        }
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store.entries.len() >= MAX_INCLUDE_FAILURES || store.bytes.saturating_add(bytes) > limit
+        {
+            store.entries.clear();
+            store.bytes = 0;
+        }
+        let entry = IncludeFailureEntry {
+            failure,
+            context,
+            probes: Arc::new(probes),
+            reads: Arc::new(reads),
+            bytes,
+        };
+        if let Some(old) = store.entries.insert((configuration, key), entry) {
+            store.bytes = store.bytes.saturating_sub(old.bytes);
+        }
+        store.bytes = store.bytes.saturating_add(bytes);
+    }
+
+    /// Makes every stored failure claim `scanned_entries` listed entries.
+    #[cfg(test)]
+    pub(crate) fn inflate_include_failures_for_tests(&self, scanned_entries: usize) {
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in store.entries.values_mut() {
+            entry.failure = Arc::new(pascal_core::IncludeFailure {
+                observations: entry.failure.observations.clone(),
+                scanned_entries,
+                work: entry.failure.work,
+                byte_work: entry.failure.byte_work,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_failure_charges_for_tests(&self) -> Vec<(usize, usize, usize)> {
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.failure.scanned_entries,
+                    entry.failure.work,
+                    entry.failure.byte_work,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_failure_count(&self) -> usize {
+        self.inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
+
+    /// Drops every include failure (memory pressure, watcher overflow).
+    fn clear_include_failures(&self) {
+        let mut store = self
+            .inner
+            .include_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.entries.clear();
+        store.bytes = 0;
     }
 
     /// The provider interface compiled under resolver configuration

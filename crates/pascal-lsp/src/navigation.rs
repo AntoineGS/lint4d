@@ -91,6 +91,7 @@ mod inlay;
 mod overload;
 mod rename;
 pub(crate) use rename::BindingWorkBudget;
+pub(crate) use rename::DependencyGuard;
 #[cfg(test)]
 pub(crate) use rename::test_set_occurrence_prefilter;
 mod selection;
@@ -7169,6 +7170,25 @@ impl NavigationIndex {
             direct
         } else if let Some(generic) = self.generic_parameter_references(uri, document, identifier) {
             generic
+        } else if let Ok(Some(owner)) =
+            method_heading_owner_path_at(identifier, &document.source, &mut || Ok(()))
+        {
+            let cancel = AtomicBool::new(false);
+            let mut budget = AssistanceBudget::new(
+                MAX_NAVIGATION_OVERLOAD_WORK,
+                MAX_NAVIGATION_OVERLOAD_BYTES,
+                "method heading owner",
+            );
+            self.method_heading_owner_candidates_with_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &owner,
+                &cancel,
+                &mut budget,
+            )
+            .unwrap_or_default()
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at(identifier, &document.source)
         {
@@ -7227,6 +7247,15 @@ impl NavigationIndex {
             budget.require_work(generic.len(), cancel)?;
             budget.require_bytes(uri.as_str().len().saturating_mul(generic.len()), cancel)?;
             Ok(generic)
+        } else if let Some(owner) =
+            method_heading_owner_path_at(identifier, &document.source, &mut || {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)
+            })?
+        {
+            self.method_heading_owner_candidates_with_budget(
+                uri, document, offset, identifier, &owner, cancel, budget,
+            )
         } else if let Some((path, cursor_index)) =
             qualified_type_path_at_with_budget(identifier, &document.source, cancel, budget)?
         {
@@ -7502,7 +7531,7 @@ impl NavigationIndex {
                 };
                 if scope_id != ROOT_SCOPE
                     && !symbol.local_only
-                    && symbol.owner_type.is_none()
+                    && document.has_unqualified_owner(*index, symbol)
                     && symbol.generic_parameter.is_none()
                     && symbol.kind != SymbolKind::Unit
                     && !symbol.unresolved_abbreviated
@@ -7623,7 +7652,7 @@ impl NavigationIndex {
                 continue;
             };
             if !symbol.local_only
-                && symbol.owner_type.is_none()
+                && document.has_unqualified_owner(*index, symbol)
                 && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.unresolved_abbreviated
@@ -7789,7 +7818,7 @@ impl NavigationIndex {
             let Some(symbol) = document.symbols.get(*index) else {
                 continue;
             };
-            if symbol.owner_type.is_none()
+            if document.has_unqualified_owner(*index, symbol)
                 && symbol.generic_parameter.is_none()
                 && symbol.kind != SymbolKind::Unit
                 && !symbol.local_only
@@ -7889,6 +7918,96 @@ impl NavigationIndex {
             }
         }
         Ok(references)
+    }
+
+    /// The type an owner segment of a method heading names. Its first
+    /// segment is looked up as a type in the unit scope and the rest as
+    /// directly nested types. An implementation heading only ever names a
+    /// type declared in the unit or program that holds the body, so one that
+    /// reaches another document binds nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn method_heading_owner_candidates_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        owner: &MethodHeadingOwner,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let owners = self.type_reference_candidates_with_budget(
+            uri,
+            document,
+            offset,
+            identifier,
+            &owner.path[..1],
+            0,
+            cancel,
+            budget,
+        )?;
+        if owner.implementation && owners.iter().any(|candidate| candidate.uri != *uri) {
+            return Ok(Vec::new());
+        }
+        self.nested_type_candidates(owners, &owner.path[1..], &mut |work| {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(work, cancel)
+        })
+    }
+
+    /// Follow `segments` from `owners` through directly nested type
+    /// declarations, as a method heading's `TOuter.TInner` names them: each
+    /// segment is a type declared inside the previous one's declaration.
+    fn nested_type_candidates(
+        &self,
+        owners: Vec<Candidate>,
+        segments: &[String],
+        tick: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<Vec<Candidate>, String> {
+        let mut current = owners;
+        for segment in segments {
+            let key = canonical_name(segment);
+            let mut next = Vec::new();
+            for owner in &current {
+                let (Some(owner_symbol), Some(document)) =
+                    (self.symbol(owner), self.documents.get(&owner.uri))
+                else {
+                    continue;
+                };
+                let Some(indices) = document
+                    .member_symbol_indices
+                    .get(&(owner_symbol.key.clone(), key.clone()))
+                else {
+                    continue;
+                };
+                tick(indices.len().max(1))?;
+                for index in indices {
+                    if document.symbols.get(*index).is_some_and(|symbol| {
+                        symbol.kind == SymbolKind::Type
+                            && symbol.declaration_span != owner_symbol.declaration_span
+                            && owner_symbol
+                                .declaration_span
+                                .contains(symbol.declaration_span)
+                    }) {
+                        push_unique_candidate(
+                            &mut next,
+                            Candidate {
+                                uri: owner.uri.clone(),
+                                index: *index,
+                            },
+                        );
+                    }
+                }
+            }
+            if next
+                .iter()
+                .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+            {
+                return Ok(Vec::new());
+            }
+            current = next;
+        }
+        Ok(current)
     }
 
     fn type_reference_candidates(
@@ -9032,7 +9151,7 @@ impl NavigationIndex {
                     document.symbols.get(*index).is_some_and(|symbol| {
                         scope_id != ROOT_SCOPE
                             && !symbol.local_only
-                            && symbol.owner_type.is_none()
+                            && document.has_unqualified_owner(*index, symbol)
                             && symbol.generic_parameter.is_none()
                             && symbol.kind != SymbolKind::Unit
                             && !symbol.unresolved_abbreviated
@@ -9116,7 +9235,7 @@ impl NavigationIndex {
             .filter(|index| {
                 document.symbols.get(*index).is_some_and(|symbol| {
                     !symbol.local_only
-                        && symbol.owner_type.is_none()
+                        && document.has_unqualified_owner(*index, symbol)
                         && symbol.generic_parameter.is_none()
                         && symbol.kind != SymbolKind::Unit
                         && !symbol.unresolved_abbreviated
@@ -9220,9 +9339,10 @@ impl NavigationIndex {
                     self.exported_references_for_document(&unit_uri)
                         .into_iter()
                         .filter(|candidate| {
-                            self.symbol(candidate).is_some_and(|symbol| {
-                                symbol.owner_type.is_none() && symbol.key == key
-                            })
+                            self.candidate_has_unqualified_owner(candidate)
+                                && self
+                                    .symbol(candidate)
+                                    .is_some_and(|symbol| symbol.key == key)
                         }),
                 ),
                 Receiver::Type(instance) => {
@@ -14014,6 +14134,15 @@ impl NavigationIndex {
             .collect()
     }
 
+    fn candidate_has_unqualified_owner(&self, candidate: &Candidate) -> bool {
+        self.documents.get(&candidate.uri).is_some_and(|document| {
+            document
+                .symbols
+                .get(candidate.index)
+                .is_some_and(|symbol| document.has_unqualified_owner(candidate.index, symbol))
+        })
+    }
+
     fn symbol(&self, candidate: &Candidate) -> Option<&Symbol> {
         self.documents
             .get(&candidate.uri)
@@ -16084,6 +16213,10 @@ pub(crate) struct ParsedDocument {
     verified_header: Option<Range>,
     compile_time_session: Option<Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
     conditional_unknown_symbols: Vec<bool>,
+    /// By symbol index: an enum value that has an owner type yet is an
+    /// unqualified name in its declaring scope, its type not declared under
+    /// `{$SCOPEDENUMS ON}` (l4d-1qta).
+    unscoped_enum_values: Vec<bool>,
     has_initialization: bool,
     has_finalization: bool,
     unknown_class_owners: HashSet<String>,
@@ -16110,6 +16243,12 @@ pub(crate) struct ParsedDocument {
 }
 
 impl ParsedDocument {
+    /// Whether symbol `index` can be an unqualified name: it has no owner
+    /// type, or it is an unscoped enum value (l4d-1qta).
+    fn has_unqualified_owner(&self, index: usize, symbol: &Symbol) -> bool {
+        symbol.owner_type.is_none() || self.unscoped_enum_values.get(index) == Some(&true)
+    }
+
     fn current_verified_header(&self) -> Option<Range> {
         self.compile_time_session.as_ref()?;
         self.verified_header
@@ -16261,6 +16400,9 @@ impl ParsedDocument {
             visit(0)?;
         }
         for _ in &self.conditional_unknown_symbols {
+            visit(0)?;
+        }
+        for _ in &self.unscoped_enum_values {
             visit(0)?;
         }
         for (key, indices) in &self.symbol_indices_by_scope_key {
@@ -16798,8 +16940,15 @@ impl Document {
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
         let documentation = documentation::collect(&source, &symbols, cancel)?;
         inherit_member_routine_visibility(&mut symbols);
-        let conditional_unknown_symbols =
+        let mut conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
+        let unscoped_enum_values = enum_value_scoping(
+            root,
+            &conditionals,
+            &symbols,
+            &mut conditional_unknown_symbols,
+            cancel,
+        )?;
         let helpers = collect_helpers(root, &source);
         let (type_ancestry, superseded_forward_types) = collect_type_ancestry(root, &source);
         let method_resolutions = collect_method_resolutions(root, &source);
@@ -16841,8 +16990,8 @@ impl Document {
         let exported_symbol_indices = symbols
             .iter()
             .enumerate()
-            .filter(|(_, symbol)| {
-                if symbol.owner_type.is_some()
+            .filter(|(index, symbol)| {
+                if (symbol.owner_type.is_some() && !unscoped_enum_values[*index])
                     || symbol.kind == SymbolKind::Unit
                     || symbol.local_only
                     || symbol.generic_parameter.is_some()
@@ -16962,6 +17111,7 @@ impl Document {
             verified_header,
             compile_time_session,
             conditional_unknown_symbols,
+            unscoped_enum_values,
             has_initialization,
             has_finalization,
             unknown_class_owners,
@@ -17260,7 +17410,10 @@ fn symbol_is_available_at(
     current_uri: &Url,
     offset: usize,
 ) -> bool {
-    if candidate_uri != current_uri || symbol.owner_type.is_some() || !symbol.declaration_ordered {
+    if candidate_uri != current_uri
+        || (symbol.owner_type.is_some() && symbol.kind != SymbolKind::EnumValue)
+        || !symbol.declaration_ordered
+    {
         return true;
     }
     if symbol.span.start <= offset {
@@ -18167,7 +18320,10 @@ fn add_named_symbol<'a>(
             owner_type: owner_type.clone(),
             owner_type_name: owner_type_name.clone(),
             visibility,
-            declaration_ordered: scope != ROOT_SCOPE && owner_type.is_none(),
+            // An enum value's owner is its type, yet it is an unqualified
+            // name declared in order like the type (l4d-1qta).
+            declaration_ordered: scope != ROOT_SCOPE
+                && (owner_type.is_none() || kind == SymbolKind::EnumValue),
             generic_parameters: generic_parameters.clone(),
             generic_parameter: None,
             type_name: type_name.clone(),
@@ -19651,6 +19807,97 @@ fn conditional_unknown_symbols(
         .collect()
 }
 
+/// Which enum values are unqualified names (l4d-1qta). An enumerated type
+/// takes the `{$SCOPEDENUMS}` state at its declaration: off, its values
+/// enter the scope that declares the type, besides `Type.Value`; on, only
+/// the qualified spelling names them. An unknown state makes the values'
+/// binding unknown, as for a declaration under unknown conditional
+/// activity. Checked against dcc 37.0:
+/// - the values of a type nested in a class or record enter the scope that
+///   declares the outer type, not the class (`TR.rB` is E2003, unqualified
+///   `rB` and `Unit.rB` compile, also in the type's methods and importers).
+///   The class or record section does not matter: a type nested in a
+///   private, strict private, protected or strict protected section gives
+///   importers its values too (`1qta-r1/P1-P3`, `P5-P7`; l4d-qssj), though
+///   `TC.TE.pB` is E2361;
+/// - the values of an anonymous enumerated type (`set of (A, B)`,
+///   `var X: (A, B)`) are unqualified names whatever the state.
+fn enum_value_scoping(
+    root: Node<'_>,
+    conditionals: &ConditionalAnalysis,
+    symbols: &[Symbol],
+    conditional_unknown: &mut [bool],
+    cancel: &AtomicBool,
+) -> Result<Vec<bool>, String> {
+    let mut unscoped = vec![false; symbols.len()];
+    if !symbols
+        .iter()
+        .any(|symbol| symbol.kind == SymbolKind::EnumValue)
+    {
+        return Ok(unscoped);
+    }
+    let states = conditional::ScopedEnums::new(&conditionals.directives);
+    // Value name start -> (state at the type's declaration, a named type).
+    let mut values = HashMap::new();
+    let mut visited = 0usize;
+    let mut cancelled = false;
+    collect_nodes_with_ancestors(root, &mut |node, ancestors| {
+        visited += 1;
+        if cancelled || (visited.is_multiple_of(4096) && cancel.load(Ordering::Relaxed)) {
+            cancelled = true;
+            return;
+        }
+        if node.kind() != "declEnumValue" {
+            return;
+        }
+        let Some(name) = node.child_by_field_name("name") else {
+            return;
+        };
+        let mut nearest = nearest_first(ancestors);
+        let enumeration = nearest.next();
+        let wrapper = nearest.next();
+        let declaration = nearest.next();
+        let named = match (enumeration, wrapper, declaration) {
+            (Some(enumeration), Some(wrapper), Some(declaration)) => {
+                enumeration.kind() == "declEnum"
+                    && wrapper.kind() == "type"
+                    && declaration.kind() == "declType"
+                    && declaration
+                        .child_by_field_name("type")
+                        .is_some_and(|field| field.id() == wrapper.id())
+            }
+            _ => false,
+        };
+        let declared_at = if named {
+            declaration.map_or(node.start_byte(), |declaration| declaration.start_byte())
+        } else {
+            enumeration.map_or(node.start_byte(), |enumeration| enumeration.start_byte())
+        };
+        values.insert(name.start_byte(), (states.at(declared_at), named));
+    });
+    if cancelled || cancel.load(Ordering::Relaxed) {
+        return Err("request cancelled".to_string());
+    }
+    for (index, symbol) in symbols.iter().enumerate() {
+        if symbol.kind != SymbolKind::EnumValue || symbol.origin != Origin::Declaration {
+            continue;
+        }
+        let Some(&(state, named)) = values.get(&symbol.span.start) else {
+            continue;
+        };
+        let state = if named {
+            state
+        } else {
+            conditional::Truth::False
+        };
+        if state == conditional::Truth::Unknown {
+            conditional_unknown[index] = true;
+        }
+        unscoped[index] = symbol.owner_type.is_some() && state != conditional::Truth::True;
+    }
+    Ok(unscoped)
+}
+
 fn collect_nodes_matching<'a>(root: Node<'a>, kind: &str) -> Vec<Node<'a>> {
     let mut result = Vec::new();
     collect_nodes(root, &mut |node| {
@@ -20435,6 +20682,114 @@ fn qualified_identifier_index_with_budget(
         }
     }
     Ok(None)
+}
+
+/// The owner segments of a dotted routine name in a `declProc`, when
+/// `identifier` is one of them:
+///
+/// - a method implementation heading (`procedure TOuter.TInner.Method`,
+///   `procedure TList<T>.Add`, `class operator TRec.Add`), whose owner is a
+///   type of the current unit or program;
+/// - a method resolution clause in a class body (`procedure IFoo.Bar = Baz;`),
+///   whose owner is a visible interface type, possibly from a used unit.
+///
+/// `path` holds the segments up to and including the cursor, so `TOuter`
+/// resolves to `TOuter` itself and not to `TInner`. The last segment (the
+/// method) is not an owner: a heading's method binds through the routine's
+/// direct symbol, and a resolution clause's method is not bound here.
+struct MethodHeadingOwner {
+    path: Vec<String>,
+    implementation: bool,
+}
+
+fn method_heading_owner_path_at(
+    identifier: Node<'_>,
+    source: &str,
+    tick: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<MethodHeadingOwner>, String> {
+    let mut current = identifier;
+    if let Some(parent) = current.tree_parent()
+        && parent.kind() == "genericTpl"
+        && parent
+            .child_by_field_name("entity")
+            .is_some_and(|entity| Span::from_node(entity) == Span::from_node(current))
+    {
+        current = parent;
+    }
+    let mut top = None;
+    while let Some(parent) = current.tree_parent() {
+        tick()?;
+        let is_operand = ["lhs", "rhs"].into_iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|operand| Span::from_node(operand) == Span::from_node(current))
+        });
+        if parent.kind() != "genericDot" || !is_operand {
+            break;
+        }
+        top = Some(parent);
+        current = parent;
+    }
+    let Some(top) = top else {
+        return Ok(None);
+    };
+    let Some(header) = top.tree_parent().filter(|header| {
+        header.kind() == "declProc"
+            && header
+                .child_by_field_name("name")
+                .is_some_and(|name| Span::from_node(name) == Span::from_node(top))
+    }) else {
+        return Ok(None);
+    };
+    let implementation = header.tree_parent().is_some_and(|definition| {
+        definition.kind() == "defProc"
+            && definition
+                .child_by_field_name("header")
+                .is_some_and(|node| Span::from_node(node) == Span::from_node(header))
+    });
+    let Some(owner) = top.child_by_field_name("lhs") else {
+        return Ok(None);
+    };
+    let target = Span::from_node(identifier);
+    let mut parts = Vec::new();
+    let mut cursor_index = None;
+    let mut pending = vec![owner];
+    while let Some(node) = pending.pop() {
+        tick()?;
+        match node.kind() {
+            "identifier" => {
+                if Span::from_node(node) == target {
+                    cursor_index = Some(parts.len());
+                }
+                parts.push(node_text(node, source));
+            }
+            "genericTpl" => {
+                let Some(entity) = node.child_by_field_name("entity") else {
+                    return Ok(None);
+                };
+                pending.push(entity);
+            }
+            "genericDot" => {
+                let (Some(lhs), Some(rhs)) = (
+                    node.child_by_field_name("lhs"),
+                    node.child_by_field_name("rhs"),
+                ) else {
+                    return Ok(None);
+                };
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(cursor_index) = cursor_index else {
+        return Ok(None);
+    };
+    parts.truncate(cursor_index + 1);
+    Ok(Some(MethodHeadingOwner {
+        path: parts,
+        implementation,
+    }))
 }
 
 fn qualified_type_path_at(identifier: Node<'_>, source: &str) -> Option<(Vec<String>, usize)> {

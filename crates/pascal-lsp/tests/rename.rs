@@ -4269,3 +4269,445 @@ end.
         "rename accepted an inaccessible receiver's unit fallback: {result:?}"
     );
 }
+
+#[test]
+fn renames_a_class_and_every_method_heading_that_names_it() {
+    let source = r#"unit HeadingRename;
+interface
+type
+  TFoo = class
+    procedure Bar;
+    destructor Destroy; override;
+  type
+    TInner = class
+      function Method: Integer;
+    end;
+  end;
+implementation
+procedure TFoo.Bar;
+begin
+end;
+destructor TFoo.Destroy;
+begin
+  inherited;
+end;
+function TFoo.TInner.Method: Integer;
+begin
+  Result := 0;
+end;
+end.
+"#;
+    let source_uri = uri("HeadingRename");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("heading rename source parses");
+
+    for position in [
+        position_of(source, "TFoo", 0),
+        position_of(source, "TFoo", 2),
+    ] {
+        let edits = index
+            .rename_edits(&source_uri, position, "TBar")
+            .expect("class rename succeeds");
+        assert_exact_edits(
+            &edits,
+            (0..4)
+                .map(|occurrence| {
+                    (
+                        source_uri.clone(),
+                        range_of(source, "TFoo", occurrence),
+                        "TBar".to_owned(),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "TInner", 1), "TNested")
+        .expect("nested class rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "TInner", 0),
+                "TNested".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "TInner", 1),
+                "TNested".to_owned(),
+            ),
+        ],
+    );
+}
+
+const SCOPED_ENUM_RENAME: &str = "unit ScopedRename;
+interface
+{$SCOPEDENUMS ON}
+type
+  TColor = (Red, Green);
+{$SCOPEDENUMS OFF}
+  TShade = (Light, Dark);
+const Green = 5;
+implementation
+procedure Run;
+var C: TColor; S: TShade; N: Integer;
+begin
+  N := Green;
+  C := TColor.Green;
+  S := Dark;
+  S := TShade.Dark;
+end;
+end.
+";
+
+/// l4d-1qta: renaming a scoped enum value edits its declaration and its
+/// qualified uses, never the unqualified `Green`, which is the constant.
+#[test]
+fn renaming_a_scoped_enum_value_edits_only_its_qualified_uses() {
+    let source = SCOPED_ENUM_RENAME;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ScopedRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Green", 0), "Lime")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Green", 0),
+                "Lime".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Green", 3),
+                "Lime".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta: an unscoped enum value is renamed at its unqualified and its
+/// qualified uses.
+#[test]
+fn renaming_an_unscoped_enum_value_edits_unqualified_and_qualified_uses() {
+    let source = SCOPED_ENUM_RENAME;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ScopedRename", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Dark", 0), "Deep")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 0),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 1),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 2),
+                "Deep".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta: a SCOPEDENUMS directive under an unknown condition leaves the
+/// scoping of the enumerated types after it unknown: renaming one of their
+/// values refuses, an enum declared before the directive is unaffected.
+#[test]
+fn scoped_enums_under_an_unknown_condition_leave_only_later_values_unknown() {
+    let source = "unit UnknownScoping;
+interface
+type
+  TShade = (Light, Dark);
+{$IFDEF MYSTERY}{$SCOPEDENUMS ON}{$ENDIF}
+  TColor = (Red, Green);
+implementation
+procedure Run;
+var C: TColor; S: TShade;
+begin
+  C := Green;
+  S := Dark;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "UnknownScoping", source);
+
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Green", 0), "Lime")
+            .is_err(),
+        "a value whose scoping is unknown cannot be renamed"
+    );
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Dark", 0), "Deep")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 0),
+                "Deep".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Dark", 1),
+                "Deep".to_owned(),
+            ),
+        ],
+    );
+}
+
+const ROUTINE_LOCAL_ENUM: &str = "unit P11;
+interface
+const lA = 1;
+implementation
+procedure Outer;
+  procedure Inner;
+  var N: Integer;
+  begin
+    N := lA;
+  end;
+type TL = (lA, lB);
+var L: TL;
+begin
+  L := lA;
+end;
+end.
+";
+
+/// l4d-1qta fix round 1 (C1, dcc 37.0 `O1.dpr`): `lA` in `Inner`, before the
+/// routine-local `type TL`, is the unit constant; each rename edits only its
+/// own uses.
+#[test]
+fn routine_local_enum_value_renames_follow_declaration_order() {
+    let source = ROUTINE_LOCAL_ENUM;
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "P11", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "lA", 0), "kA")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "lA", 0),
+                "kA".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "lA", 1),
+                "kA".to_owned(),
+            ),
+        ],
+    );
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "lA", 2), "mA")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "lA", 2),
+                "mA".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "lA", 3),
+                "mA".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta fix round 1 (I1): a record-nested value is renamed at its uses in
+/// the record's method and in the unit.
+#[test]
+fn renaming_a_nested_enum_value_edits_its_unit_scope_uses() {
+    let source = "unit NR;
+interface
+type
+  TR = record
+  type TQ = (qA, qB);
+  var G: TQ;
+  procedure M;
+  end;
+implementation
+procedure TR.M;
+begin
+  G := qA;
+end;
+procedure Run;
+var R: TR;
+begin
+  R.G := qA;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "NR", source);
+
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "qA", 0), "qZ")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        (0..3)
+            .map(|n| {
+                (
+                    source_uri.clone(),
+                    range_of(source, "qA", n),
+                    "qZ".to_owned(),
+                )
+            })
+            .collect(),
+    );
+}
+
+/// l4d-1qta fix round 1 (I1, dcc 37.0 `S1.dpr`): with `uses SB, SA`, `qB` is
+/// SA's record-nested value, so renaming SB's constant must not edit it.
+#[test]
+fn renaming_a_constant_shadowed_by_an_imported_nested_value_refuses() {
+    let sa = "unit SA;
+interface
+type
+  TR = record
+  type TQ = (qA, qB);
+  end;
+implementation
+end.
+";
+    let sb = "unit SB;
+interface
+const qB = 7;
+implementation
+end.
+";
+    let s1 = "unit S1;
+interface
+uses SB, SA;
+implementation
+procedure Run;
+var Q: TR.TQ;
+begin
+  Q := qB;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let sa_uri = update(&mut index, "SA", sa);
+    let sb_uri = update(&mut index, "SB", sb);
+    let s1_uri = update(&mut index, "S1", s1);
+    index.bind_imports(
+        &s1_uri,
+        [
+            ("SA".to_owned(), sa_uri.clone()),
+            ("SB".to_owned(), sb_uri.clone()),
+        ],
+    );
+
+    if let Ok(edits) = index.rename_edits(&sb_uri, position_of(sb, "qB", 0), "qC") {
+        assert!(
+            !edits.contains_key(&s1_uri),
+            "S1's qB is SA's value: {edits:?}"
+        );
+    }
+}
+
+/// l4d-1qta fix round 1 (I2): an enum value used unit-qualified is renamed
+/// there too.
+#[test]
+fn renaming_an_enum_value_edits_its_unit_qualified_use() {
+    let colors = "unit Colors;
+interface
+type
+  TColor = (Red, Blue);
+implementation
+end.
+";
+    let cons = "unit Cons;
+interface
+uses Colors;
+implementation
+procedure Run;
+var C: TColor;
+begin
+  C := Colors.Red;
+  C := Red;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let colors_uri = update(&mut index, "Colors", colors);
+    let cons_uri = update(&mut index, "Cons", cons);
+    index.bind_imports(&cons_uri, [("Colors".to_owned(), colors_uri.clone())]);
+
+    let edits = index
+        .rename_edits(&colors_uri, position_of(colors, "Red", 0), "Crimson")
+        .expect("rename succeeds");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                colors_uri.clone(),
+                range_of(colors, "Red", 0),
+                "Crimson".to_owned(),
+            ),
+            (
+                cons_uri.clone(),
+                range_of(cons, "Red", 0),
+                "Crimson".to_owned(),
+            ),
+            (
+                cons_uri.clone(),
+                range_of(cons, "Red", 1),
+                "Crimson".to_owned(),
+            ),
+        ],
+    );
+}
+
+/// l4d-1qta fix round 1 (M4, dcc 37.0 `T4.dpr` E2004): an unscoped value and
+/// a constant of the same name in one scope do not compile; rename refuses.
+#[test]
+fn renaming_a_value_redeclared_in_its_scope_refuses() {
+    let source = "unit T4;
+interface
+type
+  TColor = (Red, Green);
+const Green = 5;
+implementation
+procedure Run;
+var N: Integer;
+begin
+  N := Green;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "T4", source);
+    assert!(
+        index
+            .rename_edits(&source_uri, position_of(source, "Green", 0), "Lime")
+            .is_err()
+    );
+}

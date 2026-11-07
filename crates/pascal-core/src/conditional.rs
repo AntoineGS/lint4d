@@ -2827,9 +2827,22 @@ pub(crate) fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &st
     let members = body.split(',').map(str::trim);
     let valid = members.clone().all(|member| {
         let bytes = member.as_bytes();
-        bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-')
+        (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-'))
+            || is_numeric_switch(member)
     });
     valid.then_some(members)
+}
+
+/// A switch carrying its value as digits: `A1`/`A2`/`A4`/`A8`/`A16` (record
+/// alignment) and `Z1`/`Z2`/`Z4` (minimum enumeration size). They are the
+/// numeric forms of `ALIGN` and `MINENUMSIZE`, which the layout engine models.
+fn is_numeric_switch(member: &str) -> bool {
+    let (letter, digits) = member.split_at_checked(1).unwrap_or_default();
+    match letter {
+        "A" | "a" => matches!(digits, "1" | "2" | "4" | "8" | "16"),
+        "Z" | "z" => matches!(digits, "1" | "2" | "4"),
+        _ => false,
+    }
 }
 
 pub(crate) fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
@@ -3817,23 +3830,92 @@ fn is_else_directive(body: &str) -> bool {
 fn directive_symbol(body: &str) -> Option<String> {
     let argument = directive_arguments(body).trim();
     let symbol = argument.strip_prefix('&').unwrap_or(argument);
-    let mut characters = symbol.chars();
-    let first = characters.next()?;
-    if !first.is_ascii_alphanumeric() && first != '_' {
+    // dcc reads the symbol's leading identifier and ignores what follows:
+    // `{$define DELPHI.NET}` defines DELPHI, `{$ifdef FOO junk}` tests FOO
+    // (dcc32 21.0 and 24.0, l4d-onnm).
+    let end = symbol
+        .bytes()
+        .position(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+        .unwrap_or(symbol.len());
+    if end == 0 {
         return None;
     }
-    if !characters
-        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '.')
-    {
-        return None;
-    }
-    canonical_symbol(argument)
+    canonical_symbol(&symbol[..end])
 }
 
 /// Return the canonical symbol from a DEFINE/UNDEF directive for bounded
 /// consumers that carry conditional facts across source boundaries.
 pub fn defined_symbol(body: &str) -> Option<String> {
     directive_symbol(body)
+}
+
+/// The value a `{$SCOPEDENUMS}` directive sets, `None` for any other
+/// directive. A value other than `ON` or `OFF` is unknown.
+pub fn scoped_enums_switch(body: &str) -> Option<Truth> {
+    let keyword = directive_keyword(body)?;
+    if !keyword.eq_ignore_ascii_case("scopedenums") {
+        return None;
+    }
+    let value = directive_arguments(body).trim();
+    Some(if value.eq_ignore_ascii_case("on") {
+        Truth::True
+    } else if value.eq_ignore_ascii_case("off") {
+        Truth::False
+    } else {
+        Truth::Unknown
+    })
+}
+
+/// Whether `{$SCOPEDENUMS ON}` is in effect at each offset of a source,
+/// from its directives in source order (l4d-1qta). An enumerated type takes
+/// the state at its declaration: while it is on, the type's values are not
+/// added to the enclosing scope. The state starts off; a directive under
+/// unknown activity that would change it, an unexpanded include (its text
+/// is unknown) and an options restore (`POPOPT`, `POP`) make it unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopedEnums {
+    /// The state from each offset on, in increasing offset order.
+    changes: Vec<(usize, Truth)>,
+}
+
+impl ScopedEnums {
+    pub fn new(directives: &[ConditionalDirective]) -> Self {
+        let mut state = Truth::False;
+        let mut changes = Vec::new();
+        for directive in directives {
+            if directive.activity == Truth::False {
+                continue;
+            }
+            let next = if directive.kind == DirectiveKind::Include {
+                Truth::Unknown
+            } else if let Some(value) = scoped_enums_switch(&directive.body) {
+                if directive.activity == Truth::True || value == state {
+                    value
+                } else {
+                    Truth::Unknown
+                }
+            } else if directive_keyword(&directive.body).is_some_and(|keyword| {
+                keyword.eq_ignore_ascii_case("popopt") || keyword.eq_ignore_ascii_case("pop")
+            }) {
+                Truth::Unknown
+            } else {
+                continue;
+            };
+            if next != state {
+                state = next;
+                changes.push((directive.end, state));
+            }
+        }
+        Self { changes }
+    }
+
+    /// The state in effect at `offset`.
+    pub fn at(&self, offset: usize) -> Truth {
+        let index = self.changes.partition_point(|(start, _)| *start <= offset);
+        index
+            .checked_sub(1)
+            .map_or(Truth::False, |index| self.changes[index].1)
+    }
 }
 
 fn evaluate_condition(
@@ -4808,6 +4890,12 @@ impl ExpressionParser<'_> {
                 }
                 symbol
                     .map(|symbol| {
+                        // dcc rejects a dotted argument (E2029 ')' expected
+                        // but '.' found, dcc32 21.0 and 24.0): its value is
+                        // not known (l4d-onnm).
+                        if symbol.contains('.') {
+                            return Value::Unknown;
+                        }
                         if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
                             lookup(ExpressionQuery::Defined(&symbol, symbol_range))
                         }) {
@@ -5456,7 +5544,17 @@ pub fn is_harmless_directive_keyword(keyword: &str) -> bool {
 }
 
 fn is_harmless_keyword(keyword: &str) -> bool {
+    let suffixed = keyword.ends_with(['+', '-']);
     let keyword = keyword.trim_end_matches(['+', '-']);
+    // `{$I+}` and `{$I-}` are IOCHECKS, but a bare `{$I name}` is an include.
+    if keyword == "i" {
+        return suffixed;
+    }
+    // Name binding reads `SCOPEDENUMS ON`/`OFF` per enumerated type through
+    // `ScopedEnums`; dcc 37.0 rejects the `+`/`-` spelling (E1030).
+    if keyword == "scopedenums" {
+        return !suffixed;
+    }
     matches!(
         keyword,
         "a" | "a1"
@@ -5580,6 +5678,25 @@ fn is_harmless_keyword(keyword: &str) -> bool {
             | "p"
             | "s"
             | "w"
+            // Short forms of switches whose long forms are listed above, each
+            // a code generation switch: `B` is `BOOLEVAL` (short-circuit
+            // evaluation), `J` is `WRITEABLECONST` (typed constants may be
+            // assigned; the name still binds the same declaration), `V` is
+            // `VARSTRINGCHECKS`, `O` is `OPTIMIZATION`, `D` is `DEBUGINFO`
+            // (`{$D 'text'}` is the harmless `DESCRIPTION`), `Y` is
+            // `REFERENCEINFO`, `G` is `IMPORTEDDATA` and `U` is `SAFEDIVIDE`.
+            // `B`, `O`, `D` and `Y` stay tracked `$IFOPT` options through
+            // `supported_option_name`, like `R`; `I` is handled above.
+            | "b"
+            | "j"
+            | "v"
+            | "o"
+            | "d"
+            | "y"
+            | "g"
+            | "u"
+            // Delphi 2009/2010 string-conversion checks, like `VARSTRINGCHECKS`.
+            | "stringchecks"
     )
 }
 

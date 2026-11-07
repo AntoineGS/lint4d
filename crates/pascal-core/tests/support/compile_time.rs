@@ -157,6 +157,13 @@ impl Fixture {
             content_hash: pascal_project::content_hash_bytes(&source.bytes),
         };
     }
+    pub fn include_revision(&mut self, name: &str, version: i32) {
+        let source = self.includes.get_mut(name).expect("fixture include");
+        source.revision = SourceRevision::Overlay {
+            version,
+            content_hash: pascal_project::content_hash_bytes(&source.bytes),
+        };
+    }
     pub fn deny_unit(&mut self, name: &str) {
         self.denied_units.insert(name.into());
     }

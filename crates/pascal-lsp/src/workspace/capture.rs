@@ -463,6 +463,12 @@ impl ReadCapture {
         restrict(&captured.reads, &captured.index, observations)
     }
 
+    /// Whether the capture overflowed, and whether it met editor state.
+    pub(crate) fn flags(&self) -> (bool, bool) {
+        let captured = self.lock();
+        (captured.reads.overflowed, captured.reads.editor_state)
+    }
+
     pub(crate) fn snapshot(&self) -> CapturedReads {
         self.lock().reads.clone()
     }

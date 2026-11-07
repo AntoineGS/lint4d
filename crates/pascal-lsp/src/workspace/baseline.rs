@@ -243,7 +243,8 @@ impl ProjectWorkBudget for RequestCancel<'_> {
 
 impl Workspace {
     /// The directories `key`'s membership was read from, in scan order:
-    /// the main source's, the explicit units', then the search paths, as
+    /// the main source's, the explicit units' (by path key), then the
+    /// search paths, as
     /// `index_membership` records its catalogues.
     fn membership_directories(&self, key: &ContextKey) -> Result<Vec<Directory>, BaselineGap> {
         let state = self.contexts.get(key).ok_or(BaselineGap::NotAProject)?;
@@ -536,21 +537,41 @@ impl Workspace {
         let Some(state) = self.contexts.get(key) else {
             return Adoption::None;
         };
+        let project = state
+            .context
+            .project_file()
+            .map_or_else(String::new, |path| path.display().to_string());
+        let (adoption, reason) = self.adopt_candidate(key, cancel);
+        // Every outcome is traced: a skipped candidate leaves no other sign.
+        crate::trace::trace!(
+            "  baseline adoption {project}: {} ({reason})",
+            match adoption {
+                Adoption::Adopted => "adopted",
+                Adoption::None => "none",
+                Adoption::Retry => "retry",
+            }
+        );
+        adoption
+    }
+
+    /// The adoption and why: the last candidate's reason for a skip.
+    fn adopt_candidate(&self, key: &ContextKey, cancel: &AtomicBool) -> (Adoption, &'static str) {
+        let state = &self.contexts[key];
         let Ok(directories) = self.membership_directories(key) else {
-            return Adoption::None;
+            return (Adoption::None, "no membership directories");
         };
         let scope = discovery_scope(&directories);
         let Some(job) = self.persistent_cache().job() else {
-            return Adoption::None;
+            return (Adoption::None, "no store");
         };
         let store = job.store();
         let context = CacheContextKey::new(&state.context);
         let candidates = match store.find_snapshots(&context) {
             Ok(Lookup::Hit(candidates)) => candidates,
-            Ok(Lookup::Miss(_)) => return Adoption::None,
+            Ok(Lookup::Miss(_)) => return (Adoption::None, "no snapshot"),
             Err(bypass) => {
                 job.observe(&bypass);
-                return Adoption::Retry;
+                return (Adoption::Retry, "store bypass");
             }
         };
         let overlays = self.overlay_inputs();
@@ -575,47 +596,68 @@ impl Workspace {
             &work,
             job.cancel_flag(),
         );
+        let mut reason = "no candidate";
         for header in candidates {
             if job.is_cancelled() || cancel.load(Ordering::Relaxed) {
-                return Adoption::Retry;
+                return (Adoption::Retry, "cancelled");
             }
             let Some(discovery) = header.discovery_evidence() else {
+                reason = "no discovery evidence";
                 continue;
             };
             let evidence = match store.open_evidence(discovery) {
                 Ok(Lookup::Hit(evidence)) => evidence,
-                Ok(Lookup::Miss(_)) => continue,
+                Ok(Lookup::Miss(_)) => {
+                    reason = "discovery evidence retired";
+                    continue;
+                }
                 Err(bypass) => {
                     job.observe(&bypass);
-                    return Adoption::Retry;
+                    return (Adoption::Retry, "store bypass");
                 }
             };
             if evidence.purpose() != EvidencePurpose::Discovery
                 || evidence.subject().subject != scope.digest()
             {
+                crate::trace::trace!(
+                    "  baseline candidate scope mismatch: {} directories, scope {} vs stored {}",
+                    directories.len(),
+                    scope.digest(),
+                    evidence.subject().subject
+                );
+                reason = "scope mismatch";
                 continue;
             }
             match validate_evidence(store, &evidence, &mut validator) {
                 Ok(EvidenceCheck::Holds) => {}
-                Ok(EvidenceCheck::Stale(_) | EvidenceCheck::Store(_)) => continue,
-                Ok(EvidenceCheck::Unproven(_)) => return Adoption::Retry,
+                Ok(EvidenceCheck::Stale(_) | EvidenceCheck::Store(_)) => {
+                    reason = "stale evidence";
+                    continue;
+                }
+                Ok(EvidenceCheck::Unproven(_)) => return (Adoption::Retry, "unproven evidence"),
                 Err(bypass) => {
                     job.observe(&bypass);
-                    return Adoption::Retry;
+                    return (Adoption::Retry, "store bypass");
                 }
             }
             let records = match snapshot_records(store, &header) {
                 Ok(Some(records)) => records,
-                Ok(None) => continue,
+                Ok(None) => {
+                    reason = "retired";
+                    continue;
+                }
                 Err(bypass) => {
                     job.observe(&bypass);
-                    return Adoption::Retry;
+                    return (Adoption::Retry, "store bypass");
                 }
             };
             let held = match store.hold_snapshot(&header) {
                 Ok(true) => true,
                 // Retired since it was found.
-                Ok(false) => continue,
+                Ok(false) => {
+                    reason = "retired";
+                    continue;
+                }
                 Err(bypass) => {
                     job.observe(&bypass);
                     false
@@ -628,12 +670,12 @@ impl Workspace {
                 sealed: false,
             };
             return if self.install_hint(&job, key, hint) {
-                Adoption::Adopted
+                (Adoption::Adopted, if held { "held" } else { "unheld" })
             } else {
-                Adoption::None
+                (Adoption::None, "install refused")
             };
         }
-        Adoption::None
+        (Adoption::None, reason)
     }
 
     /// Release the holds of evicted contexts' snapshots (D40).
@@ -797,8 +839,8 @@ mod tests {
     use crate::workspace::indexing::slow_member_for_test;
     use crate::workspace::indexing::tests::persisting::{persisting_view, records, restarted_view};
     use crate::workspace::indexing::tests::{
-        advance, indexed_project, members, named_unit, over_pending_bytes_unit, selected,
-        session_unit, workspace, write,
+        advance, explicit_unit_items, indexed_project, members, named_unit,
+        over_pending_bytes_unit, project_workspace, selected, session_unit, workspace, write,
     };
     use crate::workspace::indexing::{IndexBound, IndexMode};
     use crate::workspace::persist::tests::private_dir;
@@ -1125,6 +1167,108 @@ mod tests {
         assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
         assert_eq!(snapshots(&second, &cache, &key).len(), 1);
         assert_eq!(held(&cache), vec![sealed.header().id()]);
+        cache.shutdown();
+    }
+
+    /// App.dpr, `lib/U0..U2.pas` on the search path and eight explicit
+    /// units, each in its own directory outside it.
+    fn explicit_project(root: &Path) -> (Workspace, ContextKey, IndexAnchor) {
+        for index in 0..3 {
+            named_unit(
+                &root.join(format!("lib/U{index}.pas")),
+                &format!("P{index}"),
+            );
+        }
+        let items = explicit_unit_items(root, 8);
+        let (workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            &items,
+            WorkspaceOptions::default(),
+        );
+        (workspace, key, IndexAnchor::Project(root.join("App.dproj")))
+    }
+
+    /// 13e-1: a restarted process computes the sealed discovery scope again
+    /// when the project has explicit units in many directories, so it
+    /// adopts the snapshot (the scope used to follow a `HashMap`'s order,
+    /// which differs per process and per call).
+    #[test]
+    fn a_restart_adopts_a_snapshot_with_explicit_units_in_many_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (session, key, anchor) = explicit_project(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert_eq!(progress.persisted, 12, "{progress:?}");
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        let sealed = first.project_cache.baseline_hint(&key).unwrap();
+        cache.shutdown();
+
+        let (mut second, cache) = restarted_view(temp.path(), store.path());
+        reset_counters();
+        advance(
+            &mut second,
+            &anchor,
+            IndexBound::units(0).with_mode(IndexMode::Reuse),
+        );
+        let hint = second.project_cache.baseline_hint(&key).expect("adopted");
+        assert_eq!(hint.header().id(), sealed.header().id());
+        assert!(hint.held() && !hint.sealed());
+        let progress = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.reused, 12, "{progress:?}");
+        assert_eq!(hint_reuses_for_test(), 12, "every member via the snapshot");
+        assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
+        cache.shutdown();
+    }
+
+    /// 13e-1, the R2 shape: after adopting a snapshot of a project with
+    /// explicit units, a member limited by an admission bound is
+    /// `retrying`, and the context is complete after the reuse pass.
+    #[test]
+    fn an_adopted_snapshot_with_explicit_units_leaves_the_limited_member_retrying() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (session, key, anchor) = explicit_project(temp.path());
+        over_pending_bytes_unit(&temp.path().join("lib/U0.pas"));
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        cache.shutdown();
+
+        let (mut second, cache) = restarted_view(temp.path(), store.path());
+        reset_counters();
+        let reuse = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        let hint = second.project_cache.baseline_hint(&key).expect("adopted");
+        assert!(hint.held() && !hint.sealed());
+        assert!(hint_reuses_for_test() > 0, "{reuse:?}");
+        let status = second.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (status[0].counts.retrying, status[0].counts.deferred),
+            (2, 0),
+            "{:?}",
+            status[0]
+        );
+        assert!(status[0].complete, "{:?}", status[0]);
+        assert_eq!(status[0].snapshot, "held", "{:?}", status[0]);
+        let progress = advance(&mut second, &anchor, IndexBound::all());
+        assert_eq!(progress.retries_attempted, 2, "{progress:?}");
+        assert!(
+            progress.complete && !progress.worth_requeue(),
+            "{progress:?}"
+        );
+        assert_eq!(seal(&second, &key), SealOutcome::Unchanged);
         cache.shutdown();
     }
 

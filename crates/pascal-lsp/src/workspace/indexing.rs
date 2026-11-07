@@ -3652,11 +3652,18 @@ impl Workspace {
                 paths.push(absolute_path(main.to_path_buf()));
                 directories.extend(main.parent().map(Path::to_path_buf));
             }
-            for units in context.explicit_units().into_values() {
-                for unit in units {
-                    directories.extend(unit.parent().map(Path::to_path_buf));
-                    paths.push(absolute_path(unit));
-                }
+            // `explicit_units` is a `HashMap`; the order-sensitive discovery
+            // scope (`baseline::discovery_scope`) needs the same directory
+            // order in every process, so the units go by path key.
+            let mut explicit = context
+                .explicit_units()
+                .into_values()
+                .flatten()
+                .collect::<Vec<_>>();
+            explicit.sort_by_cached_key(|unit| path_key(unit));
+            for unit in explicit {
+                directories.extend(unit.parent().map(Path::to_path_buf));
+                paths.push(absolute_path(unit));
             }
             directories.extend(context.search_paths());
             let mut seen = HashSet::new();
@@ -5234,6 +5241,64 @@ pub(in crate::workspace) mod tests {
                 .iter()
                 .any(|(scope, _)| scope.root == root.join("ext") && scope.depth == Depth::Listing)
         );
+    }
+
+    /// `<DCCReference>` items for `count` units `d<n>/E<n>.pas`, each in its
+    /// own directory outside every search path. The names count down while
+    /// the paths count up, so neither name nor declaration order is sorted
+    /// by path.
+    pub(in crate::workspace) fn explicit_unit_items(root: &Path, count: usize) -> String {
+        (0..count)
+            .rev()
+            .map(|index| {
+                let path = format!("d{index}/E{}.pas", count - index);
+                named_unit(&root.join(&path), &format!("Q{index}"));
+                format!("<DCCReference Include=\"{path}\"/>")
+            })
+            .collect()
+    }
+
+    /// 13e-1: the discovery-scope digest is order-sensitive, so the
+    /// membership's directory order must not come from a `HashMap`: the
+    /// explicit units' directories follow the main source's, sorted by
+    /// path key, and every computation, in any process, gives the same
+    /// order.
+    #[test]
+    fn explicit_unit_directories_are_scanned_in_path_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        unit(&root.join("lib/A.pas"));
+        let items = explicit_unit_items(root, 8);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            &items,
+            WorkspaceOptions::default(),
+        );
+        let roots = |found: &IndexMembership| {
+            found
+                .scopes
+                .iter()
+                .map(|(scope, _)| scope.root.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut expected = vec![root.to_path_buf()];
+        let mut explicit = (0..8)
+            .map(|index| root.join(format!("d{index}")))
+            .collect::<Vec<_>>();
+        explicit.sort_by_cached_key(|path| path_key(path));
+        expected.extend(explicit);
+        expected.push(root.join("lib"));
+        let first = roots(&membership(&mut workspace, &key));
+        assert_eq!(first, expected);
+        assert_eq!(roots(&membership(&mut workspace, &key)), first);
+        let (mut fresh, fresh_key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+            &items,
+            WorkspaceOptions::default(),
+        );
+        assert_eq!(roots(&membership(&mut fresh, &fresh_key)), first);
     }
 
     #[test]

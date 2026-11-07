@@ -16243,6 +16243,42 @@ pub(crate) struct ParsedDocument {
 }
 
 impl ParsedDocument {
+    /// Estimated heap this parse keeps (l4d-10), from its shape: the
+    /// syntax tree by node, symbols by count, the source texts, and the
+    /// per-scope binding keys, which can dominate a unit with many scopes
+    /// (RAD Studio's `Classes.pas`: 54 of its 77 MB). Calibrated with the
+    /// test allocator on RAD Studio 7.0 RTL/VCL units and generated business
+    /// object units (`retained_tests`); within about 10% on each, erring
+    /// high.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        const PER_SOURCE_BYTE: usize = 3;
+        const PER_TREE_NODE: usize = 140;
+        const PER_SYMBOL: usize = 1_500;
+        let binding_keys = self.scope_binding_keys.iter().fold(
+            std::mem::size_of_val(self.scope_binding_keys.as_slice()),
+            |total, keys| {
+                keys.iter().fold(
+                    total.saturating_add(
+                        keys.capacity()
+                            .saturating_mul(std::mem::size_of::<String>() + 1),
+                    ),
+                    |total, key| total.saturating_add(key.capacity()),
+                )
+            },
+        );
+        self.source
+            .len()
+            .saturating_mul(PER_SOURCE_BYTE)
+            .saturating_add(
+                self.tree
+                    .root_node()
+                    .descendant_count()
+                    .saturating_mul(PER_TREE_NODE),
+            )
+            .saturating_add(self.symbols.len().saturating_mul(PER_SYMBOL))
+            .saturating_add(binding_keys)
+    }
+
     /// Whether symbol `index` can be an unqualified name: it has no owner
     /// type, or it is an unscoped enum value (l4d-1qta).
     fn has_unqualified_owner(&self, index: usize, symbol: &Symbol) -> bool {

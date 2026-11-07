@@ -3301,6 +3301,26 @@ pub struct Workspace {
     interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
     /// Interface entries this workspace stored that were new or changed.
     interface_entries_stored: usize,
+    /// During a warm crawl, dependencies found by an import load that are
+    /// not indexed yet. The crawl indexes each when it reaches it and drops
+    /// its parse once its imports are stored, so it keeps one unit's parse at
+    /// a time instead of the whole closure's (l4d-10).
+    crawl_deferred: Option<HashMap<Url, DeferredSource>>,
+}
+
+/// A dependency the warm crawl found but has not indexed yet, with what its
+/// import load would have indexed it from.
+struct DeferredSource {
+    text: String,
+    disk_size: Option<usize>,
+    raw_content_hash: Option<u64>,
+    context_key: ContextKey,
+    /// Indexed once already (and its parse released), so the crawl need not
+    /// index it again unless it walks it.
+    indexed_once: bool,
+    /// Charges `text` to the cache budget while the crawl holds it. Absent
+    /// when the budget had no room; the crawl keeps the text regardless.
+    _charge: Option<crate::project_cache::Reservation>,
 }
 
 pub(crate) type DependencyHook =
@@ -7994,7 +8014,24 @@ impl Workspace {
                         .index
                         .source_text(&dependency_uri)
                         .is_some_and(|source| source == dependency_text);
-                let indexed = if already_indexed {
+                let deferred = !already_indexed
+                    && self.crawl_deferred.as_mut().is_some_and(|deferred| {
+                        deferred
+                            .entry(dependency_uri.clone())
+                            .or_insert_with(|| DeferredSource {
+                                _charge: self.project_cache.reserve(
+                                    crate::project_cache::ReservationKind::CrawlSources,
+                                    dependency_text.len(),
+                                ),
+                                text: dependency_text.clone(),
+                                disk_size,
+                                raw_content_hash,
+                                context_key: effective_context_key.clone(),
+                                indexed_once: false,
+                            });
+                        true
+                    });
+                let indexed = if already_indexed || deferred {
                     true
                 } else {
                     self.index_source_with_cancel(
@@ -8194,11 +8231,34 @@ impl Workspace {
         self.dependency_hook = Some(hook);
     }
 
-    /// Loads `uri` and every direct import into the shared cache.
+    /// Loads `uri` and every direct import into the shared cache, and keeps
+    /// what it walked indexed in this workspace.
+    #[cfg(test)]
     pub(crate) fn warm_with_cancel(
         &mut self,
         uri: &Url,
         cancel: &AtomicBool,
+    ) -> Result<WarmOutcome, String> {
+        self.warm_closure(uri, cancel, false)
+    }
+
+    /// The warmer's crawl: `warm_with_cancel` for a workspace dropped once it
+    /// returns. Only the shared cache keeps what it walked, so this
+    /// workspace holds one unit's parse at a time instead of the closure's
+    /// (l4d-10); the cache's budget bounds the rest.
+    pub(crate) fn crawl_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<WarmOutcome, String> {
+        self.warm_closure(uri, cancel, true)
+    }
+
+    fn warm_closure(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+        release: bool,
     ) -> Result<WarmOutcome, String> {
         let context_key = self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), None)?;
         let fingerprint = self.contexts.get(&context_key).map(|state| {
@@ -8213,21 +8273,38 @@ impl Workspace {
         }
         let mut pinned = HashSet::from([uri.clone()]);
         let session_cache = ResolverSessionCache::default();
-        let dependencies = self.load_imports_with_session_cache(
-            uri,
-            &context_key,
-            &mut pinned,
-            Some(cancel),
-            &session_cache,
-        )?;
-        let closure = self.warm_interface_closure(
-            uri,
-            &dependencies,
-            &context_key,
-            &mut pinned,
-            cancel,
-            &session_cache,
-        )?;
+        // A crawl's product is the shared cache: the source records of the
+        // closure it walks and releases would only grow this workspace.
+        let records = if release {
+            self.crawl_deferred = Some(HashMap::new());
+            Some(self.analysis_records.take())
+        } else {
+            None
+        };
+        let walked = self
+            .load_imports_with_session_cache(
+                uri,
+                &context_key,
+                &mut pinned,
+                Some(cancel),
+                &session_cache,
+            )
+            .and_then(|dependencies| {
+                let closure = self.warm_interface_closure(
+                    uri,
+                    &dependencies,
+                    &context_key,
+                    &mut pinned,
+                    cancel,
+                    &session_cache,
+                )?;
+                Ok((dependencies, closure))
+            });
+        if let Some(records) = records {
+            self.crawl_deferred = None;
+            self.analysis_records = records;
+        }
+        let (dependencies, closure) = walked?;
         Ok(WarmOutcome {
             fingerprint,
             dependencies,
@@ -8265,6 +8342,14 @@ impl Workspace {
                 hook(&unit, finished, finished + frontier.len() + 1)?;
             }
             done += 1;
+            let indexed = self.index_deferred_source(&unit, context_key, pinned, cancel)?;
+            // A walked unit is never walked again.
+            if let Some(deferred) = self.crawl_deferred.as_mut() {
+                deferred.remove(&unit);
+            }
+            if !indexed {
+                continue;
+            }
             // Each load reports its own dependencies through the hook; keep
             // one progress sequence for the whole crawl.
             let hook = self.dependency_hook.take();
@@ -8276,25 +8361,120 @@ impl Workspace {
                 session_cache,
             );
             self.dependency_hook = hook;
-            match loaded {
+            let summary = match loaded {
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(_) => continue,
-                Ok(_) => {}
-            }
-            let Some(summary) = self.interface_import_summaries.get(&unit).cloned() else {
-                continue;
+                Err(_) => None,
+                Ok(_) => self.interface_import_summaries.get(&unit).cloned(),
             };
-            if !summary.complete {
-                continue;
-            }
-            for target in summary.targets {
-                if visited.insert(target.clone()) {
-                    closure.push(target.clone());
-                    frontier.push_back(target);
+            // Its unit, import and interface entries are stored: the crawl
+            // needs its parse no more.
+            self.release_crawled_unit(root, &unit);
+            if let Some(summary) = summary.filter(|summary| summary.complete) {
+                for target in summary.targets {
+                    if visited.insert(target.clone()) {
+                        closure.push(target.clone());
+                        frontier.push_back(target);
+                    }
                 }
             }
+            self.index_unwalked_deferred_sources(root, &visited, context_key, pinned, cancel)?;
         }
+        let unwalked = HashSet::new();
+        self.index_unwalked_deferred_sources(root, &unwalked, context_key, pinned, cancel)?;
         Ok(closure)
+    }
+
+    /// Indexes a dependency the crawl deferred, as its import load would
+    /// have. False when it could not be indexed; a unit that was not
+    /// deferred is indexed already.
+    fn index_deferred_source(
+        &mut self,
+        uri: &Url,
+        fallback_context: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        let Some(source) = self
+            .crawl_deferred
+            .as_ref()
+            .and_then(|deferred| deferred.get(uri))
+        else {
+            return Ok(self.index.contains(uri));
+        };
+        if self.index.contains(uri) {
+            return Ok(true);
+        }
+        let text = source.text.clone();
+        let (disk_size, raw_content_hash) = (source.disk_size, source.raw_content_hash);
+        let context_key = if self.contexts.contains_key(&source.context_key) {
+            source.context_key.clone()
+        } else {
+            fallback_context.clone()
+        };
+        let stamp = self.disk_stamps.get(uri).cloned();
+        let indexed = self.index_source_with_cancel(
+            uri,
+            text,
+            disk_size,
+            raw_content_hash,
+            &context_key,
+            pinned,
+            Some(cancel),
+        )?;
+        if indexed && let Some(stamp) = stamp {
+            self.disk_stamps.insert(uri.clone(), stamp);
+        }
+        if let Some(source) = self
+            .crawl_deferred
+            .as_mut()
+            .and_then(|deferred| deferred.get_mut(uri))
+        {
+            source.indexed_once = true;
+        }
+        Ok(indexed)
+    }
+
+    /// Drops a crawled unit's parse from this workspace; the shared cache
+    /// keeps it while its budget allows. The root and open documents stay.
+    fn release_crawled_unit(&mut self, root: &Url, uri: &Url) {
+        if self.crawl_deferred.is_none() || uri == root || self.open_documents.contains_key(uri) {
+            return;
+        }
+        let stamp = self.disk_stamps.get(uri).cloned();
+        let _ = self.remove_indexed_with_control(uri, None, None, false);
+        if let Some(stamp) = stamp {
+            self.disk_stamps.insert(uri.clone(), stamp);
+        }
+    }
+
+    /// Indexes, one at a time, the deferred dependencies the crawl will not
+    /// walk (implementation imports, or past the walk's end), so the shared
+    /// cache gets their parses as before, and releases each.
+    fn index_unwalked_deferred_sources(
+        &mut self,
+        root: &Url,
+        walked: &HashSet<Url>,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let pending = self
+            .crawl_deferred
+            .as_ref()
+            .map(|deferred| {
+                deferred
+                    .iter()
+                    .filter(|(uri, source)| !source.indexed_once && !walked.contains(*uri))
+                    .map(|(uri, _)| uri.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for uri in pending {
+            check_workspace_cancel(Some(cancel))?;
+            self.index_deferred_source(&uri, context_key, pinned, cancel)?;
+            self.release_crawled_unit(root, &uri);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -19631,8 +19811,7 @@ mod tests {
 
         cache.invalidate_after_overflow();
         assert!(
-            cache.stats().outstanding_bytes
-                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            cache.stats().outstanding_bytes > INHERITED_BASE.len(),
             "the worker still holds the parses it stored"
         );
         drop(worker);
@@ -19667,12 +19846,110 @@ mod tests {
         // (`UnitValue::retained_bytes`), which the test cannot recompute
         // without rebuilding them.
         assert!(
-            cache.stats().outstanding_bytes
-                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            cache.stats().outstanding_bytes > INHERITED_BASE.len(),
             "so its charge stays outstanding"
         );
         drop(worker);
         assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    /// `Main` uses `U00`; each `Unn` uses the next through its interface, so
+    /// the warm crawl walks a closure of `units` units of about 8 KB each.
+    fn chain_fixture(units: usize) -> (tempfile::TempDir, Workspace, Url, Vec<Url>) {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut chain = Vec::new();
+        for unit in 0..units {
+            let uses = if unit + 1 < units {
+                format!("uses U{:02};\n", unit + 1)
+            } else {
+                String::new()
+            };
+            let mut text = format!(
+                "unit U{unit:02};\ninterface\n{uses}type\n  TC{unit:02} = class\n  public\n"
+            );
+            for member in 0..120 {
+                text.push_str(&format!(
+                    "    procedure Member{member}(Value: Integer; const Name: string);\n"
+                ));
+            }
+            text.push_str("  end;\nimplementation\n");
+            for member in 0..120 {
+                text.push_str(&format!(
+                    "procedure TC{unit:02}.Member{member}(Value: Integer; const Name: string);\nbegin\nend;\n"
+                ));
+            }
+            text.push_str("end.\n");
+            let path = root.join(format!("U{unit:02}.pas"));
+            fs::write(&path, text).unwrap();
+            chain.push(Url::from_file_path(path).unwrap());
+        }
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses U00;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let workspace = test_workspace(vec![root], Default::default());
+        (temp, workspace, Url::from_file_path(main).unwrap(), chain)
+    }
+
+    /// l4d-10: a warm crawl keeps the parses of the closure it walked in its
+    /// own index. Past the budget, those leased parses stayed charged and
+    /// alive while the cache evicted everything else (SFClient2: 2.9 GB
+    /// outstanding against a 2 GiB budget). The crawl must release what it
+    /// no longer needs, so the closure fits the budget, and still finish.
+    #[test]
+    fn a_crawl_over_a_closure_larger_than_the_budget_stays_within_it() {
+        let (_temp, workspace, main, chain) = chain_fixture(40);
+        let cache = workspace.project_cache().clone();
+        let budget = 4 << 20;
+        cache.set_max_bytes(budget);
+        let mut worker = worker_view(&workspace);
+        let peak_charged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(target_os = "linux")]
+        let baseline = crate::test_alloc::live_bytes();
+        #[cfg(target_os = "linux")]
+        let peak_live = Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let hook_cache = cache.clone();
+        let hook_peak = peak_charged.clone();
+        #[cfg(target_os = "linux")]
+        let hook_live = peak_live.clone();
+        worker.set_dependency_hook(Arc::new(move |_, _, _| {
+            let stats = hook_cache.stats();
+            hook_peak.fetch_max(
+                stats.bytes + stats.outstanding_bytes + stats.reserved_bytes(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            #[cfg(target_os = "linux")]
+            hook_live.fetch_max(
+                crate::test_alloc::live_bytes() - baseline,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+
+        let outcome = worker
+            .crawl_with_cancel(&main, &AtomicBool::new(false))
+            .expect("the crawl finishes");
+
+        assert_eq!(outcome.dependencies, chain[..1]);
+        assert_eq!(outcome.closure, chain[1..], "the whole closure is walked");
+        let charged = peak_charged.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            charged <= budget,
+            "charged {charged} bytes against a {budget}-byte budget"
+        );
+        // Measured, the bound holds up to the estimates' error and the
+        // crawl's own bookkeeping.
+        #[cfg(target_os = "linux")]
+        {
+            let live = peak_live.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                live <= (budget + budget / 20) as isize,
+                "the crawl kept {live} bytes against a {budget}-byte budget"
+            );
+        }
     }
 
     #[test]
@@ -19695,7 +19972,7 @@ mod tests {
         cache.invalidate_after_overflow();
         let held = cache.stats().outstanding_bytes;
         assert!(
-            held >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            held > INHERITED_BASE.len(),
             "the snapshot still holds Base's parse: {held} bytes charged"
         );
 
@@ -25749,10 +26026,13 @@ BDS = '/fake/37'
         assert_eq!(options.limits.max_cache_bytes, 1_048_576);
 
         let workspace = test_workspace(vec![temp.path().to_path_buf()], options);
-        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
+        // Past half of a 1 MiB budget, so its pin does not hold it (l4d-10);
+        // under the 2 GiB default it would.
+        store_pinned_test_import(&workspace, temp.path(), 768 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        let stats = workspace.project_cache.stats();
+        assert_eq!(stats.bytes, 768 * 1024);
+        assert_eq!(stats.pinned_bytes, 0);
     }
 
     #[test]
@@ -25839,10 +26119,13 @@ BDS = '/fake/37'
         .expect("prepared runtime options");
 
         assert!(workspace.apply_prepared_runtime_options(prepared));
-        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
+        // Past half of a 1 MiB budget, so its pin does not hold it (l4d-10);
+        // under the 2 GiB default it would.
+        store_pinned_test_import(&workspace, temp.path(), 768 * 1024);
 
-        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
-        assert!(!workspace.project_cache.has_room());
+        let stats = workspace.project_cache.stats();
+        assert_eq!(stats.bytes, 768 * 1024);
+        assert_eq!(stats.pinned_bytes, 0);
     }
 
     #[cfg(unix)]

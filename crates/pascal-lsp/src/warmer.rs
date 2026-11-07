@@ -556,6 +556,7 @@ impl Warmer {
                 lower_thread_priority();
                 for job in job_receiver {
                     run_job(job, gate.clone(), &event_sender);
+                    release_free_heap();
                 }
             })
             .expect("spawn warmer thread");
@@ -1068,6 +1069,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             });
         }
         crate::trace::trace!("  warm unit {done}/{total} {}", unit_name(unit));
+        release_free_heap();
         // Pause between units while interactive requests run.
         if done == total || hook_gate.try_wait_idle(&hook_cancel) {
             Ok(())
@@ -1078,7 +1080,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
         }
     }));
-    let result = workspace.warm_with_cancel(&uri, &job.cancel);
+    let result = workspace.crawl_with_cancel(&uri, &job.cancel);
     // Entries stored before a pause or error are already in the shared cache,
     // and a retry will not store them again, so report them now.
     if workspace.interface_entries_stored() > 0 {
@@ -1115,6 +1117,34 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
 
 fn unit_name(uri: &Url) -> &str {
     uri.path().rsplit('/').next().unwrap_or_default()
+}
+
+/// Gives the allocator's free pages back to the system, at most every few
+/// seconds: after each job, and between the units of a long crawl. glibc
+/// keeps freed memory in its arenas: on SFClient2 a 2.4 GB live heap held
+/// 6.3 GB resident after the crawl (l4d-10).
+fn release_free_heap() {
+    const MIN_INTERVAL: Duration = Duration::from_secs(10);
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|last| last.elapsed() < MIN_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let started = Instant::now();
+        // SAFETY: malloc_trim only returns free allocator pages to the system.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        crate::trace::trace!(
+            "warmer malloc_trim elapsed_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1570,11 +1600,20 @@ mod tests {
         cache.pin(&main, pins.clone());
         let budget = cache.stats().bytes;
         assert!(budget > 0);
-        cache.set_max_bytes(budget);
-        assert!(!cache.has_room(), "old crawl pins use the full budget");
+        // Pins hold at most half the budget (l4d-10).
+        cache.set_max_bytes(2 * budget);
+        assert_eq!(
+            cache.stats().pinned_bytes,
+            budget,
+            "old crawl pins hold their whole share"
+        );
 
         warmer.reset([main.clone()], cache);
-        assert!(cache.has_room(), "reset releases old crawl pins");
+        assert_eq!(
+            cache.stats().pinned_bytes,
+            0,
+            "reset releases old crawl pins"
+        );
         assert_eq!(cache.stats().bytes, budget, "reset retains cache entries");
 
         let second_events = run_until_end(&mut warmer, &workspace);

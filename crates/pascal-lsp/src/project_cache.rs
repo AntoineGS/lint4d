@@ -23,11 +23,6 @@ use crate::workspace_index::{
 /// Default for the `maxCacheBytes` limit.
 pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Retained heap bytes per indexed source byte, measured by
-/// `measure_retained_bytes_per_source_byte` on RAD Studio 7.0 RTL/VCL units.
-#[allow(dead_code)]
-pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09-29: 46, 45, 45 on RAD Studio 7.0 RTL/VCL
-
 /// Shared directory catalogues (l4d-20) may hold at most this fraction of
 /// `maxCacheBytes`. Like a reservation, they may evict unpinned entries to
 /// make room, but never past that eighth of the budget.
@@ -85,12 +80,8 @@ pub(crate) fn overlay_content_hash(text: &str) -> u64 {
     pascal_project::content_hash_bytes(text.as_bytes())
 }
 
-pub(crate) fn unit_value_bytes(indexed_len: usize) -> usize {
-    indexed_len.saturating_mul(RETAINED_BYTES_PER_SOURCE_BYTE)
-}
-
 pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usize {
-    resolved.dependencies.iter().fold(4096usize, |total, unit| {
+    let dependencies = resolved.dependencies.iter().fold(4096usize, |total, unit| {
         total
             .saturating_add(unit.source.bytes.len())
             .saturating_add(
@@ -99,7 +90,25 @@ pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usi
                     .as_deref()
                     .map_or(0, |text| text.len()),
             )
-    })
+            .saturating_add(unit.requested_name.len())
+            .saturating_add(unit.declared_name.len())
+            .saturating_add(unit.source.id.as_str().len())
+            .saturating_add(path_bytes(&unit.source.path))
+            .saturating_add(revision_bytes(&unit.source.revision))
+    });
+    resolved
+        .bindings
+        .iter()
+        .fold(dependencies, |total, binding| {
+            total
+                .saturating_add(binding.importer_source_id.as_str().len())
+                .saturating_add(binding.site.requested_name.len())
+                .saturating_add(strings_bytes(&binding.authorized_qualifiers))
+                .saturating_add(match &binding.target {
+                    pascal_core::ResolutionTarget::Found(id) => id.as_str().len(),
+                    _ => 0,
+                })
+        })
 }
 
 fn path_bytes(path: &Path) -> usize {
@@ -130,17 +139,29 @@ fn report_bytes(report: &pascal_core::ResolutionReport) -> usize {
     let observations = report.observations.iter().fold(
         std::mem::size_of_val(report.observations.as_slice()),
         |total, observation| {
-            let path = match observation {
-                O::Directory { path, .. }
-                | O::Candidate { path, .. }
-                | O::Payload { path, .. }
-                | O::Metadata(
-                    pascal_project::MetadataObservation::Stat { path }
-                    | pascal_project::MetadataObservation::Payload { path, .. },
-                ) => path,
-                O::ProjectRead(read) => &read.path,
+            let owned = match observation {
+                O::Directory { path, entry, .. } => {
+                    path_bytes(path).saturating_add(path_bytes(&entry.path))
+                }
+                O::Candidate { path, entry, .. } => path_bytes(path)
+                    .saturating_add(entry.as_ref().map_or(0, |entry| path_bytes(&entry.path))),
+                O::Payload {
+                    source_id,
+                    path,
+                    revision,
+                } => path_bytes(path)
+                    .saturating_add(source_id.as_str().len())
+                    .saturating_add(revision_bytes(revision)),
+                O::Metadata(pascal_project::MetadataObservation::Stat { path }) => path_bytes(path),
+                O::Metadata(pascal_project::MetadataObservation::Payload {
+                    path,
+                    path_entry,
+                    ..
+                }) => path_bytes(path).saturating_add(path_bytes(&path_entry.path)),
+                O::ProjectRead(read) => path_bytes(&read.path)
+                    .saturating_add(read.content_bytes.as_ref().map_or(0, Vec::len)),
             };
-            total.saturating_add(path_bytes(path))
+            total.saturating_add(owned)
         },
     );
     observations
@@ -367,55 +388,249 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
     held
 }
 
-#[cfg(test)]
-mod tests {
-    fn resident_bytes() -> usize {
-        let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
-        let pages: usize = statm
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse().ok())
-            .expect("resident pages");
-        pages * 4096
+/// `retained_bytes()` against the heap a value really keeps (l4d-10),
+/// counted by the test allocator, tree-sitter's C allocations included.
+#[cfg(all(test, target_os = "linux"))]
+mod retained_tests {
+    use super::*;
+    use crate::test_alloc::live_bytes;
+
+    /// The Lazarus code tool manager: 228 KB of RTL-style Object Pascal.
+    const LARGE_UNIT: &str = include_str!("../../tree-sitter-pascal/examples/codetoolmanager.pas");
+
+    fn kept_by<T>(build: impl FnOnce() -> T) -> (T, usize) {
+        let before = live_bytes();
+        let value = build();
+        let after = live_bytes();
+        (
+            value,
+            usize::try_from(after - before).expect("net allocation"),
+        )
     }
 
-    /// Run manually:
-    /// `PASCAL_RTL=~/.local/share/Headless-Delphi/files/RAD\ Studio/7.0/source/Win32 \
-    ///  cargo test -p pascal-lsp --release --lib -- --ignored measure_retained --nocapture`
-    #[test]
-    #[ignore = "manual measurement against local Delphi sources"]
-    fn measure_retained_bytes_per_source_byte() {
-        let root = std::path::PathBuf::from(std::env::var("PASCAL_RTL").expect("PASCAL_RTL"));
-        let files = [
-            "rtl/win/Windows.pas",
-            "rtl/sys/SysUtils.pas",
-            "rtl/common/Classes.pas",
-            "vcl/Controls.pas",
-            "vcl/Forms.pas",
-            "db/DB.pas",
-        ];
+    fn parse(name: &str, text: &str) -> Arc<ParsedDocument> {
         let mut index = crate::navigation::NavigationIndex::new();
-        let context = pascal_core::conditional::ConditionalContext::default();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let before = resident_bytes();
-        let mut source_bytes = 0usize;
-        for file in files {
-            let path = root.join(file);
-            let bytes = std::fs::read(&path).expect("source");
-            let text = crate::workspace::resolver::decode_source_bytes(&bytes);
-            source_bytes += text.len();
-            let uri = lsp_types::Url::from_file_path(&path).expect("uri");
-            index
-                .update_with_context_and_cached_with_cancel(uri, text, &context, None, &cancel)
-                .expect("index");
-        }
-        let after = resident_bytes();
-        let factor = (after.saturating_sub(before)) / source_bytes.max(1);
-        println!(
-            "source={source_bytes} retained={} factor={factor}",
-            after - before
+        let uri = Url::from_file_path(Path::new("/ws").join(name)).unwrap();
+        index
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                text.to_string(),
+                &pascal_core::conditional::ConditionalContext::default(),
+                None,
+                &AtomicBool::new(false),
+            )
+            .expect("index");
+        index.parsed_document(&uri).expect("parsed")
+    }
+
+    fn assert_within_a_fifth(what: &str, estimate: usize, measured: usize) {
+        let error = estimate.abs_diff(measured) as f64 / measured as f64;
+        assert!(
+            error <= 0.2,
+            "{what}: retained_bytes {estimate} vs measured {measured} ({:.0}% off)",
+            error * 100.0
         );
-        std::hint::black_box(&index);
+    }
+
+    #[test]
+    fn a_large_units_parse_is_estimated_within_a_fifth_of_its_heap() {
+        let (unit, measured) = kept_by(|| UnitValue {
+            parsed: parse("CodeToolManager.pas", LARGE_UNIT),
+            expansion: None,
+            probes: Vec::new(),
+            disk: None,
+        });
+        assert_within_a_fifth("unit", unit.retained_bytes(), measured);
+    }
+
+    /// Generated declarations: many syntax nodes and symbols per byte, so
+    /// a per-source-byte factor under-counts them (48x estimated, 120x kept).
+    fn dense_unit() -> String {
+        let mut text = String::from("unit Dense;\ninterface\ntype\n  TDense = class\n  public\n");
+        for member in 0..400 {
+            text.push_str(&format!(
+                "    procedure Member{member}(Value: Integer; const Name: string);\n"
+            ));
+        }
+        text.push_str("  end;\nimplementation\n");
+        for member in 0..400 {
+            text.push_str(&format!(
+                "procedure TDense.Member{member}(Value: Integer; const Name: string);\nbegin\nend;\n"
+            ));
+        }
+        text.push_str("end.\n");
+        text
+    }
+
+    /// Mostly comments: few nodes per byte, so a per-byte factor over-counts.
+    fn sparse_unit() -> String {
+        let mut text = String::from("unit Sparse;\ninterface\n");
+        for line in 0..4_000 {
+            text.push_str(&format!(
+                "// Line {line} of the licence and change history kept at the top of the unit.\n"
+            ));
+        }
+        text.push_str("procedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n");
+        text
+    }
+
+    /// A project read policy with as many roots as a large Delphi project's
+    /// search path: every disk revision carries its own copy.
+    fn wide_policy() -> pascal_project::ReadPolicy {
+        let roots = (0..60)
+            .map(|root| PathBuf::from(format!("/ws/Projects/Library/Components/Source{root:02}")))
+            .collect::<Vec<_>>();
+        pascal_project::ReadPolicy::new(
+            &roots,
+            &[],
+            &["*.bak".to_string(), "__history".to_string()],
+            &pascal_project::delphi_overrides::EffectiveOverrides::default(),
+        )
+    }
+
+    fn disk_revision(
+        policy: &pascal_project::ReadPolicy,
+        path: &Path,
+    ) -> pascal_core::SourceRevision {
+        pascal_core::SourceRevision::Disk {
+            stamp: ProjectReadStamp {
+                bytes: 20_000,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                is_dir: false,
+                is_symlink: false,
+                change: None,
+                settled: true,
+            },
+            content_hash: 7,
+            read_policy: policy.clone(),
+            path_entry: pascal_project::ProjectPathEntry {
+                path: path.parent().unwrap().to_path_buf(),
+                provenance: pascal_project::ProjectPathProvenance::LegacyNative,
+            },
+        }
+    }
+
+    fn unit_path(index: usize) -> PathBuf {
+        PathBuf::from(format!(
+            "/ws/Projects/Library/Components/Source00/BusinessUnit{index:04}.pas"
+        ))
+    }
+
+    fn import_value_like_a_vcl_unit(policy: &pascal_project::ReadPolicy) -> ImportValue {
+        use pascal_core::{
+            ImportSection, ImportSite, LoadedSource, ResolutionObservation as O, ResolutionTarget,
+            ResolvedImport, ResolvedUnit, SourceId,
+        };
+        let dependencies = (0..30)
+            .map(|index| {
+                let path = unit_path(index);
+                let text = "x".repeat(20_000);
+                ResolvedUnit {
+                    requested_name: format!("BusinessUnit{index:04}"),
+                    declared_name: format!("BusinessUnit{index:04}"),
+                    source: LoadedSource {
+                        id: SourceId::new(path.display().to_string()),
+                        bytes: Arc::from(text.as_bytes()),
+                        decoded_text: Some(Arc::from(text.as_str())),
+                        revision: disk_revision(policy, &path),
+                        path,
+                        compile_time_backing: None,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let bindings = (0..30)
+            .map(|index| ResolvedImport {
+                importer_source_id: SourceId::new("/ws/Projects/App/Main.pas"),
+                site: ImportSite {
+                    byte_range: index * 20..index * 20 + 16,
+                    requested_name: format!("BusinessUnit{index:04}"),
+                    section: ImportSection::Interface,
+                },
+                target: ResolutionTarget::Found(SourceId::new(
+                    unit_path(index).display().to_string(),
+                )),
+                authorized_qualifiers: vec!["Vcl".to_string(), "System".to_string()],
+            })
+            .collect();
+        let observations = (0..200)
+            .map(|index| O::Candidate {
+                path: unit_path(index),
+                entry: Some(pascal_project::ProjectPathEntry {
+                    path: unit_path(index).parent().unwrap().to_path_buf(),
+                    provenance: pascal_project::ProjectPathProvenance::LegacyNative,
+                }),
+                stamp: None,
+                present: index < 30,
+            })
+            .collect();
+        ImportValue {
+            resolved: Arc::new(pascal_core::ResolvedImports {
+                bindings,
+                dependencies,
+                complete: true,
+                settled: true,
+            }),
+            report: Arc::new(pascal_core::ResolutionReport {
+                observations,
+                warnings: vec!["a warning about one of the imports".to_string()],
+                complete: true,
+                incomplete_reasons: vec![],
+            }),
+            probes: (0..30)
+                .map(|index| Probe::Content {
+                    path: unit_path(index),
+                    stamp: None,
+                    content_hash: 7,
+                })
+                .collect(),
+            watch_dirs: (0..10)
+                .map(|index| {
+                    unit_path(index)
+                        .parent()
+                        .unwrap()
+                        .join(format!("Dir{index}"))
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_import_entry_is_estimated_within_a_fifth_of_its_heap() {
+        let policy = wide_policy();
+        let (value, measured) = kept_by(|| import_value_like_a_vcl_unit(&policy));
+        assert_within_a_fifth("imports", value.retained_bytes(), measured);
+    }
+
+    #[test]
+    fn an_interface_entry_is_estimated_within_a_fifth_of_its_heap() {
+        let policy = wide_policy();
+        let (value, measured) = kept_by(|| InterfaceImportsValue {
+            bindings: (0..100)
+                .map(|index| InterfaceBinding {
+                    name: format!("BusinessUnit{index:04}"),
+                    uri: Url::from_file_path(unit_path(index)).unwrap(),
+                    revision: disk_revision(&policy, &unit_path(index)),
+                })
+                .collect(),
+            complete: true,
+            probes: (0..100)
+                .map(|index| Probe::Content {
+                    path: unit_path(index),
+                    stamp: None,
+                    content_hash: 7,
+                })
+                .collect(),
+        });
+        assert_within_a_fifth("interface", value.retained_bytes(), measured);
+    }
+
+    #[test]
+    fn dense_and_sparse_parses_are_estimated_within_a_fifth_of_their_heap() {
+        for (name, text) in [("Dense.pas", dense_unit()), ("Sparse.pas", sparse_unit())] {
+            let (parsed, measured) = kept_by(|| parse(name, &text));
+            assert_within_a_fifth(name, parsed.retained_bytes(), measured);
+        }
     }
 }
 
@@ -1000,7 +1215,10 @@ mod cache_tests {
             import_value_bytes(&resolved),
             4096usize
                 .saturating_add(raw.len())
-                .saturating_add(decoded.len()),
+                .saturating_add(decoded.len())
+                .saturating_add("Provider".len() * 2)
+                .saturating_add("Provider.pas".len())
+                .saturating_add("/ws/Provider.pas".len()),
             "the estimate includes both retained source payloads and entry metadata"
         );
     }
@@ -1795,16 +2013,17 @@ mod cache_tests {
 
     #[test]
     fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
-        let cache = ProjectCache::new(20);
+        // Pins hold at most half the budget: A's 11 bytes fit 20.
+        let cache = ProjectCache::new(40);
         let ctx = context("A.dproj");
         pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
         pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill_unit(&cache, "A.pas", &ctx, 1, vec![]);
-        fill(&cache, "B.pas", &ctx, 1, 9);
+        fill(&cache, "B.pas", &ctx, 1, 19);
 
         cache.unpin(&uri("Open1.pas"));
-        fill(&cache, "C.pas", &ctx, 1, 9);
+        fill(&cache, "C.pas", &ctx, 1, 19);
         assert!(!ready(&cache, "B.pas"));
         assert_eq!(cache.ready_layers(&uri("A.pas")), vec!["Import", "Unit"]);
 
@@ -1813,7 +2032,7 @@ mod cache_tests {
             ready(&cache, "A.pas"),
             "unpinning alone stays within budget"
         );
-        fill(&cache, "D.pas", &ctx, 1, 9);
+        fill(&cache, "D.pas", &ctx, 1, 19);
         assert_eq!(
             cache.ready_layers(&uri("A.pas")),
             vec!["Unit"],
@@ -1849,17 +2068,21 @@ mod cache_tests {
 
     #[test]
     fn pinning_a_ready_entry_counts_it_as_pinned_until_unpinned() {
-        let cache = ProjectCache::new(10);
+        let cache = ProjectCache::new(20);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
-        assert!(cache.has_room());
+        assert_eq!(cache.stats().pinned_bytes, 0);
         pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
-        assert!(!cache.has_room());
+        assert_eq!(cache.stats().pinned_bytes, 10);
         cache.clear_pins();
-        assert!(cache.has_room());
+        assert_eq!(cache.stats().pinned_bytes, 0);
         pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
         cache.invalidate_path(&ws_path("A.pas"));
-        assert!(cache.has_room(), "an evicted pinned entry no longer counts");
+        assert_eq!(
+            cache.stats().pinned_bytes,
+            0,
+            "an evicted pinned entry no longer counts"
+        );
     }
 
     #[test]
@@ -2098,13 +2321,10 @@ mod cache_tests {
     }
 
     #[test]
-    /// `retained_bytes` takes the parse at the measured factor; that factor
-    /// is calibrated by RSS in `measure_retained_bytes_per_source_byte`, since
-    /// tree-sitter's trees live in C allocations no in-process count sees.
-    /// This checks only what the estimate adds on top of it.
+    /// The parse's own estimate is checked against measured allocations in
+    /// `retained_tests`; this checks what the unit estimate adds to it.
     fn unit_retained_bytes_add_probes_and_unshared_text_to_the_parse_estimate() {
         let parsed = parsed_unit("Base.pas");
-        let source_len = parsed.source_text().len();
         let unit = |probes, disk| UnitValue {
             parsed: parsed.clone(),
             expansion: None,
@@ -2114,7 +2334,7 @@ mod cache_tests {
         let bare = unit(vec![], None).retained_bytes();
         assert_eq!(
             bare,
-            unit_value_bytes(source_len) + std::mem::size_of::<UnitValue>()
+            parsed.retained_bytes() + std::mem::size_of::<UnitValue>()
         );
         assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
 
@@ -2358,8 +2578,8 @@ mod cache_tests {
     }
 
     #[test]
-    fn pinned_entries_at_budget_report_no_room() {
-        let cache = ProjectCache::new(10);
+    fn pins_at_their_share_still_leave_room() {
+        let cache = ProjectCache::new(20);
         let ctx = context("A.dproj");
         cache.pin(
             &uri("Open.pas"),
@@ -2368,24 +2588,98 @@ mod cache_tests {
         fill(&cache, "A.pas", &ctx, 1, 10);
 
         assert_eq!(cache.stats().bytes, 10);
-        assert!(!cache.has_room());
+        assert_eq!(cache.stats().pinned_bytes, 10);
+        assert!(cache.has_room());
         assert!(!cache.stats().pinned_over_budget);
     }
 
+    /// l4d-10, phase-8 ruling R8-6: pins hold at most half of
+    /// `maxCacheBytes`. Pinned entries past that share are kept like any
+    /// other entry and evicted by recency, so the budget still bounds them.
     #[test]
-    fn pinned_entries_over_budget_report_no_room() {
-        let cache = ProjectCache::new(5);
+    fn pins_hold_at_most_half_the_budget() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        pin_names(
+            &cache,
+            "Open.pas",
+            &["A.pas", "B.pas", "C.pas", "D.pas"],
+            &ctx,
+        );
+        for name in ["A.pas", "B.pas", "C.pas", "D.pas"] {
+            fill(&cache, name, &ctx, 1, 30);
+        }
+
+        let stats = cache.stats();
+        assert!(stats.bytes <= 100, "pins do not lift the budget: {stats:?}");
+        assert!(!stats.pinned_over_budget, "{stats:?}");
+        assert!(
+            cache.has_room(),
+            "half the budget stays free of pins for warming"
+        );
+        assert!(ready(&cache, "A.pas"), "the first pins are held");
+    }
+
+    /// Snapshots walk a closure through its interface entries: a few KB per
+    /// unit that a pinned closure's parses would otherwise crowd out of the
+    /// pins' share (SFClient2: "closure walked: 0 providers, 44 missed").
+    #[test]
+    fn pins_hold_interface_entries_past_the_share() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open.pas", &["A.pas", "B.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 50);
+        cache.put_interface_imports(&uri("B.pas"), &ctx, 1, interface_value(&[], true), None);
+        // Evicts every entry the pins do not hold.
+        fill(&cache, "Other.pas", &ctx, 1, 50);
+
+        assert!(
+            cache
+                .peek_interface_imports(&uri("B.pas"), &ctx, 1, &HashMap::new())
+                .is_some(),
+            "the pinned interface entry is held"
+        );
+    }
+
+    #[test]
+    fn pins_are_held_in_the_order_the_owner_lists_them() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        for name in ["Root.pas", "Dep.pas", "Far1.pas", "Far2.pas"] {
+            fill(&cache, name, &ctx, 1, 20);
+        }
+        pin_names(
+            &cache,
+            "Root.pas",
+            &["Root.pas", "Dep.pas", "Far1.pas", "Far2.pas"],
+            &ctx,
+        );
+        // Evicts every entry the pins do not hold.
+        fill(&cache, "Other.pas", &ctx, 1, 60);
+
+        assert!(ready(&cache, "Root.pas"));
+        assert!(ready(&cache, "Dep.pas"));
+        assert!(
+            !ready(&cache, "Far1.pas") && !ready(&cache, "Far2.pas"),
+            "pins past half the budget are evictable"
+        );
+    }
+
+    #[test]
+    fn a_pinned_entry_past_the_pins_share_is_evicted_by_recency() {
+        let cache = ProjectCache::new(10);
         let ctx = context("A.dproj");
         cache.pin(
             &uri("Open.pas"),
             vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
         );
         fill(&cache, "A.pas", &ctx, 1, 10);
-        assert!(!cache.has_room());
-        assert!(cache.stats().pinned_over_budget);
-        cache.unpin(&uri("Open.pas"));
-        fill(&cache, "B.pas", &ctx, 1, 1);
+        assert!(ready(&cache, "A.pas"), "it fits the budget");
+        assert_eq!(cache.stats().pinned_bytes, 0, "but not the pins' share");
         assert!(cache.has_room());
+        fill(&cache, "B.pas", &ctx, 1, 1);
+        assert!(!ready(&cache, "A.pas"));
+        assert!(ready(&cache, "B.pas"));
     }
 
     #[test]
@@ -3275,16 +3569,17 @@ impl Probed for InterfaceImportsValue {
 }
 
 impl UnitValue {
-    /// Estimated heap retained by the entry: the parse at the measured
-    /// factor, its include expansion, probes, and file text it does not
-    /// share with the parse.
+    /// Estimated heap retained by the entry: the parse
+    /// (`ParsedDocument::retained_bytes`), its include expansion, probes, and
+    /// file text it does not share with the parse.
     pub(crate) fn retained_bytes(&self) -> usize {
         let unshared_text = self
             .disk
             .as_ref()
             .filter(|disk| !Arc::ptr_eq(&disk.text, self.parsed.source_text()))
             .map_or(0, |disk| disk.text.len());
-        unit_value_bytes(self.parsed.source_text().len())
+        self.parsed
+            .retained_bytes()
             .saturating_add(std::mem::size_of::<Self>())
             .saturating_add(self.expansion.as_deref().map_or(0, expansion_bytes))
             .saturating_add(probes_bytes(&self.probes))
@@ -3314,13 +3609,26 @@ impl InterfaceImportsValue {
     }
 }
 
+/// Heap a source revision owns. Its read policy shares the context's
+/// storage (`ReadPolicy` clones are shallow), so only the path entry counts.
+fn revision_bytes(revision: &pascal_core::SourceRevision) -> usize {
+    match revision {
+        pascal_core::SourceRevision::Disk { path_entry, .. } => path_bytes(&path_entry.path),
+        pascal_core::SourceRevision::Overlay { .. } => 0,
+    }
+}
+
 fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
-    value.bindings.iter().fold(256usize, |total, binding| {
-        total
-            .saturating_add(128)
-            .saturating_add(binding.name.len())
-            .saturating_add(binding.uri.as_str().len())
-    })
+    value.bindings.iter().fold(
+        std::mem::size_of::<InterfaceImportsValue>()
+            .saturating_add(std::mem::size_of_val(value.bindings.as_slice())),
+        |total, binding| {
+            total
+                .saturating_add(binding.name.len())
+                .saturating_add(binding.uri.as_str().len())
+                .saturating_add(revision_bytes(&binding.revision))
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3345,6 +3653,9 @@ struct Entry {
     input_hash: u64,
     bytes: usize,
     last_used: u64,
+    /// Counted in `pinned_bytes` instead of the LRU order: its key is pinned
+    /// and the pins' share of the budget had room for it.
+    held: bool,
 }
 
 #[derive(Debug)]
@@ -3702,6 +4013,8 @@ pub(crate) struct CacheStats {
     pub units: usize,
     pub imports: usize,
     pub bytes: usize,
+    /// Bytes of the entries pins hold, at most half the budget.
+    pub pinned_bytes: usize,
     /// Bytes of removed values that workers still hold.
     pub outstanding_bytes: usize,
     /// Pinned bytes alone exceed the budget; reserved and outstanding bytes are reported separately.
@@ -3713,6 +4026,7 @@ pub(crate) struct CacheStats {
     pub reserved_catalogue_bytes: usize,
     pub reserved_index_bytes: usize,
     pub reserved_provider_graph_bytes: usize,
+    pub reserved_crawl_source_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3724,6 +4038,7 @@ impl CacheStats {
             .saturating_add(self.reserved_catalogue_bytes)
             .saturating_add(self.reserved_index_bytes)
             .saturating_add(self.reserved_provider_graph_bytes)
+            .saturating_add(self.reserved_crawl_source_bytes)
     }
 }
 
@@ -3748,10 +4063,13 @@ pub(crate) enum ReservationKind {
     /// Compiled provider interfaces (l4d-4nbs D29), held by their store like
     /// the catalogues.
     ProviderGraphs,
+    /// Source texts a warm crawl holds for the dependencies it has not
+    /// walked yet (l4d-10).
+    CrawlSources,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         match self {
@@ -3761,6 +4079,7 @@ impl ReservationKind {
             Self::Catalogues => 3,
             Self::WorkspaceIndex => 4,
             Self::ProviderGraphs => 5,
+            Self::CrawlSources => 6,
         }
     }
 }
@@ -4372,6 +4691,7 @@ impl ProjectCache {
             input_hash: content_hash,
             bytes,
             last_used: state.clock,
+            held: false,
         };
         // Replace even an unchanged entry: its probes may be fresher.
         insert_ready(&mut state, key, entry);
@@ -4913,13 +5233,14 @@ fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at:
 
 /// Stores a ready entry, replacing any ready entry under the key, and keeps
 /// every index in step with it.
-fn insert_ready(state: &mut State, key: Key, entry: Entry) {
+fn insert_ready(state: &mut State, key: Key, mut entry: Entry) {
     remove_ready(state, &key);
     state.bytes = state.bytes.saturating_add(entry.bytes);
     if let Some(address) = parse_address(&entry.value) {
         hold_parse(state, address, entry.bytes);
     }
-    if is_pinned(state, &key) {
+    entry.held = is_pinned(state, &key) && pin_share_has_room(state, key.layer, entry.bytes);
+    if entry.held {
         state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
     } else {
         state.lru.insert(entry.last_used, key.clone());
@@ -5066,7 +5387,7 @@ fn remove_ready(state: &mut State, key: &Key) -> bool {
         return false;
     };
     state.bytes = state.bytes.saturating_sub(entry.bytes);
-    if is_pinned(state, key) {
+    if entry.held {
         state.pinned_bytes = state.pinned_bytes.saturating_sub(entry.bytes);
     } else {
         state.lru.remove(&entry.last_used);
@@ -5093,19 +5414,35 @@ fn remove_ready(state: &mut State, key: &Key) -> bool {
 fn touch(state: &mut State, key: &Key) {
     state.clock += 1;
     let clock = state.clock;
-    let pinned = is_pinned(state, key);
     let Some(Slot::Ready(entry)) = state.slots.get_mut(key) else {
         return;
     };
     let previous = std::mem::replace(&mut entry.last_used, clock);
-    if !pinned {
+    if !entry.held {
         state.lru.remove(&previous);
         state.lru.insert(clock, key.clone());
     }
 }
 
+/// Pins may hold at most this fraction of `maxCacheBytes` (phase-8 ruling
+/// R8-6), interface entries aside: the rest stays for warming, requests and
+/// reservations.
+const PIN_BUDGET_SHARE: usize = 2;
+
+/// Whether the pins' share of the budget has room for `bytes` more of
+/// `layer`. Interface entries are always held: a few KB per unit, they are
+/// what snapshots walk a closure through.
+fn pin_share_has_room(state: &State, layer: Layer, bytes: usize) -> bool {
+    layer == Layer::Interface
+        || state
+            .pinned_bytes
+            .checked_add(bytes)
+            .is_some_and(|total| total <= state.max_bytes / PIN_BUDGET_SHARE)
+}
+
 /// Moves the ready entries of a `(uri, fingerprint)` between the LRU order
 /// and the pinned total when its first owner pins it or its last unpins it.
+/// A pinned entry the pins' share has no room for stays in the LRU order.
 fn set_pinned(state: &mut State, uri: &Url, fingerprint: u64, pinned: bool) {
     for layer in LAYERS {
         let key = Key {
@@ -5116,13 +5453,20 @@ fn set_pinned(state: &mut State, uri: &Url, fingerprint: u64, pinned: bool) {
         let Some(Slot::Ready(entry)) = state.slots.get(&key) else {
             continue;
         };
-        let (bytes, last_used) = (entry.bytes, entry.last_used);
-        if pinned {
+        let (bytes, last_used, held) = (entry.bytes, entry.last_used, entry.held);
+        let hold = pinned && (held || pin_share_has_room(state, layer, bytes));
+        if hold == held {
+            continue;
+        }
+        if hold {
             state.lru.remove(&last_used);
             state.pinned_bytes = state.pinned_bytes.saturating_add(bytes);
         } else {
-            state.lru.insert(last_used, key);
+            state.lru.insert(last_used, key.clone());
             state.pinned_bytes = state.pinned_bytes.saturating_sub(bytes);
+        }
+        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
+            entry.held = hold;
         }
     }
 }
@@ -5255,6 +5599,7 @@ impl ProjectCache {
                 input_hash: claim.input_hash,
                 bytes,
                 last_used: state.clock,
+                held: false,
             };
             insert_ready(&mut state, claim.key.clone(), entry);
             // The entry holds the parse now, so the lease is not outstanding
@@ -5371,13 +5716,19 @@ impl ProjectCache {
         std::mem::take(&mut lock(&self.inner).closure_crawl_requests)
     }
 
+    /// Pins `keys` for `owner`, nearest first: when the pins' share of the
+    /// budget fills, the later keys' entries stay evictable.
     pub(crate) fn pin(&self, owner: &Url, keys: Vec<(Url, u64)>) {
         let mut state = lock(&self.inner);
-        let keys = keys.into_iter().collect::<HashSet<_>>();
+        let mut unique = HashSet::with_capacity(keys.len());
         // Count the new set first so keys in both sets stay pinned throughout.
-        for key in &keys {
-            add_pin(&mut state, key);
+        for key in keys {
+            if !unique.contains(&key) {
+                add_pin(&mut state, &key);
+                unique.insert(key);
+            }
         }
+        let keys = unique;
         if let Some(previous) = state.pins.insert(owner.clone(), keys) {
             for key in &previous {
                 remove_pin(&mut state, key);
@@ -5632,6 +5983,7 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
+            pinned_bytes: state.pinned_bytes,
             outstanding_bytes: state.outstanding_bytes,
             pinned_over_budget: state.pinned_bytes > state.max_bytes,
             reserved_facts_bytes: state.reserved[ReservationKind::Facts.index()],
@@ -5640,6 +5992,7 @@ impl ProjectCache {
             reserved_catalogue_bytes: state.reserved[ReservationKind::Catalogues.index()],
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
+            reserved_crawl_source_bytes: state.reserved[ReservationKind::CrawlSources.index()],
         }
     }
 

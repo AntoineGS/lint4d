@@ -3137,11 +3137,15 @@ pub(crate) struct ExpansionRecord {
     pub(crate) physical_source: String,
     pub(crate) context_key: ContextKey,
     pub(crate) expanded: ExpandedSource,
-    pub(crate) source_texts: HashMap<Url, String>,
+    pub(crate) source_texts: Arc<HashMap<Url, String>>,
     pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
     pub(crate) include_observations: Vec<crate::include_expansion::IncludeObservation>,
     pub(crate) dependencies: HashSet<Url>,
     pub(crate) complete: bool,
+    /// What workspace symbols need to reuse the parse of this expansion of
+    /// an open document (D49), built once on first use.
+    pub(crate) projection:
+        std::sync::OnceLock<Option<Arc<crate::include_expansion::PhysicalProjection>>>,
 }
 
 impl WorkspaceRoot {
@@ -5696,7 +5700,7 @@ impl Workspace {
                 expansion
                     .expanded
                     .visit_recovery_payload(&mut charge_retained_payload)?;
-                for (uri, source) in &expansion.source_texts {
+                for (uri, source) in expansion.source_texts.iter() {
                     charge_retained_payload(uri.as_str().len())?;
                     charge_retained_payload(source.len())?;
                 }
@@ -9256,11 +9260,12 @@ impl Workspace {
                 physical_source,
                 context_key: context_key.clone(),
                 expanded: result.expanded,
-                source_texts,
+                source_texts: Arc::new(source_texts),
                 dependency_entries,
                 include_observations,
                 dependencies,
                 complete: result.complete,
+                projection: std::sync::OnceLock::new(),
             },
         );
         check_workspace_cancel(cancel)?;
@@ -9324,8 +9329,9 @@ impl Workspace {
         let dependency_entries = expansion.dependency_entries.clone();
         let mut dependencies = expansion
             .source_texts
-            .into_iter()
-            .filter(|(uri, _)| uri != root_uri)
+            .iter()
+            .filter(|(uri, _)| *uri != root_uri)
+            .map(|(uri, source)| (uri.clone(), source.clone()))
             .collect::<Vec<_>>();
         dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         for (uri, source) in dependencies {
@@ -18195,11 +18201,12 @@ mod tests {
                     physical_source: String::new(),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
         }
@@ -18363,11 +18370,12 @@ mod tests {
                     physical_source: format!("unit Root{index};"),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
             workspace
@@ -18815,11 +18823,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: key,
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18850,11 +18859,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: budget_test_context_key(0),
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));

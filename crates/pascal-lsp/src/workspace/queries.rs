@@ -3386,8 +3386,9 @@ fn fact_symbols(
 
 /// The readable workspace symbols of `snapshot`. An open document held as
 /// its session's expanded parse reports each declaration in its file
-/// through the source map (D49); if one has no physical position, that
-/// document is answered from a parse of its buffer instead.
+/// through the source map (D49), if that file is readable; if one has no
+/// physical position, that document is answered from a parse of its
+/// buffer instead.
 fn snapshot_workspace_symbols(
     snapshot: &super::rename::RenameSnapshot,
     query: &str,
@@ -3462,6 +3463,10 @@ fn project_symbols(
         let Some((span, text)) = document.projection.locate(start..end, &mut budget)? else {
             return Ok(None);
         };
+        // A declaration in a file the request may not read is not listed.
+        if !snapshot.readable.contains(&span.uri) {
+            continue;
+        }
         if !positions.contains_key(&span.uri) {
             let index =
                 crate::text::PositionIndex::new_with_cancel(text, cancel).map_err(to_cancel)?;
@@ -6414,6 +6419,19 @@ mod tests {
             .expect("the include's declaration is listed");
         assert_eq!(included.location.uri, source_uri(&root.join("Decls.inc")));
         assert_eq!(included.location.range.start, Position::new(1, 2));
+        // The include text the answer used is recorded as read from disk.
+        let computed = workspace_symbols_from_input(input, "Value", &AtomicBool::new(false));
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == source_uri(&root.join("Decls.inc"))
+                    && !record.open
+                    && record.stamp.is_some()
+                    && record.content_hash.is_some()),
+            "{:?}",
+            computed.records
+        );
     }
 
     const OPENED_WITH_INCLUDE: &str =
@@ -6519,6 +6537,120 @@ mod tests {
         let found = symbols(&changed, "Value");
         assert_eq!(at(&found, "BufferValue"), None, "{:?}", found.value);
         assert_eq!(at(&found, "RenamedValue"), Some((uri, Position::new(2, 6))));
+    }
+
+    /// An include edited on disk since the session expanded the document
+    /// no longer proves the reused parse: the buffer is parsed as it is.
+    #[test]
+    fn an_include_changed_on_disk_refuses_the_reused_parse() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        fs::write(root.join("Decls.inc"), "const\n  ChangedValue = 2;\n").expect("include");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "the buffer is parsed"
+        );
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("ClosedValue".to_owned(), "Closed.pas".to_owned()),
+                ("OpenedValue".to_owned(), "Opened.pas".to_owned()),
+            ]
+        );
+    }
+
+    /// A declaration the reused parse maps into a file the request may not
+    /// read is not listed.
+    #[test]
+    fn a_reused_parse_lists_no_declaration_of_an_unreadable_include() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("ws");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(temp.path().join("outside")).expect("outside");
+        fs::write(
+            root.join("Opened.pas"),
+            "unit Opened;\ninterface\n{$I ../outside/Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+        fs::write(
+            temp.path().join("outside/Decls.inc"),
+            "const\n  IncludedValue = 2;\n",
+        )
+        .expect("include");
+        fs::write(
+            root.join("Closed.pas"),
+            unit_text("Closed", "const ClosedValue = 3;\n"),
+        )
+        .expect("source");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let uri = open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        assert!(
+            input
+                .cached_documents
+                .get(&uri)
+                .is_some_and(|cached| cached.projection.is_some()),
+            "the fixture must reuse an expanded parse"
+        );
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("ClosedValue".to_owned(), "Closed.pas".to_owned()),
+                ("OpenedValue".to_owned(), "Opened.pas".to_owned()),
+            ]
+        );
+    }
+
+    /// An open include is proved by its buffer, and the answer records it
+    /// as open.
+    #[test]
+    fn an_open_include_is_proved_by_its_buffer() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        let include = source_uri(&root.join("Decls.inc"));
+        workspace
+            .open_document(
+                include.clone(),
+                "const\n  BufferedValue = 2;\n".to_owned(),
+                1,
+            )
+            .expect("open include");
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let computed = workspace_symbols_from_input(input, "Value", &AtomicBool::new(false));
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        let found = computed.value.expect("workspace symbols");
+        assert!(
+            found
+                .value
+                .iter()
+                .any(|symbol| symbol.name == "BufferedValue"
+                    && symbol.location.uri == include
+                    && symbol.location.range.start == Position::new(1, 2)),
+            "{:?}",
+            found.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == include && record.open),
+            "{:?}",
+            computed.records
+        );
     }
 
     /// A declaration of the reused parse that spans the include has no

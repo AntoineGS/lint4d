@@ -1687,7 +1687,7 @@ impl Workspace {
             .filter_map(|(uri, parsed)| {
                 let context_key = self.document_contexts.get(&uri)?;
                 let context = self.contexts.get(context_key)?.context.clone();
-                let projection = self.open_projection(&uri, context_key, &parsed);
+                let projection = self.open_projection(&uri, context_key);
                 Some((
                     canonical_file_uri(&uri),
                     CachedDocument {
@@ -1701,33 +1701,35 @@ impl Workspace {
         self.input_with(self.document_owners.clone(), cached_documents)
     }
 
-    /// The projection of an open document's parse when that parse is of
-    /// the include expansion of its current buffer under `context_key`.
+    /// The projection of the include expansion of an open document under
+    /// `context_key`, shared with the session's expansion. Whether the
+    /// parse and the buffer are the ones it was made from and of is proved
+    /// by the workspace-symbols snapshot that uses it, so other requests
+    /// pay nothing for it.
     fn open_projection(
         &self,
         uri: &Url,
         context_key: &ContextKey,
-        parsed: &ParsedDocument,
     ) -> Option<Arc<crate::include_expansion::PhysicalProjection>> {
-        let text = self.open_documents.get(uri)?.text.as_ref()?;
+        self.open_documents.get(uri)?.text.as_ref()?;
         let expansion = self.expansions.get(uri)?;
-        if expansion.context_key != *context_key
-            || expansion.physical_source != **text
-            || **parsed.source_text() != *expansion.expanded.text()
-        {
+        if expansion.context_key != *context_key {
             return None;
         }
-        let texts = expansion
-            .source_texts
-            .iter()
-            .filter(|(source, _)| *source != uri)
-            .map(|(source, text)| (source.clone(), text.clone()))
-            .collect();
-        Some(Arc::new(expansion.expanded.projection(
-            uri.clone(),
-            text.clone(),
-            texts,
-        )))
+        expansion
+            .projection
+            .get_or_init(|| {
+                expansion
+                    .expanded
+                    .projection(
+                        uri.clone(),
+                        expansion.source_texts.clone(),
+                        expansion.dependency_entries.clone(),
+                        text_content_hash,
+                    )
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// `analysis_input` without the document owners and reusable parses,
@@ -7075,8 +7077,12 @@ fn build_snapshot_with_policy(
         // buffer answers workspace symbols through its source map.
         let projection = cached_document
             .filter(|_| mode == SnapshotMode::WorkspaceSymbols && record.open)
-            .and_then(|cached| cached.projection.clone())
-            .filter(|projection| projection.physical() == source);
+            .and_then(|cached| {
+                let projection = cached.projection.clone()?;
+                (projection.physical_hash() == text_content_hash(&source)
+                    && projection.expanded_hash() == text_content_hash(cached.parsed.source_text()))
+                .then_some(projection)
+            });
         let hydration_ticket = match hydration.as_mut().map(|admission| {
             admission.admit(
                 indexed_source.len() as u64,
@@ -7129,10 +7135,36 @@ fn build_snapshot_with_policy(
                 }
             })
             .unwrap_or_default();
-        let reused = match (projection, &cached) {
-            (Some(projection), Some(parsed))
+        // Its includes must still read as the expansion read them.
+        let includes = match &projection {
+            Some(projection) => projection_includes(
+                &loader,
+                input,
+                &source_context_key,
+                projection,
+                &records,
+                retained_files,
+                retained_bytes,
+                cancel,
+            )?,
+            None => None,
+        };
+        let reused = match (projection, includes, &cached) {
+            (Some(projection), Some(includes), Some(parsed))
                 if index.insert_parsed(uri.clone(), parsed.clone(), &conditional_context) =>
             {
+                for (path, record, read_policy, path_entry) in includes {
+                    if let Some(content_hash) = record.content_hash {
+                        baseline.set_include_payload_dependency(&path, read_policy, path_entry);
+                        baseline_content_hashes.insert(path_key(&path), content_hash);
+                    }
+                    if is_readable_source_for_context(&loader, &path, Some(&source_context_key)) {
+                        readable.insert(record.uri.clone());
+                    }
+                    retained_files = retained_files.saturating_add(1);
+                    retained_bytes = retained_bytes.saturating_add(record.text.len());
+                    records.insert(record.uri.clone(), record);
+                }
                 projected.insert(
                     uri.clone(),
                     ProjectedDocument {
@@ -7691,18 +7723,6 @@ fn build_snapshot_with_policy(
             )
         })
         .collect::<Vec<_>>();
-    // A projected document's answer reads its include files.
-    let mut included = projected
-        .values()
-        .flat_map(|document: &ProjectedDocument| document.projection.included())
-        .filter_map(|uri| uri.to_file_path().ok())
-        .collect::<Vec<_>>();
-    included.sort();
-    included.dedup();
-    baseline_records.extend(included.into_iter().filter_map(|path| {
-        let stamp = path_stamp(&path);
-        path_record_at(path, stamp, None, None, None, None, None, false)
-    }));
     for record in &mut baseline_records {
         record.auto_import_provider_observation = record
             .path
@@ -7787,39 +7807,18 @@ fn retain_expansion_dependencies(
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("include source is not a file URI: {uri}"))?;
-        let (read_policy, path_entry) = if let Some(path_entry) = dependency_entries.get(&uri) {
-            let Some(context) = loader.contexts.get(context_key).map(|state| &state.context) else {
+        let (read_policy, path_entry) = match include_read_policy(
+            loader,
+            context_key,
+            &uri,
+            &path,
+            dependency_entries.get(&uri),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
                 *complete = false;
-                incomplete_reason.get_or_insert_with(|| {
-                    format!("include source {uri} has no retained project context")
-                });
+                incomplete_reason.get_or_insert(reason);
                 continue;
-            };
-            (context.read_policy().clone(), path_entry.clone())
-        } else {
-            match snapshot_payload_dependency(loader, context_key, &path) {
-                Ok(value) => value,
-                Err(error) if loader.accepts_path(&path) => {
-                    let Some(context) =
-                        loader.contexts.get(context_key).map(|state| &state.context)
-                    else {
-                        *complete = false;
-                        incomplete_reason.get_or_insert(error);
-                        continue;
-                    };
-                    (
-                        context.read_policy().clone(),
-                        ProjectPathEntry {
-                            path: path.clone(),
-                            provenance: ProjectPathProvenance::LegacyNative,
-                        },
-                    )
-                }
-                Err(error) => {
-                    *complete = false;
-                    incomplete_reason.get_or_insert(error);
-                    continue;
-                }
             }
         };
         contexts.insert(uri.clone(), context_key.clone());
@@ -7827,100 +7826,26 @@ fn retain_expansion_dependencies(
             .document_contexts
             .insert(uri.clone(), context_key.clone());
 
-        let record = if let Some(document) = loader.open_documents.get(&uri) {
-            let Some(open_source) = document.text.as_ref() else {
+        let record = match include_record(
+            loader,
+            input,
+            &uri,
+            &path,
+            &source,
+            &read_policy,
+            &path_entry,
+        ) {
+            Ok(record) => record,
+            Err(reason) => {
                 *complete = false;
-                incomplete_reason.get_or_insert_with(|| {
-                    format!("include source {uri} was rejected and cannot be retained")
-                });
+                incomplete_reason.get_or_insert(reason);
                 continue;
-            };
-            if **open_source != *source {
-                *complete = false;
-                incomplete_reason.get_or_insert_with(|| {
-                    format!("include source {uri} changed during expansion")
-                });
-                continue;
-            }
-            SourceRecord {
-                uri: uri.clone(),
-                text: source.clone(),
-                version: Some(document.version),
-                stamp: None,
-                open: true,
-                path: None,
-                path_stamp: None,
-                content_hash: None,
-                parsed_text_hash: Some(text_content_hash(&source)),
-                content_bytes: None,
-                candidate_membership: None,
-                candidate_observations: Vec::new(),
-                read_policy: Some(read_policy.clone()),
-                path_entry: Some(path_entry.clone()),
-                include_payload: false,
-                missing_provider_candidate: false,
-                document_link_missing_candidate: false,
-                document_link_case_variant: None,
-                directory_observation: false,
-                document_link_ancestor: false,
-                missing_provider_scope: None,
-                auto_import_provider_observation: false,
-                auto_import_scopes: Vec::new(),
-            }
-        } else {
-            let allow_legacy_payload =
-                matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
-            let disk = match read_disk_source(
-                &path,
-                input.options.limits.max_file_bytes,
-                &read_policy,
-                &path_entry,
-                allow_legacy_payload,
-            ) {
-                Ok(disk) => disk,
-                Err(error) => {
-                    *complete = false;
-                    incomplete_reason.get_or_insert_with(|| {
-                        format!("could not re-read include source {uri}: {error}")
-                    });
-                    continue;
-                }
-            };
-            if disk.text != source {
-                *complete = false;
-                incomplete_reason.get_or_insert_with(|| {
-                    format!("include source {uri} changed during expansion")
-                });
-                continue;
-            }
-            baseline.set_include_payload_dependency(&path, read_policy.clone(), path_entry.clone());
-            baseline_content_hashes.insert(path_key(&path), disk.content_hash);
-            SourceRecord {
-                uri: uri.clone(),
-                text: source.clone(),
-                version: None,
-                stamp: Some(disk.stamp),
-                open: false,
-                path: None,
-                path_stamp: None,
-                content_hash: Some(disk.content_hash),
-                parsed_text_hash: Some(text_content_hash(&source)),
-                content_bytes: None,
-                candidate_membership: None,
-                candidate_observations: Vec::new(),
-                read_policy: Some(read_policy.clone()),
-                path_entry: Some(path_entry.clone()),
-                include_payload: true,
-                missing_provider_candidate: false,
-                document_link_missing_candidate: false,
-                document_link_case_variant: None,
-                directory_observation: false,
-                document_link_ancestor: false,
-                missing_provider_scope: None,
-                auto_import_provider_observation: false,
-                auto_import_scopes: Vec::new(),
             }
         };
+        if let Some(content_hash) = record.content_hash {
+            baseline.set_include_payload_dependency(&path, read_policy.clone(), path_entry.clone());
+            baseline_content_hashes.insert(path_key(&path), content_hash);
+        }
 
         if *retained_files >= input.options.limits.max_files
             || retained_bytes.saturating_add(source.len()) > input.options.limits.max_total_bytes
@@ -7944,6 +7869,164 @@ fn retain_expansion_dependencies(
         records.insert(uri, record);
     }
     Ok(())
+}
+
+/// One include a reused parse read: its path, the record proving its
+/// text, and how it was read.
+type ProvedInclude = (PathBuf, SourceRecord, ReadPolicy, ProjectPathEntry);
+
+/// The records proving every include of `projection` still reads as the
+/// expansion read it, within the retained-source limits; `None` when one
+/// does not (the document is then parsed from its buffer).
+#[allow(clippy::too_many_arguments)]
+fn projection_includes(
+    loader: &Workspace,
+    input: &WorkspaceInput,
+    context_key: &ContextKey,
+    projection: &crate::include_expansion::PhysicalProjection,
+    records: &HashMap<Url, SourceRecord>,
+    retained_files: usize,
+    retained_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<ProvedInclude>>, String> {
+    let mut includes = Vec::new();
+    let (mut files, mut bytes) = (retained_files, retained_bytes);
+    for (uri, text, entry) in projection.included() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if records.contains_key(uri) {
+            // Another source already holds this file: only the same text.
+            if records[uri].text != text {
+                return Ok(None);
+            }
+            continue;
+        }
+        let Ok(path) = uri.to_file_path().map(absolute_path) else {
+            return Ok(None);
+        };
+        let Ok((read_policy, path_entry)) =
+            include_read_policy(loader, context_key, uri, &path, entry)
+        else {
+            return Ok(None);
+        };
+        let Ok(record) = include_record(loader, input, uri, &path, text, &read_policy, &path_entry)
+        else {
+            return Ok(None);
+        };
+        files = files.saturating_add(1);
+        bytes = bytes.saturating_add(text.len());
+        if files > input.options.limits.max_files || bytes > input.options.limits.max_total_bytes {
+            return Ok(None);
+        }
+        includes.push((path, record, read_policy, path_entry));
+    }
+    Ok(Some(includes))
+}
+
+/// The read policy and search-path entry of include `path` of an
+/// expansion under `context_key`, or why there is none.
+fn include_read_policy(
+    loader: &Workspace,
+    context_key: &ContextKey,
+    uri: &Url,
+    path: &Path,
+    entry: Option<&ProjectPathEntry>,
+) -> Result<(ReadPolicy, ProjectPathEntry), String> {
+    let context = || loader.contexts.get(context_key).map(|state| &state.context);
+    if let Some(path_entry) = entry {
+        let Some(context) = context() else {
+            return Err(format!(
+                "include source {uri} has no retained project context"
+            ));
+        };
+        return Ok((context.read_policy().clone(), path_entry.clone()));
+    }
+    match snapshot_payload_dependency(loader, context_key, path) {
+        Ok(value) => Ok(value),
+        Err(error) if loader.accepts_path(path) => {
+            let Some(context) = context() else {
+                return Err(error);
+            };
+            Ok((
+                context.read_policy().clone(),
+                ProjectPathEntry {
+                    path: path.to_path_buf(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                },
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The record proving `source`, the text an expansion read of include
+/// `uri`, is its current text: the open buffer's, or the disk's read now
+/// with its stamp and content hash. Otherwise why it is not.
+fn include_record(
+    loader: &Workspace,
+    input: &WorkspaceInput,
+    uri: &Url,
+    path: &Path,
+    source: &str,
+    read_policy: &ReadPolicy,
+    path_entry: &ProjectPathEntry,
+) -> Result<SourceRecord, String> {
+    let record = |version, stamp, open, content_hash, include_payload| SourceRecord {
+        uri: uri.clone(),
+        text: source.to_owned(),
+        version,
+        stamp,
+        open,
+        path: None,
+        path_stamp: None,
+        content_hash,
+        parsed_text_hash: Some(text_content_hash(source)),
+        content_bytes: None,
+        candidate_membership: None,
+        candidate_observations: Vec::new(),
+        read_policy: Some(read_policy.clone()),
+        path_entry: Some(path_entry.clone()),
+        include_payload,
+        missing_provider_candidate: false,
+        document_link_missing_candidate: false,
+        document_link_case_variant: None,
+        directory_observation: false,
+        document_link_ancestor: false,
+        missing_provider_scope: None,
+        auto_import_provider_observation: false,
+        auto_import_scopes: Vec::new(),
+    };
+    if let Some(document) = loader.open_documents.get(uri) {
+        let Some(open_source) = document.text.as_ref() else {
+            return Err(format!(
+                "include source {uri} was rejected and cannot be retained"
+            ));
+        };
+        if **open_source != *source {
+            return Err(format!("include source {uri} changed during expansion"));
+        }
+        return Ok(record(Some(document.version), None, true, None, false));
+    }
+    let allow_legacy_payload = matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+    let disk = read_disk_source(
+        path,
+        input.options.limits.max_file_bytes,
+        read_policy,
+        path_entry,
+        allow_legacy_payload,
+    )
+    .map_err(|error| format!("could not re-read include source {uri}: {error}"))?;
+    if disk.text != source {
+        return Err(format!("include source {uri} changed during expansion"));
+    }
+    Ok(record(
+        None,
+        Some(disk.stamp),
+        false,
+        Some(disk.content_hash),
+        true,
+    ))
 }
 
 pub(crate) fn ensure_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {

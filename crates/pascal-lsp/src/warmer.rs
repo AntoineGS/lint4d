@@ -3250,7 +3250,9 @@ mod tests {
         warmer.request_index(IndexAnchor::Document(main.clone()));
         warmer.poll(&workspace);
         assert!(warmer.busy, "the index job was dispatched");
+        let deadline = Instant::now() + Duration::from_secs(60);
         while gate.index_turn_waiters() == 0 {
+            assert!(Instant::now() < deadline, "the batch never waited");
             std::thread::yield_now();
         }
 
@@ -3333,7 +3335,9 @@ mod tests {
         };
         // Wait until the waiter is parked on the condvar, then check it has
         // not returned (a returned turn would be in the channel already).
+        let deadline = Instant::now() + Duration::from_secs(60);
         while gate.index_turn_waiters() == 0 {
+            assert!(Instant::now() < deadline, "the turn never waited");
             std::thread::yield_now();
         }
         assert!(done_rx.try_recv().is_err(), "the turn waits for bulk work");

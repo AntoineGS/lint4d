@@ -10159,6 +10159,7 @@ pub(in crate::workspace) mod tests {
                 let (mut view, cache) = restarted_view(temp.path(), store.path());
                 let batch = std::thread::current().id();
                 let closed = AtomicBool::new(false);
+                let deadline = Instant::now() + Duration::from_secs(60);
                 // The batch's first check (waiting for member 0) finds the
                 // gate closed; workers wait for it before their first member,
                 // so the batch does wait.
@@ -10168,6 +10169,10 @@ pub(in crate::workspace) mod tests {
                         closed.swap(true, Ordering::SeqCst)
                     } else {
                         while !closed.load(Ordering::SeqCst) {
+                            assert!(
+                                Instant::now() < deadline,
+                                "the batch never checked the gate"
+                            );
                             std::thread::yield_now();
                         }
                         true

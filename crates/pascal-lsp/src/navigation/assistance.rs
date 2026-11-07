@@ -585,8 +585,10 @@ impl NavigationIndex {
                     cancel,
                 )?;
                 let auto_import = completion_candidate.auto_import.clone();
-                let detail =
-                    completion_detail(display.map(|display| display.excerpt), auto_import.as_ref());
+                let detail = completion_detail(
+                    display.map(|display| self.completion_excerpt(candidate, display.excerpt)),
+                    auto_import.as_ref(),
+                );
                 budget.require_bytes(detail.as_ref().map_or(0, String::len), cancel)?;
                 let snippet = if matches!(call_context, CompletionCallContext::Callable)
                     && symbol.kind == SymbolKind::Routine
@@ -1032,7 +1034,7 @@ impl NavigationIndex {
                     cancel,
                     &mut budget,
                 )?
-                .map(|display| display.excerpt);
+                .map(|display| self.completion_excerpt(&seed.candidate, display.excerpt));
             completion_detail(declaration, seed.auto_import.as_ref())
         } else {
             None
@@ -1609,7 +1611,7 @@ impl NavigationIndex {
                         continue;
                     };
                     if symbol.scope != super::ROOT_SCOPE
-                        || symbol.owner_type.is_some()
+                        || !current_document.has_unqualified_owner(*index, symbol)
                         || symbol.local_only
                         || !symbol_visible_in_region(symbol, region)
                     {
@@ -1963,7 +1965,7 @@ impl NavigationIndex {
                 continue;
             };
             if symbol.scope != scope
-                || symbol.owner_type.is_some()
+                || !document.has_unqualified_owner(*index, symbol)
                 || symbol.local_only
                 || symbol.kind == SymbolKind::Unit
             {
@@ -2009,7 +2011,7 @@ impl NavigationIndex {
             let Some(symbol) = document.symbols.get(*index) else {
                 continue;
             };
-            if symbol.owner_type.is_some()
+            if !document.has_unqualified_owner(*index, symbol)
                 || symbol.kind == SymbolKind::Unit
                 || symbol.local_only
                 || !(symbol.region == Region::Interface
@@ -2133,7 +2135,7 @@ impl NavigationIndex {
                 let Some(symbol) = document.symbols.get(*index) else {
                     continue;
                 };
-                if symbol.owner_type.is_some()
+                if !document.has_unqualified_owner(*index, symbol)
                     || symbol.kind == SymbolKind::Unit
                     || symbol.local_only
                     || symbol.region != Region::Interface
@@ -3385,6 +3387,38 @@ impl NavigationIndex {
             .into_values()
             .chain(other_candidates.into_values())
             .collect()
+    }
+
+    /// The completion detail for a declaration excerpt: an enum value's
+    /// excerpt is only the value, so its enumerated type qualifies it
+    /// (l4d-qssj).
+    fn completion_excerpt(&self, candidate: &Candidate, excerpt: String) -> String {
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return excerpt;
+        };
+        let Some(symbol) = document.symbols.get(candidate.index) else {
+            return excerpt;
+        };
+        if symbol.kind != SymbolKind::EnumValue {
+            return excerpt;
+        }
+        let enumerated = symbol.owner_type.as_ref().is_some_and(|owner| {
+            document
+                .type_symbol_indices
+                .get(owner)
+                .into_iter()
+                .flatten()
+                .any(|index| {
+                    document
+                        .symbols
+                        .get(*index)
+                        .is_some_and(|owner| owner.type_kind == super::TypeKind::Enum)
+                })
+        });
+        match symbol.owner_type_name.as_deref() {
+            Some(type_name) if enumerated => format!("{type_name}.{excerpt}"),
+            _ => excerpt,
+        }
     }
 
     fn declaration_display(

@@ -10591,6 +10591,70 @@ fn completion_auto_imports_an_implementation_symbol_after_existing_interface_use
     server.shutdown();
 }
 
+/// l4d-qssj: through the workspace, an imported unit's unscoped enum value
+/// is offered unqualified, and an unimported one is auto-imported; scoped
+/// values are neither.
+#[test]
+fn completion_offers_imported_and_auto_imported_unscoped_enum_values() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let imported_path = temp.path().join("EnumImported.pas");
+    let provider_path = temp.path().join("EnumProvider.pas");
+    let main_path = temp.path().join("EnumMain.pas");
+    let imported_source = "unit EnumImported;\ninterface\ntype\n  TPhase = (phStart, phStop);\n{$SCOPEDENUMS ON}\n  TPart = (phScoped);\nimplementation\nend.\n";
+    let provider_source = "unit EnumProvider;\ninterface\ntype\n  TLevel = (lvLow, lvHigh);\n{$SCOPEDENUMS ON}\n  TTier = (lvScoped);\nimplementation\nend.\n";
+    let main_source = "unit EnumMain;\ninterface\nuses EnumImported;\nimplementation\nprocedure Run;\nbegin\n  Log(ph);\n  Log(lv);\nend;\nend.\n";
+    write_file(&imported_path, imported_source);
+    write_file(&provider_path, provider_source);
+    write_file(&main_path, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let labels = |server: &mut TestServer, id: &str, needle: &str| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": uri(&main_path)},
+                "position": position_after(main_source, needle, 0),
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "completion failed: {response:?}");
+        let result = response.result.expect("completion result");
+        let mut items = result["items"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .map(|item| {
+                (
+                    item["label"].as_str().unwrap_or_default().to_owned(),
+                    item["additionalTextEdits"]
+                        .as_array()
+                        .and_then(|edits| edits.first())
+                        .and_then(|edit| edit["newText"].as_str())
+                        .map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>();
+        items.sort();
+        items
+    };
+    assert_eq!(
+        labels(&mut server, "enum-imported", "Log(ph"),
+        [("phStart".to_owned(), None), ("phStop".to_owned(), None)]
+    );
+    let import = Some("uses EnumProvider;\n".to_owned());
+    assert_eq!(
+        labels(&mut server, "enum-auto-import", "Log(lv"),
+        [
+            ("lvHigh".to_owned(), import.clone()),
+            ("lvLow".to_owned(), import)
+        ]
+    );
+    server.shutdown();
+}
+
 #[test]
 fn completion_auto_import_appends_to_an_existing_implementation_uses_clause() {
     let temp = tempfile::tempdir().expect("temporary workspace");

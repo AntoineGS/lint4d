@@ -17869,3 +17869,180 @@ fn unqualified_enum_values_shadow_and_hover() {
         .expect("hover on an unqualified enum value");
     assert!(format!("{:?}", hover.contents).contains("Red"), "{hover:?}");
 }
+
+fn completion_after(
+    index: &NavigationIndex,
+    source_uri: &Url,
+    source: &str,
+    needle: &str,
+    occurrence: usize,
+) -> lsp_types::CompletionList {
+    index
+        .completion(source_uri, position_after(source, needle, occurrence))
+        .expect("completion")
+}
+
+fn completion_item<'a>(
+    list: &'a lsp_types::CompletionList,
+    label: &str,
+) -> Option<&'a lsp_types::CompletionItem> {
+    list.items.iter().find(|item| item.label == label)
+}
+
+/// l4d-qssj: completion offers an unscoped enum value unqualified, as an
+/// enum member whose detail names its type, consistent with the binder
+/// (l4d-1qta).
+#[test]
+fn completion_offers_unscoped_enum_values_unqualified() {
+    let source = "unit CE;\ninterface\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Gr;\nend;\nend.\n";
+    let source_uri = uri("CE");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let list = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    let item = completion_item(&list, "Green")
+        .unwrap_or_else(|| panic!("Green is offered: {:?}", list.items));
+    assert_eq!(item.kind, Some(CompletionItemKind::ENUM_MEMBER));
+    assert_eq!(item.detail.as_deref(), Some("TColor.Green"), "{item:?}");
+}
+
+/// l4d-qssj: a value of an enum declared under `{$SCOPEDENUMS ON}` is not an
+/// unqualified name, so only `TEnum.` completion offers it; `TEnum.` offers
+/// an unscoped type's values too.
+#[test]
+fn completion_offers_scoped_enum_values_only_qualified() {
+    let source = "unit CS;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TColor = (Red, Green);\n{$SCOPEDENUMS OFF}\n  TShade = (Light, Dark);\nimplementation\nprocedure Run;\nvar C: TColor; S: TShade;\nbegin\n  C := Gr;\n  C := TColor.Gr;\n  S := TShade.Da;\nend;\nend.\n";
+    let source_uri = uri("CS");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let unqualified = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    assert!(
+        completion_item(&unqualified, "Green").is_none(),
+        "{:?}",
+        unqualified.items
+    );
+    let qualified = completion_after(&index, &source_uri, source, "TColor.Gr", 0);
+    assert!(
+        completion_item(&qualified, "Green").is_some(),
+        "{:?}",
+        qualified.items
+    );
+    let unscoped = completion_after(&index, &source_uri, source, "TShade.Da", 0);
+    assert!(
+        completion_item(&unscoped, "Dark").is_some(),
+        "{:?}",
+        unscoped.items
+    );
+}
+
+/// l4d-qssj: an imported unit's unscoped values are offered unqualified and
+/// after `Unit.`; its scoped values are not.
+#[test]
+fn completion_offers_imported_unscoped_enum_values() {
+    let provider = "unit CProv;\ninterface\ntype\n  TState = (stMaybe, stYes);\n{$SCOPEDENUMS ON}\n  TMode = (moFast, moSlow);\nimplementation\nend.\n";
+    let consumer = "unit CCons;\ninterface\nuses CProv;\nimplementation\nprocedure Run;\nbegin\n  Log(st);\n  Log(mo);\n  Log(CProv.st);\n  Log(CProv.mo);\nend;\nend.\n";
+    let provider_uri = uri("CProv");
+    let consumer_uri = uri("CCons");
+    let index = indexed(
+        &[(&provider_uri, provider), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("CProv", &provider_uri)])],
+    );
+    let labels = |needle: &str| {
+        let list = completion_after(&index, &consumer_uri, consumer, needle, 0);
+        let mut labels = list
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    };
+    assert_eq!(labels("Log(st"), ["stMaybe", "stYes"]);
+    assert!(
+        labels("Log(mo")
+            .iter()
+            .all(|label| !label.starts_with("mo"))
+    );
+    assert_eq!(labels("CProv.st"), ["stMaybe", "stYes"]);
+    assert!(labels("CProv.mo").is_empty());
+}
+
+/// l4d-qssj: the values of an enum nested in a class are unit-scope names
+/// of the declaring unit (dcc 37.0, l4d-1qta): offered at unit level, in the
+/// class's methods, and after `Unit.` in an importer.
+#[test]
+fn completion_offers_nested_enum_values_as_unit_scope_names() {
+    let source = "unit CN;\ninterface\ntype\n  TC = class\n  public type\n    TKind = (kLeaf, kBranch);\n    procedure M;\n  end;\nimplementation\nprocedure TC.M;\nvar K: TKind;\nbegin\n  K := kL;\nend;\nprocedure Run;\nvar N: Integer;\nbegin\n  N := Ord(kB);\nend;\nend.\n";
+    let consumer = "unit CNUse;\ninterface\nuses CN;\nimplementation\nprocedure Run;\nbegin\n  Log(kL);\n  Log(CN.kB);\nend;\nend.\n";
+    let source_uri = uri("CN");
+    let consumer_uri = uri("CNUse");
+    let index = indexed(
+        &[(&source_uri, source), (&consumer_uri, consumer)],
+        &[(&consumer_uri, &[("CN", &source_uri)])],
+    );
+    for (uri, text, needle, label) in [
+        (&source_uri, source, "K := kL", "kLeaf"),
+        (&source_uri, source, "Ord(kB", "kBranch"),
+        (&consumer_uri, consumer, "Log(kL", "kLeaf"),
+        (&consumer_uri, consumer, "CN.kB", "kBranch"),
+    ] {
+        let list = completion_after(&index, uri, text, needle, 0);
+        assert!(
+            completion_item(&list, label).is_some(),
+            "{needle}: {:?}",
+            list.items
+        );
+    }
+}
+
+/// l4d-qssj: a routine-local enum value is declared in order, so completion
+/// before its type declaration does not offer it (dcc 37.0 `O1.dpr`).
+#[test]
+fn completion_omits_routine_local_enum_values_before_their_declaration() {
+    let source = "unit CL;\ninterface\nimplementation\nprocedure Outer;\n  procedure Inner; var N: Integer; begin N := lA; end;\ntype TL = (lAlpha, lBeta);\nvar L: TL;\nbegin\n  L := lA;\nend;\nend.\n";
+    let source_uri = uri("CL");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let before = completion_after(&index, &source_uri, source, "N := lA", 0);
+    assert!(
+        completion_item(&before, "lAlpha").is_none(),
+        "{:?}",
+        before.items
+    );
+    let after = completion_after(&index, &source_uri, source, "L := lA", 0);
+    assert!(
+        completion_item(&after, "lAlpha").is_some(),
+        "{:?}",
+        after.items
+    );
+}
+
+/// l4d-qssj: anonymous enum values stay unqualified under SCOPEDENUMS ON
+/// (dcc 37.0 `T3.dpr`, `T6.dpr`).
+#[test]
+fn completion_offers_anonymous_enum_values_under_scopedenums() {
+    let source = "unit CA;\ninterface\n{$SCOPEDENUMS ON}\ntype\n  TS = set of (sAlpha, sBeta);\nvar\n  X: (aAlpha, aBeta);\n  S: TS;\nimplementation\nprocedure Run;\nbegin\n  X := aA;\n  S := [sA];\nend;\nend.\n";
+    let source_uri = uri("CA");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    for (needle, label) in [("X := aA", "aAlpha"), ("S := [sA", "sAlpha")] {
+        let list = completion_after(&index, &source_uri, source, needle, 0);
+        assert!(
+            completion_item(&list, label).is_some(),
+            "{needle}: {:?}",
+            list.items
+        );
+    }
+}
+
+/// l4d-qssj: with the `{$SCOPEDENUMS}` state unknown, an enum value's
+/// binding is unknown; completion treats it like other conditionally
+/// unknown declarations: it is withheld and the list is incomplete.
+#[test]
+fn completion_marks_unknown_scoping_enum_values_uncertain() {
+    let source = "unit CU;\ninterface\n{$IFDEF MAYBE}{$SCOPEDENUMS ON}{$ENDIF}\ntype\n  TColor = (Red, Green);\nimplementation\nprocedure Run;\nvar C: TColor;\nbegin\n  C := Gr;\nend;\nend.\n";
+    let source_uri = uri("CU");
+    let index = indexed(&[(&source_uri, source)], &[]);
+    let list = completion_after(&index, &source_uri, source, "C := Gr", 0);
+    assert!(
+        completion_item(&list, "Green").is_none(),
+        "{:?}",
+        list.items
+    );
+    assert!(list.is_incomplete);
+}

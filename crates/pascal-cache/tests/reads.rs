@@ -4,8 +4,8 @@ mod common;
 use common::private_tempdir;
 
 use pascal_cache::{
-    ArtifactHeader, ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, IndexHit,
-    LocalArtifactKey, Lookup, Malformed, Miss, Namespace, RowBatch, SourceContent, Store,
+    ArtifactHeader, ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest,
+    IndexHit, LocalArtifactKey, Lookup, Malformed, Miss, Namespace, RowBatch, SourceContent, Store,
     StoreLimits,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
@@ -31,7 +31,7 @@ fn key(text: &str) -> LocalArtifactKey {
 }
 
 fn raw(directory: &Path) -> Connection {
-    let connection = Connection::open(directory.join("analysis.sqlite3")).unwrap();
+    let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }
@@ -189,7 +189,8 @@ fn oversized_rows_are_misses_before_they_are_copied() {
             .unwrap();
         connection
             .execute(
-                "UPDATE artifact_rows SET payload = zeroblob(?1) WHERE artifact_id = ?2 AND ordinal = 1",
+                "UPDATE artifact_rows SET payload = zeroblob(?1) WHERE artifact_ref = \
+                 (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2) AND ordinal = 1",
                 params![bytes, header.artifact_id().as_bytes().as_slice()],
             )
             .unwrap();
@@ -298,9 +299,8 @@ fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
     let header = publish(&store, &key("unit A;"), &small(256));
     raw(root.path())
         .execute(
-            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, row_kind, \
-             index_key, payload, row_checksum) \
-             SELECT namespace_id, reset_epoch, artifact_id, 256, 1, NULL, x'00', zeroblob(32) \
+            "INSERT INTO artifact_rows (artifact_ref, ordinal, row_kind, index_key, payload, \
+             row_checksum) SELECT artifact_ref, 256, 1, NULL, x'00', zeroblob(32) \
              FROM artifact_rows WHERE ordinal = 0",
             [],
         )
@@ -343,7 +343,7 @@ fn index_pages_are_stable_and_complete() {
             ordinal,
         }));
     }
-    expected.sort();
+    // Hits come in the store's publication order of their artifacts.
     let mut seen: Vec<IndexHit> = Vec::new();
     let mut after = None;
     let mut pages = 0;
@@ -357,8 +357,8 @@ fn index_pages_are_stable_and_complete() {
         }
         after = page.next;
         if pages == 1 {
-            // A new artifact published mid-scan appears once if its key sorts
-            // after the cursor and never duplicates earlier hits.
+            // A new artifact published mid-scan sorts after the cursor, so
+            // it appears once and never duplicates earlier hits.
             publish_named(&store, "unit Late;", &[b"tfoo"]);
         }
     }
@@ -369,6 +369,7 @@ fn index_pages_are_stable_and_complete() {
         .filter(|hit| hit.artifact_id != late)
         .collect();
     assert_eq!(seen_without_late, expected);
+    assert_eq!(seen.last().map(|hit| hit.artifact_id), Some(late));
     let mut sorted = seen.clone();
     sorted.sort();
     sorted.dedup();
@@ -423,7 +424,7 @@ fn index_lookup_uses_the_index_without_sorting() {
                 0i64,
                 1i64,
                 b"tfoo".as_slice(),
-                Vec::<u8>::new(),
+                0i64,
                 -1i64,
                 257i64,
                 1i64
@@ -583,8 +584,10 @@ fn a_row_copied_from_another_artifact_is_a_checksum_miss() {
         .execute(
             "UPDATE artifact_rows SET (row_kind, index_key, payload, row_checksum) = \
              (SELECT row_kind, index_key, payload, row_checksum FROM artifact_rows \
-              WHERE artifact_id = ?2 AND ordinal = 1) \
-             WHERE artifact_id = ?1 AND ordinal = 1",
+              WHERE artifact_ref = (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2) \
+              AND ordinal = 1) \
+             WHERE artifact_ref = (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?1) \
+             AND ordinal = 1",
             params![
                 a.artifact_id().as_bytes().as_slice(),
                 b.artifact_id().as_bytes().as_slice()

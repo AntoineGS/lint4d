@@ -115,9 +115,17 @@ impl Store {
     /// each, sorted. Publication order (`publication_seq`) is left out, so
     /// two stores given the same publications compare equal.
     pub fn content_for_test(&self) -> Result<Vec<String>, Bypass> {
-        const TABLES: [(&str, &[&str]); 7] = [
-            ("key_manifests", &["kind", "digest", "manifest"]),
+        // `(label, rows, columns)`: rows keyed by a surrogate show the
+        // identity it stands for, and the surrogates themselves, which
+        // depend on publication order, are left out.
+        const TABLES: [(&str, &str, &[&str]); 7] = [
             (
+                "key_manifests",
+                "key_manifests",
+                &["kind", "digest", "manifest"],
+            ),
+            (
+                "artifacts",
                 "artifacts",
                 &[
                     "artifact_id",
@@ -132,9 +140,17 @@ impl Store {
             ),
             (
                 "artifact_rows",
-                &["artifact_id", "ordinal", "row_kind", "index_key", "payload"],
+                "artifact_rows r JOIN artifacts a ON a.artifact_ref = r.artifact_ref",
+                &[
+                    "a.artifact_id",
+                    "r.ordinal",
+                    "r.row_kind",
+                    "r.index_key",
+                    "r.payload",
+                ],
             ),
             (
+                "evidence_sets",
                 "evidence_sets",
                 &[
                     "evidence_id",
@@ -149,9 +165,18 @@ impl Store {
             ),
             (
                 "observations",
-                &["evidence_id", "ordinal", "kind", "path_key", "payload"],
+                "evidence_observations o JOIN evidence_sets e ON e.evidence_ref = o.evidence_ref \
+                 JOIN observation_content c ON c.observation = o.observation",
+                &[
+                    "e.evidence_id",
+                    "o.ordinal",
+                    "c.kind",
+                    "c.path_key",
+                    "c.payload",
+                ],
             ),
             (
+                "member_records",
                 "member_records",
                 &[
                     "record_id",
@@ -166,6 +191,7 @@ impl Store {
             ),
             (
                 "member_bindings",
+                "member_bindings",
                 &[
                     "record_id",
                     "ordinal",
@@ -179,14 +205,14 @@ impl Store {
         ];
         let reader = self.reader()?;
         let mut lines = Vec::new();
-        for (table, columns) in TABLES {
+        for (table, rows, columns) in TABLES {
             let row = columns
                 .iter()
                 .map(|column| format!("quote({column})"))
                 .collect::<Vec<_>>()
                 .join(" || ' ' || ");
             let mut statement = reader
-                .prepare(&format!("SELECT '{table} ' || {row} FROM {table}"))
+                .prepare(&format!("SELECT '{table} ' || {row} FROM {rows}"))
                 .map_err(|error| classify(&error))?;
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))

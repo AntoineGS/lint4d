@@ -263,7 +263,7 @@ fn a_process_aborted_before_commit_leaves_no_partial_artifact() {
             .unwrap(),
         Lookup::Miss(Miss::Absent)
     );
-    let rows: i64 = Connection::open(directory.join("analysis.sqlite3"))
+    let rows: i64 = Connection::open(directory.join(DATABASE_FILE))
         .unwrap()
         .query_row("SELECT count(*) FROM artifact_rows", [], |row| row.get(0))
         .unwrap();

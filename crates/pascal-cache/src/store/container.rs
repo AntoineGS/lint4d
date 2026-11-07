@@ -5,18 +5,22 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// The physical container format. Phases that add tables increment it; a
 /// store of another version is bypassed, never migrated (spec §6).
-pub const CONTAINER_VERSION: i64 = 4;
+pub const CONTAINER_VERSION: i64 = 5;
 /// `L4DC` in the SQLite header's `application_id`.
 pub const APPLICATION_ID: i64 = 0x4C34_4443;
 const DEFAULT_MAX_DISK_BYTES: i64 = 8 << 30;
 const DEFAULT_WAL_THRESHOLD_BYTES: i64 = 256 << 20;
 
-/// Container version 4. The numeric bounds repeat `limits.rs`: rows,
+/// Container version 5. The numeric bounds repeat `limits.rs`: rows,
 /// 1 MiB manifests/payloads/supplemental data, 16 MiB content and 4 KiB
 /// index keys. Spec §6.1 (amended 2026-10-16) describes every table.
 /// Spec §6.1 (amended 2026-10-27) adds evidence purposes and the publication sequence.
 /// Spec §6.1 (amended 2026-11-03) adds sequences on artifacts and records, leases and
 /// reference indexes.
+/// Container 5 (l4d-zf1b.8, 13c-4) keys artifact rows by an INTEGER
+/// surrogate of their artifact and stores each distinct observation once
+/// per scope, listed by the evidence sets through `evidence_observations`.
+/// The surrogates are internal: no identity, record or snapshot holds one.
 const SCHEMA: &str = "
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -53,6 +57,7 @@ CREATE TABLE key_manifests (
 ) STRICT;
 
 CREATE TABLE artifacts (
+    artifact_ref INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace_id BLOB NOT NULL,
     reset_epoch INTEGER NOT NULL,
     artifact_id BLOB NOT NULL,
@@ -64,7 +69,7 @@ CREATE TABLE artifacts (
     fact_checksum BLOB NOT NULL CHECK (length(fact_checksum) = 32),
     supplemental BLOB NOT NULL CHECK (length(supplemental) <= 1048576),
     publication_seq INTEGER NOT NULL CHECK (publication_seq >= 1),
-    PRIMARY KEY (namespace_id, reset_epoch, artifact_id),
+    UNIQUE (namespace_id, reset_epoch, artifact_id),
     FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
         REFERENCES key_manifests (namespace_id, reset_epoch, digest),
     FOREIGN KEY (namespace_id, reset_epoch, root_key)
@@ -73,21 +78,17 @@ CREATE TABLE artifacts (
 ) STRICT;
 
 CREATE TABLE artifact_rows (
-    namespace_id BLOB NOT NULL,
-    reset_epoch INTEGER NOT NULL,
-    artifact_id BLOB NOT NULL,
+    artifact_ref INTEGER NOT NULL REFERENCES artifacts (artifact_ref),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     row_kind INTEGER NOT NULL CHECK (row_kind BETWEEN 1 AND 255),
     index_key BLOB CHECK (index_key IS NULL OR length(index_key) <= 4096),
     payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
     row_checksum BLOB NOT NULL CHECK (length(row_checksum) = 32),
-    PRIMARY KEY (namespace_id, reset_epoch, artifact_id, ordinal),
-    FOREIGN KEY (namespace_id, reset_epoch, artifact_id)
-        REFERENCES artifacts (namespace_id, reset_epoch, artifact_id)
-) STRICT;
+    PRIMARY KEY (artifact_ref, ordinal)
+) STRICT, WITHOUT ROWID;
 
 CREATE INDEX artifact_rows_by_index_key
-    ON artifact_rows (namespace_id, reset_epoch, row_kind, index_key, artifact_id, ordinal)
+    ON artifact_rows (row_kind, index_key, artifact_ref, ordinal)
     WHERE index_key IS NOT NULL;
 
 CREATE INDEX artifacts_by_root
@@ -97,6 +98,7 @@ CREATE INDEX artifacts_by_lifecycle
     ON artifacts (namespace_id, reset_epoch, lifecycle, publication_seq);
 
 CREATE TABLE evidence_sets (
+    evidence_ref INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace_id BLOB NOT NULL,
     reset_epoch INTEGER NOT NULL,
     evidence_id BLOB NOT NULL CHECK (length(evidence_id) = 32),
@@ -108,7 +110,7 @@ CREATE TABLE evidence_sets (
     observation_count INTEGER NOT NULL CHECK (observation_count BETWEEN 0 AND 65536),
     content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 0 AND 16777216),
     publication_seq INTEGER NOT NULL CHECK (publication_seq >= 1),
-    PRIMARY KEY (namespace_id, reset_epoch, evidence_id),
+    UNIQUE (namespace_id, reset_epoch, evidence_id),
     FOREIGN KEY (namespace_id, reset_epoch, context_key)
         REFERENCES key_manifests (namespace_id, reset_epoch, digest),
     FOREIGN KEY (namespace_id, reset_epoch, subject_key)
@@ -133,21 +135,29 @@ CREATE INDEX evidence_by_subject_key ON evidence_sets (namespace_id, reset_epoch
 CREATE INDEX evidence_by_lifecycle
     ON evidence_sets (namespace_id, reset_epoch, lifecycle, publication_seq);
 
-CREATE TABLE observations (
+CREATE TABLE observation_content (
+    observation INTEGER PRIMARY KEY,
     namespace_id BLOB NOT NULL,
-    reset_epoch INTEGER NOT NULL,
-    evidence_id BLOB NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    reset_epoch INTEGER NOT NULL CHECK (reset_epoch >= 0),
+    content_digest BLOB NOT NULL CHECK (length(content_digest) = 32),
     kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 3),
     path_key BLOB NOT NULL CHECK (length(path_key) <= 4096),
     payload BLOB NOT NULL CHECK (length(payload) <= 1048576),
-    PRIMARY KEY (namespace_id, reset_epoch, evidence_id, ordinal),
-    FOREIGN KEY (namespace_id, reset_epoch, evidence_id)
-        REFERENCES evidence_sets (namespace_id, reset_epoch, evidence_id)
+    UNIQUE (namespace_id, reset_epoch, content_digest)
 ) STRICT;
 
-CREATE INDEX observations_by_path
-    ON observations (namespace_id, reset_epoch, path_key, evidence_id);
+CREATE INDEX observation_content_by_path
+    ON observation_content (namespace_id, reset_epoch, path_key);
+
+CREATE TABLE evidence_observations (
+    evidence_ref INTEGER NOT NULL REFERENCES evidence_sets (evidence_ref),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    observation INTEGER NOT NULL REFERENCES observation_content (observation),
+    PRIMARY KEY (evidence_ref, ordinal)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX evidence_observations_by_observation
+    ON evidence_observations (observation, evidence_ref);
 
 CREATE TABLE member_records (
     namespace_id BLOB NOT NULL,
@@ -512,17 +522,19 @@ mod tests {
             [
                 "artifact_rows",
                 "artifacts",
+                "evidence_observations",
                 "evidence_sets",
                 "key_manifests",
                 "lease_holds",
                 "member_bindings",
                 "member_records",
                 "namespaces",
-                "observations",
+                "observation_content",
                 "process_leases",
                 "retired_scopes",
                 "snapshot_members",
                 "snapshots",
+                "sqlite_sequence",
                 "store_state"
             ]
         );
@@ -635,7 +647,7 @@ mod tests {
 
     #[test]
     fn older_containers_are_bypassed_not_migrated() {
-        for version in [1, 2, 3] {
+        for version in [1, 2, 3, 4] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("a.sqlite3");
             {
@@ -870,11 +882,11 @@ mod tests {
                 "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
                  INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
                  INSERT INTO artifacts VALUES
-                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);
+                     (1, zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);
                  INSERT INTO key_manifests VALUES
                      (zeroblob(32), 0, CAST(zeroblob(31) || x'01' AS BLOB), 4, zeroblob(9));
                  INSERT INTO evidence_sets VALUES
-                     (zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
+                     (1, zeroblob(32), 0, zeroblob(32), 1, CAST(zeroblob(31) || x'01' AS BLOB),
                       zeroblob(32), zeroblob(32), 1, 0, 0, 1);
                  INSERT INTO member_records VALUES
                      (zeroblob(32), 0, zeroblob(32), 1, x'', x'', NULL, NULL, 0, 0, 1);
@@ -904,13 +916,11 @@ mod tests {
                 MAX_SUPPLEMENTAL_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES \
-                 (zeroblob(32), 0, zeroblob(32), 0, 1, zeroblob(?1), x'', zeroblob(32))",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, zeroblob(?1), x'', zeroblob(32))",
                 MAX_INDEX_KEY_BYTES,
             ),
             (
-                "INSERT INTO artifact_rows VALUES \
-                 (zeroblob(32), 0, zeroblob(32), 0, 1, NULL, zeroblob(?1), zeroblob(32))",
+                "INSERT INTO artifact_rows VALUES (1, 0, 1, NULL, zeroblob(?1), zeroblob(32))",
                 MAX_ROW_BATCH_BYTES,
             ),
             (
@@ -922,13 +932,13 @@ mod tests {
                 MAX_ARTIFACT_CONTENT_BYTES,
             ),
             (
-                "INSERT INTO observations VALUES \
-                 (zeroblob(32), 0, zeroblob(32), 0, 1, zeroblob(?1), x'')",
+                "INSERT INTO observation_content VALUES \
+                 (1, zeroblob(32), 0, zeroblob(32), 1, zeroblob(?1), x'')",
                 MAX_INDEX_KEY_BYTES,
             ),
             (
-                "INSERT INTO observations VALUES \
-                 (zeroblob(32), 0, zeroblob(32), 0, 1, x'', zeroblob(?1))",
+                "INSERT INTO observation_content VALUES \
+                 (1, zeroblob(32), 0, zeroblob(32), 1, x'', zeroblob(?1))",
                 MAX_ROW_BATCH_BYTES,
             ),
             (
@@ -971,7 +981,9 @@ mod tests {
             let at = connection.execute(sql, [limit as i64]);
             assert!(at.is_ok(), "{sql} at {limit}: {at:?}");
             connection.execute("DELETE FROM artifact_rows", []).unwrap();
-            connection.execute("DELETE FROM observations", []).unwrap();
+            connection
+                .execute("DELETE FROM observation_content", [])
+                .unwrap();
             connection
                 .execute("DELETE FROM member_bindings", [])
                 .unwrap();
@@ -996,14 +1008,14 @@ mod tests {
                 "INSERT INTO namespaces VALUES (zeroblob(32), x'00', 0, 1, 0);
                  INSERT INTO key_manifests VALUES (zeroblob(32), 0, zeroblob(32), 2, zeroblob(9));
                  INSERT INTO artifacts VALUES
-                     (zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);",
+                     (1, zeroblob(32), 0, zeroblob(32), 2, NULL, 1, 0, 0, zeroblob(32), x'', 1);",
             )
             .unwrap();
         for (purpose, artifact) in [(1, "NULL"), (2, "zeroblob(32)"), (3, "zeroblob(32)")] {
             let error = connection
                 .execute(
                     &format!(
-                        "INSERT INTO evidence_sets VALUES (zeroblob(32), 0, zeroblob(32), {purpose}, \
+                        "INSERT INTO evidence_sets VALUES (NULL, zeroblob(32), 0, zeroblob(32), {purpose}, \
                          zeroblob(32), zeroblob(32), {artifact}, 1, 0, 0, 1)"
                     ),
                     [],
@@ -1016,7 +1028,7 @@ mod tests {
             connection
                 .execute(
                     &format!(
-                        "INSERT INTO evidence_sets VALUES (zeroblob(32), 0, {id}, {purpose}, \
+                        "INSERT INTO evidence_sets VALUES (NULL, zeroblob(32), 0, {id}, {purpose}, \
                          zeroblob(32), zeroblob(32), {artifact}, 1, 0, 0, 1)"
                     ),
                     [],

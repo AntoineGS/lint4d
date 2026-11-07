@@ -163,9 +163,10 @@ impl ArtifactReader<'_> {
         ensure_live(&transaction, scope)?;
         let found: Option<i64> = transaction
             .query_row(
-                "SELECT 1 FROM artifact_rows \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3 AND ordinal >= ?4 \
-                 LIMIT 1",
+                "SELECT 1 FROM artifacts a CROSS JOIN artifact_rows r \
+                 ON r.artifact_ref = a.artifact_ref \
+                 WHERE a.namespace_id = ?1 AND a.reset_epoch = ?2 AND a.artifact_id = ?3 \
+                 AND r.ordinal >= ?4 LIMIT 1",
                 params![
                     scope.namespace.as_bytes().as_slice(),
                     epoch(scope),
@@ -221,37 +222,38 @@ impl ArtifactReader<'_> {
         let mut reader = store.reader()?;
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, scope)?;
-        // GC between batches is a miss, never a silent gap (spec §9).
-        let lifecycle: Option<i64> = transaction
+        // GC between batches is a miss, never a silent gap (spec §9). The
+        // rows are found through the header's surrogate, resolved in the
+        // batch's own transaction: surrogates are never reused, and the row
+        // checksums bind the artifact ID, so rows of another artifact
+        // could not verify anyway.
+        let header: Option<(i64, i64)> = transaction
             .query_row(
-                "SELECT lifecycle FROM artifacts \
+                "SELECT artifact_ref, lifecycle FROM artifacts \
                  WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3",
                 params![
                     scope.namespace.as_bytes().as_slice(),
                     epoch(scope),
                     artifact_id.as_bytes().as_slice()
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| classify(&error))?;
-        match lifecycle {
+        let artifact_ref = match header {
             None => return self.fail(Miss::Vanished),
-            Some(1) => {}
+            Some((artifact_ref, 1)) => artifact_ref,
             Some(_) => return self.fail(Miss::Retired),
-        }
+        };
         let mut statement = transaction
             .prepare_cached(
                 "SELECT ordinal, row_kind, index_key, payload, row_checksum FROM artifact_rows \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3 AND ordinal >= ?4 \
-                 ORDER BY ordinal LIMIT ?5",
+                 WHERE artifact_ref = ?1 AND ordinal >= ?2 ORDER BY ordinal LIMIT ?3",
             )
             .map_err(|error| classify(&error))?;
         let mut rows = statement
             .query(params![
-                scope.namespace.as_bytes().as_slice(),
-                epoch(scope),
-                artifact_id.as_bytes().as_slice(),
+                artifact_ref,
                 self.next_ordinal as i64,
                 MAX_ROW_BATCH_ROWS as i64
             ])

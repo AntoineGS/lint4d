@@ -3,7 +3,11 @@ use crate::Digest;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const DATABASE_FILE: &str = "analysis.sqlite3";
+/// The database of this container version. An incompatible container gets
+/// a new name, so a new build opens a fresh file beside the old one, which
+/// is left in place for an administrator to delete; a running server never
+/// deletes it (R9-3). Container 4 and earlier used `analysis.sqlite3`.
+pub const DATABASE_FILE: &str = "analysis-v5.sqlite3";
 const NAMESPACE_LOCKS: &str = "namespaces";
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
@@ -478,10 +482,21 @@ mod tests {
         assert_eq!(
             location.database_files(),
             [
-                root.path().join("cache/analysis.sqlite3"),
-                root.path().join("cache/analysis.sqlite3-wal"),
-                root.path().join("cache/analysis.sqlite3-shm"),
+                root.path().join("cache/analysis-v5.sqlite3"),
+                root.path().join("cache/analysis-v5.sqlite3-wal"),
+                root.path().join("cache/analysis-v5.sqlite3-shm"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_database_is_named_after_the_container_version() {
+        assert_eq!(
+            DATABASE_FILE,
+            format!(
+                "analysis-v{}.sqlite3",
+                super::super::container::CONTAINER_VERSION
+            )
         );
     }
 

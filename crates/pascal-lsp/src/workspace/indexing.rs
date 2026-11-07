@@ -11508,9 +11508,9 @@ end.
                         let metadata = entry.metadata().unwrap();
                         if metadata.is_dir() {
                             stack.push(entry.path());
-                        } else if entry.file_name() == "analysis.sqlite3" {
+                        } else if entry.file_name() == "analysis-v5.sqlite3" {
                             database += metadata.len();
-                        } else if entry.file_name() == "analysis.sqlite3-wal" {
+                        } else if entry.file_name() == "analysis-v5.sqlite3-wal" {
                             wal += metadata.len();
                         }
                     }

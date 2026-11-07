@@ -342,19 +342,19 @@ pub(crate) fn insert_prepared(
             ],
         )
         .map_err(fail)?;
+    // The rows hang off the header's surrogate, which nothing outside this
+    // container ever sees.
+    let artifact_ref = transaction.last_insert_rowid();
     let mut insert = transaction
         .prepare_cached(
-            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, \
-             row_kind, index_key, payload, row_checksum) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO artifact_rows (artifact_ref, ordinal, row_kind, index_key, payload, \
+             row_checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(fail)?;
     for (ordinal, (row, checksum)) in write.rows.iter().zip(checksums).enumerate() {
         insert
             .execute(params![
-                namespace,
-                reset_epoch,
-                artifact_id.as_bytes().as_slice(),
+                artifact_ref,
                 ordinal as i64,
                 i64::from(row.row_kind),
                 row.index_key,

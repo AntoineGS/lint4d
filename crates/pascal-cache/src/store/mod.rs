@@ -51,7 +51,7 @@ pub use evidence::{
 };
 #[cfg(feature = "test-support")]
 pub use index::INDEX_QUERY as INDEX_QUERY_FOR_TEST;
-pub use index::{IndexHit, IndexPage};
+pub use index::{IndexCursor, IndexHit, IndexPage};
 pub use keys::{ArtifactKeyRef, RootMismatch};
 pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use maintenance::{Maintenance, Phase, StepBudget, StepReport};

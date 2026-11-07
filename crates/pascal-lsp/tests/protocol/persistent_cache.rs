@@ -151,7 +151,7 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
         "{status}"
     );
     assert_eq!(status["directory"], directory.to_str().unwrap());
-    assert!(directory.join("analysis.sqlite3").is_file());
+    assert!(directory.join("analysis-v5.sqlite3").is_file());
     let mode = fs::metadata(&directory).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
     open(&mut server, &main, 1, &main_source);
@@ -160,6 +160,69 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
     assert_eq!(live_leases(&directory), 1);
     server.shutdown();
     assert_eq!(live_leases(&directory), 0);
+}
+
+/// An empty one-page SQLite database whose header says lint4d container 4.
+fn container_4_header() -> Vec<u8> {
+    let mut page = vec![0u8; 4096];
+    page[..16].copy_from_slice(b"SQLite format 3\0");
+    page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    page[18..24].copy_from_slice(&[1, 1, 0, 64, 32, 32]);
+    page[24..28].copy_from_slice(&1u32.to_be_bytes());
+    page[28..32].copy_from_slice(&1u32.to_be_bytes());
+    page[44..48].copy_from_slice(&4u32.to_be_bytes());
+    page[56..60].copy_from_slice(&1u32.to_be_bytes());
+    page[60..64].copy_from_slice(&4u32.to_be_bytes());
+    page[68..72].copy_from_slice(&0x4C34_4443u32.to_be_bytes());
+    page[92..96].copy_from_slice(&1u32.to_be_bytes());
+    page[96..100].copy_from_slice(&3_051_003u32.to_be_bytes());
+    page[100] = 0x0D;
+    page[105..107].copy_from_slice(&4096u16.to_be_bytes());
+    page
+}
+
+/// R9-3 (l4d-zf1b.8, 13c-4): a container of an earlier version keeps its
+/// own file name. The server opens its versioned file beside it, with no
+/// user action, and never touches or deletes the old one.
+#[test]
+fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
+    let (_temp, main, _provider, main_source, _provider_source) = standard_workspace();
+    let environment = tempfile::tempdir().unwrap();
+    let directory = store_directory(environment.path());
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(
+        environment.path().join("cache"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(
+        environment.path().join("cache/lint4d"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let old = directory.join("analysis.sqlite3");
+    fs::write(&old, container_4_header()).unwrap();
+    let before = (
+        fs::read(&old).unwrap(),
+        fs::metadata(&old).unwrap().modified().unwrap(),
+    );
+    let mut server = launch(environment.path());
+    server.initialize(main.parent().unwrap(), Value::Null);
+    let settled = settle(&mut server, true);
+    assert_eq!(settled["status"]["state"], "enabled", "{settled}");
+    assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
+    open(&mut server, &main, 1, &main_source);
+    hover(&mut server, &main, &main_source, "PublicRoutine");
+    server.shutdown();
+    assert_eq!(
+        (
+            fs::read(&old).unwrap(),
+            fs::metadata(&old).unwrap().modified().unwrap()
+        ),
+        before
+    );
+    assert!(!directory.join("analysis.sqlite3-wal").exists());
 }
 
 #[test]

@@ -1393,6 +1393,15 @@ Linux and `~/Library/Caches/lint4d/analysis` on macOS. On Windows persistence
 is bypassed until `l4d-x2ft`. Entries are keyed by content. Editor buffers are
 never stored.
 
+**Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
+files), where `<N>` is the store's container version, currently
+`analysis-v5.sqlite3`. A build with an incompatible container opens a fresh
+file of its own version beside the old one, with no action needed. The old
+file (container 4 and earlier: `analysis.sqlite3`) is never opened, changed
+or deleted by a newer server, because an older `pascal-lsp` may still use it;
+delete it once no such server runs. The `namespaces/` lock files and
+`maintenance.lock` are shared by every version.
+
 #### Persistent indexing
 
 The workspace index (which unit is declared where, and the facts the other
@@ -1562,6 +1571,13 @@ administration output report counts, sizes and fixed names, never source text
 or paths of projects. The one path they contain is the cache directory itself.
 
 #### Disk use
+
+Container 5 keeps artifact rows under a 64-bit surrogate of their artifact,
+with a name index that repeats no 32-byte key, and stores each distinct
+observation (a search-path listing, presence or payload) once, listed by
+every evidence set that made it; nothing is compressed. On a synthetic store
+shaped like a large workspace this is about 178 bytes per stored fact row
+(409 in container 4) and 40 bytes per observation (442).
 
 The managed budget is 8 GiB for the database, WAL and shared-memory files
 together. The WAL is checkpointed once it passes 256 MiB. Both are targets for

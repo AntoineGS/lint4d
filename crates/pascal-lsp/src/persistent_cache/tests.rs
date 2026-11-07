@@ -842,7 +842,7 @@ fn the_exclusion_follows_the_active_options() {
     cache.reconfigure(options(root.path()));
     assert_eq!(cache.settle(SETTLE), CacheState::Enabled);
     let exclusion = cache.exclusion().expect("enabled: excluded");
-    assert!(exclusion.contains(&root.path().join("analysis.sqlite3-wal")));
+    assert!(exclusion.contains(&root.path().join("analysis-v5.sqlite3-wal")));
     // A reopen keeps it.
     cache.readmit();
     assert_eq!(cache.settle(SETTLE), CacheState::Enabled);

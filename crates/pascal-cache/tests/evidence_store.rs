@@ -229,7 +229,8 @@ fn tampered_evidence_is_never_a_verified_read() {
             "a well-formed observation swapped in",
             Box::new(move |db| {
                 db.execute(
-                    "UPDATE observations SET payload = ?1 WHERE ordinal = 1",
+                    "UPDATE observation_content SET payload = ?1 WHERE observation = \
+                     (SELECT observation FROM evidence_observations WHERE ordinal = 1)",
                     [&flipped],
                 )
                 .unwrap();
@@ -239,15 +240,19 @@ fn tampered_evidence_is_never_a_verified_read() {
         (
             "a kind that disagrees with the payload",
             Box::new(|db| {
-                db.execute("UPDATE observations SET kind = 3 WHERE ordinal = 1", [])
-                    .unwrap();
+                db.execute(
+                    "UPDATE observation_content SET kind = 3 WHERE observation = \
+                     (SELECT observation FROM evidence_observations WHERE ordinal = 1)",
+                    [],
+                )
+                .unwrap();
             }),
             Miss::Malformed(Malformed::Evidence),
         ),
         (
             "a deleted row",
             Box::new(|db| {
-                db.execute("DELETE FROM observations WHERE ordinal = 2", [])
+                db.execute("DELETE FROM evidence_observations WHERE ordinal = 2", [])
                     .unwrap();
             }),
             Miss::Malformed(Malformed::Count),
@@ -256,8 +261,8 @@ fn tampered_evidence_is_never_a_verified_read() {
             "an appended row",
             Box::new(|db| {
                 db.execute(
-                    "INSERT INTO observations SELECT namespace_id, reset_epoch, evidence_id, 3, \
-                     kind, path_key, payload FROM observations WHERE ordinal = 0",
+                    "INSERT INTO evidence_observations SELECT evidence_ref, 3, observation \
+                     FROM evidence_observations WHERE ordinal = 0",
                     [],
                 )
                 .unwrap();
@@ -344,7 +349,7 @@ fn evidence_retired_or_deleted_between_batches_is_a_miss() {
         ),
         (
             "deleted",
-            "DELETE FROM observations; DELETE FROM evidence_sets",
+            "DELETE FROM evidence_observations; DELETE FROM evidence_sets",
             Miss::Vanished,
         ),
     ] {
@@ -390,13 +395,13 @@ fn a_row_past_the_declared_count_is_a_count_miss_even_when_malformed_or_oversize
         let keys = keys("unit A;");
         publish(&store, &keys, &observations()).unwrap();
         raw(directory.path())
-            .execute(
-                &format!(
-                    "INSERT INTO observations SELECT namespace_id, reset_epoch, evidence_id, 3, \
-                     3, {path_key}, {payload} FROM observations WHERE ordinal = 0"
-                ),
-                [],
-            )
+            .execute_batch(&format!(
+                "INSERT INTO observation_content (namespace_id, reset_epoch, \
+                     content_digest, kind, path_key, payload) SELECT namespace_id, reset_epoch, \
+                     zeroblob(32), 3, {path_key}, {payload} FROM observation_content LIMIT 1; \
+                     INSERT INTO evidence_observations SELECT evidence_ref, 3, last_insert_rowid() \
+                     FROM evidence_observations WHERE ordinal = 0"
+            ))
             .unwrap();
         assert_eq!(
             read_all(&store, &keys),
@@ -428,8 +433,10 @@ fn a_republished_set_is_never_hidden_by_the_candidate_cap() {
     // The set whose ID sorts last: an ID-ordered cap always leaves it out.
     let payload: Vec<u8> = raw(directory.path())
         .query_row(
-            "SELECT payload FROM observations \
-             WHERE evidence_id = (SELECT max(evidence_id) FROM evidence_sets)",
+            "SELECT c.payload FROM observation_content c \
+             JOIN evidence_observations o ON o.observation = c.observation \
+             JOIN evidence_sets e ON e.evidence_ref = o.evidence_ref \
+             WHERE e.evidence_id = (SELECT max(evidence_id) FROM evidence_sets)",
             [],
             |row| row.get(0),
         )

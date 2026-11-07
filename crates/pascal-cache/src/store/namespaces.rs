@@ -18,19 +18,42 @@ const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 11] = [
+const RECLAIM_TABLES: [&str; 12] = [
     "lease_holds",
     "process_leases",
     "snapshot_members",
     "snapshots",
     "member_bindings",
     "member_records",
-    "observations",
+    "evidence_observations",
     "evidence_sets",
+    "observation_content",
     "artifact_rows",
     "artifacts",
     "key_manifests",
 ];
+
+/// At most `?3` rows of `table` in scope `(?1, ?2)`. Rows keyed by a
+/// parent's surrogate are in the scope of that parent.
+fn reclaim_sql(table: &str) -> String {
+    match table {
+        "evidence_observations" => "DELETE FROM evidence_observations \
+             WHERE (evidence_ref, ordinal) IN (SELECT o.evidence_ref, o.ordinal \
+             FROM evidence_sets e CROSS JOIN evidence_observations o \
+             ON o.evidence_ref = e.evidence_ref \
+             WHERE e.namespace_id = ?1 AND e.reset_epoch = ?2 LIMIT ?3)"
+            .to_string(),
+        "artifact_rows" => "DELETE FROM artifact_rows \
+             WHERE (artifact_ref, ordinal) IN (SELECT r.artifact_ref, r.ordinal \
+             FROM artifacts a CROSS JOIN artifact_rows r ON r.artifact_ref = a.artifact_ref \
+             WHERE a.namespace_id = ?1 AND a.reset_epoch = ?2 LIMIT ?3)"
+            .to_string(),
+        table => format!(
+            "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 LIMIT ?3)"
+        ),
+    }
+}
 
 /// The scope every row of this store is published and read in (spec §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -332,13 +355,7 @@ pub(crate) fn reclaim(
                 break 'scopes;
             }
             let deleted = transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} \
-                         WHERE namespace_id = ?1 AND reset_epoch = ?2 LIMIT ?3)"
-                    ),
-                    params![id, reset_epoch, budget as i64],
-                )
+                .execute(&reclaim_sql(table), params![id, reset_epoch, budget as i64])
                 .map_err(fail)?;
             rows += deleted;
             budget -= deleted;
@@ -430,11 +447,13 @@ mod tests {
             Deadline::after(std::time::Duration::from_secs(2)),
         )
         .unwrap();
+        // Tables without a scope column are keyed by a scoped parent's
+        // surrogate.
         let scoped: std::collections::BTreeSet<String> = connection
             .prepare(
-                "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
-                 WHERE m.type = 'table' AND c.name = 'reset_epoch' \
-                 AND m.name NOT IN ('namespaces', 'retired_scopes', 'store_state')",
+                "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                 AND name NOT IN ('namespaces', 'retired_scopes', 'store_state', \
+                 'sqlite_sequence')",
             )
             .unwrap()
             .query_map([], |row| row.get(0))

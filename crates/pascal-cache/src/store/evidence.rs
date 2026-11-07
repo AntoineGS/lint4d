@@ -117,10 +117,26 @@ impl EvidenceHeader {
     }
 }
 
+/// Domain of the digest an observation's stored content is shared by.
+/// Storage only: the evidence ID hashes the payloads themselves.
+const OBSERVATION_CONTENT_CONTEXT: &str =
+    "lint4d persistent analysis cache 2026-11 observation content v1";
+
 struct EncodedObservation {
     kind: u8,
     path_key: Vec<u8>,
     payload: Vec<u8>,
+    content_digest: Digest,
+}
+
+fn content_digest(kind: u8, path_key: &[u8], payload: &[u8]) -> Digest {
+    let mut hasher = blake3::Hasher::new_derive_key(OBSERVATION_CONTENT_CONTEXT);
+    hasher.update(&[kind]);
+    hasher.update(&(path_key.len() as u64).to_le_bytes());
+    hasher.update(path_key);
+    hasher.update(&(payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+    Digest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// The count limit, checked before anything is reserved or encoded.
@@ -157,8 +173,10 @@ fn encode_observations(
         if content > MAX_ARTIFACT_CONTENT_BYTES {
             return Err(Bypass::TooLarge(TooLarge::Content { bytes: content }));
         }
+        let kind = observation.kind();
         encoded.push(EncodedObservation {
-            kind: observation.kind(),
+            content_digest: content_digest(kind, &path_key, &payload),
+            kind,
             path_key,
             payload,
         });
@@ -295,26 +313,77 @@ fn insert_evidence(
                     ],
                 )
                 .map_err(fail)?;
-            let mut insert = transaction
+            let evidence_ref = transaction.last_insert_rowid();
+            let mut list = transaction
                 .prepare_cached(
-                    "INSERT INTO observations (namespace_id, reset_epoch, evidence_id, \
-                     ordinal, kind, path_key, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO evidence_observations (evidence_ref, ordinal, observation) \
+                     VALUES (?1, ?2, ?3)",
                 )
                 .map_err(fail)?;
             for (ordinal, observation) in prepared.observations.iter().enumerate() {
-                insert
-                    .execute(params![
+                let content = put_observation_content(transaction, scope, observation)?;
+                list.execute(params![evidence_ref, ordinal as i64, content])
+                    .map_err(fail)?;
+            }
+            Ok(Published::Inserted)
+        }
+    }
+}
+
+/// The stored content of `observation` in `scope`, inserted unless an
+/// identical one is there. Shared content is immutable: a stored row under
+/// the same digest with other bytes is an integrity failure, never
+/// overwritten. Unreferenced content is swept by reclamation
+/// (`gc::DELETE_STEPS`), which runs in a write transaction like this one,
+/// so content found here stays until this transaction's reference commits.
+fn put_observation_content(
+    transaction: &Connection,
+    scope: Scope,
+    observation: &EncodedObservation,
+) -> Result<i64, Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    let namespace = scope.namespace.as_bytes().as_slice();
+    let digest = observation.content_digest.as_bytes().as_slice();
+    let stored: Option<(i64, i64, Vec<u8>, Vec<u8>)> = transaction
+        .prepare_cached(
+            "SELECT observation, kind, path_key, payload FROM observation_content \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND content_digest = ?3",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_row(params![namespace, epoch(scope), digest], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .optional()
+        })
+        .map_err(fail)?;
+    match stored {
+        Some((id, kind, path_key, payload))
+            if kind == i64::from(observation.kind)
+                && path_key == observation.path_key
+                && payload == observation.payload =>
+        {
+            Ok(id)
+        }
+        Some(_) => Err(Bypass::Integrity(Integrity::ConflictingEvidence)),
+        None => {
+            transaction
+                .prepare_cached(
+                    "INSERT INTO observation_content (namespace_id, reset_epoch, \
+                     content_digest, kind, path_key, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .and_then(|mut statement| {
+                    statement.execute(params![
                         namespace,
-                        reset_epoch,
-                        id,
-                        ordinal as i64,
+                        epoch(scope),
+                        digest,
                         i64::from(observation.kind),
                         observation.path_key,
                         observation.payload
                     ])
-                    .map_err(fail)?;
-            }
-            Ok(Published::Inserted)
+                })
+                .map_err(fail)?;
+            Ok(transaction.last_insert_rowid())
         }
     }
 }
@@ -638,6 +707,10 @@ impl Store {
 
 /// The rows of one evidence set: observations whose `kind` and `path_key`
 /// columns must agree with their payload, folded into the evidence ID.
+/// Shared content is read through the set's list; a listed observation
+/// whose content is missing or of another scope drops out of the join and
+/// leaves an ordinal gap, and corrupted content fails the evidence ID of
+/// every set that lists it.
 #[derive(Clone)]
 struct ObservationSource(EvidenceHasher);
 
@@ -645,12 +718,17 @@ impl RowSource for ObservationSource {
     type Item = Observation;
     const PARENT_SQL: &'static str = "SELECT lifecycle FROM evidence_sets \
          WHERE namespace_id = ?1 AND reset_epoch = ?2 AND evidence_id = ?3";
-    const ROWS_SQL: &'static str = "SELECT ordinal, kind, path_key, payload FROM observations \
-         WHERE namespace_id = ?1 AND reset_epoch = ?2 AND evidence_id = ?3 \
-         AND ordinal >= ?4 ORDER BY ordinal LIMIT ?5";
-    const TRAILING_SQL: &'static str = "SELECT 1 FROM observations \
-         WHERE namespace_id = ?1 AND reset_epoch = ?2 AND evidence_id = ?3 \
-         AND ordinal >= ?4 LIMIT 1";
+    const ROWS_SQL: &'static str = "SELECT o.ordinal, c.kind, c.path_key, c.payload \
+         FROM evidence_sets e CROSS JOIN evidence_observations o \
+             ON o.evidence_ref = e.evidence_ref \
+         CROSS JOIN observation_content c ON c.observation = o.observation \
+             AND c.namespace_id = e.namespace_id AND c.reset_epoch = e.reset_epoch \
+         WHERE e.namespace_id = ?1 AND e.reset_epoch = ?2 AND e.evidence_id = ?3 \
+         AND o.ordinal >= ?4 ORDER BY o.ordinal LIMIT ?5";
+    const TRAILING_SQL: &'static str = "SELECT 1 FROM evidence_sets e \
+         CROSS JOIN evidence_observations o ON o.evidence_ref = e.evidence_ref \
+         WHERE e.namespace_id = ?1 AND e.reset_epoch = ?2 AND e.evidence_id = ?3 \
+         AND o.ordinal >= ?4 LIMIT 1";
 
     fn size(row: &rusqlite::Row<'_>) -> rusqlite::Result<usize> {
         Ok(row.get_ref(2)?.as_blob()?.len() + row.get_ref(3)?.as_blob()?.len())

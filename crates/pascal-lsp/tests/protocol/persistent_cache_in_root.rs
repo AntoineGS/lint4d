@@ -154,9 +154,9 @@ fn workspace_symbol_request(server: &mut TestServer) -> RequestId {
 /// `**/*` reports them.
 fn store_file_events(server: &mut TestServer, store: &Path) {
     let changes: Vec<_> = [
-        ("analysis.sqlite3", 2),
-        ("analysis.sqlite3-wal", 1),
-        ("analysis.sqlite3-shm", 1),
+        ("analysis-v5.sqlite3", 2),
+        ("analysis-v5.sqlite3-wal", 1),
+        ("analysis-v5.sqlite3-shm", 1),
         ("maintenance.lock", 1),
         ("namespaces", 1),
         ("namespaces/0123.lock", 3),

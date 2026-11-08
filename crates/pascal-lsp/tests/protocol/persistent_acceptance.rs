@@ -1258,6 +1258,7 @@ fn synthetic_acceptance_record() {
         let done = wait_index(&mut on, persisted);
         let on_seconds = started.elapsed().as_secs_f64();
         settle_background(&mut on);
+        let on_status = request(&mut on, "pascal/cacheStatus", json!({}));
         let (on_hwm, on_written, on_read) = process_peaks(&on);
         let (running_db, running_wal) = store_sizes(environment.path(), &cache);
         shutdown(on);
@@ -1294,6 +1295,8 @@ fn synthetic_acceptance_record() {
                 "store_running": {"db_bytes": running_db, "wal_bytes": running_wal},
                 "store_stopped": {"db_bytes": stopped_db, "wal_bytes": stopped_wal},
                 "extracted": done["extracted"],
+                "lock_waits": on_status["lockWaits"],
+                "maintenance": on_status["counters"]["maintenance"],
             },
             "off": {"seconds_to_complete": off_seconds, "vmhwm_mib": off_hwm as f64 / KIB_PER_MIB},
             "ratio_on_off": ratio,
@@ -1309,8 +1312,9 @@ fn synthetic_acceptance_record() {
     let done = wait_index(&mut warm, complete);
     let warm_seconds = started.elapsed().as_secs_f64();
     let counters = metrics(&mut warm);
-    let reuse = delta(counters, [0; 12]);
+    let lifetime = delta(counters, [0; 12]);
     assert_eq!(done["extracted"], 0, "{done}");
+    let (settled_hwm, ..) = process_peaks(&warm);
 
     let mut reference_samples = Vec::new();
     let mut symbol_samples = Vec::new();
@@ -1341,19 +1345,20 @@ fn synthetic_acceptance_record() {
         "seconds_to_complete": warm_seconds,
         "reused": done["reused"],
         "extracted": done["extracted"],
-        "reuse_pass_counters": {
-            "parses": reuse[5],
-            "payload_read_attempts": reuse[0],
-            "payload_bytes": reuse[1],
-            "stamp_probes": reuse[3],
-            "legacy_hash_bytes": reuse[4],
-            "import_binding_calls": reuse[8],
-            "import_binding_pairs": reuse[9],
+        "process_lifetime_counters_at_complete": {
+            "parses": lifetime[5],
+            "payload_read_attempts": lifetime[0],
+            "payload_bytes": lifetime[1],
+            "stamp_probes": lifetime[3],
+            "legacy_hash_bytes": lifetime[4],
+            "import_binding_calls": lifetime[8],
+            "import_binding_pairs": lifetime[9],
         },
-        "cache_status": {"counters": status["counters"], "maintenance": status["maintenance"]},
+        "cache_status": {"counters": status["counters"], "lock_waits": status["lockWaits"]},
         "references": sample_summary(&reference_samples),
         "symbols": sample_summary(&symbol_samples),
-        "vmhwm_mib": hwm as f64 / KIB_PER_MIB,
+        "vmhwm_after_reuse_mib": settled_hwm as f64 / KIB_PER_MIB,
+        "vmhwm_end_mib": hwm as f64 / KIB_PER_MIB,
         "write_bytes": written,
         "rchar": read,
     }));

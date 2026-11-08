@@ -112,6 +112,9 @@ struct IndexSeams {
     pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
     /// A bypass for the publication of an extracted member.
     publish: Option<PublishFault>,
+    /// A bypass for the publication of a member's record, after its
+    /// artifact was published or found.
+    record: Option<PublishFault>,
     /// `await_maintenance` calls.
     waits: u64,
 }
@@ -602,6 +605,22 @@ impl PersistentCache {
         if let Some(inner) = &self.inner {
             lock(&inner.seams).publish = fault;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_record_fault_for_test(&self, fault: Option<PublishFault>) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).record = fault;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
+        let inner = self.inner.as_ref()?;
+        lock(&inner.seams)
+            .record
+            .as_mut()
+            .and_then(|fault| fault(path))
     }
 
     #[cfg(test)]

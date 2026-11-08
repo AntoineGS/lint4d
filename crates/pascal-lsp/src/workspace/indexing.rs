@@ -2950,19 +2950,11 @@ impl Workspace {
                         // sealed (D33, §6.3).
                         match skip {
                             PersistSkip::Store(
-                                pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering,
-                            ) => self.project_cache.mark_index_stale(key, path),
-                            // Only maintenance makes this room (the
-                            // store woke it): the member waits for a
-                            // batch that finds no pressure rather than
-                            // being extracted into the same refusal.
-                            // `LowDiskSpace` and this store's own
-                            // `ScratchExhausted` are not pressure
-                            // maintenance clears: memory-only.
-                            PersistSkip::Store(
-                                pascal_cache::Bypass::WalPressure
-                                | pascal_cache::Bypass::OverBudget,
-                            ) => self.project_cache.note_index_awaiting_room(key, path),
+                                bypass @ (pascal_cache::Bypass::Busy
+                                | pascal_cache::Bypass::Recovering
+                                | pascal_cache::Bypass::WalPressure
+                                | pascal_cache::Bypass::OverBudget),
+                            ) => self.defer_refused_record(key, path, &bypass),
                             // The same inputs exceed the same fixed limit
                             // every time: the facts stay indexed here and
                             // an artifact-less record lists the member, so
@@ -2996,6 +2988,25 @@ impl Workspace {
             }
             PublishOutcome::NotAMember => MemberOutcome::Skipped,
             PublishOutcome::Memory => MemberOutcome::Memory,
+        }
+    }
+
+    /// A Fresh member's record was refused by a bypass that passes:
+    /// another process's writes (`Busy`, `Recovering`) make the next batch
+    /// prove it again; only maintenance makes room (`WalPressure`,
+    /// `OverBudget`, which the store woke it for), so it waits for a batch
+    /// that finds no pressure rather than being proven into the same
+    /// refusal. `LowDiskSpace` and this store's own `ScratchExhausted` are
+    /// not pressure maintenance clears: the member stays memory-only.
+    fn defer_refused_record(&self, key: &ContextKey, path: &Path, bypass: &pascal_cache::Bypass) {
+        match bypass {
+            pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering => {
+                self.project_cache.mark_index_stale(key, path);
+            }
+            pascal_cache::Bypass::WalPressure | pascal_cache::Bypass::OverBudget => {
+                self.project_cache.note_index_awaiting_room(key, path);
+            }
+            _ => {}
         }
     }
 
@@ -3196,6 +3207,11 @@ impl Workspace {
         if stopped() {
             return Err(PersistSkip::Unavailable);
         }
+        #[cfg(test)]
+        if let Some(bypass) = self.persistent_cache().record_fault_for_test(path) {
+            job.observe(&bypass);
+            return Err(PersistSkip::Store(bypass));
+        }
         let proven = publish_proven(job.store(), &eligible);
         #[cfg(test)]
         wal.note(1);
@@ -3306,16 +3322,17 @@ impl Workspace {
     /// Prove the record `inputs` derive for a member the index holds: found
     /// live in the store (`live` when it is the held snapshot's record the
     /// batch already opened), else published. Without a proof the member
-    /// only delays the context's snapshot.
+    /// only delays the context's snapshot; `Err` is the store bypass that
+    /// refused it (observed).
     fn prove_member(
         &self,
         key: &ContextKey,
         inputs: &RecordInputs<'_>,
         live: Option<pascal_cache::Digest>,
         cancel: &AtomicBool,
-    ) -> bool {
+    ) -> Result<bool, pascal_cache::Bypass> {
         if !self.may_publish(key) {
-            return false;
+            return Ok(false);
         }
         let eligible = match self.eligible_indexed_member(key, inputs) {
             Ok(eligible) => eligible,
@@ -3324,31 +3341,37 @@ impl Workspace {
                     "  index member {} not proven: {ineligible:?}",
                     inputs.path.display()
                 );
-                return false;
+                return Ok(false);
             }
         };
         let Some(job) = self.persistent_cache().job() else {
-            return false;
+            return Ok(false);
         };
         let stopped = || job.is_cancelled() || cancel.load(Ordering::Relaxed);
         if stopped() {
-            return false;
+            return Ok(false);
         }
         let proof = match prove_existing(job.store(), &eligible, live) {
             Ok(Some(proof)) => Ok(proof),
-            Ok(None) if stopped() => return false,
-            Ok(None) => publish_proven(job.store(), &eligible),
+            Ok(None) if stopped() => return Ok(false),
+            Ok(None) => {
+                #[cfg(test)]
+                let fault = self.persistent_cache().record_fault_for_test(inputs.path);
+                #[cfg(not(test))]
+                let fault = None;
+                fault.map_or_else(|| publish_proven(job.store(), &eligible), Err)
+            }
             Err(bypass) => Err(bypass),
         };
         let proof = match proof {
             Ok(proof) => proof,
             Err(bypass) => {
                 job.observe(&bypass);
-                return false;
+                return Err(bypass);
             }
         };
         drop(job);
-        self.set_member_record(key, &proof)
+        Ok(self.set_member_record(key, &proof))
     }
 
     /// A refused or limited member is listed by an artifact-less record, so
@@ -3375,7 +3398,8 @@ impl Workspace {
             },
             None,
             cancel,
-        );
+        )
+        .ok();
     }
 
     /// Index `path` from the store's facts, if current inputs prove them
@@ -3457,6 +3481,7 @@ impl Workspace {
                 }
             }
         }
+        let hinted_record = hinted.is_some();
         let result = hinted.unwrap_or_else(|| {
             self.reuse_in_context_with(
                 &uri,
@@ -3472,6 +3497,19 @@ impl Workspace {
         if cancel.load(Ordering::Relaxed) {
             return Validated::Outcome(ReuseOutcome::Cancelled);
         }
+        // No snapshot listed the member: a refusal an earlier process
+        // recorded is found by the record it derives, as the held
+        // snapshot's would be (Task 8c).
+        let missed = |absent: bool| {
+            if !hinted_record {
+                match self.has_artifact_less_record(key, path, job.store()) {
+                    Ok(true) => return Validated::Outcome(ReuseOutcome::Retrying),
+                    Ok(false) => {}
+                    Err(bypass) => job.observe(&bypass),
+                }
+            }
+            Validated::Outcome(ReuseOutcome::Missed { absent })
+        };
         let (facts, reads, artifact, evidence, include_stamps, root_hash, record) = match result {
             Ok(Reuse::Hit {
                 facts,
@@ -3499,17 +3537,15 @@ impl Workspace {
             Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => {
                 return Validated::Outcome(ReuseOutcome::Retry);
             }
-            Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => {
-                return Validated::Outcome(ReuseOutcome::Missed { absent: true });
-            }
+            Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => return missed(true),
             Ok(Reuse::Miss(ReuseMiss::Stale(_) | ReuseMiss::Store(_) | ReuseMiss::Open)) => {
-                return Validated::Outcome(ReuseOutcome::Missed { absent: false });
+                return missed(false);
             }
             // `record_reuse` observed the bypass.
             Err(super::persist::PersistError::Store(_)) => {
                 return Validated::Outcome(ReuseOutcome::Retry);
             }
-            Err(_) => return Validated::Outcome(ReuseOutcome::Missed { absent: false }),
+            Err(_) => return missed(false),
         };
         job.store().hint_used(match evidence {
             Some(id) => Hint::Evidence(id),
@@ -3566,7 +3602,7 @@ impl Workspace {
         let outcome = match published {
             PublishOutcome::Indexed => {
                 if let Some(state) = self.contexts.get(key) {
-                    timed(ReusePhase::Prove, || {
+                    let proven = timed(ReusePhase::Prove, || {
                         self.prove_member(
                             key,
                             &RecordInputs {
@@ -3579,8 +3615,19 @@ impl Workspace {
                             },
                             live,
                             cancel,
-                        );
+                        )
                     });
+                    // Refused as an extracted member's record would be: the
+                    // member must not stay indexed without its record and
+                    // let the batch complete, or the seal finds it
+                    // unproven and nothing proves it again (rootcause-p2 A1).
+                    if let Err(bypass) = proven {
+                        crate::trace::trace!(
+                            "  index member {} reused, record not proven: {bypass:?}",
+                            path.display()
+                        );
+                        self.defer_refused_record(key, path, &bypass);
+                    }
                 }
                 ReuseOutcome::Reused
             }

@@ -4839,6 +4839,44 @@ mod tests {
             workspace.persistent_cache().shutdown();
         }
 
+        /// Task 8c (rootcause-p2 A1): the member's artifact lands but its
+        /// record is refused for room, and so is the record of the proof
+        /// that reuses the artifact. The warmer never seals without it: no
+        /// seal is tried until the record lands, and then it seals.
+        #[test]
+        fn a_record_refused_again_on_reuse_is_proven_before_the_seal() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let cache = workspace.persistent_cache().clone();
+            let mut refusals = 0;
+            cache.set_record_fault_for_test(Some(Box::new(move |path| {
+                (path.ends_with("App.dpr") && refusals < 2).then(|| {
+                    refusals += 1;
+                    pascal_cache::Bypass::WalPressure
+                })
+            })));
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WarmEvent::IndexProgress {
+                            seal: Some(SealOutcome::Sealed | SealOutcome::Ineligible(_)),
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                events
+                    .iter()
+                    .any(|event| sealed(event, &SealOutcome::Sealed)),
+                "{events:?}"
+            );
+            workspace.persistent_cache().shutdown();
+        }
+
         const WIDE_MAIN: &str =
             "unit Main;\ninterface\nuses Provider, U0, U1;\nimplementation\nend.\n";
 

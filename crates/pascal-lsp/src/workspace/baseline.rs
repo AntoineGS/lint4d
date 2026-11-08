@@ -7,7 +7,10 @@
 
 use super::authorize::authorize_record;
 use super::capture::ReadCapture;
-use super::eligible::{CapturedEvidence, Ineligible, SealFailure, capture_evidence, seal_baseline};
+use super::eligible::{
+    CapturedEvidence, Ineligible, RecordInputs, SealFailure, Unindexed, capture_evidence,
+    seal_baseline,
+};
 use super::evidence::EvidenceGap;
 use super::indexing::{ReusePhase, timed};
 use super::persist::{PersistError, Reuse, ReuseMiss, ReuseVia, admitted, decoded};
@@ -834,6 +837,48 @@ impl Workspace {
             Err(miss) => HintReuse::Done(Reuse::Miss(miss)),
         })
     }
+
+    /// Without a held snapshot to list it: whether the store holds a live
+    /// artifact-less record for `path`, the one a refused or limited member
+    /// derives (`prove_unindexed`), authorized for `key`'s context as
+    /// `reuse_from_hint` authorizes a snapshot's record. It supplies no
+    /// facts; it only lets the member be retried last (R8-3).
+    pub(super) fn has_artifact_less_record(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        store: &Store,
+    ) -> Result<bool, Bypass> {
+        let Some(state) = self.contexts.get(key) else {
+            return Ok(false);
+        };
+        for unindexed in [Unindexed::NotRecorded, Unindexed::OverSize] {
+            let inputs = RecordInputs {
+                path,
+                facts: None,
+                artifact: None,
+                member_evidence: None,
+                origin: state.context.source_origin(path),
+                unindexed: Some(unindexed),
+            };
+            let Ok(eligible) = self.eligible_indexed_member(key, &inputs) else {
+                return Ok(false);
+            };
+            let Ok(id) = eligible.value().id() else {
+                continue;
+            };
+            let Lookup::Hit(header) = timed(ReusePhase::Lookup, || store.open_member_record(id))?
+            else {
+                continue;
+            };
+            if authorize_record(header, &state.context)
+                .is_ok_and(|record| record.value().member().artifact.is_none())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1599,6 +1644,120 @@ mod tests {
             assert!(progress.complete, "{progress:?}");
             assert!(!progress.worth_requeue(), "batch {batch}: {progress:?}");
         }
+        cache.shutdown();
+    }
+
+    /// Task 8c (rootcause-p2 A2): a process that holds no snapshot (the
+    /// last one never sealed) still finds a member's artifact-less record
+    /// by the record its inputs derive, authorizes it, and counts the
+    /// member `retrying`: once only retrying members are pending, the
+    /// context is complete.
+    #[test]
+    fn without_a_snapshot_a_refused_member_with_a_record_is_retrying() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 3, options.clone());
+        let big = temp.path().join("lib/U0.pas");
+        named_unit(&big, &"Long".repeat(60));
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert_eq!(progress.refused, 1, "{progress:?}");
+        assert!(first.project_cache.index_member_has_record(&key, &big));
+        // No seal: the next process holds no snapshot.
+        cache.shutdown();
+
+        let (mut second, cache) = persisting_view(&workspace(temp.path(), options), store.path());
+        let reuse = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert!(second.project_cache.baseline_hint(&key).is_none());
+        assert_eq!(
+            (
+                reuse.reused,
+                reuse.retrying,
+                reuse.pending,
+                reuse.reuse_retrying
+            ),
+            (2, 1, 1, 1),
+            "{reuse:?}"
+        );
+        assert!(reuse.complete, "pending == retrying: {reuse:?}");
+        cache.shutdown();
+    }
+
+    /// Task 8c (rootcause-p2 A2): the same for a limited member, whose
+    /// artifact-less record says `NotRecorded`.
+    #[test]
+    fn without_a_snapshot_a_limited_member_with_a_record_is_retrying() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (session, key, anchor) = indexed_project(temp.path(), 4, WorkspaceOptions::default());
+        let over = temp.path().join("lib/U0.pas");
+        over_pending_bytes_unit(&over);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete && progress.limited > 0, "{progress:?}");
+        assert!(first.project_cache.index_member_has_record(&key, &over));
+        cache.shutdown();
+
+        let (mut second, cache) = persisting_view(
+            &workspace(temp.path(), WorkspaceOptions::default()),
+            store.path(),
+        );
+        let reuse = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert!(second.project_cache.baseline_hint(&key).is_none());
+        assert_eq!(reuse.retrying, progress.limited, "{reuse:?}");
+        assert_eq!(reuse.pending, reuse.retrying, "{reuse:?}");
+        assert!(reuse.complete, "{reuse:?}");
+        cache.shutdown();
+    }
+
+    /// Task 8c (rootcause-p2 A1): a member whose artifact landed but whose
+    /// record was refused for room is proven again through the store, and
+    /// that proof is refused too. The member still holds `complete` back
+    /// (it is awaiting room, not silently unrecorded), so the seal is
+    /// tried only once a later batch has proven it, and lists it.
+    #[test]
+    fn a_reproof_refused_for_room_holds_the_seal_until_the_record_lands() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 4, WorkspaceOptions::default());
+        let target = temp.path().join("lib/U1.pas");
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        let refused = target.clone();
+        let mut refusals = 0;
+        cache.set_record_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && refusals < 2).then(|| {
+                refusals += 1;
+                pascal_cache::Bypass::WalPressure
+            })
+        })));
+        let mut batches = Vec::new();
+        for _ in 0..6 {
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            let complete = progress.complete;
+            batches.push(progress);
+            if complete {
+                break;
+            }
+        }
+        let last = batches.last().unwrap();
+        assert!(last.complete, "{batches:?}");
+        assert!(
+            view.project_cache.index_member_has_record(&key, &target),
+            "complete with the member unrecorded: {batches:?}"
+        );
+        assert_eq!(seal(&view, &key), SealOutcome::Sealed);
         cache.shutdown();
     }
 

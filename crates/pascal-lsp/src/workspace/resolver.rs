@@ -919,6 +919,24 @@ pub(crate) fn resolver_for_context_with_limits(
     .with_context_observations(observations)
 }
 
+/// `resolver_for_context_with_limits` without the context's observations,
+/// for a references proof's include walk (`UnverifiedRanking`): no lookup's
+/// answer reads them, and each member's walk builds its own resolver.
+pub(crate) fn resolver_for_include_walk(
+    context: Arc<ProjectContext>,
+    roots: Vec<PathBuf>,
+    input: &WorkspaceInput,
+    mut limits: ResolverLimits,
+) -> UnitResolver<LspSourceStore> {
+    limits.max_compile_time_byte_work = byte_work_cap(limits.max_compile_time_byte_work);
+    UnitResolver::new(
+        context.clone(),
+        roots,
+        LspSourceStore::from_input(context, input),
+        limits,
+    )
+}
+
 pub(crate) fn resolver_for_context_with_session_cache(
     context: Arc<ProjectContext>,
     observations: &ProjectObservations,

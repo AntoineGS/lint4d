@@ -5090,6 +5090,46 @@ struct UnverifiedRanking {
     /// What every include lookup observed, proven or not: a proof reusing
     /// another member's (`includes`) observes nothing itself.
     observed: Vec<BaselineEntry>,
+    /// Include resolutions shared by the request's members (Task 8c).
+    resolutions: HashMap<ResolutionKey, SharedResolution>,
+    /// What the member walk in progress added to `includes` and
+    /// `resolutions`, dropped if it starts again unshared.
+    attempt: Vec<AttemptEntry>,
+    /// Lookups answered from `resolutions`, and the time include walks took.
+    shared_hits: usize,
+    walk_time: std::time::Duration,
+}
+
+/// What an include lookup's answer reads besides the resolver's own
+/// history: the context, the including file's directory (its owner entry
+/// and the include search entries derive from it), the name as written,
+/// and what the legacy route the lookup passes authorizes (the resolver
+/// reads a route only through `legacy_route_authorizes*`, the stores only
+/// its presence), as the resolver's own shared misses are keyed
+/// (`IncludeFailureKey`). The including file's own identity and the member
+/// it belongs to are not read.
+type ResolutionKey = (
+    ContextKey,
+    PathBuf,
+    String,
+    Option<pascal_core::LegacyRouteAuthority>,
+);
+
+/// A `Found` include resolution and what it charged the resolver that made
+/// it, for a file that resolver had not loaded before.
+#[derive(Clone)]
+struct SharedResolution {
+    child: pascal_core::resolver::ResolvedSource,
+    files: usize,
+    bytes: usize,
+    /// Directory entries the lookup's listings held, cached ones included:
+    /// at most what a resolver without those listings would scan.
+    consulted: usize,
+}
+
+enum AttemptEntry {
+    Include((ContextKey, String, bool)),
+    Resolution(ResolutionKey),
 }
 
 /// The members a ranking proved absent, each with the stamp taken before
@@ -5117,6 +5157,21 @@ struct IncludeWalk<'a> {
     active: Vec<String>,
     /// Per path key reached, whether it passed a legacy route.
     routes: HashMap<String, bool>,
+    /// Whether lookups may be answered from `UnverifiedRanking::resolutions`.
+    share: bool,
+    limits: pascal_core::ResolverLimits,
+    /// Path keys of the files this walk's resolver loaded (the root
+    /// included), and of those answered from a shared resolution instead,
+    /// which it never loaded.
+    loaded: HashSet<String>,
+    virtual_loaded: HashSet<String>,
+    /// What the shared answers would have charged this walk's resolver.
+    virtual_files: usize,
+    virtual_bytes: usize,
+    virtual_consulted: usize,
+    /// The walk cannot prove its answers are a fresh resolver's: it is
+    /// walked again without sharing.
+    restart: bool,
 }
 
 impl IncludeWalk<'_> {
@@ -5129,6 +5184,32 @@ impl IncludeWalk<'_> {
             }
         }
         Some(())
+    }
+
+    /// Whether a resolver that had also loaded the files this walk's
+    /// shared answers name, and been charged for them, stays within its
+    /// include and directory-entry limits once charged `pending` (files,
+    /// bytes, consulted entries) more: then no lookup of this walk reaches
+    /// a limit there that it does not reach here.
+    fn fits(
+        &self,
+        resolver: &pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        pending: (usize, usize, usize),
+    ) -> bool {
+        let (files, bytes, _) = resolver.include_usage();
+        let (scanned, _) = resolver.directory_entries();
+        files
+            .saturating_add(self.virtual_files)
+            .saturating_add(pending.0)
+            <= self.limits.max_include_files
+            && bytes
+                .saturating_add(self.virtual_bytes)
+                .saturating_add(pending.1)
+                <= self.limits.max_include_bytes
+            && scanned
+                .saturating_add(self.virtual_consulted)
+                .saturating_add(pending.2)
+                <= self.limits.max_directory_entries
     }
 }
 
@@ -5188,6 +5269,10 @@ impl UnverifiedRanking {
             bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
             includes: HashMap::new(),
             observed: Vec::new(),
+            resolutions: HashMap::new(),
+            attempt: Vec::new(),
+            shared_hits: 0,
+            walk_time: std::time::Duration::ZERO,
         }
     }
 
@@ -5288,10 +5373,12 @@ impl UnverifiedRanking {
             ranked.sort_by_key(|(_, tier)| *tier);
         }
         crate::trace::trace!(
-            "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms",
+            "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms; include walks {:.1} ms, {} shared resolutions",
             ranked.len(),
             members.len(),
-            started.elapsed().as_secs_f64() * 1000.0
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.walk_time.as_secs_f64() * 1000.0,
+            self.shared_hits,
         );
         paths.extend(ranked.into_iter().map(|(path, _)| path));
         if !members.is_empty() {
@@ -5320,7 +5407,48 @@ impl UnverifiedRanking {
         if requests.is_empty() {
             return Some(Vec::new());
         }
-        let state = scope.workspace.contexts.get(scope.key)?;
+        let started = std::time::Instant::now();
+        let (bytes_left, observed) = (self.bytes_left, self.observed.len());
+        self.attempt.clear();
+        let mut proof = self.walk_member(scope, path, text, requests.clone(), true, cancel);
+        if let Err(()) = proof {
+            // Undo the shared attempt, so the walk without sharing reads,
+            // charges and records what a fresh resolver's walk would.
+            self.bytes_left = bytes_left;
+            self.observed.truncate(observed);
+            for entry in std::mem::take(&mut self.attempt) {
+                match entry {
+                    AttemptEntry::Include(key) => {
+                        self.includes.remove(&key);
+                    }
+                    AttemptEntry::Resolution(key) => {
+                        self.resolutions.remove(&key);
+                    }
+                }
+            }
+            proof = self.walk_member(scope, path, text, requests, false, cancel);
+        }
+        self.attempt.clear();
+        self.walk_time += started.elapsed();
+        proof.ok().flatten()
+    }
+
+    /// `includes_absent`'s walk of one member; `Err` when a lookup it
+    /// shared could have been answered differently by the member's own
+    /// resolver (only when `share`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_member(
+        &mut self,
+        scope: &IncludeScope<'_>,
+        path: &Path,
+        text: &[u8],
+        requests: Vec<super::lexical::IncludeRequest>,
+        share: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<BaselineEntry>>, ()> {
+        let Some(state) = scope.workspace.contexts.get(scope.key) else {
+            return Ok(None);
+        };
         let context = Arc::clone(&state.context);
         // A fresh resolver per member, as each member's analysis has: a
         // resolver keeps the first load of a file, with the provenance of
@@ -5328,17 +5456,33 @@ impl UnverifiedRanking {
         // default limits may exceed the session's: where the session's
         // include is `Incomplete` (an over-limit listing or include cap),
         // the proof may follow further, never to a different file, and the
-        // excluded member drops that "include incomplete" note.
+        // excluded member drops that "include incomplete" note. It holds
+        // none of the context's observations: no lookup's answer reads
+        // them, and building them into every member's resolver costs the
+        // square of their count (they only dedupe what a lookup reports).
         let mut limits = pascal_core::ResolverLimits::default();
         limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
-        let mut resolver = super::resolver::resolver_for_context_with_limits(
+        let mut resolver = super::resolver::resolver_for_include_walk(
             Arc::clone(&context),
-            &state.context_observations,
             scope.input.roots.clone(),
             scope.input,
             limits,
         );
-        (|| {
+        let mut walk = IncludeWalk {
+            key: scope.key,
+            context: &context,
+            active: Vec::new(),
+            routes: HashMap::new(),
+            share,
+            limits,
+            loaded: HashSet::new(),
+            virtual_loaded: HashSet::new(),
+            virtual_files: 0,
+            virtual_bytes: 0,
+            virtual_consulted: 0,
+            restart: false,
+        };
+        let proof = (|| {
             let uri = Url::from_file_path(path).ok()?;
             let route = scope
                 .workspace
@@ -5360,12 +5504,8 @@ impl UnverifiedRanking {
                 return None;
             }
             let route = resolver.legacy_route_for_source(&root, None);
-            let mut walk = IncludeWalk {
-                key: scope.key,
-                context: &context,
-                active: vec![path_key(&root.path)],
-                routes: HashMap::new(),
-            };
+            walk.active.push(path_key(&root.path));
+            walk.loaded.insert(path_key(&root.path));
             let mut baseline = Vec::new();
             self.follow(
                 &mut resolver,
@@ -5377,7 +5517,8 @@ impl UnverifiedRanking {
                 cancel,
             )?;
             Some(baseline)
-        })()
+        })();
+        if walk.restart { Err(()) } else { Ok(proof) }
     }
 
     /// Follows the include `requests` of the file `including`, loaded under
@@ -5406,26 +5547,8 @@ impl UnverifiedRanking {
             if walk.active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
                 return None;
             }
-            let outcome = resolver
-                .try_resolve_include(
-                    pascal_core::IncludeResolveRequest {
-                        including_path: including,
-                        byte_range: request.range,
-                        requested_name: &request.name,
-                        legacy_route: route.as_ref(),
-                    },
-                    cancel,
-                )
-                .ok()?;
-            self.observed.extend(
-                outcome
-                    .observations
-                    .iter()
-                    .filter_map(super::rename::resolver_observation_baseline),
-            );
-            let pascal_core::Resolution::Found(child) = outcome.result else {
-                return None;
-            };
+            let child =
+                self.resolve(resolver, walk, including, &request, route.as_ref(), cancel)?;
             let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = child.revision
             else {
                 return None;
@@ -5485,12 +5608,111 @@ impl UnverifiedRanking {
                 })
             })();
             walk.routes = outer;
-            self.includes.insert(memo, proven.clone());
+            if self.includes.insert(memo.clone(), proven.clone()).is_none() {
+                self.attempt.push(AttemptEntry::Include(memo));
+            }
             let proven = proven?;
             walk.merge_routes(&proven.routes)?;
             baseline.extend(proven.baseline);
         }
         Some(())
+    }
+
+    /// The file the include `request` of `including` resolves to, as the
+    /// walk's resolver resolves it, or `None`. A lookup a member of the
+    /// request already made with the same `ResolutionKey` is answered from
+    /// it, without searching again, when the walk's own resolver would give
+    /// the same answer: it has not loaded that file (its first load would
+    /// otherwise answer, with that load's provenance), and with every
+    /// shared answer charged to it no include or directory-entry limit is
+    /// reached. Every other answer comes from the resolver; one that loads
+    /// a file a shared answer named, or reaches a limit once the shared
+    /// answers are charged, stops the walk for a walk without sharing
+    /// (`IncludeWalk::restart`). The shared answer's observations were
+    /// recorded by the member that made it (`observed`).
+    fn resolve(
+        &mut self,
+        resolver: &mut pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        walk: &mut IncludeWalk<'_>,
+        including: &Path,
+        request: &super::lexical::IncludeRequest,
+        route: Option<&pascal_core::LegacyRoute>,
+        cancel: &AtomicBool,
+    ) -> Option<pascal_core::resolver::ResolvedSource> {
+        let key: ResolutionKey = (
+            walk.key.clone(),
+            including.parent()?.to_path_buf(),
+            request.name.clone(),
+            route.map(pascal_core::LegacyRouteAuthority::of),
+        );
+        if walk.share
+            && let Some(shared) = self.resolutions.get(&key)
+        {
+            let child_key = path_key(&shared.child.path);
+            if !walk.loaded.contains(&child_key)
+                && !walk.virtual_loaded.contains(&child_key)
+                && walk.fits(resolver, (shared.files, shared.bytes, shared.consulted))
+            {
+                walk.virtual_files += shared.files;
+                walk.virtual_bytes += shared.bytes;
+                walk.virtual_consulted += shared.consulted;
+                walk.virtual_loaded.insert(child_key);
+                self.shared_hits += 1;
+                return Some(shared.child.clone());
+            }
+        }
+        let (files, bytes, _) = resolver.include_usage();
+        let (_, consulted) = resolver.directory_entries();
+        let outcome = resolver
+            .try_resolve_include(
+                pascal_core::IncludeResolveRequest {
+                    including_path: including,
+                    byte_range: request.range.clone(),
+                    requested_name: &request.name,
+                    legacy_route: route,
+                },
+                cancel,
+            )
+            .ok()?;
+        self.observed.extend(
+            outcome
+                .observations
+                .iter()
+                .filter_map(super::rename::resolver_observation_baseline),
+        );
+        let pascal_core::Resolution::Found(child) = outcome.result else {
+            return None;
+        };
+        let child_key = path_key(&child.path);
+        let (files_after, bytes_after, _) = resolver.include_usage();
+        let (_, consulted_after) = resolver.directory_entries();
+        let added = (
+            files_after.saturating_sub(files),
+            bytes_after.saturating_sub(bytes),
+            consulted_after.saturating_sub(consulted),
+        );
+        let has_virtual = !walk.virtual_loaded.is_empty();
+        // A file reached through a shared answer would have been loaded:
+        // this lookup could then have reused that load.
+        if walk.virtual_loaded.contains(&child_key)
+            || (has_virtual && !walk.fits(resolver, (0, 0, 0)))
+        {
+            walk.restart = true;
+            return None;
+        }
+        if walk.loaded.insert(child_key) && !self.resolutions.contains_key(&key) {
+            self.resolutions.insert(
+                key.clone(),
+                SharedResolution {
+                    child: child.clone(),
+                    files: added.0,
+                    bytes: added.1,
+                    consulted: added.2,
+                },
+            );
+            self.attempt.push(AttemptEntry::Resolution(key));
+        }
+        Some(child)
     }
 
     /// Takes `bytes` from the budget; `None` past it.
@@ -8422,6 +8644,114 @@ pub(in crate::workspace) mod tests {
         assert!(names.contains(&"B.pas".to_owned()), "{names:?}");
         assert!(!baselined(&found, &b), "{:?}", found.baseline);
         assert!(names.contains(&"C.pas".to_owned()), "{names:?}");
+    }
+
+    /// Task 8c (R9-5): members of one request that include the same name
+    /// from the same directory, under the same route, share its
+    /// resolution: it is searched once, and both members are excluded with
+    /// the include's stamp.
+    #[test]
+    fn members_including_one_name_from_one_directory_share_its_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        let defs = root.join("lib/Defs.inc");
+        for (path, name) in [(&first, "GuardA"), (&second, "GuardB")] {
+            write(
+                path,
+                &format!("unit {name};\n{{$I Defs.inc}}\ninterface\nimplementation\nend.\n"),
+            );
+        }
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        for path in [&first, &second, &defs] {
+            assert!(baselined(&found, path), "{path:?}: {:?}", found.baseline);
+        }
+    }
+
+    /// Task 8c (R9-5): a member whose own lookup reaches a file it was
+    /// given by a shared resolution (its resolver never loaded it, and
+    /// would have answered from that load) is walked again without
+    /// sharing, with the result a walk of its own gives.
+    #[test]
+    fn a_member_reaching_a_shared_file_again_is_walked_without_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &first,
+            "unit GuardA;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &second,
+            "unit GuardB;\n{$I Defs.inc}\n{$I ..\\lib\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        // A: one search. B: a shared answer, then its own search finds the
+        // shared file and the walk starts again: two searches.
+        assert_eq!(pascal_core::take_include_searches(), 4);
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        for path in [&first, &second, &defs] {
+            assert!(baselined(&found, path), "{path:?}: {:?}", found.baseline);
+        }
+    }
+
+    /// Task 8c (R9-5): the same include name from two directories resolves
+    /// to two files: the shared resolution is keyed by the including
+    /// directory, so the member whose own directory's file spells the name
+    /// is still bound.
+    #[test]
+    fn one_include_name_from_two_directories_is_resolved_for_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let quiet = root.join("lib/GuardA.pas");
+        let spelled = root.join("other/GuardB.pas");
+        for (path, name) in [(&quiet, "GuardA"), (&spelled, "GuardB")] {
+            write(
+                path,
+                &format!("unit {name};\n{{$I Defs.inc}}\ninterface\nimplementation\nend.\n"),
+            );
+        }
+        write(&root.join("lib/Defs.inc"), "{$DEFINE GUARDED}\n");
+        write(&root.join("other/Defs.inc"), "const Copy = SharedValue;\n");
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib;other</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for path in [&quiet, &spelled] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(pascal_core::take_include_searches(), 2);
+        assert_eq!(
+            source_names(&found),
+            ["GuardB.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(baselined(&found, &quiet), "{:?}", found.baseline);
+        assert!(!baselined(&found, &spelled), "{:?}", found.baseline);
     }
 
     /// Minor 4: an include open in the editor is read from its buffer, not

@@ -1499,6 +1499,10 @@ pub struct UnitResolver<S> {
     package_lookups: usize,
     package_catalogue_count: usize,
     scanned_entries: usize,
+    /// Entries of every directory listing a lookup consulted outside a
+    /// compile-time session, a cached listing included: what a resolver
+    /// without that cache would have scanned.
+    consulted_entries: usize,
     project_includes: Vec<ResolvedInclude>,
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
@@ -3029,6 +3033,7 @@ impl<S: SourceStore> UnitResolver<S> {
             package_lookups: 0,
             package_catalogue_count: 0,
             scanned_entries: 0,
+            consulted_entries: 0,
             project_includes: Vec::new(),
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
@@ -3916,6 +3921,12 @@ impl<S: SourceStore> UnitResolver<S> {
         self.limits.max_include_files = max_files;
         self.limits.max_include_bytes = max_bytes;
         self.limits.max_include_directives = max_directives;
+    }
+
+    /// Directory entries scanned (what `max_directory_entries` bounds), and
+    /// consulted, cached listings included, outside a compile-time session.
+    pub fn directory_entries(&self) -> (usize, usize) {
+        (self.scanned_entries, self.consulted_entries)
     }
 
     pub fn include_usage(&self) -> (usize, usize, usize) {
@@ -5907,6 +5918,12 @@ impl<S: SourceStore> UnitResolver<S> {
         if self.compile_time_store.is_none()
             && let Some(listing) = self.directories.get(&cache_key).cloned()
         {
+            self.consulted_entries = self.consulted_entries.saturating_add(
+                listing
+                    .files
+                    .len()
+                    .saturating_add(listing.directories.len()),
+            );
             return Ok(DirectoryAccess::Legacy(listing));
         }
         let request = DirectoryRequest {
@@ -5927,6 +5944,12 @@ impl<S: SourceStore> UnitResolver<S> {
             Err(error) => return Err(root_store_error(error)),
         };
         self.scanned_entries = self.scanned_entries.saturating_add(
+            listing
+                .files
+                .len()
+                .saturating_add(listing.directories.len()),
+        );
+        self.consulted_entries = self.consulted_entries.saturating_add(
             listing
                 .files
                 .len()
@@ -9186,7 +9209,7 @@ pub struct LegacyRouteAuthority {
 }
 
 impl LegacyRouteAuthority {
-    fn of(route: &LegacyRoute) -> Self {
+    pub fn of(route: &LegacyRoute) -> Self {
         let sibling_directory = canonical_path(&route.sibling_directory);
         let valid = canonical_path(&route.source_path)
             .parent()

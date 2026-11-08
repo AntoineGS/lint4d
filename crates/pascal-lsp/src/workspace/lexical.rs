@@ -67,7 +67,7 @@ pub(crate) fn holds_identifier(text: &[u8], needles: &[String]) -> bool {
 
 /// An include directive of a member's raw text: its byte range and the file
 /// name the resolver looks up (`pascal_core::resolver::include_name`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct IncludeRequest {
     pub(crate) range: Range<usize>,
     pub(crate) name: String,

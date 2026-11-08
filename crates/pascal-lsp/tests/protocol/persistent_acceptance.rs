@@ -8,7 +8,6 @@ use super::persistent_index::{complete, persisted, shutdown, wait_index};
 use super::persistent_queries::*;
 use super::*;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 /// The unmutated matrix fixture: the persisting first server and the warm
 /// second server both answer like an uncached server, and the warm one
@@ -631,10 +630,13 @@ fn watched_batch(server: &mut TestServer, changes: &[(PathBuf, u8)]) {
     );
 }
 
-/// A warm server over the store of a first one that persisted `OPENS`'
-/// context: index complete, background settled, nothing extracted.
-fn running_warm(environment: &Path, root: &Path) -> TestServer {
-    warm_server(environment, root, &OPENS)
+/// Waits until the server has processed the change events: the (complete)
+/// context's `extracted` counter, 0 on a warm server that reused every
+/// member, only rises once the changed members were re-read.
+fn await_extraction(server: &mut TestServer) -> Value {
+    wait_index(server, |context| {
+        complete(context) && context["extracted"].as_u64() > Some(0)
+    })
 }
 
 /// Answers `SHARED_REFERENCES` and `Symbols("TShared")` on a warm server
@@ -663,14 +665,16 @@ fn finish_and_compare(
 fn a_same_stamp_write_during_the_session() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &MATRIX);
-    let mut server = running_warm(environment.path(), &root);
+    let mut server = warm_server(environment.path(), &root, &OPENS);
     let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
     let before = answers(&mut server, &root, &queries);
-    assert_agree(&before, &before);
+    assert!(before.iter().all(|answer| answer.complete), "{before:?}");
     assert!(locates(&before[0], "Importer3.pas", 6, 2), "{before:?}");
 
     move_occurrence_keeping_the_stamp(&root, "lib/Importer3.pas");
     watched_batch(&mut server, &[(root.join("lib/Importer3.pas"), 2)]);
+    let processed = await_extraction(&mut server);
+    assert!(processed["extracted"].as_u64() >= Some(1), "{processed}");
     let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
     assert_agree(&warm, &uncached);
     assert_ne!(warm, before, "the write is visible");
@@ -692,6 +696,10 @@ fn a_same_stamp_write_during_the_session() {
 /// stamp seen, `Importer2.pas` restored byte-identical with a new mtime and
 /// `App.dproj` edited by whitespace only. Everything settled.
 fn branch_switch(root: &Path) {
+    let first_stamp = fs::metadata(root.join("lib/Importer1.pas"))
+        .unwrap()
+        .modified()
+        .unwrap();
     fs::remove_file(root.join("lib/Other3.pas")).unwrap();
     write_file(
         &root.join("lib/Branch.pas"),
@@ -712,7 +720,7 @@ fn branch_switch(root: &Path) {
         .write(true)
         .open(root.join("lib/Importer1.pas"))
         .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .set_modified(first_stamp - Duration::from_secs(3600))
         .unwrap();
 }
 
@@ -781,9 +789,11 @@ fn a_branch_switch_while_stopped() {
 fn a_branch_switch_while_running() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &MATRIX);
-    let mut server = running_warm(environment.path(), &root);
+    let mut server = warm_server(environment.path(), &root, &OPENS);
     branch_switch(&root);
     watched_batch(&mut server, &branch_changes(&root));
+    let processed = await_extraction(&mut server);
+    assert!(processed["extracted"].as_u64() >= Some(2), "{processed}");
     let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
     let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
     assert_agree(&warm, &uncached);
@@ -797,12 +807,14 @@ fn a_branch_switch_while_running() {
 fn a_branch_switch_while_running_with_a_watcher_overflow() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &MATRIX);
-    let mut server = running_warm(environment.path(), &root);
+    let mut server = warm_server(environment.path(), &root, &OPENS);
     branch_switch(&root);
     let padding: Vec<_> = (0..65)
         .map(|index| (root.join(format!("lib/Padding{index}.pas")), 2))
         .collect();
     watched_batch(&mut server, &padding);
+    let processed = await_extraction(&mut server);
+    assert!(processed["extracted"].as_u64() >= Some(2), "{processed}");
     let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
     let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
     assert_agree(&warm, &uncached);
@@ -843,7 +855,7 @@ fn a_regenerated_source_is_reused_or_reextracted_by_content() {
     assert_agree(&warm, &uncached);
     assert_eq!(warm, original);
     assert_eq!(status["extracted"], 0, "{status}");
-    assert!(status["reused"].as_u64() > Some(0), "{status}");
+    assert_eq!(status["reused"], status["members"], "{status}");
 
     rewrite_keeping_the_stamp(
         &generated,
@@ -859,9 +871,10 @@ fn a_regenerated_source_is_reused_or_reextracted_by_content() {
 
 /// A mutation applied with fresh mtimes (a changed member, a new member and
 /// their directory) while the warm server is stopped. The immediate answers
-/// are truthful (a partial answer only lists uncached locations); once the
-/// stamps settle with wall-clock time, the context completes on its own and
-/// the answers equal the uncached ones.
+/// are truthful (a partial answer only lists uncached locations); the
+/// context still completes by itself (re-extracting the changed and new
+/// members; it does not wait for the 2 s settle window) and the answers
+/// equal the uncached ones.
 #[test]
 fn an_unsettled_tree_is_truthful_then_completes() {
     let environment = tempfile::tempdir().unwrap();
@@ -904,7 +917,6 @@ fn an_unsettled_tree_is_truthful_then_completes() {
             started.elapsed()
         );
     };
-    eprintln!("unsettled tree completed after {:?}", started.elapsed());
     settle_background(&mut server);
     let settled = answers(&mut server, &root, &queries);
     shutdown(server);
@@ -914,4 +926,5 @@ fn an_unsettled_tree_is_truthful_then_completes() {
     assert!(locates(&settled[0], "Fresh.pas", 6, 2), "{settled:?}");
     assert!(locates(&settled[0], "Importer3.pas", 6, 0), "{settled:?}");
     assert!(status["reused"].as_u64() > Some(0), "{status}");
+    assert!(status["extracted"].as_u64() >= Some(1), "{status}");
 }

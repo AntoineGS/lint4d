@@ -10752,6 +10752,75 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// A session of another build (`byte` names its namespace) that
+        /// opens the store and closes it.
+        fn other_build_session(root: &Path, directory: &Path, byte: u8, options: CacheOptions) {
+            let workspace = workspace(root, WorkspaceOptions::default());
+            let cache = PersistentCache::start_unscheduled_for_test(
+                CacheOptions {
+                    directory: Some(directory.to_path_buf()),
+                    ..options
+                },
+                workspace.project_cache().clone(),
+                Arc::default(),
+                Namespace::new(Digest::from_bytes([byte; 32])),
+            );
+            assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
+            cache.shutdown();
+        }
+
+        /// l4d-1ypi: the editor's build and another build alternating on
+        /// one store. Each start used to retire the other build's namespace,
+        /// so every start was cold.
+        #[test]
+        fn a_build_started_again_after_another_build_reuses_its_facts() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (key, anchor) = first_session(temp.path(), store.path(), 40);
+            other_build_session(temp.path(), store.path(), 12, CacheOptions::default());
+            let (mut third, cache) = restarted_view(temp.path(), store.path());
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut third,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(
+                crate::navigation::test_document_parse_count(),
+                0,
+                "no member was parsed"
+            );
+            assert_eq!(progress.reused, 40, "{progress:?}");
+            assert_eq!(recorded(&third, &key).len(), 40);
+            cache.shutdown();
+        }
+
+        /// With `persistentCacheMaxNamespaces` 1 the other build's start
+        /// retires this build's namespace (the behaviour before l4d-1ypi).
+        #[test]
+        fn a_store_keeping_one_namespace_starts_the_other_build_cold() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let (_, anchor) = first_session(temp.path(), store.path(), 4);
+            other_build_session(
+                temp.path(),
+                store.path(),
+                12,
+                CacheOptions {
+                    max_namespaces: 1,
+                    ..CacheOptions::default()
+                },
+            );
+            let (mut third, cache) = restarted_view(temp.path(), store.path());
+            let progress = advance(
+                &mut third,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(progress.reused, 0, "{progress:?}");
+            cache.shutdown();
+        }
+
         /// Release's child configurations of `configured_project`: with
         /// Debug and Release they are one more context than the index store
         /// holds (`MAX_INDEXED_CONTEXTS`).

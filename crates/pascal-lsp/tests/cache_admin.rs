@@ -406,3 +406,132 @@ fn every_mode_writes_one_bounded_json_line() {
     assert_eq!(json["store"], "present");
     assert!(json.get("directoryTruncated").is_none());
 }
+
+fn other_build(byte: u8) -> Namespace {
+    Namespace::new(pascal_cache::Digest::from_bytes([byte; 32]))
+}
+
+/// l4d-1ypi: status lists every retained namespace with its last use, size
+/// and whether a live process holds it.
+#[test]
+fn status_lists_the_retained_namespaces() {
+    let environment = tempfile::tempdir().unwrap();
+    let directory = private_directory(environment.path(), "store");
+    drop(Store::open(&directory, &other_build(1), StoreLimits::default()).unwrap());
+    let held = Store::open(&directory, Namespace::current(), StoreLimits::default()).unwrap();
+    let (code, json, _) = admin(
+        environment.path(),
+        &["--cache-status", "--cache-directory", text(&directory)],
+    );
+    let json = json.unwrap();
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["namespaces"]["live"], 2, "{json}");
+    let list = json["namespaces"]["list"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{json}");
+    let entry = |id: pascal_cache::Digest| {
+        list.iter()
+            .find(|entry| entry["id"] == id.to_hex())
+            .unwrap_or_else(|| panic!("{json}"))
+    };
+    let current = entry(Namespace::current().id());
+    assert_eq!(current["current"], true);
+    assert_eq!(current["held"], true);
+    assert_eq!(current["resetEpoch"], 0);
+    assert!(current["lastUsed"].is_u64(), "{json}");
+    // A held namespace is not estimated (its rows may change).
+    assert!(current["estimatedBytes"].is_null(), "{json}");
+    let other = entry(other_build(1).id());
+    assert_eq!(other["current"], false);
+    assert_eq!(other["held"], false);
+    assert_eq!(json["namespaces"]["listTruncated"], false);
+    drop(held);
+}
+
+#[test]
+fn a_status_listing_many_namespaces_stays_within_one_bounded_line() {
+    let environment = tempfile::tempdir().unwrap();
+    let directory = private_directory(environment.path(), &"s".repeat(200));
+    let keep_all = StoreLimits {
+        max_namespaces: pascal_cache::MAX_NAMESPACES,
+        ..StoreLimits::default()
+    };
+    for byte in 1..=pascal_cache::MAX_NAMESPACES as u8 {
+        drop(Store::open(&directory, &other_build(byte), keep_all).unwrap());
+    }
+    // `admin` checks the 4 KiB bound.
+    let (code, json, _) = admin(
+        environment.path(),
+        &["--cache-status", "--cache-directory", text(&directory)],
+    );
+    let json = json.unwrap();
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["namespaces"]["live"], pascal_cache::MAX_NAMESPACES);
+    let listed = json["namespaces"]["list"].as_array().unwrap().len();
+    assert!(listed >= 8, "{json}");
+    assert_eq!(
+        json["namespaces"]["listTruncated"],
+        listed < pascal_cache::MAX_NAMESPACES,
+        "{json}"
+    );
+}
+
+#[test]
+fn prune_keeping_one_namespace_retires_the_other_builds() {
+    let environment = tempfile::tempdir().unwrap();
+    let directory = private_directory(environment.path(), "store");
+    drop(Store::open(&directory, &other_build(1), StoreLimits::default()).unwrap());
+    let (code, json, _) = admin(
+        environment.path(),
+        &["--cache-prune", "--cache-directory", text(&directory)],
+    );
+    assert_eq!(code, 0, "{json:?}");
+    let live = |environment: &Path| {
+        let (_, json, _) = admin(
+            environment,
+            &["--cache-status", "--cache-directory", text(&directory)],
+        );
+        json.unwrap()["namespaces"]["live"].as_u64().unwrap()
+    };
+    assert_eq!(live(environment.path()), 2, "the default keeps both builds");
+    let (code, json, _) = admin(
+        environment.path(),
+        &[
+            "--cache-prune",
+            "--cache-max-namespaces",
+            "1",
+            "--cache-directory",
+            text(&directory),
+        ],
+    );
+    assert_eq!(code, 0, "{json:?}");
+    assert_eq!(live(environment.path()), 1);
+}
+
+#[test]
+fn the_namespace_count_option_is_validated() {
+    let environment = tempfile::tempdir().unwrap();
+    let directory = environment.path().join("z");
+    let directory = text(&directory);
+    let cases: &[&[&str]] = &[
+        &["--cache-prune", "--cache-max-namespaces", "0"],
+        &["--cache-prune", "--cache-max-namespaces", "17"],
+        &["--cache-prune", "--cache-max-namespaces", "x"],
+        &["--cache-prune", "--cache-max-namespaces"],
+        &["--cache-status", "--cache-max-namespaces", "2"],
+        &[
+            "--cache-reset",
+            "--cache-max-namespaces",
+            "2",
+            "--cache-max-namespaces",
+            "2",
+        ],
+    ];
+    for case in cases {
+        let mut arguments = case.to_vec();
+        arguments.extend(["--cache-directory", directory]);
+        let (code, json, stderr) = admin(environment.path(), &arguments);
+        assert_eq!(code, 2, "{case:?} {json:?}");
+        assert!(stderr.contains("--help"), "{case:?}: {stderr}");
+    }
+    assert!(!Path::new(directory).exists());
+}

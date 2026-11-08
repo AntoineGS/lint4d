@@ -2060,7 +2060,9 @@ fn ac2_a_low_budget_bounds_writes_and_maintenance_reclaims_obsolete_versions() {
     .unwrap();
     publish_bulk(&obsolete, "unit Old;", 9, 1_000_000).unwrap();
     drop(obsolete);
-    let store = open(root.path()); // retires namespace 2 at open
+    // Namespace 2 is kept at open (l4d-1ypi); over the low budget below,
+    // maintenance retires it as the least recently used.
+    let store = open(root.path());
     store.checkpoint().unwrap();
     let full = store.usage().unwrap();
     store

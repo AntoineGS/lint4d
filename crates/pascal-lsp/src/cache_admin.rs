@@ -6,7 +6,10 @@
 use crate::persistent_cache::names;
 use crate::persistent_cache::status::{UsageView, truncate, usage_json};
 use pascal_cache::admin::{self, PruneLimits, StoreStatus};
-use pascal_cache::{Bypass, Namespace, PolicyError, Store, StoreLimits, StorePolicy};
+use pascal_cache::{
+    Bypass, DEFAULT_MAX_NAMESPACES, Digest, MAX_NAMESPACES, Namespace, PolicyError, Store,
+    StoreLimits, StorePolicy,
+};
 use serde_json::{Value, json};
 use std::fmt;
 use std::path::PathBuf;
@@ -15,6 +18,8 @@ use std::path::PathBuf;
 const MAX_DIRECTORY_BYTES: usize = 4096;
 /// Longest directory echoed in the JSON output, in escaped bytes.
 const MAX_REPORTED_DIRECTORY_BYTES: usize = 2048;
+/// Longest JSON line a mode writes.
+const MAX_OUTPUT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
@@ -24,6 +29,9 @@ pub enum Invocation {
     Cache {
         directory: Option<PathBuf>,
         mode: CacheMode,
+        /// `--cache-max-namespaces`: the namespaces the opened store keeps
+        /// (l4d-1ypi); `None` keeps the default.
+        max_namespaces: Option<usize>,
     },
 }
 
@@ -85,6 +93,7 @@ pub fn parse_arguments(arguments: &[String]) -> Result<Invocation, UsageError> {
     let mut simple: Option<CacheMode> = None;
     let mut max_disk_bytes = None;
     let mut wal_threshold_bytes = None;
+    let mut max_namespaces = None;
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
         let mode = match argument.as_str() {
@@ -128,6 +137,20 @@ pub fn parse_arguments(arguments: &[String]) -> Result<Invocation, UsageError> {
                     return Err(usage("--cache-wal-threshold-bytes given twice"));
                 }
             }
+            "--cache-max-namespaces" => {
+                let value = positive(argument, iterator.next())?;
+                let value = usize::try_from(value)
+                    .ok()
+                    .filter(|value| *value <= MAX_NAMESPACES)
+                    .ok_or_else(|| {
+                        usage(format!(
+                            "--cache-max-namespaces needs an integer from 1 to {MAX_NAMESPACES}"
+                        ))
+                    })?;
+                if max_namespaces.replace(value).is_some() {
+                    return Err(usage("--cache-max-namespaces given twice"));
+                }
+            }
             "--stdio" | "-h" | "--help" | "-V" | "--version" => {
                 return Err(usage(format!(
                     "{argument} cannot be combined with a cache mode"
@@ -148,9 +171,22 @@ pub fn parse_arguments(arguments: &[String]) -> Result<Invocation, UsageError> {
             max_disk_bytes,
             wal_threshold_bytes,
         },
-        (None, false) => return Err(usage("--cache-directory needs a cache mode")),
+        (None, false) => {
+            return Err(usage(
+                "--cache-directory and --cache-max-namespaces need a cache mode",
+            ));
+        }
     };
-    Ok(Invocation::Cache { directory, mode })
+    if mode == CacheMode::Status && max_namespaces.is_some() {
+        return Err(usage(
+            "--cache-max-namespaces cannot be combined with --cache-status, which retires nothing",
+        ));
+    }
+    Ok(Invocation::Cache {
+        directory,
+        mode,
+        max_namespaces,
+    })
 }
 
 fn parse_server_arguments(arguments: &[String]) -> Result<Invocation, UsageError> {
@@ -234,7 +270,7 @@ fn directory_json(directory: Option<&PathBuf>) -> (Value, bool) {
     (json!(kept), kept.len() < lossy.len())
 }
 
-pub fn run(directory: Option<PathBuf>, mode: CacheMode) -> Outcome {
+pub fn run(directory: Option<PathBuf>, mode: CacheMode, max_namespaces: Option<usize>) -> Outcome {
     let resolved = match directory {
         Some(directory) => Ok(directory),
         None => pascal_cache::default_directory(),
@@ -246,7 +282,13 @@ pub fn run(directory: Option<PathBuf>, mode: CacheMode) -> Outcome {
     }
     let (json, code, stderr) = match &resolved {
         Err(bypass) => bypass_failure(base, mode.name(), bypass),
-        Ok(directory) => execute(base, directory, &mode),
+        Ok(directory) => {
+            let limits = StoreLimits {
+                max_namespaces: max_namespaces.unwrap_or(DEFAULT_MAX_NAMESPACES),
+                ..StoreLimits::default()
+            };
+            execute(base, directory, &mode, limits)
+        }
     };
     Outcome {
         code,
@@ -255,9 +297,13 @@ pub fn run(directory: Option<PathBuf>, mode: CacheMode) -> Outcome {
     }
 }
 
-fn execute(mut base: Value, directory: &std::path::Path, mode: &CacheMode) -> (Value, i32, String) {
+fn execute(
+    mut base: Value,
+    directory: &std::path::Path,
+    mode: &CacheMode,
+    limits: StoreLimits,
+) -> (Value, i32, String) {
     let namespace = Namespace::current();
-    let limits = StoreLimits::default();
     let name = mode.name();
     match mode {
         CacheMode::Status => match admin::status(directory) {
@@ -290,10 +336,13 @@ fn execute(mut base: Value, directory: &std::path::Path, mode: &CacheMode) -> (V
                 base["namespaces"] = json!({
                     "live": report.live_namespaces,
                     "retired": report.retired_namespaces,
+                    "list": [],
+                    "listTruncated": report.namespaces_truncated,
                 });
                 base["retiredScopes"] = json!(report.retired_scopes);
                 base["liveLeases"] = json!(report.live_leases);
                 base["advice"] = json!(names::advice_name(report.advice));
+                list_namespaces(&mut base, &report.namespaces, namespace.id());
                 (base, 0, String::new())
             }
         },
@@ -329,7 +378,43 @@ fn execute(mut base: Value, directory: &std::path::Path, mode: &CacheMode) -> (V
         CacheMode::Policy {
             max_disk_bytes,
             wal_threshold_bytes,
-        } => set_policy(base, directory, *max_disk_bytes, *wal_threshold_bytes),
+        } => set_policy(
+            base,
+            directory,
+            *max_disk_bytes,
+            *wal_threshold_bytes,
+            limits,
+        ),
+    }
+}
+
+/// List `namespaces` in `base`, the most recently used first, dropping the
+/// least recently used ones that would take the line past
+/// [`MAX_OUTPUT_BYTES`].
+fn list_namespaces(base: &mut Value, namespaces: &[admin::NamespaceStatus], current: Digest) {
+    let entries: Vec<Value> = namespaces
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id.to_hex(),
+                "current": entry.id == current,
+                "resetEpoch": entry.reset_epoch,
+                "lastUsed": entry.last_used_unix_seconds,
+                "estimatedBytes": entry.estimated_bytes,
+                "held": entry.held,
+            })
+        })
+        .collect();
+    let mut listed = entries.len();
+    loop {
+        base["namespaces"]["list"] = Value::Array(entries[..listed].to_vec());
+        if listed < entries.len() {
+            base["namespaces"]["listTruncated"] = json!(true);
+        }
+        if listed == 0 || base.to_string().len() <= MAX_OUTPUT_BYTES {
+            return;
+        }
+        listed -= 1;
     }
 }
 
@@ -338,8 +423,9 @@ fn set_policy(
     directory: &std::path::Path,
     max_disk_bytes: Option<u64>,
     wal_threshold_bytes: Option<u64>,
+    limits: StoreLimits,
 ) -> (Value, i32, String) {
-    let store = match Store::open(directory, Namespace::current(), StoreLimits::default()) {
+    let store = match Store::open(directory, Namespace::current(), limits) {
         Ok(store) => store,
         Err(bypass) => return bypass_failure(base, "policy", &bypass),
     };
@@ -405,7 +491,8 @@ mod tests {
             parse_arguments(&args(&["--cache-status"])),
             Ok(Invocation::Cache {
                 directory: None,
-                mode: CacheMode::Status
+                mode: CacheMode::Status,
+                max_namespaces: None,
             })
         ));
         assert!(matches!(
@@ -422,6 +509,14 @@ mod tests {
                     max_disk_bytes: Some(1073741824),
                     wal_threshold_bytes: Some(16777216)
                 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_arguments(&args(&["--cache-prune", "--cache-max-namespaces", "16"])),
+            Ok(Invocation::Cache {
+                mode: CacheMode::Prune,
+                max_namespaces: Some(16),
                 ..
             })
         ));
@@ -448,6 +543,10 @@ mod tests {
             ],
             &["--cache-directory", &long, "--cache-status"],
             &["--bogus"],
+            &["--cache-max-namespaces", "2"],
+            &["--cache-status", "--cache-max-namespaces", "2"],
+            &["--cache-prune", "--cache-max-namespaces", "0"],
+            &["--cache-prune", "--cache-max-namespaces", "17"],
         ] {
             assert!(parse_arguments(&args(bad)).is_err(), "{bad:?}");
         }

@@ -27,7 +27,7 @@ fn store_directory(environment: &Path) -> PathBuf {
     environment.join("cache/lint4d/analysis")
 }
 
-fn rand_suffix() -> u64 {
+pub(super) fn rand_suffix() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -87,7 +87,7 @@ fn open(server: &mut TestServer, path: &Path, version: i32, text: &str) {
     );
 }
 
-fn change(server: &mut TestServer, path: &Path, version: i32, text: &str) {
+pub(super) fn change(server: &mut TestServer, path: &Path, version: i32, text: &str) {
     server.send_notification(
         "textDocument/didChange",
         json!({
@@ -97,7 +97,7 @@ fn change(server: &mut TestServer, path: &Path, version: i32, text: &str) {
     );
 }
 
-fn watched_change(server: &mut TestServer, path: &Path) {
+pub(super) fn watched_change(server: &mut TestServer, path: &Path) {
     server.send_notification(
         "workspace/didChangeWatchedFiles",
         json!({"changes": [{"uri": uri(path), "type": 2}]}),

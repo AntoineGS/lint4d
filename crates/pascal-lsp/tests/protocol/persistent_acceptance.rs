@@ -928,3 +928,211 @@ fn an_unsettled_tree_is_truthful_then_completes() {
     assert!(status["reused"].as_u64() > Some(0), "{status}");
     assert!(status["extracted"].as_u64() >= Some(1), "{status}");
 }
+
+/// Servers One and Two run concurrently over one warmed store. One holds
+/// an unsaved `Importer0.pas` without its `TShared` occurrence, Two an
+/// unsaved `Other1.pas` that imports `Shared` and spells `TShared`. Each
+/// answers like an uncached server with the same buffer, neither sees the
+/// other's buffer, and a later warm server without buffers answers like an
+/// uncached one on disk.
+#[test]
+fn two_live_sessions_with_distinct_overlays_answer_from_their_own_buffers() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let mut first = launch_labelled(environment.path(), "cache", "overlay-first");
+    first.initialize(&root, Value::Null);
+    open_disk(&mut first, &root, &OPENS);
+    wait_index(&mut first, persisted);
+    shutdown(first);
+
+    let importer = fs::read_to_string(root.join("lib/Importer0.pas"))
+        .unwrap()
+        .replace("  TShared.Create;\n", "");
+    let other = fs::read_to_string(root.join("lib/Other1.pas"))
+        .unwrap()
+        .replace("type TShared = class end;\n", "uses Shared;\n");
+    assert!(other.contains("uses Shared;") && other.contains("TShared.Create"));
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+
+    let mut one = launch_labelled(environment.path(), "cache", "overlay-one");
+    let mut two = launch_labelled(environment.path(), "cache", "overlay-two");
+    for (server, label) in [
+        (&mut one, "lib/Importer0.pas"),
+        (&mut two, "lib/Other1.pas"),
+    ] {
+        server.initialize(&root, Value::Null);
+        open_disk(server, &root, &OPENS);
+        let text = if label.contains("Importer0") {
+            &importer
+        } else {
+            &other
+        };
+        open_text(server, &root.join(label), text);
+    }
+    for server in [&mut one, &mut two] {
+        wait_index(server, complete);
+        settle_background(server);
+    }
+    let from_one = answers(&mut one, &root, &queries);
+    let from_two = answers(&mut two, &root, &queries);
+    shutdown(one);
+    shutdown(two);
+
+    let uncached_one = uncached_answers_with_overlays(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &[("lib/Importer0.pas", &importer)],
+        &queries,
+    );
+    let uncached_two = uncached_answers_with_overlays(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &[("lib/Other1.pas", &other)],
+        &queries,
+    );
+    assert_agree(&from_one, &uncached_one);
+    assert_agree(&from_two, &uncached_two);
+    assert!(
+        !locates(&from_one[0], "Importer0.pas", 6, 2),
+        "{from_one:?}"
+    );
+    assert!(!locates(&from_one[0], "Other1.pas", 6, 2), "{from_one:?}");
+    assert!(locates(&from_two[0], "Importer0.pas", 6, 2), "{from_two:?}");
+    assert!(locates(&from_two[0], "Other1.pas", 6, 2), "{from_two:?}");
+    assert!(
+        from_one[1]
+            .locations
+            .iter()
+            .any(|symbol| symbol.contains("/lib/Other1.pas")),
+        "{from_one:?}"
+    );
+    assert!(
+        from_two[1]
+            .locations
+            .iter()
+            .all(|symbol| !symbol.contains("/lib/Other1.pas")),
+        "{from_two:?}"
+    );
+
+    let mut third = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let status = wait_index(&mut third, complete);
+    let warm = answers(&mut third, &root, &queries);
+    shutdown(third);
+    let on_disk = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);
+    assert_agree(&warm, &on_disk);
+    assert!(locates(&warm[0], "Importer0.pas", 6, 2), "{warm:?}");
+    assert!(!locates(&warm[0], "Other1.pas", 6, 2), "{warm:?}");
+    assert_eq!(status["extracted"], 0, "{status}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
+}
+
+/// `Importer0.pas` is edited twice in a buffer (the occurrence removed,
+/// then moved to column 0), the final buffer is written to disk with
+/// `didSave` and a `Changed` event, and the document closes. A fresh warm
+/// server answers like an uncached one on disk, so only the saved text was
+/// published.
+#[test]
+fn a_save_transition_publishes_the_saved_text_only() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let path = root.join("lib/Importer0.pas");
+    let original = fs::read_to_string(&path).unwrap();
+    let removed = original.replace("  TShared.Create;\n", "");
+    let moved = original.replace("  TShared.Create;\n", "TShared.Create;\n");
+    assert!(removed != original && moved != original);
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+
+    let mut server = warm_server(environment.path(), &root, &OPENS);
+    open_disk(&mut server, &root, &["lib/Importer0.pas"]);
+    super::persistent_cache::change(&mut server, &path, 2, &removed);
+    super::persistent_cache::change(&mut server, &path, 3, &moved);
+    settle_background(&mut server);
+    fs::write(&path, &moved).unwrap();
+    server.send_notification(
+        "textDocument/didSave",
+        json!({"textDocument": {"uri": uri(&path)}}),
+    );
+    super::persistent_cache::watched_change(&mut server, &path);
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&path)}}),
+    );
+    let processed = await_extraction(&mut server);
+    assert!(processed["extracted"].as_u64() >= Some(1), "{processed}");
+    settle_background(&mut server);
+    shutdown(server);
+
+    let mut fresh = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let status = wait_index(&mut fresh, complete);
+    let warm = answers(&mut fresh, &root, &queries);
+    shutdown(fresh);
+    let uncached = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);
+    assert_agree(&warm, &uncached);
+    assert!(locates(&warm[0], "Importer0.pas", 6, 0), "{warm:?}");
+    assert!(!locates(&warm[0], "Importer0.pas", 6, 2), "{warm:?}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
+}
+
+/// `textDocument/rename` through the protocol: the in-process rule that
+/// rename never uses index selection is
+/// `rename_and_code_actions_never_use_index_selection`
+/// (src/workspace/queries.rs); here a warm server's edits equal an
+/// uncached server's. With unresolved includes both refuse or both edit
+/// identically; a smaller warm edit set would be an unproven edit.
+#[test]
+fn rename_on_a_warm_server_edits_like_an_uncached_one() {
+    const RENAME: Query = Query::Rename("lib/Shared.pas", 2, 6, "TRenamed");
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let run = differential_full(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        |_| {},
+        &[RENAME],
+    );
+    assert_agree(&run.cold, &run.uncached);
+    assert_agree(&run.warm, &run.uncached);
+    assert!(
+        run.warm[0].locations.len() > MATRIX.importers,
+        "{:?}",
+        run.warm
+    );
+    assert_eq!(run.warm_status["extracted"], 0, "{}", run.warm_status);
+    assert!(
+        run.warm_status["reused"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
+
+    let environment = tempfile::tempdir().unwrap();
+    let spec = FixtureSpec {
+        unresolved_includes: 3,
+        ..MATRIX
+    };
+    let root = query_fixture(environment.path(), &spec);
+    let run = differential_uncold(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        |_| {},
+        &[RENAME],
+    );
+    let (warm, uncached) = (&run.warm[0], &run.uncached[0]);
+    assert!(
+        warm.complete == uncached.complete
+            && (!warm.complete || warm.locations == uncached.locations),
+        "warm {warm:?} must equal uncached {uncached:?}"
+    );
+    assert!(
+        run.warm_status["reused"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
+}

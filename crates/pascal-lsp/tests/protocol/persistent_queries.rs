@@ -596,7 +596,7 @@ fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
 }
 
 /// A4: a didOpen whose `text` is `text`, not the file's.
-fn open_text(server: &mut TestServer, path: &Path, text: &str) {
+pub(super) fn open_text(server: &mut TestServer, path: &Path, text: &str) {
     server.send_notification(
         "textDocument/didOpen",
         json!({"textDocument": {
@@ -734,6 +734,8 @@ fn synthetic_warm_query_latency() {
 pub(super) enum Query {
     References(&'static str, u32, u32),
     Symbols(&'static str),
+    /// `textDocument/rename` of the symbol at the position to the name.
+    Rename(&'static str, u32, u32, &'static str),
 }
 
 /// A query's sorted locations (whole symbols for `workspace/symbol`), its
@@ -745,7 +747,72 @@ pub(super) struct Answer {
     pub(super) notes: Vec<String>,
 }
 
+/// The sorted `uri:startLine:startChar-endLine:endChar=newText` edits of a
+/// workspace edit, over its `changes` and `documentChanges` forms.
+fn rename_edits(result: &Value) -> Vec<String> {
+    let edit = |uri: &str, edit: &Value| {
+        let (start, end) = (&edit["range"]["start"], &edit["range"]["end"]);
+        format!(
+            "{uri}:{}:{}-{}:{}={}",
+            start["line"], start["character"], end["line"], end["character"], edit["newText"]
+        )
+    };
+    let mut edits = Vec::new();
+    if let Some(changes) = result["changes"].as_object() {
+        for (uri, list) in changes {
+            edits.extend(list.as_array().into_iter().flatten().map(|e| edit(uri, e)));
+        }
+    }
+    for change in result["documentChanges"].as_array().into_iter().flatten() {
+        let uri = change["textDocument"]["uri"].as_str().unwrap_or_default();
+        edits.extend(
+            change["edits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| edit(uri, e)),
+        );
+    }
+    edits.sort();
+    edits
+}
+
+fn rename(
+    server: &mut TestServer,
+    path: &Path,
+    line: u32,
+    character: u32,
+    new_name: &str,
+) -> Answer {
+    let id = RequestId::from(format!("rename-{}", super::persistent_cache::rand_suffix()));
+    server.send_request(
+        id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(path)},
+            "position": {"line": line, "character": character},
+            "newName": new_name,
+        }),
+    );
+    let response = server.response(&id);
+    match response.error {
+        None => Answer {
+            locations: rename_edits(&response.result.unwrap_or(Value::Null)),
+            complete: true,
+            notes: Vec::new(),
+        },
+        Some(error) => Answer {
+            locations: Vec::new(),
+            complete: false,
+            notes: vec![error.message],
+        },
+    }
+}
+
 fn answer(server: &mut TestServer, root: &Path, query: Query) -> Answer {
+    if let Query::Rename(relative, line, character, new_name) = query {
+        return rename(server, &root.join(relative), line, character, new_name);
+    }
     gaps(server);
     let locations = match query {
         Query::References(relative, line, character) => {
@@ -766,6 +833,7 @@ fn answer(server: &mut TestServer, root: &Path, query: Query) -> Answer {
             symbols.sort();
             symbols
         }
+        Query::Rename(..) => unreachable!("answered above"),
     };
     let notes = gaps(server);
     Answer {
@@ -817,7 +885,32 @@ pub(super) fn uncached_answers(
     opens: &[&str],
     queries: &[Query],
 ) -> Vec<Answer> {
-    let mut cold = cold_server_with(environment, root, options, opens);
+    uncached_answers_with_overlays(environment, root, options, opens, &[], queries)
+}
+
+/// `uncached_answers` with an unsaved buffer (`(relative path, text)`)
+/// open on the server.
+pub(super) fn uncached_answers_with_overlays(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    overlays: &[(&str, &str)],
+    queries: &[Query],
+) -> Vec<Answer> {
+    let mut cold = launch_labelled(environment, "cold-cache", "cold");
+    let mut options = match options {
+        Value::Null => json!({}),
+        options => options.clone(),
+    };
+    options["persistentCacheEnabled"] = json!(false);
+    cold.initialize(root, options);
+    open_disk(&mut cold, root, opens);
+    for (relative, text) in overlays {
+        open_text(&mut cold, &root.join(relative), text);
+    }
+    wait_index(&mut cold, complete);
+    settle_background(&mut cold);
     let found = answers(&mut cold, root, queries);
     shutdown(cold);
     found

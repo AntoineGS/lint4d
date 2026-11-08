@@ -69,9 +69,10 @@ pub struct RetireReport {
     pub in_use: usize,
     /// Other namespaces left live by retention (l4d-1ypi).
     pub kept: usize,
-    /// Namespaces retired with no current size estimate. The first one
-    /// the disk pressure retires that way ends the pass: what it freed
-    /// shows after reclamation (reviews I-r2-1, M-r2-2).
+    /// Namespaces retired with no current size estimate. One ends the
+    /// pass's pressure part, and until its scope is reclaimed it stops the
+    /// pressure part of every later pass: what it freed shows only after
+    /// reclamation (reviews I-r2-1, M-r2-2, I-r3-1).
     pub unknown_size: usize,
 }
 
@@ -414,7 +415,7 @@ pub(crate) fn reclaim(
     transaction: &Connection,
     max_rows: usize,
     live: Scope,
-) -> Result<Reclaimed, Bypass> {
+) -> Result<(Reclaimed, Vec<(Digest, i64)>), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let scopes: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
@@ -433,6 +434,7 @@ pub(crate) fn reclaim(
     };
     let mut budget = max_rows;
     let mut rows = 0;
+    let mut reclaimed = Vec::new();
     'scopes: for (id, reset_epoch) in &scopes {
         for table in RECLAIM_TABLES {
             if budget == 0 {
@@ -454,6 +456,7 @@ pub(crate) fn reclaim(
                 params![id, reset_epoch],
             )
             .map_err(fail)?;
+        reclaimed.push((digest_from(id)?, *reset_epoch));
     }
     // With no rows left to spend, the live scope is not examined:
     // `complete` then speaks for the retired scopes only.
@@ -479,10 +482,13 @@ pub(crate) fn reclaim(
     let remaining: i64 = transaction
         .query_row("SELECT count(*) FROM retired_scopes", [], |row| row.get(0))
         .map_err(fail)?;
-    Ok(Reclaimed {
-        rows,
-        complete: remaining == 0 && drained,
-    })
+    Ok((
+        Reclaimed {
+            rows,
+            complete: remaining == 0 && drained,
+        },
+        reclaimed,
+    ))
 }
 
 #[cfg(all(test, unix))]

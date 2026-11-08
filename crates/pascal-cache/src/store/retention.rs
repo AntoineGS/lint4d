@@ -438,18 +438,26 @@ impl Store {
         };
         fault_point!(self, NamespacesRanked);
         let mut estimates = self.estimates();
+        // A retired scope still to reclaim of unknown size stops the
+        // pressure part: what it frees shows only once it is reclaimed
+        // (review I-r3-1).
+        let mut pending_unknown = false;
         if excess > 0 {
             estimates
                 .retired
                 .retain(|scope, _| retired_scopes.contains(scope));
-            let pending = retired_scopes.iter().fold(0u64, |total, scope| {
+            let mut pending = 0u64;
+            for scope in &retired_scopes {
                 let bytes = estimates.retired.get(scope).copied().or_else(|| {
                     read_recorded(&self.location, scope.0)
                         .filter(|recorded| recorded.epoch == scope.1)
                         .map(|recorded| recorded.bytes)
                 });
-                total.saturating_add(bytes.unwrap_or(0))
-            });
+                match bytes {
+                    Some(bytes) => pending = pending.saturating_add(bytes),
+                    None => pending_unknown = true,
+                }
+            }
             excess = excess.saturating_sub(pending);
         }
         let kept = self
@@ -461,7 +469,7 @@ impl Store {
         let mut report = RetireReport::default();
         // A retirement of unknown size ends the pressure part (review
         // I-r2-1): what it freed shows after reclamation, in a later pass.
-        let mut stopped = false;
+        let mut stopped = pending_unknown;
         let retire = |candidate: &Ranked,
                       estimates: &mut Estimates,
                       report: &mut RetireReport|
@@ -484,15 +492,20 @@ impl Store {
                 Retirement::Done => {
                     report.retired += 1;
                     match bytes {
+                        // The record stays until the scope is reclaimed,
+                        // so other processes count it as pending.
                         Some(bytes) => {
                             estimates
                                 .retired
                                 .insert((candidate.id, candidate.epoch), bytes);
                         }
-                        None => report.unknown_size += 1,
+                        None => {
+                            report.unknown_size += 1;
+                            // A stale record is no size for anyone.
+                            estimates.recorded.remove(&candidate.id);
+                            let _ = fs::remove_file(self.location.namespace_size(candidate.id));
+                        }
                     }
-                    estimates.recorded.remove(&candidate.id);
-                    let _ = fs::remove_file(self.location.namespace_size(candidate.id));
                     Some(bytes)
                 }
                 Retirement::Held => {
@@ -539,6 +552,16 @@ impl Store {
         }
         report.kept = ranked.len().saturating_sub(report.retired + report.in_use);
         Ok((report, next))
+    }
+}
+
+/// Remove the records of `scopes`, reclaimed: a record of another epoch
+/// stays. Best effort.
+pub(crate) fn forget_reclaimed(location: &StoreLocation, scopes: &[(Digest, i64)]) {
+    for (id, epoch) in scopes {
+        if read_recorded(location, *id).is_some_and(|recorded| recorded.epoch == *epoch) {
+            let _ = fs::remove_file(location.namespace_size(*id));
+        }
     }
 }
 

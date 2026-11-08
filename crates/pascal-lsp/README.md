@@ -1407,23 +1407,28 @@ during maintenance, least recently used first. While the store needs space,
 over its disk budget or with less than 256 MiB free on its filesystem
 (whatever filled it: the cache gives disk back), it also retires the least
 recently used kept one at once, without waiting for its size. Its size is
-usually unknown, so the pass stops there and the next one, after
-reclamation, sees what it freed. Only a current size estimate lets one pass
-retire several: background maintenance estimates the next kept namespace
+usually unknown, so the pass stops there, and later passes (at every open,
+maintenance cycle or prune) retire no further kept namespace until its rows
+are reclaimed and what it freed shows. Only a current size estimate lets one
+pass retire several, and a retired namespace with an estimate counts as
+freed until it is reclaimed (its record stays until then, for every
+process): background maintenance estimates the next kept namespace
 after such a stop, in short steps of at most 4,096 entries per cycle (the
 phases that give disk back run in every cycle), only while no server holds
 it, and records it beside the lock file (`namespaces/<hex>.size`). An
 estimate is current while the namespace's epoch and lock-file time are
 unchanged. Opening the store never reads one. An estimate leaves out index
 overhead and counts an observation shared by several evidence sets once per
-set. A retired scope still to reclaim counts as freed by its record even
-when its lock-file time no longer matched (the lock file is gone), so a
-namespace that grew or shrank since makes a pass retire one too many or too
-few. A record can also be taken as current when the lock-file time did not
-change: recording a use is best effort, and an open and close within the
-filesystem's time granularity leave the same time. The next pass, which
-rereads usage, free pages and pending scopes, corrects each. It never
-retires a namespace a running server holds. `--cache-status` lists them.
+set. A retired scope still to reclaim counts as freed by the record kept
+from its retirement, which can no longer be checked against a lock file;
+only a record current at retirement is kept, so this is wrong only when the
+record was wrongly taken as current, and then a namespace that grew or
+shrank makes a pass retire one too many or too few. A record is wrongly
+taken as current when the lock-file time did not change although the
+namespace was used: recording a use is best effort, and an open and close
+within the filesystem's time granularity leave the same time. The next
+pass, which rereads usage, free pages and pending scopes, corrects each. It
+never retires a namespace a running server holds. `--cache-status` lists them.
 
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
 files), where `<N>` is the store's container version, currently

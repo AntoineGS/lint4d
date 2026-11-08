@@ -267,10 +267,11 @@ impl Store {
             {
                 return Err(Bypass::WalPressure);
             }
-            let reclaimed = namespaces::reclaim(&transaction, max_rows, self.scope)?;
+            let (reclaimed, scopes) = namespaces::reclaim(&transaction, max_rows, self.scope)?;
             fault_point!(self, GcDeleteBeforeCommit);
             self.before_commit();
             transaction.commit().map_err(fail)?;
+            retention::forget_reclaimed(&self.location, &scopes);
             Ok(reclaimed)
         })
     }

@@ -277,6 +277,16 @@ fn a_retired_scope_still_to_reclaim_counts_as_freed() {
     pretend_excess(&store, 5 * MIB);
     assert_eq!(store.retire_obsolete().unwrap().retired, 1);
     assert!(!live(dir, 1) && live(dir, 2));
+    // Its record stays until the scope is reclaimed, for other processes.
+    let size = dir
+        .join("namespaces")
+        .join(format!("{}.size", namespace(1).id().to_hex()));
+    assert!(size.exists());
+    let other = open(dir, 4);
+    other.pretend_usage_for_test(0);
+    pretend_excess(&other, 5 * MIB);
+    assert_eq!(other.retire_obsolete().unwrap().retired, 0, "known pending");
+    drop(other);
     let again = store.retire_obsolete().unwrap();
     assert_eq!((again.retired, again.unknown_size), (0, 0), "{again:?}");
     // Over by more than build 1 frees, build 2 goes too, size unknown.
@@ -284,6 +294,8 @@ fn a_retired_scope_still_to_reclaim_counts_as_freed() {
     let more = store.retire_obsolete().unwrap();
     assert_eq!((more.retired, more.unknown_size), (1, 1), "{more:?}");
     assert!(!live(dir, 2));
+    reclaim_all(&store);
+    assert!(!size.exists(), "removed with its scope");
 }
 
 /// Review I-r2-2: current estimates let one pass retire several kept
@@ -354,9 +366,57 @@ fn a_stale_record_is_an_unknown_size() {
     let first = store.retire_obsolete().unwrap();
     assert_eq!((first.retired, first.unknown_size), (1, 1), "{first:?}");
     assert!(live(dir, 2), "the pass stopped");
-    // Nothing counted as freed: the next pass goes on.
+    // Review I-r3-1: until build 1 is reclaimed, its unknown size stops
+    // every pass.
+    assert_eq!(store.retire_obsolete().unwrap().retired, 0);
+    assert!(live(dir, 2));
+    reclaim_all(&store);
     assert_eq!(store.retire_obsolete().unwrap().retired, 1);
     assert!(!live(dir, 2));
+}
+
+fn reclaim_all(store: &Store) {
+    while !store.reclaim(4096).unwrap().complete {}
+}
+
+/// Review I-r3-1: a store over its budget at open retired one kept
+/// namespace there; later passes wait until reclamation has run.
+#[test]
+fn passes_after_an_unknown_size_retirement_wait_for_its_reclamation() {
+    let root = private_tempdir();
+    let dir = root.path();
+    session(dir, 1, 1);
+    plant(dir, 1, 10 * MIB);
+    session(dir, 2, 2);
+    plant(dir, 2, 10 * MIB);
+    raw(dir)
+        .execute(
+            "UPDATE store_state SET max_disk_bytes = ?1, wal_threshold_bytes = ?2",
+            params![1i64 << 20, (1i64 << 20) - 1],
+        )
+        .unwrap();
+    let store = Arc::new(open(dir, 3));
+    assert!(!live(dir, 1) && live(dir, 2));
+    assert_eq!(store.retire_obsolete().unwrap().retired, 0);
+    assert!(live(dir, 2), "build 1 is not reclaimed yet");
+    // Maintenance: build 2 stays until the Delete phase has run.
+    let retired_before_delete = Arc::new(AtomicBool::new(false));
+    let (flag, seen) = (retired_before_delete.clone(), dir.to_path_buf());
+    let first_delete = Arc::new(AtomicBool::new(true));
+    store.set_fault_for_test(FaultPoint::GcDeleteBeforeCommit, move || {
+        if first_delete.swap(false, Ordering::Relaxed) && !live(&seen, 2) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    });
+    maintain(&store, 1);
+    assert!(!retired_before_delete.load(Ordering::Relaxed));
+    // Once build 1 is reclaimed the store, still over budget, goes on.
+    let mut cycles = 0;
+    while live(dir, 2) {
+        maintain(&store, 1);
+        cycles += 1;
+        assert!(cycles < 10, "build 2 is retired once build 1 is reclaimed");
+    }
 }
 
 #[test]

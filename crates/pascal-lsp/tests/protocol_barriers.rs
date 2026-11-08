@@ -22,3 +22,6 @@ mod persistent_queries;
 
 #[path = "protocol/persistent_acceptance.rs"]
 mod persistent_acceptance;
+
+#[path = "protocol/persistent_processes.rs"]
+mod persistent_processes;

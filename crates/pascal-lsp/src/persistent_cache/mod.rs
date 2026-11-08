@@ -20,6 +20,8 @@ pub(crate) mod exclusion;
 pub(crate) mod names;
 pub(crate) mod options;
 pub(crate) mod status;
+#[cfg(feature = "test-support")]
+pub mod test_faults;
 mod worker;
 
 pub(crate) use counters::Counters;

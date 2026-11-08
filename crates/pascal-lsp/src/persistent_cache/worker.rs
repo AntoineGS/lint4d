@@ -316,6 +316,10 @@ fn open(inner: &Arc<Inner>) -> bool {
         .and_then(|directory| {
             AdmittedStore::open(&inner.project_cache, &directory, &inner.namespace, limits)
         });
+    #[cfg(feature = "test-support")]
+    if let Ok(store) = &opened {
+        super::test_faults::arm(store);
+    }
     let mut shared = inner.lock();
     if shared.state != CacheState::Opening || shared.generation != generation {
         // Fenced meanwhile: close what was opened before acknowledging.

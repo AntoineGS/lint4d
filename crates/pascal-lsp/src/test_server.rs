@@ -21,6 +21,8 @@ const TEST_MANUAL_SELECTION_PREPARED_BARRIER_ENV: &str =
     "PASCAL_LSP_TEST_MANUAL_SELECTION_PREPARED_BARRIER";
 const TEST_COMPILED_CONTENT_BARRIER_ENV: &str = "PASCAL_LSP_TEST_COMPILED_CONTENT_BARRIER";
 const TEST_OUTBOUND_WRITER_BARRIER_ENV: &str = "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER";
+const TEST_STORE_FAULT_ENV: &str = "PASCAL_LSP_TEST_STORE_FAULT";
+const TEST_STORE_GROWTH_PAGES_ENV: &str = "PASCAL_LSP_TEST_STORE_GROWTH_PAGES";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 const TEST_WORKSPACE_FIFO_PROBE_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_FIFO_PROBE";
 
@@ -84,7 +86,19 @@ fn workspace_fifo_probe_from_environment(
     )))
 }
 
+fn store_growth_pages_from_environment() -> Result<Option<i64>, String> {
+    let Some(value) = std::env::var_os(TEST_STORE_GROWTH_PAGES_ENV) else {
+        return Ok(None);
+    };
+    value
+        .to_string_lossy()
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{TEST_STORE_GROWTH_PAGES_ENV} must be an integer"))
+}
+
 fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, String> {
+    let store_fault = std::env::var(TEST_STORE_FAULT_ENV).ok();
     Ok(TestBarrierConfig::new(
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
@@ -124,7 +138,10 @@ fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, Stri
         TEST_WORKSPACE_FIFO_PROBE_ENV,
     )?)
     .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from))
-    .with_analysis_metrics(analysis_metrics))
+    .with_analysis_metrics(analysis_metrics)
+    .with_store_fault(store_fault.as_deref())
+    .map_err(|error| format!("{TEST_STORE_FAULT_ENV}: {error}"))?
+    .with_store_growth_pages(store_growth_pages_from_environment()?))
 }
 
 fn main() {

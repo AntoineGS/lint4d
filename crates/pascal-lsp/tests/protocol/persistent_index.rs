@@ -85,7 +85,7 @@ fn open_disk(server: &mut TestServer, path: &Path) {
     );
 }
 
-fn initialize_and_open(server: &mut TestServer, root: &Path, relative: &str) {
+pub(super) fn initialize_and_open(server: &mut TestServer, root: &Path, relative: &str) {
     server.initialize(root, Value::Null);
     open_disk(server, &root.join(relative));
 }

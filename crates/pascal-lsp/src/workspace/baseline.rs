@@ -852,6 +852,10 @@ impl Workspace {
         let Some(state) = self.contexts.get(key) else {
             return Ok(false);
         };
+        // As `reuse_from_hint`: a root open in the editor is not this record's.
+        if Url::from_file_path(path).is_ok_and(|uri| self.root_is_session_private(&uri)) {
+            return Ok(false);
+        }
         for unindexed in [Unindexed::NotRecorded, Unindexed::OverSize] {
             let inputs = RecordInputs {
                 path,
@@ -1758,6 +1762,93 @@ mod tests {
             "complete with the member unrecorded: {batches:?}"
         );
         assert_eq!(seal(&view, &key), SealOutcome::Sealed);
+        cache.shutdown();
+    }
+
+    /// Task 8c fix round 1 (Important 1): a refused member's artifact-less
+    /// record refused for room keeps the member awaiting room, so the
+    /// batches do not complete without it and the seal lists it.
+    #[test]
+    fn a_refused_members_record_refused_for_room_holds_the_seal_until_it_lands() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 3, options);
+        let big = temp.path().join("lib/U0.pas");
+        named_unit(&big, &"Long".repeat(60));
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut view, cache) = persisting_view(&session, store.path());
+        let refused = big.clone();
+        let mut once = false;
+        cache.set_record_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && !std::mem::replace(&mut once, true))
+                .then_some(pascal_cache::Bypass::WalPressure)
+        })));
+        let mut batches = Vec::new();
+        for _ in 0..6 {
+            let progress = advance(&mut view, &anchor, IndexBound::all());
+            let complete = progress.complete;
+            batches.push(progress);
+            if complete {
+                break;
+            }
+        }
+        assert!(batches.last().unwrap().complete, "{batches:?}");
+        assert!(
+            !batches[0].complete,
+            "the refusal holds the batch back: {:?}",
+            batches[0]
+        );
+        assert!(
+            view.project_cache.index_member_has_record(&key, &big),
+            "complete with the refused member unrecorded: {batches:?}"
+        );
+        assert_eq!(seal(&view, &key), SealOutcome::Sealed);
+        cache.shutdown();
+    }
+
+    /// Task 8c fix round 1 (Minor 1): as the held path, the no-snapshot
+    /// lookup of an artifact-less record ignores a root open in the editor.
+    #[test]
+    fn without_a_snapshot_an_open_root_finds_no_artifact_less_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (session, key, anchor) = indexed_project(temp.path(), 4, WorkspaceOptions::default());
+        let over = temp.path().join("lib/U0.pas");
+        over_pending_bytes_unit(&over);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        assert!(advance(&mut first, &anchor, IndexBound::all()).complete);
+        assert!(first.project_cache.index_member_has_record(&key, &over));
+        cache.shutdown();
+
+        let (mut second, cache) = persisting_view(
+            &workspace(temp.path(), WorkspaceOptions::default()),
+            store.path(),
+        );
+        advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        let job = cache.job().unwrap();
+        assert_eq!(
+            second.has_artifact_less_record(&key, &over, job.store()),
+            Ok(true)
+        );
+        second
+            .open_document(
+                Url::from_file_path(&over).unwrap(),
+                "unit U0;\ninterface\nimplementation\nend.\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            second.has_artifact_less_record(&key, &over, job.store()),
+            Ok(false)
+        );
+        drop(job);
         cache.shutdown();
     }
 

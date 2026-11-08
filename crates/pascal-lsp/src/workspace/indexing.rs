@@ -2991,7 +2991,9 @@ impl Workspace {
         }
     }
 
-    /// A Fresh member's record was refused by a bypass that passes:
+    /// A member's record (a Fresh member's, or the artifact-less one of a
+    /// Refused, Limited or over-limit member) was refused by a bypass that
+    /// passes:
     /// another process's writes (`Busy`, `Recovering`) make the next batch
     /// prove it again; only maintenance makes room (`WalPressure`,
     /// `OverBudget`, which the store woke it for), so it waits for a batch
@@ -3386,7 +3388,7 @@ impl Workspace {
         let Some(state) = self.contexts.get(key) else {
             return;
         };
-        self.prove_member(
+        let proven = self.prove_member(
             key,
             &RecordInputs {
                 path,
@@ -3398,8 +3400,16 @@ impl Workspace {
             },
             None,
             cancel,
-        )
-        .ok();
+        );
+        // Refused as a Fresh member's record is: the member must not stay
+        // unrecorded while the batch completes (Task 8c fix round 1).
+        if let Err(bypass) = proven {
+            crate::trace::trace!(
+                "  index member {} unindexed, record not proven: {bypass:?}",
+                path.display()
+            );
+            self.defer_refused_record(key, path, &bypass);
+        }
     }
 
     /// Index `path` from the store's facts, if current inputs prove them
@@ -5070,6 +5080,18 @@ fn take_unverified(
 const MAX_UNVERIFIED_RANKING_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_UNVERIFIED_RANKING_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static WALK_MAX_INCLUDE_FILES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The include file limit of the references proof's walks on this thread.
+#[cfg(test)]
+pub(crate) fn set_walk_max_include_files_for_test(files: Option<usize>) {
+    WALK_MAX_INCLUDE_FILES.with(|limit| limit.set(files));
+}
+
 /// The deepest include nesting the references proof follows.
 const MAX_LEXICAL_INCLUDE_DEPTH: usize = 16;
 
@@ -5462,6 +5484,10 @@ impl UnverifiedRanking {
         // square of their count (they only dedupe what a lookup reports).
         let mut limits = pascal_core::ResolverLimits::default();
         limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
+        #[cfg(test)]
+        if let Some(files) = WALK_MAX_INCLUDE_FILES.with(std::cell::Cell::get) {
+            limits.max_include_files = files;
+        }
         let mut resolver = super::resolver::resolver_for_include_walk(
             Arc::clone(&context),
             scope.input.roots.clone(),
@@ -8710,6 +8736,47 @@ pub(in crate::workspace) mod tests {
         for path in [&first, &second, &defs] {
             assert!(baselined(&found, path), "{path:?}: {:?}", found.baseline);
         }
+    }
+
+    /// Task 8c fix round 1 (Minor 4): a member whose own lookup stays
+    /// within the include file limit only because a shared answer was not
+    /// charged to its resolver is walked again without sharing, and its
+    /// third include is then past the limit, as for a walk of its own: it
+    /// is not proven.
+    #[test]
+    fn a_member_past_a_limit_once_shared_answers_are_charged_is_walked_without_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        write(
+            &first,
+            "unit GuardA;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &second,
+            "unit GuardB;\n{$I Defs.inc}\n{$I Two.inc}\n{$I Three.inc}\ninterface\nimplementation\nend.\n",
+        );
+        for name in ["Defs.inc", "Two.inc", "Three.inc"] {
+            write(&root.join("lib").join(name), "{$DEFINE GUARDED}\n");
+        }
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        set_walk_max_include_files_for_test(Some(2));
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let searches = pascal_core::take_include_searches();
+        set_walk_max_include_files_for_test(None);
+        // A: 1. B's attempt: a shared answer, then 2 searches, the last
+        // past the limit with the shared answer charged. B's rerun: 3.
+        assert_eq!(searches, 6);
+        assert_eq!(
+            source_names(&found),
+            ["GuardB.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(baselined(&found, &first), "{:?}", found.baseline);
     }
 
     /// Task 8c (R9-5): the same include name from two directories resolves

@@ -7230,6 +7230,31 @@ impl StoredIndex {
     }
 
     /// The members of `set` still fresh without a record.
+    /// The members of `set` in a state that holds a record (Fresh,
+    /// Refused or Limited) without one: what a refusal for room leaves.
+    fn unrecorded_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        if set.is_empty() {
+            return Vec::new();
+        }
+        self.index
+            .records()
+            .into_iter()
+            .filter(|(path, record)| {
+                record.is_none()
+                    && set.contains(path)
+                    && matches!(
+                        self.index.state_of(path),
+                        Some(
+                            crate::workspace_index::MemberState::Fresh
+                                | crate::workspace_index::MemberState::Refused(_)
+                                | crate::workspace_index::MemberState::Limited
+                        )
+                    )
+            })
+            .map(|(path, _)| path)
+            .collect()
+    }
+
     fn unrecorded_fresh_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
         if set.is_empty() {
             return Vec::new();
@@ -8243,18 +8268,17 @@ impl ProjectCache {
     }
 
     pub(crate) fn index_is_awaiting_room(&self, key: &ContextKey) -> bool {
-        self.index().contexts.get(key).is_some_and(|stored| {
-            !stored
-                .unrecorded_fresh_among(&stored.awaiting_room)
-                .is_empty()
-        })
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| !stored.unrecorded_among(&stored.awaiting_room).is_empty())
     }
 
-    /// The members `note_index_awaiting_room` named that are still fresh
-    /// without a record (0 when none).
+    /// The members `note_index_awaiting_room` named that are still without
+    /// a record their state holds (0 when none).
     pub(crate) fn index_awaiting_room(&self, key: &ContextKey) -> usize {
         self.index().contexts.get(key).map_or(0, |stored| {
-            stored.unrecorded_fresh_among(&stored.awaiting_room).len()
+            stored.unrecorded_among(&stored.awaiting_room).len()
         })
     }
 
@@ -8271,7 +8295,7 @@ impl ProjectCache {
             return 0;
         };
         let named = std::mem::take(&mut stored.awaiting_room);
-        let unrecorded = stored.unrecorded_fresh_among(&named);
+        let unrecorded = stored.unrecorded_among(&named);
         for path in &unrecorded {
             stored.index.mark_stale(path);
         }

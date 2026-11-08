@@ -14028,10 +14028,14 @@ end.
         }
 
         /// D24 during a query: an administrative reset fences the store
-        /// after the request read its target's index; the warm answer stays
-        /// the memory-only one.
+        /// after selection read its target's index; the warm answer stays
+        /// the memory-only one. Under R9-1 a references request selects and
+        /// binds in memory and never reads the store (no store access in
+        /// `queries`/`rename`/`select_sources`), so this proves only that a
+        /// fence landing mid-request changes nothing, and that the fence
+        /// took effect.
         #[test]
-        fn a_bypassed_store_mid_request_keeps_the_answer() {
+        fn a_store_fenced_after_selection_keeps_the_answer() {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             write(
@@ -14113,6 +14117,13 @@ end.
             set_after_target_view_hook(None);
             assert!(fenced.get() >= 1, "the store was fenced mid-request");
             assert_eq!(found, expected);
+            let job = cache.job().expect("job");
+            assert_eq!(
+                job.store().check_scope(),
+                Err(pascal_cache::Bypass::Fenced),
+                "the reset fenced the store the request ran beside"
+            );
+            drop(job);
             cache.shutdown();
         }
     }

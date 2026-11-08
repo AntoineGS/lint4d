@@ -561,6 +561,10 @@ fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
     );
     assert!(not_indexed(&notes), "{notes:?}");
     assert!(
+        !partial.is_empty(),
+        "the declaring unit and open sources are proven: {partial:?}"
+    );
+    assert!(
         partial.iter().all(|location| expected.contains(location)),
         "only proven locations: {partial:?}"
     );

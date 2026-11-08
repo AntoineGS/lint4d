@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub(super) const UNITS: usize = 300;
 /// `App.dpr` and the units.
 pub(super) const MEMBERS: u64 = UNITS as u64 + 1;
-const INDEX_DEADLINE: Duration = Duration::from_secs(120);
+pub(super) const INDEX_DEADLINE: Duration = Duration::from_secs(120);
 
 /// `bulk` extra declarations per unit make each analysis slower.
 fn named_unit(path: &Path, identifier: &str, include: bool, bulk: usize) {

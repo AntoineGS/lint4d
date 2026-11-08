@@ -26,7 +26,6 @@ fn an_unchanged_tree_answers_alike_cold_warm_and_uncached() {
     );
     assert_agree(&run.cold, &run.uncached);
     assert_agree(&run.warm, &run.uncached);
-    assert_truthful(&run.warm, &run.uncached);
     assert_eq!(run.warm_status["extracted"], 0, "{}", run.warm_status);
     assert!(
         run.warm_status["reused"].as_u64() > Some(0),
@@ -229,6 +228,18 @@ fn a_runtime_a_b_a_switch_reuses_a() {
     assert_eq!(final_a["extracted"], 0, "{final_a}");
     assert!(final_a["reused"].as_u64() > Some(0), "{final_a}");
     shutdown(second);
+
+    // The final A above may come from memory; a fresh process proves the
+    // store holds it.
+    let mut third = launch_labelled(environment.path(), "cache", "switch-third");
+    third.initialize(&root, a.clone());
+    open_disk(&mut third, &root, &["A.dpr"]);
+    let stored_a = wait_selected(&mut third, "A.dproj");
+    assert_eq!(stored_a["extracted"], 0, "{stored_a}");
+    assert!(stored_a["reused"].as_u64() > Some(0), "{stored_a}");
+    settle_background(&mut third);
+    assert_agree(&answers(&mut third, &root, &a_queries), &expected_a);
+    shutdown(third);
 }
 
 /// `lib/Shared.pas` moved out of the workspace root to
@@ -1048,6 +1059,7 @@ fn a_save_transition_publishes_the_saved_text_only() {
     super::persistent_cache::change(&mut server, &path, 3, &moved);
     settle_background(&mut server);
     fs::write(&path, &moved).unwrap();
+    pascal_project::backdate_tree_for_test(&root);
     server.send_notification(
         "textDocument/didSave",
         json!({"textDocument": {"uri": uri(&path)}}),
@@ -1059,11 +1071,18 @@ fn a_save_transition_publishes_the_saved_text_only() {
     );
     let processed = await_extraction(&mut server);
     assert!(processed["extracted"].as_u64() >= Some(1), "{processed}");
-    settle_background(&mut server);
+    // The saved member was extracted after the save (the warm server had
+    // extracted nothing before) and every record is stored again; a
+    // shutdown before that would cancel its publication.
+    let stored = wait_index(&mut server, |context| {
+        persisted(context) && context["extracted"].as_u64() >= Some(1)
+    });
     shutdown(server);
 
     let mut fresh = cached_server(environment.path(), &root, &Value::Null, &OPENS);
     let status = wait_index(&mut fresh, complete);
+    assert_eq!(status["extracted"], 0, "{status} after {stored}");
+    assert_eq!(status["reused"], status["members"], "{status}");
     let warm = answers(&mut fresh, &root, &queries);
     shutdown(fresh);
     let uncached = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);

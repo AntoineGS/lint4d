@@ -6,7 +6,8 @@
 
 use super::persistent_cache::{request, settle, store_directory, watched_change};
 use super::persistent_index::{
-    MEMBERS, UNITS, complete, fixture, initialize_and_open, persisted, shutdown, wait_index,
+    INDEX_DEADLINE, MEMBERS, UNITS, complete, fixture, initialize_and_open, persisted, shutdown,
+    wait_index,
 };
 use super::persistent_queries::*;
 use super::*;
@@ -36,6 +37,26 @@ impl StoreFault {
         );
         Self { barrier, spec }
     }
+
+    /// Waits for the fault point to be reached; the crawl that leads to it
+    /// is not bounded by the request timeout, so `INDEX_DEADLINE` applies.
+    pub(super) fn wait_until_entered(&self) {
+        wait_barrier_entered(&self.barrier);
+    }
+}
+
+/// Polls for the barrier's `entered` file until `INDEX_DEADLINE`.
+fn wait_barrier_entered(barrier: &TestBarrier) {
+    let deadline = Instant::now() + INDEX_DEADLINE;
+    while !barrier.entered.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the barrier {:?} was not reached within {INDEX_DEADLINE:?}",
+            barrier.entered
+        );
+        // Deadline pacing of a file poll; no event is ordered by it.
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// A server over `environment/<cache>` armed with `fault` (the value of
@@ -64,19 +85,19 @@ pub(super) fn launch_with_store_fault(
 }
 
 /// Server A is held inside the transaction of its third record
-/// publication. Server B, started meanwhile on the same workspace, is
-/// refused the store as busy (its `pascal/cacheStatus` says so), so it
-/// reuses nothing and extracts every member: the held record, like the two
-/// committed ones, is not read by a process that has no store. After the
+/// publication. Server B, started meanwhile on the same workspace, has its
+/// store open refused as busy (its `pascal/cacheStatus` says so), so it
+/// reuses nothing and extracts every member: it has no store to read the
+/// committed records or the held one from. After the
 /// release both finish and a fourth server reuses every member.
 #[test]
-fn a_held_record_publication_is_visible_to_no_other_process() {
+fn a_store_held_at_open_is_bypassed_busy_and_converges() {
     let environment = tempfile::tempdir().unwrap();
     let root = fixture(environment.path(), UNITS);
     let fault = StoreFault::new(environment.path(), "RecordBeforeCommit", "hold", 3);
     let mut held = launch_with_store_fault(environment.path(), "cache", "held", &fault.spec, &[]);
     initialize_and_open(&mut held, &root, "App.dpr");
-    fault.barrier.wait_until_entered();
+    fault.wait_until_entered();
 
     let mut other = super::persistent_cache::launch(environment.path());
     initialize_and_open(&mut other, &root, "App.dpr");
@@ -85,8 +106,16 @@ fn a_held_record_publication_is_visible_to_no_other_process() {
     // While A holds the write transaction, B's store open is refused as
     // busy and B runs memory-only: it never sees the held record.
     let status = cache_status(&mut other);
-    assert_eq!(status["state"], "bypassed", "{status}");
-    assert_eq!(status["cause"]["kind"], "busy", "{status}");
+    // The refusal is counted as busy; the state is `bypassed` or, while
+    // the server retries the open, `opening`, never `enabled`.
+    assert!(
+        status["counters"]["bypasses"]["busy"].as_u64() > Some(0),
+        "{status}"
+    );
+    assert!(
+        status["state"] == "bypassed" || status["state"] == "opening",
+        "{status}"
+    );
     // Everything still pending at `complete` awaits the reuse pass the
     // bypass made impossible; nothing is refused.
     assert_eq!(done["pending"], done["reusePending"], "{done}");
@@ -112,8 +141,11 @@ fn a_held_record_publication_is_visible_to_no_other_process() {
     shutdown(fourth);
 }
 
-/// `pascal/testStoreGrowth` limits the open store and says so; the server
-/// started with `PASCAL_LSP_TEST_STORE_GROWTH_PAGES` armed its store alike.
+/// `pascal/testStoreGrowth` limits the open store and says so
+/// (`applied: true`); a server without an open store (persistence
+/// disabled) reports `applied: false`. The
+/// `PASCAL_LSP_TEST_STORE_GROWTH_PAGES` variable is exercised by
+/// `a_full_store_in_one_process_changes_no_answer_and_recovers`.
 #[test]
 fn the_growth_request_applies_to_the_open_store() {
     let environment = tempfile::tempdir().unwrap();
@@ -128,6 +160,17 @@ fn the_growth_request_applies_to_the_open_store() {
     );
     assert_eq!(reply["applied"], true, "{reply}");
     shutdown(server);
+
+    let mut disabled = super::persistent_cache::launch(environment.path());
+    disabled.initialize(&root, json!({"persistentCacheEnabled": false}));
+    settle(&mut disabled, false);
+    let reply = request(
+        &mut disabled,
+        "pascal/testStoreGrowth",
+        json!({"extraPages": 100000}),
+    );
+    assert_eq!(reply["applied"], false, "{reply}");
+    shutdown(disabled);
 }
 
 fn cache_status(server: &mut TestServer) -> Value {
@@ -171,13 +214,24 @@ fn assert_accounted(context: &Value) {
     assert_eq!(context["pending"], 0, "{context}");
 }
 
-/// Waits for the child of a server armed with an `abort` fault to die and
-/// asserts that it was `abort()` that ended it. The abort is certain once
-/// the fault point is reached, so a plain blocking wait is bounded by the
-/// test run itself.
-fn wait_for_abort(server: &mut TestServer) {
+/// Waits, until `INDEX_DEADLINE`, for the child of a server armed with an
+/// `abort` fault at `point` to die and asserts that it was `abort()` that
+/// ended it.
+fn wait_for_abort(server: &mut TestServer, point: &str) {
     use std::os::unix::process::ExitStatusExt;
-    let status = server.child.wait().expect("wait for the aborting server");
+    let deadline = Instant::now() + INDEX_DEADLINE;
+    let status = loop {
+        if let Some(status) = server.child.try_wait().expect("poll the aborting server") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server did not abort at {point} within {INDEX_DEADLINE:?}"
+        );
+        // Deadline pacing only: the server may already be gone, so no
+        // request can order this poll.
+        thread::sleep(Duration::from_millis(5));
+    };
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status}");
 }
 
@@ -202,7 +256,7 @@ fn concurrent_publishers_converge() {
     let fault = StoreFault::new(environment.path(), "MembersBeforeCommit", "hold", 1);
     let mut held = launch_with_store_fault(environment.path(), "cache", "a", &fault.spec, &[]);
     started(&mut held, &root, &OPENS);
-    fault.barrier.wait_until_entered();
+    fault.wait_until_entered();
 
     open_disk(&mut other, &root, &OPENS);
     let meanwhile = wait_index(&mut other, complete);
@@ -261,7 +315,7 @@ fn abort_at(point: &str, nth: usize) {
     let fault = StoreFault::new(environment.path(), point, "abort", nth);
     let mut dying = launch_with_store_fault(environment.path(), "cache", "a", &fault.spec, &[]);
     started(&mut dying, &root_a, &opens_a);
-    wait_for_abort(&mut dying);
+    wait_for_abort(&mut dying, point);
 
     let after = answers(&mut other, &root_b, &queries_b);
     assert_agree(&after, &before);
@@ -409,8 +463,9 @@ fn a_full_store_in_one_process_changes_no_answer_and_recovers() {
     );
     pascal_project::backdate_tree_for_test(&root_a);
     watched_change(&mut full, &edited);
-    settle_background(&mut full);
-    let resumed = wait_index(&mut full, complete);
+    let resumed = wait_index(&mut full, |context| {
+        context["persisted"].as_u64() > Some(persisted_before)
+    });
     assert!(
         resumed["persisted"].as_u64().unwrap() > persisted_before,
         "persistence resumed: {resumed}"
@@ -461,8 +516,16 @@ fn a_read_only_store_is_bypassed() {
     let uncached = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);
 
     let directory = environment.path().join("cache/lint4d/analysis");
-    let database = directory.join("analysis-v7.sqlite3");
-    assert!(database.is_file(), "{database:?}");
+    let database = fs::read_dir(&directory)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("analysis-v") && name.ends_with(".sqlite3"))
+        })
+        .expect("the store database");
     let mut guard = Restore(Vec::new());
     guard.chmod(&database, 0o400);
     guard.chmod(&directory, 0o500);
@@ -503,7 +566,7 @@ fn a_held_writer_does_not_block_another_processes_queries() {
     let fault = StoreFault::new(environment.path(), "RecordBeforeCommit", "hold", 1);
     let mut held = launch_with_store_fault(environment.path(), "cache", "a", &fault.spec, &[]);
     started(&mut held, &root_a, &OPENS);
-    fault.barrier.wait_until_entered();
+    fault.wait_until_entered();
 
     let found = answers(&mut other, &root_b, &queries);
     assert!(
@@ -553,7 +616,7 @@ fn a_held_record_is_invisible_to_an_open_reader() {
     let fault = StoreFault::new(environment.path(), "RecordBeforeCommit", "hold", 1);
     let mut held = launch_with_store_fault(environment.path(), "cache", "a", &fault.spec, &[]);
     started(&mut held, &root, &OPENS);
-    fault.barrier.wait_until_entered();
+    fault.wait_until_entered();
 
     watched_change(&mut other, &member);
     let found = answers(&mut other, &root, &queries);
@@ -833,7 +896,7 @@ fn gc_in_one_process_while_another_reads() {
         &[("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", spec.as_str())],
     );
     started(&mut reader, &root, &OPENS);
-    barrier.wait_until_entered();
+    wait_barrier_entered(&barrier);
 
     assert!(is_live(environment.path(), 2) && is_live(environment.path(), 3));
     let pruned = admin(

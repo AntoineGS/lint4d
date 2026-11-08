@@ -3,10 +3,11 @@
 //! size estimates it uses.
 //!
 //! A namespace's last use is its lock file's modification time. A size
-//! estimate is read on a reader in bounded chunks by maintenance, never at
-//! open and never on the writer (review I1), and recorded beside the lock
-//! file (`<hex>.size`) for later passes, other processes and
-//! `--cache-status`. A record is current while the namespace's epoch and
+//! estimate is read only for the kept namespace the disk pressure would
+//! retire next, on a reader in chunks bounded per step and per cycle by
+//! maintenance, never at open and never on the writer (reviews I1,
+//! I-new-1), and recorded beside the lock file (`<hex>.size`) for later
+//! passes, other processes and `--cache-status`. A record is current while the namespace's epoch and
 //! lock-file time are unchanged: rows of a namespace change only while a
 //! process holds it, and every holder records its use at open, at least
 //! once a minute while open, and at close.
@@ -210,6 +211,42 @@ fn write_recorded(location: &StoreLocation, id: Digest, recorded: Recorded) -> R
     written.map_err(io)
 }
 
+/// Entries of `namespaces/` [`clean_temporaries`] looks at, and how old a
+/// record temporary must be to be removed (its writer crashed).
+const MAX_CLEANED_ENTRIES: usize = 256;
+const STALE_TEMPORARY: Duration = Duration::from_secs(300);
+
+/// Remove record temporaries (`<hex>.size.<nonce>.tmp`) older than
+/// [`STALE_TEMPORARY`] among the first [`MAX_CLEANED_ENTRIES`] entries of
+/// `namespaces/` (review M-new-4). Best effort.
+pub(crate) fn clean_temporaries(location: &StoreLocation) {
+    let Ok(entries) = fs::read_dir(location.namespace_locks()) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.take(MAX_CLEANED_ENTRIES).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.ends_with(".tmp") && name.contains(".size.")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .is_some_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|age| age >= STALE_TEMPORARY)
+            });
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// An estimate being read, one chunk per maintenance transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Scan {
@@ -227,9 +264,49 @@ pub(crate) struct Estimates {
     scan: Option<Scan>,
     recorded: HashMap<Digest, Recorded>,
     retired: HashMap<(Digest, i64), u64>,
+    /// Per candidate scope: the cycles that tried to estimate it and the
+    /// scans its reuse restarted. Past [`MAX_ESTIMATE_CYCLES`] or
+    /// [`MAX_SCAN_RESTARTS`] it is retired with an unknown size.
+    tries: HashMap<(Digest, i64), Tries>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Tries {
+    cycles: u32,
+    restarts: u32,
+}
+
+/// Cycles one candidate's estimate may take (at most
+/// `MAX_ESTIMATE_ROWS_PER_CYCLE` entries each) before the pressure retires
+/// it unestimated, and scans its reuse may restart.
+const MAX_ESTIMATE_CYCLES: u32 = 64;
+const MAX_SCAN_RESTARTS: u32 = 3;
+
+/// What one [`Store::estimate_for`] transaction did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Estimate {
+    /// Read this many entries (at least 1); the scan goes on.
+    Read(usize),
+    /// The estimate is recorded.
+    Done,
+    /// Held, or used since the scan started: given up for this cycle.
+    Abandoned,
 }
 
 impl Estimates {
+    /// Whether the pressure retires `ranked` without its size.
+    fn gave_up(&self, ranked: &Ranked) -> bool {
+        self.tries
+            .get(&(ranked.id, ranked.epoch))
+            .is_some_and(|tries| {
+                tries.cycles >= MAX_ESTIMATE_CYCLES || tries.restarts >= MAX_SCAN_RESTARTS
+            })
+    }
+
+    fn tries(&mut self, ranked: &Ranked) -> &mut Tries {
+        self.tries.entry((ranked.id, ranked.epoch)).or_default()
+    }
+
     /// The current estimate of `ranked`, from memory or its record.
     fn current(&mut self, location: &StoreLocation, ranked: &Ranked) -> Option<u64> {
         if let Some(recorded) = self.recorded.get(&ranked.id)
@@ -297,39 +374,37 @@ impl Store {
         }
     }
 
-    /// Read one chunk of at most `limit` entries (`limit >= 1`) of the
-    /// next estimate maintenance needs, on a reader: an unheld live
-    /// namespace other than this one whose recorded estimate is not
-    /// current. `None` when every estimate is current. The count is at
-    /// least 1, so a step's rows bound the work.
-    pub(crate) fn estimate_step(&self, limit: usize) -> Result<Option<usize>, Bypass> {
+    /// Count a maintenance cycle that estimates `target`.
+    pub(crate) fn note_estimate_cycle(&self, target: &Ranked) {
+        self.estimates().tries(target).cycles += 1;
+    }
+
+    /// Read one chunk of at most `limit` entries (`limit >= 1`) of
+    /// `target`'s estimate on a reader, resuming its scan. A scan restarts
+    /// when the namespace was used since it began (its rows may have
+    /// changed); that counts against [`MAX_SCAN_RESTARTS`].
+    pub(crate) fn estimate_for(&self, target: &Ranked, limit: usize) -> Result<Estimate, Bypass> {
         let deadline = Deadline::after(self.limits.wait);
         let mut estimates = self.estimates();
+        let used = lock_time(&self.location, target.id);
         if let Some(scan) = &estimates.scan
-            && nanos(lock_time(&self.location, scan.ranked.id)) != nanos(scan.ranked.used)
+            && (scan.ranked.id != target.id || scan.ranked.epoch != target.epoch)
         {
-            // Used since the scan started: its rows may have changed.
             estimates.scan = None;
         }
+        if let Some(scan) = &estimates.scan
+            && nanos(used) != nanos(scan.ranked.used)
+        {
+            estimates.scan = None;
+            estimates.tries(target).restarts += 1;
+            return Ok(Estimate::Abandoned);
+        }
         if estimates.scan.is_none() {
-            let ranked = {
-                let reader = self.pool.acquire(Role::Reader, deadline)?;
-                ranked_live(&reader, &self.location, Some(self.scope.namespace))?
-            };
-            let mut next = None;
-            for candidate in ranked {
-                if estimates.current(&self.location, &candidate).is_none()
-                    && !namespaces::held(&self.location.namespace_lock(candidate.id))?
-                {
-                    next = Some(candidate);
-                    break;
-                }
+            if namespaces::held(&self.location.namespace_lock(target.id))? {
+                return Ok(Estimate::Abandoned);
             }
-            let Some(ranked) = next else {
-                return Ok(None);
-            };
             estimates.scan = Some(Scan {
-                ranked,
+                ranked: Ranked { used, ..*target },
                 table: 0,
                 cursor: Vec::new(),
                 bytes: 0,
@@ -342,20 +417,23 @@ impl Store {
             fault_point!(self, EstimateChunk);
             read_chunk(&transaction, scan, limit)?
         };
-        if scan.table == TABLES.len() {
-            let scan = estimates.scan.take().expect("set above");
-            if nanos(lock_time(&self.location, scan.ranked.id)) == nanos(scan.ranked.used) {
-                let recorded = Recorded {
-                    epoch: scan.ranked.epoch,
-                    used: nanos(scan.ranked.used),
-                    bytes: scan.bytes,
-                };
-                // Best effort: an unrecorded estimate is kept in memory.
-                let _ = write_recorded(&self.location, scan.ranked.id, recorded);
-                estimates.recorded.insert(scan.ranked.id, recorded);
-            }
+        if scan.table < TABLES.len() {
+            return Ok(Estimate::Read(read.max(1)));
         }
-        Ok(Some(read.max(1)))
+        let scan = estimates.scan.take().expect("set above");
+        if nanos(lock_time(&self.location, target.id)) != nanos(scan.ranked.used) {
+            estimates.tries(target).restarts += 1;
+            return Ok(Estimate::Abandoned);
+        }
+        let recorded = Recorded {
+            epoch: scan.ranked.epoch,
+            used: nanos(scan.ranked.used),
+            bytes: scan.bytes,
+        };
+        // Best effort: an unrecorded estimate is kept in memory.
+        let _ = write_recorded(&self.location, scan.ranked.id, recorded);
+        estimates.recorded.insert(scan.ranked.id, recorded);
+        Ok(Estimate::Done)
     }
 
     /// One retirement pass (see [`Store::retire_obsolete`]). The ranking,
@@ -364,6 +442,19 @@ impl Store {
     /// namespace's rows are read: a kept namespace without a current
     /// estimate is left to maintenance (`unestimated`).
     pub(crate) fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
+        self.retire_pass_within(deadline).map(|(report, _)| report)
+    }
+
+    /// [`Self::retire_within`] for maintenance: also the kept namespace
+    /// the pressure would retire next whose size is unknown.
+    pub(crate) fn retire_pass(&self) -> Result<(RetireReport, Option<Ranked>), Bypass> {
+        self.retire_pass_within(Deadline::after(self.limits.open_wait))
+    }
+
+    fn retire_pass_within(
+        &self,
+        deadline: Deadline,
+    ) -> Result<(RetireReport, Option<Ranked>), Bypass> {
         let current = self.scope.namespace;
         let (ranked, mut excess, retired_scopes) = {
             let mut reader = self.pool.acquire(Role::Reader, deadline)?;
@@ -401,6 +492,7 @@ impl Store {
             .min(ranked.len());
         let (recent, older) = ranked.split_at(kept);
         let mut report = RetireReport::default();
+        let mut unestimated = None;
         let candidates = older.iter().rev().chain(recent.iter().rev());
         for (index, candidate) in candidates.enumerate() {
             let by_count = index < older.len();
@@ -408,9 +500,10 @@ impl Store {
                 break;
             }
             let bytes = estimates.current(&self.location, candidate);
-            if !by_count && bytes.is_none() {
+            if !by_count && bytes.is_none() && !estimates.gave_up(candidate) {
                 if !namespaces::held(&self.location.namespace_lock(candidate.id))? {
                     report.unestimated += 1;
+                    unestimated = Some(*candidate);
                     break;
                 }
                 report.in_use += 1;
@@ -449,7 +542,10 @@ impl Store {
             }
         }
         report.kept = ranked.len().saturating_sub(report.retired + report.in_use);
-        Ok(report)
+        estimates
+            .tries
+            .retain(|(id, epoch), _| ranked.iter().any(|r| r.id == *id && r.epoch == *epoch));
+        Ok((report, unestimated))
     }
 }
 

@@ -159,6 +159,7 @@ impl Store {
         sqlite::check_sqlite_version(rusqlite::version_number())?;
         let location = StoreLocation::prepare(directory)?;
         location.prepare_namespace_locks()?;
+        retention::clean_temporaries(&location);
         for file in location.database_files() {
             StoreLocation::check_file(&file)?;
         }

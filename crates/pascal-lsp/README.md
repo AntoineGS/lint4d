@@ -1407,11 +1407,18 @@ during maintenance, least recently used first. While the store needs space,
 over its disk budget or with less than 256 MiB free on its filesystem
 (whatever filled it: the cache gives disk back), maintenance also retires
 kept ones, least recently used first, until their estimated sizes cover the
-excess. Sizes are estimated by background maintenance in short steps, only
-for namespaces no server holds, and recorded beside their lock files
-(`namespaces/<hex>.size`); opening the store never reads them, so an
-over-budget store waits for maintenance. An estimate leaves out index
-overhead, so a pass may retire one namespace more than needed. It never
+excess. A size is estimated only then, only for the kept namespace that
+would go next and only while no server holds it, by background maintenance
+in short steps of at most 4,096 entries per cycle, so the phases that give
+disk back run in every cycle; the estimate is recorded beside the lock file
+(`namespaces/<hex>.size`). Opening the store never reads one, so an
+over-budget store waits for maintenance. A namespace whose estimate does not
+finish within 64 cycles, or that is reused during three of its scans, is
+retired anyway with an unknown size (counted as nothing freed). An estimate
+leaves out index overhead, so a pass may retire one namespace more than
+needed; it can also count an observation shared by several evidence sets
+more than once, and miss what a crashed server wrote in its last minute.
+Each pass rereads what it freed, so the next one corrects either way. It never
 retires a namespace a running server holds. `--cache-status` lists them.
 
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
@@ -1701,8 +1708,8 @@ directory longer than 2,048 escaped bytes is cut in the output and
   first: `id` (the namespace hex), `current` (this command's build),
   `resetEpoch`, `lastUsed` (Unix seconds, `null` without a lock file),
   `estimatedBytes` (the size maintenance last estimated for this epoch, its
-  rows' content plus 64 bytes per row; `null` until a maintenance pass
-  estimated it, which happens only while no server holds it) and `held` (a
+  rows' content plus 64 bytes per row; `null` unless disk pressure made
+  maintenance estimate it) and `held` (a
   running process holds its lock, as retirement sees it: the lock is tried
   once without waiting). At most 16 are listed, fewer if the line would pass
   4 KiB; `listTruncated` says so. Of more than 256 live namespaces, the 256

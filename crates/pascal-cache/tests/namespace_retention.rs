@@ -10,12 +10,12 @@ use common::private_tempdir;
 use pascal_cache::admin::{self, StatusReport, StoreStatus};
 use pascal_cache::{
     DATABASE_FILE, Digest, FaultPoint, LimitsError, MAX_NAMESPACES, Maintenance, MaintenanceLimits,
-    Namespace, ROW_OVERHEAD_BYTES, RetireReport, StepBudget, Store, StoreLimits, StorePolicy,
+    Namespace, RetireReport, StepBudget, Store, StoreLimits, StorePolicy,
 };
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MIB: u64 = 1 << 20;
@@ -228,28 +228,25 @@ fn over_its_disk_budget_a_store_retires_the_least_recently_used_namespaces_first
         live(dir, 1) && live(dir, 2),
         "within the budget both are kept"
     );
-    // Maintenance estimates both namespaces' sizes (no pressure yet).
-    maintain(&store, 1);
     pretend_excess(&store, 5 * MIB);
     assert_eq!(
         store.retire_obsolete(),
         Ok(RetireReport {
-            retired: 1,
+            retired: 0,
             in_use: 0,
-            kept: 1,
-            unestimated: 0,
-        })
+            kept: 2,
+            unestimated: 1,
+        }),
+        "the least recently used is not estimated yet"
     );
-    assert_eq!(state(dir, 1), Some((0, 2)), "the least recently used");
-    assert!(live(dir, 2));
-    // Build 1's rows are not reclaimed yet, but they count as freed: the
-    // next pass retires nothing more.
-    assert_eq!(store.retire_obsolete().unwrap().retired, 0);
-    assert!(live(dir, 2));
-    // Over by more than build 1 frees, build 2 goes too.
+    // Maintenance estimates it, then retires it.
+    maintain(&store, 1);
+    assert!(!live(dir, 1), "the least recently used");
+    assert!(live(dir, 2), "build 1's estimate covers the excess");
+    // Over by more than build 1 freed, build 2 goes too.
     pretend_excess(&store, 15 * MIB);
-    assert_eq!(store.retire_obsolete().unwrap().retired, 1);
-    assert_eq!(state(dir, 2), Some((0, 2)));
+    maintain(&store, 1);
+    assert!(!live(dir, 2));
     assert_eq!(store.check_scope(), Ok(()), "the current build stays");
 }
 
@@ -263,19 +260,10 @@ fn a_held_namespace_among_the_kept_ones_is_skipped_under_pressure() {
     session(dir, 2, 2);
     plant(dir, 2, 10 * MIB);
     let store = open(dir, 3);
-    maintain(&store, 1);
     pretend_excess(&store, 5 * MIB);
-    assert_eq!(
-        store.retire_obsolete(),
-        Ok(RetireReport {
-            retired: 1,
-            in_use: 1,
-            kept: 0,
-            unestimated: 0,
-        })
-    );
+    maintain(&store, 1);
     assert!(live(dir, 1), "held, though least recently used");
-    assert_eq!(state(dir, 2), Some((0, 2)));
+    assert!(!live(dir, 2));
     drop(held);
 }
 
@@ -340,17 +328,29 @@ fn estimate_of(directory: &Path, byte: u8) -> Option<u64> {
         .and_then(|entry| entry.estimated_bytes)
 }
 
-/// Estimation reads in bounded chunks that count against the step's rows,
-/// never holds the writer, stops at the cancel flag, resumes across steps,
-/// and is remembered: a later cycle reads nothing again.
+/// Delete-phase transactions of `store`, counted by a fault hook.
+fn count_deletes(store: &Store) -> Arc<AtomicUsize> {
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let counter = deletes.clone();
+    store.set_fault_for_test(FaultPoint::GcDeleteBeforeCommit, move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+    deletes
+}
+
+/// Under pressure the least recently used kept namespace is estimated in
+/// chunks bounded by the step's rows, never on the writer, stopping at the
+/// cancel flag; a cycle reads at most its estimate cap and goes on to the
+/// phases that give disk back, and the scan resumes in the next cycle
+/// (review I-new-1).
 #[test]
-fn namespace_sizes_are_estimated_in_bounded_steps_and_remembered() {
+fn an_estimate_is_read_in_bounded_steps_without_delaying_reclamation() {
     let root = private_tempdir();
     let dir = root.path();
     session(dir, 1, 1);
-    plant_many(dir, 1, 1000);
+    plant_many(dir, 1, 5000);
     let store = Arc::new(open(dir, 2));
-    // While estimation reads, the writer is free.
+    pretend_excess(&store, 1024);
     let writer_free = Arc::new(AtomicBool::new(true));
     let (weak, free) = (Arc::downgrade(&store), writer_free.clone());
     store.set_fault_for_test(FaultPoint::EstimateChunk, move || {
@@ -360,6 +360,7 @@ fn namespace_sizes_are_estimated_in_bounded_steps_and_remembered() {
             free.store(false, Ordering::Relaxed);
         }
     });
+    let deletes = count_deletes(&store);
     let mut maintenance = Maintenance::new(MaintenanceLimits::default()).unwrap();
     let cancel = AtomicBool::new(true);
     let budget = StepBudget {
@@ -369,31 +370,76 @@ fn namespace_sizes_are_estimated_in_bounded_steps_and_remembered() {
     let report = maintenance.step(&store, budget, &cancel).unwrap();
     assert!(report.cancelled && report.rows == 0, "{report:?}");
     let cancel = AtomicBool::new(false);
-    let mut steps = 0;
-    while estimate_of(dir, 1).is_none() {
+    let (mut steps, mut cycles, mut deleted_before_retired) = (0, 0, false);
+    while live(dir, 1) {
         let report = maintenance.step(&store, budget, &cancel).unwrap();
         assert!(report.rows <= 100, "{report:?}");
+        cycles += usize::from(report.cycle_complete);
+        deleted_before_retired |= deletes.load(Ordering::Relaxed) > 0 && live(dir, 1);
         steps += 1;
-        assert!(steps < 100);
+        assert!(steps < 500);
     }
-    assert!(steps >= 10, "1000 rows in steps of at most 100: {steps}");
+    assert!(steps >= 50, "5000 rows in steps of at most 100: {steps}");
+    assert!(cycles >= 1, "more than one cycle's estimate cap");
+    assert!(deleted_before_retired, "reclamation ran while estimating");
     assert!(writer_free.load(Ordering::Relaxed));
-    assert_eq!(estimate_of(dir, 1), Some(1000 * (1 + ROW_OVERHEAD_BYTES)));
-    store.clear_fault_for_test(FaultPoint::EstimateChunk);
-    let before = maintain(&store, 1);
-    assert_eq!(
-        maintain(&store, 1),
-        0,
-        "nothing read again (first cycle {before})"
+}
+
+/// Review I-new-1: without pressure no estimate is read.
+#[test]
+fn no_estimate_is_read_without_pressure() {
+    let root = private_tempdir();
+    let dir = root.path();
+    session(dir, 1, 1);
+    plant_many(dir, 1, 500);
+    let store = open(dir, 2);
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let counter = chunks.clone();
+    store.set_fault_for_test(FaultPoint::EstimateChunk, move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(maintain(&store, 2), 0);
+    assert_eq!(chunks.load(Ordering::Relaxed), 0);
+    assert_eq!(estimate_of(dir, 1), None);
+}
+
+/// Review I-new-1: in a low-space emergency, a kept namespace reopened
+/// during every scan is retired anyway after a few tries (its size counted
+/// as unknown), and reclamation runs meanwhile.
+#[test]
+fn a_candidate_reused_during_its_scans_is_retired_without_stalling() {
+    let root = private_tempdir();
+    let dir = root.path().to_path_buf();
+    session(&dir, 1, 1);
+    plant_many(&dir, 1, 1000);
+    let store = open(&dir, 2);
+    let reused = dir.clone();
+    store.set_fault_for_test(FaultPoint::EstimateChunk, move || {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(lock(&reused, 1))
+            .unwrap();
+        file.set_modified(SystemTime::now()).unwrap();
+    });
+    let deletes = count_deletes(&store);
+    store.pretend_free_space_for_test(Some(pascal_cache::LOW_SPACE_MARGIN_BYTES - MIB));
+    let mut maintenance = Maintenance::new(MaintenanceLimits::default()).unwrap();
+    let never = AtomicBool::new(false);
+    let budget = StepBudget {
+        time: Duration::from_secs(5),
+        rows: 100,
+    };
+    let mut steps = 0;
+    while artifacts(&dir, 1) > 0 {
+        maintenance.step(&store, budget, &never).unwrap();
+        steps += 1;
+        assert!(steps < 200, "stalled: {steps} steps");
+    }
+    assert!(!live(&dir, 1));
+    assert!(
+        deletes.load(Ordering::Relaxed) > 1,
+        "reclamation ran every cycle"
     );
-    // Another process's status and retirement reuse the recorded size.
-    drop(store);
-    let other = open(dir, 3);
-    assert_eq!(estimate_of(dir, 1), Some(1000 * (1 + ROW_OVERHEAD_BYTES)));
-    // Only namespace 2, now closed and empty, is estimated: one chunk per
-    // table.
-    assert_eq!(maintain(&other, 1), 3, "build 1 is not read again");
-    drop(other);
 }
 
 /// Review M1: a namespace used between the ranking and its retirement is
@@ -569,7 +615,6 @@ fn status_lists_every_retained_namespace_most_recently_used_first() {
     plant(dir, 1, 4 * MIB);
     session(dir, 2, 2);
     let held = open(dir, 3);
-    assert_eq!(estimate_of(dir, 1), None, "not estimated yet");
     maintain(&held, 1);
     let report = status(dir);
     let listed: Vec<_> = report
@@ -588,12 +633,89 @@ fn status_lists_every_retained_namespace_most_recently_used_first() {
     let first = &report.namespaces[2];
     assert_eq!(first.last_used_unix_seconds, Some(1_700_000_001));
     assert_eq!(first.reset_epoch, 0);
-    assert_eq!(first.estimated_bytes, Some(4 * MIB + ROW_OVERHEAD_BYTES));
-    assert_eq!(report.namespaces[1].estimated_bytes, Some(0));
-    assert_eq!(
-        report.namespaces[0].estimated_bytes, None,
-        "the current namespace of a running server is not estimated"
+    assert!(
+        report
+            .namespaces
+            .iter()
+            .all(|entry| entry.estimated_bytes.is_none()),
+        "without pressure nothing is estimated"
     );
     assert!(!report.namespaces_truncated);
     drop(held);
+}
+
+/// A store keeping only its own namespace, with build 1 unheld and live
+/// beside it.
+fn alone_beside_build_one(dir: &Path) -> Store {
+    let holder = open(dir, 1);
+    let store = Store::open(dir, &namespace(2), keeping(1)).unwrap();
+    drop(holder);
+    store
+}
+
+/// Review M-new-1: a namespace ranked without a lock file that a process
+/// opens and closes before its retirement is not retired, and its new lock
+/// file stays.
+#[test]
+fn a_namespace_ranked_without_a_lock_file_and_then_used_is_not_retired() {
+    let root = private_tempdir();
+    let dir = root.path().to_path_buf();
+    let store = alone_beside_build_one(&dir);
+    std::fs::remove_file(lock(&dir, 1)).unwrap();
+    let reopen = dir.clone();
+    store.set_fault_for_test(FaultPoint::NamespacesRanked, move || {
+        // Ranked without a lock file; now a process opens and closes it.
+        drop(open(&reopen, 1));
+    });
+    let report = store.retire_obsolete().unwrap();
+    assert_eq!(report.retired, 0, "{report:?}");
+    assert!(live(&dir, 1));
+    assert!(lock(&dir, 1).exists());
+}
+
+/// Review M-new-1: a pass that finds its candidate no longer live at the
+/// ranked epoch (another process moved it on) leaves its lock file.
+#[test]
+fn a_candidate_gone_from_its_epoch_keeps_its_lock_file() {
+    let root = private_tempdir();
+    let dir = root.path().to_path_buf();
+    let store = alone_beside_build_one(&dir);
+    let moved = dir.clone();
+    store.set_fault_for_test(FaultPoint::NamespacesRanked, move || {
+        raw(&moved)
+            .execute(
+                "UPDATE namespaces SET reset_epoch = 1 WHERE namespace_id = ?1",
+                [namespace(1).id().as_bytes().as_slice()],
+            )
+            .unwrap();
+    });
+    let report = store.retire_obsolete().unwrap();
+    assert_eq!(report.retired, 0, "{report:?}");
+    assert!(lock(&dir, 1).exists(), "its use stays recorded");
+    assert_eq!(state(&dir, 1), Some((1, 1)));
+}
+
+/// Review M-new-4: opening the store removes record temporaries a crashed
+/// writer left, older than a few minutes, and keeps recent ones.
+#[test]
+fn opening_removes_stale_record_temporaries() {
+    let root = private_tempdir();
+    let dir = root.path();
+    drop(open(dir, 1));
+    let locks = dir.join("namespaces");
+    let stale = locks.join(format!("{}.size.00ff.tmp", namespace(1).id().to_hex()));
+    let fresh = locks.join(format!("{}.size.0100.tmp", namespace(1).id().to_hex()));
+    for path in [&stale, &fresh] {
+        std::fs::write(path, b"l4d-size 1 0 - 1\n").unwrap();
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    drop(open(dir, 1));
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+    assert!(lock(dir, 1).exists());
 }

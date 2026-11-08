@@ -96,6 +96,11 @@ impl StoreLocation {
         self.directory.join(MAINTENANCE_LOCK)
     }
 
+    /// The directory of the namespace lock files and size records.
+    pub(crate) fn namespace_locks(&self) -> PathBuf {
+        self.directory.join(NAMESPACE_LOCKS)
+    }
+
     pub fn prepare_namespace_locks(&self) -> Result<(), Bypass> {
         platform::prepare_subdirectory(&self.directory.join(NAMESPACE_LOCKS))
     }

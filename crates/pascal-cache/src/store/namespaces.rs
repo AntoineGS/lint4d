@@ -339,12 +339,17 @@ pub(crate) fn retire_one(
     // Never hold the lock file across a SQLite wait: take the write lock
     // first, then try the (non-blocking) exclusive lock.
     let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
-    let Some(lock) = NamespaceLock::try_exclusive(location.namespace_lock(namespace))? else {
+    let path = location.namespace_lock(namespace);
+    // Ranked without a lock file: one there now was made by a process that
+    // opened the namespace since (review M-new-1).
+    if ranked_use.is_none() && fs::symlink_metadata(&path).is_ok() {
+        drop(transaction);
+        return Ok(Retirement::UsedSince);
+    }
+    let Some(lock) = NamespaceLock::try_exclusive(path)? else {
         drop(transaction);
         return Ok(Retirement::Held);
     };
-    // A namespace ranked without a lock file has none to compare: the one
-    // `try_exclusive` just created is new.
     if ranked_use.is_some() && lock.used() > ranked_use {
         drop(transaction);
         return Ok(Retirement::UsedSince);
@@ -365,14 +370,14 @@ pub(crate) fn retire_one(
             .map_err(fail)?;
     }
     transaction.commit().map_err(fail)?;
-    // The scope is retired either way. A lock file that cannot be
-    // removed is reused if the namespace is registered again.
+    if changed == 0 {
+        // Live at another epoch: its lock file records its use.
+        return Ok(Retirement::Gone);
+    }
+    // A lock file that cannot be removed is reused if the namespace is
+    // registered again.
     let _ = lock.remove();
-    Ok(if changed == 1 {
-        Retirement::Done
-    } else {
-        Retirement::Gone
-    })
+    Ok(Retirement::Done)
 }
 
 /// Whether a live process holds namespace lock `path` (what retirement

@@ -368,13 +368,81 @@ fn nested_and_repeated_includes_edited_while_stopped() {
     assert_agree(&run.warm, &run.uncached);
     assert_reused(&run);
     assert!(locates(&run.warm[0], "Inner.inc", 2, 2), "{:?}", run.warm);
+    // The two expansions of `Inner.inc` map to one source location, which
+    // the server reports once: the warm answer gains exactly that location
+    // over the pre-mutation one and keeps `Importer0.pas`'s own.
+    assert!(
+        !run.cold[0]
+            .locations
+            .iter()
+            .any(|location| location.contains("Inner.inc")),
+        "{:?}",
+        run.cold
+    );
+    assert_eq!(
+        run.warm[0].locations.len(),
+        run.cold[0].locations.len() + 1,
+        "cold {:?} warm {:?}",
+        run.cold,
+        run.warm
+    );
+    assert!(
+        locates(&run.warm[0], "Importer0.pas", 7, 2),
+        "{:?}",
+        run.warm
+    );
     assert_eq!(run.warm[1].locations.len(), 1, "{:?}", run.warm);
 }
 
+/// `Importer0.pas` includes `lib/Outer.inc` in its interface and its
+/// implementation; `Outer.inc` defines `OUTER_SEEN` the first time and
+/// includes `Inner.inc` the second (`{$IFNDEF OUTER_SEEN}`). `Inner.inc`
+/// gains `FromInner` while stopped. A conditional include is a documented
+/// analysis limit: the uncached server reports the references as
+/// incomplete too, so the check is that the warm server reports the same
+/// coverage and never more than the uncached one.
+#[test]
+fn a_guarded_include_edited_while_stopped_is_truthful() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let importer = root.join("lib/Importer0.pas");
+    let text = fs::read_to_string(&importer)
+        .unwrap()
+        .replace("uses Shared;\n", "uses Shared;\n{$I Outer.inc}\n")
+        .replace("implementation\n", "implementation\n{$I Outer.inc}\n");
+    write_file(&importer, &text);
+    write_file(
+        &root.join("lib/Outer.inc"),
+        "{$IFNDEF OUTER_SEEN}{$DEFINE OUTER_SEEN}{$ELSE}{$I Inner.inc}{$ENDIF}\n",
+    );
+    write_file(&root.join("lib/Inner.inc"), "{ inner }\n");
+    pascal_project::backdate_tree_for_test(&root);
+    let run = differential_uncold(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        |root| {
+            write_file(
+                &root.join("lib/Inner.inc"),
+                "procedure FromInner;\nbegin\n  TShared.Create;\nend;\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[SHARED_REFERENCES, Query::Symbols("FromInner")],
+    );
+    assert_truthful(&run.warm, &run.uncached);
+    assert_reused(&run);
+    for (warm, uncached) in run.warm.iter().zip(&run.uncached) {
+        assert_eq!(warm.complete, uncached.complete, "{warm:?} {uncached:?}");
+        assert_eq!(warm.notes, uncached.notes);
+    }
+}
+
 /// Three units include `Missing.inc`, which does not resolve; while
-/// stopped it appears and declares `TFromMissing`. Follow-up R9-4: the
-/// warm server may still report the three members as a gap, so the check
-/// is truthfulness, not equality.
+/// stopped it appears and declares `TFromMissing`. Follow-up R9-4 allowed
+/// the warm server to keep reporting the three members as a gap; it does
+/// not (complete and equal to the uncached answer), and that is asserted.
 #[test]
 fn a_missing_include_appearing_while_stopped_is_truthful() {
     const MISSING: FixtureSpec = FixtureSpec {
@@ -400,14 +468,8 @@ fn a_missing_include_appearing_while_stopped_is_truthful() {
         },
         &[SHARED_REFERENCES, Query::Symbols("TFromMissing")],
     );
-    assert_truthful(&run.warm, &run.uncached);
+    assert_agree(&run.warm, &run.uncached);
     assert_reused(&run);
-    println!(
-        "warm complete: {:?}, uncached complete: {:?}, equal: {}",
-        run.warm.iter().map(|a| a.complete).collect::<Vec<_>>(),
-        run.uncached.iter().map(|a| a.complete).collect::<Vec<_>>(),
-        run.warm == run.uncached
-    );
 }
 
 /// `App.dproj`'s search path gains `lib2` and `App.dpr` uses
@@ -530,6 +592,11 @@ fn a_compiler_version_change_while_stopped() {
     assert_agree(&run.warm, &run.uncached);
     // The compiler version is part of the context key, so nothing of the
     // first server's records is reusable: the warm server extracts anew.
+    assert!(
+        run.warm_status["members"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
     assert_eq!(run.warm_status["reused"], 0, "{}", run.warm_status);
     assert_eq!(
         run.warm_status["extracted"], run.warm_status["members"],

@@ -215,8 +215,29 @@ fn maintain(store: &Store, cycles: usize) -> usize {
     rows
 }
 
+/// Record `bytes` as namespace `byte`'s current estimate: its epoch 0 and
+/// its lock file's time, as maintenance writes it.
+fn record(directory: &Path, byte: u8, bytes: u64) {
+    let used = std::fs::metadata(lock(directory, byte))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        directory
+            .join("namespaces")
+            .join(format!("{}.size", namespace(byte).id().to_hex())),
+        format!("l4d-size 1 0 {used} {bytes}\n"),
+    )
+    .unwrap();
+}
+
+/// Review M-r2-2: under pressure the least recently used kept namespace is
+/// retired at once, its size unknown, and the pass stops there.
 #[test]
-fn over_its_disk_budget_a_store_retires_the_least_recently_used_namespaces_first() {
+fn over_its_disk_budget_a_store_retires_the_least_recently_used_namespace_at_once() {
     let root = private_tempdir();
     let dir = root.path();
     session(dir, 1, 1);
@@ -228,26 +249,114 @@ fn over_its_disk_budget_a_store_retires_the_least_recently_used_namespaces_first
         live(dir, 1) && live(dir, 2),
         "within the budget both are kept"
     );
+    pretend_excess(&store, 100 * MIB);
+    assert_eq!(
+        store.retire_obsolete(),
+        Ok(RetireReport {
+            retired: 1,
+            in_use: 0,
+            kept: 1,
+            unknown_size: 1,
+        })
+    );
+    assert!(!live(dir, 1), "the least recently used");
+    assert!(live(dir, 2), "a size unknown stops the pass");
+    assert_eq!(store.check_scope(), Ok(()), "the current build stays");
+}
+
+/// Review I-r2-2: the estimate of a retired scope not yet reclaimed counts
+/// as freed space.
+#[test]
+fn a_retired_scope_still_to_reclaim_counts_as_freed() {
+    let root = private_tempdir();
+    let dir = root.path();
+    session(dir, 1, 1);
+    record(dir, 1, 10 * MIB);
+    session(dir, 2, 2);
+    let store = open(dir, 3);
+    pretend_excess(&store, 5 * MIB);
+    assert_eq!(store.retire_obsolete().unwrap().retired, 1);
+    assert!(!live(dir, 1) && live(dir, 2));
+    let again = store.retire_obsolete().unwrap();
+    assert_eq!((again.retired, again.unknown_size), (0, 0), "{again:?}");
+    // Over by more than build 1 frees, build 2 goes too, size unknown.
+    pretend_excess(&store, 15 * MIB);
+    let more = store.retire_obsolete().unwrap();
+    assert_eq!((more.retired, more.unknown_size), (1, 1), "{more:?}");
+    assert!(!live(dir, 2));
+}
+
+/// Review I-r2-2: current estimates let one pass retire several kept
+/// namespaces, until they cover the excess.
+#[test]
+fn current_estimates_let_one_pass_retire_until_the_excess_is_covered() {
+    let root = private_tempdir();
+    let dir = root.path();
+    for byte in 1..=3 {
+        session(dir, byte, u64::from(byte));
+        record(dir, byte, 10 * MIB);
+    }
+    let store = Store::open(dir, &namespace(4), keeping(4)).unwrap();
+    pretend_excess(&store, 15 * MIB);
+    assert_eq!(
+        store.retire_obsolete(),
+        Ok(RetireReport {
+            retired: 2,
+            in_use: 0,
+            kept: 1,
+            unknown_size: 0,
+        })
+    );
+    assert!(!live(dir, 1) && !live(dir, 2));
+    assert!(live(dir, 3), "builds 1 and 2 cover the excess");
+}
+
+/// A known size retired by the count rule counts against the excess too:
+/// the pressure then keeps the kept namespace.
+#[test]
+fn a_count_retirement_of_known_size_counts_against_the_excess() {
+    let root = private_tempdir();
+    let dir = root.path();
+    // Both held while build 3 opens, so its open retires neither.
+    let holders = (open(dir, 1), open(dir, 2));
+    let store = Store::open(dir, &namespace(3), keeping(2)).unwrap();
+    drop(holders);
+    for byte in 1..=2 {
+        used_at(dir, byte, u64::from(byte));
+        record(dir, byte, 10 * MIB);
+    }
     pretend_excess(&store, 5 * MIB);
     assert_eq!(
         store.retire_obsolete(),
         Ok(RetireReport {
-            retired: 0,
+            retired: 1,
             in_use: 0,
-            kept: 2,
-            unestimated: 1,
-        }),
-        "the least recently used is not estimated yet"
+            kept: 1,
+            unknown_size: 0,
+        })
     );
-    // Maintenance estimates it, then retires it.
-    maintain(&store, 1);
-    assert!(!live(dir, 1), "the least recently used");
-    assert!(live(dir, 2), "build 1's estimate covers the excess");
-    // Over by more than build 1 freed, build 2 goes too.
-    pretend_excess(&store, 15 * MIB);
-    maintain(&store, 1);
+    assert!(!live(dir, 1), "beyond the count");
+    assert!(live(dir, 2), "build 1's size covers the excess");
+}
+
+/// Review I-r2-1: a record whose lock-file time no longer matches is not a
+/// size: retiring with it stops the pass and frees nothing on paper.
+#[test]
+fn a_stale_record_is_an_unknown_size() {
+    let root = private_tempdir();
+    let dir = root.path();
+    session(dir, 1, 1);
+    record(dir, 1, 100 * MIB);
+    used_at(dir, 1, 2);
+    session(dir, 2, 3);
+    let store = open(dir, 4);
+    pretend_excess(&store, 5 * MIB);
+    let first = store.retire_obsolete().unwrap();
+    assert_eq!((first.retired, first.unknown_size), (1, 1), "{first:?}");
+    assert!(live(dir, 2), "the pass stopped");
+    // Nothing counted as freed: the next pass goes on.
+    assert_eq!(store.retire_obsolete().unwrap().retired, 1);
     assert!(!live(dir, 2));
-    assert_eq!(store.check_scope(), Ok(()), "the current build stays");
 }
 
 #[test]
@@ -267,27 +376,26 @@ fn a_held_namespace_among_the_kept_ones_is_skipped_under_pressure() {
     drop(held);
 }
 
-/// A store over its budget at open sets the planted namespaces' sizes
-/// apart: `Store::open` never scans a namespace's rows (review I1), so the
-/// pressure part waits for maintenance to estimate them.
+/// A store over its budget at open retires its least recently used kept
+/// namespace there, without reading any namespace's rows (reviews I1,
+/// M-r2-2).
 #[test]
-fn opening_over_budget_leaves_the_pressure_retirement_to_maintenance() {
+fn opening_over_budget_retires_the_least_recently_used_namespace_unread() {
     let root = private_tempdir();
     let dir = root.path();
     session(dir, 1, 1);
     plant(dir, 1, 10 * MIB);
+    session(dir, 2, 2);
     raw(dir)
         .execute(
             "UPDATE store_state SET max_disk_bytes = ?1, wal_threshold_bytes = ?2",
             params![1i64 << 20, (1i64 << 20) - 1],
         )
         .unwrap();
-    let store = open(dir, 2);
-    assert!(live(dir, 1), "not estimated at open, so not retired there");
-    assert_eq!(store.retire_obsolete().unwrap().unestimated, 1);
-    maintain(&store, 1);
-    // Retired, and reclaimed in the same cycle.
-    assert!(!live(dir, 1), "maintenance estimated and retired it");
+    let _store = open(dir, 3);
+    assert!(!live(dir, 1), "retired at open");
+    assert!(live(dir, 2), "its size unknown, the pass stopped");
+    assert_eq!(estimate_of(dir, 1), None);
 }
 
 /// Rows of `artifacts` artifacts with no content in namespace `byte`.
@@ -338,22 +446,25 @@ fn count_deletes(store: &Store) -> Arc<AtomicUsize> {
     deletes
 }
 
-/// Under pressure the least recently used kept namespace is estimated in
-/// chunks bounded by the step's rows, never on the writer, stopping at the
-/// cancel flag; a cycle reads at most its estimate cap and goes on to the
-/// phases that give disk back, and the scan resumes in the next cycle
-/// (review I-new-1).
+/// After a pass stopped at a retirement of unknown size, maintenance
+/// estimates the next kept namespace in chunks bounded by the step's rows,
+/// never on the writer, stopping at the cancel flag, and at most its cap
+/// per cycle, so reclamation runs in the same cycle; the next pass does
+/// not wait for the estimate (reviews I-new-1, M-r2-2).
 #[test]
-fn an_estimate_is_read_in_bounded_steps_without_delaying_reclamation() {
+fn an_estimate_never_holds_back_retirement_or_reclamation() {
     let root = private_tempdir();
     let dir = root.path();
     session(dir, 1, 1);
-    plant_many(dir, 1, 5000);
-    let store = Arc::new(open(dir, 2));
+    session(dir, 2, 2);
+    plant_many(dir, 2, 5000);
+    let store = Arc::new(open(dir, 3));
     pretend_excess(&store, 1024);
     let writer_free = Arc::new(AtomicBool::new(true));
-    let (weak, free) = (Arc::downgrade(&store), writer_free.clone());
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let (weak, free, counter) = (Arc::downgrade(&store), writer_free.clone(), chunks.clone());
     store.set_fault_for_test(FaultPoint::EstimateChunk, move || {
+        counter.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = weak.upgrade()
             && store.hold_writer_for_test().is_err()
         {
@@ -370,19 +481,28 @@ fn an_estimate_is_read_in_bounded_steps_without_delaying_reclamation() {
     let report = maintenance.step(&store, budget, &cancel).unwrap();
     assert!(report.cancelled && report.rows == 0, "{report:?}");
     let cancel = AtomicBool::new(false);
-    let (mut steps, mut cycles, mut deleted_before_retired) = (0, 0, false);
-    while live(dir, 1) {
+    let mut steps = 0;
+    loop {
         let report = maintenance.step(&store, budget, &cancel).unwrap();
         assert!(report.rows <= 100, "{report:?}");
-        cycles += usize::from(report.cycle_complete);
-        deleted_before_retired |= deletes.load(Ordering::Relaxed) > 0 && live(dir, 1);
         steps += 1;
-        assert!(steps < 500);
+        if report.cycle_complete {
+            break;
+        }
+        assert!(steps < 200);
     }
-    assert!(steps >= 50, "5000 rows in steps of at most 100: {steps}");
-    assert!(cycles >= 1, "more than one cycle's estimate cap");
-    assert!(deleted_before_retired, "reclamation ran while estimating");
+    assert!(!live(dir, 1), "retired by the first pass");
+    assert!(live(dir, 2), "its size unknown, the first pass stopped");
+    assert!(steps >= 40, "4096 entries in steps of at most 100: {steps}");
+    assert!(chunks.load(Ordering::Relaxed) >= 40);
+    assert!(
+        deletes.load(Ordering::Relaxed) > 0,
+        "reclamation in the same cycle"
+    );
     assert!(writer_free.load(Ordering::Relaxed));
+    // The next cycle's pass retires build 2 without its estimate.
+    maintain(&store, 1);
+    assert!(!live(dir, 2));
 }
 
 /// Review I-new-1: without pressure no estimate is read.
@@ -589,7 +709,7 @@ fn a_held_namespace_is_never_retired() {
             retired: 0,
             in_use: 1,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 0,
         })
     );
     assert_eq!(held.check_scope(), Ok(()));

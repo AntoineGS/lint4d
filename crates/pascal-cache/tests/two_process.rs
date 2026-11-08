@@ -312,7 +312,7 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
             retired: 0,
             in_use: 1,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 0,
         })
     );
     assert!(lock.exists());
@@ -324,7 +324,7 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
             retired: 1,
             in_use: 0,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 1,
         })
     );
     assert!(!lock.exists());

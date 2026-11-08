@@ -69,9 +69,10 @@ pub struct RetireReport {
     pub in_use: usize,
     /// Other namespaces left live by retention (l4d-1ypi).
     pub kept: usize,
-    /// Kept namespaces the disk pressure would retire whose size is not
-    /// estimated yet; maintenance estimates them first (review I1).
-    pub unestimated: usize,
+    /// Namespaces retired with no current size estimate. The first one
+    /// the disk pressure retires that way ends the pass: what it freed
+    /// shows after reclamation (reviews I-r2-1, M-r2-2).
+    pub unknown_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

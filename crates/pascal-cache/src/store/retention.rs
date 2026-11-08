@@ -2,14 +2,16 @@
 //! live namespaces a retirement pass keeps, by recency and by size, and the
 //! size estimates it uses.
 //!
-//! A namespace's last use is its lock file's modification time. A size
-//! estimate is read only for the kept namespace the disk pressure would
-//! retire next, on a reader in chunks bounded per step and per cycle by
-//! maintenance, never at open and never on the writer (reviews I1,
-//! I-new-1), and recorded beside the lock file (`<hex>.size`) for later
-//! passes, other processes and `--cache-status`. A record is current while the namespace's epoch and
-//! lock-file time are unchanged: rows of a namespace change only while a
-//! process holds it, and every holder records its use at open, at least
+//! A namespace's last use is its lock file's modification time. Under
+//! disk pressure a pass retires the least recently used kept namespace at
+//! once; only a current size estimate lets it go on to the next. An
+//! estimate is read for the next kept namespace after a pass stopped, on a
+//! reader in chunks bounded per step and per cycle by maintenance, never at
+//! open and never on the writer (reviews I1, I-new-1, M-r2-2), and recorded
+//! beside the lock file (`<hex>.size`) for later passes, other processes
+//! and `--cache-status`. A record is current while the namespace's epoch
+//! and lock-file time are unchanged: rows of a namespace change only while
+//! a process holds it, and every holder records its use at open, at least
 //! once a minute while open, and at close.
 
 use super::Store;
@@ -264,23 +266,7 @@ pub(crate) struct Estimates {
     scan: Option<Scan>,
     recorded: HashMap<Digest, Recorded>,
     retired: HashMap<(Digest, i64), u64>,
-    /// Per candidate scope: the cycles that tried to estimate it and the
-    /// scans its reuse restarted. Past [`MAX_ESTIMATE_CYCLES`] or
-    /// [`MAX_SCAN_RESTARTS`] it is retired with an unknown size.
-    tries: HashMap<(Digest, i64), Tries>,
 }
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Tries {
-    cycles: u32,
-    restarts: u32,
-}
-
-/// Cycles one candidate's estimate may take (at most
-/// `MAX_ESTIMATE_ROWS_PER_CYCLE` entries each) before the pressure retires
-/// it unestimated, and scans its reuse may restart.
-const MAX_ESTIMATE_CYCLES: u32 = 64;
-const MAX_SCAN_RESTARTS: u32 = 3;
 
 /// What one [`Store::estimate_for`] transaction did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,19 +280,6 @@ pub(crate) enum Estimate {
 }
 
 impl Estimates {
-    /// Whether the pressure retires `ranked` without its size.
-    fn gave_up(&self, ranked: &Ranked) -> bool {
-        self.tries
-            .get(&(ranked.id, ranked.epoch))
-            .is_some_and(|tries| {
-                tries.cycles >= MAX_ESTIMATE_CYCLES || tries.restarts >= MAX_SCAN_RESTARTS
-            })
-    }
-
-    fn tries(&mut self, ranked: &Ranked) -> &mut Tries {
-        self.tries.entry((ranked.id, ranked.epoch)).or_default()
-    }
-
     /// The current estimate of `ranked`, from memory or its record.
     fn current(&mut self, location: &StoreLocation, ranked: &Ranked) -> Option<u64> {
         if let Some(recorded) = self.recorded.get(&ranked.id)
@@ -374,15 +347,10 @@ impl Store {
         }
     }
 
-    /// Count a maintenance cycle that estimates `target`.
-    pub(crate) fn note_estimate_cycle(&self, target: &Ranked) {
-        self.estimates().tries(target).cycles += 1;
-    }
-
     /// Read one chunk of at most `limit` entries (`limit >= 1`) of
-    /// `target`'s estimate on a reader, resuming its scan. A scan restarts
-    /// when the namespace was used since it began (its rows may have
-    /// changed); that counts against [`MAX_SCAN_RESTARTS`].
+    /// `target`'s estimate on a reader, resuming its scan. A namespace used
+    /// since its scan began (its rows may have changed) is abandoned; the
+    /// next cycle starts again.
     pub(crate) fn estimate_for(&self, target: &Ranked, limit: usize) -> Result<Estimate, Bypass> {
         let deadline = Deadline::after(self.limits.wait);
         let mut estimates = self.estimates();
@@ -396,7 +364,6 @@ impl Store {
             && nanos(used) != nanos(scan.ranked.used)
         {
             estimates.scan = None;
-            estimates.tries(target).restarts += 1;
             return Ok(Estimate::Abandoned);
         }
         if estimates.scan.is_none() {
@@ -422,7 +389,6 @@ impl Store {
         }
         let scan = estimates.scan.take().expect("set above");
         if nanos(lock_time(&self.location, target.id)) != nanos(scan.ranked.used) {
-            estimates.tries(target).restarts += 1;
             return Ok(Estimate::Abandoned);
         }
         let recorded = Recorded {
@@ -439,14 +405,15 @@ impl Store {
     /// One retirement pass (see [`Store::retire_obsolete`]). The ranking,
     /// the excess and the estimates are read on a reader and from the
     /// records; only each retirement takes the writer, briefly. No
-    /// namespace's rows are read: a kept namespace without a current
-    /// estimate is left to maintenance (`unestimated`).
+    /// namespace's rows are read.
     pub(crate) fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
         self.retire_pass_within(deadline).map(|(report, _)| report)
     }
 
-    /// [`Self::retire_within`] for maintenance: also the kept namespace
-    /// the pressure would retire next whose size is unknown.
+    /// [`Self::retire_within`] for maintenance: also, when the pass stopped
+    /// at a retirement of unknown size with the excess not covered, the
+    /// next kept namespace without a current estimate, unheld: estimating
+    /// it lets a later pass retire past it.
     pub(crate) fn retire_pass(&self) -> Result<(RetireReport, Option<Ranked>), Bypass> {
         self.retire_pass_within(Deadline::after(self.limits.open_wait))
     }
@@ -492,23 +459,16 @@ impl Store {
             .min(ranked.len());
         let (recent, older) = ranked.split_at(kept);
         let mut report = RetireReport::default();
-        let mut unestimated = None;
-        let candidates = older.iter().rev().chain(recent.iter().rev());
-        for (index, candidate) in candidates.enumerate() {
-            let by_count = index < older.len();
-            if (!by_count && excess == 0) || report.retired == MAX_RETIRED_PER_PASS {
-                break;
-            }
+        // A retirement of unknown size ends the pressure part (review
+        // I-r2-1): what it freed shows after reclamation, in a later pass.
+        let mut stopped = false;
+        let retire = |candidate: &Ranked,
+                      estimates: &mut Estimates,
+                      report: &mut RetireReport|
+         -> Result<Option<Option<u64>>, Bypass> {
+            // A current record only: one whose lock-file time no longer
+            // matches is no size.
             let bytes = estimates.current(&self.location, candidate);
-            if !by_count && bytes.is_none() && !estimates.gave_up(candidate) {
-                if !namespaces::held(&self.location.namespace_lock(candidate.id))? {
-                    report.unestimated += 1;
-                    unestimated = Some(*candidate);
-                    break;
-                }
-                report.in_use += 1;
-                continue;
-            }
             let outcome = {
                 let mut writer = self.pool.acquire(Role::Writer, deadline)?;
                 namespaces::retire_one(
@@ -520,32 +480,65 @@ impl Store {
                     deadline,
                 )?
             };
-            match outcome {
+            Ok(match outcome {
                 Retirement::Done => {
                     report.retired += 1;
-                    let bytes = bytes.or_else(|| {
-                        read_recorded(&self.location, candidate.id)
-                            .filter(|recorded| recorded.epoch == candidate.epoch)
-                            .map(|recorded| recorded.bytes)
-                    });
-                    if let Some(bytes) = bytes {
-                        estimates
-                            .retired
-                            .insert((candidate.id, candidate.epoch), bytes);
-                        excess = excess.saturating_sub(bytes);
+                    match bytes {
+                        Some(bytes) => {
+                            estimates
+                                .retired
+                                .insert((candidate.id, candidate.epoch), bytes);
+                        }
+                        None => report.unknown_size += 1,
                     }
                     estimates.recorded.remove(&candidate.id);
                     let _ = fs::remove_file(self.location.namespace_size(candidate.id));
+                    Some(bytes)
                 }
-                Retirement::Held => report.in_use += 1,
-                Retirement::Gone | Retirement::UsedSince => {}
+                Retirement::Held => {
+                    report.in_use += 1;
+                    None
+                }
+                Retirement::Gone | Retirement::UsedSince => None,
+            })
+        };
+        // The count rule needs no size.
+        for candidate in older.iter().rev() {
+            if report.retired == MAX_RETIRED_PER_PASS {
+                break;
+            }
+            match retire(candidate, &mut estimates, &mut report)? {
+                Some(Some(bytes)) => excess = excess.saturating_sub(bytes),
+                Some(None) => stopped = true,
+                None => {}
+            }
+        }
+        // The pressure: the least recently used kept namespace goes at
+        // once, size known or not (review M-r2-2); only a current estimate
+        // lets the pass go on to the next one.
+        let mut next = None;
+        for candidate in recent.iter().rev() {
+            if excess == 0 || report.retired == MAX_RETIRED_PER_PASS {
+                break;
+            }
+            if stopped {
+                // Worth estimating, so that a later pass may go past it.
+                if estimates.current(&self.location, candidate).is_none()
+                    && !namespaces::held(&self.location.namespace_lock(candidate.id))?
+                {
+                    next = Some(*candidate);
+                    break;
+                }
+                continue;
+            }
+            match retire(candidate, &mut estimates, &mut report)? {
+                Some(Some(bytes)) => excess = excess.saturating_sub(bytes),
+                Some(None) => stopped = true,
+                None => {}
             }
         }
         report.kept = ranked.len().saturating_sub(report.retired + report.in_use);
-        estimates
-            .tries
-            .retain(|(id, epoch), _| ranked.iter().any(|r| r.id == *id && r.epoch == *epoch));
-        Ok((report, unestimated))
+        Ok((report, next))
     }
 }
 

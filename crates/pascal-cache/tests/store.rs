@@ -91,7 +91,7 @@ fn a_namespace_in_use_is_not_retired() {
             retired: 0,
             in_use: 1,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 0,
         })
     );
     assert_eq!(old.check_scope(), Ok(()));
@@ -126,7 +126,7 @@ fn a_retired_namespace_reopens_in_a_new_epoch() {
             retired: 0,
             in_use: 1,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 0,
         })
     );
 }
@@ -427,7 +427,7 @@ fn retirement_under_a_held_write_lock_ends_within_the_open_wait() {
             retired: 8,
             in_use: 0,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 8,
         })
     );
 }
@@ -484,7 +484,7 @@ fn a_lock_file_that_cannot_be_removed_does_not_undo_retirement() {
             retired: 1,
             in_use: 0,
             kept: 0,
-            unestimated: 0,
+            unknown_size: 1,
         })
     );
     assert_eq!(state(&directory, 1), Some((0, 2)));

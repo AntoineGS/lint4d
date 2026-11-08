@@ -37,7 +37,7 @@ pub enum Phase {
     Checkpoint,
     /// Retire the namespaces retention does not keep and no live process
     /// holds (`Store::retire_obsolete`); under disk pressure, estimate the
-    /// size of the kept one it would retire next, bounded per cycle.
+    /// size of the next kept one, bounded per cycle.
     ObsoleteNamespaces,
     AbandonedBuilds,
     UnusedSnapshots,
@@ -296,23 +296,22 @@ impl Maintenance {
 }
 
 impl Maintenance {
-    /// One transaction of `ObsoleteNamespaces` (review I-new-1): the
-    /// retirement pass first, which needs no size for the count rule. Only
-    /// when the disk pressure would retire a kept namespace whose size is
-    /// unknown is that one estimated, one chunk of at most `batch` entries
-    /// per transaction and [`MAX_ESTIMATE_ROWS_PER_CYCLE`] per cycle; then
-    /// the cycle goes on, and the scan resumes in the next one. A finished
-    /// estimate is used by a second pass at once.
+    /// One transaction of `ObsoleteNamespaces` (reviews I-new-1, M-r2-2):
+    /// the retirement pass first, which waits for no estimate. When it
+    /// stopped at a retirement of unknown size with the excess not covered,
+    /// the next kept namespace is estimated, one chunk of at most `batch`
+    /// entries per transaction and [`MAX_ESTIMATE_ROWS_PER_CYCLE`] per
+    /// cycle, so a later pass may retire past it; then the cycle goes on,
+    /// and the scan resumes in the next one.
     fn obsolete_namespaces(
         &mut self,
         store: &Store,
         batch: usize,
     ) -> Result<(usize, bool), Bypass> {
         let Some(target) = self.estimating else {
-            let (_, unestimated) = store.retire_pass()?;
-            return Ok(match unestimated {
+            let (_, next) = store.retire_pass()?;
+            return Ok(match next {
                 Some(target) if self.estimated_rows < MAX_ESTIMATE_ROWS_PER_CYCLE => {
-                    store.note_estimate_cycle(&target);
                     self.estimating = Some(target);
                     (1, false)
                 }
@@ -329,12 +328,7 @@ impl Maintenance {
                 self.estimated_rows += rows;
                 (rows, false)
             }
-            Estimate::Done => {
-                self.estimating = None;
-                store.retire_pass()?;
-                (1, true)
-            }
-            Estimate::Abandoned => {
+            Estimate::Done | Estimate::Abandoned => {
                 self.estimating = None;
                 (0, true)
             }

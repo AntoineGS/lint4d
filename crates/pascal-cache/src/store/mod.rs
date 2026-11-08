@@ -235,9 +235,10 @@ impl Store {
     /// Keep the [`StoreLimits::max_namespaces`] most recently used live
     /// namespaces, this one included, and retire the others no live process
     /// holds, least recently used first; while the store is over its disk
-    /// policy, retire kept ones too, least recently used first, as far as
-    /// maintenance has estimated their sizes (l4d-1ypi). Reads no
-    /// namespace's rows and takes the writer only to retire.
+    /// policy, retire the least recently used kept one at once and go on
+    /// to the next only while current size estimates cover what was
+    /// retired (l4d-1ypi). Reads no namespace's rows and takes the writer
+    /// only to retire.
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
         self.guarded(Access::Maintenance, || {
             self.retire_within(Deadline::after(self.limits.open_wait))

@@ -1405,20 +1405,24 @@ the future (a clock that ran ahead, a copied directory) counts as now. A
 server retires the namespaces beyond that count when it opens the store and
 during maintenance, least recently used first. While the store needs space,
 over its disk budget or with less than 256 MiB free on its filesystem
-(whatever filled it: the cache gives disk back), maintenance also retires
-kept ones, least recently used first, until their estimated sizes cover the
-excess. A size is estimated only then, only for the kept namespace that
-would go next and only while no server holds it, by background maintenance
-in short steps of at most 4,096 entries per cycle, so the phases that give
-disk back run in every cycle; the estimate is recorded beside the lock file
-(`namespaces/<hex>.size`). Opening the store never reads one, so an
-over-budget store waits for maintenance. A namespace whose estimate does not
-finish within 64 cycles, or that is reused during three of its scans, is
-retired anyway with an unknown size (counted as nothing freed). An estimate
-leaves out index overhead, so a pass may retire one namespace more than
-needed; it can also count an observation shared by several evidence sets
-more than once, and miss what a crashed server wrote in its last minute.
-Each pass rereads what it freed, so the next one corrects either way. It never
+(whatever filled it: the cache gives disk back), it also retires the least
+recently used kept one at once, without waiting for its size. Its size is
+usually unknown, so the pass stops there and the next one, after
+reclamation, sees what it freed. Only a current size estimate lets one pass
+retire several: background maintenance estimates the next kept namespace
+after such a stop, in short steps of at most 4,096 entries per cycle (the
+phases that give disk back run in every cycle), only while no server holds
+it, and records it beside the lock file (`namespaces/<hex>.size`). An
+estimate is current while the namespace's epoch and lock-file time are
+unchanged. Opening the store never reads one. An estimate leaves out index
+overhead and counts an observation shared by several evidence sets once per
+set. A retired scope still to reclaim counts as freed by its record even
+when its lock-file time no longer matched (the lock file is gone), so a
+namespace that grew or shrank since makes a pass retire one too many or too
+few. A record can also be taken as current when the lock-file time did not
+change: recording a use is best effort, and an open and close within the
+filesystem's time granularity leave the same time. The next pass, which
+rereads usage, free pages and pending scopes, corrects each. It never
 retires a namespace a running server holds. `--cache-status` lists them.
 
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
@@ -1709,7 +1713,8 @@ directory longer than 2,048 escaped bytes is cut in the output and
   `resetEpoch`, `lastUsed` (Unix seconds, `null` without a lock file),
   `estimatedBytes` (the size maintenance last estimated for this epoch, its
   rows' content plus 64 bytes per row; `null` unless disk pressure made
-  maintenance estimate it) and `held` (a
+  maintenance estimate it; it can be out of date once the namespace was
+  used again) and `held` (a
   running process holds its lock, as retirement sees it: the lock is tried
   once without waiting). At most 16 are listed, fewer if the line would pass
   4 KiB; `listTruncated` says so. Of more than 256 live namespaces, the 256

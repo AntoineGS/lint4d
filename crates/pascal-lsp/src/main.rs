@@ -5,7 +5,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
     println!(
-        "pascal-lsp {VERSION}\n\nNative Linux Delphi/Object Pascal language server.\n\nUSAGE:\n    pascal-lsp [--stdio]\n    pascal-lsp (--cache-status | --cache-prune | --cache-reset) [--cache-directory DIR]\n    pascal-lsp [--cache-max-disk-bytes N] [--cache-wal-threshold-bytes N] [--cache-directory DIR]\n\nOPTIONS:\n    --stdio       Use JSON-RPC over stdin/stdout (the default)\n    -h, --help    Print this help message\n    -V, --version Print version information\n\nCACHE ADMINISTRATION (the server is not started; one JSON line on stdout):\n    --cache-status                  Report the persistent cache store without creating it\n    --cache-prune                   Run bounded maintenance cycles until the store is within budget\n    --cache-reset                   Reset this build's namespace; live servers reopen\n    --cache-max-disk-bytes N        Set the store's disk budget (creates the store)\n    --cache-wal-threshold-bytes N   Set the store's WAL threshold (creates the store)\n    --cache-directory DIR           Absolute store directory (default: the user cache directory)\n\nEXIT CODES:\n    0  done (an absent store is a success)\n    1  refused or failed (see the error field)\n    2  usage error"
+        "pascal-lsp {VERSION}\n\nNative Linux Delphi/Object Pascal language server.\n\nUSAGE:\n    pascal-lsp [--stdio]\n    pascal-lsp --cache-status [--cache-directory DIR]\n    pascal-lsp (--cache-prune | --cache-reset) [--cache-max-namespaces N] [--cache-directory DIR]\n    pascal-lsp [--cache-max-disk-bytes N] [--cache-wal-threshold-bytes N] [--cache-max-namespaces N] [--cache-directory DIR]\n\nOPTIONS:\n    --stdio       Use JSON-RPC over stdin/stdout (the default)\n    -h, --help    Print this help message\n    -V, --version Print version information\n\nCACHE ADMINISTRATION (the server is not started; one JSON line on stdout):\n    --cache-status                  Report the persistent cache store without creating it\n    --cache-prune                   Run bounded maintenance cycles until the store is within budget\n    --cache-reset                   Reset this build's namespace; live servers reopen\n    --cache-max-disk-bytes N        Set the store's disk budget (creates the store)\n    --cache-wal-threshold-bytes N   Set the store's WAL threshold (creates the store)\n    --cache-max-namespaces N        Builds whose cache the opened store keeps, 1 to 16 (default 3)\n    --cache-directory DIR           Absolute store directory (default: the user cache directory)\n\nEXIT CODES:\n    0  done (an absent store is a success)\n    1  refused or failed (see the error field)\n    2  usage error"
     );
 }
 
@@ -33,8 +33,12 @@ fn main() {
         Err(error) => usage_error(error),
         Ok(Invocation::Help) => print_help(),
         Ok(Invocation::Version) => println!("pascal-lsp {VERSION}"),
-        Ok(Invocation::Cache { directory, mode }) => {
-            let outcome = pascal_lsp::cache_admin::run(directory, mode);
+        Ok(Invocation::Cache {
+            directory,
+            mode,
+            max_namespaces,
+        }) => {
+            let outcome = pascal_lsp::cache_admin::run(directory, mode, max_namespaces);
             println!("{}", outcome.stdout);
             if let Some(line) = outcome.stderr {
                 eprintln!("{line}");

@@ -1393,6 +1393,43 @@ Linux and `~/Library/Caches/lint4d/analysis` on macOS. On Windows persistence
 is bypassed until `l4d-x2ft`. Entries are keyed by content. Editor buffers are
 never stored.
 
+**Builds.** Each build of `pascal-lsp` keeps its entries in a namespace of
+its own, named by a fingerprint of the sources it was built from: a rebuild
+after any source change starts with an empty namespace. The store keeps the
+three most recently used namespaces (`persistentCacheMaxNamespaces`), so
+switching between two builds on one machine (an installed server and a
+development build, say) reopens each one's entries. A namespace is used when a
+server opens or closes it, and once a minute while it is open, so a server
+that crashed after a long session still counts as recently used; a time in
+the future (a clock that ran ahead, a copied directory) counts as now. A
+server retires the namespaces beyond that count when it opens the store and
+during maintenance, least recently used first. While the store needs space,
+over its disk budget or with less than 256 MiB free on its filesystem
+(whatever filled it: the cache gives disk back), it also retires the least
+recently used kept one at once, without waiting for its size. Its size is
+usually unknown, so the pass stops there, and later passes (at every open,
+maintenance cycle or prune) retire no further kept namespace until its rows
+are reclaimed and what it freed shows. Only a current size estimate lets one
+pass retire several, and a retired namespace with an estimate counts as
+freed until it is reclaimed (its record stays until then, for every
+process): background maintenance estimates the next kept namespace
+after such a stop, in short steps of at most 4,096 entries per cycle (the
+phases that give disk back run in every cycle), only while no server holds
+it, and records it beside the lock file (`namespaces/<hex>.size`). An
+estimate is current while the namespace's epoch and lock-file time are
+unchanged. Opening the store never reads one. An estimate leaves out index
+overhead and counts an observation shared by several evidence sets once per
+set. A retired scope still to reclaim counts as freed by the record kept
+from its retirement, which can no longer be checked against a lock file;
+only a record current at retirement is kept, so this is wrong only when the
+record was wrongly taken as current, and then a namespace that grew or
+shrank makes a pass retire one too many or too few. A record is wrongly
+taken as current when the lock-file time did not change although the
+namespace was used: recording a use is best effort, and an open and close
+within the filesystem's time granularity leave the same time. The next
+pass, which rereads usage, free pages and pending scopes, corrects each. It
+never retires a namespace a running server holds. `--cache-status` lists them.
+
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
 files), where `<N>` is the store's container version, currently
 `analysis-v7.sqlite3`. A build with an incompatible container opens a fresh
@@ -1517,6 +1554,7 @@ are dropped first, then anchors are cut.
 | `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
 | `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
 | `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
+| `persistentCacheMaxNamespaces` | 3 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries. Above 16 it is clamped here, while `--cache-max-namespaces` rejects it |
 | `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
 
 The limits can be lowered, not raised. In `initializationOptions`, a value
@@ -1531,9 +1569,10 @@ At runtime (`pascalLsp` settings), `persistentCacheEnabled`,
 `persistentCachePageBytes`, `persistentCacheScratchBytes` and
 `persistentCacheWaitMs` apply as in the table. A value above the maximum clamps
 silently, an invalid value is ignored with a warning and keeps the previous
-one, and `null` resets an option. `persistentCacheDirectory` is ignored with a
-warning, because runtime settings can come from workspace files and a project
-must not redirect where the server writes.
+one, and `null` resets an option. `persistentCacheDirectory` and
+`persistentCacheMaxNamespaces` are ignored with a warning, because runtime
+settings can come from workspace files and a project must not redirect where
+the server writes or retire other builds' entries.
 
 #### A store directory inside a workspace
 
@@ -1635,7 +1674,7 @@ least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
 | `cause` | `null`, or `kind`, `advice` and (for `configuration`) a `message` of at most 1 KiB; `kind` is `configuration`, `memory` or a bypass name such as `location`, `lowDiskSpace` or `corrupt`; a `location` cause adds `location` (`notPrivate`, `notLocal`, `symlink`, ...) |
 | `advice` (in `cause`) | `none`, `retry`, `prune`, `resetNamespace` or `freshDirectory` |
 | `directory` | The store directory, cut at 4,096 escaped bytes |
-| `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
+| `limits` | `pageBytes`, `scratchBytes`, `waitMs`, `maxNamespaces` in effect |
 | `resetEpoch` | The namespace's reset counter while open |
 | `reservedBytes` | `pages`, `scratch`, `facts` and `queryTrees` (the candidate parses of the running references and workspace-symbol requests) charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
 | `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
@@ -1658,7 +1697,13 @@ pascal-lsp --cache-status         # report; does not create the store
 pascal-lsp --cache-prune          # bounded maintenance until within budget
 pascal-lsp --cache-reset          # drop this build's entries
 pascal-lsp --cache-max-disk-bytes 4294967296 --cache-wal-threshold-bytes 134217728
+pascal-lsp --cache-prune --cache-max-namespaces 1   # keep only this build's entries
 ```
+
+The modes that open the store (all but status) retire namespaces like a
+server, keeping `--cache-max-namespaces N` (1 to 16, default 3) of them. A
+value outside that range is a usage error, while the initialization option
+clamps one above 16.
 
 Exit codes: `0` done (an absent store, including an empty directory, is
 success), `1` refused or failed (the JSON has an `error` field with `bypass`,
@@ -1667,7 +1712,18 @@ directory longer than 2,048 escaped bytes is cut in the output and
 `directoryTruncated` is `true`.
 
 - **Status** reports container version and compatibility, usage, policy,
-  pressure, live and retired namespaces, live leases and advice. A store in
+  pressure, live and retired namespaces, live leases and advice.
+  `namespaces.list` has one entry per live namespace, most recently used
+  first: `id` (the namespace hex), `current` (this command's build),
+  `resetEpoch`, `lastUsed` (Unix seconds, `null` without a lock file),
+  `estimatedBytes` (the size maintenance last estimated for this epoch, its
+  rows' content plus 64 bytes per row; `null` unless disk pressure made
+  maintenance estimate it; it can be out of date once the namespace was
+  used again) and `held` (a
+  running process holds its lock, as retirement sees it: the lock is tried
+  once without waiting). At most 16 are listed, fewer if the line would pass
+  4 KiB; `listTruncated` says so. Of more than 256 live namespaces, the 256
+  most recently used are considered. A store in
   a directory that is not private is refused and left unchanged.
 - **Prune** repeats maintenance cycles until a full cycle leaves the store
   within its headroom (`withinBudget`), a full cycle changes nothing

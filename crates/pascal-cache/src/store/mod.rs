@@ -33,6 +33,7 @@ mod pool;
 mod queries;
 mod reader;
 mod records;
+mod retention;
 mod sequence;
 mod snapshots;
 mod sqlite;
@@ -95,12 +96,13 @@ pub use leases::{
     Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,
 };
 pub use limits::{
-    CONNECTION_OVERHEAD_BYTES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES,
-    MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
-    MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES,
-    MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES,
-    MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT, StoreLimits,
+    CONNECTION_OVERHEAD_BYTES, DEFAULT_MAX_NAMESPACES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError,
+    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
+    MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
+    MAX_MEMBER_BINDINGS, MAX_NAMESPACES, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
+    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES,
+    MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    SQLITE_LENGTH_LIMIT, StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
@@ -133,6 +135,10 @@ pub struct Store {
     clock: clock::Clock,
     lease: leases::ProcessLease,
     hints: leases::Hints,
+    estimates: std::sync::Mutex<retention::Estimates>,
+    /// When this process last recorded its use of the namespace (clock
+    /// seconds; see `refresh_use`).
+    last_use: std::sync::atomic::AtomicU64,
     health: health::Health,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
@@ -140,8 +146,9 @@ pub struct Store {
 
 impl Store {
     /// Open or create the store in `directory` for `namespace`, then retire
-    /// namespaces no live process holds. Any failure is a bypass: the
-    /// caller analyses without the cache.
+    /// the namespaces retention does not keep (see
+    /// [`Self::retire_obsolete`]). Any failure is a bypass: the caller
+    /// analyses without the cache.
     pub fn open(
         directory: &Path,
         namespace: &Namespace,
@@ -152,6 +159,7 @@ impl Store {
         sqlite::check_sqlite_version(rusqlite::version_number())?;
         let location = StoreLocation::prepare(directory)?;
         location.prepare_namespace_locks()?;
+        retention::clean_temporaries(&location);
         for file in location.database_files() {
             StoreLocation::check_file(&file)?;
         }
@@ -185,9 +193,11 @@ impl Store {
             pool,
             scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
+            last_use: std::sync::atomic::AtomicU64::new(clock.unix_seconds()),
             clock,
             lease,
             hints: leases::Hints::default(),
+            estimates: std::sync::Mutex::default(),
             health: health::Health::default(),
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),
@@ -222,15 +232,17 @@ impl Store {
         })
     }
 
+    /// Keep the [`StoreLimits::max_namespaces`] most recently used live
+    /// namespaces, this one included, and retire the others no live process
+    /// holds, least recently used first; while the store is over its disk
+    /// policy, retire the least recently used kept one at once and go on
+    /// to the next only while current size estimates cover what was
+    /// retired (l4d-1ypi). Reads no namespace's rows and takes the writer
+    /// only to retire.
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
         self.guarded(Access::Maintenance, || {
             self.retire_within(Deadline::after(self.limits.open_wait))
         })
-    }
-
-    fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
-        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-        namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace, deadline)
     }
 
     /// Delete at most `max_rows` rows in one `IMMEDIATE` transaction: rows
@@ -255,10 +267,11 @@ impl Store {
             {
                 return Err(Bypass::WalPressure);
             }
-            let reclaimed = namespaces::reclaim(&transaction, max_rows, self.scope)?;
+            let (reclaimed, scopes) = namespaces::reclaim(&transaction, max_rows, self.scope)?;
             fault_point!(self, GcDeleteBeforeCommit);
             self.before_commit();
             transaction.commit().map_err(fail)?;
+            retention::forget_reclaimed(&self.location, &scopes);
             Ok(reclaimed)
         })
     }
@@ -345,6 +358,7 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         leases::release(self);
+        self._lock.touch();
     }
 }
 

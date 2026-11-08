@@ -956,21 +956,17 @@ fn two_live_sessions_with_distinct_overlays_answer_from_their_own_buffers() {
 
     let mut one = launch_labelled(environment.path(), "cache", "overlay-one");
     let mut two = launch_labelled(environment.path(), "cache", "overlay-two");
-    for (server, label) in [
-        (&mut one, "lib/Importer0.pas"),
-        (&mut two, "lib/Other1.pas"),
+    for (server, label, text) in [
+        (&mut one, "lib/Importer0.pas", &importer),
+        (&mut two, "lib/Other1.pas", &other),
     ] {
         server.initialize(&root, Value::Null);
         open_disk(server, &root, &OPENS);
-        let text = if label.contains("Importer0") {
-            &importer
-        } else {
-            &other
-        };
         open_text(server, &root.join(label), text);
     }
     for server in [&mut one, &mut two] {
-        wait_index(server, complete);
+        let status = wait_index(server, complete);
+        assert!(status["reused"].as_u64() > Some(0), "{status}");
         settle_background(server);
     }
     let from_one = answers(&mut one, &root, &queries);
@@ -1125,11 +1121,19 @@ fn rename_on_a_warm_server_edits_like_an_uncached_one() {
         &[RENAME],
     );
     let (warm, uncached) = (&run.warm[0], &run.uncached[0]);
-    assert!(
-        warm.complete == uncached.complete
-            && (!warm.complete || warm.locations == uncached.locations),
-        "warm {warm:?} must equal uncached {uncached:?}"
-    );
+    for answer in [warm, uncached] {
+        assert!(
+            !answer.complete && answer.locations.is_empty(),
+            "{answer:?}"
+        );
+        assert!(
+            answer.notes.len() == 1
+                && answer.notes[0].starts_with("rename workspace scan incomplete: ")
+                && answer.notes[0].contains("include Missing.inc was not found"),
+            "{answer:?}"
+        );
+    }
+    assert_eq!(warm.notes, uncached.notes, "the same refusal");
     assert!(
         run.warm_status["reused"].as_u64() > Some(0),
         "{}",

@@ -3404,12 +3404,12 @@ fn snapshot_workspace_symbols(
     let found = snapshot
         .index
         .workspace_symbols_with_cancel(query, cancel)?;
+    let found = merge_listed_symbols(snapshot, query, found)?;
     if snapshot.projected.is_empty() {
-        let found = found
+        return Ok(found
             .into_iter()
             .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
-            .collect();
-        return append_listed_symbols(snapshot, query, found);
+            .collect());
     }
     let mut result = Vec::with_capacity(found.len());
     let mut held = HashMap::<Url, Vec<SymbolInformation>>::new();
@@ -3438,21 +3438,28 @@ fn snapshot_workspace_symbols(
         };
         result.splice(at..at, placed);
     }
-    append_listed_symbols(snapshot, query, result)
+    Ok(result)
 }
 
-/// `found` with the symbols of the sources the snapshot answered from kept
-/// symbol lists (Task 8d), as its index would have listed them.
-fn append_listed_symbols(
+/// The index's answer `found` (documents in URI order) with the symbols of
+/// the sources the snapshot answered from kept symbol lists (Task 8d), each
+/// placed where its document's would be had the index parsed it.
+fn merge_listed_symbols(
     snapshot: &super::rename::RenameSnapshot,
     query: &str,
     mut found: Vec<SymbolInformation>,
 ) -> Result<Vec<SymbolInformation>, String> {
-    for listed in snapshot.listed.values() {
-        if !snapshot.readable.contains(listed.list.uri()) {
-            continue;
-        }
-        found.extend(listed.list.matching(query)?);
+    if snapshot.listed.is_empty() {
+        return Ok(found);
+    }
+    let mut listed = snapshot.listed.values().collect::<Vec<_>>();
+    listed.sort_by(|left, right| left.list.uri().as_str().cmp(right.list.uri().as_str()));
+    // From the last document back, so earlier insertion points stay valid.
+    for listed in listed.into_iter().rev() {
+        let uri = listed.list.uri().as_str();
+        let at = found.partition_point(|symbol| symbol.location.uri.as_str() < uri);
+        let symbols = listed.list.matching(query)?;
+        found.splice(at..at, symbols);
         if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
             return Err(error);
         }
@@ -5472,6 +5479,55 @@ mod tests {
                 cache.shutdown();
             }
         }
+    }
+
+    /// Task 8d fix round 1: a walk answering several sources from kept
+    /// symbol lists answers exactly as the direct read, order included.
+    #[test]
+    fn a_walk_answering_from_symbol_lists_keeps_the_direct_reads_order() {
+        let names = ["GuardA", "GuardB", "GuardC", "GuardD", "GuardE", "GuardF"];
+        let mut extra = names
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    unit_text(
+                        name,
+                        &format!("const {name}Value = 1;\nconst {name}Other = 2;\n"),
+                    )
+                    .into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        extra.push(("Opened", unit_text("Opened", "").into_bytes()));
+        let files = extra
+            .iter()
+            .map(|(name, bytes)| (format!("{name}.pas"), bytes.clone()))
+            .collect::<Vec<_>>();
+        let extra = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect::<Vec<_>>();
+        let (_temp, root, workspace) = lexical_workspace(&extra);
+        crate::navigation::test_reset_document_parse_count();
+        let walked = symbols(&workspace.analysis_input(), "Guard");
+        let walked_parses = crate::navigation::test_document_parse_count();
+        assert!(walked.value.len() >= 12, "{:?}", walked.value);
+        let retrying = files[..names.len()]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let (mut view, _) = retrying_view(&workspace, &root, None, &retrying, &["Opened.pas"]);
+        // The indexed read keeps the lists; the walk then answers from them.
+        symbols(&view.analysis_input(), "Guard");
+        view.close_document(&source_uri(&root.join("Opened.pas")));
+        crate::navigation::test_reset_document_parse_count();
+        let listed = symbols(&view.analysis_input(), "Guard");
+        assert!(
+            crate::navigation::test_document_parse_count() + names.len() <= walked_parses,
+            "the lists were not used"
+        );
+        assert_eq!(listed.value, walked.value);
     }
 
     #[test]

@@ -166,66 +166,109 @@ pub(crate) fn symbol_needles(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// The whole identifiers of some texts (`identifier_runs`, ASCII
-/// lowercased) as a fixed-size Bloom filter: a needle it does not hold
-/// occurs in none of them as an identifier (exact), one it holds may.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct TokenFilter(Box<[u64; TOKEN_FILTER_WORDS]>);
+/// The hash `TokenFilter` keys an identifier by: FNV-1a over its ASCII
+/// lowercased bytes, then a splitmix64 finalizer.
+fn token_hash(token: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in token {
+        hash = (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3);
+    }
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
+}
 
-const TOKEN_FILTER_WORDS: usize = 1024;
-const TOKEN_FILTER_BITS: u64 = (TOKEN_FILTER_WORDS * 64) as u64;
+/// The identifier hashes (`token_hash`) of some texts, distinct once
+/// compacted: what a `TokenFilter` is sized and built from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TokenHashes(Vec<u64>);
+
+impl TokenHashes {
+    /// Adds every identifier of `text` (`identifier_runs`).
+    pub(crate) fn insert_text(&mut self, text: &[u8]) {
+        self.0
+            .extend(identifier_runs(text).map(|run| token_hash(&text[run])));
+        self.compact();
+    }
+
+    pub(crate) fn union(&mut self, other: &Self) {
+        self.0.extend_from_slice(&other.0);
+        self.compact();
+    }
+
+    fn compact(&mut self) {
+        self.0.sort_unstable();
+        self.0.dedup();
+    }
+
+    pub(crate) fn into_filter(self) -> TokenFilter {
+        TokenFilter::of(&self.0)
+    }
+}
+
+/// The whole identifiers of some texts (ASCII lowercased) as a Bloom filter
+/// of about `TOKEN_FILTER_BITS_PER_TOKEN` bits per distinct identifier
+/// (a power of two, within `TOKEN_FILTER_MIN_BITS..=TOKEN_FILTER_MAX_BITS`):
+/// a needle it does not hold occurs in none of them as an identifier
+/// (exact), one it holds may.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TokenFilter(Box<[u64]>);
+
+const TOKEN_FILTER_BITS_PER_TOKEN: usize = 16;
+const TOKEN_FILTER_MIN_BITS: usize = 1 << 12;
+const TOKEN_FILTER_MAX_BITS: usize = 1 << 21;
 const TOKEN_FILTER_PROBES: u64 = 4;
 
 impl std::fmt::Debug for TokenFilter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let set = self.0.iter().map(|word| word.count_ones()).sum::<u32>();
-        write!(formatter, "TokenFilter({set} bits)")
+        write!(
+            formatter,
+            "TokenFilter({set} of {} bits)",
+            self.0.len() * 64
+        )
     }
 }
 
 impl Default for TokenFilter {
     fn default() -> Self {
-        Self(Box::new([0; TOKEN_FILTER_WORDS]))
+        Self::of(&[])
     }
 }
 
 impl TokenFilter {
-    pub(crate) const BYTES: usize = TOKEN_FILTER_WORDS * 8;
-
-    fn probes(token: &[u8]) -> impl Iterator<Item = usize> {
-        // FNV-1a over the lowercased bytes, then a splitmix64 finalizer.
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in token {
-            hash = (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3);
-        }
-        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        hash ^= hash >> 31;
-        let (first, step) = (hash & 0xffff_ffff, (hash >> 32) | 1);
-        (0..TOKEN_FILTER_PROBES).map(move |probe| {
-            (first.wrapping_add(probe.wrapping_mul(step)) % TOKEN_FILTER_BITS) as usize
-        })
-    }
-
-    /// Adds every identifier of `text`.
-    pub(crate) fn insert_text(&mut self, text: &[u8]) {
-        for run in identifier_runs(text) {
-            for bit in Self::probes(&text[run]) {
-                self.0[bit / 64] |= 1 << (bit % 64);
+    /// The filter of `hashes`, sized by their count.
+    fn of(hashes: &[u64]) -> Self {
+        let bits = hashes
+            .len()
+            .saturating_mul(TOKEN_FILTER_BITS_PER_TOKEN)
+            .next_power_of_two()
+            .clamp(TOKEN_FILTER_MIN_BITS, TOKEN_FILTER_MAX_BITS);
+        let mut filter = Self(vec![0; bits / 64].into_boxed_slice());
+        for hash in hashes {
+            for bit in filter.probes(*hash) {
+                filter.0[bit / 64] |= 1 << (bit % 64);
             }
         }
+        filter
     }
 
-    pub(crate) fn union(&mut self, other: &Self) {
-        for (word, other) in self.0.iter_mut().zip(other.0.iter()) {
-            *word |= other;
-        }
+    pub(crate) fn bytes(&self) -> usize {
+        self.0.len() * 8
+    }
+
+    fn probes(&self, hash: u64) -> impl Iterator<Item = usize> + use<> {
+        let mask = (self.0.len() * 64 - 1) as u64;
+        let (first, step) = (hash & 0xffff_ffff, (hash >> 32) | 1);
+        (0..TOKEN_FILTER_PROBES)
+            .map(move |probe| (first.wrapping_add(probe.wrapping_mul(step)) & mask) as usize)
     }
 
     /// Whether some needle may be an identifier of the texts.
     pub(crate) fn may_hold(&self, needles: &[String]) -> bool {
         needles.iter().any(|needle| {
-            Self::probes(needle.as_bytes()).all(|bit| self.0[bit / 64] & (1 << (bit % 64)) != 0)
+            self.probes(token_hash(needle.as_bytes()))
+                .all(|bit| self.0[bit / 64] & (1 << (bit % 64)) != 0)
         })
     }
 }
@@ -252,7 +295,7 @@ impl LexicalSummary {
     pub(crate) fn bytes(&self) -> usize {
         let entry = std::mem::size_of::<(std::path::PathBuf, Option<super::PathStamp>)>();
         std::mem::size_of::<Self>()
-            + TokenFilter::BYTES
+            + self.tokens.bytes()
             + self
                 .dependencies
                 .iter()
@@ -448,8 +491,9 @@ mod tests {
     #[test]
     fn a_token_filter_never_misses_an_identifier() {
         let text = b"unit Guarded; {$I Defs.inc} const GetSharedValues = 1; x_9 := TDatabaseInfo;";
-        let mut filter = TokenFilter::default();
-        filter.insert_text(text);
+        let mut hashes = TokenHashes::default();
+        hashes.insert_text(text);
+        let filter = hashes.clone().into_filter();
         for run in identifier_runs(text) {
             let token = String::from_utf8(text[run].to_vec()).unwrap();
             assert!(filter.may_hold(&[token.to_ascii_uppercase()]), "{token}");
@@ -457,10 +501,36 @@ mod tests {
         assert!(filter.may_hold(&["tdatabaseinfo".to_owned()]));
         assert!(!filter.may_hold(&["sharedvalue".to_owned()]));
         assert!(!filter.may_hold(&["databaseinfo".to_owned()]));
-        let mut other = TokenFilter::default();
+        let mut other = TokenHashes::default();
         other.insert_text(b"SharedValue");
-        filter.union(&other);
-        assert!(filter.may_hold(&["SHAREDVALUE".to_owned()]));
+        hashes.union(&other);
+        assert!(hashes.into_filter().may_hold(&["SHAREDVALUE".to_owned()]));
+    }
+
+    /// The filter grows with the identifiers it holds, so a large member
+    /// keeps a low false-positive rate; its negatives stay exact.
+    #[test]
+    fn a_token_filter_is_sized_by_its_identifiers() {
+        let small = {
+            let mut hashes = TokenHashes::default();
+            hashes.insert_text(b"unit A;");
+            hashes.into_filter()
+        };
+        assert_eq!(small.bytes(), TOKEN_FILTER_MIN_BITS / 8);
+        let text = (0..25_000)
+            .map(|index| format!("Ident{index} "))
+            .collect::<String>();
+        let mut hashes = TokenHashes::default();
+        hashes.insert_text(text.as_bytes());
+        let large = hashes.into_filter();
+        assert_eq!(large.bytes(), (1 << 19) / 8);
+        for index in (0..25_000).step_by(97) {
+            assert!(large.may_hold(&[format!("ident{index}")]));
+        }
+        let false_positives = (0..10_000)
+            .filter(|index| large.may_hold(&[format!("absent{index}")]))
+            .count();
+        assert!(false_positives < 100, "{false_positives} of 10000");
     }
 
     #[test]

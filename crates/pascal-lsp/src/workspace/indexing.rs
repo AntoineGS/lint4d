@@ -5210,7 +5210,7 @@ struct ProvenInclude {
     /// What the lookups of its own includes observed, and the identifiers
     /// of it and everything it includes.
     observations: Vec<BaselineEntry>,
-    tokens: Arc<super::lexical::TokenFilter>,
+    tokens: Arc<super::lexical::TokenHashes>,
 }
 
 /// What proves one member's includes cannot hold a name: their stamps,
@@ -5220,7 +5220,7 @@ struct ProvenInclude {
 struct WalkProof {
     baseline: Vec<BaselineEntry>,
     observed: Vec<BaselineEntry>,
-    tokens: super::lexical::TokenFilter,
+    tokens: super::lexical::TokenHashes,
     route: Option<Option<pascal_core::LegacyRoute>>,
 }
 
@@ -5250,7 +5250,7 @@ struct IncludeWalk<'a> {
     /// What this walk's lookups observed, shared ones included, and the
     /// identifiers of the includes it reached.
     observed: Vec<BaselineEntry>,
-    tokens: super::lexical::TokenFilter,
+    tokens: super::lexical::TokenHashes,
 }
 
 impl IncludeWalk<'_> {
@@ -5298,6 +5298,17 @@ struct IncludeScope<'a> {
     workspace: &'a Workspace,
     input: &'a WorkspaceInput,
     key: &'a ContextKey,
+}
+
+/// Whether a summary's stamp for a path proves the path unchanged now:
+/// settled, with a change identity (as a witness needs, spec §7), and
+/// equal to `current`; or missing then and now.
+fn summary_stamp_holds(held: Option<&PathStamp>, current: Option<&PathStamp>) -> bool {
+    match (held, current) {
+        (None, None) => true,
+        (Some(held), Some(current)) => held.has_change_identity() && held.proves_unchanged(current),
+        _ => false,
+    }
 }
 
 /// What a ranking in one scope checks summaries against: the binding they
@@ -5586,11 +5597,7 @@ impl UnverifiedRanking {
             !summary
                 .private
                 .contains(&path_key(&absolute_path(path.to_path_buf())))
-                && match (stamp, path_stamp(path)) {
-                    (None, None) => true,
-                    (Some(held), Some(current)) => held.proves_unchanged(&current),
-                    _ => false,
-                }
+                && summary_stamp_holds(stamp.as_ref(), path_stamp(path).as_ref())
         };
         if !unchanged(path, &Some(held.root.clone()))
             || !held
@@ -5634,6 +5641,7 @@ impl UnverifiedRanking {
         }
         let mut tokens = proof.tokens.clone();
         tokens.insert_text(text);
+        let tokens = tokens.into_filter();
         let mut dependencies = proof.baseline.clone();
         dependencies.extend(proof.observed.iter().cloned());
         dependencies.sort_by(|left, right| left.0.cmp(&right.0));
@@ -5750,7 +5758,7 @@ impl UnverifiedRanking {
             virtual_consulted: 0,
             restart: false,
             observed: Vec::new(),
-            tokens: super::lexical::TokenFilter::default(),
+            tokens: super::lexical::TokenHashes::default(),
         };
         let proof = (|| {
             let route_started = std::time::Instant::now();
@@ -9253,6 +9261,30 @@ pub(in crate::workspace) mod tests {
         );
         assert_eq!(take_summary_reuses_for_test(), 0);
         assert!(source_names(&found).contains(&"Guarded.pas".to_owned()));
+    }
+
+    /// Task 8d fix round 1 (Minor 5): a stamp without a change identity,
+    /// or not settled, proves nothing for a summary.
+    #[test]
+    fn a_summary_stamp_needs_a_settled_stamp_with_a_change_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.pas");
+        write(&path, "unit A;");
+        pascal_project::backdate_for_test(&path);
+        let stamp = path_stamp(&path).expect("stamp");
+        assert!(summary_stamp_holds(Some(&stamp), Some(&stamp)));
+        assert!(summary_stamp_holds(None, None));
+        assert!(!summary_stamp_holds(Some(&stamp), None));
+        assert!(!summary_stamp_holds(None, Some(&stamp)));
+        let mut unidentified = stamp.clone();
+        unidentified.change = None;
+        assert!(!summary_stamp_holds(
+            Some(&unidentified),
+            Some(&unidentified)
+        ));
+        let mut unsettled = stamp.clone();
+        unsettled.settled = false;
+        assert!(!summary_stamp_holds(Some(&unsettled), Some(&stamp)));
     }
 
     /// Task 8d's synthetic shape: `members` retrying members of 20 to 200 KB

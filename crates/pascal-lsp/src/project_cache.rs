@@ -8519,8 +8519,9 @@ impl ProjectCache {
     }
 
     /// Keeps `summaries` with `key`'s index, charged to the index share
-    /// like its members; nothing is kept for a context the store does not
-    /// hold or past the share.
+    /// like its members, under `binding` (summaries of another binding are
+    /// dropped); nothing is kept for a context the store does not hold or
+    /// past the share.
     pub(crate) fn keep_lexical_summaries(
         &self,
         key: &ContextKey,
@@ -8528,9 +8529,13 @@ impl ProjectCache {
         summaries: Vec<(PathBuf, Arc<crate::workspace::lexical::LexicalSummary>)>,
     ) {
         let paid = summaries.iter().map(|(_, summary)| summary.bytes()).sum();
-        if summaries.is_empty() || !self.charge_index_evicting(paid, key) {
-            return;
-        }
+        // Nothing new still rebinds: summaries of a replaced context, and
+        // the context they hold, do not outlive the next ranking.
+        let (summaries, paid) = if paid == 0 || self.charge_index_evicting(paid, key) {
+            (summaries, paid)
+        } else {
+            (Vec::new(), 0)
+        };
         let released = match self.index().contexts.get_mut(key) {
             Some(stored) => stored.summaries.keep(binding, summaries, paid),
             None => paid,
@@ -9503,7 +9508,11 @@ mod index_tests {
         // Kept again: replaced, not charged twice.
         kept(&cache);
         assert_eq!(cache.stats().reserved_index_bytes, base + 2 * bytes);
-        // Another binding drops them.
+        // Another binding drops them, even with nothing new to keep.
+        cache.keep_lexical_summaries(&a, binding("other"), Vec::new());
+        assert_eq!(cache.stats().reserved_index_bytes, base);
+        assert_eq!(cache.lexical_summary_count(&a), 0);
+        kept(&cache);
         cache.keep_lexical_summaries(&a, binding("other"), vec![(paths[0].into(), summary())]);
         assert_eq!(cache.stats().reserved_index_bytes, base + bytes);
         assert!(cache.lexical_summaries(&a, &binding("a")).is_none());

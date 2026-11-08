@@ -123,8 +123,24 @@ pub(super) fn warm_server(environment: &Path, root: &Path, opens: &[&str]) -> Te
 
 /// A server without the persistent cache, indexed in memory.
 pub(super) fn cold_server(environment: &Path, root: &Path, opens: &[&str]) -> TestServer {
+    cold_server_with(environment, root, &Value::Null, opens)
+}
+
+/// `cold_server` with the initialization `options` besides the disabled
+/// persistent cache.
+fn cold_server_with(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+) -> TestServer {
+    let mut options = match options {
+        Value::Null => json!({}),
+        options => options.clone(),
+    };
+    options["persistentCacheEnabled"] = json!(false);
     let mut server = launch_labelled(environment, "cold-cache", "cold");
-    server.initialize(root, json!({"persistentCacheEnabled": false}));
+    server.initialize(root, options);
     open_disk(&mut server, root, opens);
     wait_index(&mut server, complete);
     settle_background(&mut server);
@@ -710,6 +726,523 @@ fn synthetic_warm_query_latency() {
     let (p50, p95) = percentiles(symbols_taken);
     println!("warm workspace/symbol: p50 {p50:?}, p95 {p95:?}");
     shutdown(warm);
+}
+
+/// A read-only query of the differential matrix; paths are relative to the
+/// server's root.
+#[derive(Clone, Copy)]
+enum Query {
+    References(&'static str, u32, u32),
+    Symbols(&'static str),
+}
+
+/// A query's sorted locations (whole symbols for `workspace/symbol`), its
+/// completeness and the coverage notes that qualify it.
+#[derive(Debug, PartialEq, Eq)]
+struct Answer {
+    locations: Vec<String>,
+    complete: bool,
+    notes: Vec<String>,
+}
+
+fn answer(server: &mut TestServer, root: &Path, query: Query) -> Answer {
+    gaps(server);
+    let locations = match query {
+        Query::References(relative, line, character) => {
+            references(server, &root.join(relative), line, character)
+                .into_iter()
+                .map(|(uri, line, character)| format!("{uri}:{line}:{character}"))
+                .collect()
+        }
+        Query::Symbols(query) => {
+            let result = request(server, "workspace/symbol", json!({"query": query}));
+            let mut symbols: Vec<String> = result
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(Value::to_string)
+                .collect();
+            symbols.sort();
+            symbols
+        }
+    };
+    let notes = gaps(server);
+    Answer {
+        locations,
+        complete: notes.is_empty(),
+        notes,
+    }
+}
+
+fn answers(server: &mut TestServer, root: &Path, queries: &[Query]) -> Vec<Answer> {
+    queries
+        .iter()
+        .map(|query| answer(server, root, *query))
+        .collect()
+}
+
+/// A server over the shared store that indexes `opens`' contexts,
+/// persists them and stops.
+fn persist_and_stop(environment: &Path, root: &Path, options: &Value, opens: &[&str]) {
+    let mut first = launch_labelled(environment, "cache", "differential-first");
+    first.initialize(root, options.clone());
+    open_disk(&mut first, root, opens);
+    wait_index(&mut first, persisted);
+    shutdown(first);
+}
+
+/// A server over the shared store once its index is `complete` and its
+/// background work settled.
+fn cached_server(environment: &Path, root: &Path, options: &Value, opens: &[&str]) -> TestServer {
+    let mut server = launch_labelled(environment, "cache", "differential-cached");
+    server.initialize(root, options.clone());
+    open_disk(&mut server, root, opens);
+    wait_index(&mut server, complete);
+    settle_background(&mut server);
+    server
+}
+
+/// The answers of a persistence-disabled server on the same tree once its
+/// index is complete.
+fn uncached_answers(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    queries: &[Query],
+) -> Vec<Answer> {
+    let mut cold = cold_server_with(environment, root, options, opens);
+    let found = answers(&mut cold, root, queries);
+    shutdown(cold);
+    found
+}
+
+/// Spec §12.1: a warm pair whose first server persists and stops, `mutate`
+/// applied while it is stopped, then the answers of the cached second
+/// server and of a persistence-disabled server on the same tree.
+fn differential(
+    environment: &Path,
+    root: &Path,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+) -> (Vec<Answer>, Vec<Answer>) {
+    differential_with(environment, root, &Value::Null, opens, mutate, queries)
+}
+
+fn differential_with(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+) -> (Vec<Answer>, Vec<Answer>) {
+    persist_and_stop(environment, root, options, opens);
+    mutate(root);
+    let mut cached = cached_server(environment, root, options, opens);
+    let warm = answers(&mut cached, root, queries);
+    shutdown(cached);
+    let cold = uncached_answers(environment, root, options, opens, queries);
+    (warm, cold)
+}
+
+const MATRIX: FixtureSpec = FixtureSpec {
+    units: 60,
+    importers: 5,
+    with_include_every: 10,
+    unresolved_includes: 0,
+    shared_name: "TShared",
+};
+
+const SHARED_REFERENCES: Query = Query::References("lib/Shared.pas", 2, 6);
+
+fn assert_agree(warm: &[Answer], cold: &[Answer]) {
+    assert_eq!(warm, cold, "cached and uncached answers agree");
+    assert!(
+        warm.iter().all(|answer| answer.complete),
+        "complete answers: {warm:?}"
+    );
+}
+
+fn locates(answer: &Answer, file: &str, line: u32, character: u32) -> bool {
+    answer
+        .locations
+        .iter()
+        .any(|location| location.ends_with(&format!("/{file}:{line}:{character}")))
+}
+
+/// A same-size rewrite that keeps the file's modification time, as one
+/// within one timestamp tick or a restoring tool would.
+fn rewrite_keeping_the_stamp(path: &Path, text: &str) {
+    let metadata = fs::metadata(path).unwrap();
+    assert_eq!(metadata.len(), text.len() as u64, "same size");
+    fs::write(path, text).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(metadata.modified().unwrap())
+        .unwrap();
+    assert_eq!(
+        fs::metadata(path).unwrap().modified().unwrap(),
+        metadata.modified().unwrap()
+    );
+}
+
+/// AC1 through the protocol: `Importer3.pas`'s occurrence moves from
+/// column 2 to column 0 while its size and modification time stay those
+/// the first server saw.
+#[test]
+fn a_same_size_same_mtime_edit_while_stopped_changes_warm_references_like_uncached() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let (warm, cold) = differential(
+        environment.path(),
+        &root,
+        &OPENS,
+        |root| {
+            let importer = root.join("lib/Importer3.pas");
+            let text = fs::read_to_string(&importer).unwrap();
+            let moved = text.replace("begin\n  TShared.Create;\n", "begin\nTShared.Create;  \n");
+            assert_ne!(moved, text);
+            rewrite_keeping_the_stamp(&importer, &moved);
+        },
+        &[SHARED_REFERENCES],
+    );
+    assert_agree(&warm, &cold);
+    assert!(locates(&warm[0], "Importer3.pas", 6, 0), "{warm:?}");
+    assert!(!locates(&warm[0], "Importer3.pas", 6, 2), "{warm:?}");
+}
+
+/// `Importer0.pas` includes `lib/Shared.inc` in its implementation; while
+/// the first server is stopped the include gains the declaration
+/// `TFromInclude` and an occurrence of `TShared`.
+#[test]
+fn an_include_edit_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let importer = root.join("lib/Importer0.pas");
+    let text = fs::read_to_string(&importer)
+        .unwrap()
+        .replace("implementation\n", "implementation\n{$I Shared.inc}\n");
+    write_file(&importer, &text);
+    write_file(&root.join("lib/Shared.inc"), "{ shared }\n");
+    pascal_project::backdate_tree_for_test(&root);
+    let (warm, cold) = differential(
+        environment.path(),
+        &root,
+        &OPENS,
+        |root| {
+            write_file(
+                &root.join("lib/Shared.inc"),
+                "type TFromInclude = class(TShared) end;\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[SHARED_REFERENCES, Query::Symbols("TFromInclude")],
+    );
+    assert_agree(&warm, &cold);
+    assert!(locates(&warm[0], "Shared.inc", 0, 26), "{warm:?}");
+    assert_eq!(warm[1].locations.len(), 1, "{warm:?}");
+}
+
+/// Negative candidate appearance: the importers in `lib` find `Shared` in
+/// `lib1`, last in the search path `lib0;lib;lib1`; while the first server
+/// is stopped `lib0/Shared.pas`, earlier in it, appears and they bind it
+/// instead. (`lib` itself would win as the importers' own directory.)
+#[test]
+fn a_new_shadowing_unit_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>lib0;lib;lib1</DCC_UnitSearchPath></PropertyGroup><ItemGroup></ItemGroup></Project>",
+    );
+    fs::create_dir_all(root.join("lib0")).unwrap();
+    fs::create_dir_all(root.join("lib1")).unwrap();
+    fs::rename(root.join("lib/Shared.pas"), root.join("lib1/Shared.pas")).unwrap();
+    pascal_project::backdate_tree_for_test(&root);
+    let (warm, cold) = differential(
+        environment.path(),
+        &root,
+        &["App.dpr", "lib1/Shared.pas"],
+        |root| {
+            write_file(
+                &root.join("lib0/Shared.pas"),
+                "unit Shared;\ninterface\ntype TShared = class end;\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[
+            Query::References("lib1/Shared.pas", 2, 6),
+            Query::References("lib0/Shared.pas", 2, 6),
+            Query::Symbols("TShared"),
+        ],
+    );
+    assert_agree(&warm, &cold);
+    assert_eq!(warm[0].locations.len(), 1, "only the declaration: {warm:?}");
+    assert_eq!(warm[1].locations.len(), MATRIX.importers + 1, "{warm:?}");
+}
+
+/// `lib/Shared.pas` becomes `lib/Shared2.pas` (unit `Shared2`) and the
+/// importers use `Shared2`.
+#[test]
+fn a_provider_rename_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let (warm, cold) = differential(
+        environment.path(),
+        &root,
+        &["App.dpr"],
+        |root| {
+            let shared = root.join("lib/Shared.pas");
+            let text = fs::read_to_string(&shared)
+                .unwrap()
+                .replace("unit Shared;", "unit Shared2;");
+            fs::remove_file(&shared).unwrap();
+            write_file(&root.join("lib/Shared2.pas"), &text);
+            for index in 0..MATRIX.importers {
+                let importer = root.join(format!("lib/Importer{index}.pas"));
+                let text = fs::read_to_string(&importer)
+                    .unwrap()
+                    .replace("uses Shared;", "uses Shared2;");
+                write_file(&importer, &text);
+            }
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[
+            Query::References("lib/Shared2.pas", 2, 6),
+            Query::Symbols("Shared"),
+        ],
+    );
+    assert_agree(&warm, &cold);
+    assert_eq!(warm[0].locations.len(), MATRIX.importers + 1, "{warm:?}");
+    assert!(
+        !warm[1]
+            .locations
+            .iter()
+            .any(|symbol| symbol.contains("/lib/Shared.pas")),
+        "{warm:?}"
+    );
+}
+
+/// One `.dproj` with three build configurations: Debug (`debug/UA.pas`),
+/// Release (`release/UB.pas`) and Profile, a child of Release that adds
+/// `profile/UC.pas`. `App.dpr` uses one of them, each declaring `Shared`,
+/// and calls `Shared` at line 3, column 2.
+fn configured_fixture(environment: &Path) -> PathBuf {
+    let root = environment.join("workspace");
+    write_file(
+        &root.join("App.dproj"),
+        r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Debug</Config>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Profile' or '$(Cfg_3)'!=''"><Cfg_3>true</Cfg_3><CfgParent>Cfg_1</CfgParent><Cfg_1>true</Cfg_1><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_1)'!=''"><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>release</DCC_UnitSearchPath></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>debug</DCC_UnitSearchPath></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_3)'!=''"><DCC_Define>PROFILE;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>profile;$(DCC_UnitSearchPath)</DCC_UnitSearchPath></PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Profile"><Key>Cfg_3</Key><CfgParent>Cfg_1</CfgParent></BuildConfiguration>
+  </ItemGroup>
+</Project>"#,
+    );
+    write_file(
+        &root.join("App.dpr"),
+        "program App;\n{$IFDEF DEBUG}uses UA;{$ELSE}{$IFDEF PROFILE}uses UC;{$ELSE}uses UB;{$ENDIF}{$ENDIF}\nbegin\n  Shared;\nend.\n",
+    );
+    for (directory, unit) in [("debug", "UA"), ("release", "UB"), ("profile", "UC")] {
+        write_file(
+            &root.join(format!("{directory}/{unit}.pas")),
+            &format!(
+                "unit {unit};\ninterface\nprocedure Shared;\nimplementation\nprocedure Shared;\nbegin\nend;\nend.\n"
+            ),
+        );
+    }
+    pascal_project::backdate_tree_for_test(&root);
+    root
+}
+
+/// Task 9's Debug/Release contexts through the protocol, with a third
+/// configuration, over one store: A = Release, then B = Debug, then
+/// Profile. While each warm pair is stopped, the configuration's own unit
+/// gains a second call of `Shared`.
+#[test]
+fn build_configurations_a_release_and_b_debug() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = configured_fixture(environment.path());
+    let queries = [Query::References("App.dpr", 3, 2), Query::Symbols("Shared")];
+    let mut seen = Vec::new();
+    // Without a compiler version a define the configuration does not set
+    // is unknown, not false: each configuration undefines the others'.
+    for (config, unit, undefines) in [
+        ("Release", "release/UB.pas", &["DEBUG", "PROFILE"][..]),
+        ("Debug", "debug/UA.pas", &[][..]),
+        ("Profile", "profile/UC.pas", &["DEBUG"][..]),
+    ] {
+        let options = json!({
+            "projectFile": root.join("App.dproj").display().to_string(),
+            "buildConfig": config,
+            "conditionalUndefines": undefines,
+        });
+        let (warm, cold) = differential_with(
+            environment.path(),
+            &root,
+            &options,
+            &["App.dpr"],
+            |root| {
+                let path = root.join(unit);
+                let text = fs::read_to_string(&path).unwrap().replace(
+                    "implementation\n",
+                    "implementation\nprocedure Again;\nbegin\n  Shared;\nend;\n",
+                );
+                write_file(&path, &text);
+                pascal_project::backdate_tree_for_test(root);
+            },
+            &queries,
+        );
+        assert_agree(&warm, &cold);
+        let file = unit.rsplit('/').next().unwrap();
+        assert!(locates(&warm[0], file, 6, 2), "{config}: {warm:?}");
+        assert_eq!(warm[0].locations.len(), 4, "{config}: {warm:?}");
+        seen.push(warm);
+    }
+    assert_ne!(seen[0], seen[1], "Release and Debug answer differently");
+    assert_ne!(seen[0], seen[2], "Release and Profile answer differently");
+}
+
+/// `workspace/app` holds App.dproj (search path `lib`) over the query
+/// fixture's units; `workspace/Wide.dproj` (search path `app/lib;extra`)
+/// adds `extra/Extra<n>.pas`, which import `Shared`, spell `TShared` and
+/// declare `TExtra<n>`.
+fn narrow_and_wide_fixture(environment: &Path) -> (PathBuf, PathBuf) {
+    let wide = environment.join("workspace");
+    let narrow = wide.join("app");
+    let built = query_fixture(&wide.join("staging"), &MATRIX);
+    fs::rename(&built, &narrow).unwrap();
+    fs::remove_dir_all(wide.join("staging")).unwrap();
+    write_file(
+        &wide.join("Wide.dproj"),
+        "<Project><PropertyGroup><MainSource>Wide.dpr</MainSource><DCC_UnitSearchPath>app/lib;extra</DCC_UnitSearchPath></PropertyGroup><ItemGroup></ItemGroup></Project>",
+    );
+    write_file(&wide.join("Wide.dpr"), "program Wide;\nbegin\nend.\n");
+    for index in 0..MATRIX.importers {
+        write_file(
+            &wide.join(format!("extra/Extra{index}.pas")),
+            &format!(
+                "unit Extra{index};\ninterface\nuses Shared;\ntype TExtra{index} = class(TShared) end;\nimplementation\nend.\n"
+            ),
+        );
+    }
+    pascal_project::backdate_tree_for_test(&wide);
+    (wide, narrow)
+}
+
+/// Phase 7 (`authorize_record`) through indexed queries: a wide server
+/// persists `extra/`, outside the narrow server's read roots, into the
+/// shared store. The narrow warm server answers as its own uncached server
+/// does, and no wide-only location appears.
+#[test]
+fn narrow_and_wide_read_roots_over_one_store() {
+    let environment = tempfile::tempdir().unwrap();
+    let (wide, narrow) = narrow_and_wide_fixture(environment.path());
+    let queries = [
+        SHARED_REFERENCES,
+        Query::Symbols("TExtra"),
+        Query::Symbols("TShared"),
+    ];
+
+    let mut first = launch_labelled(environment.path(), "cache", "wide");
+    first.initialize(&wide, Value::Null);
+    open_disk(
+        &mut first,
+        &wide,
+        &["app/App.dpr", "Wide.dpr", "app/lib/Shared.pas"],
+    );
+    wait_contexts(&mut first, |contexts| {
+        contexts.len() == 2 && contexts.iter().all(persisted)
+    });
+    settle_background(&mut first);
+    let (extra, _) = symbols_with_notes(&mut first, "TExtra");
+    assert_eq!(
+        extra.len(),
+        MATRIX.importers,
+        "the wide server persisted extra/: {extra:?}"
+    );
+    shutdown(first);
+
+    let mut cached = cached_server(environment.path(), &narrow, &Value::Null, &OPENS);
+    let warm = answers(&mut cached, &narrow, &queries);
+    shutdown(cached);
+    let cold = uncached_answers(environment.path(), &narrow, &Value::Null, &OPENS, &queries);
+    assert_agree(&warm, &cold);
+    assert_eq!(warm[0].locations.len(), MATRIX.importers + 1, "{warm:?}");
+    assert!(
+        warm.iter()
+            .flat_map(|answer| &answer.locations)
+            .all(|location| !location.contains("/extra/")),
+        "{warm:?}"
+    );
+}
+
+/// A second server is killed while its reuse pass is held at
+/// `PASCAL_LSP_TEST_REUSE_PASS_BARRIER` after `HELD` members; a third
+/// server over the same store answers as an uncached one.
+#[test]
+fn cancellation_mid_reuse_then_restart() {
+    const HELD: usize = 5;
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+    persist_and_stop(environment.path(), &root, &Value::Null, &OPENS);
+
+    let directory = environment.path().join("reuse-pass-barrier");
+    fs::create_dir_all(&directory).unwrap();
+    let barrier = TestBarrier {
+        entered: directory.join("entered"),
+        release: directory.join("release"),
+    };
+    let spec = format!(
+        "{}|{}|{HELD}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let cache_home = environment.path().join("cache");
+    let mut second = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment.path(),
+        [
+            ("XDG_CACHE_HOME", cache_home.to_str().expect("UTF-8 path")),
+            ("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", spec.as_str()),
+        ],
+    );
+    second.initialize(&root, Value::Null);
+    open_disk(&mut second, &root, &OPENS);
+    barrier.wait_until_entered();
+    let held = request(&mut second, "pascal/indexStatus", json!({}));
+    assert!(
+        held["contexts"]
+            .as_array()
+            .is_some_and(|contexts| !contexts.iter().any(complete)),
+        "killed before complete: {held}"
+    );
+    second.kill();
+
+    let mut third = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let warm = answers(&mut third, &root, &queries);
+    shutdown(third);
+    let cold = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);
+    assert_agree(&warm, &cold);
+    assert_eq!(warm[0].locations.len(), MATRIX.importers + 1, "{warm:?}");
 }
 
 /// A source with conditional directives open with its saved text: the

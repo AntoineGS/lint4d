@@ -4560,7 +4560,7 @@ impl Workspace {
                     result.baseline.extend(absent.members);
                     result.baseline.extend(absent.includes);
                 }
-                let (skipped, searched) = take_unverified(
+                let (skipped, searched, _) = take_unverified(
                     paths,
                     key,
                     &open,
@@ -4594,7 +4594,7 @@ impl Workspace {
                 limit,
                 packages,
                 owner_pending,
-                retrying,
+                deferred,
                 ..
             } = view;
 
@@ -4682,14 +4682,15 @@ impl Workspace {
             }
             // A target searched for its facts reads no unverified member.
             let mut none_left = 0;
-            // Members retrying a previous refusal are counted by the
-            // "retried later" gap below, not again as not indexed yet.
-            let (skipped, read) = take_unverified(
+            // Deferred members past the bound are counted by the "retried
+            // later" gap below, not again as not indexed yet; those excluded
+            // above or read within the bound are not counted at all.
+            let (skipped, read, retried_later) = take_unverified(
                 unverified,
                 key,
                 &open,
                 &deleted,
-                &|path_key| deferral_gap && retrying.contains(path_key),
+                &|path_key| deferral_gap && deferred.contains(path_key),
                 &mut taken,
                 if searched {
                     &mut unverified_left
@@ -4703,10 +4704,11 @@ impl Workspace {
                     "{skipped} units of {display} are not indexed yet; {read} were searched directly"
                 ));
             }
-            if searched && let Some(reason) = coverage.first_deferral.as_deref() {
+            if retried_later > 0
+                && let Some(reason) = coverage.first_deferral.as_deref()
+            {
                 result.gaps.push(format!(
-                    "{} units of {display} failed to load for the index and are retried later: {reason}",
-                    coverage.deferred
+                    "{retried_later} units of {display} failed to load for the index and are retried later: {reason}"
                 ));
             }
             refused += refused_members.len();
@@ -4873,8 +4875,9 @@ struct TargetView {
     limit: Option<String>,
     packages: bool,
     owner_pending: usize,
-    /// Path keys of the unverified members retrying a previous refusal.
-    retrying: HashSet<String>,
+    /// Path keys of the unverified members whose last load was deferred
+    /// (those retrying a previous refusal among them).
+    deferred: HashSet<String>,
 }
 
 /// What a request reads of each target's index.
@@ -4935,10 +4938,10 @@ fn target_view(
             }
         }
     };
-    let retrying = candidates
+    let deferred = candidates
         .unverified
         .iter()
-        .filter(|path| index.retrying(path))
+        .filter(|path| index.deferred(path))
         .map(|path| path_key(path))
         .collect();
     let recorded = candidates
@@ -4963,7 +4966,7 @@ fn target_view(
         limit: membership.limit.clone(),
         packages: membership.packages,
         owner_pending: membership.owner_pending,
-        retrying,
+        deferred,
     }
 }
 
@@ -4978,7 +4981,8 @@ struct MembershipListing {
 /// Adds `unverified` (path order) to `sources` while the request-wide bound
 /// lasts; open buffers are always read (A4) and do not use it. Returns how
 /// many were skipped, leaving out those whose path key is `reported`
-/// elsewhere, and how many used the bound.
+/// elsewhere, how many used the bound, and how many `reported` ones were
+/// skipped.
 #[allow(clippy::too_many_arguments)]
 fn take_unverified(
     unverified: Vec<PathBuf>,
@@ -4989,8 +4993,8 @@ fn take_unverified(
     taken: &mut HashSet<String>,
     left: &mut usize,
     sources: &mut Vec<(PathBuf, ContextKey)>,
-) -> (usize, usize) {
-    let (mut skipped, mut searched) = (0, 0);
+) -> (usize, usize, usize) {
+    let (mut skipped, mut searched, mut skipped_reported) = (0, 0, 0);
     for path in unverified {
         let path_key = path_key(&path);
         if deleted(&path) || taken.contains(&path_key) {
@@ -4998,7 +5002,11 @@ fn take_unverified(
         }
         if !open.contains(&path_key) {
             if *left == 0 {
-                skipped += usize::from(!reported(&path_key));
+                if reported(&path_key) {
+                    skipped_reported += 1;
+                } else {
+                    skipped += 1;
+                }
                 continue;
             }
             *left -= 1;
@@ -5007,7 +5015,7 @@ fn take_unverified(
         taken.insert(path_key);
         sources.push((path, key.clone()));
     }
-    (skipped, searched)
+    (skipped, searched, skipped_reported)
 }
 
 /// The bytes one references request may read to rank its unverified
@@ -5269,7 +5277,11 @@ impl UnverifiedRanking {
         let context = Arc::clone(&state.context);
         // A fresh resolver per member, as each member's analysis has: a
         // resolver keeps the first load of a file, with the provenance of
-        // the search entry that found it, for every later lookup.
+        // the search entry that found it, for every later lookup. Its
+        // default limits may exceed the session's: where the session's
+        // include is `Incomplete` (an over-limit listing or include cap),
+        // the proof may follow further, never to a different file, and the
+        // excluded member drops that "include incomplete" note.
         let mut limits = pascal_core::ResolverLimits::default();
         limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
         let mut resolver = super::resolver::resolver_for_context_with_limits(
@@ -6694,14 +6706,19 @@ pub(in crate::workspace) mod tests {
             coverage.first_deferral.as_deref(),
             Some("an injected member error")
         );
+        // Past the direct-search bound, the deferred members are counted
+        // once, by the "retried later" gap.
         let input = workspace.analysis_input();
-        let found = indexed(
-            &mut workspace,
-            &input,
-            &one_target(&key, &anchor),
-            None,
-            &[],
-        );
+        let found = {
+            let _caps = override_caps(|caps| caps.unverified = Some(0));
+            indexed(
+                &mut workspace,
+                &input,
+                &one_target(&key, &anchor),
+                None,
+                &[],
+            )
+        };
         assert!(
             found
                 .gaps
@@ -8052,7 +8069,7 @@ pub(in crate::workspace) mod tests {
 
     /// l4d-1nfk on the references path: a member retrying a previous
     /// refusal whose bytes cannot hold `SharedValue` is excluded with its
-    /// stamp; it stays counted by the "retried later" gap.
+    /// stamp, so no "retried later" gap counts it.
     #[test]
     fn a_retrying_member_without_the_name_is_left_out_of_references() {
         let temp = tempfile::tempdir().unwrap();
@@ -8073,12 +8090,7 @@ pub(in crate::workspace) mod tests {
         );
         assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
         assert!(baselined(&found, &plain), "{:?}", found.baseline);
-        assert_eq!(
-            found.gaps,
-            [
-                "1 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
-            ]
-        );
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
     }
 
     #[test]
@@ -9035,9 +9047,10 @@ pub(in crate::workspace) mod tests {
         assert_eq!(references.sources.len(), 5, "references keep their bound");
     }
 
-    /// Members retrying a previous refusal are the "retried later" gap; the
-    /// "not indexed yet" count leaves them out, and they still use the
-    /// direct-search bound (final review Minor 5).
+    /// Members retrying a previous refusal past the direct-search bound are
+    /// the "retried later" gap; the "not indexed yet" count leaves them out
+    /// (final review Minor 5), and those read within the bound are in
+    /// neither.
     #[test]
     fn retrying_members_are_not_counted_again_as_not_indexed_yet() {
         let temp = tempfile::tempdir().unwrap();
@@ -9068,8 +9081,7 @@ pub(in crate::workspace) mod tests {
             ]
         );
         // Every member spells `p`, so none is excluded lexically: within
-        // the bound the retrying members are read, and only the "retried
-        // later" line counts them.
+        // the bound the retrying members are read, so no gap counts them.
         let _caps = override_caps(|caps| caps.unverified_symbols = Some(5));
         let (sources, _) = workspace
             .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
@@ -9078,12 +9090,7 @@ pub(in crate::workspace) mod tests {
             source_names(&sources),
             ["App.dpr", "U0.pas", "U1.pas", "U2.pas", "U3.pas"]
         );
-        assert_eq!(
-            sources.gaps,
-            [
-                "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
-            ]
-        );
+        assert!(sources.gaps.is_empty(), "{:?}", sources.gaps);
     }
 
     /// l4d-1nfk: a retrying member is an unverified member like any other,
@@ -9153,7 +9160,8 @@ pub(in crate::workspace) mod tests {
         assert_eq!(source_names(&sources), ["U3.pas"]);
 
         // Past the bound, a retrying member spelling the query is the
-        // "retried later" gap, never a silent drop.
+        // "retried later" gap, never a silent drop; the one read within
+        // the bound is not counted.
         named_unit(&root.join("lib/U2.pas"), "P1Two");
         for name in ["U2.pas", "U3.pas"] {
             retry(&mut workspace, name);
@@ -9167,7 +9175,7 @@ pub(in crate::workspace) mod tests {
         assert_eq!(
             sources.gaps,
             [
-                "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
+                "1 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
             ]
         );
     }
@@ -9609,6 +9617,10 @@ pub(in crate::workspace) mod tests {
                 .expect("references");
                 assert!(found.coverage.is_complete(), "{:?}", found.coverage);
                 let indexed = crate::workspace::rename::test_take_indexed_sources();
+                assert!(
+                    indexed.contains(&root.join("debug/UA.pas")),
+                    "the answer came from the index: {indexed:?}"
+                );
                 assert_eq!(release_only(&indexed), Vec::<PathBuf>::new(), "{indexed:?}");
                 let mut located = found
                     .value
@@ -13657,7 +13669,7 @@ end.
             /// schedule (the worker woken by the refusal) checkpoints, and
             /// the refused members are proven by later batches: a cold run
             /// persists every member and seals, with no hand-run step. Sized
-            /// so container 6 rows (13d-3) still pass the 8 MiB minimum.
+            /// so container 7 rows (l4d-rpfc) still pass the 8 MiB minimum.
             #[test]
             fn a_cold_index_past_the_wal_threshold_persists_every_member_and_seals() {
                 const UNITS: usize = 90;

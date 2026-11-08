@@ -717,6 +717,16 @@ impl ContextIndex {
         })
     }
 
+    /// Whether `path` is pending after a load that failed for a reason
+    /// that may pass: what `IndexCoverage::deferred` counts.
+    pub(crate) fn deferred(&self, path: &Path) -> bool {
+        self.id_of(path).is_some_and(|id| {
+            let member = &self.members[id.0 as usize];
+            member.deferred != 0
+                && matches!(member.state(), MemberState::Unindexed | MemberState::Stale)
+        })
+    }
+
     pub(crate) fn mark_reuse_tried(&mut self, path: &Path) {
         if let Some(id) = self.id_of(path) {
             self.members[id.0 as usize].reuse_tried = true;

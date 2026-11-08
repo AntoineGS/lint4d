@@ -8,6 +8,7 @@ use super::persistent_index::{complete, persisted, shutdown, wait_index};
 use super::persistent_queries::*;
 use super::*;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// The unmutated matrix fixture: the persisting first server and the warm
 /// second server both answer like an uncached server, and the warm one
@@ -606,4 +607,311 @@ fn a_compiler_version_change_while_stopped() {
     assert_eq!(run.cold[1].locations.len(), 1, "{:?}", run.cold);
     assert!(run.warm[1].locations.is_empty(), "{:?}", run.warm);
     assert_ne!(run.warm, run.cold, "the version changes the answers");
+}
+
+/// The `Importer`'s occurrence moves from column 2 to column 0; size and
+/// modification time stay.
+fn move_occurrence_keeping_the_stamp(root: &Path, importer: &str) {
+    let path = root.join(importer);
+    let text = fs::read_to_string(&path).unwrap();
+    let moved = text.replace("begin\n  TShared.Create;\n", "begin\nTShared.Create;  \n");
+    assert_ne!(moved, text);
+    rewrite_keeping_the_stamp(&path, &moved);
+}
+
+/// `workspace/didChangeWatchedFiles` with `(path, type)` entries (1 created,
+/// 2 changed, 3 deleted).
+fn watched_batch(server: &mut TestServer, changes: &[(PathBuf, u8)]) {
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": changes
+            .iter()
+            .map(|(path, kind)| json!({"uri": uri(path), "type": kind}))
+            .collect::<Vec<_>>()}),
+    );
+}
+
+/// A warm server over the store of a first one that persisted `OPENS`'
+/// context: index complete, background settled, nothing extracted.
+fn running_warm(environment: &Path, root: &Path) -> TestServer {
+    warm_server(environment, root, &OPENS)
+}
+
+/// Answers `SHARED_REFERENCES` and `Symbols("TShared")` on a warm server
+/// once its index is complete and its background settled, stops it and
+/// returns them with the uncached answers of the tree as it then is.
+fn finish_and_compare(
+    environment: &Path,
+    root: &Path,
+    mut server: TestServer,
+    queries: &[Query],
+) -> (Vec<Answer>, Vec<Answer>, Value) {
+    let status = wait_index(&mut server, complete);
+    settle_background(&mut server);
+    let warm = answers(&mut server, root, queries);
+    shutdown(server);
+    let uncached = uncached_answers(environment, root, &Value::Null, &OPENS, queries);
+    (warm, uncached, status)
+}
+
+/// The first half of a same-stamp write while the warm server runs:
+/// `Importer3.pas` is rewritten (occurrence to column 0, stamp kept) and a
+/// `Changed` event names it. The second half rewrites `Importer4.pas` the
+/// same way with no event and restarts the server, which never trusts
+/// watcher coverage.
+#[test]
+fn a_same_stamp_write_during_the_session() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let mut server = running_warm(environment.path(), &root);
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+    let before = answers(&mut server, &root, &queries);
+    assert_agree(&before, &before);
+    assert!(locates(&before[0], "Importer3.pas", 6, 2), "{before:?}");
+
+    move_occurrence_keeping_the_stamp(&root, "lib/Importer3.pas");
+    watched_batch(&mut server, &[(root.join("lib/Importer3.pas"), 2)]);
+    let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
+    assert_agree(&warm, &uncached);
+    assert_ne!(warm, before, "the write is visible");
+    assert!(locates(&warm[0], "Importer3.pas", 6, 0), "{warm:?}");
+    assert!(!locates(&warm[0], "Importer3.pas", 6, 2), "{warm:?}");
+
+    move_occurrence_keeping_the_stamp(&root, "lib/Importer4.pas");
+    let restarted = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let (warm, uncached, status) =
+        finish_and_compare(environment.path(), &root, restarted, &queries);
+    assert_agree(&warm, &uncached);
+    assert!(locates(&warm[0], "Importer4.pas", 6, 0), "{warm:?}");
+    assert!(locates(&warm[0], "Importer3.pas", 6, 0), "{warm:?}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
+}
+
+/// A checkout's effect: `Other3.pas` deleted, `Branch.pas` added,
+/// `Importer1.pas` replaced by other content with an older mtime than any
+/// stamp seen, `Importer2.pas` restored byte-identical with a new mtime and
+/// `App.dproj` edited by whitespace only. Everything settled.
+fn branch_switch(root: &Path) {
+    fs::remove_file(root.join("lib/Other3.pas")).unwrap();
+    write_file(
+        &root.join("lib/Branch.pas"),
+        "unit Branch;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  TShared.Create;\nend;\nend.\n",
+    );
+    write_file(
+        &root.join("lib/Importer1.pas"),
+        "unit Importer1;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  TShared.Create;\n  TShared.Create;\nend;\nend.\n",
+    );
+    let importer2 = root.join("lib/Importer2.pas");
+    let text = fs::read_to_string(&importer2).unwrap();
+    write_file(&importer2, &text);
+    let project = root.join("App.dproj");
+    let text = fs::read_to_string(&project).unwrap();
+    write_file(&project, &format!("{text}\n"));
+    pascal_project::backdate_tree_for_test(root);
+    fs::File::options()
+        .write(true)
+        .open(root.join("lib/Importer1.pas"))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+}
+
+fn branch_changes(root: &Path) -> Vec<(PathBuf, u8)> {
+    vec![
+        (root.join("lib/Other3.pas"), 3),
+        (root.join("lib/Branch.pas"), 1),
+        (root.join("lib/Importer1.pas"), 2),
+        (root.join("lib/Importer2.pas"), 2),
+        (root.join("App.dproj"), 2),
+    ]
+}
+
+fn assert_branch_answers(warm: &[Answer]) {
+    assert!(locates(&warm[0], "Branch.pas", 6, 2), "{warm:?}");
+    assert!(locates(&warm[0], "Importer1.pas", 7, 2), "{warm:?}");
+    assert!(
+        !warm[0]
+            .locations
+            .iter()
+            .any(|location| location.contains("Other3.pas")),
+        "{warm:?}"
+    );
+    assert!(
+        !warm[1]
+            .locations
+            .iter()
+            .any(|location| location.contains("Other3.pas")),
+        "{warm:?}"
+    );
+}
+
+/// The branch switch while the first server is stopped.
+#[test]
+fn a_branch_switch_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let run = differential_full(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        branch_switch,
+        &[SHARED_REFERENCES, Query::Symbols("TShared")],
+    );
+    assert_agree(&run.warm, &run.uncached);
+    assert_branch_answers(&run.warm);
+    assert_reused(&run);
+    let members = run.warm_status["members"].as_u64().unwrap();
+    let extracted = run.warm_status["extracted"].as_u64().unwrap();
+    // `Branch.pas` (new) and `Importer1.pas` (other bytes). `Importer2.pas`
+    // (same bytes, new mtime) and the whitespace-edited `App.dproj` are
+    // reused by content; `Other3.pas` is gone.
+    assert_eq!(extracted, 2, "{}", run.warm_status);
+    assert_eq!(
+        run.warm_status["reused"],
+        members - 2,
+        "{}",
+        run.warm_status
+    );
+}
+
+/// The same switch while the warm server runs, announced by one watched
+/// batch naming every change.
+#[test]
+fn a_branch_switch_while_running() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let mut server = running_warm(environment.path(), &root);
+    branch_switch(&root);
+    watched_batch(&mut server, &branch_changes(&root));
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+    let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
+    assert_agree(&warm, &uncached);
+    assert_branch_answers(&warm);
+}
+
+/// The same switch, but the server is told through an oversized watched
+/// batch (65 entries, past `MAX_FILE_OPERATION_BATCH_ENTRIES`) that names
+/// nothing real: it discards derived state and must rediscover the tree.
+#[test]
+fn a_branch_switch_while_running_with_a_watcher_overflow() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let mut server = running_warm(environment.path(), &root);
+    branch_switch(&root);
+    let padding: Vec<_> = (0..65)
+        .map(|index| (root.join(format!("lib/Padding{index}.pas")), 2))
+        .collect();
+    watched_batch(&mut server, &padding);
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+    let (warm, uncached, _) = finish_and_compare(environment.path(), &root, server, &queries);
+    assert_agree(&warm, &uncached);
+    assert_branch_answers(&warm);
+}
+
+const GENERATED: &str = "procedure Gen;\nbegin\n  TShared.Create;\nend;\n";
+
+/// `Importer0.pas` includes `lib/Generated.inc`. While stopped a generator
+/// rewrites it (a) with the same bytes and a new mtime, then (b) in a
+/// second round with other bytes of the same size and the mtime of (a).
+#[test]
+fn a_regenerated_source_is_reused_or_reextracted_by_content() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let importer = root.join("lib/Importer0.pas");
+    let text = fs::read_to_string(&importer)
+        .unwrap()
+        .replace("implementation\n", "implementation\n{$I Generated.inc}\n");
+    write_file(&importer, &text);
+    let generated = root.join("lib/Generated.inc");
+    write_file(&generated, GENERATED);
+    pascal_project::backdate_tree_for_test(&root);
+    let queries = [SHARED_REFERENCES, Query::Symbols("Gen")];
+
+    let mut first = launch_labelled(environment.path(), "cache", "generated-first");
+    first.initialize(&root, Value::Null);
+    open_disk(&mut first, &root, &OPENS);
+    wait_index(&mut first, persisted);
+    let original = answers(&mut first, &root, &queries);
+    shutdown(first);
+    assert!(locates(&original[0], "Generated.inc", 2, 2), "{original:?}");
+
+    write_file(&generated, GENERATED);
+    pascal_project::backdate_tree_for_test(&root);
+    let cached = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let (warm, uncached, status) = finish_and_compare(environment.path(), &root, cached, &queries);
+    assert_agree(&warm, &uncached);
+    assert_eq!(warm, original);
+    assert_eq!(status["extracted"], 0, "{status}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
+
+    rewrite_keeping_the_stamp(
+        &generated,
+        &GENERATED.replace("begin\n  TShared.Create;\n", "begin\nTShared.Create;  \n"),
+    );
+    let cached = cached_server(environment.path(), &root, &Value::Null, &OPENS);
+    let (warm, uncached, status) = finish_and_compare(environment.path(), &root, cached, &queries);
+    assert_agree(&warm, &uncached);
+    assert!(locates(&warm[0], "Generated.inc", 2, 0), "{warm:?}");
+    assert!(!locates(&warm[0], "Generated.inc", 2, 2), "{warm:?}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
+}
+
+/// A mutation applied with fresh mtimes (a changed member, a new member and
+/// their directory) while the warm server is stopped. The immediate answers
+/// are truthful (a partial answer only lists uncached locations); once the
+/// stamps settle with wall-clock time, the context completes on its own and
+/// the answers equal the uncached ones.
+#[test]
+fn an_unsettled_tree_is_truthful_then_completes() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let queries = [SHARED_REFERENCES, Query::Symbols("TShared")];
+    let mut first = launch_labelled(environment.path(), "cache", "unsettled-first");
+    first.initialize(&root, Value::Null);
+    open_disk(&mut first, &root, &OPENS);
+    wait_index(&mut first, persisted);
+    shutdown(first);
+
+    let importer = root.join("lib/Importer3.pas");
+    let text = fs::read_to_string(&importer).unwrap();
+    write_file(
+        &importer,
+        &text.replace("begin\n  TShared.Create;\n", "begin\nTShared.Create;  \n"),
+    );
+    write_file(
+        &root.join("lib/Fresh.pas"),
+        "unit Fresh;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  TShared.Create;\nend;\nend.\n",
+    );
+
+    let mut server = launch_labelled(environment.path(), "cache", "unsettled-warm");
+    server.initialize(&root, Value::Null);
+    open_disk(&mut server, &root, &OPENS);
+    let started = Instant::now();
+    let immediate = answers(&mut server, &root, &queries);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        let status = request(&mut server, "pascal/indexStatus", json!({}));
+        if let Some(context) = status["contexts"]
+            .as_array()
+            .and_then(|contexts| contexts.iter().find(|context| complete(context)))
+        {
+            break context.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the context never completed after {:?}: {status}",
+            started.elapsed()
+        );
+    };
+    eprintln!("unsettled tree completed after {:?}", started.elapsed());
+    settle_background(&mut server);
+    let settled = answers(&mut server, &root, &queries);
+    shutdown(server);
+    let uncached = uncached_answers(environment.path(), &root, &Value::Null, &OPENS, &queries);
+    assert_truthful(&immediate, &uncached);
+    assert_agree(&settled, &uncached);
+    assert!(locates(&settled[0], "Fresh.pas", 6, 2), "{settled:?}");
+    assert!(locates(&settled[0], "Importer3.pas", 6, 0), "{settled:?}");
+    assert!(status["reused"].as_u64() > Some(0), "{status}");
 }

@@ -740,9 +740,9 @@ pub(super) enum Query {
 /// completeness and the coverage notes that qualify it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Answer {
-    locations: Vec<String>,
-    complete: bool,
-    notes: Vec<String>,
+    pub(super) locations: Vec<String>,
+    pub(super) complete: bool,
+    pub(super) notes: Vec<String>,
 }
 
 fn answer(server: &mut TestServer, root: &Path, query: Query) -> Answer {

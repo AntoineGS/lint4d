@@ -95,12 +95,13 @@ pub use leases::{
     Hint, HintStats, LEASE_EXPIRY, LEASE_RENEWAL, MAX_LEASE_HOLDS, MAX_PENDING_HINTS,
 };
 pub use limits::{
-    CONNECTION_OVERHEAD_BYTES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError, MAX_ARTIFACT_CONTENT_BYTES,
-    MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES, MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES,
-    MAX_INDEX_PAGE, MAX_MANIFEST_BYTES, MAX_MEMBER_BINDINGS, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES,
-    MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES,
-    MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, SQLITE_LENGTH_LIMIT, StoreLimits,
+    CONNECTION_OVERHEAD_BYTES, DEFAULT_MAX_NAMESPACES, JOURNAL_SIZE_LIMIT_BYTES, LimitsError,
+    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_EVIDENCE_CANDIDATES,
+    MAX_EVIDENCE_OBSERVATIONS, MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE, MAX_MANIFEST_BYTES,
+    MAX_MEMBER_BINDINGS, MAX_NAMESPACES, MAX_OPEN_WAIT, MAX_PAGE_CACHE_BYTES, MAX_READERS,
+    MAX_ROW_BATCH_BYTES, MAX_ROW_BATCH_ROWS, MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES,
+    MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES,
+    SQLITE_LENGTH_LIMIT, StoreLimits,
 };
 pub use namespaces::{Reclaimed, RetireReport, Scope};
 pub use sqlite::MIN_SQLITE_VERSION_NUMBER;
@@ -140,7 +141,7 @@ pub struct Store {
 
 impl Store {
     /// Open or create the store in `directory` for `namespace`, then retire
-    /// namespaces no live process holds. Any failure is a bypass: the
+    /// the namespaces retention does not keep (see [`Self::retire_obsolete`]). Any failure is a bypass: the
     /// caller analyses without the cache.
     pub fn open(
         directory: &Path,
@@ -222,6 +223,10 @@ impl Store {
         })
     }
 
+    /// Keep the [`StoreLimits::max_namespaces`] most recently used live
+    /// namespaces, this one included, and retire the others no live process
+    /// holds, least recently used first; while the store is over its disk
+    /// policy, retire kept ones too, least recently used first (l4d-1ypi).
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
         self.guarded(Access::Maintenance, || {
             self.retire_within(Deadline::after(self.limits.open_wait))
@@ -230,7 +235,26 @@ impl Store {
 
     fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
         let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-        namespaces::retire_obsolete(&mut writer, &self.location, self.scope.namespace, deadline)
+        let excess_bytes = {
+            let transaction = sqlite::begin_within(
+                &mut writer,
+                rusqlite::TransactionBehavior::Deferred,
+                deadline,
+            )?;
+            let policy = budget::read_policy(&transaction)?.policy;
+            budget::excess_bytes(policy, &budget::read_usage(self, &transaction)?)
+        };
+        let retention = namespaces::Retention {
+            keep: self.limits.max_namespaces,
+            excess_bytes,
+        };
+        namespaces::retire_obsolete(
+            &mut writer,
+            &self.location,
+            self.scope.namespace,
+            retention,
+            deadline,
+        )
     }
 
     /// Delete at most `max_rows` rows in one `IMMEDIATE` transaction: rows
@@ -345,6 +369,7 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         leases::release(self);
+        self._lock.touch();
     }
 }
 

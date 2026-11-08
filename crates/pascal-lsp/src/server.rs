@@ -3982,6 +3982,7 @@ fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
         "persistentCachePageBytes",
         "persistentCacheScratchBytes",
         "persistentCacheWaitMs",
+        "persistentCacheMaxNamespaces",
     ]
     .iter()
     .any(|key| object.contains_key(*key))
@@ -16242,6 +16243,7 @@ mod tests {
             "persistentCachePageBytes",
             "persistentCacheScratchBytes",
             "persistentCacheWaitMs",
+            "persistentCacheMaxNamespaces",
             "maxWorkspaceUnits",
         ] {
             let settings = serde_json::json!({ key: null });

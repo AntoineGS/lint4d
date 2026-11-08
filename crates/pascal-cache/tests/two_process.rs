@@ -292,10 +292,15 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
             "child exited early"
         );
     }
+    // Keeping only its own namespace, the store retires every other one
+    // no process holds.
     let store = Store::open(
         &directory,
         &namespace(SHARED_NAMESPACE),
-        StoreLimits::default(),
+        StoreLimits {
+            max_namespaces: 1,
+            ..StoreLimits::default()
+        },
     )
     .unwrap();
     let lock = store
@@ -305,7 +310,8 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
         store.retire_obsolete(),
         Ok(RetireReport {
             retired: 0,
-            in_use: 1
+            in_use: 1,
+            kept: 0,
         })
     );
     assert!(lock.exists());
@@ -315,7 +321,8 @@ fn a_live_process_keeps_its_namespace_until_it_exits() {
         store.retire_obsolete(),
         Ok(RetireReport {
             retired: 1,
-            in_use: 0
+            in_use: 0,
+            kept: 0,
         })
     );
     assert!(!lock.exists());

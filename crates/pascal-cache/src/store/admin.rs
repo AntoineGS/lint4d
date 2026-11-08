@@ -12,6 +12,7 @@ use super::leases::live_since;
 use super::limits::MIN_CONNECTION_PAGE_CACHE_BYTES;
 use super::location::{DATABASE_FILE, StoreLocation};
 use super::maintenance::{Maintenance, StepBudget, StepReport};
+use super::namespaces;
 use super::outcome::{Bypass, LocationIssue};
 use super::sqlite::{begin, check_sqlite_version, classify, open_connection};
 use super::{Store, StoreLimits, unix_seconds};
@@ -104,9 +105,31 @@ pub struct StatusReport {
     pub retired_namespaces: u64,
     pub retired_scopes: u64,
     pub live_leases: u64,
+    /// The live namespaces, the most recently used first, at most
+    /// [`MAX_LISTED_NAMESPACES`] (l4d-1ypi).
+    pub namespaces: Vec<NamespaceStatus>,
+    /// More live namespaces than are listed.
+    pub namespaces_truncated: bool,
     /// [`RecoveryAdvice::None`] for a healthy container; [`RecoveryAdvice::Prune`]
     /// when writes are refused for space.
     pub advice: RecoveryAdvice,
+}
+
+/// Live namespaces a status report lists.
+pub const MAX_LISTED_NAMESPACES: usize = 16;
+
+/// One live namespace of a store: one build's facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceStatus {
+    /// The namespace identity, derived from the build fingerprint.
+    pub id: crate::Digest,
+    pub reset_epoch: u64,
+    /// When a process last opened or closed it; `None` without a lock file.
+    pub last_used_unix_seconds: Option<u64>,
+    /// Estimated bytes of its live scope's rows.
+    pub estimated_bytes: u64,
+    /// A live process lease is registered in it.
+    pub held: bool,
 }
 
 fn unreadable(bypass: Bypass) -> StoreStatus {
@@ -167,6 +190,25 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
     let usage = read_usage_at(&location, &transaction)?;
     let pressure = pressure_of(policy.policy, &usage);
     let live_since = live_since(unix_seconds());
+    let ranked = namespaces::ranked_live(&transaction, &location, None)?;
+    let namespaces_truncated = ranked.len() > MAX_LISTED_NAMESPACES;
+    let namespaces = ranked
+        .into_iter()
+        .take(MAX_LISTED_NAMESPACES)
+        .map(|(id, reset_epoch, used)| {
+            Ok(NamespaceStatus {
+                id,
+                reset_epoch: u64::try_from(reset_epoch).map_err(|_| Bypass::Corrupt)?,
+                last_used_unix_seconds: used.and_then(namespaces::unix_seconds_of),
+                estimated_bytes: namespaces::estimated_bytes(
+                    &transaction,
+                    id.as_bytes(),
+                    reset_epoch,
+                )?,
+                held: namespace_held(&transaction, id, reset_epoch, live_since)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Bypass>>()?;
     Ok(Some(StatusReport {
         container: ContainerInfo {
             version: CONTAINER_VERSION,
@@ -191,12 +233,30 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
             "SELECT count(*) FROM process_leases WHERE renewed_unix_seconds >= ?1",
             live_since,
         )?,
+        namespaces,
+        namespaces_truncated,
         advice: if pressure == Pressure::None {
             RecoveryAdvice::None
         } else {
             RecoveryAdvice::Prune
         },
     }))
+}
+
+fn namespace_held(
+    connection: &Connection,
+    id: crate::Digest,
+    reset_epoch: i64,
+    live_since: i64,
+) -> Result<bool, Bypass> {
+    connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM process_leases WHERE namespace_id = ?1 \
+             AND reset_epoch = ?2 AND renewed_unix_seconds >= ?3)",
+            rusqlite::params![id.as_bytes().as_slice(), reset_epoch, live_since],
+            |row| row.get(0),
+        )
+        .map_err(|error| classify(&error))
 }
 
 fn count(connection: &Connection, sql: &str, parameter: i64) -> Result<u64, Bypass> {

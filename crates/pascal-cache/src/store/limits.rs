@@ -42,6 +42,11 @@ pub const MAX_SNAPSHOT_CANDIDATES: usize = 8;
 /// `SQLITE_LIMIT_LENGTH`: SQLite refuses to materialize a longer value, so
 /// a planted oversized blob fails before it is copied.
 pub const SQLITE_LENGTH_LIMIT: i32 = 2 * 1024 * 1024;
+/// Live namespaces a store keeps by default: the opening build's and the two
+/// most recently used others (l4d-1ypi).
+pub const DEFAULT_MAX_NAMESPACES: usize = 3;
+/// The most `StoreLimits::max_namespaces` may be.
+pub const MAX_NAMESPACES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -50,6 +55,11 @@ pub struct StoreLimits {
     pub wait: Duration,
     pub open_wait: Duration,
     pub readers: usize,
+    /// Live namespaces kept at retirement, this store's own included, the
+    /// most recently used first, while the store stays within its disk
+    /// policy. A namespace a live process holds is never retired, so more
+    /// may stay live.
+    pub max_namespaces: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +71,7 @@ pub enum LimitsError {
     ScratchTooSmall,
     WaitTooLong,
     OpenWaitTooLong,
+    MaxNamespaces,
 }
 
 impl Default for StoreLimits {
@@ -71,6 +82,7 @@ impl Default for StoreLimits {
             wait: MAX_WAIT,
             open_wait: Duration::from_secs(1),
             readers: MAX_READERS,
+            max_namespaces: DEFAULT_MAX_NAMESPACES,
         }
     }
 }
@@ -98,6 +110,9 @@ impl StoreLimits {
         }
         if self.open_wait > MAX_OPEN_WAIT {
             return Err(LimitsError::OpenWaitTooLong);
+        }
+        if !(1..=MAX_NAMESPACES).contains(&self.max_namespaces) {
+            return Err(LimitsError::MaxNamespaces);
         }
         Ok(())
     }

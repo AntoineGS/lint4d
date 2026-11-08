@@ -1,3 +1,4 @@
+use super::budget::ROW_OVERHEAD_BYTES;
 use super::gc;
 use super::location::StoreLocation;
 use super::outcome::{Bypass, Integrity};
@@ -7,14 +8,16 @@ use crate::{Digest, Namespace};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The `lifecycle` of every namespace, artifact, evidence set and member
 /// record: retiring one ends its read eligibility at once.
 pub(crate) const LIVE: i64 = 1;
 pub(crate) const RETIRED: i64 = 2;
-/// Namespaces examined per retirement pass; the rest wait for the next start.
+/// Namespaces retired per retirement pass; the rest wait for the next pass.
 const MAX_RETIRED_PER_PASS: usize = 64;
+/// Live namespaces one retirement pass ranks.
+const MAX_EXAMINED_PER_PASS: usize = 256;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
@@ -67,8 +70,10 @@ pub struct Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetireReport {
     pub retired: usize,
-    /// Obsolete namespaces another live process still holds.
+    /// Namespaces the pass would have retired that a live process holds.
     pub in_use: usize,
+    /// Other namespaces left live by retention (l4d-1ypi).
+    pub kept: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +139,11 @@ impl NamespaceLock {
         loop {
             let file = open_lock_file(&path)?;
             match file.try_lock_shared() {
-                Ok(()) if still_linked(&file, &path)? => return Ok(Self { _file: file, path }),
+                Ok(()) if still_linked(&file, &path)? => {
+                    let lock = Self { _file: file, path };
+                    lock.touch();
+                    return Ok(lock);
+                }
                 Ok(()) | Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(error)) => return Err(Bypass::Io(error.kind())),
             }
@@ -154,6 +163,13 @@ impl NamespaceLock {
             Ok(()) | Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(Bypass::Io(error.kind())),
         }
+    }
+
+    /// Record that this process uses the namespace now (spec §10
+    /// amendment 2026-11-08): retirement keeps the most recently used.
+    /// Best effort: a time that cannot be set leaves the namespace older.
+    pub(crate) fn touch(&self) {
+        let _ = self._file.set_modified(SystemTime::now());
     }
 
     /// Unlink the file before releasing it, so a process that opened it in
@@ -288,69 +304,208 @@ pub(crate) fn reset(transaction: &Connection, scope: Scope) -> Result<(), Bypass
     Ok(())
 }
 
-/// Retire every other live namespace no process holds, one short
-/// transaction each.
-pub(crate) fn retire_obsolete(
-    connection: &mut Connection,
-    location: &StoreLocation,
-    current: Digest,
-    deadline: Deadline,
-) -> Result<RetireReport, Bypass> {
+/// What a retirement pass keeps (l4d-1ypi).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Retention {
+    /// Live namespaces kept, the current one included.
+    pub(crate) keep: usize,
+    /// Bytes the store is over its disk policy by, free pages counted as
+    /// free (see `budget::excess_bytes`).
+    pub(crate) excess_bytes: u64,
+}
+
+/// When namespace `id` was last opened or closed: the modification time of
+/// its lock file (spec §10 amendment 2026-11-08). `None` when the file is
+/// gone or has no readable time: such a namespace is the least recently
+/// used.
+pub(crate) fn last_used(location: &StoreLocation, id: Digest) -> Option<SystemTime> {
+    fs::symlink_metadata(location.namespace_lock(id))
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .and_then(|metadata| metadata.modified().ok())
+}
+
+/// `last_used` in whole seconds since the epoch.
+pub(crate) fn unix_seconds_of(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// An estimate of the bytes the rows of `scope` hold: the content of its
+/// artifacts, evidence sets, member records and observations plus
+/// `ROW_OVERHEAD_BYTES` for each of them and each row they list. It reads
+/// no payload but the observations' lengths.
+pub(crate) fn estimated_bytes(
+    connection: &Connection,
+    id: &[u8],
+    reset_epoch: i64,
+) -> Result<u64, Bypass> {
+    let bytes: i64 = connection
+        .prepare_cached(
+            "SELECT \
+             (SELECT coalesce(sum(content_bytes + ?3 * (1 + row_count)), 0) FROM artifacts \
+              WHERE namespace_id = ?1 AND reset_epoch = ?2) + \
+             (SELECT coalesce(sum(content_bytes + ?3 * (1 + observation_count)), 0) \
+              FROM evidence_sets WHERE namespace_id = ?1 AND reset_epoch = ?2) + \
+             (SELECT coalesce(sum(content_bytes + ?3 * (1 + binding_count)), 0) \
+              FROM member_records WHERE namespace_id = ?1 AND reset_epoch = ?2) + \
+             (SELECT coalesce(sum(length(payload) + ?3), 0) FROM observation_content \
+              WHERE namespace_id = ?1 AND reset_epoch = ?2)",
+        )
+        .and_then(|mut statement| {
+            statement.query_row(params![id, reset_epoch, ROW_OVERHEAD_BYTES as i64], |row| {
+                row.get(0)
+            })
+        })
+        .map_err(|error| classify(&error))?;
+    Ok(u64::try_from(bytes).unwrap_or(0))
+}
+
+/// The estimated bytes of the retired scopes reclamation has yet to delete,
+/// at most `MAX_RETIRED_PER_PASS` of them.
+fn pending_bytes(connection: &Connection) -> Result<u64, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    limit_wait(connection, deadline)?;
-    let candidates: Vec<(Vec<u8>, i64)> = {
+    let scopes: Vec<(Vec<u8>, i64)> = {
+        let mut statement = connection
+            .prepare("SELECT namespace_id, reset_epoch FROM retired_scopes LIMIT ?1")
+            .map_err(fail)?;
+        statement
+            .query_map([MAX_RETIRED_PER_PASS as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(fail)?
+            .collect::<Result<_, _>>()
+            .map_err(fail)?
+    };
+    scopes.iter().try_fold(0u64, |total, (id, epoch)| {
+        Ok(total.saturating_add(estimated_bytes(connection, id, *epoch)?))
+    })
+}
+
+/// Live namespaces other than `current`, at most `MAX_EXAMINED_PER_PASS`,
+/// the most recently used first.
+pub(crate) fn ranked_live(
+    connection: &Connection,
+    location: &StoreLocation,
+    current: Option<Digest>,
+) -> Result<Vec<(Digest, i64, Option<SystemTime>)>, Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    let rows: Vec<(Vec<u8>, i64)> = {
         let mut statement = connection
             .prepare(
                 "SELECT namespace_id, reset_epoch FROM namespaces \
                  WHERE state = ?1 AND namespace_id <> ?2 ORDER BY namespace_id LIMIT ?3",
             )
             .map_err(fail)?;
+        let excluded = current.map_or(Vec::new(), |id| id.as_bytes().to_vec());
         statement
             .query_map(
-                params![
-                    LIVE,
-                    current.as_bytes().as_slice(),
-                    MAX_RETIRED_PER_PASS as i64
-                ],
+                params![LIVE, excluded, MAX_EXAMINED_PER_PASS as i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(fail)?
             .collect::<Result<_, _>>()
             .map_err(fail)?
     };
+    let mut ranked = rows
+        .into_iter()
+        .map(|(id, epoch)| {
+            let id = digest_from(&id)?;
+            Ok((id, epoch, last_used(location, id)))
+        })
+        .collect::<Result<Vec<_>, Bypass>>()?;
+    // `None` sorts first, so reversed it is last: the least recently used.
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+    });
+    Ok(ranked)
+}
+
+/// Retire live namespaces no process holds, one short transaction each
+/// (spec §10 amendment 2026-11-08, l4d-1ypi): every one beyond the
+/// `retention.keep - 1` most recently used others, least recently used
+/// first, then, while the store is over its disk policy by more than the
+/// retired scopes still to reclaim, the kept ones too, least recently used
+/// first. A namespace a live process holds is skipped (`in_use`).
+pub(crate) fn retire_obsolete(
+    connection: &mut Connection,
+    location: &StoreLocation,
+    current: Digest,
+    retention: Retention,
+    deadline: Deadline,
+) -> Result<RetireReport, Bypass> {
+    limit_wait(connection, deadline)?;
+    let ranked = ranked_live(connection, location, Some(current))?;
+    let mut excess = retention.excess_bytes;
+    if excess > 0 {
+        excess = excess.saturating_sub(pending_bytes(connection)?);
+    }
+    let kept = retention.keep.saturating_sub(1).min(ranked.len());
+    let (recent, older) = ranked.split_at(kept);
     let mut report = RetireReport::default();
-    for (id, reset_epoch) in candidates {
-        let namespace = digest_from(&id)?;
-        // Never hold the lock file across a SQLite wait: take the write
-        // lock first, then try the (non-blocking) exclusive lock.
-        let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
-        let Some(lock) = NamespaceLock::try_exclusive(location.namespace_lock(namespace))? else {
-            drop(transaction);
-            report.in_use += 1;
-            continue;
+    let candidates = older.iter().rev().chain(recent.iter().rev());
+    for (index, (namespace, reset_epoch, _)) in candidates.enumerate() {
+        if (index >= older.len() && excess == 0) || report.retired == MAX_RETIRED_PER_PASS {
+            break;
+        }
+        let bytes = if excess > 0 {
+            estimated_bytes(connection, namespace.as_bytes(), *reset_epoch)?
+        } else {
+            0
         };
-        let changed = transaction
+        match retire_one(connection, location, *namespace, *reset_epoch, deadline)? {
+            Some(1) => {
+                report.retired += 1;
+                excess = excess.saturating_sub(bytes);
+            }
+            Some(_) => {}
+            None => report.in_use += 1,
+        }
+    }
+    report.kept = ranked.len().saturating_sub(report.retired + report.in_use);
+    Ok(report)
+}
+
+/// Retire `namespace` at `reset_epoch` unless a live process holds it
+/// (`None`); `Some(0)` when it was no longer live at that epoch.
+fn retire_one(
+    connection: &mut Connection,
+    location: &StoreLocation,
+    namespace: Digest,
+    reset_epoch: i64,
+    deadline: Deadline,
+) -> Result<Option<usize>, Bypass> {
+    let fail = |error: rusqlite::Error| classify(&error);
+    let id = namespace.as_bytes().as_slice();
+    // Never hold the lock file across a SQLite wait: take the write lock
+    // first, then try the (non-blocking) exclusive lock.
+    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
+    let Some(lock) = NamespaceLock::try_exclusive(location.namespace_lock(namespace))? else {
+        drop(transaction);
+        return Ok(None);
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE namespaces SET state = ?3 \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?4",
+            params![id, reset_epoch, RETIRED, LIVE],
+        )
+        .map_err(fail)?;
+    if changed == 1 {
+        transaction
             .execute(
-                "UPDATE namespaces SET state = ?3 \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?4",
-                params![id, reset_epoch, RETIRED, LIVE],
+                "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
+                params![id, reset_epoch],
             )
             .map_err(fail)?;
-        if changed == 1 {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
-                    params![id, reset_epoch],
-                )
-                .map_err(fail)?;
-        }
-        transaction.commit().map_err(fail)?;
-        // The scope is retired either way. A lock file that cannot be
-        // removed is reused if the namespace is registered again.
-        let _ = lock.remove();
-        report.retired += changed;
     }
-    Ok(report)
+    transaction.commit().map_err(fail)?;
+    // The scope is retired either way. A lock file that cannot be
+    // removed is reused if the namespace is registered again.
+    let _ = lock.remove();
+    Ok(Some(changed))
 }
 
 /// Delete at most `max_rows` rows in the caller's write transaction (spec

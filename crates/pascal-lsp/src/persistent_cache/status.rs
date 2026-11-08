@@ -176,6 +176,7 @@ impl CacheStatus {
                 "pageBytes": limits.page_cache_bytes,
                 "scratchBytes": limits.scratch_bytes,
                 "waitMs": limits.wait.as_millis() as u64,
+                "maxNamespaces": limits.max_namespaces,
             },
             "resetEpoch": self.reset_epoch,
             "reservedBytes": {

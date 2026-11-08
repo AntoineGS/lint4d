@@ -33,7 +33,8 @@ pub enum Phase {
     Leases,
     /// A passive checkpoint (and truncation when complete).
     Checkpoint,
-    /// Retire namespaces no live process holds.
+    /// Retire the namespaces retention does not keep and no live process
+    /// holds (`Store::retire_obsolete`).
     ObsoleteNamespaces,
     AbandonedBuilds,
     UnusedSnapshots,

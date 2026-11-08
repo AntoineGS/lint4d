@@ -4,8 +4,8 @@
 
 use crate::workspace::{RuntimeOption, apply_runtime_field};
 use pascal_cache::{
-    MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES, MAX_SCRATCH_BYTES, MAX_WAIT,
-    MIN_CONNECTION_PAGE_CACHE_BYTES, StoreLimits,
+    DEFAULT_MAX_NAMESPACES, MAX_NAMESPACES, MAX_PAGE_CACHE_BYTES, MAX_READERS, MAX_ROW_BATCH_BYTES,
+    MAX_SCRATCH_BYTES, MAX_WAIT, MIN_CONNECTION_PAGE_CACHE_BYTES, StoreLimits,
 };
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -26,6 +26,10 @@ pub(crate) struct CacheOptions {
     pub(crate) page_bytes: u64,
     pub(crate) scratch_bytes: u64,
     pub(crate) wait: Duration,
+    /// Live namespaces (builds) the store keeps, this one included
+    /// (l4d-1ypi). An initialization setting only: a runtime value could
+    /// come from a workspace file and retire other builds' facts.
+    pub(crate) max_namespaces: usize,
     /// An invalid initialization value: persistence stays off for the
     /// session, and this actionable message is reported.
     pub(crate) invalid: Option<String>,
@@ -39,6 +43,7 @@ impl Default for CacheOptions {
             page_bytes: MAX_PAGE_CACHE_BYTES,
             scratch_bytes: MAX_SCRATCH_BYTES,
             wait: MAX_WAIT,
+            max_namespaces: DEFAULT_MAX_NAMESPACES,
             invalid: None,
         }
     }
@@ -113,6 +118,7 @@ impl CacheOptions {
             page_cache_bytes: self.page_bytes,
             scratch_bytes: self.scratch_bytes,
             wait: self.wait,
+            max_namespaces: self.max_namespaces,
             ..StoreLimits::default()
         }
     }
@@ -182,6 +188,16 @@ impl CacheOptions {
             &mut invalid,
         );
         options.wait = Duration::from_millis(wait_ms);
+        let mut max_namespaces = DEFAULT_MAX_NAMESPACES as u64;
+        parse_limit(
+            object,
+            "persistentCacheMaxNamespaces",
+            (1, MAX_NAMESPACES as u64, "the current build's namespace"),
+            &mut max_namespaces,
+            &mut warnings,
+            &mut invalid,
+        );
+        options.max_namespaces = max_namespaces as usize;
         if !invalid.is_empty() {
             options.invalid = Some(format!(
                 "persistent cache disabled for this session: {}",
@@ -201,6 +217,8 @@ pub(crate) struct CacheOptionsUpdate {
     /// Runtime settings may come from workspace-controlled files: the
     /// directory is an initialization setting only (spec §11.1).
     directory_present: bool,
+    /// So is the namespace count (l4d-1ypi).
+    max_namespaces_present: bool,
 }
 
 impl CacheOptionsUpdate {
@@ -211,6 +229,7 @@ impl CacheOptionsUpdate {
             scratch_bytes: RuntimeOption::Reset,
             wait: RuntimeOption::Reset,
             directory_present: false,
+            max_namespaces_present: false,
         }
     }
 }
@@ -267,6 +286,7 @@ pub(crate) fn parse_runtime_cache_options(object: &Map<String, Value>) -> CacheO
             RuntimeOption::Invalid(error) => RuntimeOption::Invalid(error),
         },
         directory_present: object.contains_key("persistentCacheDirectory"),
+        max_namespaces_present: object.contains_key("persistentCacheMaxNamespaces"),
     }
 }
 
@@ -312,6 +332,13 @@ impl CacheOptionsOverride {
                     .to_string(),
             );
         }
+        if update.max_namespaces_present {
+            warnings.push(
+                "ignoring runtime persistentCacheMaxNamespaces: it is an initialization setting; \
+                 restart with initializationOptions.persistentCacheMaxNamespaces to change it"
+                    .to_string(),
+            );
+        }
         warnings
     }
 
@@ -323,6 +350,7 @@ impl CacheOptionsOverride {
             page_bytes: self.page_bytes.unwrap_or(base.page_bytes),
             scratch_bytes: self.scratch_bytes.unwrap_or(base.scratch_bytes),
             wait: self.wait.unwrap_or(base.wait),
+            max_namespaces: base.max_namespaces,
             invalid: base.invalid.clone(),
         }
     }
@@ -350,6 +378,38 @@ mod tests {
             (16 << 20, 16 << 20)
         );
         assert_eq!(options.wait, std::time::Duration::from_millis(25));
+        assert_eq!(options.max_namespaces, 3);
+    }
+
+    #[test]
+    fn the_namespace_count_is_validated_clamped_and_initialization_only() {
+        let (two, warnings) = init(json!({"persistentCacheMaxNamespaces": 2}));
+        assert!(warnings.is_empty() && two.active());
+        assert_eq!(two.limits().max_namespaces, 2);
+        let (many, warnings) = init(json!({"persistentCacheMaxNamespaces": 1000}));
+        assert_eq!(many.max_namespaces, pascal_cache::MAX_NAMESPACES);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(many.active());
+        for bad in [json!(0), json!(-1), json!("3"), json!(1.5)] {
+            let (options, _) = init(json!({"persistentCacheMaxNamespaces": bad}));
+            let message = options.invalid.expect("invalid");
+            assert!(
+                message.contains("persistentCacheMaxNamespaces"),
+                "{message}"
+            );
+        }
+        let mut runtime = CacheOptionsOverride::default();
+        let warnings = runtime.apply(parse_runtime_cache_options(
+            json!({"persistentCacheMaxNamespaces": 1})
+                .as_object()
+                .unwrap(),
+        ));
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("initialization setting"),
+            "{warnings:?}"
+        );
+        assert_eq!(runtime.effective(&two).max_namespaces, 2);
     }
 
     #[test]

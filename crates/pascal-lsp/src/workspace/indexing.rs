@@ -5097,6 +5097,10 @@ const MAX_LEXICAL_INCLUDE_DEPTH: usize = 16;
 
 type BaselineEntry = (PathBuf, Option<PathStamp>);
 
+fn ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 /// What one request has left for ranking unverified members.
 struct UnverifiedRanking {
     names: Vec<String>,
@@ -5120,6 +5124,21 @@ struct UnverifiedRanking {
     /// Lookups answered from `resolutions`, and the time include walks took.
     shared_hits: usize,
     walk_time: std::time::Duration,
+    profile: RankingProfile,
+}
+
+/// Where a ranking's time went, for its trace line.
+#[derive(Default)]
+struct RankingProfile {
+    /// Member reads, and the token scans of their bytes.
+    read: std::time::Duration,
+    scan: std::time::Duration,
+    /// Per member walk: building its resolver and the root's legacy route,
+    /// loading the root again, include lookups, and include reads.
+    resolver: std::time::Duration,
+    root: std::time::Duration,
+    lookups: std::time::Duration,
+    include_reads: std::time::Duration,
 }
 
 /// What an include lookup's answer reads besides the resolver's own
@@ -5295,6 +5314,7 @@ impl UnverifiedRanking {
             attempt: Vec::new(),
             shared_hits: 0,
             walk_time: std::time::Duration::ZERO,
+            profile: RankingProfile::default(),
         }
     }
 
@@ -5339,24 +5359,30 @@ impl UnverifiedRanking {
             let tier = if unread(path) || cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 Ok(2)
             } else {
-                match self.read(path) {
+                let read_started = std::time::Instant::now();
+                let read = self.read(path);
+                self.profile.read += read_started.elapsed();
+                match read {
                     None => Ok(2),
                     Some((stamp, text)) => {
-                        let proof = (stamp.is_some()
+                        let scan_started = std::time::Instant::now();
+                        let absent = stamp.is_some()
                             && provable(path)
-                            && super::lexical::proves_absent(&text, &self.names, self.symbols))
-                        .then(|| {
-                            if self.symbols {
-                                Some(Vec::new())
-                            } else if let Some(scope) = scope {
-                                self.includes_absent(scope, path, &text, cancel)
-                            } else {
-                                super::lexical::include_requests(&text)
-                                    .filter(Vec::is_empty)
-                                    .map(|_| Vec::new())
-                            }
-                        })
-                        .flatten();
+                            && super::lexical::proves_absent(&text, &self.names, self.symbols);
+                        self.profile.scan += scan_started.elapsed();
+                        let proof = absent
+                            .then(|| {
+                                if self.symbols {
+                                    Some(Vec::new())
+                                } else if let Some(scope) = scope {
+                                    self.includes_absent(scope, path, &text, cancel)
+                                } else {
+                                    super::lexical::include_requests(&text)
+                                        .filter(Vec::is_empty)
+                                        .map(|_| Vec::new())
+                                }
+                            })
+                            .flatten();
                         if let Some(proof) = proof {
                             includes.extend(proof);
                             Err(stamp)
@@ -5395,12 +5421,18 @@ impl UnverifiedRanking {
             ranked.sort_by_key(|(_, tier)| *tier);
         }
         crate::trace::trace!(
-            "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms; include walks {:.1} ms, {} shared resolutions",
+            "  unverified ranking: {} members, {likely} likely, {} lexically excluded, bound {left}, {:.1} ms; include walks {:.1} ms, {} shared resolutions; reads {:.1} ms, scans {:.1} ms, resolvers {:.1} ms, roots {:.1} ms, lookups {:.1} ms, include reads {:.1} ms",
             ranked.len(),
             members.len(),
             started.elapsed().as_secs_f64() * 1000.0,
             self.walk_time.as_secs_f64() * 1000.0,
             self.shared_hits,
+            ms(self.profile.read),
+            ms(self.profile.scan),
+            ms(self.profile.resolver),
+            ms(self.profile.root),
+            ms(self.profile.lookups),
+            ms(self.profile.include_reads),
         );
         paths.extend(ranked.into_iter().map(|(path, _)| path));
         if !members.is_empty() {
@@ -5488,12 +5520,14 @@ impl UnverifiedRanking {
         if let Some(files) = WALK_MAX_INCLUDE_FILES.with(std::cell::Cell::get) {
             limits.max_include_files = files;
         }
+        let resolver_started = std::time::Instant::now();
         let mut resolver = super::resolver::resolver_for_include_walk(
             Arc::clone(&context),
             scope.input.roots.clone(),
             scope.input,
             limits,
         );
+        self.profile.resolver += resolver_started.elapsed();
         let mut walk = IncludeWalk {
             key: scope.key,
             context: &context,
@@ -5509,10 +5543,13 @@ impl UnverifiedRanking {
             restart: false,
         };
         let proof = (|| {
+            let route_started = std::time::Instant::now();
             let uri = Url::from_file_path(path).ok()?;
             let route = scope
                 .workspace
                 .legacy_route_for_resolver(&uri, path, scope.key, &context);
+            self.profile.resolver += route_started.elapsed();
+            let root_started = std::time::Instant::now();
             let root = resolver
                 .load_source(
                     path,
@@ -5530,6 +5567,7 @@ impl UnverifiedRanking {
                 return None;
             }
             let route = resolver.legacy_route_for_source(&root, None);
+            self.profile.root += root_started.elapsed();
             walk.active.push(path_key(&root.path));
             walk.loaded.insert(path_key(&root.path));
             let mut baseline = Vec::new();
@@ -5573,8 +5611,10 @@ impl UnverifiedRanking {
             if walk.active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
                 return None;
             }
-            let child =
-                self.resolve(resolver, walk, including, &request, route.as_ref(), cancel)?;
+            let lookup_started = std::time::Instant::now();
+            let child = self.resolve(resolver, walk, including, &request, route.as_ref(), cancel);
+            self.profile.lookups += lookup_started.elapsed();
+            let child = child?;
             let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = child.revision
             else {
                 return None;
@@ -5606,15 +5646,18 @@ impl UnverifiedRanking {
                 }
                 walk.routes.insert(child_key.clone(), routed);
                 self.charge(child.bytes.len())?;
-                let (stamp, bytes) = self.read(&child.path)?;
-                stamp.as_ref()?;
-                if pascal_project::content_hash_bytes(&bytes) != content_hash
-                    || !super::lexical::is_byte_text(&bytes)
-                    || super::lexical::holds_identifier(&bytes, &self.names)
-                {
-                    return None;
-                }
-                let requests = super::lexical::include_requests(&bytes)?;
+                let read_started = std::time::Instant::now();
+                let read = self.read(&child.path).and_then(|(stamp, bytes)| {
+                    stamp.as_ref()?;
+                    (pascal_project::content_hash_bytes(&bytes) == content_hash
+                        && super::lexical::is_byte_text(&bytes)
+                        && !super::lexical::holds_identifier(&bytes, &self.names))
+                    .then_some(())?;
+                    Some((stamp, super::lexical::include_requests(&bytes)))
+                });
+                self.profile.include_reads += read_started.elapsed();
+                let (stamp, requests) = read?;
+                let requests = requests?;
                 let mut baseline = vec![(child.path.clone(), stamp)];
                 walk.active.push(child_key);
                 let followed = self.follow(
@@ -8777,6 +8820,118 @@ pub(in crate::workspace) mod tests {
             ["GuardB.pas", "Shared.pas", "User.pas"]
         );
         assert!(baselined(&found, &first), "{:?}", found.baseline);
+    }
+
+    /// Task 8d's synthetic shape: `members` retrying members of 20 to 200 KB
+    /// spread over four library directories, each including its
+    /// directory's `defines.inc`, which includes two or three nested files;
+    /// none spells `SharedValue`.
+    fn retrying_library_shape(root: &Path, members: usize) -> (Workspace, ContextKey, IndexAnchor) {
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let libraries = ["liba", "libb", "libc", "libd"];
+        for (index, library) in libraries.iter().enumerate() {
+            let nested = 2 + index % 2;
+            let mut defines = String::new();
+            for file in 0..nested {
+                defines.push_str(&format!("{{$I nested{file}.inc}}\n"));
+                write(
+                    &root.join(library).join(format!("nested{file}.inc")),
+                    &"{$IFDEF MSWINDOWS}{$DEFINE WINDOWS_ONLY}{$ENDIF}\n".repeat(40),
+                );
+            }
+            defines.push_str(&"{$IFNDEF FPC}{$DEFINE DELPHI}{$ENDIF}\n".repeat(60));
+            write(&root.join(library).join("defines.inc"), &defines);
+        }
+        let paths = (0..members)
+            .map(|member| {
+                root.join(libraries[member % libraries.len()])
+                    .join(format!("Member{member}.pas"))
+            })
+            .collect::<Vec<_>>();
+        for (member, path) in paths.iter().enumerate() {
+            write(
+                path,
+                &format!(
+                    "unit Member{member};\n{{$I defines.inc}}\ninterface\nimplementation\nend.\n"
+                ),
+            );
+        }
+        // A large project's context: `dirs` more search directories, each
+        // holding one unit, and `explicit` explicit units.
+        let knob = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|count| count.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let mut search = "lib;liba;libb;libc;libd".to_owned();
+        for dir in 0..knob("L4D_PROFILE_SEARCH_DIRS") {
+            write(
+                &root.join(format!("extra/d{dir}/Extra{dir}.pas")),
+                &format!("unit Extra{dir};\ninterface\nimplementation\nend.\n"),
+            );
+            search.push_str(&format!(";extra\\d{dir}"));
+        }
+        let mut items = String::new();
+        for unit in 0..knob("L4D_PROFILE_EXPLICIT") {
+            write(
+                &root.join(format!("app/Form{unit}.pas")),
+                &format!("unit Form{unit};\ninterface\nimplementation\nend.\n"),
+            );
+            items.push_str(&format!("<DCCReference Include=\"app\\Form{unit}.pas\"/>"));
+        }
+        let (mut workspace, key) = project_workspace(
+            root,
+            &format!(
+                "<DCC_UnitSearchPath>{search}</DCC_UnitSearchPath><DCC_IncludePath>{search}</DCC_IncludePath>"
+            ),
+            &items,
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for (member, path) in paths.iter().enumerate() {
+            let size = 20 * 1024 + (member * 7919) % (180 * 1024);
+            let mut text =
+                format!("unit Member{member};\n{{$I defines.inc}}\ninterface\nimplementation\n");
+            let mut routine = 0;
+            while text.len() < size {
+                text.push_str(&format!(
+                    "procedure TMember{member}Helper.Routine{routine}(const AValue: Integer; var AResult: string);\nvar\n  LIndex: Integer;\nbegin\n  for LIndex := 0 to AValue do\n    AResult := AResult + IntToStr(LIndex); // GetSharedValues\nend;\n\n"
+                ));
+                routine += 1;
+            }
+            text.push_str("end.\n");
+            write(path, &text);
+            retry_member(&workspace, &key, path);
+        }
+        (workspace, key, anchor)
+    }
+
+    /// Task 8d Part 1: times the references ranking over the synthetic
+    /// shape. Run with `PASCAL_LSP_TRACE` set, in a release test build.
+    #[test]
+    #[ignore = "profiling fixture"]
+    fn profile_the_references_ranking_over_retrying_library_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let members = std::env::var("L4D_PROFILE_MEMBERS")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(350);
+        let (mut workspace, key, anchor) = retrying_library_shape(root, members);
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let found = references_of_shared_value(&mut workspace, &key, &anchor);
+            eprintln!(
+                "round {round}: {:.1} ms, {} sources, {} baselined",
+                ms(started.elapsed()),
+                found.sources.len(),
+                found.baseline.len()
+            );
+            assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        }
     }
 
     /// Task 8c (R9-5): the same include name from two directories resolves

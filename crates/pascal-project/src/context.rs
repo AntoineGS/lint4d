@@ -166,9 +166,86 @@ pub struct ProjectContext {
     /// consumed while constructing this context.
     pub(crate) installation_config_files: Vec<PathBuf>,
     pub(crate) override_error: Option<String>,
+    /// `main_source_entry` and `explicit_unit_entries` by file name, built
+    /// on first use (no field is changed after construction).
+    pub(crate) exact_entries: ExactEntryIndex,
+}
+
+/// The exact entries `path_entry_for` checks, in its order, bucketed by
+/// their ASCII-lowercased file name: two equal paths have the same file
+/// name, under either volume case rule. Derived from the other fields, so
+/// it takes no part in equality, and a clone starts empty: a struct update
+/// from a clone (`..context.clone()`) may change the entries.
+#[derive(Debug, Default)]
+pub(crate) struct ExactEntryIndex(std::sync::OnceLock<ExactEntryBuckets>);
+
+impl Clone for ExactEntryIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExactEntryBuckets {
+    named: HashMap<String, Vec<(usize, ProjectPathEntry)>>,
+    unnamed: Vec<(usize, ProjectPathEntry)>,
+}
+
+impl PartialEq for ExactEntryIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExactEntryIndex {}
+
+fn file_name_bucket(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
 }
 
 impl ProjectContext {
+    /// The first of the main source and explicit entries equal to `path`,
+    /// as a scan of them in order finds it.
+    fn exact_entry_for(&self, path: &Path) -> Option<&ProjectPathEntry> {
+        let ordered = || {
+            self.main_source_entry
+                .iter()
+                .chain(self.explicit_unit_entries.values().flatten())
+        };
+        let Some(name) = file_name_bucket(path) else {
+            return ordered().find(|entry| project_paths_equal(&entry.path, path));
+        };
+        let buckets = self.exact_entries.0.get_or_init(|| {
+            let mut buckets = ExactEntryBuckets::default();
+            for (order, entry) in ordered().enumerate() {
+                match file_name_bucket(&entry.path) {
+                    Some(name) => buckets
+                        .named
+                        .entry(name)
+                        .or_default()
+                        .push((order, entry.clone())),
+                    None => buckets.unnamed.push((order, entry.clone())),
+                }
+            }
+            buckets
+        });
+        let first = |bucket: &[(usize, ProjectPathEntry)]| {
+            bucket
+                .iter()
+                .position(|(_, entry)| project_paths_equal(&entry.path, path))
+        };
+        let named = buckets
+            .named
+            .get(&name)
+            .and_then(|bucket| first(bucket).map(|at| &bucket[at]));
+        let unnamed = first(&buckets.unnamed).map(|at| &buckets.unnamed[at]);
+        match (named, unnamed) {
+            (Some(left), Some(right)) => Some(if left.0 < right.0 { &left.1 } else { &right.1 }),
+            (left, right) => left.or(right).map(|(_, entry)| entry),
+        }
+    }
+
     pub fn discovery_complete(&self) -> bool {
         self.discovery_complete
     }
@@ -524,12 +601,7 @@ impl ProjectContext {
     /// the requested path while retaining the original provenance.
     pub fn path_entry_for(&self, path: &Path) -> Option<ProjectPathEntry> {
         let path = lexical_normalize(path);
-        let exact = self
-            .main_source_entry
-            .iter()
-            .chain(self.explicit_unit_entries.values().flatten())
-            .find(|entry| project_paths_equal(&entry.path, &path));
-        if let Some(entry) = exact {
+        if let Some(entry) = self.exact_entry_for(&path) {
             return Some(ProjectPathEntry {
                 path,
                 provenance: entry.provenance.clone(),
@@ -540,7 +612,20 @@ impl ProjectContext {
             .iter()
             .chain(&self.browsing_path_entries)
             .chain(&self.debug_dcu_path_entries)
-            .filter(|entry| project_path_starts_with(&path, &lexical_normalize(&entry.path)))
+            .filter(|entry| {
+                // Normalizing changes the components only of a path with
+                // a `.` or `..` component.
+                if entry.path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                }) {
+                    project_path_starts_with(&path, &lexical_normalize(&entry.path))
+                } else {
+                    project_path_starts_with(&path, &entry.path)
+                }
+            })
             .max_by_key(|entry| entry.path.components().count())
             .map(|entry| ProjectPathEntry {
                 path: path.clone(),
@@ -556,7 +641,10 @@ impl ProjectContext {
         let owner_directory = lexical_normalize(owner_directory);
         let include_paths = self.include_path_entries.clone();
         let search_paths = self.search_path_entries.clone();
-        let mut entries = Vec::new();
+        let mut entries = Vec::<ProjectPathEntry>::new();
+        // Indexes of `entries` by file name (`file_name_bucket`): only an
+        // entry of the same bucket can equal a new one.
+        let mut buckets = HashMap::<Option<String>, Vec<usize>>::new();
         for entry in self
             .path_entry_for(&owner_directory)
             .into_iter()
@@ -564,12 +652,18 @@ impl ProjectContext {
             .chain(search_paths)
         {
             let normalized = lexical_normalize(&entry.path);
-            if entries
-                .iter()
-                .any(|existing: &ProjectPathEntry| project_paths_equal(&existing.path, &normalized))
-            {
+            let bucket = file_name_bucket(&normalized);
+            let same = |bucket: Option<&Vec<usize>>| {
+                bucket.is_some_and(|bucket| {
+                    bucket
+                        .iter()
+                        .any(|at: &usize| project_paths_equal(&entries[*at].path, &normalized))
+                })
+            };
+            if same(buckets.get(&bucket)) || (bucket.is_some() && same(buckets.get(&None))) {
                 continue;
             }
+            buckets.entry(bucket).or_default().push(entries.len());
             entries.push(ProjectPathEntry {
                 path: normalized,
                 provenance: entry.provenance,
@@ -807,6 +901,7 @@ impl ProjectContext {
             packages,
             installation_config_files,
             override_error,
+            exact_entries: ExactEntryIndex::default(),
         }
     }
 
@@ -841,6 +936,7 @@ impl ProjectContext {
             packages,
             installation_config_files,
             override_error,
+            exact_entries: _,
         } = self;
         ProjectContextParts {
             discovery_complete,
@@ -1022,6 +1118,143 @@ mod tests {
         assert_eq!(context.include_paths(), vec![b]);
         assert_eq!(context.main_source(), Some(Path::new("/w/App.dpr")));
         assert_eq!(context.explicit_units()["Unit1"], vec![unit]);
+    }
+
+    /// Task 8d: the file-name index finds the entry a scan of the main
+    /// source and explicit entries in order finds, on either volume rule,
+    /// and a clone with other entries does not reuse it.
+    #[test]
+    fn exact_entries_are_found_as_an_ordered_scan_finds_them() {
+        let entries = [
+            ProjectPathEntry::configured("/w/App.dpr".into()),
+            ProjectPathEntry::legacy("/w/a/Unit1.pas".into()),
+            ProjectPathEntry::configured("/w/a/UNIT1.PAS".into()),
+            ProjectPathEntry::configured("/w/b/Unit1.pas".into()),
+            ProjectPathEntry::configured("/w/a/Unit2.pas".into()),
+        ];
+        let context = ProjectContext {
+            main_source_entry: Some(entries[0].clone()),
+            explicit_unit_entries: [
+                ("unit1".to_string(), entries[1..4].to_vec()),
+                ("unit2".to_string(), entries[4..].to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+            ..ProjectContext::default()
+        };
+        let scanned = |context: &ProjectContext, path: &Path| {
+            context
+                .main_source_entry
+                .iter()
+                .chain(context.explicit_unit_entries.values().flatten())
+                .find(|entry| project_paths_equal(&entry.path, path))
+                .cloned()
+        };
+        let probes = [
+            "/w/App.dpr",
+            "/w/a/Unit1.pas",
+            "/w/a/unit1.pas",
+            "/w/b/UNIT1.pas",
+            "/w/a/Unit2.pas",
+            "/w/a/Unit3.pas",
+            "/w/a",
+            "/",
+        ];
+        for insensitive in [false, true] {
+            let check = || {
+                let context = context.clone();
+                for probe in probes {
+                    let probe = Path::new(probe);
+                    assert_eq!(
+                        context.exact_entry_for(probe).cloned(),
+                        scanned(&context, probe),
+                        "{probe:?} insensitive {insensitive}"
+                    );
+                }
+            };
+            if insensitive {
+                path_identity::with_case_insensitive_volumes(check);
+            } else {
+                check();
+            }
+        }
+        assert!(
+            context
+                .exact_entry_for(Path::new("/w/a/Unit2.pas"))
+                .is_some()
+        );
+        let changed = ProjectContext {
+            explicit_unit_entries: HashMap::new(),
+            ..context.clone()
+        };
+        assert!(
+            changed
+                .exact_entry_for(Path::new("/w/a/Unit2.pas"))
+                .is_none()
+        );
+    }
+
+    /// Task 8d: a search entry is matched by its normalized components,
+    /// whether or not it is spelled with `.` or `..`.
+    #[test]
+    fn search_entries_with_and_without_dot_components_own_their_paths() {
+        let context = ProjectContext {
+            search_path_entries: vec![
+                ProjectPathEntry::legacy("/w/x/../lib/./deep".into()),
+                ProjectPathEntry::configured("/w/lib".into()),
+            ],
+            ..ProjectContext::default()
+        };
+        let owner = |path: &str| {
+            context
+                .path_entry_for(Path::new(path))
+                .map(|entry| entry.provenance)
+        };
+        assert_eq!(
+            owner("/w/lib/deep/A.pas"),
+            Some(ProjectPathProvenance::LegacyNative)
+        );
+        assert_eq!(
+            owner("/w/lib/B.pas"),
+            Some(ProjectPathProvenance::Configured)
+        );
+        assert_eq!(owner("/w/x/C.pas"), None);
+    }
+
+    /// Task 8d: deduplicating include entries by file-name bucket keeps the
+    /// first of every equal spelling, in order.
+    #[test]
+    fn include_search_entries_keep_the_first_of_equal_entries_in_order() {
+        let context = ProjectContext {
+            include_path_entries: vec![
+                ProjectPathEntry::configured("/w/inc".into()),
+                ProjectPathEntry::configured("/w/lib".into()),
+                ProjectPathEntry::configured("/w/other/inc".into()),
+                ProjectPathEntry::legacy("/w/inc/".into()),
+            ],
+            search_path_entries: vec![
+                ProjectPathEntry::legacy("/w/lib".into()),
+                ProjectPathEntry::configured("/w/src".into()),
+                ProjectPathEntry::configured("/w/x/../inc".into()),
+            ],
+            ..ProjectContext::default()
+        };
+        let entries = context.include_search_entries(Path::new("/w/src/Unit.pas"));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.path.clone(), entry.provenance.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (PathBuf::from("/w/src"), ProjectPathProvenance::Configured),
+                (PathBuf::from("/w/inc"), ProjectPathProvenance::Configured),
+                (PathBuf::from("/w/lib"), ProjectPathProvenance::Configured),
+                (
+                    PathBuf::from("/w/other/inc"),
+                    ProjectPathProvenance::Configured
+                ),
+            ]
+        );
     }
 
     #[test]

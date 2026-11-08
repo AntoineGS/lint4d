@@ -725,6 +725,11 @@ pub(crate) struct RenameSnapshot {
     /// Open documents `index` holds as their session's expanded parse
     /// (workspace symbols only, D49).
     pub(crate) projected: HashMap<Url, ProjectedDocument>,
+    /// Closed sources answered from the symbol list a previous symbol read
+    /// kept instead of a parse (workspace symbols only, Task 8d), and the
+    /// lists of the sources this snapshot parsed, to keep.
+    pub(crate) listed: HashMap<Url, Arc<super::lexical::ListedSymbols>>,
+    pub(crate) to_list: Vec<(ContextKey, PathBuf, Arc<super::lexical::ListedSymbols>)>,
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
     _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
@@ -769,6 +774,8 @@ impl RenameSnapshot {
             mode: SnapshotMode::Assistance,
             index_gaps: Vec::new(),
             projected: HashMap::new(),
+            listed: HashMap::new(),
+            to_list: Vec::new(),
             _cache_leases: HashMap::new(),
             _hydration: Vec::new(),
         }
@@ -6538,6 +6545,8 @@ fn build_snapshot_with_policy(
                     mode,
                     index_gaps,
                     projected: HashMap::new(),
+                    listed: HashMap::new(),
+                    to_list: Vec::new(),
                     _cache_leases: HashMap::new(),
                     _hydration: Vec::new(),
                 });
@@ -6638,6 +6647,8 @@ fn build_snapshot_with_policy(
     let mut indexed_stamps = HashMap::new();
     let mut indexed_uris = HashSet::new();
     let mut projected = HashMap::new();
+    let mut listed = HashMap::new();
+    let mut to_list = Vec::new();
     let mut retained_files = 0usize;
     let mut retained_bytes = 0usize;
     let mut scanned_bytes = 0usize;
@@ -7176,7 +7187,28 @@ fn build_snapshot_with_policy(
             }
             _ => false,
         };
-        if !reused {
+        // Task 8d: a closed source parsed raw, as every symbol read parses
+        // it, answers from the list kept for the same bytes and context.
+        let listable = !reused
+            && mode == SnapshotMode::WorkspaceSymbols
+            && !record.open
+            && cached.is_none()
+            && !loader.expansions.contains_key(&uri);
+        let content_hash = record.content_hash.filter(|_| listable);
+        let held = content_hash
+            .and_then(|_| {
+                input
+                    .project_cache
+                    .listed_symbols(&source_context_key, &path)
+            })
+            .filter(|held| {
+                Some(held.content_hash) == content_hash
+                    && held.parsed_text_hash == text_content_hash(&indexed_source)
+                    && held.conditional_context == conditional_context
+            });
+        if let Some(held) = held {
+            listed.insert(uri.clone(), held);
+        } else if !reused {
             index
                 .update_with_session(
                     uri.clone(),
@@ -7187,6 +7219,20 @@ fn build_snapshot_with_policy(
                     loader.expansions.get(&uri).map(|e| &e.expanded),
                 )
                 .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+            if let Some(content_hash) = content_hash
+                && let Some(list) = index.workspace_symbol_list(&uri, cancel)?
+            {
+                to_list.push((
+                    source_context_key.clone(),
+                    path.clone(),
+                    Arc::new(super::lexical::ListedSymbols {
+                        content_hash,
+                        parsed_text_hash: text_content_hash(&indexed_source),
+                        conditional_context: conditional_context.clone(),
+                        list,
+                    }),
+                ));
+            }
         }
         // The snapshot's own index holds the parse: no lease charges it.
         if let (Some(admission), Some(ticket)) = (hydration.as_mut(), hydration_ticket) {
@@ -7751,6 +7797,8 @@ fn build_snapshot_with_policy(
         mode,
         index_gaps,
         projected,
+        listed,
+        to_list,
         _cache_leases: loader.cache_leases,
         _hydration: hydration
             .map(HydrationAdmission::into_held)

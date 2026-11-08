@@ -3237,7 +3237,7 @@ fn indexed_workspace_symbols(
             })
             .collect()
     } else {
-        let snapshot = super::rename::build_indexed_snapshot(
+        let mut snapshot = super::rename::build_indexed_snapshot(
             input,
             &[],
             &[],
@@ -3246,6 +3246,13 @@ fn indexed_workspace_symbols(
             sources,
             cancel,
         )?;
+        let mut lists = HashMap::<_, Vec<_>>::new();
+        for (key, path, list) in std::mem::take(&mut snapshot.to_list) {
+            lists.entry(key).or_default().push((path, list));
+        }
+        for (key, lists) in lists {
+            input.project_cache.keep_listed_symbols(&key, lists);
+        }
         if !snapshot.complete {
             coverage.note(
                 None,
@@ -3398,10 +3405,11 @@ fn snapshot_workspace_symbols(
         .index
         .workspace_symbols_with_cancel(query, cancel)?;
     if snapshot.projected.is_empty() {
-        return Ok(found
+        let found = found
             .into_iter()
             .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
-            .collect());
+            .collect();
+        return append_listed_symbols(snapshot, query, found);
     }
     let mut result = Vec::with_capacity(found.len());
     let mut held = HashMap::<Url, Vec<SymbolInformation>>::new();
@@ -3430,7 +3438,26 @@ fn snapshot_workspace_symbols(
         };
         result.splice(at..at, placed);
     }
-    Ok(result)
+    append_listed_symbols(snapshot, query, result)
+}
+
+/// `found` with the symbols of the sources the snapshot answered from kept
+/// symbol lists (Task 8d), as its index would have listed them.
+fn append_listed_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    query: &str,
+    mut found: Vec<SymbolInformation>,
+) -> Result<Vec<SymbolInformation>, String> {
+    for listed in snapshot.listed.values() {
+        if !snapshot.readable.contains(listed.list.uri()) {
+            continue;
+        }
+        found.extend(listed.list.matching(query)?);
+        if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
+            return Err(error);
+        }
+    }
+    Ok(found)
 }
 
 /// `symbols` of the projected document `uri` at their physical positions,
@@ -5379,6 +5406,68 @@ mod tests {
                 symbol_names(&walked.value),
                 "persist {persist}"
             );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Task 8d Part 3, both persistence modes: a retrying member the
+    /// symbol read parses keeps its symbol list with the context index;
+    /// the next request reads the member again but does not parse it, and
+    /// answers exactly as the parse did, for another query too. A same-size
+    /// rewrite keeping the modification time is parsed again (A7).
+    #[test]
+    fn a_read_members_symbol_list_is_reused_and_a_same_size_rewrite_is_parsed_again() {
+        use crate::workspace::persist::acceptance::rewrite_keeping_the_stamp;
+        let guarded = GUARDED.replace(
+            "interface\n",
+            "interface\nconst GuardedValue = 1;\ntype TGuardedThing = class procedure GuardedRun; end;\n",
+        );
+        let extra = [
+            ("Guarded.pas", guarded.clone().into_bytes()),
+            ("Defs.inc", b"{$DEFINE GUARDED}\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            let parsed = |query: &str| {
+                crate::navigation::test_reset_document_parse_count();
+                let found = symbols(&view.analysis_input(), query);
+                (found.value, crate::navigation::test_document_parse_count())
+            };
+            let (first, first_parses) = parsed("Guarded");
+            assert!(first.len() >= 3, "persist {persist}: {first:?}");
+            let (second, second_parses) = parsed("Guarded");
+            assert_eq!(second, first, "persist {persist}");
+            assert_eq!(second_parses + 1, first_parses, "persist {persist}");
+            let (run, run_parses) = parsed("GuardedRun");
+            assert_eq!(
+                symbol_names(&run),
+                [("GuardedRun".to_owned(), "Guarded.pas".to_owned())]
+            );
+            assert_eq!(run_parses, second_parses, "persist {persist}");
+
+            let path = root.join("Guarded.pas");
+            rewrite_keeping_the_stamp(
+                &path,
+                guarded.replace("GuardedRun", "GuardedRUX").as_bytes(),
+            );
+            let (edited, edited_parses) = parsed("GuardedRUX");
+            assert_eq!(
+                symbol_names(&edited),
+                [("GuardedRUX".to_owned(), "Guarded.pas".to_owned())],
+                "persist {persist}"
+            );
+            assert_eq!(edited_parses, first_parses, "persist {persist}");
             if let Some(cache) = cache {
                 cache.shutdown();
             }

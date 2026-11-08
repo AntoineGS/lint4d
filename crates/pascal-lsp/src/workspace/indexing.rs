@@ -9369,6 +9369,31 @@ pub(in crate::workspace) mod tests {
             );
             assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
         }
+        // Task 8d Part 3: a symbol query whose piece 11 members spell.
+        open(&mut workspace, &root.join("lib/User.pas"), 1);
+        let input = workspace.analysis_input();
+        let mut answers = Vec::new();
+        for round in 0..3 {
+            crate::navigation::test_reset_document_parse_count();
+            let charged = workspace.project_cache.stats().reserved_index_bytes;
+            let started = std::time::Instant::now();
+            let found = super::super::queries::workspace_symbols_from_input(
+                input.clone(),
+                "Member7",
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("workspace symbols");
+            eprintln!(
+                "symbols round {round}: {:.1} ms, {} symbols, {} parses, index charge +{} B",
+                ms(started.elapsed()),
+                found.value.len(),
+                crate::navigation::test_document_parse_count(),
+                workspace.project_cache.stats().reserved_index_bytes - charged,
+            );
+            answers.push(found.value);
+        }
+        assert!(answers.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     /// Task 8c (R9-5): the same include name from two directories resolves

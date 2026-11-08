@@ -291,12 +291,33 @@ impl SummaryBinding {
 pub(crate) const MAX_LEXICAL_SUMMARIES: usize = 8192;
 pub(crate) const MAX_LEXICAL_SUMMARY_BYTES: usize = 64 * 1024 * 1024;
 
-/// One context's summaries, kept with its index state and charged to the
-/// index share with it (`StoredIndex::total_charge`).
+/// The workspace symbols of a source the symbol read parsed (Task 8d):
+/// valid for bytes with the same content hash and decoded text hash,
+/// parsed under the same conditional context without an expansion.
+#[derive(Debug)]
+pub(crate) struct ListedSymbols {
+    pub(crate) content_hash: u64,
+    pub(crate) parsed_text_hash: u64,
+    pub(crate) conditional_context: pascal_project::ConditionalContext,
+    pub(crate) list: crate::navigation::WorkspaceSymbolList,
+}
+
+impl ListedSymbols {
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.list.bytes()
+            + std::mem::size_of_val(&self.conditional_context)
+            + 64 * self.conditional_context.defines.len()
+    }
+}
+
+/// One context's summaries and symbol lists, kept with its index state and
+/// charged to the index share with it (`StoredIndex::total_charge`).
 #[derive(Debug, Default)]
 pub(crate) struct LexicalSummaries {
     binding: Option<SummaryBinding>,
     members: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<LexicalSummary>>,
+    symbols: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<ListedSymbols>>,
     bytes: usize,
 }
 
@@ -311,6 +332,38 @@ impl LexicalSummaries {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.members.len()
+    }
+
+    pub(crate) fn symbols(&self, path: &std::path::Path) -> Option<std::sync::Arc<ListedSymbols>> {
+        self.symbols.get(path).cloned()
+    }
+
+    /// Keeps `lists`, whose `paid` bytes the caller charged, within the
+    /// bounds; returns the bytes to release.
+    pub(crate) fn keep_symbols(
+        &mut self,
+        lists: Vec<(std::path::PathBuf, std::sync::Arc<ListedSymbols>)>,
+        paid: usize,
+    ) -> usize {
+        let mut released = 0;
+        let mut kept = 0;
+        for (path, list) in lists {
+            let bytes = list.bytes();
+            if let Some(old) = self.symbols.remove(&path) {
+                let old = old.bytes();
+                self.bytes -= old;
+                released += old;
+            }
+            if self.members.len() + self.symbols.len() >= MAX_LEXICAL_SUMMARIES
+                || self.bytes + bytes > MAX_LEXICAL_SUMMARY_BYTES
+            {
+                continue;
+            }
+            self.bytes += bytes;
+            kept += bytes;
+            self.symbols.insert(path, list);
+        }
+        released + paid.saturating_sub(kept)
     }
 
     /// The summaries proven under `binding`.
@@ -335,9 +388,14 @@ impl LexicalSummaries {
             .as_ref()
             .is_some_and(|held| held.matches(&binding))
         {
-            released += self.bytes;
+            let held = self
+                .members
+                .values()
+                .map(|summary| summary.bytes())
+                .sum::<usize>();
+            released += held;
             self.members.clear();
-            self.bytes = 0;
+            self.bytes -= held;
             self.binding = Some(binding);
         }
         let mut kept = 0;
@@ -348,7 +406,7 @@ impl LexicalSummaries {
                 self.bytes -= old;
                 released += old;
             }
-            if self.members.len() >= MAX_LEXICAL_SUMMARIES
+            if self.members.len() + self.symbols.len() >= MAX_LEXICAL_SUMMARIES
                 || self.bytes + bytes > MAX_LEXICAL_SUMMARY_BYTES
             {
                 continue;
@@ -367,6 +425,13 @@ impl LexicalSummaries {
             let keep = member(path);
             if !keep {
                 self.bytes -= summary.bytes();
+            }
+            keep
+        });
+        self.symbols.retain(|path, list| {
+            let keep = member(path);
+            if !keep {
+                self.bytes -= list.bytes();
             }
             keep
         });

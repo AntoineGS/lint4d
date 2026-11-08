@@ -8538,6 +8538,32 @@ impl ProjectCache {
         self.release_index(released);
     }
 
+    /// The symbol list `key`'s index holds for `path` (Task 8d).
+    pub(crate) fn listed_symbols(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+    ) -> Option<Arc<crate::workspace::lexical::ListedSymbols>> {
+        self.index().contexts.get(key)?.summaries.symbols(path)
+    }
+
+    /// Keeps symbol `lists` with `key`'s index, charged like its summaries.
+    pub(crate) fn keep_listed_symbols(
+        &self,
+        key: &ContextKey,
+        lists: Vec<(PathBuf, Arc<crate::workspace::lexical::ListedSymbols>)>,
+    ) {
+        let paid = lists.iter().map(|(_, list)| list.bytes()).sum();
+        if lists.is_empty() || !self.charge_index_evicting(paid, key) {
+            return;
+        }
+        let released = match self.index().contexts.get_mut(key) {
+            Some(stored) => stored.summaries.keep_symbols(lists, paid),
+            None => paid,
+        };
+        self.release_index(released);
+    }
+
     #[cfg(test)]
     pub(crate) fn lexical_summary_count(&self, key: &ContextKey) -> usize {
         self.index()
@@ -9482,11 +9508,50 @@ mod index_tests {
         assert_eq!(cache.stats().reserved_index_bytes, base + bytes);
         assert!(cache.lexical_summaries(&a, &binding("a")).is_none());
         kept(&cache);
+        // A symbol list is charged and held the same way.
+        let uri = lsp_types::Url::from_file_path("/w/A.pas").unwrap();
+        let mut index = crate::navigation::NavigationIndex::new();
+        index
+            .update(
+                uri.clone(),
+                "unit A;\ninterface\nconst X = 1;\nimplementation\nend.\n".to_owned(),
+            )
+            .unwrap();
+        let list = Arc::new(crate::workspace::lexical::ListedSymbols {
+            content_hash: 1,
+            parsed_text_hash: 2,
+            conditional_context: Default::default(),
+            list: index
+                .workspace_symbol_list(&uri, &std::sync::atomic::AtomicBool::new(false))
+                .unwrap()
+                .unwrap(),
+        });
+        let listed = list.bytes();
+        let before = cache.stats().reserved_index_bytes;
+        cache.keep_listed_symbols(&a, vec![(paths[1].into(), list)]);
+        assert_eq!(cache.stats().reserved_index_bytes, before + listed);
+        assert!(cache.listed_symbols(&a, Path::new(paths[1])).is_some());
         cache.set_index_membership(a.clone(), anchor("a"), membership(&paths[..1]), usize::MAX);
         assert_eq!(cache.lexical_summary_count(&a), 1);
+        assert!(cache.listed_symbols(&a, Path::new(paths[1])).is_none());
         assert_eq!(
             cache.stats().reserved_index_bytes,
             membership_cost(&paths[..1]) + bytes
+        );
+        cache.keep_listed_symbols(
+            &a,
+            vec![(
+                paths[0].into(),
+                Arc::new(crate::workspace::lexical::ListedSymbols {
+                    content_hash: 1,
+                    parsed_text_hash: 2,
+                    conditional_context: Default::default(),
+                    list: index
+                        .workspace_symbol_list(&uri, &std::sync::atomic::AtomicBool::new(false))
+                        .unwrap()
+                        .unwrap(),
+                }),
+            )],
         );
         // Evicted with the context.
         for index in 0..MAX_INDEXED_CONTEXTS {

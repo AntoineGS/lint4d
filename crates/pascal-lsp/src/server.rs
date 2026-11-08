@@ -1343,6 +1343,7 @@ pub struct TestBarrierConfig {
     analysis_metrics: bool,
     store_fault: Option<crate::persistent_cache::test_faults::StoreFaultSpec>,
     store_growth_pages: Option<i64>,
+    build_fingerprint: Option<pascal_cache::Digest>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1399,6 +1400,7 @@ impl TestBarrierConfig {
             analysis_metrics: false,
             store_fault: None,
             store_growth_pages: None,
+            build_fingerprint: None,
         }
     }
 
@@ -1415,6 +1417,16 @@ impl TestBarrierConfig {
     pub fn with_store_growth_pages(mut self, pages: Option<i64>) -> Self {
         self.store_growth_pages = pages;
         self
+    }
+
+    /// Opens every store under the namespace of this build fingerprint (64
+    /// hex characters) instead of the real one; see
+    /// `PASCAL_LSP_TEST_NAMESPACE`.
+    pub fn with_namespace(mut self, fingerprint: Option<&str>) -> Result<Self, String> {
+        self.build_fingerprint = fingerprint
+            .map(crate::persistent_cache::test_faults::parse_build_fingerprint)
+            .transpose()?;
+        Ok(self)
     }
 
     /// Serves `pascal/testAnalysisMetrics`; never enabled by `run_stdio`.
@@ -10554,6 +10566,7 @@ fn run_stdio_with_config(
     crate::persistent_cache::test_faults::install(
         test_barriers.store_fault.clone(),
         test_barriers.store_growth_pages,
+        test_barriers.build_fingerprint,
     );
     let (connection, priority_receiver, io_threads) = bounded_stdio(test_barriers.clone());
     let connection = ProtocolConnection::new(connection, priority_receiver, &test_barriers);

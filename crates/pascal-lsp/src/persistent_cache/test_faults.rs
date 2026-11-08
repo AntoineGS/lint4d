@@ -7,7 +7,7 @@
 //! limits the database's growth right after every open. The hook runs inside
 //! a write transaction and never touches the store.
 
-use pascal_cache::{FaultPoint, Store};
+use pascal_cache::{Digest, FaultPoint, Namespace, Store};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -71,18 +71,37 @@ impl StoreFaultSpec {
 struct Installed {
     fault: Option<StoreFaultSpec>,
     growth_pages: Option<i64>,
+    build_fingerprint: Option<Digest>,
 }
 
 static INSTALLED: Mutex<Installed> = Mutex::new(Installed {
     fault: None,
     growth_pages: None,
+    build_fingerprint: None,
 });
 
+/// Parses `PASCAL_LSP_TEST_NAMESPACE`: 64 hex characters standing in for the
+/// build fingerprint, so one test binary can play several builds.
+pub fn parse_build_fingerprint(text: &str) -> Result<Digest, String> {
+    Digest::from_hex(text).ok_or_else(|| "must be 64 hexadecimal characters".to_string())
+}
+
+/// The namespace the test server opens its store with, when overridden.
+pub(crate) fn namespace_override() -> Option<Namespace> {
+    let installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
+    installed.build_fingerprint.map(Namespace::new)
+}
+
 /// Record what every store this process opens is armed with.
-pub(crate) fn install(fault: Option<StoreFaultSpec>, growth_pages: Option<i64>) {
+pub(crate) fn install(
+    fault: Option<StoreFaultSpec>,
+    growth_pages: Option<i64>,
+    build_fingerprint: Option<Digest>,
+) {
     let mut installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
     installed.fault = fault;
     installed.growth_pages = growth_pages;
+    installed.build_fingerprint = build_fingerprint;
 }
 
 /// Arm a freshly opened store.

@@ -580,3 +580,271 @@ fn a_held_record_is_invisible_to_an_open_reader() {
     shutdown(third);
     assert_agree(&found, &uncached);
 }
+
+/// A distinct build fingerprint (64 hex characters) per `n`.
+fn build_fingerprint(n: u8) -> String {
+    format!("{n:02x}").repeat(32)
+}
+
+/// The id `--cache-status` lists for the namespace of build `n`.
+fn build_id(n: u8) -> String {
+    let fingerprint = pascal_cache::Digest::from_hex(&build_fingerprint(n)).unwrap();
+    pascal_cache::Namespace::new(fingerprint).id().to_hex()
+}
+
+const STORE: &str = "cache/lint4d/analysis";
+
+/// A test server playing build `n` over `environment/cache`, with the
+/// `extra` variables.
+fn launch_build(environment: &Path, n: u8, extra: &[(&str, &str)]) -> TestServer {
+    let fingerprint = build_fingerprint(n);
+    let mut variables = vec![("PASCAL_LSP_TEST_NAMESPACE", fingerprint.as_str())];
+    variables.extend_from_slice(extra);
+    launch_with(environment, &variables)
+}
+
+/// Build `n` indexes `OPENS` of `root` until persisted and stops; returns
+/// its context. Its last use is then recorded as `rank` (seconds after a
+/// fixed origin earlier than every real start), so the least recently used
+/// order does not depend on the clock's granularity.
+fn run_build(environment: &Path, root: &Path, n: u8, options: Value, rank: u64) -> Value {
+    let mut server = launch_build(environment, n, &[]);
+    server.initialize(root, options);
+    open_disk(&mut server, root, &OPENS);
+    let done = wait_index(&mut server, persisted);
+    shutdown(server);
+    used_at(environment, n, rank);
+    done
+}
+
+fn used_at(environment: &Path, n: u8, rank: u64) {
+    let lock = environment
+        .join(STORE)
+        .join("namespaces")
+        .join(format!("{}.lock", build_id(n)));
+    let file = fs::OpenOptions::new().write(true).open(lock).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank))
+        .unwrap();
+}
+
+/// A build `n` server over the store, complete and settled.
+fn started_build(environment: &Path, root: &Path, n: u8, options: Value) -> (TestServer, Value) {
+    let mut server = launch_build(environment, n, &[]);
+    server.initialize(root, options);
+    open_disk(&mut server, root, &OPENS);
+    let done = wait_index(&mut server, complete);
+    settle_background(&mut server);
+    (server, done)
+}
+
+/// The admin binary (`--cache-status`, `--cache-prune`, ...) over the same
+/// store as the servers; its one JSON line. It registers the real build's
+/// namespace like any process opening the store, which is no test build.
+fn admin(environment: &Path, arguments: &[&str]) -> Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pascal-lsp"))
+        .args(arguments)
+        .env("HOME", environment.join("home"))
+        .env("XDG_CACHE_HOME", environment.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run pascal-lsp");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("one JSON line")
+}
+
+/// `(id, held)` of the live namespaces `--cache-status` lists.
+fn live_namespaces(environment: &Path) -> Vec<(String, bool)> {
+    let status = admin(environment, &["--cache-status"]);
+    status["namespaces"]["list"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["id"].as_str().unwrap().to_string(),
+                entry["held"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn is_live(environment: &Path, n: u8) -> bool {
+    let id = build_id(n);
+    live_namespaces(environment)
+        .iter()
+        .any(|(listed, _)| *listed == id)
+}
+
+const BUILD_QUERIES: [Query; 2] = [SHARED_REFERENCES, Query::Symbols("TShared")];
+
+/// Two builds alternate over one store through the protocol: each finds
+/// the facts it persisted before the other build ran, extracts nothing,
+/// and answers like an uncached server.
+#[test]
+fn two_builds_alternating_through_the_protocol_reuse_each_others_facts() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let first = run_build(environment.path(), &root, 1, Value::Null, 1);
+    assert!(first["extracted"].as_u64().unwrap() > 0, "{first}");
+    let second = run_build(environment.path(), &root, 2, Value::Null, 2);
+    assert!(second["extracted"].as_u64().unwrap() > 0, "{second}");
+    assert_eq!(second["reused"], 0, "build 2 starts cold: {second}");
+
+    let uncached = uncached_answers(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &BUILD_QUERIES,
+    );
+    for (n, rank) in [(1, 3), (2, 4)] {
+        let (mut server, done) = started_build(environment.path(), &root, n, Value::Null);
+        assert_eq!(done["extracted"], 0, "build {n}: {done}");
+        assert!(done["reused"].as_u64().unwrap() > 0, "build {n}: {done}");
+        let found = answers(&mut server, &root, &BUILD_QUERIES);
+        shutdown(server);
+        used_at(environment.path(), n, rank);
+        assert_agree(&found, &uncached);
+    }
+}
+
+/// With the default of three namespaces a fourth build retires the least
+/// recently used one: the status lists the other three, a warm restart of
+/// build 2 still extracts nothing, and the retired build 1 starts cold with
+/// the right answers.
+#[test]
+fn a_fourth_build_retires_the_least_recently_used_namespace() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    for n in 1..=3u8 {
+        run_build(environment.path(), &root, n, Value::Null, n as u64);
+    }
+    assert!((1..=3).all(|n| is_live(environment.path(), n)));
+    run_build(environment.path(), &root, 4, Value::Null, 4);
+    assert!(!is_live(environment.path(), 1), "the oldest is retired");
+    assert!((2..=4).all(|n| is_live(environment.path(), n)));
+
+    let uncached = uncached_answers(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &BUILD_QUERIES,
+    );
+    // Build 2 is used again, so build 3 becomes the least recently used.
+    let (mut server, done) = started_build(environment.path(), &root, 2, Value::Null);
+    assert_eq!(done["extracted"], 0, "{done}");
+    let found = answers(&mut server, &root, &BUILD_QUERIES);
+    shutdown(server);
+    used_at(environment.path(), 2, 5);
+    assert_agree(&found, &uncached);
+
+    let (mut server, done) = started_build(environment.path(), &root, 1, Value::Null);
+    assert_eq!(done["reused"], 0, "the retired build starts cold: {done}");
+    assert!(done["extracted"].as_u64().unwrap() > 0, "{done}");
+    let found = answers(&mut server, &root, &BUILD_QUERIES);
+    shutdown(server);
+    assert_agree(&found, &uncached);
+    assert!(is_live(environment.path(), 1));
+    assert!(!is_live(environment.path(), 3), "build 3 was retired");
+}
+
+/// Build 1 is live (held) and warm while builds 2 and 3 start with a store
+/// keeping one namespace: build 1 is never retired and keeps answering like
+/// an uncached server. After it exits, a later start retires it.
+#[test]
+fn a_live_reader_keeps_its_namespace_while_another_build_needs_room() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let keep_one = json!({"persistentCacheMaxNamespaces": 1});
+    run_build(environment.path(), &root, 1, Value::Null, 1);
+    let (mut reader, done) = started_build(environment.path(), &root, 1, Value::Null);
+    assert_eq!(done["extracted"], 0, "{done}");
+    let uncached = uncached_answers(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &BUILD_QUERIES,
+    );
+
+    run_build(environment.path(), &root, 2, keep_one.clone(), 2);
+    run_build(environment.path(), &root, 3, keep_one.clone(), 3);
+    let listed = live_namespaces(environment.path());
+    let held = |n: u8| listed.iter().find(|(id, _)| *id == build_id(n));
+    assert_eq!(held(1).map(|(_, held)| *held), Some(true), "{listed:?}");
+    assert!(held(2).is_none(), "build 2 was retired: {listed:?}");
+    assert!(held(3).is_some(), "{listed:?}");
+    let found = answers(&mut reader, &root, &BUILD_QUERIES);
+    assert_agree(&found, &uncached);
+    shutdown(reader);
+    used_at(environment.path(), 1, 4);
+
+    run_build(environment.path(), &root, 4, keep_one, 5);
+    assert!(!is_live(environment.path(), 1), "no longer held, retired");
+    assert!(is_live(environment.path(), 4));
+}
+
+/// Build 1's server is held in its reuse pass (after 5 members) while the
+/// admin binary prunes the store keeping one namespace: it retires and
+/// reclaims builds 2 and 3, never the held one. After the release the
+/// reader completes extracting nothing and answers like an uncached server.
+#[test]
+fn gc_in_one_process_while_another_reads() {
+    const HELD: usize = 5;
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    for n in 1..=3u8 {
+        run_build(environment.path(), &root, n, Value::Null, n as u64);
+    }
+    let directory = environment.path().join("reuse-pass-barrier");
+    fs::create_dir_all(&directory).unwrap();
+    let barrier = TestBarrier {
+        entered: directory.join("entered"),
+        release: directory.join("release"),
+    };
+    let spec = format!(
+        "{}|{}|{HELD}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let mut reader = launch_build(
+        environment.path(),
+        1,
+        &[("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", spec.as_str())],
+    );
+    started(&mut reader, &root, &OPENS);
+    barrier.wait_until_entered();
+
+    admin(
+        environment.path(),
+        &["--cache-prune", "--cache-max-namespaces", "1"],
+    );
+    let listed = live_namespaces(environment.path());
+    assert!(
+        listed.iter().any(|(id, held)| *id == build_id(1) && *held),
+        "the reader's namespace is held and kept: {listed:?}"
+    );
+    assert!(!is_live(environment.path(), 2) && !is_live(environment.path(), 3));
+
+    barrier.release();
+    let done = wait_index(&mut reader, complete);
+    assert_eq!(done["extracted"], 0, "{done}");
+    assert_eq!(done["reused"], done["members"], "{done}");
+    settle_background(&mut reader);
+    let found = answers(&mut reader, &root, &BUILD_QUERIES);
+    shutdown(reader);
+    let uncached = uncached_answers(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        &BUILD_QUERIES,
+    );
+    assert_agree(&found, &uncached);
+}

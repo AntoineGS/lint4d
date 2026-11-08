@@ -23,6 +23,7 @@ const TEST_COMPILED_CONTENT_BARRIER_ENV: &str = "PASCAL_LSP_TEST_COMPILED_CONTEN
 const TEST_OUTBOUND_WRITER_BARRIER_ENV: &str = "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER";
 const TEST_STORE_FAULT_ENV: &str = "PASCAL_LSP_TEST_STORE_FAULT";
 const TEST_STORE_GROWTH_PAGES_ENV: &str = "PASCAL_LSP_TEST_STORE_GROWTH_PAGES";
+const TEST_NAMESPACE_ENV: &str = "PASCAL_LSP_TEST_NAMESPACE";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 const TEST_WORKSPACE_FIFO_PROBE_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_FIFO_PROBE";
 
@@ -99,7 +100,8 @@ fn store_growth_pages_from_environment() -> Result<Option<i64>, String> {
 
 fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, String> {
     let store_fault = std::env::var(TEST_STORE_FAULT_ENV).ok();
-    Ok(TestBarrierConfig::new(
+    let namespace = std::env::var(TEST_NAMESPACE_ENV).ok();
+    TestBarrierConfig::new(
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
         barrier_from_environment(TEST_DIAGNOSTICS_BARRIER_ENV)?,
@@ -141,7 +143,9 @@ fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, Stri
     .with_analysis_metrics(analysis_metrics)
     .with_store_fault(store_fault.as_deref())
     .map_err(|error| format!("{TEST_STORE_FAULT_ENV}: {error}"))?
-    .with_store_growth_pages(store_growth_pages_from_environment()?))
+    .with_store_growth_pages(store_growth_pages_from_environment()?)
+    .with_namespace(namespace.as_deref())
+    .map_err(|error| format!("{TEST_NAMESPACE_ENV}: {error}"))
 }
 
 fn main() {

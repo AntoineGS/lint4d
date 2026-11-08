@@ -273,6 +273,11 @@ fn a_library_provider_edited_while_stopped() {
         ],
     );
     assert_agree(&run.warm, &run.uncached);
+    assert!(
+        run.warm_status["reused"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
     assert!(run.warm[0].locations.len() > 1, "{:?}", run.warm);
     assert!(
         locates(&run.warm[0], "library/Shared.pas", 2, 5),
@@ -289,7 +294,7 @@ fn a_provider_moving_between_project_and_library_origin() {
     let environment = tempfile::tempdir().unwrap();
     let (root, options) = library_fixture(environment.path(), false);
     let library = environment.path().join("library");
-    let (warm, uncached) = differential_with(
+    let run = differential_uncold(
         environment.path(),
         &root,
         &options,
@@ -304,7 +309,13 @@ fn a_provider_moving_between_project_and_library_origin() {
             Query::Symbols("TShared"),
         ],
     );
+    let (warm, uncached) = (run.warm, run.uncached);
     assert_agree(&warm, &uncached);
+    assert!(
+        run.warm_status["reused"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
     assert!(locates(&warm[0], "library/Shared.pas", 2, 5), "{warm:?}");
     assert!(
         warm[0]
@@ -313,4 +324,219 @@ fn a_provider_moving_between_project_and_library_origin() {
             .all(|location| !location.contains("/lib/Shared.pas")),
         "{warm:?}"
     );
+}
+
+fn assert_reused(run: &Differential) {
+    assert!(
+        run.warm_status["reused"].as_u64() > Some(0),
+        "{}",
+        run.warm_status
+    );
+}
+
+/// `Importer0.pas` includes `lib/Outer.inc` twice in its implementation
+/// (a conditional include is a documented analysis limit, so none guards
+/// the repetition); `Outer.inc` includes `Inner.inc`. While stopped,
+/// `Inner.inc` gains `FromInner`, which spells `TShared`.
+#[test]
+fn nested_and_repeated_includes_edited_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let importer = root.join("lib/Importer0.pas");
+    let text = fs::read_to_string(&importer)
+        .unwrap()
+        .replace("implementation\n", "implementation\n{$I Outer.inc}\n")
+        .replace("end.\n", "{$I Outer.inc}\nend.\n");
+    write_file(&importer, &text);
+    write_file(&root.join("lib/Outer.inc"), "{$I Inner.inc}\n");
+    write_file(&root.join("lib/Inner.inc"), "{ inner }\n");
+    pascal_project::backdate_tree_for_test(&root);
+    let run = differential_full(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        |root| {
+            write_file(
+                &root.join("lib/Inner.inc"),
+                "procedure FromInner;\nbegin\n  TShared.Create;\nend;\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[SHARED_REFERENCES, Query::Symbols("FromInner")],
+    );
+    assert_agree(&run.warm, &run.uncached);
+    assert_reused(&run);
+    assert!(locates(&run.warm[0], "Inner.inc", 2, 2), "{:?}", run.warm);
+    assert_eq!(run.warm[1].locations.len(), 1, "{:?}", run.warm);
+}
+
+/// Three units include `Missing.inc`, which does not resolve; while
+/// stopped it appears and declares `TFromMissing`. Follow-up R9-4: the
+/// warm server may still report the three members as a gap, so the check
+/// is truthfulness, not equality.
+#[test]
+fn a_missing_include_appearing_while_stopped_is_truthful() {
+    const MISSING: FixtureSpec = FixtureSpec {
+        units: 60,
+        importers: 5,
+        with_include_every: 10,
+        unresolved_includes: 3,
+        shared_name: "TShared",
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MISSING);
+    let run = differential_uncold(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &OPENS,
+        |root| {
+            write_file(
+                &root.join("lib/Missing.inc"),
+                "type TFromMissing = class(TShared) end;\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[SHARED_REFERENCES, Query::Symbols("TFromMissing")],
+    );
+    assert_truthful(&run.warm, &run.uncached);
+    assert_reused(&run);
+    println!(
+        "warm complete: {:?}, uncached complete: {:?}, equal: {}",
+        run.warm.iter().map(|a| a.complete).collect::<Vec<_>>(),
+        run.uncached.iter().map(|a| a.complete).collect::<Vec<_>>(),
+        run.warm == run.uncached
+    );
+}
+
+/// `App.dproj`'s search path gains `lib2` and `App.dpr` uses
+/// `lib2/Extra.pas`, which imports `Shared` and spells `TShared`.
+#[test]
+fn a_project_metadata_edit_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    let run = differential_full(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &["App.dpr"],
+        |root| {
+            let project = root.join("App.dproj");
+            let text = fs::read_to_string(&project).unwrap().replace(
+                ">lib</DCC_UnitSearchPath>",
+                ">lib;lib2</DCC_UnitSearchPath>",
+            );
+            write_file(&project, &text);
+            write_file(
+                &root.join("App.dpr"),
+                "program App;\nuses Extra;\nbegin\nend.\n",
+            );
+            write_file(
+                &root.join("lib2/Extra.pas"),
+                "unit Extra;\ninterface\nuses Shared;\ntype TExtra = class(TShared) end;\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+        },
+        &[SHARED_REFERENCES, Query::Symbols("TExtra")],
+    );
+    assert_agree(&run.warm, &run.uncached);
+    assert_reused(&run);
+    assert!(
+        run.warm[0]
+            .locations
+            .iter()
+            .any(|location| location.contains("/lib2/Extra.pas:")),
+        "{:?}",
+        run.warm
+    );
+    assert_eq!(run.warm[1].locations.len(), 1, "{:?}", run.warm);
+}
+
+/// The provider sits behind `$(SHAREDDIR)` in `App.dproj`'s search path.
+/// The user override config (`delphi-tools/config.toml`, shared by every
+/// server of the environment) sets `SHAREDDIR = 'lib1'`; while stopped it
+/// becomes `lib2`, whose `Shared.pas` also declares `TOnlyInLib2`.
+#[test]
+fn a_delphi_environment_variable_change_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    fs::create_dir_all(root.join("lib1")).unwrap();
+    fs::rename(root.join("lib/Shared.pas"), root.join("lib1/Shared.pas")).unwrap();
+    let project = root.join("App.dproj");
+    let text = fs::read_to_string(&project).unwrap().replace(
+        ">lib</DCC_UnitSearchPath>",
+        ">lib;$(SHAREDDIR)</DCC_UnitSearchPath>",
+    );
+    write_file(&project, &text);
+    let config = environment.path().join("config/delphi-tools/config.toml");
+    write_file(&config, "[properties]\nSHAREDDIR = 'lib1'\n");
+    pascal_project::backdate_tree_for_test(&root);
+    pascal_project::backdate_tree_for_test(&environment.path().join("config"));
+    let run = differential_full(
+        environment.path(),
+        &root,
+        &Value::Null,
+        &["App.dpr"],
+        |root| {
+            write_file(
+                &root.join("lib2/Shared.pas"),
+                "unit Shared;\ninterface\ntype TShared = class end;\n  TOnlyInLib2 = class(TShared) end;\nimplementation\nend.\n",
+            );
+            write_file(&config, "[properties]\nSHAREDDIR = 'lib2'\n# switched\n");
+            pascal_project::backdate_tree_for_test(root);
+            pascal_project::backdate_tree_for_test(config.parent().unwrap().parent().unwrap());
+        },
+        &[
+            Query::References("lib/Importer0.pas", 6, 2),
+            Query::Symbols("TOnlyInLib2"),
+        ],
+    );
+    assert_agree(&run.warm, &run.uncached);
+    assert_reused(&run);
+    assert!(run.cold[1].locations.is_empty(), "{:?}", run.cold);
+    assert_eq!(run.warm[1].locations.len(), 1, "{:?}", run.warm);
+    assert!(
+        run.warm[0]
+            .locations
+            .iter()
+            .any(|location| location.contains("/lib2/Shared.pas:")),
+        "{:?}",
+        run.warm
+    );
+}
+
+/// `Shared.pas` declares `TLegacyOnly` unless `VER360`. The first server
+/// runs as compiler 24.0, the warm and uncached servers as 36.0; nothing
+/// changes on disk.
+#[test]
+fn a_compiler_version_change_while_stopped() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &MATRIX);
+    write_file(
+        &root.join("lib/Shared.pas"),
+        "unit Shared;\ninterface\ntype TShared = class end;\n{$IFDEF VER360}{$ELSE}type TLegacyOnly = class(TShared) end;{$ENDIF}\nimplementation\nend.\n",
+    );
+    pascal_project::backdate_tree_for_test(&root);
+    let run = differential_switch(
+        environment.path(),
+        &root,
+        &json!({"compilerVersion": "24.0"}),
+        &json!({"compilerVersion": "36.0"}),
+        &OPENS,
+        |_| {},
+        &[SHARED_REFERENCES, Query::Symbols("TLegacyOnly")],
+    );
+    assert_agree(&run.warm, &run.uncached);
+    // The compiler version is part of the context key, so nothing of the
+    // first server's records is reusable: the warm server extracts anew.
+    assert_eq!(run.warm_status["reused"], 0, "{}", run.warm_status);
+    assert_eq!(
+        run.warm_status["extracted"], run.warm_status["members"],
+        "{}",
+        run.warm_status
+    );
+    assert_eq!(run.cold[1].locations.len(), 1, "{:?}", run.cold);
+    assert!(run.warm[1].locations.is_empty(), "{:?}", run.warm);
+    assert_ne!(run.warm, run.cold, "the version changes the answers");
 }

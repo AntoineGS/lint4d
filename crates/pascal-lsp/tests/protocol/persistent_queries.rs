@@ -844,8 +844,29 @@ pub(super) fn differential_with(
     mutate: impl Fn(&Path),
     queries: &[Query],
 ) -> (Vec<Answer>, Vec<Answer>) {
-    let run = differential_run(environment, root, options, opens, mutate, queries, false);
+    let run = differential_uncold(environment, root, options, opens, mutate, queries);
     (run.warm, run.uncached)
+}
+
+/// `differential_with` that also returns the warm server's status; it
+/// skips the check on the unmutated tree.
+pub(super) fn differential_uncold(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+) -> Differential {
+    differential_run(
+        environment,
+        root,
+        [options, options],
+        opens,
+        mutate,
+        queries,
+        false,
+    )
 }
 
 /// The three servers of one differential: the persisting first server on
@@ -870,7 +891,37 @@ pub(super) fn differential_full(
     mutate: impl Fn(&Path),
     queries: &[Query],
 ) -> Differential {
-    differential_run(environment, root, options, opens, mutate, queries, true)
+    differential_run(
+        environment,
+        root,
+        [options, options],
+        opens,
+        mutate,
+        queries,
+        true,
+    )
+}
+
+/// `differential_full` whose first server runs with the `before` options
+/// and whose warm and uncached servers run with the `after` options.
+pub(super) fn differential_switch(
+    environment: &Path,
+    root: &Path,
+    before: &Value,
+    after: &Value,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+) -> Differential {
+    differential_run(
+        environment,
+        root,
+        [before, after],
+        opens,
+        mutate,
+        queries,
+        true,
+    )
 }
 
 /// `check_cold` also queries the unmutated tree; it is off for mutations
@@ -879,19 +930,19 @@ pub(super) fn differential_full(
 fn differential_run(
     environment: &Path,
     root: &Path,
-    options: &Value,
+    [before, after]: [&Value; 2],
     opens: &[&str],
     mutate: impl Fn(&Path),
     queries: &[Query],
     check_cold: bool,
 ) -> Differential {
     let original = if check_cold {
-        uncached_answers(environment, root, options, opens, queries)
+        uncached_answers(environment, root, before, opens, queries)
     } else {
         Vec::new()
     };
     let mut first = launch_labelled(environment, "cache", "differential-first");
-    first.initialize(root, options.clone());
+    first.initialize(root, before.clone());
     open_disk(&mut first, root, opens);
     wait_index(&mut first, persisted);
     let cold = if check_cold {
@@ -904,11 +955,11 @@ fn differential_run(
         assert_agree(&cold, &original);
     }
     mutate(root);
-    let mut cached = cached_server(environment, root, options, opens);
+    let mut cached = cached_server(environment, root, after, opens);
     let warm_status = wait_index(&mut cached, complete);
     let warm = answers(&mut cached, root, queries);
     shutdown(cached);
-    let uncached = uncached_answers(environment, root, options, opens, queries);
+    let uncached = uncached_answers(environment, root, after, opens, queries);
     Differential {
         cold,
         warm,

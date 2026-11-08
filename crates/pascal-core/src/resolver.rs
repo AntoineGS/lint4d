@@ -3941,6 +3941,11 @@ impl<S: SourceStore> UnitResolver<S> {
         self.report.clone()
     }
 
+    /// The observations `report` would hold, without copying it.
+    pub fn report_observations(&self) -> &[ResolutionObservation] {
+        &self.report.observations
+    }
+
     fn outcome<T>(
         &mut self,
         result: Result<Resolution<T>, ResolverError>,

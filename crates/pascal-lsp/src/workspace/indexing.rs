@@ -5183,7 +5183,8 @@ struct SharedResolution {
     /// Directory entries the lookup's listings held, cached ones included:
     /// at most what a resolver without those listings would scan.
     consulted: usize,
-    /// What the lookup observed, for the summaries of members it answers.
+    /// Everything that determined the answer (`walk_observations` of the
+    /// walk that made it), for the summaries of members it answers.
     observations: Vec<BaselineEntry>,
 }
 
@@ -5207,8 +5208,8 @@ struct Absent {
 struct ProvenInclude {
     baseline: Vec<BaselineEntry>,
     routes: Vec<(String, bool)>,
-    /// What the lookups of its own includes observed, and the identifiers
-    /// of it and everything it includes.
+    /// Everything that determined it (`walk_observations` of the walk that
+    /// proved it), and the identifiers of it and everything it includes.
     observations: Vec<BaselineEntry>,
     tokens: Arc<super::lexical::TokenHashes>,
 }
@@ -5247,8 +5248,9 @@ struct IncludeWalk<'a> {
     /// The walk cannot prove its answers are a fresh resolver's: it is
     /// walked again without sharing.
     restart: bool,
-    /// What this walk's lookups observed, shared ones included, and the
-    /// identifiers of the includes it reached.
+    /// The whole observation sets of the shared answers and include
+    /// proofs this walk took (`walk_observations` adds its resolver's),
+    /// and the identifiers of the includes it reached.
     observed: Vec<BaselineEntry>,
     tokens: super::lexical::TokenHashes,
 }
@@ -5309,6 +5311,25 @@ fn summary_stamp_holds(held: Option<&PathStamp>, current: Option<&PathStamp>) ->
         (Some(held), Some(current)) => held.has_change_identity() && held.proves_unchanged(current),
         _ => false,
     }
+}
+
+/// Everything that determined the answers of `walk` so far: every
+/// observation its resolver holds (a lookup reports only those it adds,
+/// and a cached listing none), and the whole sets of the shared answers
+/// and include proofs it took (Task 8d, final review C1).
+fn walk_observations(
+    resolver: &pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+    walk: &IncludeWalk<'_>,
+) -> Vec<BaselineEntry> {
+    let mut observed = resolver
+        .report_observations()
+        .iter()
+        .filter_map(super::rename::resolver_observation_baseline)
+        .chain(walk.observed.iter().cloned())
+        .collect::<Vec<_>>();
+    observed.sort_by(|left, right| left.0.cmp(&right.0));
+    observed.dedup();
+    observed
 }
 
 /// What a ranking in one scope checks summaries against: the binding they
@@ -5801,7 +5822,7 @@ impl UnverifiedRanking {
             )?;
             Some(WalkProof {
                 baseline,
-                observed: std::mem::take(&mut walk.observed),
+                observed: walk_observations(&resolver, &walk),
                 tokens: std::mem::take(&mut walk.tokens),
                 route: Some(root_route),
             })
@@ -5860,7 +5881,6 @@ impl UnverifiedRanking {
             }
             let outer = std::mem::take(&mut walk.routes);
             let outer_tokens = std::mem::take(&mut walk.tokens);
-            let observed_at = walk.observed.len();
             let proven = (|| {
                 let owner = child.path.parent()?;
                 if !routed
@@ -5903,7 +5923,7 @@ impl UnverifiedRanking {
                 Some(ProvenInclude {
                     baseline,
                     routes: walk.routes.drain().collect(),
-                    observations: walk.observed[observed_at..].to_vec(),
+                    observations: walk_observations(resolver, walk),
                     tokens: Arc::new(std::mem::take(&mut walk.tokens)),
                 })
             })();
@@ -5984,8 +6004,7 @@ impl UnverifiedRanking {
             .iter()
             .filter_map(super::rename::resolver_observation_baseline)
             .collect::<Vec<_>>();
-        self.observed.extend(observations.iter().cloned());
-        walk.observed.extend(observations.iter().cloned());
+        self.observed.extend(observations);
         let pascal_core::Resolution::Found(child) = outcome.result else {
             return None;
         };
@@ -6014,7 +6033,7 @@ impl UnverifiedRanking {
                     files: added.0,
                     bytes: added.1,
                     consulted: added.2,
-                    observations,
+                    observations: walk_observations(resolver, walk),
                 },
             );
             self.attempt.push(AttemptEntry::Resolution(key));
@@ -9086,6 +9105,129 @@ pub(in crate::workspace) mod tests {
         advance(&mut workspace, &anchor, IndexBound::all());
         retry_member(&workspace, &key, &guarded);
         (workspace, key, anchor, [guarded, defs, nested])
+    }
+
+    /// Final review C1 fixture: retrying members `lib/A.pas` and
+    /// `lib/B.pas` with `files` (relative path, text), include path
+    /// `inc1;inc2`, `inc1` empty; settled.
+    fn two_summarised_members(
+        root: &Path,
+        files: &[(&str, &str)],
+    ) -> (Workspace, ContextKey, IndexAnchor) {
+        for (path, text) in files {
+            write(&root.join(path), text);
+        }
+        fs::create_dir_all(root.join("inc1")).unwrap();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>inc1;inc2</DCC_IncludePath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for member in ["lib/A.pas", "lib/B.pas"] {
+            retry_member(&workspace, &key, &root.join(member));
+        }
+        (workspace, key, anchor)
+    }
+
+    /// C1: after both summaries are built, `shadow` (spelling the name)
+    /// appears earlier in the search path. The second request binds what
+    /// a ranking without summaries binds, and its baseline already held
+    /// what the new file changes.
+    fn a_shadow_invalidates_both_summaries(files: &[(&str, &str)], shadow: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let (mut workspace, key, anchor) = two_summarised_members(&root, files);
+        let first = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(source_names(&first), ["Shared.pas", "User.pas"]);
+        assert_eq!(workspace.project_cache.lexical_summary_count(&key), 2);
+        let changed = |found: &IndexedSources| {
+            found
+                .baseline
+                .iter()
+                .any(|(path, stamp)| match path_stamp(path) {
+                    None => stamp.is_some(),
+                    Some(current) => stamp.as_ref().is_none_or(|held| *held != current),
+                })
+        };
+        let shadow = root.join(shadow);
+        write(&shadow, "const Copy = SharedValue;\n");
+        pascal_project::backdate_for_test(&shadow);
+        pascal_project::backdate_for_test(shadow.parent().unwrap());
+        assert!(
+            changed(&first),
+            "the first request's baseline misses the new file"
+        );
+        take_summary_reuses_for_test();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let reused = take_summary_reuses_for_test();
+        // The same files and query without any summary.
+        let fresh_temp = tempfile::tempdir().unwrap();
+        let fresh_root = fresh_temp.path().join("ws");
+        let (mut fresh, fresh_key, fresh_anchor) = two_summarised_members(&fresh_root, files);
+        write(
+            &fresh_root.join(shadow.strip_prefix(&root).unwrap()),
+            "const Copy = SharedValue;\n",
+        );
+        let expected = references_of_shared_value(&mut fresh, &fresh_key, &fresh_anchor);
+        assert_eq!(
+            source_names(&found),
+            source_names(&expected),
+            "reused {reused}"
+        );
+        assert!(
+            source_names(&expected).contains(&"B.pas".to_owned()),
+            "{:?}",
+            source_names(&expected)
+        );
+    }
+
+    /// C1, scenario 1: B takes `X.inc`'s proof from the memo; A's walk
+    /// observed the missing `inc1/Defs.inc` before it, so the memo's own
+    /// slice lacks it.
+    #[test]
+    fn a_new_include_shadowing_a_memo_proof_invalidates_the_consumers_summary() {
+        a_shadow_invalidates_both_summaries(
+            &[
+                (
+                    "lib/A.pas",
+                    "unit A;\n{$I Defs.inc}\n{$I ..\\x\\X.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                (
+                    "lib/B.pas",
+                    "unit B;\n{$I ..\\x\\X.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                ("x/X.inc", "{$I Defs.inc}\n"),
+                ("inc2/Defs.inc", "{$DEFINE QUIET}\n"),
+            ],
+            "inc1/Defs.inc",
+        );
+    }
+
+    /// C1, scenario 2: B takes A's shared resolution of `Defs.inc`; A's
+    /// resolver listed `inc1` for an earlier lookup, so that resolution's
+    /// own slice lacks the listing a case variant changes.
+    #[test]
+    fn a_case_variant_shadowing_a_shared_resolution_invalidates_the_consumers_summary() {
+        a_shadow_invalidates_both_summaries(
+            &[
+                (
+                    "lib/A.pas",
+                    "unit A;\n{$I Other.inc}\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                (
+                    "lib/B.pas",
+                    "unit B;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                ("inc2/Other.inc", "{$DEFINE OTHER}\n"),
+                ("inc2/Defs.inc", "{$DEFINE QUIET}\n"),
+            ],
+            "inc1/DEFS.INC",
+        );
     }
 
     /// References of `SharedValue` twice: the summaries the second reused.

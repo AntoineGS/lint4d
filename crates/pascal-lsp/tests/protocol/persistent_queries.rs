@@ -1148,10 +1148,10 @@ fn narrow_and_wide_fixture(environment: &Path) -> (PathBuf, PathBuf) {
     (wide, narrow)
 }
 
-/// Phase 7 (`authorize_record`) through indexed queries: a wide server
-/// persists `extra/`, outside the narrow server's read roots, into the
-/// shared store. The narrow warm server answers as its own uncached server
-/// does, and no wide-only location appears.
+/// Phase 7 through indexed queries: a wide server persists `extra/`,
+/// outside the narrow server's read roots, into the shared store. The
+/// narrow server, warmed only by the wide server's writes, answers as its
+/// own uncached server does, and no wide-only location appears.
 #[test]
 fn narrow_and_wide_read_roots_over_one_store() {
     let environment = tempfile::tempdir().unwrap();
@@ -1183,6 +1183,19 @@ fn narrow_and_wide_read_roots_over_one_store() {
 
     let mut cached = cached_server(environment.path(), &narrow, &Value::Null, &OPENS);
     let warm = answers(&mut cached, &narrow, &queries);
+    // The read roots are part of the context key, so the narrow server
+    // never looks up a record keyed by the wide context and never asks for
+    // `extra/`: `authorize_record`'s refusal cannot be reached from here
+    // (`isolation.rs` covers it). What it does read of the wide server's
+    // writes are the context-free local artifacts of `app/` units, admitted
+    // under its own read policy.
+    let context = wait_index(&mut cached, complete);
+    let counters = request(&mut cached, "pascal/cacheStatus", json!({}))["counters"].clone();
+    assert!(
+        context["reused"].as_u64() > Some(0) && counters["hits"].as_u64() > Some(0),
+        "the narrow server reads wide-written records: {context} {counters}"
+    );
+    assert_eq!(counters["misses"]["authorization"], 0, "{counters}");
     shutdown(cached);
     let cold = uncached_answers(environment.path(), &narrow, &Value::Null, &OPENS, &queries);
     assert_agree(&warm, &cold);

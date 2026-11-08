@@ -4755,19 +4755,78 @@ mod tests {
             false,
             &AtomicBool::new(false),
         );
-        if let Ok(edit) = rename.value {
-            let changes = edit.changes.expect("plain changes");
-            assert_eq!(
-                changes.len(),
-                21,
-                "never a partial edit: {:?}",
-                changes.keys()
-            );
-        }
+        let edit = rename.value.expect("rename is a walk, never admitted");
+        let changes = edit.changes.expect("plain changes");
+        assert_eq!(
+            changes.len(),
+            21,
+            "never a partial edit: {:?}",
+            changes.keys()
+        );
 
         test_set_limit(Some(shared_bytes - 1));
         assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
         assert_eq!(query_trees(), 0, "released by the refused request");
+    }
+
+    /// R9-8: the declaring unit is a required source although the request
+    /// comes from an importer; refused by the budget, it fails the request
+    /// with the retryable error instead of becoming a gap.
+    #[test]
+    fn a_refused_declaring_unit_fails_references_from_an_importer() {
+        use crate::project_cache::RETAINED_BYTES_PER_SOURCE_BYTE;
+        use crate::workspace::hydration::{HYDRATION_REFUSED, test_set_limit};
+        struct Unlimited;
+        impl Drop for Unlimited {
+            fn drop(&mut self) {
+                test_set_limit(None);
+            }
+        }
+        let _unlimited = Unlimited;
+        let fixture = many_units(1, 0);
+        // Larger than the importer, so a limit can admit only the importer.
+        fs::write(
+            &fixture.shared,
+            format!(
+                "unit Shared;\n{{{}}}\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+                "x".repeat(512)
+            ),
+        )
+        .expect("shared");
+        pascal_project::backdate_tree_for_test(fixture.shared.parent().expect("root"));
+        let importer = source_uri(&fixture.importers[0]);
+        build_index_for(&fixture.input, &importer);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &importer,
+                Position::new(6, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+        };
+        let len = |path: &Path| fs::metadata(path).expect("source").len() as usize;
+        let shared_bytes = len(&fixture.shared) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        let importer_bytes = len(&fixture.importers[0]) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        assert!(importer_bytes < shared_bytes);
+
+        test_set_limit(Some(shared_bytes + importer_bytes));
+        let found = references().expect("both admitted");
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        assert_eq!(found.value.len(), 2, "{:?}", found.value);
+
+        test_set_limit(Some(importer_bytes));
+        assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
+        assert_eq!(
+            fixture
+                .input
+                .project_cache
+                .stats()
+                .reserved_query_trees_bytes,
+            0,
+            "released by the refused request"
+        );
     }
 
     /// `Shared` declares `SharedValue`, `Importer` uses it, and `Broken`

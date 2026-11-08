@@ -87,6 +87,10 @@ fn a_held_record_publication_is_visible_to_no_other_process() {
     let status = cache_status(&mut other);
     assert_eq!(status["state"], "bypassed", "{status}");
     assert_eq!(status["cause"]["kind"], "busy", "{status}");
+    // Everything still pending at `complete` awaits the reuse pass the
+    // bypass made impossible; nothing is refused.
+    assert_eq!(done["pending"], done["reusePending"], "{done}");
+    assert_eq!(done["refused"], 0, "{done}");
     assert_eq!(done["reused"], 0, "{done}");
     assert_eq!(
         done["extracted"].as_u64().unwrap() + done["pending"].as_u64().unwrap(),
@@ -168,20 +172,12 @@ fn assert_accounted(context: &Value) {
 }
 
 /// Waits for the child of a server armed with an `abort` fault to die and
-/// asserts that it was `abort()` that ended it.
+/// asserts that it was `abort()` that ended it. The abort is certain once
+/// the fault point is reached, so a plain blocking wait is bounded by the
+/// test run itself.
 fn wait_for_abort(server: &mut TestServer) {
     use std::os::unix::process::ExitStatusExt;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        if let Some(status) = server.child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the server never reached its fault point"
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
+    let status = server.child.wait().expect("wait for the aborting server");
     assert_eq!(status.signal(), Some(libc::SIGABRT), "{status}");
 }
 
@@ -253,7 +249,9 @@ fn abort_at(point: &str, nth: usize) {
     let opens_b = ["App.dpr", "lib/U3.pas"];
     let opens_a = ["App.dpr", "lib/U7.pas"];
     let queries_b = [Query::Symbols("P3"), Query::References("lib/U3.pas", 2, 10)];
-    let queries_a = [Query::Symbols("P7"), Query::References("lib/U7.pas", 2, 10)];
+    // "P" matches every unit's procedure, so a half record of the aborted
+    // member would show as a missing or extra symbol.
+    let queries_a = [Query::Symbols("P"), Query::References("lib/U7.pas", 2, 10)];
 
     let mut other = launch_labelled(environment.path(), "cache", "b");
     started(&mut other, &root_b, &opens_b);
@@ -287,6 +285,11 @@ fn abort_at(point: &str, nth: usize) {
         );
     }
     let found = answers(&mut third, &root_a, &queries_a);
+    assert!(
+        found[0].locations.len() >= UNITS,
+        "{}",
+        found[0].locations.len()
+    );
     let uncached = uncached_answers(
         environment.path(),
         &root_a,
@@ -323,10 +326,9 @@ fn a_process_aborted_at_each_publication_boundary() {
 /// A's store may not grow (`PASCAL_LSP_TEST_STORE_GROWTH_PAGES=0`) over a
 /// store B warmed. A answers like an uncached server, buffer included, and
 /// reports the full store through its `full` bypass counter; B keeps
-/// answering warm. Once the limit is lifted and a closed member changes,
-/// A's persistence resumes after the store's health backoff (wall clock,
-/// one second doubling per failed probe), so the edit is repeated until a
-/// publication lands.
+/// answering warm. Once the limit is lifted, the store's test clock is
+/// advanced past the longest health backoff (`pascal/testStoreClock`) and a
+/// closed member changes, A's persistence resumes.
 #[test]
 fn a_full_store_in_one_process_changes_no_answer_and_recovers() {
     let environment = tempfile::tempdir().unwrap();
@@ -345,6 +347,14 @@ fn a_full_store_in_one_process_changes_no_answer_and_recovers() {
     wait_index(&mut other, persisted);
     settle_background(&mut other);
     let warm = answers(&mut other, &root_b, &queries_b);
+    let uncached_b = uncached_answers(
+        environment.path(),
+        &root_b,
+        &Value::Null,
+        &OPENS,
+        &queries_b,
+    );
+    assert_agree(&warm, &uncached_b);
 
     let mut full = launch_with(
         environment.path(),
@@ -375,6 +385,7 @@ fn a_full_store_in_one_process_changes_no_answer_and_recovers() {
 
     let again = answers(&mut other, &root_b, &queries_b);
     assert_agree(&again, &warm);
+    assert_agree(&again, &uncached_b);
     let status = cache_status(&mut other);
     assert_eq!(status["state"], "enabled", "{status}");
 
@@ -385,30 +396,25 @@ fn a_full_store_in_one_process_changes_no_answer_and_recovers() {
         json!({"extraPages": 1_048_576}),
     );
     assert_eq!(lifted["applied"], true, "{lifted}");
+    let advanced = request(
+        &mut full,
+        "pascal/testStoreClock",
+        json!({"advanceMs": pascal_cache::MAX_HEALTH_BACKOFF.as_millis() as u64}),
+    );
+    assert_eq!(advanced["applied"], true, "{advanced}");
     let edited = root_a.join("lib/Other4.pas");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut round = 0;
-    loop {
-        round += 1;
-        write_file(
-            &edited,
-            &format!(
-                "unit Other4;\ninterface\ntype TAlien = class end;\nprocedure Edit{round};\nimplementation\nprocedure Edit{round};\nbegin\nend;\nend.\n"
-            ),
-        );
-        pascal_project::backdate_tree_for_test(&root_a);
-        watched_change(&mut full, &edited);
-        settle_background(&mut full);
-        let status = wait_index(&mut full, complete);
-        if status["persisted"].as_u64().unwrap() > persisted_before {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "persistence did not resume: {status}"
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    write_file(
+        &edited,
+        "unit Other4;\ninterface\ntype TAlien = class end;\nprocedure Edited;\nimplementation\nprocedure Edited;\nbegin\nend;\nend.\n",
+    );
+    pascal_project::backdate_tree_for_test(&root_a);
+    watched_change(&mut full, &edited);
+    settle_background(&mut full);
+    let resumed = wait_index(&mut full, complete);
+    assert!(
+        resumed["persisted"].as_u64().unwrap() > persisted_before,
+        "persistence resumed: {resumed}"
+    );
     shutdown(full);
     shutdown(other);
 }
@@ -534,6 +540,7 @@ fn a_held_record_is_invisible_to_an_open_reader() {
     answers(&mut other, &root, &queries);
     settle_background(&mut other);
     let baseline = parses(&mut other) - mark;
+    let parses_before = parses(&mut other);
 
     let member = root.join("lib/Other7.pas");
     let edited = fs::read_to_string(&member)
@@ -548,8 +555,6 @@ fn a_held_record_is_invisible_to_an_open_reader() {
     started(&mut held, &root, &OPENS);
     fault.barrier.wait_until_entered();
 
-    settle_background(&mut other);
-    let parses_before = parses(&mut other);
     watched_change(&mut other, &member);
     let found = answers(&mut other, &root, &queries);
     let changed = parses(&mut other) - parses_before;

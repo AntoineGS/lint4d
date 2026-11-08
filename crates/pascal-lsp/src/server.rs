@@ -10872,6 +10872,10 @@ const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
 /// `{"extraPages": n}` limits the open store's growth; `{"applied": bool}`.
 #[cfg(feature = "test-support")]
 const TEST_STORE_GROWTH_METHOD: &str = "pascal/testStoreGrowth";
+/// `{"advanceMs": n}` advances the open store's test clock (its health
+/// backoff); `{"applied": bool}`.
+#[cfg(feature = "test-support")]
+const TEST_STORE_CLOCK_METHOD: &str = "pascal/testStoreClock";
 /// Whether the server has background work: a warmer crawl or index batch,
 /// an analysis job or a diagnostic deadline. Answered in message order.
 #[cfg(feature = "test-support")]
@@ -12082,6 +12086,28 @@ fn event_loop(
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
+                if request.method == TEST_STORE_CLOCK_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let applied = request
+                    .params
+                    .get("advanceMs")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|millis| {
+                        crate::persistent_cache::test_faults::advance_clock(
+                            persistent,
+                            Duration::from_millis(millis),
+                        )
+                    });
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({ "applied": applied }),
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
                 if request.method == TEST_BACKGROUND_IDLE_METHOD
                     && !shutdown_received
                     && !configuration.is_preparing() =>
@@ -12904,6 +12930,7 @@ fn request_requires_configuration(method: &str) -> bool {
     if method == TEST_CACHE_SETTLE_METHOD
         || method == TEST_BACKGROUND_IDLE_METHOD
         || method == TEST_STORE_GROWTH_METHOD
+        || method == TEST_STORE_CLOCK_METHOD
     {
         return true;
     }

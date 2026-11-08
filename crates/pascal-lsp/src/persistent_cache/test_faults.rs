@@ -122,3 +122,12 @@ pub(crate) fn limit_growth(cache: &super::PersistentCache, extra_pages: i64) -> 
         .job()
         .is_some_and(|job| job.store().limit_growth_for_test(extra_pages).is_ok())
 }
+
+/// `pascal/testStoreClock`: advance the open store's test clock, which ends
+/// its health backoff; `false` without an open store.
+pub(crate) fn advance_clock(cache: &super::PersistentCache, by: std::time::Duration) -> bool {
+    cache.job().is_some_and(|job| {
+        job.store().advance_clock_for_test(by);
+        true
+    })
+}

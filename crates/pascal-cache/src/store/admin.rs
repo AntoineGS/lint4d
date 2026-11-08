@@ -12,10 +12,10 @@ use super::leases::live_since;
 use super::limits::MIN_CONNECTION_PAGE_CACHE_BYTES;
 use super::location::{DATABASE_FILE, StoreLocation};
 use super::maintenance::{Maintenance, StepBudget, StepReport};
-use super::namespaces;
 use super::outcome::{Bypass, LocationIssue};
 use super::sqlite::{begin, check_sqlite_version, classify, open_connection};
 use super::{Store, StoreLimits, unix_seconds};
+use super::{namespaces, retention};
 use crate::Namespace;
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
@@ -124,11 +124,17 @@ pub struct NamespaceStatus {
     /// The namespace identity, derived from the build fingerprint.
     pub id: crate::Digest,
     pub reset_epoch: u64,
-    /// When a process last opened or closed it; `None` without a lock file.
+    /// When a process last opened it, closed it or, while open, recorded
+    /// its use (once a minute); a future time reads as now. `None` without
+    /// a lock file.
     pub last_used_unix_seconds: Option<u64>,
-    /// Estimated bytes of its live scope's rows.
-    pub estimated_bytes: u64,
-    /// A live process lease is registered in it.
+    /// The size maintenance last estimated for this epoch (rows' content
+    /// plus `ROW_OVERHEAD_BYTES` per row); `None` until maintenance of
+    /// another process estimates it: a namespace is estimated only while
+    /// no process holds it.
+    pub estimated_bytes: Option<u64>,
+    /// A live process holds its lock, as retirement sees it (probed
+    /// without waiting).
     pub held: bool,
 }
 
@@ -153,8 +159,10 @@ fn database_exists(directory: &Path) -> Result<bool, Bypass> {
 
 /// Report the store in `directory`. An absent database is reported, not
 /// created. Otherwise one connection reads the existing file: no namespace
-/// is registered, no namespace lock is taken and no row is written (SQLite
-/// itself may create the `-wal` and `-shm` side files of a WAL database).
+/// is registered, no row is written (SQLite itself may create the `-wal`
+/// and `-shm` side files of a WAL database), and no namespace lock is
+/// waited for: each listed namespace's lock is probed once without waiting
+/// (`held`), and no lock file is created.
 /// An unreadable container is reported with its advice and left in place.
 pub fn status(directory: &Path) -> StoreStatus {
     super::count_operation();
@@ -190,25 +198,27 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
     let usage = read_usage_at(&location, &transaction)?;
     let pressure = pressure_of(policy.policy, &usage);
     let live_since = live_since(unix_seconds());
-    let ranked = namespaces::ranked_live(&transaction, &location, None)?;
-    let namespaces_truncated = ranked.len() > MAX_LISTED_NAMESPACES;
+    let ranked = retention::ranked_live(&transaction, &location, None)?;
     let namespaces = ranked
-        .into_iter()
+        .iter()
         .take(MAX_LISTED_NAMESPACES)
-        .map(|(id, reset_epoch, used)| {
+        .map(|ranked| {
             Ok(NamespaceStatus {
-                id,
-                reset_epoch: u64::try_from(reset_epoch).map_err(|_| Bypass::Corrupt)?,
-                last_used_unix_seconds: used.and_then(namespaces::unix_seconds_of),
-                estimated_bytes: namespaces::estimated_bytes(
-                    &transaction,
-                    id.as_bytes(),
-                    reset_epoch,
-                )?,
-                held: namespace_held(&transaction, id, reset_epoch, live_since)?,
+                id: ranked.id,
+                reset_epoch: u64::try_from(ranked.epoch).map_err(|_| Bypass::Corrupt)?,
+                last_used_unix_seconds: ranked.last_used().and_then(retention::unix_seconds_of),
+                estimated_bytes: retention::read_recorded(&location, ranked.id)
+                    .filter(|recorded| recorded.epoch == ranked.epoch)
+                    .map(|recorded| recorded.bytes),
+                held: namespaces::held(&location.namespace_lock(ranked.id))?,
             })
         })
         .collect::<Result<Vec<_>, Bypass>>()?;
+    let live_namespaces = count(
+        &transaction,
+        "SELECT count(*) FROM namespaces WHERE state = 1",
+        0,
+    )?;
     Ok(Some(StatusReport {
         container: ContainerInfo {
             version: CONTAINER_VERSION,
@@ -217,11 +227,9 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
         usage,
         policy,
         pressure,
-        live_namespaces: count(
-            &transaction,
-            "SELECT count(*) FROM namespaces WHERE state = 1",
-            0,
-        )?,
+        // Every live namespace but the listed ones, whatever their count.
+        namespaces_truncated: live_namespaces > namespaces.len() as u64,
+        live_namespaces,
         retired_namespaces: count(
             &transaction,
             "SELECT count(*) FROM namespaces WHERE state <> 1",
@@ -234,29 +242,12 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
             live_since,
         )?,
         namespaces,
-        namespaces_truncated,
         advice: if pressure == Pressure::None {
             RecoveryAdvice::None
         } else {
             RecoveryAdvice::Prune
         },
     }))
-}
-
-fn namespace_held(
-    connection: &Connection,
-    id: crate::Digest,
-    reset_epoch: i64,
-    live_since: i64,
-) -> Result<bool, Bypass> {
-    connection
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM process_leases WHERE namespace_id = ?1 \
-             AND reset_epoch = ?2 AND renewed_unix_seconds >= ?3)",
-            rusqlite::params![id.as_bytes().as_slice(), reset_epoch, live_since],
-            |row| row.get(0),
-        )
-        .map_err(|error| classify(&error))
 }
 
 fn count(connection: &Connection, sql: &str, parameter: i64) -> Result<u64, Bypass> {

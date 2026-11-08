@@ -438,7 +438,8 @@ fn status_lists_the_retained_namespaces() {
     assert_eq!(current["held"], true);
     assert_eq!(current["resetEpoch"], 0);
     assert!(current["lastUsed"].is_u64(), "{json}");
-    assert!(current["estimatedBytes"].is_u64(), "{json}");
+    // A held namespace is not estimated (its rows may change).
+    assert!(current["estimatedBytes"].is_null(), "{json}");
     let other = entry(other_build(1).id());
     assert_eq!(other["current"], false);
     assert_eq!(other["held"], false);

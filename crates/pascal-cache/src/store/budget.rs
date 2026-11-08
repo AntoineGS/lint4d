@@ -308,6 +308,7 @@ impl Store {
         let now = self.clock.unix_seconds();
         if super::leases::due(&self.lease, now) {
             super::leases::renew(transaction, self.scope, &self.lease, now)?;
+            self.refresh_use(now);
         }
         Ok(())
     }

@@ -83,6 +83,14 @@ impl StoreLocation {
             .join(format!("{}.lock", namespace.to_hex()))
     }
 
+    /// The recorded size estimate of `namespace` (review I1), beside its
+    /// lock file.
+    pub fn namespace_size(&self, namespace: Digest) -> PathBuf {
+        self.directory
+            .join(NAMESPACE_LOCKS)
+            .join(format!("{}.size", namespace.to_hex()))
+    }
+
     /// The lock file one maintenance step holds exclusively; never removed.
     pub fn maintenance_lock(&self) -> PathBuf {
         self.directory.join(MAINTENANCE_LOCK)

@@ -33,6 +33,7 @@ mod pool;
 mod queries;
 mod reader;
 mod records;
+mod retention;
 mod sequence;
 mod snapshots;
 mod sqlite;
@@ -134,6 +135,10 @@ pub struct Store {
     clock: clock::Clock,
     lease: leases::ProcessLease,
     hints: leases::Hints,
+    estimates: std::sync::Mutex<retention::Estimates>,
+    /// When this process last recorded its use of the namespace (clock
+    /// seconds; see `refresh_use`).
+    last_use: std::sync::atomic::AtomicU64,
     health: health::Health,
     #[cfg(feature = "test-support")]
     hooks: testing::Hooks,
@@ -141,8 +146,9 @@ pub struct Store {
 
 impl Store {
     /// Open or create the store in `directory` for `namespace`, then retire
-    /// the namespaces retention does not keep (see [`Self::retire_obsolete`]). Any failure is a bypass: the
-    /// caller analyses without the cache.
+    /// the namespaces retention does not keep (see
+    /// [`Self::retire_obsolete`]). Any failure is a bypass: the caller
+    /// analyses without the cache.
     pub fn open(
         directory: &Path,
         namespace: &Namespace,
@@ -186,9 +192,11 @@ impl Store {
             pool,
             scratch: reader::ScratchBudget::new(limits.scratch_bytes),
             _lock: lock,
+            last_use: std::sync::atomic::AtomicU64::new(clock.unix_seconds()),
             clock,
             lease,
             hints: leases::Hints::default(),
+            estimates: std::sync::Mutex::default(),
             health: health::Health::default(),
             #[cfg(feature = "test-support")]
             hooks: testing::Hooks::default(),
@@ -226,35 +234,13 @@ impl Store {
     /// Keep the [`StoreLimits::max_namespaces`] most recently used live
     /// namespaces, this one included, and retire the others no live process
     /// holds, least recently used first; while the store is over its disk
-    /// policy, retire kept ones too, least recently used first (l4d-1ypi).
+    /// policy, retire kept ones too, least recently used first, as far as
+    /// maintenance has estimated their sizes (l4d-1ypi). Reads no
+    /// namespace's rows and takes the writer only to retire.
     pub fn retire_obsolete(&self) -> Result<RetireReport, Bypass> {
         self.guarded(Access::Maintenance, || {
             self.retire_within(Deadline::after(self.limits.open_wait))
         })
-    }
-
-    fn retire_within(&self, deadline: Deadline) -> Result<RetireReport, Bypass> {
-        let mut writer = self.pool.acquire(Role::Writer, deadline)?;
-        let excess_bytes = {
-            let transaction = sqlite::begin_within(
-                &mut writer,
-                rusqlite::TransactionBehavior::Deferred,
-                deadline,
-            )?;
-            let policy = budget::read_policy(&transaction)?.policy;
-            budget::excess_bytes(policy, &budget::read_usage(self, &transaction)?)
-        };
-        let retention = namespaces::Retention {
-            keep: self.limits.max_namespaces,
-            excess_bytes,
-        };
-        namespaces::retire_obsolete(
-            &mut writer,
-            &self.location,
-            self.scope.namespace,
-            retention,
-            deadline,
-        )
     }
 
     /// Delete at most `max_rows` rows in one `IMMEDIATE` transaction: rows

@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 pub struct StepBudget {
     /// Real elapsed time; checked before every transaction.
     pub time: Duration,
-    /// Rows the step's transactions change at most (vacuum pages count as
-    /// rows; lease renewals and hint flushes do not).
+    /// Rows the step's transactions change at most (vacuum pages and the
+    /// entries a namespace size estimate reads count as rows; lease
+    /// renewals and hint flushes do not).
     pub rows: usize,
 }
 
@@ -33,7 +34,8 @@ pub enum Phase {
     Leases,
     /// A passive checkpoint (and truncation when complete).
     Checkpoint,
-    /// Retire the namespaces retention does not keep and no live process
+    /// Estimate the sizes of unheld namespaces in bounded chunks, then
+    /// retire the namespaces retention does not keep and no live process
     /// holds (`Store::retire_obsolete`).
     ObsoleteNamespaces,
     AbandonedBuilds,
@@ -250,8 +252,14 @@ impl Maintenance {
                 Err(Bypass::WalPressure)
             }),
             Phase::Checkpoint => Ran::of(store.checkpoint().map(|_| (0, true))),
+            // Size estimates first, one bounded chunk per transaction
+            // (review I1), then the retirement pass that uses them.
             Phase::ObsoleteNamespaces => Ran::of(if unpressured()? {
-                store.retire_obsolete().map(|_| (0, true))
+                match store.estimate_step(batch) {
+                    Ok(Some(rows)) => Ok((rows, false)),
+                    Ok(None) => store.retire_obsolete().map(|_| (0, true)),
+                    Err(bypass) => Err(bypass),
+                }
             } else {
                 Err(Bypass::WalPressure)
             }),

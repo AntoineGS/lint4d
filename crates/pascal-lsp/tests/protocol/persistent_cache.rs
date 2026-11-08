@@ -496,9 +496,12 @@ fn an_administrative_reset_fences_the_server_which_reopens() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    // The step observes `Fenced`; the next settle sees the reopened store.
+    // A step observes `Fenced`: this one (`stepped` false) or the
+    // scheduled one, whose first step after the open may run before or
+    // after the reset (then this one steps the reopened store). Either way
+    // the next settle sees the reopened store, fenced once.
     let stepped = settle(&mut server, true);
-    assert_eq!(stepped["stepped"], true, "{stepped}");
+    assert!(stepped["stepped"].is_boolean(), "{stepped}");
     let after = settle(&mut server, false);
     let status = &after["status"];
     assert_eq!(status["state"], "enabled", "{after}");

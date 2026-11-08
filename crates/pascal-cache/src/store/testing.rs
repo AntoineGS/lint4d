@@ -297,10 +297,15 @@ pub enum FaultPoint {
     VacuumBeforeCommit,
     /// Inside a namespace reset, before commit.
     ResetBeforeCommit,
+    /// In a namespace retirement pass, after it ranked the namespaces and
+    /// before it retires any; no connection is held.
+    NamespacesRanked,
+    /// Inside a namespace size estimate's read transaction, on a reader.
+    EstimateChunk,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -315,6 +320,8 @@ impl FaultPoint {
         Self::CheckpointCompleted,
         Self::VacuumBeforeCommit,
         Self::ResetBeforeCommit,
+        Self::NamespacesRanked,
+        Self::EstimateChunk,
     ];
 
     /// The points inside maintenance batches.
@@ -342,6 +349,8 @@ impl FaultPoint {
             Self::CheckpointCompleted => "CheckpointCompleted",
             Self::VacuumBeforeCommit => "VacuumBeforeCommit",
             Self::ResetBeforeCommit => "ResetBeforeCommit",
+            Self::NamespacesRanked => "NamespacesRanked",
+            Self::EstimateChunk => "EstimateChunk",
         }
     }
 

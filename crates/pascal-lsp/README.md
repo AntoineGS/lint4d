@@ -1399,11 +1399,20 @@ after any source change starts with an empty namespace. The store keeps the
 three most recently used namespaces (`persistentCacheMaxNamespaces`), so
 switching between two builds on one machine (an installed server and a
 development build, say) reopens each one's entries. A namespace is used when a
-server opens or closes it. A server retires the namespaces beyond that count
-when it opens the store and during maintenance, least recently used first;
-while the store is over its disk budget it also retires kept ones, least
-recently used first, until what it retires covers the excess. It never retires
-a namespace a running server holds. `--cache-status` lists them.
+server opens or closes it, and once a minute while it is open, so a server
+that crashed after a long session still counts as recently used; a time in
+the future (a clock that ran ahead, a copied directory) counts as now. A
+server retires the namespaces beyond that count when it opens the store and
+during maintenance, least recently used first. While the store needs space,
+over its disk budget or with less than 256 MiB free on its filesystem
+(whatever filled it: the cache gives disk back), maintenance also retires
+kept ones, least recently used first, until their estimated sizes cover the
+excess. Sizes are estimated by background maintenance in short steps, only
+for namespaces no server holds, and recorded beside their lock files
+(`namespaces/<hex>.size`); opening the store never reads them, so an
+over-budget store waits for maintenance. An estimate leaves out index
+overhead, so a pass may retire one namespace more than needed. It never
+retires a namespace a running server holds. `--cache-status` lists them.
 
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
 files), where `<N>` is the store's container version, currently
@@ -1529,7 +1538,7 @@ are dropped first, then anchors are cut.
 | `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
 | `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
 | `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
-| `persistentCacheMaxNamespaces` | 3 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries |
+| `persistentCacheMaxNamespaces` | 3 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries. Above 16 it is clamped here, while `--cache-max-namespaces` rejects it |
 | `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
 
 The limits can be lowered, not raised. In `initializationOptions`, a value
@@ -1676,7 +1685,9 @@ pascal-lsp --cache-prune --cache-max-namespaces 1   # keep only this build's ent
 ```
 
 The modes that open the store (all but status) retire namespaces like a
-server, keeping `--cache-max-namespaces N` (1 to 16, default 3) of them.
+server, keeping `--cache-max-namespaces N` (1 to 16, default 3) of them. A
+value outside that range is a usage error, while the initialization option
+clamps one above 16.
 
 Exit codes: `0` done (an absent store, including an empty directory, is
 success), `1` refused or failed (the JSON has an `error` field with `bypass`,
@@ -1689,9 +1700,13 @@ directory longer than 2,048 escaped bytes is cut in the output and
   `namespaces.list` has one entry per live namespace, most recently used
   first: `id` (the namespace hex), `current` (this command's build),
   `resetEpoch`, `lastUsed` (Unix seconds, `null` without a lock file),
-  `estimatedBytes` (its rows' content plus 64 bytes per row) and `held` (a
-  running server holds a live lease in it). At most 16 are listed, fewer if
-  the line would pass 4 KiB; `listTruncated` says so. A store in
+  `estimatedBytes` (the size maintenance last estimated for this epoch, its
+  rows' content plus 64 bytes per row; `null` until a maintenance pass
+  estimated it, which happens only while no server holds it) and `held` (a
+  running process holds its lock, as retirement sees it: the lock is tried
+  once without waiting). At most 16 are listed, fewer if the line would pass
+  4 KiB; `listTruncated` says so. Of more than 256 live namespaces, the 256
+  most recently used are considered. A store in
   a directory that is not private is refused and left unchanged.
 - **Prune** repeats maintenance cycles until a full cycle leaves the store
   within its headroom (`withinBudget`), a full cycle changes nothing

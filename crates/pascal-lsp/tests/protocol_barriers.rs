@@ -19,3 +19,6 @@ mod persistent_index;
 
 #[path = "protocol/persistent_queries.rs"]
 mod persistent_queries;
+
+#[path = "protocol/persistent_acceptance.rs"]
+mod persistent_acceptance;

@@ -74,7 +74,7 @@ pub(super) fn query_fixture(environment: &Path, spec: &FixtureSpec) -> PathBuf {
     root
 }
 
-fn launch_labelled(environment: &Path, cache: &str, label: &str) -> TestServer {
+pub(super) fn launch_labelled(environment: &Path, cache: &str, label: &str) -> TestServer {
     let cache_home = environment.join(cache);
     let trace = std::env::var("PASCAL_LSP_TRACE")
         .ok()
@@ -89,7 +89,7 @@ fn launch_labelled(environment: &Path, cache: &str, label: &str) -> TestServer {
     TestServer::launch_test_server_with_environment_path_and_variables(environment, variables)
 }
 
-fn open_disk(server: &mut TestServer, root: &Path, opens: &[&str]) {
+pub(super) fn open_disk(server: &mut TestServer, root: &Path, opens: &[&str]) {
     for relative in opens {
         let path = root.join(relative);
         server.send_notification(
@@ -270,7 +270,7 @@ pub(super) fn symbols_with_notes(
     (result.as_array().cloned().unwrap_or_default(), gaps(server))
 }
 
-const OPENS: [&str; 2] = ["App.dpr", "lib/Shared.pas"];
+pub(super) const OPENS: [&str; 2] = ["App.dpr", "lib/Shared.pas"];
 
 const SPEC: FixtureSpec = FixtureSpec {
     units: 500,
@@ -731,7 +731,7 @@ fn synthetic_warm_query_latency() {
 /// A read-only query of the differential matrix; paths are relative to the
 /// server's root.
 #[derive(Clone, Copy)]
-enum Query {
+pub(super) enum Query {
     References(&'static str, u32, u32),
     Symbols(&'static str),
 }
@@ -739,7 +739,7 @@ enum Query {
 /// A query's sorted locations (whole symbols for `workspace/symbol`), its
 /// completeness and the coverage notes that qualify it.
 #[derive(Debug, PartialEq, Eq)]
-struct Answer {
+pub(super) struct Answer {
     locations: Vec<String>,
     complete: bool,
     notes: Vec<String>,
@@ -775,7 +775,7 @@ fn answer(server: &mut TestServer, root: &Path, query: Query) -> Answer {
     }
 }
 
-fn answers(server: &mut TestServer, root: &Path, queries: &[Query]) -> Vec<Answer> {
+pub(super) fn answers(server: &mut TestServer, root: &Path, queries: &[Query]) -> Vec<Answer> {
     queries
         .iter()
         .map(|query| answer(server, root, *query))
@@ -794,7 +794,12 @@ fn persist_and_stop(environment: &Path, root: &Path, options: &Value, opens: &[&
 
 /// A server over the shared store once its index is `complete` and its
 /// background work settled.
-fn cached_server(environment: &Path, root: &Path, options: &Value, opens: &[&str]) -> TestServer {
+pub(super) fn cached_server(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+) -> TestServer {
     let mut server = launch_labelled(environment, "cache", "differential-cached");
     server.initialize(root, options.clone());
     open_disk(&mut server, root, opens);
@@ -805,7 +810,7 @@ fn cached_server(environment: &Path, root: &Path, options: &Value, opens: &[&str
 
 /// The answers of a persistence-disabled server on the same tree once its
 /// index is complete.
-fn uncached_answers(
+pub(super) fn uncached_answers(
     environment: &Path,
     root: &Path,
     options: &Value,
@@ -831,7 +836,7 @@ fn differential(
     differential_with(environment, root, &Value::Null, opens, mutate, queries)
 }
 
-fn differential_with(
+pub(super) fn differential_with(
     environment: &Path,
     root: &Path,
     options: &Value,
@@ -839,16 +844,80 @@ fn differential_with(
     mutate: impl Fn(&Path),
     queries: &[Query],
 ) -> (Vec<Answer>, Vec<Answer>) {
-    persist_and_stop(environment, root, options, opens);
-    mutate(root);
-    let mut cached = cached_server(environment, root, options, opens);
-    let warm = answers(&mut cached, root, queries);
-    shutdown(cached);
-    let cold = uncached_answers(environment, root, options, opens, queries);
-    (warm, cold)
+    let run = differential_run(environment, root, options, opens, mutate, queries, false);
+    (run.warm, run.uncached)
 }
 
-const MATRIX: FixtureSpec = FixtureSpec {
+/// The three servers of one differential: the persisting first server on
+/// the unmutated tree, the warm second server and a persistence-disabled
+/// server, both on the mutated tree.
+pub(super) struct Differential {
+    pub(super) cold: Vec<Answer>,
+    pub(super) warm: Vec<Answer>,
+    pub(super) uncached: Vec<Answer>,
+    pub(super) warm_status: Value,
+}
+
+/// Spec §12.1: an uncached run on the original tree, a persisting server
+/// whose answers must equal it, `mutate` applied while that server is
+/// stopped, then the cached second server and an uncached run on the
+/// mutated tree.
+pub(super) fn differential_full(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+) -> Differential {
+    differential_run(environment, root, options, opens, mutate, queries, true)
+}
+
+/// `check_cold` also queries the unmutated tree; it is off for mutations
+/// that create the very files the queries address, which the original tree
+/// cannot answer (`cold` is then empty).
+fn differential_run(
+    environment: &Path,
+    root: &Path,
+    options: &Value,
+    opens: &[&str],
+    mutate: impl Fn(&Path),
+    queries: &[Query],
+    check_cold: bool,
+) -> Differential {
+    let original = if check_cold {
+        uncached_answers(environment, root, options, opens, queries)
+    } else {
+        Vec::new()
+    };
+    let mut first = launch_labelled(environment, "cache", "differential-first");
+    first.initialize(root, options.clone());
+    open_disk(&mut first, root, opens);
+    wait_index(&mut first, persisted);
+    let cold = if check_cold {
+        answers(&mut first, root, queries)
+    } else {
+        Vec::new()
+    };
+    shutdown(first);
+    if check_cold {
+        assert_agree(&cold, &original);
+    }
+    mutate(root);
+    let mut cached = cached_server(environment, root, options, opens);
+    let warm_status = wait_index(&mut cached, complete);
+    let warm = answers(&mut cached, root, queries);
+    shutdown(cached);
+    let uncached = uncached_answers(environment, root, options, opens, queries);
+    Differential {
+        cold,
+        warm,
+        uncached,
+        warm_status,
+    }
+}
+
+pub(super) const MATRIX: FixtureSpec = FixtureSpec {
     units: 60,
     importers: 5,
     with_include_every: 10,
@@ -856,9 +925,9 @@ const MATRIX: FixtureSpec = FixtureSpec {
     shared_name: "TShared",
 };
 
-const SHARED_REFERENCES: Query = Query::References("lib/Shared.pas", 2, 6);
+pub(super) const SHARED_REFERENCES: Query = Query::References("lib/Shared.pas", 2, 6);
 
-fn assert_agree(warm: &[Answer], cold: &[Answer]) {
+pub(super) fn assert_agree(warm: &[Answer], cold: &[Answer]) {
     assert_eq!(warm, cold, "cached and uncached answers agree");
     assert!(
         warm.iter().all(|answer| answer.complete),
@@ -866,7 +935,26 @@ fn assert_agree(warm: &[Answer], cold: &[Answer]) {
     );
 }
 
-fn locates(answer: &Answer, file: &str, line: u32, character: u32) -> bool {
+/// A documented-limit differential: a complete warm answer equals the
+/// uncached one; a partial one only lists uncached locations and says why.
+pub(super) fn assert_truthful(warm: &[Answer], uncached: &[Answer]) {
+    assert_eq!(warm.len(), uncached.len());
+    for (warm, uncached) in warm.iter().zip(uncached) {
+        if warm.complete {
+            assert_eq!(warm, uncached, "a complete answer equals the uncached one");
+        } else {
+            assert!(
+                warm.locations
+                    .iter()
+                    .all(|location| uncached.locations.contains(location)),
+                "partial answer {warm:?} exceeds uncached {uncached:?}"
+            );
+            assert!(!warm.notes.is_empty(), "a partial answer carries notes");
+        }
+    }
+}
+
+pub(super) fn locates(answer: &Answer, file: &str, line: u32, character: u32) -> bool {
     answer
         .locations
         .iter()
@@ -875,7 +963,7 @@ fn locates(answer: &Answer, file: &str, line: u32, character: u32) -> bool {
 
 /// A same-size rewrite that keeps the file's modification time, as one
 /// within one timestamp tick or a restoring tool would.
-fn rewrite_keeping_the_stamp(path: &Path, text: &str) {
+pub(super) fn rewrite_keeping_the_stamp(path: &Path, text: &str) {
     let metadata = fs::metadata(path).unwrap();
     assert_eq!(metadata.len(), text.len() as u64, "same size");
     fs::write(path, text).unwrap();

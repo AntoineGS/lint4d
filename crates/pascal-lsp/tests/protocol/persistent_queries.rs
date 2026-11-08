@@ -681,7 +681,7 @@ fn an_unsaved_buffer_overrides_persisted_postings_both_ways() {
     shutdown(cold);
 }
 
-fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
+pub(super) fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();
     let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction).round() as usize];
     (at(0.5), at(0.95))
@@ -690,6 +690,8 @@ fn percentiles(mut samples: Vec<Duration>) -> (Duration, Duration) {
 /// Spec §12.2: synthetic numbers only, no time assertion. Run with
 /// `cargo test --release -p pascal-lsp --features test-support --test
 /// protocol_barriers synthetic_warm_query_latency -- --ignored --nocapture`.
+/// `synthetic_acceptance_record` in `persistent_acceptance.rs` supersedes it
+/// as the record.
 #[test]
 #[ignore = "release measurement"]
 fn synthetic_warm_query_latency() {

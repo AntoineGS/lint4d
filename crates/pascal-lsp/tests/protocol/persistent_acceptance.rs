@@ -1140,3 +1140,227 @@ fn rename_on_a_warm_server_edits_like_an_uncached_one() {
         run.warm_status
     );
 }
+
+/// `VmHWM` (KiB) from `/proc/<pid>/status` and `write_bytes` and `rchar`
+/// from `/proc/<pid>/io` of the server process; read just before shutdown,
+/// after `settle_background`, so the measurement adds no work of its own.
+fn process_peaks(server: &TestServer) -> (u64, u64, u64) {
+    let pid = server.child.id();
+    let field = |file: &str, name: &str| -> u64 {
+        fs::read_to_string(format!("/proc/{pid}/{file}"))
+            .unwrap_or_else(|error| panic!("read /proc/{pid}/{file}: {error}"))
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| {
+                rest.trim_start_matches(':')
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("{name} missing from /proc/{pid}/{file}"))
+    };
+    (
+        field("status", "VmHWM"),
+        field("io", "write_bytes"),
+        field("io", "rchar"),
+    )
+}
+
+/// The sizes in bytes of the analysis store's database and write-ahead log
+/// under `<environment>/<cache>`.
+fn store_sizes(environment: &Path, cache: &str) -> (u64, u64) {
+    let directory = environment.join(cache).join("lint4d/analysis");
+    let (mut database, mut wal) = (0, 0);
+    for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if name.starts_with("analysis-v") && name.ends_with(".sqlite3") {
+            database += size;
+        } else if name.starts_with("analysis-v") && name.ends_with(".sqlite3-wal") {
+            wal += size;
+        }
+    }
+    (database, wal)
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.total_cmp(b));
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        (values[middle - 1] + values[middle]) / 2.0
+    }
+}
+
+/// One JSON line on stdout and, when `PASCAL_LSP_ACCEPTANCE_RECORD` names a
+/// file, appended to it.
+fn emit(record: Value) {
+    println!("{record}");
+    if let Ok(path) = std::env::var("PASCAL_LSP_ACCEPTANCE_RECORD") {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open the acceptance record");
+        writeln!(file, "{record}").expect("append to the acceptance record");
+    }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn sample_summary(samples: &[Duration]) -> Value {
+    let (p50, p95) = percentiles(samples.to_vec());
+    let (rest50, rest95) = percentiles(samples[1..].to_vec());
+    json!({
+        "all": {"p50_ms": millis(p50), "p95_ms": millis(p95)},
+        "after_first": {"p50_ms": millis(rest50), "p95_ms": millis(rest95)},
+        "first_ms": millis(samples[0]),
+    })
+}
+
+/// Spec §12.2: the synthetic acceptance record (supersedes
+/// `synthetic_warm_query_latency`), numbers only. Five paired cold builds of
+/// the 5,000-unit fixture (persistence on to `persisted`, off to `complete`,
+/// each on a fresh store), then a warm server on the last store with 30
+/// reference and 30 symbol samples. One JSON object per line on stdout and
+/// in `PASCAL_LSP_ACCEPTANCE_RECORD`. Run with `cargo test --release
+/// --features test-support --test protocol_barriers
+/// synthetic_acceptance_record -- --ignored --nocapture`.
+#[test]
+#[ignore = "release measurement"]
+fn synthetic_acceptance_record() {
+    const LARGE: FixtureSpec = FixtureSpec {
+        units: 5_000,
+        importers: 20,
+        with_include_every: 10,
+        unresolved_includes: 50,
+        shared_name: "TShared",
+    };
+    const PAIRS: usize = 5;
+    const RUNS: usize = 30;
+    const KIB_PER_MIB: f64 = 1024.0;
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &LARGE);
+    let shared = root.join("lib/Shared.pas");
+    let (mut ratios, mut deltas) = (Vec::new(), Vec::new());
+    let mut uncached = None;
+    for pair in 0..PAIRS {
+        let cache = format!("cache-{pair}");
+        let started = Instant::now();
+        let mut on = launch_labelled(environment.path(), &cache, "record-on");
+        on.initialize(&root, Value::Null);
+        open_disk(&mut on, &root, &OPENS);
+        let done = wait_index(&mut on, persisted);
+        let on_seconds = started.elapsed().as_secs_f64();
+        settle_background(&mut on);
+        let (on_hwm, on_written, on_read) = process_peaks(&on);
+        let (running_db, running_wal) = store_sizes(environment.path(), &cache);
+        shutdown(on);
+        let (stopped_db, stopped_wal) = store_sizes(environment.path(), &cache);
+
+        let started = Instant::now();
+        let mut off = launch_labelled(environment.path(), "cold-cache", "record-off");
+        off.initialize(&root, json!({"persistentCacheEnabled": false}));
+        open_disk(&mut off, &root, &OPENS);
+        wait_index(&mut off, complete);
+        let off_seconds = started.elapsed().as_secs_f64();
+        settle_background(&mut off);
+        let (off_hwm, ..) = process_peaks(&off);
+        if pair + 1 == PAIRS {
+            let mut symbols = symbols_with_notes(&mut off, LARGE.shared_name).0;
+            symbols.sort_by_key(Value::to_string);
+            uncached = Some((references(&mut off, &shared, 2, 6), symbols));
+        }
+        shutdown(off);
+
+        let ratio = on_seconds / off_seconds;
+        let hwm_delta = (on_hwm as f64 - off_hwm as f64) / KIB_PER_MIB;
+        ratios.push(ratio);
+        deltas.push(hwm_delta);
+        emit(json!({
+            "record": "cold_pair",
+            "pair": pair,
+            "units": LARGE.units,
+            "on": {
+                "seconds_to_persisted": on_seconds,
+                "vmhwm_mib": on_hwm as f64 / KIB_PER_MIB,
+                "write_bytes": on_written,
+                "rchar": on_read,
+                "store_running": {"db_bytes": running_db, "wal_bytes": running_wal},
+                "store_stopped": {"db_bytes": stopped_db, "wal_bytes": stopped_wal},
+                "extracted": done["extracted"],
+            },
+            "off": {"seconds_to_complete": off_seconds, "vmhwm_mib": off_hwm as f64 / KIB_PER_MIB},
+            "ratio_on_off": ratio,
+            "vmhwm_delta_mib": hwm_delta,
+        }));
+    }
+
+    let cache = format!("cache-{}", PAIRS - 1);
+    let started = Instant::now();
+    let mut warm = launch_labelled(environment.path(), &cache, "record-warm");
+    warm.initialize(&root, Value::Null);
+    open_disk(&mut warm, &root, &OPENS);
+    let done = wait_index(&mut warm, complete);
+    let warm_seconds = started.elapsed().as_secs_f64();
+    let counters = metrics(&mut warm);
+    let reuse = delta(counters, [0; 12]);
+    assert_eq!(done["extracted"], 0, "{done}");
+
+    let mut reference_samples = Vec::new();
+    let mut symbol_samples = Vec::new();
+    let mut first_answers = None;
+    for run in 0..RUNS {
+        let started = Instant::now();
+        let found = references(&mut warm, &shared, 2, 6);
+        reference_samples.push(started.elapsed());
+        gaps(&mut warm);
+        let started = Instant::now();
+        let mut symbols = symbols_with_notes(&mut warm, LARGE.shared_name).0;
+        symbol_samples.push(started.elapsed());
+        if run == 0 {
+            symbols.sort_by_key(Value::to_string);
+            first_answers = Some((found, symbols));
+        }
+    }
+    assert_eq!(
+        first_answers, uncached,
+        "warm answers equal the uncached ones"
+    );
+    settle_background(&mut warm);
+    let status = request(&mut warm, "pascal/cacheStatus", json!({}));
+    let (hwm, written, read) = process_peaks(&warm);
+    shutdown(warm);
+    emit(json!({
+        "record": "warm",
+        "seconds_to_complete": warm_seconds,
+        "reused": done["reused"],
+        "extracted": done["extracted"],
+        "reuse_pass_counters": {
+            "parses": reuse[5],
+            "payload_read_attempts": reuse[0],
+            "payload_bytes": reuse[1],
+            "stamp_probes": reuse[3],
+            "legacy_hash_bytes": reuse[4],
+            "import_binding_calls": reuse[8],
+            "import_binding_pairs": reuse[9],
+        },
+        "cache_status": {"counters": status["counters"], "maintenance": status["maintenance"]},
+        "references": sample_summary(&reference_samples),
+        "symbols": sample_summary(&symbol_samples),
+        "vmhwm_mib": hwm as f64 / KIB_PER_MIB,
+        "write_bytes": written,
+        "rchar": read,
+    }));
+    emit(json!({
+        "record": "summary",
+        "pairs": PAIRS,
+        "median_ratio_on_off": median(ratios),
+        "median_vmhwm_delta_mib": median(deltas),
+    }));
+}

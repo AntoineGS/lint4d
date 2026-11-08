@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 /// The database of this container version. An incompatible container gets
 /// a new name, so a new build opens a fresh file beside the old one, which
 /// is left in place for an administrator to delete; a running server never
-/// deletes it (R9-3). Container 4 and earlier used `analysis.sqlite3`.
-pub const DATABASE_FILE: &str = "analysis-v6.sqlite3";
+/// deletes it (R9-3). Container 4 and earlier used `analysis.sqlite3`,
+/// container 5 `analysis-v5.sqlite3` and container 6 `analysis-v6.sqlite3`.
+pub const DATABASE_FILE: &str = "analysis-v7.sqlite3";
 const NAMESPACE_LOCKS: &str = "namespaces";
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
@@ -482,9 +483,9 @@ mod tests {
         assert_eq!(
             location.database_files(),
             [
-                root.path().join("cache/analysis-v6.sqlite3"),
-                root.path().join("cache/analysis-v6.sqlite3-wal"),
-                root.path().join("cache/analysis-v6.sqlite3-shm"),
+                root.path().join("cache/analysis-v7.sqlite3"),
+                root.path().join("cache/analysis-v7.sqlite3-wal"),
+                root.path().join("cache/analysis-v7.sqlite3-shm"),
             ]
         );
     }

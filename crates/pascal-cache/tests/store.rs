@@ -179,7 +179,7 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
         for ordinal in 0..rows {
             connection
                 .execute(
-                    "INSERT INTO artifact_rows VALUES (?1, ?2, 1, NULL, x'')",
+                    "INSERT INTO artifact_rows VALUES (?1, ?2, 0, 1, NULL, x'')",
                     params![artifact_ref, ordinal],
                 )
                 .unwrap();

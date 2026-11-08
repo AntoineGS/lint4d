@@ -16,3 +16,6 @@ mod persistent_cache_in_root;
 
 #[path = "protocol/persistent_index.rs"]
 mod persistent_index;
+
+#[path = "protocol/persistent_queries.rs"]
+mod persistent_queries;

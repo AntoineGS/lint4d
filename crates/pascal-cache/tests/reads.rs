@@ -299,8 +299,10 @@ fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
     let header = publish(&store, &key("unit A;"), &small(256));
     raw(root.path())
         .execute(
-            "INSERT INTO artifact_rows (artifact_ref, ordinal, row_kind, index_key, payload) \
-             SELECT artifact_ref, 256, 1, NULL, x'00' FROM artifact_rows WHERE ordinal = 0",
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             SELECT artifact_ref, 256, scope_ref, 1, NULL, x'00' FROM artifact_rows \
+             WHERE ordinal = 0",
             [],
         )
         .unwrap();
@@ -446,6 +448,7 @@ fn index_lookup_uses_the_index_without_sorting() {
                 0i64,
                 -1i64,
                 257i64,
+                1i64,
                 1i64
             ],
             |row| row.get::<_, String>(3),
@@ -454,8 +457,147 @@ fn index_lookup_uses_the_index_without_sorting() {
         .collect::<Result<_, _>>()
         .unwrap();
     let plan = plan.join("\n");
-    assert!(plan.contains("artifact_rows_by_index_key"), "{plan}");
+    assert!(
+        plan.contains("artifact_rows_by_index_key (scope_ref=? AND row_kind=? AND index_key=?"),
+        "{plan}"
+    );
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+}
+
+fn namespace_id(fingerprint: u8) -> [u8; 32] {
+    *Namespace::new(Digest::from_bytes([fingerprint; 32]))
+        .id()
+        .as_bytes()
+}
+
+/// l4d-rpfc: the name index is scope-led, so another scope's rows under the
+/// same key are never visited, and never returned.
+#[test]
+fn index_lookup_never_visits_another_scopes_rows() {
+    let root = private_tempdir();
+    let ours = open(root.path(), StoreLimits::default()); // Namespace [1; 32]
+    let theirs = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([8; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let mine = publish_named(&ours, "unit A;", &[b"tfoo"]);
+    let id = namespace_id(1);
+    let steps = |directory: &Path| -> i32 {
+        let connection = raw(directory);
+        let scope_ref: i64 = connection
+            .query_row(
+                "SELECT scope_ref FROM scopes WHERE namespace_id = ?1 AND reset_epoch = 0",
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(pascal_cache::INDEX_QUERY_FOR_TEST)
+            .unwrap();
+        let rows = statement
+            .query_map(
+                params![
+                    id.as_slice(),
+                    0i64,
+                    1i64,
+                    b"tfoo".as_slice(),
+                    0i64,
+                    -1i64,
+                    257i64,
+                    1i64,
+                    scope_ref
+                ],
+                |_| Ok(()),
+            )
+            .unwrap()
+            .count();
+        assert_eq!(rows, 1);
+        statement.get_status(rusqlite::StatementStatus::VmStep)
+    };
+    // One row of theirs already follows ours in the index, so both counts
+    // include the step that reads past the end of our range.
+    publish_named(&theirs, "unit B;", &[b"tfoo"]);
+    let before = steps(root.path());
+    let names: Vec<&[u8]> = vec![b"tfoo"; 20];
+    for index in 0..300 {
+        publish_named(&theirs, &format!("unit B{index};"), &names);
+    }
+    assert_eq!(
+        steps(root.path()),
+        before,
+        "6,000 rows of another scope were visited"
+    );
+    let page = ours.find_by_index(1, b"tfoo", None, 256).unwrap();
+    assert_eq!(
+        page.hits,
+        vec![IndexHit {
+            artifact_id: mine,
+            ordinal: 0
+        }]
+    );
+    assert_eq!(page.next, None);
+}
+
+/// l4d-rpfc: `scope_ref` has no foreign key. A row whose ref names another
+/// scope, or none, is hidden from both scopes, never returned to the wrong one.
+#[test]
+fn a_wrong_scope_ref_hides_a_row_and_never_leaks_it() {
+    let root = private_tempdir();
+    let ours = open(root.path(), StoreLimits::default());
+    let theirs = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([8; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let mine = publish_named(&ours, "unit A;", &[b"tfoo"]);
+    let other = publish_named(&theirs, "unit B;", &[b"tfoo"]);
+    let theirs_ref: i64 = raw(root.path())
+        .query_row(
+            "SELECT scope_ref FROM scopes WHERE namespace_id = ?1",
+            [namespace_id(8).as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let only = |id: Digest| {
+        vec![IndexHit {
+            artifact_id: id,
+            ordinal: 0,
+        }]
+    };
+    for wrong in [theirs_ref, 1_000_000] {
+        raw(root.path())
+            .execute(
+                "UPDATE artifact_rows SET scope_ref = ?1 WHERE artifact_ref = \
+                 (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2)",
+                params![wrong, mine.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(
+            ours.find_by_index(1, b"tfoo", None, 256)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            theirs.find_by_index(1, b"tfoo", None, 256).unwrap().hits,
+            only(other),
+            "{wrong}"
+        );
+    }
+}
+
+/// l4d-rpfc: a scope with no `scopes` row never published an artifact, so
+/// its lookup is the empty last page.
+#[test]
+fn index_lookup_in_a_scope_without_artifacts_is_an_empty_last_page() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let page = store.find_by_index(1, b"tfoo", None, 256).unwrap();
+    assert!(page.hits.is_empty());
+    assert_eq!(page.next, None);
 }
 
 #[test]
@@ -706,9 +848,10 @@ fn reordered_duplicated_and_missing_rows_are_misses() {
         ),
         // One row duplicated past the end.
         (
-            "INSERT INTO artifact_rows (artifact_ref, ordinal, row_kind, index_key, payload) \
-             SELECT artifact_ref, 10, row_kind, index_key, payload FROM artifact_rows \
-             WHERE ordinal = 9",
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             SELECT artifact_ref, 10, scope_ref, row_kind, index_key, payload \
+             FROM artifact_rows WHERE ordinal = 9",
             Miss::Malformed(Malformed::Count),
         ),
         // A row in the middle, the first or the last missing.

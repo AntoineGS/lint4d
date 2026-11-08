@@ -100,7 +100,9 @@ pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
 #[cfg(test)]
 pub(crate) use symbols::test_set_symbol_result_cap;
-pub(crate) use symbols::{lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap};
+pub(crate) use symbols::{
+    WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
+};
 mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
@@ -977,6 +979,15 @@ impl NavigationIndex {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<lsp_types::SymbolInformation>, String> {
         symbols::workspace_symbols_with_cancel(self, query, cancel)
+    }
+
+    /// `uri`'s workspace symbols for every query, when it is indexed.
+    pub(crate) fn workspace_symbol_list(
+        &self,
+        uri: &Url,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<WorkspaceSymbolList>, String> {
+        WorkspaceSymbolList::of(self, uri, cancel)
     }
 
     pub(crate) fn flatten_document_symbols(

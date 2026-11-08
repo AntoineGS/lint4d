@@ -593,7 +593,7 @@ mod tests {
         write(&root.join("Main.pas"));
         let store = root.join(".cache/lint4d/analysis");
         fs::create_dir_all(store.join("namespaces")).unwrap();
-        fs::write(store.join("analysis-v6.sqlite3"), b"").unwrap();
+        fs::write(store.join("analysis-v7.sqlite3"), b"").unwrap();
         fs::write(store.join("namespaces/0123.lock"), b"").unwrap();
         let cache = crate::persistent_cache::CacheExclusion::new(&store);
 

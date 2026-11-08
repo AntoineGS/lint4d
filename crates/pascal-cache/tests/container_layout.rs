@@ -3,8 +3,9 @@
 //! name, artifact rows hang off an INTEGER surrogate and observations are
 //! stored once per content and shared by the evidence sets that list them.
 //! Container 6 (13d-3) stores no per-row checksum: the fact checksum of the
-//! whole artifact verifies its rows. Identities, fact checksums and
-//! integrity checks are those of container 4.
+//! whole artifact verifies its rows. Container 7 (l4d-zf1b.9, l4d-rpfc)
+//! leads the name index with an integer scope surrogate. Identities, fact
+//! checksums and integrity checks are those of container 4.
 
 mod common;
 
@@ -98,8 +99,8 @@ fn read_set(store: &Store, id: Digest) -> Result<Vec<Observation>, Miss> {
 
 #[test]
 fn the_database_file_name_carries_the_container_version() {
-    assert_eq!(CONTAINER_VERSION, 6);
-    assert_eq!(DATABASE_FILE, "analysis-v6.sqlite3");
+    assert_eq!(CONTAINER_VERSION, 7);
+    assert_eq!(DATABASE_FILE, "analysis-v7.sqlite3");
     assert_eq!(
         DATABASE_FILE,
         format!("analysis-v{CONTAINER_VERSION}.sqlite3")
@@ -114,6 +115,7 @@ fn previous_container_files_beside_are_left_untouched() {
     let olds = [
         (root.path().join("analysis.sqlite3"), 4),
         (root.path().join("analysis-v5.sqlite3"), 5),
+        (root.path().join("analysis-v6.sqlite3"), 6),
     ];
     let mut before = Vec::new();
     for (old, version) in &olds {
@@ -288,9 +290,10 @@ fn a_reset_reclaims_shared_content_and_rows_of_the_old_scope() {
 }
 
 /// Stored identities and fact checksums, as container 4 computed them: the
-/// layout changes of containers 5 and 6 leave every artifact ID, fact
+/// layout changes of containers 5 to 7 leave every artifact ID, fact
 /// checksum and evidence ID as it was. Only the storage projection
-/// changed: container 6 drops the per-row checksum column.
+/// changed: container 6 drops the per-row checksum column, container 7
+/// adds the scope surrogate.
 #[test]
 fn identities_and_checksums_are_those_of_container_4() {
     let root = private_tempdir();
@@ -337,6 +340,7 @@ fn identities_and_checksums_are_those_of_container_4() {
         [
             "artifact_ref",
             "ordinal",
+            "scope_ref",
             "row_kind",
             "index_key",
             "payload"

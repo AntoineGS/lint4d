@@ -1395,12 +1395,13 @@ never stored.
 
 **Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
 files), where `<N>` is the store's container version, currently
-`analysis-v6.sqlite3`. A build with an incompatible container opens a fresh
+`analysis-v7.sqlite3`. A build with an incompatible container opens a fresh
 file of its own version beside the old one, with no action needed. An old
-file (`analysis-v5.sqlite3`; container 4 and earlier: `analysis.sqlite3`) is
-never opened, changed or deleted by a newer server, because an older
-`pascal-lsp` may still use it; delete it once no such server runs. The `namespaces/` lock files and
-`maintenance.lock` are shared by every version.
+file (`analysis-v6.sqlite3`, `analysis-v5.sqlite3`; container 4 and earlier:
+`analysis.sqlite3`) is never opened, changed or deleted by a newer server,
+because an older `pascal-lsp` may still use it; delete it once no such server
+runs. The `namespaces/` lock files and `maintenance.lock` are shared by every
+version.
 
 #### Persistent indexing
 
@@ -1446,6 +1447,30 @@ validated, so the snapshot is never proof.
 
 Known limitation: an unsaved open `.dproj` gives the index a different
 context key, so its facts are not shared with the saved project.
+
+#### Indexed queries
+
+Once `pascal/indexStatus` reports a context `complete` (`pending` may equal
+`retrying`), warm `textDocument/references` and `workspace/symbol` select their
+candidate units from the persisted index instead of walking every member.
+Rename and code actions are unaffected: they always use the strict walk.
+
+- **Answers while the index is incomplete** are partial and carry notes, never
+  a silent drop. Gap texts: `N units of X are not indexed yet; M were searched
+  directly`, `N units of X failed to load for the index and are retried later`,
+  `N units of X have includes that do not resolve; they were not searched` and
+  `N candidate units were not searched: the analysis memory budget is
+  exhausted`.
+- **Exclusions are proven.** An unverified member is left out only when its raw
+  text (for references also its resolved include files; for symbols the raw
+  text only) cannot hold the name.
+- **Memory budget.** If a source a request requires is refused by the analysis
+  memory budget, the request fails with a retryable `ServerCancelled`.
+- **Open documents** are answered from their buffers, not from the index.
+  `workspace/symbol` reuses an open document's parse, including its include
+  declarations.
+- **Unit navigation.** `workspace/symbol` also lists units, as `SymbolKind`
+  `Module`, so a unit can be reached by name.
 
 `pascal/indexStatus` takes no parameters, performs no IO and returns at most
 8 KiB. It never contains member paths.
@@ -1572,14 +1597,19 @@ or paths of projects. The one path they contain is the cache directory itself.
 
 #### Disk use
 
-Container 6 keeps artifact rows under a 64-bit surrogate of their artifact,
-with a name index that repeats no 32-byte key and no per-row checksum (a read
-verifies every row against its artifact's checksum), and stores each
-distinct observation (a search-path listing, presence or payload) once,
-listed by every evidence set that made it; nothing is compressed. On a
-synthetic store shaped like a large workspace this is about 140 bytes per
-stored fact row (178 in container 5, 409 in container 4) and 40 bytes per
-observation (442 in container 4).
+Container 7 keeps artifact rows under a 64-bit surrogate of their artifact,
+with a name index led by a small integer surrogate of the row's scope that
+repeats no 32-byte key, and no per-row checksum (a read verifies every row
+against its artifact's checksum), and stores each distinct observation (a
+search-path listing, presence or payload) once, listed by every evidence set
+that made it; nothing is compressed. On a synthetic store shaped like a large
+workspace this is about 142 bytes per stored fact row (140 in container 6,
+178 in container 5, 409 in container 4) and 40 bytes per observation (442 in
+container 4).
+
+Container 7 adds a small integer scope to each artifact row and its name
+index (about 2 to 4 bytes per row) and the `binding_targets`
+reverse-dependency rows.
 
 The managed budget is 8 GiB for the database, WAL and shared-memory files
 together. The WAL is checkpointed once it passes 256 MiB. Both are targets for
@@ -1607,7 +1637,7 @@ least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
 | `directory` | The store directory, cut at 4,096 escaped bytes |
 | `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
 | `resetEpoch` | The namespace's reset counter while open |
-| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
+| `reservedBytes` | `pages`, `scratch`, `facts` and `queryTrees` (the candidate parses of the running references and workspace-symbol requests) charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
 | `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
 | `lockWaits` | Process-wide `poolWaits`, `lockWaits`, their `*Micros` totals and `busy` outcomes. Waits inside a statement after `BEGIN` are not measured |
 | `counters` | `hits`, `decodedBytes`, `misses` by cause (`input`, `version`, `freshness`, `budget`, `authorization`, `integrity`), non-zero `bypasses` by name, and `maintenance` (`steps`, `cycles`, `rows`, `skipped`) |

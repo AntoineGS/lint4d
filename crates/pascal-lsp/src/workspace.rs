@@ -129,9 +129,11 @@ pub(crate) mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+pub(crate) mod hydration;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
+pub(crate) mod lexical;
 #[cfg(test)]
 mod navigation_walk_tests;
 #[cfg(test)]
@@ -3135,11 +3137,15 @@ pub(crate) struct ExpansionRecord {
     pub(crate) physical_source: String,
     pub(crate) context_key: ContextKey,
     pub(crate) expanded: ExpandedSource,
-    pub(crate) source_texts: HashMap<Url, String>,
+    pub(crate) source_texts: Arc<HashMap<Url, String>>,
     pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
     pub(crate) include_observations: Vec<crate::include_expansion::IncludeObservation>,
     pub(crate) dependencies: HashSet<Url>,
     pub(crate) complete: bool,
+    /// What workspace symbols need to reuse the parse of this expansion of
+    /// an open document (D49), built once on first use.
+    pub(crate) projection:
+        std::sync::OnceLock<Option<Arc<crate::include_expansion::PhysicalProjection>>>,
 }
 
 impl WorkspaceRoot {
@@ -5694,7 +5700,7 @@ impl Workspace {
                 expansion
                     .expanded
                     .visit_recovery_payload(&mut charge_retained_payload)?;
-                for (uri, source) in &expansion.source_texts {
+                for (uri, source) in expansion.source_texts.iter() {
                     charge_retained_payload(uri.as_str().len())?;
                     charge_retained_payload(source.len())?;
                 }
@@ -8965,10 +8971,21 @@ impl Workspace {
             budget.check_cancelled()?;
         }
         if let (Some(claim), Some(parsed)) = (claim, self.index.parsed_document(uri)) {
-            let probes = cached_expansion
+            let mut probes = cached_expansion
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
+            // The expansion's root revision is the buffer's: a load of the
+            // closed file must not take it (its facts would never persist).
+            if cached_expansion.is_some()
+                && let Some(document) = self.open_documents.get(uri)
+            {
+                probes.push(crate::project_cache::Probe::Overlay {
+                    uri: canonical_file_uri(uri),
+                    version: document.version,
+                    content_hash: source_hash,
+                });
+            }
             let disk =
                 disk_origin.map(
                     |(stamp, raw_bytes, text)| crate::project_cache::DiskOrigin {
@@ -9254,11 +9271,12 @@ impl Workspace {
                 physical_source,
                 context_key: context_key.clone(),
                 expanded: result.expanded,
-                source_texts,
+                source_texts: Arc::new(source_texts),
                 dependency_entries,
                 include_observations,
                 dependencies,
                 complete: result.complete,
+                projection: std::sync::OnceLock::new(),
             },
         );
         check_workspace_cancel(cancel)?;
@@ -9322,8 +9340,9 @@ impl Workspace {
         let dependency_entries = expansion.dependency_entries.clone();
         let mut dependencies = expansion
             .source_texts
-            .into_iter()
-            .filter(|(uri, _)| uri != root_uri)
+            .iter()
+            .filter(|(uri, _)| *uri != root_uri)
+            .map(|(uri, source)| (uri.clone(), source.clone()))
             .collect::<Vec<_>>();
         dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         for (uri, source) in dependencies {
@@ -16922,7 +16941,8 @@ fn wait_at_import_claim_test_barrier() {
 /// work (diagnostics, `PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER`) so protocol
 /// tests can issue interactive work while it runs, or the warm crawl
 /// (`PASCAL_LSP_TEST_WARM_CRAWL_BARRIER`) once it has analysed and published
-/// exactly `units` units.
+/// exactly `units` units; a reuse batch
+/// (`PASCAL_LSP_TEST_REUSE_PASS_BARRIER`) once it has reused `units` members.
 #[cfg(feature = "test-support")]
 fn wait_at_walk_test_barrier(variable: &str, index: usize) {
     use std::io::Write as _;
@@ -18193,11 +18213,12 @@ mod tests {
                     physical_source: String::new(),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
         }
@@ -18361,11 +18382,12 @@ mod tests {
                     physical_source: format!("unit Root{index};"),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
             workspace
@@ -18740,6 +18762,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: context.into(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18781,6 +18804,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: Arc::default(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18811,11 +18835,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: key,
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18846,11 +18871,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: budget_test_context_key(0),
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));

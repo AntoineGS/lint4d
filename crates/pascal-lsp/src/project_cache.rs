@@ -4371,6 +4371,7 @@ pub(crate) struct CacheStats {
     pub reserved_index_bytes: usize,
     pub reserved_provider_graph_bytes: usize,
     pub reserved_publication_bytes: usize,
+    pub reserved_query_trees_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4383,6 +4384,7 @@ impl CacheStats {
             .saturating_add(self.reserved_index_bytes)
             .saturating_add(self.reserved_provider_graph_bytes)
             .saturating_add(self.reserved_publication_bytes)
+            .saturating_add(self.reserved_query_trees_bytes)
     }
 }
 
@@ -4409,10 +4411,13 @@ pub(crate) enum ReservationKind {
     ProviderGraphs,
     /// A member publication's transient buffers (`reserve_publication`).
     Publication,
+    /// Candidate trees an indexed query parses that no cache lease charges
+    /// (`workspace::hydration`, R9-8).
+    QueryTrees,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     fn index(self) -> usize {
         match self {
@@ -4423,6 +4428,7 @@ impl ReservationKind {
             Self::WorkspaceIndex => 4,
             Self::ProviderGraphs => 5,
             Self::Publication => 6,
+            Self::QueryTrees => 7,
         }
     }
 }
@@ -6557,6 +6563,7 @@ impl ProjectCache {
             reserved_index_bytes: state.reserved[ReservationKind::WorkspaceIndex.index()],
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
             reserved_publication_bytes: state.reserved[ReservationKind::Publication.index()],
+            reserved_query_trees_bytes: state.reserved[ReservationKind::QueryTrees.index()],
         }
     }
 
@@ -7215,14 +7222,44 @@ struct StoredIndex {
     /// The kind of input the first `unprovable` member of this process
     /// read without a capture (`Workspace::uncaptured_input`).
     unprovable_kind: Option<&'static str>,
+    /// The references proof's lexical summaries of members (Task 8d),
+    /// charged with the index.
+    summaries: crate::workspace::lexical::LexicalSummaries,
 }
 
 impl StoredIndex {
     fn total_charge(&self) -> usize {
-        self.charged.saturating_add(self.index.bytes())
+        self.charged
+            .saturating_add(self.index.bytes())
+            .saturating_add(self.summaries.bytes())
     }
 
     /// The members of `set` still fresh without a record.
+    /// The members of `set` in a state that holds a record (Fresh,
+    /// Refused or Limited) without one: what a refusal for room leaves.
+    fn unrecorded_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        if set.is_empty() {
+            return Vec::new();
+        }
+        self.index
+            .records()
+            .into_iter()
+            .filter(|(path, record)| {
+                record.is_none()
+                    && set.contains(path)
+                    && matches!(
+                        self.index.state_of(path),
+                        Some(
+                            crate::workspace_index::MemberState::Fresh
+                                | crate::workspace_index::MemberState::Refused(_)
+                                | crate::workspace_index::MemberState::Limited
+                        )
+                    )
+            })
+            .map(|(path, _)| path)
+            .collect()
+    }
+
     fn unrecorded_fresh_among(&self, set: &HashSet<PathBuf>) -> Vec<PathBuf> {
         if set.is_empty() {
             return Vec::new();
@@ -7767,9 +7804,13 @@ impl ProjectCache {
                     room_wait_failed: false,
                     publications_refused: 0,
                     unprovable_kind: None,
+                    summaries: Default::default(),
                 });
             let (_, removed) = stored.index.set_members(membership.paths.clone());
             let index = &stored.index;
+            let summaries = stored
+                .summaries
+                .retain(|path| index.state_of(path).is_some());
             stored
                 .awaiting_room
                 .retain(|path| index.state_of(path).is_some());
@@ -7782,7 +7823,7 @@ impl ProjectCache {
             stored.last_used = clock;
             stored.charged = wanted;
             stored.memory_exhausted |= exhausted;
-            let mut released = removed + held.saturating_sub(wanted);
+            let mut released = removed + held.saturating_sub(wanted) + summaries;
             while store.contexts.len() > MAX_INDEXED_CONTEXTS {
                 match store.evict_lru(&key) {
                     Some(evicted) => released += evicted,
@@ -8236,18 +8277,17 @@ impl ProjectCache {
     }
 
     pub(crate) fn index_is_awaiting_room(&self, key: &ContextKey) -> bool {
-        self.index().contexts.get(key).is_some_and(|stored| {
-            !stored
-                .unrecorded_fresh_among(&stored.awaiting_room)
-                .is_empty()
-        })
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| !stored.unrecorded_among(&stored.awaiting_room).is_empty())
     }
 
-    /// The members `note_index_awaiting_room` named that are still fresh
-    /// without a record (0 when none).
+    /// The members `note_index_awaiting_room` named that are still without
+    /// a record their state holds (0 when none).
     pub(crate) fn index_awaiting_room(&self, key: &ContextKey) -> usize {
         self.index().contexts.get(key).map_or(0, |stored| {
-            stored.unrecorded_fresh_among(&stored.awaiting_room).len()
+            stored.unrecorded_among(&stored.awaiting_room).len()
         })
     }
 
@@ -8264,7 +8304,7 @@ impl ProjectCache {
             return 0;
         };
         let named = std::mem::take(&mut stored.awaiting_room);
-        let unrecorded = stored.unrecorded_fresh_among(&named);
+        let unrecorded = stored.unrecorded_among(&named);
         for path in &unrecorded {
             stored.index.mark_stale(path);
         }
@@ -8467,6 +8507,74 @@ impl ProjectCache {
             .contexts
             .get(key)
             .is_some_and(|stored| stored.memory_exhausted)
+    }
+
+    /// The lexical summaries `key`'s index holds under `binding` (Task 8d).
+    pub(crate) fn lexical_summaries(
+        &self,
+        key: &ContextKey,
+        binding: &crate::workspace::lexical::SummaryBinding,
+    ) -> Option<crate::workspace::lexical::SummaryMap> {
+        self.index().contexts.get(key)?.summaries.under(binding)
+    }
+
+    /// Keeps `summaries` with `key`'s index, charged to the index share
+    /// like its members, under `binding` (summaries of another binding are
+    /// dropped); nothing is kept for a context the store does not hold or
+    /// past the share.
+    pub(crate) fn keep_lexical_summaries(
+        &self,
+        key: &ContextKey,
+        binding: crate::workspace::lexical::SummaryBinding,
+        summaries: Vec<(PathBuf, Arc<crate::workspace::lexical::LexicalSummary>)>,
+    ) {
+        let paid = summaries.iter().map(|(_, summary)| summary.bytes()).sum();
+        // Nothing new still rebinds: summaries of a replaced context, and
+        // the context they hold, do not outlive the next ranking.
+        let (summaries, paid) = if paid == 0 || self.charge_index_evicting(paid, key) {
+            (summaries, paid)
+        } else {
+            (Vec::new(), 0)
+        };
+        let released = match self.index().contexts.get_mut(key) {
+            Some(stored) => stored.summaries.keep(binding, summaries, paid),
+            None => paid,
+        };
+        self.release_index(released);
+    }
+
+    /// The symbol list `key`'s index holds for `path` (Task 8d).
+    pub(crate) fn listed_symbols(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+    ) -> Option<Arc<crate::workspace::lexical::ListedSymbols>> {
+        self.index().contexts.get(key)?.summaries.symbols(path)
+    }
+
+    /// Keeps symbol `lists` with `key`'s index, charged like its summaries.
+    pub(crate) fn keep_listed_symbols(
+        &self,
+        key: &ContextKey,
+        lists: Vec<(PathBuf, Arc<crate::workspace::lexical::ListedSymbols>)>,
+    ) {
+        let paid = lists.iter().map(|(_, list)| list.bytes()).sum();
+        if lists.is_empty() || !self.charge_index_evicting(paid, key) {
+            return;
+        }
+        let released = match self.index().contexts.get_mut(key) {
+            Some(stored) => stored.summaries.keep_symbols(lists, paid),
+            None => paid,
+        };
+        self.release_index(released);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lexical_summary_count(&self, key: &ContextKey) -> usize {
+        self.index()
+            .contexts
+            .get(key)
+            .map_or(0, |stored| stored.summaries.len())
     }
 
     pub(crate) fn owner_of(&self, directory: &Path) -> Option<ContextKey> {
@@ -9344,6 +9452,126 @@ mod index_tests {
             membership_cost(&["/w/B.pas"]) + names(&facts("/w/A.pas"))
         );
         cache.set_index_membership(a.clone(), anchor("a"), membership(&[]), usize::MAX);
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
+    }
+
+    /// Task 8d: a context's lexical summaries are charged to the index
+    /// share, dropped with a member that leaves the membership, replaced
+    /// under another binding, and dropped with the context when it is
+    /// evicted.
+    #[test]
+    fn lexical_summaries_are_charged_with_the_index_and_dropped_with_it() {
+        use crate::workspace::lexical::{LexicalSummary, SummaryBinding};
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.pas");
+        std::fs::write(&file, "unit A;").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let root = pascal_project::stamp_from_metadata(&metadata, &metadata);
+        let summary = || {
+            Arc::new(LexicalSummary {
+                tokens: Default::default(),
+                root: root.clone(),
+                dependencies: vec![(PathBuf::from("/w/Defs.inc"), None)],
+                route: None,
+            })
+        };
+        let bytes = summary().bytes();
+        let binding = |name: &str| SummaryBinding {
+            context: Arc::new(ProjectContext::from_parts(
+                pascal_project::ProjectContextParts {
+                    project_file: Some(PathBuf::from(name)),
+                    ..pascal_project::ProjectContextParts::default()
+                },
+            )),
+            roots: Vec::new(),
+            max_file_bytes: 1,
+        };
+        let cache = ProjectCache::new(1 << 30);
+        let a = key("a");
+        let paths = ["/w/A.pas", "/w/B.pas"];
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&paths), usize::MAX);
+        let base = cache.stats().reserved_index_bytes;
+        let kept = |cache: &ProjectCache| {
+            cache.keep_lexical_summaries(
+                &a,
+                binding("a"),
+                paths
+                    .iter()
+                    .map(|path| (PathBuf::from(path), summary()))
+                    .collect(),
+            );
+        };
+        kept(&cache);
+        assert_eq!(cache.stats().reserved_index_bytes, base + 2 * bytes);
+        assert_eq!(cache.lexical_summaries(&a, &binding("a")).unwrap().len(), 2);
+        assert!(cache.lexical_summaries(&a, &binding("other")).is_none());
+        // Kept again: replaced, not charged twice.
+        kept(&cache);
+        assert_eq!(cache.stats().reserved_index_bytes, base + 2 * bytes);
+        // Another binding drops them, even with nothing new to keep.
+        cache.keep_lexical_summaries(&a, binding("other"), Vec::new());
+        assert_eq!(cache.stats().reserved_index_bytes, base);
+        assert_eq!(cache.lexical_summary_count(&a), 0);
+        kept(&cache);
+        cache.keep_lexical_summaries(&a, binding("other"), vec![(paths[0].into(), summary())]);
+        assert_eq!(cache.stats().reserved_index_bytes, base + bytes);
+        assert!(cache.lexical_summaries(&a, &binding("a")).is_none());
+        kept(&cache);
+        // A symbol list is charged and held the same way.
+        let uri = lsp_types::Url::from_file_path("/w/A.pas").unwrap();
+        let mut index = crate::navigation::NavigationIndex::new();
+        index
+            .update(
+                uri.clone(),
+                "unit A;\ninterface\nconst X = 1;\nimplementation\nend.\n".to_owned(),
+            )
+            .unwrap();
+        let list = Arc::new(crate::workspace::lexical::ListedSymbols {
+            content_hash: 1,
+            parsed_text_hash: 2,
+            conditional_context: Default::default(),
+            list: index
+                .workspace_symbol_list(&uri, &std::sync::atomic::AtomicBool::new(false))
+                .unwrap()
+                .unwrap(),
+        });
+        let listed = list.bytes();
+        let before = cache.stats().reserved_index_bytes;
+        cache.keep_listed_symbols(&a, vec![(paths[1].into(), list)]);
+        assert_eq!(cache.stats().reserved_index_bytes, before + listed);
+        assert!(cache.listed_symbols(&a, Path::new(paths[1])).is_some());
+        cache.set_index_membership(a.clone(), anchor("a"), membership(&paths[..1]), usize::MAX);
+        assert_eq!(cache.lexical_summary_count(&a), 1);
+        assert!(cache.listed_symbols(&a, Path::new(paths[1])).is_none());
+        assert_eq!(
+            cache.stats().reserved_index_bytes,
+            membership_cost(&paths[..1]) + bytes
+        );
+        cache.keep_listed_symbols(
+            &a,
+            vec![(
+                paths[0].into(),
+                Arc::new(crate::workspace::lexical::ListedSymbols {
+                    content_hash: 1,
+                    parsed_text_hash: 2,
+                    conditional_context: Default::default(),
+                    list: index
+                        .workspace_symbol_list(&uri, &std::sync::atomic::AtomicBool::new(false))
+                        .unwrap()
+                        .unwrap(),
+                }),
+            )],
+        );
+        // Evicted with the context.
+        for index in 0..MAX_INDEXED_CONTEXTS {
+            let name = format!("other{index}");
+            cache.set_index_membership(key(&name), anchor(&name), membership(&[]), usize::MAX);
+        }
+        assert!(cache.read_index(&a, |_, _| ()).is_none());
+        assert_eq!(cache.lexical_summary_count(&a), 0);
+        assert_eq!(cache.stats().reserved_index_bytes, 0);
+        // Nothing is kept for a context the store does not hold.
+        kept(&cache);
         assert_eq!(cache.stats().reserved_index_bytes, 0);
     }
 

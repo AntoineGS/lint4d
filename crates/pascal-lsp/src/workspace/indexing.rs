@@ -899,6 +899,16 @@ fn take_reuse_phases() -> [(Duration, usize); REUSE_PHASES] {
     REUSE_PHASE_TIMES.with(|times| std::mem::take(&mut *times.borrow_mut()))
 }
 
+/// Holds a reuse batch once it has reused `count` members
+/// (`PASCAL_LSP_TEST_REUSE_PASS_BARRIER`), so protocol tests can query
+/// while the reuse pass runs.
+#[cfg(feature = "test-support")]
+fn wait_at_reuse_pass_barrier(mode: IndexMode, reused: usize) {
+    if mode == IndexMode::Reuse {
+        super::wait_at_walk_test_barrier("PASCAL_LSP_TEST_REUSE_PASS_BARRIER", reused);
+    }
+}
+
 #[cfg(test)]
 fn run_hook(
     slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<LoadHook>>>,
@@ -1441,7 +1451,7 @@ impl PersistSkip {
 /// stamp taken before reuse read it), then one slot per include in slot
 /// order, normalized as `source_slot_paths` does. An include's stamp is
 /// the one reuse took before validating its bytes; without one the member
-/// stays unverified on every request, as for an unresolved include (A7).
+/// stays unverified on every request (A7).
 fn reused_slots(
     path: &Path,
     own_stamp: &PathStamp,
@@ -1701,6 +1711,8 @@ impl Workspace {
             match reuse {
                 ReuseOutcome::Reused => {
                     progress.reused += 1;
+                    #[cfg(feature = "test-support")]
+                    wait_at_reuse_pass_barrier(bound.mode, progress.reused);
                     continue;
                 }
                 ReuseOutcome::Missed { absent } => {
@@ -2020,7 +2032,11 @@ impl Workspace {
             #[cfg(test)]
             run_hook(&AFTER_REUSE, path);
             match reuse {
-                ReuseOutcome::Reused => progress.reused += 1,
+                ReuseOutcome::Reused => {
+                    progress.reused += 1;
+                    #[cfg(feature = "test-support")]
+                    wait_at_reuse_pass_barrier(IndexMode::Reuse, progress.reused);
+                }
                 ReuseOutcome::Missed { absent } => {
                     self.project_cache.mark_index_reuse_tried(key, path);
                     progress.reuse_missed += 1;
@@ -2934,19 +2950,11 @@ impl Workspace {
                         // sealed (D33, §6.3).
                         match skip {
                             PersistSkip::Store(
-                                pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering,
-                            ) => self.project_cache.mark_index_stale(key, path),
-                            // Only maintenance makes this room (the
-                            // store woke it): the member waits for a
-                            // batch that finds no pressure rather than
-                            // being extracted into the same refusal.
-                            // `LowDiskSpace` and this store's own
-                            // `ScratchExhausted` are not pressure
-                            // maintenance clears: memory-only.
-                            PersistSkip::Store(
-                                pascal_cache::Bypass::WalPressure
-                                | pascal_cache::Bypass::OverBudget,
-                            ) => self.project_cache.note_index_awaiting_room(key, path),
+                                bypass @ (pascal_cache::Bypass::Busy
+                                | pascal_cache::Bypass::Recovering
+                                | pascal_cache::Bypass::WalPressure
+                                | pascal_cache::Bypass::OverBudget),
+                            ) => self.defer_refused_record(key, path, &bypass),
                             // The same inputs exceed the same fixed limit
                             // every time: the facts stay indexed here and
                             // an artifact-less record lists the member, so
@@ -2980,6 +2988,27 @@ impl Workspace {
             }
             PublishOutcome::NotAMember => MemberOutcome::Skipped,
             PublishOutcome::Memory => MemberOutcome::Memory,
+        }
+    }
+
+    /// A member's record (a Fresh member's, or the artifact-less one of a
+    /// Refused, Limited or over-limit member) was refused by a bypass that
+    /// passes:
+    /// another process's writes (`Busy`, `Recovering`) make the next batch
+    /// prove it again; only maintenance makes room (`WalPressure`,
+    /// `OverBudget`, which the store woke it for), so it waits for a batch
+    /// that finds no pressure rather than being proven into the same
+    /// refusal. `LowDiskSpace` and this store's own `ScratchExhausted` are
+    /// not pressure maintenance clears: the member stays memory-only.
+    fn defer_refused_record(&self, key: &ContextKey, path: &Path, bypass: &pascal_cache::Bypass) {
+        match bypass {
+            pascal_cache::Bypass::Busy | pascal_cache::Bypass::Recovering => {
+                self.project_cache.mark_index_stale(key, path);
+            }
+            pascal_cache::Bypass::WalPressure | pascal_cache::Bypass::OverBudget => {
+                self.project_cache.note_index_awaiting_room(key, path);
+            }
+            _ => {}
         }
     }
 
@@ -3180,6 +3209,11 @@ impl Workspace {
         if stopped() {
             return Err(PersistSkip::Unavailable);
         }
+        #[cfg(test)]
+        if let Some(bypass) = self.persistent_cache().record_fault_for_test(path) {
+            job.observe(&bypass);
+            return Err(PersistSkip::Store(bypass));
+        }
         let proven = publish_proven(job.store(), &eligible);
         #[cfg(test)]
         wal.note(1);
@@ -3290,16 +3324,17 @@ impl Workspace {
     /// Prove the record `inputs` derive for a member the index holds: found
     /// live in the store (`live` when it is the held snapshot's record the
     /// batch already opened), else published. Without a proof the member
-    /// only delays the context's snapshot.
+    /// only delays the context's snapshot; `Err` is the store bypass that
+    /// refused it (observed).
     fn prove_member(
         &self,
         key: &ContextKey,
         inputs: &RecordInputs<'_>,
         live: Option<pascal_cache::Digest>,
         cancel: &AtomicBool,
-    ) -> bool {
+    ) -> Result<bool, pascal_cache::Bypass> {
         if !self.may_publish(key) {
-            return false;
+            return Ok(false);
         }
         let eligible = match self.eligible_indexed_member(key, inputs) {
             Ok(eligible) => eligible,
@@ -3308,31 +3343,37 @@ impl Workspace {
                     "  index member {} not proven: {ineligible:?}",
                     inputs.path.display()
                 );
-                return false;
+                return Ok(false);
             }
         };
         let Some(job) = self.persistent_cache().job() else {
-            return false;
+            return Ok(false);
         };
         let stopped = || job.is_cancelled() || cancel.load(Ordering::Relaxed);
         if stopped() {
-            return false;
+            return Ok(false);
         }
         let proof = match prove_existing(job.store(), &eligible, live) {
             Ok(Some(proof)) => Ok(proof),
-            Ok(None) if stopped() => return false,
-            Ok(None) => publish_proven(job.store(), &eligible),
+            Ok(None) if stopped() => return Ok(false),
+            Ok(None) => {
+                #[cfg(test)]
+                let fault = self.persistent_cache().record_fault_for_test(inputs.path);
+                #[cfg(not(test))]
+                let fault = None;
+                fault.map_or_else(|| publish_proven(job.store(), &eligible), Err)
+            }
             Err(bypass) => Err(bypass),
         };
         let proof = match proof {
             Ok(proof) => proof,
             Err(bypass) => {
                 job.observe(&bypass);
-                return false;
+                return Err(bypass);
             }
         };
         drop(job);
-        self.set_member_record(key, &proof)
+        Ok(self.set_member_record(key, &proof))
     }
 
     /// A refused or limited member is listed by an artifact-less record, so
@@ -3347,7 +3388,7 @@ impl Workspace {
         let Some(state) = self.contexts.get(key) else {
             return;
         };
-        self.prove_member(
+        let proven = self.prove_member(
             key,
             &RecordInputs {
                 path,
@@ -3360,6 +3401,15 @@ impl Workspace {
             None,
             cancel,
         );
+        // Refused as a Fresh member's record is: the member must not stay
+        // unrecorded while the batch completes (Task 8c fix round 1).
+        if let Err(bypass) = proven {
+            crate::trace::trace!(
+                "  index member {} unindexed, record not proven: {bypass:?}",
+                path.display()
+            );
+            self.defer_refused_record(key, path, &bypass);
+        }
     }
 
     /// Index `path` from the store's facts, if current inputs prove them
@@ -3441,6 +3491,7 @@ impl Workspace {
                 }
             }
         }
+        let hinted_record = hinted.is_some();
         let result = hinted.unwrap_or_else(|| {
             self.reuse_in_context_with(
                 &uri,
@@ -3456,6 +3507,19 @@ impl Workspace {
         if cancel.load(Ordering::Relaxed) {
             return Validated::Outcome(ReuseOutcome::Cancelled);
         }
+        // No snapshot listed the member: a refusal an earlier process
+        // recorded is found by the record it derives, as the held
+        // snapshot's would be (Task 8c).
+        let missed = |absent: bool| {
+            if !hinted_record {
+                match self.has_artifact_less_record(key, path, job.store()) {
+                    Ok(true) => return Validated::Outcome(ReuseOutcome::Retrying),
+                    Ok(false) => {}
+                    Err(bypass) => job.observe(&bypass),
+                }
+            }
+            Validated::Outcome(ReuseOutcome::Missed { absent })
+        };
         let (facts, reads, artifact, evidence, include_stamps, root_hash, record) = match result {
             Ok(Reuse::Hit {
                 facts,
@@ -3483,17 +3547,15 @@ impl Workspace {
             Ok(Reuse::Miss(ReuseMiss::Unproven(_))) => {
                 return Validated::Outcome(ReuseOutcome::Retry);
             }
-            Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => {
-                return Validated::Outcome(ReuseOutcome::Missed { absent: true });
-            }
+            Ok(Reuse::Miss(ReuseMiss::Store(pascal_cache::Miss::Absent))) => return missed(true),
             Ok(Reuse::Miss(ReuseMiss::Stale(_) | ReuseMiss::Store(_) | ReuseMiss::Open)) => {
-                return Validated::Outcome(ReuseOutcome::Missed { absent: false });
+                return missed(false);
             }
             // `record_reuse` observed the bypass.
             Err(super::persist::PersistError::Store(_)) => {
                 return Validated::Outcome(ReuseOutcome::Retry);
             }
-            Err(_) => return Validated::Outcome(ReuseOutcome::Missed { absent: false }),
+            Err(_) => return missed(false),
         };
         job.store().hint_used(match evidence {
             Some(id) => Hint::Evidence(id),
@@ -3550,7 +3612,7 @@ impl Workspace {
         let outcome = match published {
             PublishOutcome::Indexed => {
                 if let Some(state) = self.contexts.get(key) {
-                    timed(ReusePhase::Prove, || {
+                    let proven = timed(ReusePhase::Prove, || {
                         self.prove_member(
                             key,
                             &RecordInputs {
@@ -3563,8 +3625,19 @@ impl Workspace {
                             },
                             live,
                             cancel,
-                        );
+                        )
                     });
+                    // Refused as an extracted member's record would be: the
+                    // member must not stay indexed without its record and
+                    // let the batch complete, or the seal finds it
+                    // unproven and nothing proves it again (rootcause-p2 A1).
+                    if let Err(bypass) = proven {
+                        crate::trace::trace!(
+                            "  index member {} reused, record not proven: {bypass:?}",
+                            path.display()
+                        );
+                        self.defer_refused_record(key, path, &bypass);
+                    }
                 }
                 ReuseOutcome::Reused
             }
@@ -4333,8 +4406,13 @@ impl Workspace {
         };
         let mut ranking = match selection {
             Selection::Candidates(Some(query)) => Some(UnverifiedRanking::new(query)),
+            Selection::Symbols {
+                query,
+                direct: true,
+            } => Some(UnverifiedRanking::for_symbols(query)),
             _ => None,
         };
+        let mut lexically_excluded = 0usize;
         let mut refused = 0usize;
         let mut first_refusal = None::<Box<str>>;
         let mut memory = false;
@@ -4520,17 +4598,26 @@ impl Workspace {
                 let outside = drop_outside(self, key, &mut paths);
                 outside_gap(&mut result.gaps, outside, &display);
                 if let Some(ranking) = ranking.as_mut() {
-                    ranking.rank(
+                    let absent = ranking.rank(
                         &mut paths,
                         unverified_left,
                         &|path: &Path| {
                             let key = path_key(path);
                             open.contains(&key) || taken.contains(&key) || deleted(path)
                         },
+                        &|_| true,
+                        Some(&IncludeScope {
+                            workspace: self,
+                            input,
+                            key,
+                        }),
                         cancel,
                     );
+                    lexically_excluded += absent.members.len();
+                    result.baseline.extend(absent.members);
+                    result.baseline.extend(absent.includes);
                 }
-                let (skipped, searched) = take_unverified(
+                let (skipped, searched, _) = take_unverified(
                     paths,
                     key,
                     &open,
@@ -4564,7 +4651,7 @@ impl Workspace {
                 limit,
                 packages,
                 owner_pending,
-                retrying,
+                deferred,
                 ..
             } = view;
 
@@ -4575,6 +4662,7 @@ impl Workspace {
                 );
             }
             let mut proven = HashSet::new();
+            let mut unresolved = 0usize;
             for (path, (resolved, recorded)) in excluded.into_iter().zip(recorded) {
                 check_workspace_cancel(Some(cancel))?;
                 let unchanged = recorded.first().is_some_and(|first| first.path == path)
@@ -4594,9 +4682,18 @@ impl Workspace {
                             .into_iter()
                             .map(|member| (member.path, member.stamp)),
                     );
+                } else if unchanged {
+                    // R9-4: an unchanged member whose include does not
+                    // resolve is a coverage gap, not a direct read; its facts
+                    // may lack that include's declarations.
+                    unresolved += 1;
                 } else {
                     unverified.push(path);
                 }
+            }
+            result.unresolved += unresolved;
+            if unresolved > 0 {
+                result.gaps.push(unresolved_gap(unresolved, &display));
             }
             symbols.extend(
                 view_symbols
@@ -4609,16 +4706,30 @@ impl Workspace {
             let outside =
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
             outside_gap(&mut result.gaps, outside, &display);
+            // A member retrying a previous refusal is unverified like any
+            // other: its text may prove the name absent (R9-5); the rest use
+            // the bound, and those past it stay the "retried later" gap
+            // (l4d-1nfk).
+            let deferral_gap = searched && coverage.first_deferral.is_some();
             if searched && let Some(ranking) = ranking.as_mut() {
-                ranking.rank(
+                let absent = ranking.rank(
                     &mut unverified,
                     unverified_left,
                     &|path: &Path| {
                         let key = path_key(path);
                         open.contains(&key) || taken.contains(&key) || deleted(path)
                     },
+                    &|_| true,
+                    Some(&IncludeScope {
+                        workspace: self,
+                        input,
+                        key,
+                    }),
                     cancel,
                 );
+                lexically_excluded += absent.members.len();
+                result.baseline.extend(absent.members);
+                result.baseline.extend(absent.includes);
             }
 
             for path in selected {
@@ -4628,15 +4739,15 @@ impl Workspace {
             }
             // A target searched for its facts reads no unverified member.
             let mut none_left = 0;
-            // Members retrying a previous refusal are counted by the
-            // "retried later" gap below, not again as not indexed yet.
-            let deferral_gap = searched && coverage.first_deferral.is_some();
-            let (skipped, read) = take_unverified(
+            // Deferred members past the bound are counted by the "retried
+            // later" gap below, not again as not indexed yet; those excluded
+            // above or read within the bound are not counted at all.
+            let (skipped, read, retried_later) = take_unverified(
                 unverified,
                 key,
                 &open,
                 &deleted,
-                &|path_key| deferral_gap && retrying.contains(path_key),
+                &|path_key| deferral_gap && deferred.contains(path_key),
                 &mut taken,
                 if searched {
                     &mut unverified_left
@@ -4650,10 +4761,11 @@ impl Workspace {
                     "{skipped} units of {display} are not indexed yet; {read} were searched directly"
                 ));
             }
-            if searched && let Some(reason) = coverage.first_deferral.as_deref() {
+            if retried_later > 0
+                && let Some(reason) = coverage.first_deferral.as_deref()
+            {
                 result.gaps.push(format!(
-                    "{} units of {display} failed to load for the index and are retried later: {reason}",
-                    coverage.deferred
+                    "{retried_later} units of {display} failed to load for the index and are retried later: {reason}"
                 ));
             }
             refused += refused_members.len();
@@ -4698,7 +4810,11 @@ impl Workspace {
                 continue;
             };
             let path_key = path_key(&path);
-            if deleted(&path) || taken.contains(&path_key) {
+            if deleted(&path) {
+                continue;
+            }
+            result.required.insert(path_key.clone());
+            if taken.contains(&path_key) {
                 continue;
             }
             let member_of = targets.contexts.iter().map(|(key, _)| key).find(|key| {
@@ -4744,6 +4860,11 @@ impl Workspace {
             ));
         }
 
+        if lexically_excluded > 0 {
+            crate::trace::trace!(
+                "  index sources: {lexically_excluded} unverified members lexically excluded"
+            );
+        }
         if refused > 0 {
             result.gaps.push(format!(
                 "{refused} units could not be indexed: {}",
@@ -4811,8 +4932,9 @@ struct TargetView {
     limit: Option<String>,
     packages: bool,
     owner_pending: usize,
-    /// Path keys of the unverified members retrying a previous refusal.
-    retrying: HashSet<String>,
+    /// Path keys of the unverified members whose last load was deferred
+    /// (those retrying a previous refusal among them).
+    deferred: HashSet<String>,
 }
 
 /// What a request reads of each target's index.
@@ -4873,10 +4995,10 @@ fn target_view(
             }
         }
     };
-    let retrying = candidates
+    let deferred = candidates
         .unverified
         .iter()
-        .filter(|path| index.retrying(path))
+        .filter(|path| index.deferred(path))
         .map(|path| path_key(path))
         .collect();
     let recorded = candidates
@@ -4901,7 +5023,7 @@ fn target_view(
         limit: membership.limit.clone(),
         packages: membership.packages,
         owner_pending: membership.owner_pending,
-        retrying,
+        deferred,
     }
 }
 
@@ -4916,7 +5038,8 @@ struct MembershipListing {
 /// Adds `unverified` (path order) to `sources` while the request-wide bound
 /// lasts; open buffers are always read (A4) and do not use it. Returns how
 /// many were skipped, leaving out those whose path key is `reported`
-/// elsewhere, and how many used the bound.
+/// elsewhere, how many used the bound, and how many `reported` ones were
+/// skipped.
 #[allow(clippy::too_many_arguments)]
 fn take_unverified(
     unverified: Vec<PathBuf>,
@@ -4927,8 +5050,8 @@ fn take_unverified(
     taken: &mut HashSet<String>,
     left: &mut usize,
     sources: &mut Vec<(PathBuf, ContextKey)>,
-) -> (usize, usize) {
-    let (mut skipped, mut searched) = (0, 0);
+) -> (usize, usize, usize) {
+    let (mut skipped, mut searched, mut skipped_reported) = (0, 0, 0);
     for path in unverified {
         let path_key = path_key(&path);
         if deleted(&path) || taken.contains(&path_key) {
@@ -4936,7 +5059,11 @@ fn take_unverified(
         }
         if !open.contains(&path_key) {
             if *left == 0 {
-                skipped += usize::from(!reported(&path_key));
+                if reported(&path_key) {
+                    skipped_reported += 1;
+                } else {
+                    skipped += 1;
+                }
                 continue;
             }
             *left -= 1;
@@ -4945,7 +5072,7 @@ fn take_unverified(
         taken.insert(path_key);
         sources.push((path, key.clone()));
     }
-    (skipped, searched)
+    (skipped, searched, skipped_reported)
 }
 
 /// The bytes one references request may read to rank its unverified
@@ -4953,11 +5080,289 @@ fn take_unverified(
 const MAX_UNVERIFIED_RANKING_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_UNVERIFIED_RANKING_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static WALK_MAX_INCLUDE_FILES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The include file limit of the references proof's walks on this thread.
+#[cfg(test)]
+pub(crate) fn set_walk_max_include_files_for_test(files: Option<usize>) {
+    WALK_MAX_INCLUDE_FILES.with(|limit| limit.set(files));
+}
+
+/// The deepest include nesting the references proof follows.
+const MAX_LEXICAL_INCLUDE_DEPTH: usize = 16;
+
+type BaselineEntry = (PathBuf, Option<PathStamp>);
+
+fn ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 /// What one request has left for ranking unverified members.
 struct UnverifiedRanking {
     names: Vec<String>,
     units: Vec<String>,
+    /// `names` are the pieces of a workspace-symbol query: a member is
+    /// absent when one of them does not occur.
+    symbols: bool,
     bytes_left: u64,
+    /// Per context, include path key and whether the include passes a
+    /// legacy route to its own includes: what proves the include and
+    /// everything it includes cannot hold a name, or `None`.
+    includes: HashMap<(ContextKey, String, bool), Option<ProvenInclude>>,
+    /// What every include lookup observed, proven or not: a proof reusing
+    /// another member's (`includes`) observes nothing itself.
+    observed: Vec<BaselineEntry>,
+    /// Include resolutions shared by the request's members (Task 8c).
+    resolutions: HashMap<ResolutionKey, SharedResolution>,
+    /// What the member walk in progress added to `includes` and
+    /// `resolutions`, dropped if it starts again unshared.
+    attempt: Vec<AttemptEntry>,
+    /// Lookups answered from `resolutions`, and the time include walks took.
+    shared_hits: usize,
+    walk_time: std::time::Duration,
+    profile: RankingProfile,
+    /// The lexical summaries the context's index held when the ranking
+    /// started (Task 8d), and those this ranking proved, kept at its end.
+    summaries: Option<super::lexical::SummaryMap>,
+    proven: Vec<(PathBuf, Arc<super::lexical::LexicalSummary>)>,
+    summaries_reused: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SUMMARY_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The members this thread's rankings proved from a lexical summary since
+/// the last take.
+#[cfg(test)]
+pub(crate) fn take_summary_reuses_for_test() -> usize {
+    SUMMARY_REUSES.with(|reuses| reuses.replace(0))
+}
+
+/// Where a ranking's time went, for its trace line.
+#[derive(Default)]
+struct RankingProfile {
+    /// Member reads, and the token scans of their bytes.
+    read: std::time::Duration,
+    scan: std::time::Duration,
+    /// Per member walk: building its resolver and the root's legacy route,
+    /// loading the root again, include lookups, and include reads.
+    resolver: std::time::Duration,
+    root: std::time::Duration,
+    lookups: std::time::Duration,
+    include_reads: std::time::Duration,
+}
+
+/// What an include lookup's answer reads besides the resolver's own
+/// history: the context, the including file's directory (its owner entry
+/// and the include search entries derive from it), the name as written,
+/// and what the legacy route the lookup passes authorizes (the resolver
+/// reads a route only through `legacy_route_authorizes*`, the stores only
+/// its presence), as the resolver's own shared misses are keyed
+/// (`IncludeFailureKey`). The including file's own identity and the member
+/// it belongs to are not read.
+type ResolutionKey = (
+    ContextKey,
+    PathBuf,
+    String,
+    Option<pascal_core::LegacyRouteAuthority>,
+);
+
+/// A `Found` include resolution and what it charged the resolver that made
+/// it, for a file that resolver had not loaded before.
+#[derive(Clone)]
+struct SharedResolution {
+    child: pascal_core::resolver::ResolvedSource,
+    files: usize,
+    bytes: usize,
+    /// Directory entries the lookup's listings held, cached ones included:
+    /// at most what a resolver without those listings would scan.
+    consulted: usize,
+    /// Everything that determined the answer (`walk_observations` of the
+    /// walk that made it), for the summaries of members it answers.
+    observations: Vec<BaselineEntry>,
+}
+
+enum AttemptEntry {
+    Include((ContextKey, String, bool)),
+    Resolution(ResolutionKey),
+}
+
+/// The members a ranking proved absent, each with the stamp taken before
+/// its bytes were read, and what proves the includes they resolve current.
+#[derive(Debug, Default)]
+struct Absent {
+    members: Vec<BaselineEntry>,
+    includes: Vec<BaselineEntry>,
+}
+
+/// What proves one include, and everything it includes, cannot hold a name:
+/// their stamps and resolver observations, and per file reached whether it
+/// passed a legacy route to its own includes.
+#[derive(Clone)]
+struct ProvenInclude {
+    baseline: Vec<BaselineEntry>,
+    routes: Vec<(String, bool)>,
+    /// Everything that determined it (`walk_observations` of the walk that
+    /// proved it), and the identifiers of it and everything it includes.
+    observations: Vec<BaselineEntry>,
+    tokens: Arc<super::lexical::TokenHashes>,
+}
+
+/// What proves one member's includes cannot hold a name: their stamps,
+/// what its walk's lookups observed, their identifiers, and the legacy
+/// route its root was loaded with (`None` outside a walk).
+#[derive(Default)]
+struct WalkProof {
+    baseline: Vec<BaselineEntry>,
+    observed: Vec<BaselineEntry>,
+    tokens: super::lexical::TokenHashes,
+    route: Option<Option<pascal_core::LegacyRoute>>,
+}
+
+/// One member's include walk.
+struct IncludeWalk<'a> {
+    key: &'a ContextKey,
+    context: &'a pascal_project::ProjectContext,
+    /// The path keys being followed: a cycle proves nothing.
+    active: Vec<String>,
+    /// Per path key reached, whether it passed a legacy route.
+    routes: HashMap<String, bool>,
+    /// Whether lookups may be answered from `UnverifiedRanking::resolutions`.
+    share: bool,
+    limits: pascal_core::ResolverLimits,
+    /// Path keys of the files this walk's resolver loaded (the root
+    /// included), and of those answered from a shared resolution instead,
+    /// which it never loaded.
+    loaded: HashSet<String>,
+    virtual_loaded: HashSet<String>,
+    /// What the shared answers would have charged this walk's resolver.
+    virtual_files: usize,
+    virtual_bytes: usize,
+    virtual_consulted: usize,
+    /// The walk cannot prove its answers are a fresh resolver's: it is
+    /// walked again without sharing.
+    restart: bool,
+    /// The whole observation sets of the shared answers and include
+    /// proofs this walk took (`walk_observations` adds its resolver's),
+    /// and the identifiers of the includes it reached.
+    observed: Vec<BaselineEntry>,
+    tokens: super::lexical::TokenHashes,
+}
+
+impl IncludeWalk<'_> {
+    /// Adds `routes`; `None` when a file is reached both with and without
+    /// a legacy route.
+    fn merge_routes(&mut self, routes: &[(String, bool)]) -> Option<()> {
+        for (path, routed) in routes {
+            if *self.routes.entry(path.clone()).or_insert(*routed) != *routed {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// Whether a resolver that had also loaded the files this walk's
+    /// shared answers name, and been charged for them, stays within its
+    /// include and directory-entry limits once charged `pending` (files,
+    /// bytes, consulted entries) more: then no lookup of this walk reaches
+    /// a limit there that it does not reach here.
+    fn fits(
+        &self,
+        resolver: &pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        pending: (usize, usize, usize),
+    ) -> bool {
+        let (files, bytes, _) = resolver.include_usage();
+        let (scanned, _) = resolver.directory_entries();
+        files
+            .saturating_add(self.virtual_files)
+            .saturating_add(pending.0)
+            <= self.limits.max_include_files
+            && bytes
+                .saturating_add(self.virtual_bytes)
+                .saturating_add(pending.1)
+                <= self.limits.max_include_bytes
+            && scanned
+                .saturating_add(self.virtual_consulted)
+                .saturating_add(pending.2)
+                <= self.limits.max_directory_entries
+    }
+}
+
+/// The context whose analysis of the ranked members a references proof
+/// follows includes in.
+struct IncludeScope<'a> {
+    workspace: &'a Workspace,
+    input: &'a WorkspaceInput,
+    key: &'a ContextKey,
+}
+
+/// Whether a summary's stamp for a path proves the path unchanged now:
+/// settled, with a change identity (as a witness needs, spec §7), and
+/// equal to `current`; or missing then and now.
+fn summary_stamp_holds(held: Option<&PathStamp>, current: Option<&PathStamp>) -> bool {
+    match (held, current) {
+        (None, None) => true,
+        (Some(held), Some(current)) => held.has_change_identity() && held.proves_unchanged(current),
+        _ => false,
+    }
+}
+
+/// Everything that determined the answers of `walk` so far: every
+/// observation its resolver holds (a lookup reports only those it adds,
+/// and a cached listing none), and the whole sets of the shared answers
+/// and include proofs it took (Task 8d, final review C1).
+fn walk_observations(
+    resolver: &pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+    walk: &IncludeWalk<'_>,
+) -> Vec<BaselineEntry> {
+    let mut observed = resolver
+        .report_observations()
+        .iter()
+        .filter_map(super::rename::resolver_observation_baseline)
+        .chain(walk.observed.iter().cloned())
+        .collect::<Vec<_>>();
+    observed.sort_by(|left, right| left.0.cmp(&right.0));
+    observed.dedup();
+    observed
+}
+
+/// What a ranking in one scope checks summaries against: the binding they
+/// must have been proven under, and the `path_key`s of the files the
+/// session holds (overlaid, deleted, rejected), which no summary may read.
+struct SummaryScope {
+    binding: super::lexical::SummaryBinding,
+    private: HashSet<String>,
+}
+
+impl SummaryScope {
+    fn of(scope: &IncludeScope<'_>) -> Option<Self> {
+        let state = scope.workspace.contexts.get(scope.key)?;
+        let input = scope.input;
+        let uris = input
+            .overlays
+            .keys()
+            .chain(input.deleted_overrides.keys())
+            .chain(&input.rejected_documents);
+        let private = uris
+            .filter_map(|uri| uri.to_file_path().ok())
+            .map(|path| path_key(&absolute_path(path)))
+            .chain(input.session_private_paths.iter().cloned())
+            .collect();
+        Some(Self {
+            binding: super::lexical::SummaryBinding {
+                context: Arc::clone(&state.context),
+                roots: input.roots.clone(),
+                max_file_bytes: input.options.limits.max_file_bytes,
+            },
+            private,
+        })
+    }
 }
 
 impl UnverifiedRanking {
@@ -4986,84 +5391,668 @@ impl UnverifiedRanking {
             list.sort();
             list.dedup();
         }
+        Self::with(names, units, false)
+    }
+
+    /// The ranking of a workspace-symbol request: its needles are the
+    /// identifier pieces of `query` (`lexical::symbol_needles`); a query
+    /// with a non-ASCII piece, or none, reads nothing.
+    fn for_symbols(query: &str) -> Self {
+        let mut names = super::lexical::symbol_needles(query);
+        if names.iter().any(|piece| !piece.is_ascii()) {
+            names.clear();
+        }
+        Self::with(names, Vec::new(), true)
+    }
+
+    fn with(names: Vec<String>, units: Vec<String>, symbols: bool) -> Self {
         Self {
             names,
             units,
+            symbols,
             bytes_left: MAX_UNVERIFIED_RANKING_BYTES,
+            includes: HashMap::new(),
+            observed: Vec::new(),
+            resolutions: HashMap::new(),
+            attempt: Vec::new(),
+            shared_hits: 0,
+            walk_time: std::time::Duration::ZERO,
+            profile: RankingProfile::default(),
+            summaries: None,
+            proven: Vec::new(),
+            summaries_reused: 0,
         }
     }
 
-    /// Orders `paths` (in path order) so the members likely to hold an
-    /// occurrence come first: those whose text spells a name and, for
-    /// top-level members, a name of a declaring unit (an importer); then
-    /// those spelling a name; then the unread; then the rest. Only the
-    /// order changes, never the set, so the bound alone decides what is
-    /// left out. Nothing is read when `left` already covers every path.
-    /// Paths `unread` selects (open, deleted or already taken) do not use
-    /// the bound, so they are neither read nor counted.
+    /// Removes from `paths` the members proven absent (R9-5,
+    /// `lexical::proves_absent`) and returns them, each with the stamp
+    /// taken before its bytes were read, so a write racing the read fails
+    /// revalidation. Only members `provable` selects are excluded. For
+    /// references the proof also covers every include the member's text
+    /// resolves, followed in `scope` (`includes_absent`); without a scope
+    /// a member with an include is not proven.
     ///
-    /// The scan is a byte search over the raw file: a UTF-16 file, or an
+    /// Then orders the rest (in path order) so the members likely to hold
+    /// an occurrence come first: those whose text spells a name and, for
+    /// top-level members, a name of a declaring unit (an importer); then
+    /// those spelling a name; then the unread; then the rest. The ordering
+    /// never changes the set, so the bound alone decides what is left out.
+    /// Every path is read, within the byte budget, even when `left`
+    /// covers them all: the bound decides what is bound, the proof only
+    /// saves binds. Paths `unread` selects (open, deleted or already
+    /// taken) do not use the bound, so they are neither read nor excluded.
+    ///
+    /// The ranking is a byte search over the raw file: a UTF-16 file, or an
     /// importer spelling the name only through an include, ranks last.
     fn rank(
         &mut self,
         paths: &mut Vec<PathBuf>,
         left: usize,
         unread: &dyn Fn(&Path) -> bool,
+        provable: &dyn Fn(&Path) -> bool,
+        scope: Option<&IncludeScope<'_>>,
         cancel: &AtomicBool,
-    ) {
-        if self.names.is_empty() || paths.iter().filter(|path| !unread(path)).count() <= left {
-            return;
+    ) -> Absent {
+        if self.names.is_empty() {
+            return Absent::default();
         }
         let started = std::time::Instant::now();
+        let order = paths.iter().filter(|path| !unread(path)).count() > left;
         let mut likely = 0usize;
         let mut tiers = Vec::with_capacity(paths.len());
+        let mut includes = Vec::new();
+        // Summaries prove whole identifiers over the analysed text: the
+        // references proof's, never the symbols' substring proof.
+        let summarised = scope
+            .filter(|_| !self.symbols)
+            .and_then(|scope| Some((scope, SummaryScope::of(scope)?)));
+        self.summaries = summarised.as_ref().and_then(|(scope, summary)| {
+            scope
+                .workspace
+                .project_cache
+                .lexical_summaries(scope.key, &summary.binding)
+        });
         for path in paths.iter() {
-            let tier = if unread(path)
-                || likely >= left
-                || cancel.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                2
+            let reused = match &summarised {
+                Some((scope, summary))
+                    if !unread(path)
+                        && provable(path)
+                        && !cancel.load(std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    self.reuse_summary(scope, summary, path)
+                }
+                _ => None,
+            };
+            let tier = if let Some((stamp, dependencies)) = reused {
+                includes.extend(dependencies);
+                Err(Some(stamp))
+            } else if unread(path) || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                Ok(2)
             } else {
-                match self.read(path) {
-                    None => 2,
-                    Some(text) => {
-                        let named = self
-                            .names
-                            .iter()
-                            .any(|name| crate::navigation::text_mentions_name(&text, name));
-                        let imports = self.units.is_empty()
-                            || self
-                                .units
-                                .iter()
-                                .any(|unit| crate::navigation::text_mentions_name(&text, unit));
-                        match (named, imports) {
-                            (true, true) => 0,
-                            (true, false) => 1,
-                            (false, _) => 3,
+                let read_started = std::time::Instant::now();
+                let read = self.read(path);
+                self.profile.read += read_started.elapsed();
+                match read {
+                    None => Ok(2),
+                    Some((stamp, text)) => {
+                        let scan_started = std::time::Instant::now();
+                        let absent = stamp.is_some()
+                            && provable(path)
+                            && super::lexical::proves_absent(&text, &self.names, self.symbols);
+                        self.profile.scan += scan_started.elapsed();
+                        let proof = absent
+                            .then(|| {
+                                if self.symbols {
+                                    Some(WalkProof::default())
+                                } else if let Some(scope) = scope {
+                                    self.includes_absent(scope, path, &text, cancel)
+                                } else {
+                                    super::lexical::include_requests(&text)
+                                        .filter(Vec::is_empty)
+                                        .map(|_| WalkProof::default())
+                                }
+                            })
+                            .flatten();
+                        if let Some(proof) = proof {
+                            if let (Some((_, summary)), Some(root)) = (&summarised, &stamp) {
+                                self.summarise(summary, path, root, &text, &proof);
+                            }
+                            includes.extend(proof.baseline);
+                            Err(stamp)
+                        } else {
+                            let mentions =
+                                |name: &String| crate::navigation::text_mentions_name(&text, name);
+                            let named = if self.symbols {
+                                self.names.iter().all(mentions)
+                            } else {
+                                self.names.iter().any(mentions)
+                            };
+                            let imports = self.units.is_empty() || self.units.iter().any(mentions);
+                            Ok(match (named, imports) {
+                                (true, true) => 0,
+                                (true, false) => 1,
+                                (false, _) => 3,
+                            })
                         }
                     }
                 }
             };
-            if tier == 0 {
+            if matches!(tier, Ok(0)) {
                 likely += 1;
             }
             tiers.push(tier);
         }
-        let mut ranked = std::mem::take(paths)
-            .into_iter()
-            .zip(tiers)
-            .collect::<Vec<_>>();
-        ranked.sort_by_key(|(_, tier)| *tier);
+        let mut members = Vec::new();
+        let mut ranked = Vec::with_capacity(paths.len());
+        for (path, tier) in std::mem::take(paths).into_iter().zip(tiers) {
+            match tier {
+                Ok(tier) => ranked.push((path, tier)),
+                Err(stamp) => members.push((path, stamp)),
+            }
+        }
+        if order {
+            ranked.sort_by_key(|(_, tier)| *tier);
+        }
+        let kept = self.proven.len();
+        if let Some((scope, summary)) = summarised {
+            scope.workspace.project_cache.keep_lexical_summaries(
+                scope.key,
+                summary.binding,
+                std::mem::take(&mut self.proven),
+            );
+        }
+        self.summaries = None;
         crate::trace::trace!(
-            "  unverified ranking: {} members, {likely} likely, bound {left}, {:.1} ms",
+            "  unverified ranking: {} members, {likely} likely, {} lexically excluded ({} from summaries, {kept} summaries kept), bound {left}, {:.1} ms; include walks {:.1} ms, {} shared resolutions; reads {:.1} ms, scans {:.1} ms, resolvers {:.1} ms, roots {:.1} ms, lookups {:.1} ms, include reads {:.1} ms",
             ranked.len(),
-            started.elapsed().as_secs_f64() * 1000.0
+            members.len(),
+            std::mem::take(&mut self.summaries_reused),
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.walk_time.as_secs_f64() * 1000.0,
+            self.shared_hits,
+            ms(self.profile.read),
+            ms(self.profile.scan),
+            ms(self.profile.resolver),
+            ms(self.profile.root),
+            ms(self.profile.lookups),
+            ms(self.profile.include_reads),
         );
         paths.extend(ranked.into_iter().map(|(path, _)| path));
+        if !members.is_empty() {
+            includes.append(&mut self.observed);
+        }
+        Absent { members, includes }
     }
 
-    fn read(&mut self, path: &Path) -> Option<Vec<u8>> {
+    /// The member stamp and dependencies of `path`'s summary, when it
+    /// proves no name can occur in the member's analysed text: the token
+    /// filter holds no name, the root route the walk took is the route a
+    /// walk would take now, no file it depends on is held by the session
+    /// (A4: open, deleted or rejected), and every stamp proves its path
+    /// unchanged (a missing path still missing). Then the walk it replaces
+    /// would read the same bytes, resolve the same includes and prove the
+    /// same absence.
+    fn reuse_summary(
+        &mut self,
+        scope: &IncludeScope<'_>,
+        summary: &SummaryScope,
+        path: &Path,
+    ) -> Option<(PathStamp, Vec<BaselineEntry>)> {
+        let held = Arc::clone(self.summaries.as_ref()?.get(path)?);
+        if !super::lexical::needles_are_provable(&self.names) || held.tokens.may_hold(&self.names) {
+            return None;
+        }
+        if let Some(route) = &held.route {
+            let uri = Url::from_file_path(path).ok()?;
+            let now = scope.workspace.legacy_route_for_resolver(
+                &uri,
+                path,
+                scope.key,
+                &summary.binding.context,
+            );
+            if now != *route {
+                return None;
+            }
+        }
+        let unchanged = |path: &Path, stamp: &Option<PathStamp>| {
+            !summary
+                .private
+                .contains(&path_key(&absolute_path(path.to_path_buf())))
+                && summary_stamp_holds(stamp.as_ref(), path_stamp(path).as_ref())
+        };
+        if !unchanged(path, &Some(held.root.clone()))
+            || !held
+                .dependencies
+                .iter()
+                .all(|(path, stamp)| unchanged(path, stamp))
+        {
+            return None;
+        }
+        self.summaries_reused += 1;
+        #[cfg(test)]
+        SUMMARY_REUSES.with(|reuses| reuses.set(reuses.get() + 1));
+        Some((held.root.clone(), held.dependencies.clone()))
+    }
+
+    /// Records the summary of the member `path`, whose bytes `text` (read
+    /// after `root` was taken) `proof` proved absent, to keep at the end
+    /// of the ranking. A member depending on a file the session holds has
+    /// none.
+    fn summarise(
+        &mut self,
+        summary: &SummaryScope,
+        path: &Path,
+        root: &PathStamp,
+        text: &[u8],
+        proof: &WalkProof,
+    ) {
+        let private = |path: &Path| {
+            summary
+                .private
+                .contains(&path_key(&absolute_path(path.to_path_buf())))
+        };
+        if private(path)
+            || proof
+                .baseline
+                .iter()
+                .chain(&proof.observed)
+                .any(|(path, _)| private(path))
+        {
+            return;
+        }
+        let mut tokens = proof.tokens.clone();
+        tokens.insert_text(text);
+        let tokens = tokens.into_filter();
+        let mut dependencies = proof.baseline.clone();
+        dependencies.extend(proof.observed.iter().cloned());
+        dependencies.sort_by(|left, right| left.0.cmp(&right.0));
+        dependencies.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        self.proven.push((
+            path.to_path_buf(),
+            Arc::new(super::lexical::LexicalSummary {
+                tokens,
+                root: root.clone(),
+                dependencies,
+                route: proof.route.clone(),
+            }),
+        ));
+    }
+
+    /// What proves that no include `text` (the bytes of the member `path`)
+    /// resolves can hold a name, or `None` (R9-5 amended): the analysed
+    /// text is the raw text with each include replaced by the included
+    /// file's (conditional compilation only removes text), so every
+    /// include, resolved by the resolver the member's analysis uses in
+    /// `scope`, must resolve to a disk file that is not UTF-16, holds no
+    /// needle as an identifier and whose own includes do the same, at most
+    /// `MAX_LEXICAL_INCLUDE_DEPTH` deep. Each include read counts against
+    /// the byte budget and is proven by the stamp taken before its read.
+    fn includes_absent(
+        &mut self,
+        scope: &IncludeScope<'_>,
+        path: &Path,
+        text: &[u8],
+        cancel: &AtomicBool,
+    ) -> Option<WalkProof> {
+        let requests = super::lexical::include_requests(text)?;
+        if requests.is_empty() {
+            return Some(WalkProof::default());
+        }
+        let started = std::time::Instant::now();
+        let (bytes_left, observed) = (self.bytes_left, self.observed.len());
+        self.attempt.clear();
+        let mut proof = self.walk_member(scope, path, text, requests.clone(), true, cancel);
+        if let Err(()) = proof {
+            // Undo the shared attempt, so the walk without sharing reads,
+            // charges and records what a fresh resolver's walk would.
+            self.bytes_left = bytes_left;
+            self.observed.truncate(observed);
+            for entry in std::mem::take(&mut self.attempt) {
+                match entry {
+                    AttemptEntry::Include(key) => {
+                        self.includes.remove(&key);
+                    }
+                    AttemptEntry::Resolution(key) => {
+                        self.resolutions.remove(&key);
+                    }
+                }
+            }
+            proof = self.walk_member(scope, path, text, requests, false, cancel);
+        }
+        self.attempt.clear();
+        self.walk_time += started.elapsed();
+        proof.ok().flatten()
+    }
+
+    /// `includes_absent`'s walk of one member; `Err` when a lookup it
+    /// shared could have been answered differently by the member's own
+    /// resolver (only when `share`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_member(
+        &mut self,
+        scope: &IncludeScope<'_>,
+        path: &Path,
+        text: &[u8],
+        requests: Vec<super::lexical::IncludeRequest>,
+        share: bool,
+        cancel: &AtomicBool,
+    ) -> Result<Option<WalkProof>, ()> {
+        let Some(state) = scope.workspace.contexts.get(scope.key) else {
+            return Ok(None);
+        };
+        let context = Arc::clone(&state.context);
+        // A fresh resolver per member, as each member's analysis has: a
+        // resolver keeps the first load of a file, with the provenance of
+        // the search entry that found it, for every later lookup. Its
+        // default limits may exceed the session's: where the session's
+        // include is `Incomplete` (an over-limit listing or include cap),
+        // the proof may follow further, never to a different file, and the
+        // excluded member drops that "include incomplete" note. It holds
+        // none of the context's observations: no lookup's answer reads
+        // them, and building them into every member's resolver costs the
+        // square of their count (they only dedupe what a lookup reports).
+        let mut limits = pascal_core::ResolverLimits::default();
+        limits.max_source_bytes = scope.input.options.limits.max_file_bytes;
+        #[cfg(test)]
+        if let Some(files) = WALK_MAX_INCLUDE_FILES.with(std::cell::Cell::get) {
+            limits.max_include_files = files;
+        }
+        let resolver_started = std::time::Instant::now();
+        let mut resolver = super::resolver::resolver_for_include_walk(
+            Arc::clone(&context),
+            scope.input.roots.clone(),
+            scope.input,
+            limits,
+        );
+        self.profile.resolver += resolver_started.elapsed();
+        let mut walk = IncludeWalk {
+            key: scope.key,
+            context: &context,
+            active: Vec::new(),
+            routes: HashMap::new(),
+            share,
+            limits,
+            loaded: HashSet::new(),
+            virtual_loaded: HashSet::new(),
+            virtual_files: 0,
+            virtual_bytes: 0,
+            virtual_consulted: 0,
+            restart: false,
+            observed: Vec::new(),
+            tokens: super::lexical::TokenHashes::default(),
+        };
+        let proof = (|| {
+            let route_started = std::time::Instant::now();
+            let uri = Url::from_file_path(path).ok()?;
+            let route = scope
+                .workspace
+                .legacy_route_for_resolver(&uri, path, scope.key, &context);
+            self.profile.resolver += route_started.elapsed();
+            let root_route = route.clone();
+            let root_started = std::time::Instant::now();
+            let root = resolver
+                .load_source(
+                    path,
+                    route.as_ref(),
+                    pascal_core::resolver::SourceKind::Unit,
+                    cancel,
+                )
+                .ok()?;
+            let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = root.revision
+            else {
+                return None;
+            };
+            self.charge(root.bytes.len())?;
+            if content_hash != pascal_project::content_hash_bytes(text) {
+                return None;
+            }
+            let route = resolver.legacy_route_for_source(&root, None);
+            self.profile.root += root_started.elapsed();
+            walk.active.push(path_key(&root.path));
+            walk.loaded.insert(path_key(&root.path));
+            let mut baseline = Vec::new();
+            self.follow(
+                &mut resolver,
+                &mut walk,
+                &root.path,
+                requests,
+                route,
+                &mut baseline,
+                cancel,
+            )?;
+            Some(WalkProof {
+                baseline,
+                observed: walk_observations(&resolver, &walk),
+                tokens: std::mem::take(&mut walk.tokens),
+                route: Some(root_route),
+            })
+        })();
+        if walk.restart { Err(()) } else { Ok(proof) }
+    }
+
+    /// Follows the include `requests` of the file `including`, loaded under
+    /// `route`, adding what proves them to `baseline`.
+    ///
+    /// The session analysing the member passes no route for an include and
+    /// recovers the one registered for the including file instead, so a
+    /// file reached once with a legacy route resolves its own includes with
+    /// that route on every reach. The proof follows each reach under the
+    /// route it was found with, and so refuses when the two could differ:
+    /// a file reached both with and without a route, or one without a
+    /// route whose directory is not among its own include search entries
+    /// (a route would search it first).
+    #[allow(clippy::too_many_arguments)]
+    fn follow(
+        &mut self,
+        resolver: &mut pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        walk: &mut IncludeWalk<'_>,
+        including: &Path,
+        requests: Vec<super::lexical::IncludeRequest>,
+        route: Option<pascal_core::LegacyRoute>,
+        baseline: &mut Vec<BaselineEntry>,
+        cancel: &AtomicBool,
+    ) -> Option<()> {
+        for request in requests {
+            if walk.active.len() > MAX_LEXICAL_INCLUDE_DEPTH {
+                return None;
+            }
+            let lookup_started = std::time::Instant::now();
+            let child = self.resolve(resolver, walk, including, &request, route.as_ref(), cancel);
+            self.profile.lookups += lookup_started.elapsed();
+            let child = child?;
+            let pascal_core::resolver::SourceRevision::Disk { content_hash, .. } = child.revision
+            else {
+                return None;
+            };
+            let child_key = path_key(&child.path);
+            if walk.active.contains(&child_key) {
+                return None;
+            }
+            let child_route = resolver.legacy_route_for_source(&child, route.as_ref());
+            let routed = child_route.is_some();
+            let memo = (walk.key.clone(), child_key.clone(), routed);
+            if let Some(proven) = self.includes.get(&memo) {
+                let proven = proven.clone()?;
+                walk.merge_routes(&proven.routes)?;
+                baseline.extend(proven.baseline);
+                walk.observed.extend(proven.observations);
+                walk.tokens.union(&proven.tokens);
+                continue;
+            }
+            let outer = std::mem::take(&mut walk.routes);
+            let outer_tokens = std::mem::take(&mut walk.tokens);
+            let proven = (|| {
+                let owner = child.path.parent()?;
+                if !routed
+                    && !walk
+                        .context
+                        .include_search_entries(&child.path)
+                        .iter()
+                        .any(|entry| path_key(&entry.path) == path_key(owner))
+                {
+                    return None;
+                }
+                walk.routes.insert(child_key.clone(), routed);
+                self.charge(child.bytes.len())?;
+                let read_started = std::time::Instant::now();
+                let read = self.read(&child.path).and_then(|(stamp, bytes)| {
+                    stamp.as_ref()?;
+                    (pascal_project::content_hash_bytes(&bytes) == content_hash
+                        && super::lexical::is_byte_text(&bytes)
+                        && !super::lexical::holds_identifier(&bytes, &self.names))
+                    .then_some(())?;
+                    let requests = super::lexical::include_requests(&bytes)?;
+                    walk.tokens.insert_text(&bytes);
+                    Some((stamp, requests))
+                });
+                self.profile.include_reads += read_started.elapsed();
+                let (stamp, requests) = read?;
+                let mut baseline = vec![(child.path.clone(), stamp)];
+                walk.active.push(child_key);
+                let followed = self.follow(
+                    resolver,
+                    walk,
+                    &child.path,
+                    requests,
+                    child_route,
+                    &mut baseline,
+                    cancel,
+                );
+                walk.active.pop();
+                followed?;
+                Some(ProvenInclude {
+                    baseline,
+                    routes: walk.routes.drain().collect(),
+                    observations: walk_observations(resolver, walk),
+                    tokens: Arc::new(std::mem::take(&mut walk.tokens)),
+                })
+            })();
+            walk.routes = outer;
+            walk.tokens = outer_tokens;
+            if let Some(proven) = &proven {
+                walk.tokens.union(&proven.tokens);
+            }
+            if self.includes.insert(memo.clone(), proven.clone()).is_none() {
+                self.attempt.push(AttemptEntry::Include(memo));
+            }
+            let proven = proven?;
+            walk.merge_routes(&proven.routes)?;
+            baseline.extend(proven.baseline);
+        }
+        Some(())
+    }
+
+    /// The file the include `request` of `including` resolves to, as the
+    /// walk's resolver resolves it, or `None`. A lookup a member of the
+    /// request already made with the same `ResolutionKey` is answered from
+    /// it, without searching again, when the walk's own resolver would give
+    /// the same answer: it has not loaded that file (its first load would
+    /// otherwise answer, with that load's provenance), and with every
+    /// shared answer charged to it no include or directory-entry limit is
+    /// reached. Every other answer comes from the resolver; one that loads
+    /// a file a shared answer named, or reaches a limit once the shared
+    /// answers are charged, stops the walk for a walk without sharing
+    /// (`IncludeWalk::restart`). The shared answer's observations were
+    /// recorded by the member that made it (`observed`).
+    fn resolve(
+        &mut self,
+        resolver: &mut pascal_core::UnitResolver<super::resolver::LspSourceStore>,
+        walk: &mut IncludeWalk<'_>,
+        including: &Path,
+        request: &super::lexical::IncludeRequest,
+        route: Option<&pascal_core::LegacyRoute>,
+        cancel: &AtomicBool,
+    ) -> Option<pascal_core::resolver::ResolvedSource> {
+        let key: ResolutionKey = (
+            walk.key.clone(),
+            including.parent()?.to_path_buf(),
+            request.name.clone(),
+            route.map(pascal_core::LegacyRouteAuthority::of),
+        );
+        if walk.share
+            && let Some(shared) = self.resolutions.get(&key)
+        {
+            let child_key = path_key(&shared.child.path);
+            if !walk.loaded.contains(&child_key)
+                && !walk.virtual_loaded.contains(&child_key)
+                && walk.fits(resolver, (shared.files, shared.bytes, shared.consulted))
+            {
+                walk.virtual_files += shared.files;
+                walk.virtual_bytes += shared.bytes;
+                walk.virtual_consulted += shared.consulted;
+                walk.virtual_loaded.insert(child_key);
+                walk.observed.extend(shared.observations.iter().cloned());
+                self.shared_hits += 1;
+                return Some(shared.child.clone());
+            }
+        }
+        let (files, bytes, _) = resolver.include_usage();
+        let (_, consulted) = resolver.directory_entries();
+        let outcome = resolver
+            .try_resolve_include(
+                pascal_core::IncludeResolveRequest {
+                    including_path: including,
+                    byte_range: request.range.clone(),
+                    requested_name: &request.name,
+                    legacy_route: route,
+                },
+                cancel,
+            )
+            .ok()?;
+        let observations = outcome
+            .observations
+            .iter()
+            .filter_map(super::rename::resolver_observation_baseline)
+            .collect::<Vec<_>>();
+        self.observed.extend(observations);
+        let pascal_core::Resolution::Found(child) = outcome.result else {
+            return None;
+        };
+        let child_key = path_key(&child.path);
+        let (files_after, bytes_after, _) = resolver.include_usage();
+        let (_, consulted_after) = resolver.directory_entries();
+        let added = (
+            files_after.saturating_sub(files),
+            bytes_after.saturating_sub(bytes),
+            consulted_after.saturating_sub(consulted),
+        );
+        let has_virtual = !walk.virtual_loaded.is_empty();
+        // A file reached through a shared answer would have been loaded:
+        // this lookup could then have reused that load.
+        if walk.virtual_loaded.contains(&child_key)
+            || (has_virtual && !walk.fits(resolver, (0, 0, 0)))
+        {
+            walk.restart = true;
+            return None;
+        }
+        if walk.loaded.insert(child_key) && !self.resolutions.contains_key(&key) {
+            self.resolutions.insert(
+                key.clone(),
+                SharedResolution {
+                    child: child.clone(),
+                    files: added.0,
+                    bytes: added.1,
+                    consulted: added.2,
+                    observations: walk_observations(resolver, walk),
+                },
+            );
+            self.attempt.push(AttemptEntry::Resolution(key));
+        }
+        Some(child)
+    }
+
+    /// Takes `bytes` from the budget; `None` past it.
+    fn charge(&mut self, bytes: usize) -> Option<()> {
+        let bytes = u64::try_from(bytes).ok()?;
+        self.bytes_left = self.bytes_left.checked_sub(bytes)?;
+        Some(())
+    }
+
+    /// The stamp, taken before the read, and the bytes of `path` within
+    /// the budget.
+    fn read(&mut self, path: &Path) -> Option<(Option<PathStamp>, Vec<u8>)> {
         use std::io::Read;
+        let stamp = path_stamp(path);
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
         if len > MAX_UNVERIFIED_RANKING_FILE_BYTES || len > self.bytes_left {
@@ -5072,8 +6061,12 @@ impl UnverifiedRanking {
         self.bytes_left -= len;
         let mut text = Vec::with_capacity(len as usize);
         file.take(len).read_to_end(&mut text).ok()?;
-        Some(text)
+        Some((stamp, text))
     }
+}
+
+pub(crate) fn unresolved_gap(count: usize, display: &str) -> String {
+    format!("{count} units of {display} have includes that do not resolve; they were not searched")
 }
 
 fn outside_gap(gaps: &mut Vec<String>, outside: usize, display: &str) {
@@ -5174,12 +6167,15 @@ pub(in crate::workspace) mod tests {
         });
         let mut paths = vec![a.clone(), b.clone(), c.clone()];
         let taken = path_key(&a);
-        ranking.rank(
+        let absent = ranking.rank(
             &mut paths,
             1,
             &|path: &Path| path_key(path) == taken,
+            &|path: &Path| *path != b,
+            None,
             &AtomicBool::new(false),
         );
+        assert!(absent.members.is_empty(), "{absent:?}");
         let c_at = paths.iter().position(|path| *path == c).unwrap();
         let b_at = paths.iter().position(|path| *path == b).unwrap();
         assert!(c_at < b_at, "{paths:?}");
@@ -6305,14 +7301,19 @@ pub(in crate::workspace) mod tests {
             coverage.first_deferral.as_deref(),
             Some("an injected member error")
         );
+        // Past the direct-search bound, the deferred members are counted
+        // once, by the "retried later" gap.
         let input = workspace.analysis_input();
-        let found = indexed(
-            &mut workspace,
-            &input,
-            &one_target(&key, &anchor),
-            None,
-            &[],
-        );
+        let found = {
+            let _caps = override_caps(|caps| caps.unverified = Some(0));
+            indexed(
+                &mut workspace,
+                &input,
+                &one_target(&key, &anchor),
+                None,
+                &[],
+            )
+        };
         assert!(
             found
                 .gaps
@@ -7443,7 +8444,7 @@ pub(in crate::workspace) mod tests {
     }
 
     #[test]
-    fn an_unresolved_include_makes_a_member_unverified_every_time() {
+    fn an_unchanged_unresolved_include_member_is_a_gap_every_time() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         write(
@@ -7463,7 +8464,10 @@ pub(in crate::workspace) mod tests {
                 Some(&query),
                 &[],
             );
-            assert_eq!(source_names(&found), ["Inc.pas", "Shared.pas", "User.pas"]);
+            assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+            assert_eq!(found.unresolved, 1);
+            assert_eq!(found.gaps, [unresolved_gap(1, "App.dproj")]);
+            assert!(!found.baseline.iter().any(|(path, _)| *path == member));
         }
         assert_eq!(state(&workspace, &key, &member), Some(MemberState::Fresh));
     }
@@ -7475,8 +8479,10 @@ pub(in crate::workspace) mod tests {
         let (mut workspace, key, anchor) = indexed_project(root, 5, WorkspaceOptions::default());
         let _caps = override_caps(|caps| caps.unverified = Some(3));
         let input = workspace.analysis_input();
+        // Every member spells `end` as an identifier, so none is excluded
+        // lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P0".to_owned()],
+            names: vec!["end".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };
@@ -7623,6 +8629,1201 @@ pub(in crate::workspace) mod tests {
         );
         assert_eq!(source_names(&found), ["Plain.pas"]);
         assert_eq!(workspace.project_cache.take_index_requests(), [anchor]);
+    }
+
+    fn baselined(found: &IndexedSources, path: &Path) -> bool {
+        found
+            .baseline
+            .iter()
+            .any(|(baselined, stamp)| baselined == path && stamp.is_some())
+    }
+
+    /// R9-5: a Limited member whose bytes cannot hold `SharedValue` is
+    /// proved current by its stamp instead of read, although the bound
+    /// would have read it.
+    #[test]
+    fn a_limited_member_without_the_name_is_left_out_with_its_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.limit_index_member(&key, &plain);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+        assert!(baselined(&found, &plain), "{:?}", found.baseline);
+        assert_eq!(state(&workspace, &key, &plain), Some(MemberState::Limited));
+    }
+
+    /// l4d-1nfk on the references path: a member retrying a previous
+    /// refusal whose bytes cannot hold `SharedValue` is excluded with its
+    /// stamp, so no "retried later" gap counts it.
+    #[test]
+    fn a_retrying_member_without_the_name_is_left_out_of_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.mark_index_stale(&key, &plain);
+        workspace
+            .project_cache
+            .defer_index_member(&key, &plain, RETRYING_REFUSAL);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &plain), "{:?}", found.baseline);
+        assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    }
+
+    #[test]
+    fn a_limited_member_spelling_the_name_is_still_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let user = root.join("lib/User.pas");
+        workspace.project_cache.limit_index_member(&key, &user);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(!baselined(&found, &user), "{:?}", found.baseline);
+    }
+
+    /// An include may spell the name, a UTF-16 file hides it from a byte
+    /// search, and a non-ASCII name has no byte spelling: none is excluded.
+    #[test]
+    fn includes_utf16_files_and_non_ascii_names_are_never_excluded_lexically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let included = root.join("lib/Included.pas");
+        write(
+            &included,
+            "unit Included;\ninterface\n{$I Values.inc}\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/Values.inc"), "const Copy = SharedValue;\n");
+        let wide = root.join("lib/Wide.pas");
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(
+            USER.replace("unit User", "unit Wide")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        fs::write(&wide, bytes).unwrap();
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        for path in [&included, &wide, &plain] {
+            workspace.project_cache.mark_index_stale(&key, path);
+        }
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        let names = source_names(&found);
+        assert!(names.contains(&"Included.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Wide.pas".to_owned()), "{names:?}");
+        assert!(!names.contains(&"Plain.pas".to_owned()), "{names:?}");
+
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&CandidateQuery {
+                names: vec!["Ärger".to_owned()],
+                top_level_units: None,
+                aliases: Vec::new(),
+            }),
+            &[],
+        );
+        assert!(
+            source_names(&found).contains(&"Plain.pas".to_owned()),
+            "{:?}",
+            found.sources
+        );
+    }
+
+    fn retry_member(workspace: &Workspace, key: &ContextKey, path: &Path) {
+        workspace.project_cache.mark_index_stale(key, path);
+        workspace
+            .project_cache
+            .defer_index_member(key, path, RETRYING_REFUSAL);
+    }
+
+    fn baseline_stamp(found: &IndexedSources, path: &Path) -> Option<PathStamp> {
+        found
+            .baseline
+            .iter()
+            .find(|(baselined, _)| baselined == path)
+            .and_then(|(_, stamp)| stamp.clone())
+    }
+
+    /// R9-5 amended: the proof follows resolved includes. A retrying member
+    /// whose text and include cannot hold `SharedValue` is left out, with
+    /// both stamps in the baseline.
+    #[test]
+    fn a_retrying_member_whose_includes_cannot_hold_the_name_is_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\nconst GetSharedValues = 1;\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &guarded);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &guarded), "{:?}", found.baseline);
+        assert!(baselined(&found, &defs), "{:?}", found.baseline);
+    }
+
+    /// A write to an include after the proof read it fails revalidation:
+    /// its baseline stamp is the one taken before the read.
+    #[test]
+    fn an_include_edited_after_the_proof_is_caught_by_revalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        pascal_project::backdate_tree_for_test(root);
+        let before = path_stamp(&defs).expect("stamp");
+        retry_member(&workspace, &key, &guarded);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        let proved = baseline_stamp(&found, &defs).expect("the include is in the baseline");
+        assert!(proved.proves_unchanged(&before));
+        write(&defs, "const Copy = SharedValue;\n");
+        let now = path_stamp(&defs).expect("stamp");
+        assert!(!proved.proves_unchanged(&now));
+    }
+
+    /// The include spells the name: the member is bound.
+    #[test]
+    fn a_name_spelled_only_in_an_include_keeps_the_member_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let spelled = root.join("lib/Spelled.pas");
+        write(
+            &spelled,
+            "unit Spelled;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n",
+        );
+        write(&root.join("lib/Body.inc"), "  WriteLn(SharedValue);\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &spelled);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Shared.pas", "Spelled.pas", "User.pas"]
+        );
+    }
+
+    /// An include that does not resolve, or whose name is computed, proves
+    /// nothing: the member is bound as before.
+    #[test]
+    fn an_unresolved_or_computed_include_proves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let missing = root.join("lib/Missing.pas");
+        let dated = root.join("lib/Dated.pas");
+        write(
+            &missing,
+            "unit Missing;\n{$I Missing.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &dated,
+            "unit Dated;\ninterface\nconst Built = {$I %DATE%};\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&missing, &dated] {
+            retry_member(&workspace, &key, path);
+        }
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(
+            source_names(&found),
+            ["Dated.pas", "Missing.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(!baselined(&found, &missing) && !baselined(&found, &dated));
+    }
+
+    fn references_of_shared_value(
+        workspace: &mut Workspace,
+        key: &ContextKey,
+        anchor: &IndexAnchor,
+    ) -> IndexedSources {
+        let input = workspace.analysis_input();
+        indexed(
+            workspace,
+            &input,
+            &one_target(key, anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        )
+    }
+
+    /// Review fix 1: one include reached with two provenances. `A.pas`
+    /// reaches `d/Defs.inc` through its legacy owner directory, so the file
+    /// carries a legacy route and its `{$I Sub.inc}` finds `d/Sub.inc`:
+    /// proven. `B.pas` reaches it through a mapped include path, without a
+    /// route, so its `{$I Sub.inc}` does not search `d` and does not
+    /// resolve: B's proof must neither reuse A's nor see A's load of the
+    /// file. `C.pas` reaches a file the same way.
+    #[test]
+    fn an_include_reached_with_two_provenances_proves_each_reach_on_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let outside = temp.path().join("outside");
+        let a = root.join("lib/A.pas");
+        let b = root.join("lib/B.pas");
+        write(
+            &a,
+            "unit A;\n{$I ..\\..\\outside\\d\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &b,
+            "unit B;\n{$I ..\\d\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&outside.join("d/Defs.inc"), "{$I Sub.inc}\n");
+        write(&outside.join("d/Sub.inc"), "{$DEFINE QUIET}\n");
+        write(&outside.join("m/Sub.inc"), "const Copy = SharedValue;\n");
+        let c = root.join("lib/C.pas");
+        write(
+            &c,
+            "unit C;\n{$I ..\\e\\Lone.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&outside.join("e/Lone.inc"), "{$I Quiet.inc}\n");
+        write(&outside.join("m/Quiet.inc"), "{$DEFINE QUIET}\n");
+        let (mut workspace, key, anchor) = shared_project(&root, WorkspaceOptions::default());
+        let state = workspace.contexts.get_mut(&key).expect("context");
+        let mut parts = (*state.context).clone().into_parts();
+        parts
+            .include_path_entries
+            .push(pascal_project::ProjectPathEntry {
+                path: outside.join("m"),
+                provenance: pascal_project::ProjectPathProvenance::Mapped {
+                    root: outside.clone(),
+                },
+            });
+        state.context = Arc::new(pascal_project::ProjectContext::from_parts(parts));
+        for path in [&a, &b, &c] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"A.pas".to_owned()), "{names:?}");
+        assert!(baselined(&found, &outside.join("d/Sub.inc")));
+        assert!(names.contains(&"B.pas".to_owned()), "{names:?}");
+        assert!(!baselined(&found, &b), "{:?}", found.baseline);
+        assert!(names.contains(&"C.pas".to_owned()), "{names:?}");
+    }
+
+    /// Task 8c (R9-5): members of one request that include the same name
+    /// from the same directory, under the same route, share its
+    /// resolution: it is searched once, and both members are excluded with
+    /// the include's stamp.
+    #[test]
+    fn members_including_one_name_from_one_directory_share_its_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        let defs = root.join("lib/Defs.inc");
+        for (path, name) in [(&first, "GuardA"), (&second, "GuardB")] {
+            write(
+                path,
+                &format!("unit {name};\n{{$I Defs.inc}}\ninterface\nimplementation\nend.\n"),
+            );
+        }
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        for path in [&first, &second, &defs] {
+            assert!(baselined(&found, path), "{path:?}: {:?}", found.baseline);
+        }
+    }
+
+    /// Task 8c (R9-5): a member whose own lookup reaches a file it was
+    /// given by a shared resolution (its resolver never loaded it, and
+    /// would have answered from that load) is walked again without
+    /// sharing, with the result a walk of its own gives.
+    #[test]
+    fn a_member_reaching_a_shared_file_again_is_walked_without_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &first,
+            "unit GuardA;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &second,
+            "unit GuardB;\n{$I Defs.inc}\n{$I ..\\lib\\Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        // A: one search. B: a shared answer, then its own search finds the
+        // shared file and the walk starts again: two searches.
+        assert_eq!(pascal_core::take_include_searches(), 4);
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        for path in [&first, &second, &defs] {
+            assert!(baselined(&found, path), "{path:?}: {:?}", found.baseline);
+        }
+    }
+
+    /// Task 8c fix round 1 (Minor 4): a member whose own lookup stays
+    /// within the include file limit only because a shared answer was not
+    /// charged to its resolver is walked again without sharing, and its
+    /// third include is then past the limit, as for a walk of its own: it
+    /// is not proven.
+    #[test]
+    fn a_member_past_a_limit_once_shared_answers_are_charged_is_walked_without_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("lib/GuardA.pas");
+        let second = root.join("lib/GuardB.pas");
+        write(
+            &first,
+            "unit GuardA;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &second,
+            "unit GuardB;\n{$I Defs.inc}\n{$I Two.inc}\n{$I Three.inc}\ninterface\nimplementation\nend.\n",
+        );
+        for name in ["Defs.inc", "Two.inc", "Three.inc"] {
+            write(&root.join("lib").join(name), "{$DEFINE GUARDED}\n");
+        }
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&first, &second] {
+            retry_member(&workspace, &key, path);
+        }
+        set_walk_max_include_files_for_test(Some(2));
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let searches = pascal_core::take_include_searches();
+        set_walk_max_include_files_for_test(None);
+        // A: 1. B's attempt: a shared answer, then 2 searches, the last
+        // past the limit with the shared answer charged. B's rerun: 3.
+        assert_eq!(searches, 6);
+        assert_eq!(
+            source_names(&found),
+            ["GuardB.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(baselined(&found, &first), "{:?}", found.baseline);
+    }
+
+    /// Task 8d Part 2 fixture: retrying `lib/Guarded.pas` includes
+    /// `Defs.inc`, found in `inc2` behind an `inc1` without one, which
+    /// includes `Nested.inc`; nothing spells `SharedValue`. Settled.
+    fn summarised_member(root: &Path) -> (Workspace, ContextKey, IndexAnchor, [PathBuf; 3]) {
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("inc2/Defs.inc");
+        let nested = root.join("inc2/Nested.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n{$I Nested.inc}\n");
+        write(&nested, "{$DEFINE NESTED}\n");
+        fs::create_dir_all(root.join("inc1")).unwrap();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>inc1;inc2</DCC_IncludePath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        retry_member(&workspace, &key, &guarded);
+        (workspace, key, anchor, [guarded, defs, nested])
+    }
+
+    /// Final review C1 fixture: retrying members `lib/A.pas` and
+    /// `lib/B.pas` with `files` (relative path, text), include path
+    /// `inc1;inc2`, `inc1` empty; settled.
+    fn two_summarised_members(
+        root: &Path,
+        files: &[(&str, &str)],
+    ) -> (Workspace, ContextKey, IndexAnchor) {
+        for (path, text) in files {
+            write(&root.join(path), text);
+        }
+        fs::create_dir_all(root.join("inc1")).unwrap();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>inc1;inc2</DCC_IncludePath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for member in ["lib/A.pas", "lib/B.pas"] {
+            retry_member(&workspace, &key, &root.join(member));
+        }
+        (workspace, key, anchor)
+    }
+
+    /// C1: after both summaries are built, `shadow` (spelling the name)
+    /// appears earlier in the search path. The second request binds what
+    /// a ranking without summaries binds, and its baseline already held
+    /// what the new file changes.
+    fn a_shadow_invalidates_both_summaries(files: &[(&str, &str)], shadow: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let (mut workspace, key, anchor) = two_summarised_members(&root, files);
+        let first = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(source_names(&first), ["Shared.pas", "User.pas"]);
+        assert_eq!(workspace.project_cache.lexical_summary_count(&key), 2);
+        let changed = |found: &IndexedSources| {
+            found
+                .baseline
+                .iter()
+                .any(|(path, stamp)| match path_stamp(path) {
+                    None => stamp.is_some(),
+                    Some(current) => stamp.as_ref().is_none_or(|held| *held != current),
+                })
+        };
+        let shadow = root.join(shadow);
+        write(&shadow, "const Copy = SharedValue;\n");
+        pascal_project::backdate_for_test(&shadow);
+        pascal_project::backdate_for_test(shadow.parent().unwrap());
+        assert!(
+            changed(&first),
+            "the first request's baseline misses the new file"
+        );
+        take_summary_reuses_for_test();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let reused = take_summary_reuses_for_test();
+        // The same files and query without any summary.
+        let fresh_temp = tempfile::tempdir().unwrap();
+        let fresh_root = fresh_temp.path().join("ws");
+        let (mut fresh, fresh_key, fresh_anchor) = two_summarised_members(&fresh_root, files);
+        write(
+            &fresh_root.join(shadow.strip_prefix(&root).unwrap()),
+            "const Copy = SharedValue;\n",
+        );
+        let expected = references_of_shared_value(&mut fresh, &fresh_key, &fresh_anchor);
+        assert_eq!(
+            source_names(&found),
+            source_names(&expected),
+            "reused {reused}"
+        );
+        assert!(
+            source_names(&expected).contains(&"B.pas".to_owned()),
+            "{:?}",
+            source_names(&expected)
+        );
+    }
+
+    /// C1, scenario 1: B takes `X.inc`'s proof from the memo; A's walk
+    /// observed the missing `inc1/Defs.inc` before it, so the memo's own
+    /// slice lacks it.
+    #[test]
+    fn a_new_include_shadowing_a_memo_proof_invalidates_the_consumers_summary() {
+        a_shadow_invalidates_both_summaries(
+            &[
+                (
+                    "lib/A.pas",
+                    "unit A;\n{$I Defs.inc}\n{$I ..\\x\\X.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                (
+                    "lib/B.pas",
+                    "unit B;\n{$I ..\\x\\X.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                ("x/X.inc", "{$I Defs.inc}\n"),
+                ("inc2/Defs.inc", "{$DEFINE QUIET}\n"),
+            ],
+            "inc1/Defs.inc",
+        );
+    }
+
+    /// C1, scenario 2: B takes A's shared resolution of `Defs.inc`; A's
+    /// resolver listed `inc1` for an earlier lookup, so that resolution's
+    /// own slice lacks the listing a case variant changes.
+    #[test]
+    fn a_case_variant_shadowing_a_shared_resolution_invalidates_the_consumers_summary() {
+        a_shadow_invalidates_both_summaries(
+            &[
+                (
+                    "lib/A.pas",
+                    "unit A;\n{$I Other.inc}\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                (
+                    "lib/B.pas",
+                    "unit B;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+                ),
+                ("inc2/Other.inc", "{$DEFINE OTHER}\n"),
+                ("inc2/Defs.inc", "{$DEFINE QUIET}\n"),
+            ],
+            "inc1/DEFS.INC",
+        );
+    }
+
+    /// References of `SharedValue` twice: the summaries the second reused.
+    fn twice(
+        workspace: &mut Workspace,
+        key: &ContextKey,
+        anchor: &IndexAnchor,
+        between: impl FnOnce(&mut Workspace),
+    ) -> (IndexedSources, usize) {
+        let first = references_of_shared_value(workspace, key, anchor);
+        assert_eq!(source_names(&first), ["Shared.pas", "User.pas"]);
+        between(workspace);
+        take_summary_reuses_for_test();
+        let found = references_of_shared_value(workspace, key, anchor);
+        (found, take_summary_reuses_for_test())
+    }
+
+    /// Task 8d Part 2: the second request proves the member from the
+    /// summary the first kept: no read of it or of its includes, and the
+    /// same stamps in its baseline.
+    #[test]
+    fn a_members_lexical_summary_is_reused_by_the_next_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, paths) = summarised_member(root);
+        let first = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert!(workspace.project_cache.lexical_summary_count(&key) == 1);
+        take_summary_reuses_for_test();
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(take_summary_reuses_for_test(), 1);
+        assert_eq!(pascal_core::take_include_searches(), 0);
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        for path in &paths {
+            assert_eq!(
+                baseline_stamp(&found, path),
+                baseline_stamp(&first, path),
+                "{path:?}"
+            );
+            assert!(baselined(&found, path), "{path:?}");
+        }
+        // The missing `inc1/Defs.inc` the lookup observed is baselined too.
+        assert!(
+            found
+                .baseline
+                .iter()
+                .any(|(path, stamp)| path == &root.join("inc1/Defs.inc") && stamp.is_none()),
+            "{:?}",
+            found.baseline
+        );
+    }
+
+    #[test]
+    fn an_edit_of_the_member_invalidates_its_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, [guarded, ..]) = summarised_member(root);
+        let (found, reused) = twice(&mut workspace, &key, &anchor, |_| {
+            write(
+                &guarded,
+                "unit Guarded;\n{$I Defs.inc}\ninterface\nconst A = SharedValue;\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_for_test(&guarded);
+        });
+        assert_eq!(reused, 0);
+        assert_eq!(
+            source_names(&found),
+            ["Guarded.pas", "Shared.pas", "User.pas"]
+        );
+    }
+
+    #[test]
+    fn an_edit_of_a_nested_include_invalidates_the_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, [_, _, nested]) = summarised_member(root);
+        let (found, reused) = twice(&mut workspace, &key, &anchor, |_| {
+            write(&nested, "const Copy = SharedValue;\n");
+            pascal_project::backdate_for_test(&nested);
+        });
+        assert_eq!(reused, 0);
+        assert_eq!(
+            source_names(&found),
+            ["Guarded.pas", "Shared.pas", "User.pas"]
+        );
+    }
+
+    /// A7: a same-size rewrite that keeps the modification time is caught.
+    #[test]
+    fn a_same_size_same_mtime_include_rewrite_invalidates_the_summary() {
+        use crate::workspace::persist::acceptance::rewrite_keeping_the_stamp;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, [_, defs, _]) = summarised_member(root);
+        let (found, reused) = twice(&mut workspace, &key, &anchor, |_| {
+            // Same length as "{$DEFINE GUARDED}\n{$I Nested.inc}\n".
+            rewrite_keeping_the_stamp(&defs, b"SharedValue;     \n{$I Nested.inc}\n");
+        });
+        assert_eq!(reused, 0);
+        assert_eq!(
+            source_names(&found),
+            ["Guarded.pas", "Shared.pas", "User.pas"]
+        );
+    }
+
+    /// A file appearing earlier in the include search path changes a
+    /// resolver observation of the walk: the summary is not used.
+    #[test]
+    fn a_new_include_earlier_in_the_search_path_invalidates_the_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, _) = summarised_member(root);
+        let (found, reused) = twice(&mut workspace, &key, &anchor, |_| {
+            let shadow = root.join("inc1/Defs.inc");
+            write(&shadow, "const Copy = SharedValue;\n");
+            pascal_project::backdate_for_test(&shadow);
+            pascal_project::backdate_for_test(&root.join("inc1"));
+        });
+        assert_eq!(reused, 0);
+        assert_eq!(
+            source_names(&found),
+            ["Guarded.pas", "Shared.pas", "User.pas"]
+        );
+    }
+
+    /// A4: an include open in the editor is read from its buffer: the
+    /// summary proven from the saved file is not used.
+    #[test]
+    fn an_open_include_is_never_answered_from_a_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, [_, defs, _]) = summarised_member(root);
+        let (_, reused) = twice(&mut workspace, &key, &anchor, |workspace| {
+            open(workspace, &defs, 1);
+        });
+        assert_eq!(reused, 0);
+    }
+
+    /// A query for another name uses the same summary: the token set
+    /// proves its absence too.
+    #[test]
+    fn a_summary_proves_any_name_its_tokens_lack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor, [guarded, ..]) = summarised_member(root);
+        references_of_shared_value(&mut workspace, &key, &anchor);
+        take_summary_reuses_for_test();
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&CandidateQuery {
+                names: vec!["Unrelated".to_owned()],
+                top_level_units: None,
+                aliases: Vec::new(),
+            }),
+            &[],
+        );
+        assert_eq!(take_summary_reuses_for_test(), 1);
+        assert!(baselined(&found, &guarded));
+        // `Nested` is a token of `Nested.inc`'s directive: not proven.
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&CandidateQuery {
+                names: vec!["NESTED".to_owned()],
+                top_level_units: None,
+                aliases: Vec::new(),
+            }),
+            &[],
+        );
+        assert_eq!(take_summary_reuses_for_test(), 0);
+        assert!(source_names(&found).contains(&"Guarded.pas".to_owned()));
+    }
+
+    /// Task 8d fix round 1 (Minor 5): a stamp without a change identity,
+    /// or not settled, proves nothing for a summary.
+    #[test]
+    fn a_summary_stamp_needs_a_settled_stamp_with_a_change_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A.pas");
+        write(&path, "unit A;");
+        pascal_project::backdate_for_test(&path);
+        let stamp = path_stamp(&path).expect("stamp");
+        assert!(summary_stamp_holds(Some(&stamp), Some(&stamp)));
+        assert!(summary_stamp_holds(None, None));
+        assert!(!summary_stamp_holds(Some(&stamp), None));
+        assert!(!summary_stamp_holds(None, Some(&stamp)));
+        let mut unidentified = stamp.clone();
+        unidentified.change = None;
+        assert!(!summary_stamp_holds(
+            Some(&unidentified),
+            Some(&unidentified)
+        ));
+        let mut unsettled = stamp.clone();
+        unsettled.settled = false;
+        assert!(!summary_stamp_holds(Some(&unsettled), Some(&stamp)));
+    }
+
+    /// Task 8d's synthetic shape: `members` retrying members of 20 to 200 KB
+    /// spread over four library directories, each including its
+    /// directory's `defines.inc`, which includes two or three nested files;
+    /// none spells `SharedValue`.
+    fn retrying_library_shape(root: &Path, members: usize) -> (Workspace, ContextKey, IndexAnchor) {
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let libraries = ["liba", "libb", "libc", "libd"];
+        for (index, library) in libraries.iter().enumerate() {
+            let nested = 2 + index % 2;
+            let mut defines = String::new();
+            for file in 0..nested {
+                defines.push_str(&format!("{{$I nested{file}.inc}}\n"));
+                write(
+                    &root.join(library).join(format!("nested{file}.inc")),
+                    &"{$IFDEF MSWINDOWS}{$DEFINE WINDOWS_ONLY}{$ENDIF}\n".repeat(40),
+                );
+            }
+            defines.push_str(&"{$IFNDEF FPC}{$DEFINE DELPHI}{$ENDIF}\n".repeat(60));
+            write(&root.join(library).join("defines.inc"), &defines);
+        }
+        let paths = (0..members)
+            .map(|member| {
+                root.join(libraries[member % libraries.len()])
+                    .join(format!("Member{member}.pas"))
+            })
+            .collect::<Vec<_>>();
+        for (member, path) in paths.iter().enumerate() {
+            write(
+                path,
+                &format!(
+                    "unit Member{member};\n{{$I defines.inc}}\ninterface\nimplementation\nend.\n"
+                ),
+            );
+        }
+        // A large project's context: `dirs` more search directories, each
+        // holding one unit, and `explicit` explicit units.
+        let knob = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|count| count.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let mut search = "lib;liba;libb;libc;libd".to_owned();
+        for dir in 0..knob("L4D_PROFILE_SEARCH_DIRS") {
+            write(
+                &root.join(format!("extra/d{dir}/Extra{dir}.pas")),
+                &format!("unit Extra{dir};\ninterface\nimplementation\nend.\n"),
+            );
+            search.push_str(&format!(";extra\\d{dir}"));
+        }
+        let mut items = String::new();
+        for unit in 0..knob("L4D_PROFILE_EXPLICIT") {
+            write(
+                &root.join(format!("app/Form{unit}.pas")),
+                &format!("unit Form{unit};\ninterface\nimplementation\nend.\n"),
+            );
+            items.push_str(&format!("<DCCReference Include=\"app\\Form{unit}.pas\"/>"));
+        }
+        let (mut workspace, key) = project_workspace(
+            root,
+            &format!(
+                "<DCC_UnitSearchPath>{search}</DCC_UnitSearchPath><DCC_IncludePath>{search}</DCC_IncludePath>"
+            ),
+            &items,
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for (member, path) in paths.iter().enumerate() {
+            let size = 20 * 1024 + (member * 7919) % (180 * 1024);
+            let mut text =
+                format!("unit Member{member};\n{{$I defines.inc}}\ninterface\nimplementation\n");
+            let mut routine = 0;
+            while text.len() < size {
+                text.push_str(&format!(
+                    "procedure TMember{member}Helper.Routine{routine}(const AValue: Integer; var AResult: string);\nvar\n  LIndex: Integer;\nbegin\n  for LIndex := 0 to AValue do\n    AResult := AResult + IntToStr(LIndex); // GetSharedValues\nend;\n\n"
+                ));
+                routine += 1;
+            }
+            text.push_str("end.\n");
+            write(path, &text);
+            pascal_project::backdate_for_test(path);
+            retry_member(&workspace, &key, path);
+        }
+        (workspace, key, anchor)
+    }
+
+    /// Task 8d Part 1: times the references ranking over the synthetic
+    /// shape. Run with `PASCAL_LSP_TRACE` set, in a release test build.
+    #[test]
+    #[ignore = "profiling fixture"]
+    fn profile_the_references_ranking_over_retrying_library_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let members = std::env::var("L4D_PROFILE_MEMBERS")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(350);
+        let (mut workspace, key, anchor) = retrying_library_shape(root, members);
+        for round in 0..3 {
+            let charged = workspace.project_cache.stats().reserved_index_bytes;
+            let started = std::time::Instant::now();
+            let found = references_of_shared_value(&mut workspace, &key, &anchor);
+            eprintln!(
+                "round {round}: {:.1} ms, {} sources, {} baselined, {} summaries, index charge +{} B",
+                ms(started.elapsed()),
+                found.sources.len(),
+                found.baseline.len(),
+                workspace.project_cache.lexical_summary_count(&key),
+                workspace.project_cache.stats().reserved_index_bytes - charged,
+            );
+            assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        }
+        // Task 8d Part 3: a symbol query whose piece 11 members spell.
+        open(&mut workspace, &root.join("lib/User.pas"), 1);
+        let input = workspace.analysis_input();
+        let mut answers = Vec::new();
+        for round in 0..3 {
+            crate::navigation::test_reset_document_parse_count();
+            let charged = workspace.project_cache.stats().reserved_index_bytes;
+            let started = std::time::Instant::now();
+            let found = super::super::queries::workspace_symbols_from_input(
+                input.clone(),
+                "Member7",
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("workspace symbols");
+            eprintln!(
+                "symbols round {round}: {:.1} ms, {} symbols, {} parses, index charge +{} B",
+                ms(started.elapsed()),
+                found.value.len(),
+                crate::navigation::test_document_parse_count(),
+                workspace.project_cache.stats().reserved_index_bytes - charged,
+            );
+            answers.push(found.value);
+        }
+        assert!(answers.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// Task 8c (R9-5): the same include name from two directories resolves
+    /// to two files: the shared resolution is keyed by the including
+    /// directory, so the member whose own directory's file spells the name
+    /// is still bound.
+    #[test]
+    fn one_include_name_from_two_directories_is_resolved_for_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("lib/Shared.pas"), SHARED);
+        write(&root.join("lib/User.pas"), USER);
+        let quiet = root.join("lib/GuardA.pas");
+        let spelled = root.join("other/GuardB.pas");
+        for (path, name) in [(&quiet, "GuardA"), (&spelled, "GuardB")] {
+            write(
+                path,
+                &format!("unit {name};\n{{$I Defs.inc}}\ninterface\nimplementation\nend.\n"),
+            );
+        }
+        write(&root.join("lib/Defs.inc"), "{$DEFINE GUARDED}\n");
+        write(&root.join("other/Defs.inc"), "const Copy = SharedValue;\n");
+        let (mut workspace, key) = project_workspace(
+            root,
+            "<DCC_UnitSearchPath>lib;other</DCC_UnitSearchPath>",
+            "",
+            WorkspaceOptions::default(),
+        );
+        let anchor = IndexAnchor::Project(root.join("App.dproj"));
+        advance(&mut workspace, &anchor, IndexBound::all());
+        for path in [&quiet, &spelled] {
+            retry_member(&workspace, &key, path);
+        }
+        pascal_core::take_include_searches();
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert_eq!(pascal_core::take_include_searches(), 2);
+        assert_eq!(
+            source_names(&found),
+            ["GuardB.pas", "Shared.pas", "User.pas"]
+        );
+        assert!(baselined(&found, &quiet), "{:?}", found.baseline);
+        assert!(!baselined(&found, &spelled), "{:?}", found.baseline);
+    }
+
+    /// Minor 4: an include open in the editor is read from its buffer, not
+    /// the disk the proof reads: it proves nothing.
+    #[test]
+    fn an_open_include_proves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let guarded = root.join("lib/Guarded.pas");
+        let defs = root.join("lib/Defs.inc");
+        write(
+            &guarded,
+            "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&defs, "{$DEFINE GUARDED}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        workspace
+            .open_document(
+                Url::from_file_path(&defs).unwrap(),
+                "const Copy = SharedValue;\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        retry_member(&workspace, &key, &guarded);
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        assert!(
+            source_names(&found).contains(&"Guarded.pas".to_owned()),
+            "{:?}",
+            found.sources
+        );
+        assert!(!baselined(&found, &guarded), "{:?}", found.baseline);
+    }
+
+    /// Minor 4: nested includes are followed. Without the name at any
+    /// level the member is excluded with every level's stamp; the name in
+    /// the innermost include keeps it bound.
+    #[test]
+    fn nested_includes_are_followed_to_the_innermost() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outer = root.join("lib/Outer.pas");
+        let deep = root.join("lib/Deep.pas");
+        write(
+            &outer,
+            "unit Outer;\n{$I One.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/One.inc"), "{$I Two.inc}\n");
+        write(&root.join("lib/Two.inc"), "{$DEFINE TWO}\n");
+        write(
+            &deep,
+            "unit Deep;\n{$I Three.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&root.join("lib/Three.inc"), "{$I Four.inc}\n");
+        write(&root.join("lib/Four.inc"), "const Copy = SharedValue;\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&outer, &deep] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"Outer.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Deep.pas".to_owned()), "{names:?}");
+        for name in ["Outer.pas", "One.inc", "Two.inc"] {
+            assert!(
+                baselined(&found, &root.join("lib").join(name)),
+                "{name}: {:?}",
+                found.baseline
+            );
+        }
+    }
+
+    /// Minor 4: past `MAX_LEXICAL_INCLUDE_DEPTH`, or around a cycle, the
+    /// proof stops and the member is bound; exactly at the limit it holds.
+    #[test]
+    fn the_include_depth_limit_and_cycles_prove_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lib = root.join("lib");
+        let chain = |prefix: &str, levels: usize| {
+            for level in 0..levels {
+                let text = if level + 1 < levels {
+                    format!("{{$I {prefix}{}.inc}}\n", level + 1)
+                } else {
+                    "{$DEFINE LAST}\n".to_owned()
+                };
+                write(&lib.join(format!("{prefix}{level}.inc")), &text);
+            }
+        };
+        chain("Ok", MAX_LEXICAL_INCLUDE_DEPTH);
+        chain("Deep", MAX_LEXICAL_INCLUDE_DEPTH + 1);
+        let within = lib.join("Within.pas");
+        let past = lib.join("Past.pas");
+        let cyclic = lib.join("Cyclic.pas");
+        write(
+            &within,
+            "unit Within;\n{$I Ok0.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &past,
+            "unit Past;\n{$I Deep0.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            &cyclic,
+            "unit Cyclic;\n{$I Ping.inc}\ninterface\nimplementation\nend.\n",
+        );
+        write(&lib.join("Ping.inc"), "{$I Pong.inc}\n");
+        write(&lib.join("Pong.inc"), "{$I Ping.inc}\n");
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        for path in [&within, &past, &cyclic] {
+            retry_member(&workspace, &key, path);
+        }
+        let found = references_of_shared_value(&mut workspace, &key, &anchor);
+        let names = source_names(&found);
+        assert!(!names.contains(&"Within.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Past.pas".to_owned()), "{names:?}");
+        assert!(names.contains(&"Cyclic.pas".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn a_substring_of_a_longer_identifier_does_not_hold_the_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let getter = root.join("lib/Getter.pas");
+        write(
+            &getter,
+            "unit Getter;\ninterface\nfunction GetSharedValue: Integer;\nimplementation\nfunction GetSharedValue: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        retry_member(&workspace, &key, &getter);
+        let input = workspace.analysis_input();
+        let found = indexed(
+            &mut workspace,
+            &input,
+            &one_target(&key, &anchor),
+            Some(&shared_query(Some(&["shared"]))),
+            &[],
+        );
+        assert_eq!(source_names(&found), ["Shared.pas", "User.pas"]);
+        assert!(baselined(&found, &getter), "{:?}", found.baseline);
+    }
+
+    /// The symbol needles are the query's identifier pieces: a Limited
+    /// member lacking one is left out, one spelling them all is read, and a
+    /// non-ASCII query reads its unverified member.
+    #[test]
+    fn a_symbols_request_leaves_out_unverified_members_lacking_a_query_piece() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let forms = root.join("lib/Vcl.Forms.pas");
+        write(
+            &forms,
+            "unit Vcl.Forms;\ninterface\nconst Ärger = 1;\nimplementation\nend.\n",
+        );
+        let (mut workspace, key, anchor) = shared_project(root, WorkspaceOptions::default());
+        let plain = root.join("lib/Plain.pas");
+        workspace.project_cache.mark_index_stale(&key, &forms);
+        workspace.project_cache.limit_index_member(&key, &plain);
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let symbols = |workspace: &mut Workspace, query: &str| {
+            workspace
+                .indexed_symbols(
+                    &input,
+                    &one_target(&key, &anchor),
+                    query,
+                    true,
+                    &[],
+                    &cancel,
+                )
+                .expect("indexed symbols")
+                .0
+        };
+        for query in ["vcl.forms", "Forms", "s.f"] {
+            let found = symbols(&mut workspace, query);
+            assert_eq!(source_names(&found), ["Vcl.Forms.pas"], "{query}");
+            assert!(baselined(&found, &plain), "{query}: {:?}", found.baseline);
+            assert!(found.gaps.is_empty(), "{query}: {:?}", found.gaps);
+        }
+        let found = symbols(&mut workspace, "Ärger");
+        assert_eq!(
+            source_names(&found),
+            ["Plain.pas", "Vcl.Forms.pas"],
+            "{:?}",
+            found.baseline
+        );
+        let found = symbols(&mut workspace, "vcl.dialogs");
+        assert!(source_names(&found).is_empty(), "{:?}", found.sources);
+        assert!(baselined(&found, &forms) && baselined(&found, &plain));
+    }
+
+    /// The stamp that proves an excluded member current is the one taken
+    /// before its bytes were read.
+    #[test]
+    fn a_lexical_exclusion_carries_the_stamp_taken_before_the_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("Plain.pas");
+        write(&plain, PLAIN);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let before = path_stamp(&plain).expect("stamp");
+        let mut ranking = UnverifiedRanking::new(&shared_query(None));
+        let mut paths = vec![plain.clone()];
+        let absent = ranking.rank(
+            &mut paths,
+            MAX_INTERACTIVE_UNVERIFIED_CANDIDATES,
+            &|_| false,
+            &|_| true,
+            None,
+            &AtomicBool::new(false),
+        );
+        assert!(paths.is_empty(), "{paths:?}");
+        assert_eq!(absent.members.len(), 1);
+        let (path, stamp) = &absent.members[0];
+        assert_eq!(*path, plain);
+        assert!(stamp.as_ref().expect("stamp").proves_unchanged(&before));
     }
 
     fn lib_scope(root: &Path) -> crate::catalogue::CatalogueKey {
@@ -7994,8 +10195,10 @@ pub(in crate::workspace) mod tests {
         workspace.project_cache = crate::project_cache::ProjectCache::new(64);
         let _caps = override_caps(|caps| caps.unverified = Some(2));
         let input = workspace.analysis_input();
+        // Every member spells `end` as an identifier, so none is excluded
+        // lexically (R9-5).
         let query = CandidateQuery {
-            names: vec!["P0".to_owned()],
+            names: vec!["end".to_owned()],
             top_level_units: None,
             aliases: Vec::new(),
         };
@@ -8079,9 +10282,10 @@ pub(in crate::workspace) mod tests {
         assert_eq!(references.sources.len(), 5, "references keep their bound");
     }
 
-    /// Members retrying a previous refusal are the "retried later" gap; the
-    /// "not indexed yet" count leaves them out, and they still use the
-    /// direct-search bound (final review Minor 5).
+    /// Members retrying a previous refusal past the direct-search bound are
+    /// the "retried later" gap; the "not indexed yet" count leaves them out
+    /// (final review Minor 5), and those read within the bound are in
+    /// neither.
     #[test]
     fn retrying_members_are_not_counted_again_as_not_indexed_yet() {
         let temp = tempfile::tempdir().unwrap();
@@ -8109,6 +10313,104 @@ pub(in crate::workspace) mod tests {
             [
                 "1 units of App.dproj are not indexed yet; 2 were searched directly",
                 "2 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal",
+            ]
+        );
+        // Every member spells `p`, so none is excluded lexically: within
+        // the bound the retrying members are read, so no gap counts them.
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(5));
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(
+            source_names(&sources),
+            ["App.dpr", "U0.pas", "U1.pas", "U2.pas", "U3.pas"]
+        );
+        assert!(sources.gaps.is_empty(), "{:?}", sources.gaps);
+    }
+
+    /// l4d-1nfk: a retrying member is an unverified member like any other,
+    /// so one whose text cannot hold the query is excluded with its stamp
+    /// (R9-5), not read directly; one spelling the query is still read.
+    #[test]
+    fn retrying_members_without_the_query_are_not_read_directly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (mut workspace, key, anchor) = indexed_project(root, 6, WorkspaceOptions::default());
+        assert!(advance(&mut workspace, &anchor, IndexBound::all()).complete);
+        let retry = |workspace: &mut Workspace, name: &str| {
+            let path = root.join("lib").join(name);
+            workspace.project_cache.mark_index_stale(&key, &path);
+            workspace
+                .project_cache
+                .defer_index_member(&key, &path, RETRYING_REFUSAL);
+        };
+        for name in ["U2.pas", "U3.pas"] {
+            retry(&mut workspace, name);
+        }
+        let progress = advance(&mut workspace, &anchor, IndexBound::units(0));
+        assert!(
+            progress.complete && progress.retrying == 2,
+            "retrying members do not hold complete back: {progress:?}"
+        );
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let (sources, symbols) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert!(
+            source_names(&sources).is_empty(),
+            "{:?}",
+            source_names(&sources)
+        );
+        for name in ["U2.pas", "U3.pas"] {
+            assert!(
+                baselined(&sources, &root.join("lib").join(name)),
+                "{name}: {:?}",
+                sources.baseline
+            );
+        }
+        assert!(!symbols.is_empty());
+        assert!(
+            symbols
+                .iter()
+                .all(|(_, symbol)| symbol.member.ends_with("U1.pas")
+                    && &*symbol.declaration.display == "P1"),
+            "{symbols:?}"
+        );
+        assert!(
+            !sources
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("not indexed yet")),
+            "{:?}",
+            sources.gaps
+        );
+
+        named_unit(&root.join("lib/U3.pas"), "P1Too");
+        retry(&mut workspace, "U3.pas");
+        let input = workspace.analysis_input();
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["U3.pas"]);
+
+        // Past the bound, a retrying member spelling the query is the
+        // "retried later" gap, never a silent drop; the one read within
+        // the bound is not counted.
+        named_unit(&root.join("lib/U2.pas"), "P1Two");
+        for name in ["U2.pas", "U3.pas"] {
+            retry(&mut workspace, name);
+        }
+        let _caps = override_caps(|caps| caps.unverified_symbols = Some(1));
+        let input = workspace.analysis_input();
+        let (sources, _) = workspace
+            .indexed_symbols(&input, &one_target(&key, &anchor), "P1", true, &[], &cancel)
+            .expect("indexed symbols");
+        assert_eq!(source_names(&sources), ["U2.pas"]);
+        assert_eq!(
+            sources.gaps,
+            [
+                "1 units of App.dproj failed to load for the index and are retried later: retrying a previous refusal"
             ]
         );
     }
@@ -8187,9 +10489,10 @@ pub(in crate::workspace) mod tests {
         let (mut workspace, requesting, p1, _) = two_projects(root);
         let _caps = override_caps(|caps| caps.small_sources = Some(0));
         let sources = references_of_target(&mut workspace, &requesting);
+        // P1.dpr never spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
-            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas"]
+            ["P1/U.pas", "P1/V.pas", "P1/W.pas"]
         );
         assert!(
             sources.gaps.contains(
@@ -8213,9 +10516,10 @@ pub(in crate::workspace) mod tests {
         let _ = workspace.project_cache.take_index_requests();
         let _caps = override_caps(|caps| caps.small_sources = Some(0));
         let sources = references_of_target(&mut workspace, &requesting);
+        // P1.dpr never spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
-            ["P1/P1.dpr", "P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas"]
+            ["P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas"]
         );
         assert!(
             sources.gaps.contains(
@@ -8233,17 +10537,11 @@ pub(in crate::workspace) mod tests {
         let root = temp.path();
         let (mut workspace, requesting, p1, p2) = two_projects(root);
         let sources = references_of_target(&mut workspace, &requesting);
+        // Neither .dpr spells `Target` (R9-5).
         assert_eq!(
             relative_sources(&sources, root),
             [
-                "P1/P1.dpr",
-                "P1/U.pas",
-                "P1/V.pas",
-                "P1/W.pas",
-                "P2/P2.dpr",
-                "P2/U.pas",
-                "P2/V.pas",
-                "P2/W.pas"
+                "P1/U.pas", "P1/V.pas", "P1/W.pas", "P2/U.pas", "P2/V.pas", "P2/W.pas"
             ]
         );
         let requests = workspace.project_cache.take_index_requests();
@@ -8451,6 +10749,181 @@ pub(in crate::workspace) mod tests {
             );
             assert_eq!(recorded(&second, &key).len(), 40, "every reuse is proven");
             assert_eq!(cache.counters().unwrap().snapshot().hits, 40);
+            cache.shutdown();
+        }
+
+        /// Release's child configurations of `configured_project`: with
+        /// Debug and Release they are one more context than the index store
+        /// holds (`MAX_INDEXED_CONTEXTS`).
+        const RELEASE_CHILDREN: usize = crate::project_cache::MAX_INDEXED_CONTEXTS - 1;
+
+        /// One `.dproj` whose Debug and Release configurations select
+        /// different units through their defines and search paths: App.dpr
+        /// uses `UA` (`debug/`) under DEBUG and `UB` (`release/`) otherwise,
+        /// both declaring `Shared`. `Release1`.. inherit Release.
+        fn configured_project(root: &Path) {
+            let mut groups = String::new();
+            let mut items = String::new();
+            for child in 1..=RELEASE_CHILDREN {
+                let key = child + 2;
+                groups.push_str(&format!(
+                    "  <PropertyGroup Condition=\"'$(Config)'=='Release{child}' or '$(Cfg_{key})'!=''\"><Cfg_{key}>true</Cfg_{key}><CfgParent>Cfg_1</CfgParent><Cfg_1>true</Cfg_1><Base>true</Base></PropertyGroup>\n"
+                ));
+                items.push_str(&format!(
+                    "    <BuildConfiguration Include=\"Release{child}\"><Key>Cfg_{key}</Key><CfgParent>Cfg_1</CfgParent></BuildConfiguration>\n"
+                ));
+            }
+            write(
+                &root.join("App.dproj"),
+                &format!(
+                    r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Debug</Config>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+{groups}  <PropertyGroup Condition="'$(Cfg_1)'!=''"><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>release</DCC_UnitSearchPath></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define><DCC_UnitSearchPath>debug</DCC_UnitSearchPath></PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+{items}  </ItemGroup>
+</Project>"#
+                ),
+            );
+            write(
+                &root.join("App.dpr"),
+                "program App;\n{$IFDEF DEBUG}uses UA;{$ELSE}uses UB;{$ENDIF}\nbegin\n  Shared;\nend.\n",
+            );
+            named_unit(&root.join("debug/UA.pas"), "Shared");
+            named_unit(&root.join("release/UB.pas"), "Shared");
+            pascal_project::backdate_tree_for_test(root);
+        }
+
+        fn build_configuration(root: &Path, config: &str) -> WorkspaceOptions {
+            WorkspaceOptions {
+                project_file: Some(root.join("App.dproj")),
+                build_config: Some(config.to_owned()),
+                ..WorkspaceOptions::default()
+            }
+        }
+
+        /// `base`'s caches seen under the build configuration `config`.
+        fn switched_to(base: &Workspace, cache: &PersistentCache, config: &str) -> Workspace {
+            let mut input = base.analysis_input().disk_baseline();
+            input.persistent_cache = cache.clone();
+            input.options = build_configuration(&input.roots[0], config);
+            Workspace::from_analysis_input(&input)
+        }
+
+        /// AC4 (R9-6, and the Debug/Release A/B/A reuse of `.8` AC2): Debug,
+        /// then Release and its children, evict Debug's context index;
+        /// switching back reloads Debug from the store, lazily and without a
+        /// parse, with the first Debug answer.
+        #[test]
+        fn an_a_b_a_switch_reloads_a_from_the_store_without_parsing() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let store = private_dir();
+            configured_project(root);
+            let ua = Url::from_file_path(root.join("debug/UA.pas")).unwrap();
+            let anchor = IndexAnchor::Project(root.join("App.dproj"));
+            let release_only = |sources: &[PathBuf]| {
+                sources
+                    .iter()
+                    .filter(|path| path.starts_with(root.join("release")))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let references = |view: &Workspace| {
+                crate::workspace::rename::test_take_indexed_sources();
+                let found = crate::workspace::queries::references_from_input(
+                    view.analysis_input(),
+                    &ua,
+                    lsp_types::Position::new(2, 10),
+                    true,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("references");
+                assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+                let indexed = crate::workspace::rename::test_take_indexed_sources();
+                assert!(
+                    indexed.contains(&root.join("debug/UA.pas")),
+                    "the answer came from the index: {indexed:?}"
+                );
+                assert_eq!(release_only(&indexed), Vec::<PathBuf>::new(), "{indexed:?}");
+                let mut located = found
+                    .value
+                    .iter()
+                    .map(|location| {
+                        (
+                            location.uri.clone(),
+                            location.range.start.line,
+                            location.range.start.character,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                located.sort();
+                located
+            };
+
+            let base = workspace(root, build_configuration(root, "Debug"));
+            let (mut debug, cache) = persisting_view(&base, store.path());
+            let progress = advance(&mut debug, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            let a = progress.key.clone().unwrap();
+            let a_members = members(&debug, &a);
+            assert_eq!(
+                a_members,
+                vec![root.join("App.dpr"), root.join("debug/UA.pas")]
+            );
+            assert_eq!(progress.persisted, a_members.len(), "{progress:?}");
+            let first = references(&debug);
+            assert_eq!(first.len(), 3, "{first:?}");
+
+            let mut release = switched_to(&base, &cache, "Release");
+            let progress = advance(&mut release, &anchor, IndexBound::all());
+            assert!(progress.complete, "{progress:?}");
+            let b = progress.key.clone().unwrap();
+            assert_ne!(a, b);
+            assert_eq!(
+                members(&release, &b),
+                vec![root.join("App.dpr"), root.join("release/UB.pas")]
+            );
+            // Release's children fill the store: Debug, the least recently
+            // used, is evicted by the last.
+            for child in 1..=RELEASE_CHILDREN {
+                assert!(release.project_cache.holds_index(&a), "Release{child}");
+                let mut view = switched_to(&base, &cache, &format!("Release{child}"));
+                assert!(advance(&mut view, &anchor, IndexBound::all()).complete);
+            }
+            assert!(!release.project_cache.holds_index(&a), "Debug is evicted");
+            assert!(release.project_cache.holds_index(&b));
+
+            let mut back = switched_to(&base, &cache, "Debug");
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut back,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert_eq!(
+                crate::navigation::test_document_parse_count(),
+                0,
+                "no member was parsed"
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.key.as_ref(), Some(&a));
+            assert_eq!(progress.reused, a_members.len(), "{progress:?}");
+            assert_eq!((progress.indexed, progress.persisted), (0, 0));
+            assert_eq!(members(&back, &a), a_members);
+            assert!(!back.project_cache.holds_index(&b), "Release is evicted");
+            assert_eq!(references(&back), first, "the first Debug answer");
             cache.shutdown();
         }
 
@@ -12401,9 +14874,11 @@ end.
                         let metadata = entry.metadata().unwrap();
                         if metadata.is_dir() {
                             stack.push(entry.path());
-                        } else if entry.file_name() == "analysis-v6.sqlite3" {
+                        } else if entry.file_name() == pascal_cache::DATABASE_FILE {
                             database += metadata.len();
-                        } else if entry.file_name() == "analysis-v6.sqlite3-wal" {
+                        } else if entry.file_name().to_str()
+                            == Some(&format!("{}-wal", pascal_cache::DATABASE_FILE))
+                        {
                             wal += metadata.len();
                         }
                     }
@@ -12429,7 +14904,7 @@ end.
             /// schedule (the worker woken by the refusal) checkpoints, and
             /// the refused members are proven by later batches: a cold run
             /// persists every member and seals, with no hand-run step. Sized
-            /// so container 6 rows (13d-3) still pass the 8 MiB minimum.
+            /// so container 7 rows (l4d-rpfc) still pass the 8 MiB minimum.
             #[test]
             fn a_cold_index_past_the_wal_threshold_persists_every_member_and_seals() {
                 const UNITS: usize = 90;
@@ -12797,6 +15272,106 @@ end.
                 );
                 cache.shutdown();
             }
+        }
+
+        /// D24 during a query: an administrative reset fences the store
+        /// after selection read its target's index; the warm answer stays
+        /// the memory-only one. Under R9-1 a references request selects and
+        /// binds in memory and never reads the store (no store access in
+        /// `queries`/`rename`/`select_sources`), so this proves only that a
+        /// fence landing mid-request changes nothing, and that the fence
+        /// took effect.
+        #[test]
+        fn a_store_fenced_after_selection_keeps_the_answer() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write(
+                &root.join("Shared.pas"),
+                "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+            );
+            for name in ["User1", "User2"] {
+                write(
+                    &root.join(format!("{name}.pas")),
+                    &format!(
+                        "unit {name};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n"
+                    ),
+                );
+            }
+            write(
+                &root.join("Other.pas"),
+                "unit Other;\ninterface\nconst SharedValue = 2;\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+            let shared = Url::from_file_path(root.join("Shared.pas")).unwrap();
+            let anchor = IndexAnchor::Document(shared.clone());
+            let references = |input: WorkspaceInput| {
+                let partial = crate::workspace::queries::references_from_input(
+                    input,
+                    &shared,
+                    lsp_types::Position::new(2, 6),
+                    true,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("references");
+                let mut found = partial
+                    .value
+                    .iter()
+                    .map(|location| (location.uri.clone(), location.range.start))
+                    .collect::<Vec<_>>();
+                found.sort_by_key(|(uri, start)| (uri.to_string(), start.line, start.character));
+                (found, partial.coverage.is_complete())
+            };
+
+            let mut memory = workspace(root, WorkspaceOptions::default());
+            advance(&mut memory, &anchor, IndexBound::all());
+            let expected = references(memory.analysis_input());
+            assert_eq!(expected.0.len(), 3, "{expected:?}");
+            assert!(expected.1, "complete");
+
+            let store = private_dir();
+            let (mut first, cache) =
+                persisting_view(&workspace(root, WorkspaceOptions::default()), store.path());
+            let progress = advance(&mut first, &anchor, IndexBound::all());
+            assert_eq!(progress.persisted, 4, "{progress:?}");
+            cache.shutdown();
+            let (mut second, cache) = restarted_view(root, store.path());
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(progress.reused, 4, "{progress:?}");
+
+            let fenced = Rc::new(Cell::new(0));
+            let count = Rc::clone(&fenced);
+            let directory = store.path().to_path_buf();
+            set_after_target_view_hook(Some(Box::new(move |_| {
+                if count.get() == 0 {
+                    assert_eq!(
+                        pascal_cache::admin::reset(
+                            &directory,
+                            &Namespace::new(Digest::from_bytes([11; 32])),
+                            pascal_cache::StoreLimits::default(),
+                        ),
+                        Ok(true)
+                    );
+                }
+                count.set(count.get() + 1);
+            })));
+            let found = references(second.analysis_input());
+            set_after_target_view_hook(None);
+            assert!(fenced.get() >= 1, "the store was fenced mid-request");
+            assert_eq!(found, expected);
+            let job = cache.job().expect("job");
+            assert_eq!(
+                job.store().check_scope(),
+                Err(pascal_cache::Bypass::Fenced),
+                "the reset fenced the store the request ran beside"
+            );
+            drop(job);
+            cache.shutdown();
         }
     }
 }

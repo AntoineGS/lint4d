@@ -4,11 +4,12 @@ mod common;
 
 use common::private_tempdir;
 use common::records::{
-    binding_evidence, context, member, open, raw, read_members, read_record, records, sealed,
+    ambiguous, binding_evidence, context, member, open, raw, read_members, read_record, records,
+    sealed,
 };
 use pascal_cache::{
-    Binding, BindingKind, BindingOutcome, Bypass, ImporterHit, Lookup, Malformed, Miss,
-    POSTING_ROW, SourceIdentity, Store, path_key,
+    Binding, BindingKind, BindingOutcome, Bypass, Dependency, ImporterHit, IncompleteReason,
+    Lookup, Malformed, Miss, POSTING_ROW, SourceIdentity, Store, path_key,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -362,6 +363,7 @@ fn a_forged_cursor_past_every_ordinal_never_wraps() {
     let forged = ImporterHit {
         record_id: first,
         binding_ordinal: u64::MAX,
+        dependency: Dependency::Precise,
         member_ordinal: 0,
     };
     let Lookup::Hit(page) = store
@@ -456,9 +458,9 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
         importers
             .lines()
             .next()
-            .is_some_and(|step| step.starts_with("SEARCH b ")
-                && step.contains("INDEX member_bindings_by_target ")),
-        "member_bindings drives through its target index: {importers}"
+            .is_some_and(|step| step.starts_with("SEARCH t ")
+                && step.contains("INDEX binding_targets_by_target ")),
+        "binding_targets drives through its target index: {importers}"
     );
     assert!(!importers.contains("SCAN"), "{importers}");
     assert!(!importers.contains("TEMP B-TREE"), "{importers}");
@@ -581,7 +583,12 @@ fn an_over_long_stored_record_id_is_a_malformed_snapshot() {
         .pragma_update(None, "ignore_check_constraints", "ON")
         .unwrap();
     let long = vec![7u8; 5000];
-    for table in ["member_records", "member_bindings", "snapshot_members"] {
+    for table in [
+        "member_records",
+        "member_bindings",
+        "binding_targets",
+        "snapshot_members",
+    ] {
         connection
             .execute(
                 &format!("UPDATE {table} SET record_id = ?1 WHERE record_id = ?2"),
@@ -602,4 +609,176 @@ fn an_over_long_stored_record_id_is_a_malformed_snapshot() {
         Lookup::Miss(Miss::Malformed(Malformed::Snapshot))
     );
     assert_eq!(store.scratch_in_use(), 0);
+}
+
+#[test]
+fn ambiguous_importers_are_returned_for_every_candidate_flagged() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/x/T0.pas");
+    let x = records(&store, "x/T", 1)[0];
+    let precise = store
+        .publish_member_record(&member("/w/P.pas", &["/w/x/T0.pas"], evidence))
+        .unwrap()
+        .record_id;
+    let both = store
+        .publish_member_record(&ambiguous(
+            "/w/A.pas",
+            &["/w/x/T0.pas", "/w/y/T0.pas"],
+            false,
+            evidence,
+        ))
+        .unwrap()
+        .record_id;
+    let header = sealed(&store, &[x, precise, both]);
+    let hits = all_importers(&store, &header, "/w/x/T0.pas", 1);
+    let kinds: Vec<_> = hits
+        .iter()
+        .map(|hit| (hit.record_id, hit.dependency))
+        .collect();
+    assert!(kinds.contains(&(precise, Dependency::Precise)), "{kinds:?}");
+    assert!(kinds.contains(&(both, Dependency::Ambiguous)), "{kinds:?}");
+    let other = all_importers(&store, &header, "/w/y/T0.pas", 10);
+    assert_eq!(
+        other
+            .iter()
+            .map(|hit| (hit.record_id, hit.dependency))
+            .collect::<Vec<_>>(),
+        [(both, Dependency::Ambiguous)],
+        "the other candidate finds it too, without reading payloads"
+    );
+}
+
+fn unknown_importer(
+    store: &Store,
+    path: &str,
+    evidence: pascal_cache::Digest,
+) -> pascal_cache::Digest {
+    let mut record = member(path, &[], evidence);
+    record.bindings.push(Binding {
+        kind: BindingKind::Import,
+        occurrence: 0,
+        outcome: BindingOutcome::Incomplete(IncompleteReason::UnknownConditional),
+        evidence: None,
+    });
+    store.publish_member_record(&record).unwrap().record_id
+}
+
+#[test]
+fn unbounded_importers_follow_every_target_across_pages() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/T0.pas");
+    let target = records(&store, "T", 1)[0];
+    let mut members = vec![target];
+    for index in 0..5 {
+        members.push(
+            store
+                .publish_member_record(&member(
+                    &format!("/w/P{index}.pas"),
+                    &["/w/T0.pas"],
+                    evidence,
+                ))
+                .unwrap()
+                .record_id,
+        );
+    }
+    let mut unknown = Vec::new();
+    for index in 0..4 {
+        let id = unknown_importer(&store, &format!("/w/N{index}.pas"), evidence);
+        unknown.push(id);
+        members.push(id);
+    }
+    let header = sealed(&store, &members);
+    for limit in [1, 2, 3, 100] {
+        let hits = all_importers(&store, &header, "/w/T0.pas", limit);
+        assert_eq!(
+            hits.len(),
+            9,
+            "limit {limit}: no gap or repeat at the phase boundary"
+        );
+        assert!(
+            hits[..5]
+                .iter()
+                .all(|hit| hit.dependency == Dependency::Precise)
+        );
+        assert_eq!(
+            hits[5..]
+                .iter()
+                .map(|hit| hit.record_id)
+                .collect::<BTreeSet<_>>(),
+            unknown.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            hits[5..]
+                .iter()
+                .all(|hit| hit.dependency == Dependency::Unbounded)
+        );
+    }
+    assert_eq!(
+        all_importers(&store, &header, "/w/Unrelated.pas", 10).len(),
+        4,
+        "unbounded importers are dependants of any target"
+    );
+}
+
+#[test]
+fn a_record_with_a_precise_and_an_unbounded_binding_is_a_hit_in_each_phase() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/T0.pas");
+    let target = records(&store, "T", 1)[0];
+    let mut record = member("/w/Both.pas", &["/w/T0.pas"], evidence);
+    record.bindings.push(Binding {
+        kind: BindingKind::Import,
+        occurrence: 1,
+        outcome: BindingOutcome::Incomplete(IncompleteReason::Unsupported),
+        evidence: None,
+    });
+    let both = store.publish_member_record(&record).unwrap().record_id;
+    let header = sealed(&store, &[target, both]);
+    for limit in [1, 10] {
+        let hits = all_importers(&store, &header, "/w/T0.pas", limit);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.record_id, hit.binding_ordinal, hit.dependency))
+                .collect::<Vec<_>>(),
+            [
+                (both, 0, Dependency::Precise),
+                (both, 1, Dependency::Unbounded)
+            ],
+            "limit {limit}"
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_retired_at_the_phase_boundary_is_a_miss() {
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let evidence = binding_evidence(&store, "t", "/w/T0.pas");
+    let target = records(&store, "T", 1)[0];
+    let precise = store
+        .publish_member_record(&member("/w/P.pas", &["/w/T0.pas"], evidence))
+        .unwrap()
+        .record_id;
+    let u1 = unknown_importer(&store, "/w/N1.pas", evidence);
+    let u2 = unknown_importer(&store, "/w/N2.pas", evidence);
+    let header = sealed(&store, &[target, precise, u1, u2]);
+    let Lookup::Hit(first) = store
+        .find_importers(&header, Path::new("/w/T0.pas"), None, 1)
+        .unwrap()
+    else {
+        panic!("the snapshot is sealed")
+    };
+    assert_eq!(first.hits.len(), 1);
+    assert_eq!(first.hits[0].dependency, Dependency::Precise);
+    assert!(first.next.is_some());
+    assert!(store.retire_snapshot(header.id()).unwrap());
+    assert_eq!(
+        store
+            .find_importers(&header, Path::new("/w/T0.pas"), first.next, 1)
+            .unwrap(),
+        Lookup::Miss(Miss::Retired)
+    );
 }

@@ -35,7 +35,12 @@ fn named_unit(path: &Path, identifier: &str, include: bool, bulk: usize) {
 /// `lib/U<n>.pas`, each declaring `P<n>`; one in ten includes `Shared.inc`.
 /// With `uses_units`, `App.dpr` uses every unit, so the warm crawl of the
 /// open `App.dpr` analyses them all.
-fn project_fixture(environment: &Path, units: usize, uses_units: bool, bulk: usize) -> PathBuf {
+pub(super) fn project_fixture(
+    environment: &Path,
+    units: usize,
+    uses_units: bool,
+    bulk: usize,
+) -> PathBuf {
     let root = environment.join("workspace");
     write_file(
         &root.join("App.dproj"),
@@ -112,14 +117,14 @@ pub(super) fn wait_index(server: &mut TestServer, predicate: impl Fn(&Value) -> 
     }
 }
 
-fn complete(context: &Value) -> bool {
+pub(super) fn complete(context: &Value) -> bool {
     context["complete"] == true
 }
 
 /// Complete, every member's record stored and a snapshot sealed or held:
 /// `complete` alone is reported as soon as the last member is indexed,
 /// before its publication and the seal, which a shutdown would cancel.
-fn persisted(context: &Value) -> bool {
+pub(super) fn persisted(context: &Value) -> bool {
     complete(context) && context["persisted"] == context["members"] && context["snapshot"] != "none"
 }
 
@@ -157,7 +162,7 @@ fn declares(symbols: &[Value], name: &str, unit: &str) -> bool {
     })
 }
 
-fn shutdown(mut server: TestServer) {
+pub(super) fn shutdown(mut server: TestServer) {
     server.shutdown();
 }
 

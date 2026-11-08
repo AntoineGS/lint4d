@@ -144,6 +144,121 @@ fn workspace_symbols_impl(
     Ok(result)
 }
 
+/// One document's workspace symbols for every query (Task 8d): each
+/// eligible symbol, in document order, with what `workspace_symbols_impl`
+/// filters, deduplicates and sorts it by, and its answer (or the error
+/// projecting it gives).
+#[derive(Debug)]
+pub(crate) struct WorkspaceSymbolList {
+    uri: Url,
+    entries: Vec<ListedSymbol>,
+}
+
+#[derive(Debug)]
+struct ListedSymbol {
+    lowercase: String,
+    selection: Span,
+    order: (usize, std::cmp::Reverse<usize>, usize, usize),
+    name: String,
+    kind: LspSymbolKind,
+    range: Result<Range, String>,
+    container: Option<String>,
+}
+
+impl WorkspaceSymbolList {
+    pub(super) fn of(
+        index: &NavigationIndex,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Self>, String> {
+        let Some(document) = index.documents.get(uri) else {
+            return Ok(None);
+        };
+        let cancel = Some(cancel);
+        let unit_name = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Unit)
+            .map(|symbol| symbol.name.as_str())
+            .unwrap_or(document.unit_name.as_str());
+        let positions = position_index(document, cancel)?;
+        let mut entries = Vec::new();
+        for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+            check_cancel(cancel)?;
+            if !workspace_eligible(symbol) {
+                continue;
+            }
+            entries.push(ListedSymbol {
+                lowercase: symbol.name.to_lowercase(),
+                selection: symbol.selection_span,
+                order: (
+                    symbol.declaration_span.start,
+                    std::cmp::Reverse(symbol.declaration_span.end),
+                    symbol.selection_span.start,
+                    symbol_index,
+                ),
+                name: symbol.name.clone(),
+                kind: lsp_kind(symbol),
+                range: range_for_span(&positions, &document.source, symbol.declaration_span),
+                container: workspace_container_name(unit_name, symbol),
+            });
+        }
+        Ok(Some(Self {
+            uri: uri.clone(),
+            entries,
+        }))
+    }
+
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    /// The answer `workspace_symbols_impl` gives for this document.
+    pub(crate) fn matching(&self, query: &str) -> Result<Vec<SymbolInformation>, String> {
+        let query = query.to_lowercase();
+        let mut seen = HashSet::new();
+        let mut matches = self
+            .entries
+            .iter()
+            .filter(|entry| entry.lowercase.contains(&query) && seen.insert(entry.selection))
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|entry| entry.order);
+        matches
+            .into_iter()
+            .map(|entry| {
+                Ok(SymbolInformation {
+                    name: entry.name.clone(),
+                    kind: entry.kind,
+                    tags: None,
+                    #[allow(deprecated)]
+                    deprecated: None,
+                    location: Location {
+                        uri: self.uri.clone(),
+                        range: entry.range.clone()?,
+                    },
+                    container_name: entry.container.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.uri.as_str().len()
+            + self
+                .entries
+                .iter()
+                .map(|entry| {
+                    std::mem::size_of::<ListedSymbol>()
+                        + entry.lowercase.len()
+                        + entry.name.len()
+                        + entry.container.as_ref().map_or(0, String::len)
+                        + entry.range.as_ref().err().map_or(0, String::len)
+                })
+                .sum::<usize>()
+    }
+}
+
 pub(super) fn flatten_document_symbols(
     uri: &Url,
     symbols: Vec<DocumentSymbol>,
@@ -517,6 +632,29 @@ mod tests {
     use lsp_types::Url;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
+
+    /// Task 8d: a document's symbol list answers every query as the index
+    /// walk does: the same symbols, ranges and containers, in its order.
+    #[test]
+    fn a_symbol_list_answers_every_query_as_the_index_does() {
+        let uri = Url::parse("file:///workspace/Listed.pas").expect("test URI");
+        let source = "unit Listed;\ninterface\ntype\n  TFoo = class\n    procedure Run;\n    procedure RunAll;\n  end;\n  TRun = record end;\nprocedure Run;\nconst RunLimit = 1;\nvar Counter: Integer;\nimplementation\nprocedure TFoo.Run; begin end;\nprocedure TFoo.RunAll; var Local: Integer; begin end;\nprocedure Run; begin end;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_string())
+            .expect("source parses");
+        let cancel = AtomicBool::new(false);
+        let list = super::WorkspaceSymbolList::of(&index, &uri, &cancel)
+            .expect("listed")
+            .expect("indexed");
+        for query in ["", "run", "RUN", "Foo", "listed", "local", "x", "limit"] {
+            assert_eq!(
+                list.matching(query).expect("listed symbols"),
+                super::workspace_symbols(&index, query).expect("index symbols"),
+                "{query:?}"
+            );
+        }
+    }
 
     #[test]
     fn shapes_map_to_the_kinds_symbols_report() {

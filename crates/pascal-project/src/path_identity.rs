@@ -147,6 +147,18 @@ pub fn components_equal(left: Component<'_>, right: Component<'_>, case_insensit
 /// component. Both paths should already be absolute and lexically normal.
 pub fn paths_equal(left: &Path, right: &Path) -> bool {
     let case_insensitive = is_case_insensitive(left);
+    // A file name is the last component: two names that differ decide the
+    // answer before the components are counted (callers scan thousands of
+    // project entries per lookup).
+    if let (Some(left), Some(right)) = (left.file_name(), right.file_name())
+        && !components_equal(
+            Component::Normal(left),
+            Component::Normal(right),
+            case_insensitive,
+        )
+    {
+        return false;
+    }
     left.components().count() == right.components().count()
         && left
             .components()
@@ -261,6 +273,55 @@ pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file-name shortcut never changes an answer of the component
+    /// comparison, on either kind of volume.
+    #[test]
+    fn paths_equal_agrees_with_the_component_comparison() {
+        let full = |left: &Path, right: &Path| {
+            let case_insensitive = is_case_insensitive(left);
+            left.components().count() == right.components().count()
+                && left
+                    .components()
+                    .zip(right.components())
+                    .all(|(left, right)| components_equal(left, right, case_insensitive))
+        };
+        let paths = [
+            "/w/lib/Unit.pas",
+            "/w/lib/UNIT.PAS",
+            "/w/LIB/Unit.pas",
+            "/w/lib/Other.pas",
+            "/w/lib",
+            "/w/lib/",
+            "/w/lib/.",
+            "/w/lib/..",
+            "/w/x/..",
+            "/w",
+            "/",
+            ".",
+            "..",
+            "lib/Unit.pas",
+        ];
+        for insensitive in [false, true] {
+            let check = || {
+                for left in paths {
+                    for right in paths {
+                        let (left, right) = (Path::new(left), Path::new(right));
+                        assert_eq!(
+                            paths_equal(left, right),
+                            full(left, right),
+                            "{left:?} {right:?} insensitive {insensitive}"
+                        );
+                    }
+                }
+            };
+            if insensitive {
+                with_case_insensitive_volumes(check);
+            } else {
+                check();
+            }
+        }
+    }
 
     #[test]
     fn verbatim_drive_and_unc_paths_become_plain() {

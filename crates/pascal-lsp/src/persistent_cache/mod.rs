@@ -112,6 +112,9 @@ struct IndexSeams {
     pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
     /// A bypass for the publication of an extracted member.
     publish: Option<PublishFault>,
+    /// A bypass for the publication of a member's record, after its
+    /// artifact was published or found.
+    record: Option<PublishFault>,
     /// `await_maintenance` calls.
     waits: u64,
 }
@@ -605,6 +608,22 @@ impl PersistentCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_record_fault_for_test(&self, fault: Option<PublishFault>) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).record = fault;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
+        let inner = self.inner.as_ref()?;
+        lock(&inner.seams)
+            .record
+            .as_mut()
+            .and_then(|fault| fault(path))
+    }
+
+    #[cfg(test)]
     pub(crate) fn publish_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
         let inner = self.inner.as_ref()?;
         lock(&inner.seams)
@@ -885,6 +904,7 @@ impl PersistentCache {
                     scratch: 0,
                     facts: 0,
                     publication: 0,
+                    query_trees: 0,
                 },
                 usage: None,
                 lock_waits,
@@ -910,6 +930,7 @@ impl PersistentCache {
                 scratch: stats.reserved_scratch_bytes,
                 facts: stats.reserved_facts_bytes,
                 publication: stats.reserved_publication_bytes,
+                query_trees: stats.reserved_query_trees_bytes,
             },
             usage: shared.usage.filter(|_| enabled),
             lock_waits,

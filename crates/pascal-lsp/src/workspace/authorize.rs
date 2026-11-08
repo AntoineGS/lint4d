@@ -168,9 +168,9 @@ mod tests {
     use crate::workspace::persist::tests::{open_store, private_dir};
     use pascal_cache::{BindingKind, IncompleteReason};
     use pascal_cache::{
-        ContextKey as CacheContextKey, CoverageStatus, EvidenceTarget, EvidenceWrite, ImporterHit,
-        Lookup, LookupInputs, LookupKey, LookupKind, MemberCoverage, MemberHeader, Observation,
-        SnapshotCoverage, SnapshotSeal,
+        ContextKey as CacheContextKey, CoverageStatus, Dependency, EvidenceTarget, EvidenceWrite,
+        ImporterHit, Lookup, LookupInputs, LookupKey, LookupKind, MemberCoverage, MemberHeader,
+        Observation, SnapshotCoverage, SnapshotSeal,
     };
     use pascal_project::delphi_overrides::EffectiveOverrides;
     use pascal_project::{ProjectContextParts, ProjectPathEntry, ReadPolicy, SourceOrigin};
@@ -346,6 +346,7 @@ mod tests {
             record_id,
             binding_ordinal: 0,
             member_ordinal: 0,
+            dependency: Dependency::Precise,
         };
         assert!(authorize_hit(&store, &importer, &wide).is_ok());
         let unknown = ImporterHit {
@@ -548,6 +549,7 @@ mod tests {
             record_id,
             binding_ordinal: 0,
             member_ordinal: 0,
+            dependency: Dependency::Precise,
         };
         assert_eq!(
             authorize_hit(&store, &hit, &context(&[&root], &[&root])).err(),

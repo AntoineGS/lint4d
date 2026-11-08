@@ -136,7 +136,9 @@ fn measure() -> (f64, f64) {
 /// observation on this store (l4d-zf1b.8, 13c-4). The INTEGER artifact
 /// surrogate with its slim name index, and observations shared by
 /// content, must keep well under those. Container 5 measured 177.8 per
-/// row; container 6 (13d-3) stores no 32-byte checksum per row.
+/// row; container 6 (13d-3) stores no 32-byte checksum per row (140.3).
+/// Container 7 (l4d-rpfc) adds the scope surrogate to each row and its
+/// name index entry: 142.1.
 #[test]
 fn records_take_a_fraction_of_the_container_4_size() {
     let (per_row, per_observation) = measure();

@@ -8971,10 +8971,21 @@ impl Workspace {
             budget.check_cancelled()?;
         }
         if let (Some(claim), Some(parsed)) = (claim, self.index.parsed_document(uri)) {
-            let probes = cached_expansion
+            let mut probes = cached_expansion
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
+            // The expansion's root revision is the buffer's: a load of the
+            // closed file must not take it (its facts would never persist).
+            if cached_expansion.is_some()
+                && let Some(document) = self.open_documents.get(uri)
+            {
+                probes.push(crate::project_cache::Probe::Overlay {
+                    uri: canonical_file_uri(uri),
+                    version: document.version,
+                    content_hash: source_hash,
+                });
+            }
             let disk =
                 disk_origin.map(
                     |(stamp, raw_bytes, text)| crate::project_cache::DiskOrigin {

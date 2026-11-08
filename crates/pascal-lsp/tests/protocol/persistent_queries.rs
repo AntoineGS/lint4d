@@ -711,3 +711,30 @@ fn synthetic_warm_query_latency() {
     println!("warm workspace/symbol: p50 {p50:?}, p95 {p95:?}");
     shutdown(warm);
 }
+
+/// A source with conditional directives open with its saved text: the
+/// closed-file load of the index batch must not take the open document's
+/// cached expansion, whose root revision is the buffer's, or the member
+/// never persists and the context never completes.
+#[test]
+fn an_open_source_with_directives_persists_like_its_closed_file() {
+    const SMALL: FixtureSpec = FixtureSpec {
+        units: 60,
+        importers: 5,
+        with_include_every: 10,
+        unresolved_includes: 0,
+        shared_name: "TShared",
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SMALL);
+    write_file(
+        &root.join("App.dpr"),
+        "program App;\n{$IFDEF DEBUG}{$ENDIF}\nbegin\nend.\n",
+    );
+    pascal_project::backdate_tree_for_test(&root);
+    let mut server = launch_labelled(environment.path(), "cache", "directives");
+    server.initialize(&root, Value::Null);
+    open_disk(&mut server, &root, &["App.dpr"]);
+    wait_index(&mut server, persisted);
+    shutdown(server);
+}

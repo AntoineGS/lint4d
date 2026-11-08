@@ -23,7 +23,7 @@ pub(super) fn launch(environment: &Path) -> TestServer {
     )
 }
 
-fn store_directory(environment: &Path) -> PathBuf {
+pub(super) fn store_directory(environment: &Path) -> PathBuf {
     environment.join("cache/lint4d/analysis")
 }
 

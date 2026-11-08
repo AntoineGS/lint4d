@@ -4,7 +4,7 @@
 //! `pascal/testStoreGrowth`).
 #![cfg(unix)]
 
-use super::persistent_cache::{request, settle, watched_change};
+use super::persistent_cache::{request, settle, store_directory, watched_change};
 use super::persistent_index::{
     MEMBERS, UNITS, complete, fixture, initialize_and_open, persisted, shutdown, wait_index,
 };
@@ -592,8 +592,6 @@ fn build_id(n: u8) -> String {
     pascal_cache::Namespace::new(fingerprint).id().to_hex()
 }
 
-const STORE: &str = "cache/lint4d/analysis";
-
 /// A test server playing build `n` over `environment/cache`, with the
 /// `extra` variables.
 fn launch_build(environment: &Path, n: u8, extra: &[(&str, &str)]) -> TestServer {
@@ -612,14 +610,28 @@ fn run_build(environment: &Path, root: &Path, n: u8, options: Value, rank: u64) 
     server.initialize(root, options);
     open_disk(&mut server, root, &OPENS);
     let done = wait_index(&mut server, persisted);
+    maintained(&mut server);
     shutdown(server);
     used_at(environment, n, rank);
     done
 }
 
+/// Runs maintenance steps on the server, one request each, until a whole
+/// cycle completed: the namespace retirement pass is a cycle's first phase,
+/// so the store's retention policy has been applied when this returns.
+fn maintained(server: &mut TestServer) {
+    for _ in 0..64 {
+        let settled = settle(server, true);
+        let cycles = &settled["status"]["counters"]["maintenance"]["cycles"];
+        if cycles.as_u64().is_some_and(|cycles| cycles >= 1) {
+            return;
+        }
+    }
+    panic!("no maintenance cycle completed");
+}
+
 fn used_at(environment: &Path, n: u8, rank: u64) {
-    let lock = environment
-        .join(STORE)
+    let lock = store_directory(environment)
         .join("namespaces")
         .join(format!("{}.lock", build_id(n)));
     let file = fs::OpenOptions::new().write(true).open(lock).unwrap();
@@ -634,6 +646,7 @@ fn started_build(environment: &Path, root: &Path, n: u8, options: Value) -> (Tes
     open_disk(&mut server, root, &OPENS);
     let done = wait_index(&mut server, complete);
     settle_background(&mut server);
+    maintained(&mut server);
     (server, done)
 }
 
@@ -790,9 +803,10 @@ fn a_live_reader_keeps_its_namespace_while_another_build_needs_room() {
     assert!(is_live(environment.path(), 4));
 }
 
-/// Build 1's server is held in its reuse pass (after 5 members) while the
-/// admin binary prunes the store keeping one namespace: it retires and
-/// reclaims builds 2 and 3, never the held one. After the release the
+/// Build 1's server is held in its reuse pass (after 5 members, between its
+/// store reads, not inside a read transaction) while the admin binary
+/// prunes the store keeping one namespace: both builds are live before,
+/// the prune changes rows and leaves only the held one. After the release the
 /// reader completes extracting nothing and answers like an uncached server.
 #[test]
 fn gc_in_one_process_while_another_reads() {
@@ -821,9 +835,14 @@ fn gc_in_one_process_while_another_reads() {
     started(&mut reader, &root, &OPENS);
     barrier.wait_until_entered();
 
-    admin(
+    assert!(is_live(environment.path(), 2) && is_live(environment.path(), 3));
+    let pruned = admin(
         environment.path(),
         &["--cache-prune", "--cache-max-namespaces", "1"],
+    );
+    assert!(
+        pruned["rows"].as_u64().unwrap() > 0,
+        "GC changed rows: {pruned}"
     );
     let listed = live_namespaces(environment.path());
     assert!(

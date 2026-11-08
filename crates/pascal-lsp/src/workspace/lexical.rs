@@ -22,12 +22,7 @@ const ASCII_LOWERCASING: [&[u8]; 2] = ["\u{130}".as_bytes(), "\u{212A}".as_bytes
 /// substring; the symbol read parses the raw text without expanding its
 /// includes, so they do not matter.
 pub(crate) fn proves_absent(text: &[u8], needles: &[String], any_piece_missing: bool) -> bool {
-    if needles.is_empty()
-        || needles
-            .iter()
-            .any(|needle| needle.is_empty() || !needle.is_ascii())
-        || !is_byte_text(text)
-    {
+    if !needles_are_provable(needles) || !is_byte_text(text) {
         return false;
     }
     if any_piece_missing {
@@ -43,6 +38,15 @@ pub(crate) fn proves_absent(text: &[u8], needles: &[String], any_piece_missing: 
     } else {
         !holds_identifier(text, needles)
     }
+}
+
+/// Whether a byte search can prove `needles` absent: some, none empty,
+/// all ASCII (A2).
+pub(crate) fn needles_are_provable(needles: &[String]) -> bool {
+    !needles.is_empty()
+        && needles
+            .iter()
+            .all(|needle| !needle.is_empty() && needle.is_ascii())
 }
 
 /// Not UTF-16 (no byte-order mark, no NUL byte): a byte search sees the
@@ -162,9 +166,237 @@ pub(crate) fn symbol_needles(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// The whole identifiers of some texts (`identifier_runs`, ASCII
+/// lowercased) as a fixed-size Bloom filter: a needle it does not hold
+/// occurs in none of them as an identifier (exact), one it holds may.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TokenFilter(Box<[u64; TOKEN_FILTER_WORDS]>);
+
+const TOKEN_FILTER_WORDS: usize = 1024;
+const TOKEN_FILTER_BITS: u64 = (TOKEN_FILTER_WORDS * 64) as u64;
+const TOKEN_FILTER_PROBES: u64 = 4;
+
+impl std::fmt::Debug for TokenFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = self.0.iter().map(|word| word.count_ones()).sum::<u32>();
+        write!(formatter, "TokenFilter({set} bits)")
+    }
+}
+
+impl Default for TokenFilter {
+    fn default() -> Self {
+        Self(Box::new([0; TOKEN_FILTER_WORDS]))
+    }
+}
+
+impl TokenFilter {
+    pub(crate) const BYTES: usize = TOKEN_FILTER_WORDS * 8;
+
+    fn probes(token: &[u8]) -> impl Iterator<Item = usize> {
+        // FNV-1a over the lowercased bytes, then a splitmix64 finalizer.
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in token {
+            hash = (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3);
+        }
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        let (first, step) = (hash & 0xffff_ffff, (hash >> 32) | 1);
+        (0..TOKEN_FILTER_PROBES).map(move |probe| {
+            (first.wrapping_add(probe.wrapping_mul(step)) % TOKEN_FILTER_BITS) as usize
+        })
+    }
+
+    /// Adds every identifier of `text`.
+    pub(crate) fn insert_text(&mut self, text: &[u8]) {
+        for run in identifier_runs(text) {
+            for bit in Self::probes(&text[run]) {
+                self.0[bit / 64] |= 1 << (bit % 64);
+            }
+        }
+    }
+
+    pub(crate) fn union(&mut self, other: &Self) {
+        for (word, other) in self.0.iter_mut().zip(other.0.iter()) {
+            *word |= other;
+        }
+    }
+
+    /// Whether some needle may be an identifier of the texts.
+    pub(crate) fn may_hold(&self, needles: &[String]) -> bool {
+        needles.iter().any(|needle| {
+            Self::probes(needle.as_bytes()).all(|bit| self.0[bit / 64] & (1 << (bit % 64)) != 0)
+        })
+    }
+}
+
+/// What one references proof of a member found (Task 8d): the whole
+/// identifiers of its raw text and of every include it reached, and what
+/// proved them: the member's stamp, taken before its read, then every
+/// include read (stamp before the read) and every resolver observation of
+/// its walk, as the request baseline holds them. A later request may use
+/// it only after every stamp proves its path unchanged
+/// (`ProjectReadStamp::proves_unchanged`; a missing path still missing),
+/// under the same binding and root route.
+#[derive(Debug)]
+pub(crate) struct LexicalSummary {
+    pub(crate) tokens: TokenFilter,
+    pub(crate) root: super::PathStamp,
+    pub(crate) dependencies: Vec<(std::path::PathBuf, Option<super::PathStamp>)>,
+    /// The legacy route the member's walk loaded its root with; `None` for
+    /// a member without includes, which no walk follows.
+    pub(crate) route: Option<Option<pascal_core::LegacyRoute>>,
+}
+
+impl LexicalSummary {
+    pub(crate) fn bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(std::path::PathBuf, Option<super::PathStamp>)>();
+        std::mem::size_of::<Self>()
+            + TokenFilter::BYTES
+            + self
+                .dependencies
+                .iter()
+                .map(|(path, _)| entry + path.as_os_str().len())
+                .sum::<usize>()
+            + self
+                .route
+                .iter()
+                .flatten()
+                .map(|route| {
+                    route.source_path.as_os_str().len() + route.sibling_directory.as_os_str().len()
+                })
+                .sum::<usize>()
+    }
+}
+
+/// What every summary of a context was proven under: its project context
+/// (summaries of a context replaced under the same key are not used), the
+/// workspace roots and the file size limit the walk's resolver read with.
+#[derive(Debug, Clone)]
+pub(crate) struct SummaryBinding {
+    pub(crate) context: std::sync::Arc<pascal_project::ProjectContext>,
+    pub(crate) roots: Vec<std::path::PathBuf>,
+    pub(crate) max_file_bytes: usize,
+}
+
+impl SummaryBinding {
+    fn matches(&self, other: &Self) -> bool {
+        (std::sync::Arc::ptr_eq(&self.context, &other.context) || self.context == other.context)
+            && self.roots == other.roots
+            && self.max_file_bytes == other.max_file_bytes
+    }
+}
+
+/// At most this many summaries, and bytes, per context.
+pub(crate) const MAX_LEXICAL_SUMMARIES: usize = 8192;
+pub(crate) const MAX_LEXICAL_SUMMARY_BYTES: usize = 64 * 1024 * 1024;
+
+/// One context's summaries, kept with its index state and charged to the
+/// index share with it (`StoredIndex::total_charge`).
+#[derive(Debug, Default)]
+pub(crate) struct LexicalSummaries {
+    binding: Option<SummaryBinding>,
+    members: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<LexicalSummary>>,
+    bytes: usize,
+}
+
+pub(crate) type SummaryMap =
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<LexicalSummary>>;
+
+impl LexicalSummaries {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// The summaries proven under `binding`.
+    pub(crate) fn under(&self, binding: &SummaryBinding) -> Option<SummaryMap> {
+        let held = self.binding.as_ref()?;
+        (held.matches(binding) && !self.members.is_empty()).then(|| self.members.clone())
+    }
+
+    /// Keeps `summaries`, whose `paid` bytes the caller charged, under
+    /// `binding` (dropping summaries of another binding), within the
+    /// bounds; returns the bytes to release: replaced, dropped and refused
+    /// summaries.
+    pub(crate) fn keep(
+        &mut self,
+        binding: SummaryBinding,
+        summaries: Vec<(std::path::PathBuf, std::sync::Arc<LexicalSummary>)>,
+        paid: usize,
+    ) -> usize {
+        let mut released = 0;
+        if !self
+            .binding
+            .as_ref()
+            .is_some_and(|held| held.matches(&binding))
+        {
+            released += self.bytes;
+            self.members.clear();
+            self.bytes = 0;
+            self.binding = Some(binding);
+        }
+        let mut kept = 0;
+        for (path, summary) in summaries {
+            let bytes = summary.bytes();
+            if let Some(old) = self.members.remove(&path) {
+                let old = old.bytes();
+                self.bytes -= old;
+                released += old;
+            }
+            if self.members.len() >= MAX_LEXICAL_SUMMARIES
+                || self.bytes + bytes > MAX_LEXICAL_SUMMARY_BYTES
+            {
+                continue;
+            }
+            self.bytes += bytes;
+            kept += bytes;
+            self.members.insert(path, summary);
+        }
+        released + paid.saturating_sub(kept)
+    }
+
+    /// Drops the summaries of paths `member` rejects; returns their bytes.
+    pub(crate) fn retain(&mut self, member: impl Fn(&std::path::Path) -> bool) -> usize {
+        let before = self.bytes;
+        self.members.retain(|path, summary| {
+            let keep = member(path);
+            if !keep {
+                self.bytes -= summary.bytes();
+            }
+            keep
+        });
+        before - self.bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A needle missing from the filter is no identifier of the text; one
+    /// present (case-insensitively) is always held.
+    #[test]
+    fn a_token_filter_never_misses_an_identifier() {
+        let text = b"unit Guarded; {$I Defs.inc} const GetSharedValues = 1; x_9 := TDatabaseInfo;";
+        let mut filter = TokenFilter::default();
+        filter.insert_text(text);
+        for run in identifier_runs(text) {
+            let token = String::from_utf8(text[run].to_vec()).unwrap();
+            assert!(filter.may_hold(&[token.to_ascii_uppercase()]), "{token}");
+        }
+        assert!(filter.may_hold(&["tdatabaseinfo".to_owned()]));
+        assert!(!filter.may_hold(&["sharedvalue".to_owned()]));
+        assert!(!filter.may_hold(&["databaseinfo".to_owned()]));
+        let mut other = TokenFilter::default();
+        other.insert_text(b"SharedValue");
+        filter.union(&other);
+        assert!(filter.may_hold(&["SHAREDVALUE".to_owned()]));
+    }
 
     #[test]
     fn absence_requires_every_condition() {

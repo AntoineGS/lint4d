@@ -89,6 +89,10 @@ pub(crate) struct InteractiveGate {
 /// re-dispatched crawl replays as cache hits do not count.
 const CRAWL_SLICE: Duration = Duration::from_secs(2);
 
+/// A crawl stopped for room goes again once its room grew by this share of
+/// `maxCacheBytes` (D51), so it does not stop again at once.
+const CRAWL_RESUME_ROOM_SHARE: usize = 16;
+
 /// What `wait_index_turn` decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexTurn {
@@ -492,6 +496,14 @@ pub(crate) enum WarmEvent {
         generation: u64,
         open_epoch: u64,
     },
+    /// The crawl could not store a unit without evicting what requests use
+    /// (D51) and stopped. It is dispatched again on the next trigger, or once
+    /// the budget frees room.
+    BudgetStopped {
+        uri: Url,
+        generation: u64,
+        open_epoch: u64,
+    },
     /// A crawl stopped at a unit boundary so that other warmer work runs
     /// before it is dispatched again. No client preemption.
     Yielded {
@@ -666,7 +678,7 @@ impl WarmProgress {
                     Ok(())
                 }
             }
-            WarmEvent::End { uri, .. } => {
+            WarmEvent::End { uri, .. } | WarmEvent::BudgetStopped { uri, .. } => {
                 if let Some(pending) = self
                     .pending_creates
                     .values_mut()
@@ -869,6 +881,9 @@ pub(crate) struct Warmer {
     dispatched_epochs: HashMap<Url, u64>,
     /// Invalidation epoch of each open file's last completed crawl.
     crawled_epochs: HashMap<Url, u64>,
+    /// Open files whose crawl stopped for room (D51), with the crawl's room
+    /// at the stop: dispatched again on a trigger, or once it grew.
+    budget_stopped: HashMap<Url, usize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -913,6 +928,7 @@ impl Warmer {
             busy_attempt: None,
             dispatched_epochs: HashMap::new(),
             crawled_epochs: HashMap::new(),
+            budget_stopped: HashMap::new(),
             thread: Some(thread),
         }
     }
@@ -938,6 +954,7 @@ impl Warmer {
             self.next_open_epoch
         };
         crate::trace::trace!("warm open {uri} (epoch {open_epoch})");
+        self.budget_stopped.remove(&uri);
         self.open_order.retain(|opened| opened != &uri);
         self.open_order.push_front(uri.clone());
         let already_queued = self.queue.queued.contains(&uri);
@@ -955,6 +972,7 @@ impl Warmer {
     /// its identity. Watcher invalidations are not document reopenings.
     pub(crate) fn rewarm(&mut self, uri: Url) {
         crate::trace::trace!("warm rewarm {uri}");
+        self.budget_stopped.remove(&uri);
         self.queue.push_front(uri);
         self.crawl_pending.store(true, Ordering::Relaxed);
     }
@@ -1029,6 +1047,7 @@ impl Warmer {
         self.queue.remove(uri);
         self.dispatched_epochs.remove(uri);
         self.crawled_epochs.remove(uri);
+        self.budget_stopped.remove(uri);
         self.crawl_resume.remove(uri);
         self.open_order.retain(|opened| opened != uri);
         self.open_epochs.remove(uri);
@@ -1059,6 +1078,7 @@ impl Warmer {
         self.crawl_resume.clear();
         self.dispatched_epochs.clear();
         self.crawled_epochs.clear();
+        self.budget_stopped.clear();
         let open = open.into_iter().collect::<HashSet<_>>();
         self.open_order.retain(|uri| open.contains(uri));
         self.open_epochs.retain(|uri, _| open.contains(uri));
@@ -1144,7 +1164,7 @@ impl Warmer {
                 other => crate::trace::trace!("warm event {other:?}"),
             }
             if self.accept_event(&event, cache) {
-                if let WarmEvent::End { uri, .. } = &event {
+                if let WarmEvent::End { uri, .. } | WarmEvent::BudgetStopped { uri, .. } = &event {
                     self.request_index(IndexAnchor::Document(uri.clone()));
                     if let Some(project) = self.configured_project.clone() {
                         self.request_index(IndexAnchor::Project(project));
@@ -1289,8 +1309,30 @@ impl Warmer {
             persisting && !self.index_queue.is_empty(),
             Ordering::Relaxed,
         );
-        // 2. The crawl.
-        if !self.busy && workspace.project_cache().has_room() {
+        // 2. The crawl. One stopped for room goes again once its room grew
+        // (D51). It does not go ahead of a due reuse pass that waits only
+        // for room: it would yield to the pass at its first unit boundary.
+        let cache = workspace.project_cache();
+        let resume_room = cache.max_bytes() / CRAWL_RESUME_ROOM_SHARE;
+        let room = cache.crawl_room();
+        let resumed = self
+            .budget_stopped
+            .iter()
+            .filter(|(_, at_stop)| room >= at_stop.saturating_add(resume_room))
+            .map(|(uri, _)| uri.clone())
+            .collect::<Vec<_>>();
+        for uri in resumed {
+            crate::trace::trace!("warm crawl {uri} resumes: the crawl has room again");
+            self.budget_stopped.remove(&uri);
+            self.queue.push_front(uri);
+            self.crawl_pending.store(true, Ordering::Relaxed);
+        }
+        let reuse_waits_for_room = (persisting || awaiting_store)
+            && !self.reuse_queue.is_empty()
+            && !gate.bulk_runs()
+            && !gate.warm_paused()
+            && !cache.index_batch_fits();
+        if !self.busy && !reuse_waits_for_room && cache.has_room() {
             while let Some(uri) = self.queue.pop() {
                 let Some(open_epoch) = self.open_epochs.get(&uri).copied() else {
                     continue;
@@ -1405,6 +1447,31 @@ impl Warmer {
                 }
                 self.queue.push_front(uri.clone());
                 self.crawl_pending.store(true, Ordering::Relaxed);
+                true
+            }
+            WarmEvent::BudgetStopped {
+                uri,
+                generation,
+                open_epoch,
+            } => {
+                self.busy = false;
+                self.busy_attempt = None;
+                let accepted = *generation == self.generation
+                    && self.open_epochs.get(uri).copied() == Some(*open_epoch);
+                if !accepted {
+                    return false;
+                }
+                self.crawl_resume.remove(uri);
+                // Like an end: snapshots' closure misses do not ask for the
+                // crawl again until the cache is invalidated.
+                if let Some(epoch) = self.dispatched_epochs.remove(uri) {
+                    if epoch == cache.invalidation_epoch() {
+                        self.crawled_epochs.insert(uri.clone(), epoch);
+                    } else {
+                        cache.forget_closure_misses(uri);
+                    }
+                }
+                self.budget_stopped.insert(uri.clone(), cache.crawl_room());
                 true
             }
             WarmEvent::Yielded {
@@ -1784,9 +1851,12 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     if !gate.wait_warm_idle(&job.cancel) {
         return end(None, Vec::new());
     }
-    crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::yielding(
+    // Background work: it may take only free budget or its own unused
+    // entries' room, and stops when that runs out (D51).
+    crate::project_cache::set_claim_role_on_this_thread(crate::project_cache::ClaimRole::crawl(
         job.cancel.clone(),
     ));
+    crate::project_cache::reset_crawl_admission_on_this_thread();
     let _span = crate::trace::Span::new(|| format!("warm crawl {}", uri));
     let mut workspace = Workspace::from_analysis_input(&job.job_input(false));
     // The crawl publishes the disk-proven units it analyses (R8-2/D42). A
@@ -1804,7 +1874,6 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     // The progress count where the crawl yielded, and whether to a reuse
     // pass.
     let yielded = Arc::new(Mutex::new(None::<(usize, bool)>));
-    let hook_cache = workspace.project_cache().clone();
     let hook_yielded = yielded.clone();
     #[cfg(test)]
     let slice_gate = gate.clone();
@@ -1848,12 +1917,10 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
         // Only past the last yield, so every dispatch analyses new units.
         let boundary = persists && done > resume_after && done < total;
         // A reuse pass the crawl went ahead of while Bulk work held it back
-        // runs at the first unit boundary where the index gate passes (D33).
-        if boundary
-            && reuse_due.load(Ordering::Relaxed)
-            && hook_gate.index_may_run_now()
-            && hook_cache.index_batch_fits()
-        {
+        // runs at the first unit boundary where the index gate passes (D33),
+        // whatever the budget: the pass waits for room ahead of the crawl
+        // (D51).
+        if boundary && reuse_due.load(Ordering::Relaxed) && hook_gate.index_may_run_now() {
             *hook_yielded.lock().unwrap_or_else(PoisonError::into_inner) = Some((done, true));
             return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
         }
@@ -1865,6 +1932,10 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             && slice_over()
         {
             *hook_yielded.lock().unwrap_or_else(PoisonError::into_inner) = Some((done, false));
+            return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
+        }
+        // Out of room: stop rather than parse on (D51).
+        if crate::project_cache::crawl_admission_refused_on_this_thread() {
             return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
         }
         // Pause between units while interactive requests run.
@@ -1886,6 +1957,24 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             generation: job.generation,
             open_epoch,
         });
+    }
+    let out_of_room = crate::project_cache::crawl_admission_refused_on_this_thread()
+        && !job.cancel.load(Ordering::Relaxed)
+        && yielded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none();
+    if out_of_room {
+        crate::trace::trace!("warm crawl {uri} stopped: no room for the crawl");
+        // Its parses' leases go first, so the room recorded at the stop
+        // counts them freed.
+        drop(workspace);
+        let _ = events.send(WarmEvent::BudgetStopped {
+            uri,
+            generation: job.generation,
+            open_epoch,
+        });
+        return;
     }
     match result {
         Ok(outcome) => {
@@ -3628,6 +3717,7 @@ mod tests {
             WarmEvent::Progress { done, total, .. } => format!("Progress {done}/{total}"),
             WarmEvent::End { .. } => "End".into(),
             WarmEvent::Paused { .. } => "Paused".into(),
+            WarmEvent::BudgetStopped { .. } => "BudgetStopped".into(),
             WarmEvent::Yielded { to_reuse: true, .. } => "Yielded to reuse".into(),
             WarmEvent::Yielded { .. } => "Yielded".into(),
             WarmEvent::ClosureStored { .. } => "ClosureStored".into(),
@@ -3719,6 +3809,156 @@ mod tests {
         let unpinned = warmer.pin_crawl(cache, &other, other_pins);
         assert_eq!(unpinned, vec![main], "Main was opened first");
         assert!(cache.stats().pinned_bytes <= cache.max_bytes() / 2);
+    }
+
+    const WIDE_UNITS: usize = 12;
+
+    /// `Main` (open) uses `R1..R3`, which a request loads; `Wide` (open)
+    /// uses `W1..W12`, which its crawl loads.
+    fn request_and_wide_fixture() -> (tempfile::TempDir, crate::workspace::Workspace, Url, Url) {
+        let temp = tempfile::tempdir().unwrap();
+        let write_unit = |name: &str, uses: &str| {
+            let text = format!(
+                "unit {name};\ninterface\n{uses}procedure P{name};\nimplementation\nprocedure P{name};\nbegin\nend;\nend.\n"
+            );
+            std::fs::write(temp.path().join(format!("{name}.pas")), &text).unwrap();
+            text
+        };
+        let main_text = write_unit("Main", "uses R1, R2, R3;\n");
+        for name in ["R1", "R2", "R3"] {
+            write_unit(name, "");
+        }
+        let wide_uses = (1..=WIDE_UNITS)
+            .map(|index| format!("W{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wide_text = write_unit("Wide", &format!("uses {wide_uses};\n"));
+        for index in 1..=WIDE_UNITS {
+            write_unit(&format!("W{index}"), "");
+        }
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            Default::default(),
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let wide = Url::from_file_path(temp.path().join("Wide.pas")).unwrap();
+        workspace.open_document(main.clone(), main_text, 1).unwrap();
+        workspace.open_document(wide.clone(), wide_text, 1).unwrap();
+        (temp, workspace, main, wide)
+    }
+
+    /// What a references request over `uri`'s closure parses, on this
+    /// thread under a client role.
+    fn request_parses(workspace: &crate::workspace::Workspace, uri: &Url) -> usize {
+        crate::project_cache::set_claim_role_on_this_thread(
+            crate::project_cache::ClaimRole::client(Arc::new(AtomicBool::new(false))),
+        );
+        crate::navigation::test_reset_document_parse_count();
+        let outcome = crate::workspace::Workspace::from_analysis_input(&workspace.analysis_input())
+            .warm_with_cancel(uri, &AtomicBool::new(false));
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+        let parses = crate::navigation::test_document_parse_count();
+        crate::project_cache::set_claim_role_on_this_thread(Default::default());
+        parses
+    }
+
+    fn poll_until_crawl_stops(
+        warmer: &mut Warmer,
+        workspace: &crate::workspace::Workspace,
+    ) -> Vec<WarmEvent> {
+        poll_until(warmer, workspace, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    WarmEvent::End { .. } | WarmEvent::BudgetStopped { .. }
+                )
+            })
+        })
+    }
+
+    fn wide_units_ready(cache: &crate::project_cache::ProjectCache, wide: &Url) -> usize {
+        (1..=WIDE_UNITS)
+            .filter(|index| {
+                cache
+                    .ready_layers(&wide.join(&format!("W{index}.pas")).unwrap())
+                    .contains(&"Unit".to_string())
+            })
+            .count()
+    }
+
+    /// D51 (multidev Task 10b): a crawl started with a full budget must not
+    /// evict what a references request just used, so the request's next run
+    /// parses nothing.
+    #[test]
+    fn a_crawl_never_evicts_the_entries_a_request_just_used() {
+        let (_temp, workspace, main, wide) = request_and_wide_fixture();
+        let cache = workspace.project_cache();
+        let first = request_parses(&workspace, &main);
+        assert!(first >= 3, "the request parsed its closure: {first}");
+        // Room for about two more units beside the request's.
+        let used = cache.stats().bytes;
+        cache.set_max_bytes(used + used / 2);
+        assert!(cache.has_room());
+
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(wide.clone());
+        let events = poll_until_crawl_stops(&mut warmer, &workspace);
+
+        assert_eq!(
+            request_parses(&workspace, &main),
+            0,
+            "the request's entries survived the crawl: {:?}",
+            events.iter().map(event_kind).collect::<Vec<_>>()
+        );
+        assert!(cache.stats().bytes <= cache.max_bytes());
+    }
+
+    /// D51: out of room, the crawl stops instead of parsing on and evicting
+    /// its own work, and is not dispatched again until the budget frees.
+    #[test]
+    fn a_crawl_out_of_room_stops_and_waits_for_room() {
+        let (_temp, workspace, main, wide) = request_and_wide_fixture();
+        let cache = workspace.project_cache();
+        request_parses(&workspace, &main);
+        let used = cache.stats().bytes;
+        cache.set_max_bytes(used + used / 2);
+
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(wide.clone());
+        let events = poll_until_crawl_stops(&mut warmer, &workspace);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::BudgetStopped { .. })),
+            "the crawl stopped for room: {:?}",
+            events.iter().map(event_kind).collect::<Vec<_>>()
+        );
+        let stored = wide_units_ready(cache, &wide);
+        assert!(stored < WIDE_UNITS, "the crawl did not store every unit");
+
+        let mut later = Vec::new();
+        for _ in 0..30 {
+            later.extend(warmer.poll(&workspace));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !later
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Begin { .. })),
+            "no crawl is dispatched while the budget stays full: {later:?}"
+        );
+        assert_eq!(wide_units_ready(cache, &wide), stored, "no churn");
+
+        cache.set_max_bytes(usize::MAX / 4);
+        let resumed = run_until_end(&mut warmer, &workspace);
+        assert!(
+            resumed
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Begin { .. })),
+            "{resumed:?}"
+        );
+        assert_eq!(wide_units_ready(cache, &wide), WIDE_UNITS);
     }
 
     /// Index scheduling with an enabled store (D33). Every test opens one.
@@ -4280,6 +4520,71 @@ mod tests {
                 "no extraction before the crawl's end: {kinds:?}"
             );
             assert!(warmer.reuse_queue.is_empty(), "{kinds:?}");
+            warmer.shutdown();
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// D51 (multidev Task 10b E1: a crawl at 37 s ran 877 s ahead of the
+        /// reuse pass): the crawl yields to a due reuse pass whatever the
+        /// budget, and is not dispatched again while the pass waits for room.
+        #[test]
+        fn a_crawl_yields_to_a_due_reuse_pass_when_the_budget_is_full() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = wide_fixture(&gate);
+            let cache = workspace.project_cache().clone();
+            let pins = {
+                let mut first = Warmer::start(gate.clone());
+                first.open(main.clone());
+                let events = run_until_end_within(&mut first, &workspace, Duration::from_secs(20));
+                first.shutdown();
+                match events.iter().find(|event| is_end(event)) {
+                    Some(WarmEvent::End { pins, .. }) => pins.clone(),
+                    _ => panic!("{events:?}"),
+                }
+            };
+            // The closure stays cached (pinned), and the budget has room left
+            // for the crawl but not for an index batch's dispatch.
+            cache.pin(&main, pins);
+            let stats = cache.stats();
+            let committed = stats.pinned_bytes + stats.outstanding_bytes + stats.reserved_bytes();
+            cache.set_max_bytes(committed + 2048);
+            assert!(cache.has_room() && !cache.index_batch_fits());
+
+            gate.set_running_bulk(1);
+            *gate.bulk_ends_after_checks.lock().unwrap() = Some(0);
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main.clone());
+            let events = poll_until(&mut warmer, &workspace, |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WarmEvent::Yielded { .. }
+                            | WarmEvent::End { .. }
+                            | WarmEvent::BudgetStopped { .. }
+                    )
+                })
+            });
+            let kinds = events.iter().map(event_kind).collect::<Vec<_>>();
+            assert!(
+                kinds.iter().any(|kind| kind == "Yielded to reuse"),
+                "the crawl yielded to the reuse pass with a full budget: {kinds:?}"
+            );
+            let mut later = Vec::new();
+            for _ in 0..30 {
+                later.extend(warmer.poll(&workspace));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !later.iter().any(is_begin),
+                "the crawl waits behind the pass: {:?}",
+                later.iter().map(event_kind).collect::<Vec<_>>()
+            );
+
+            cache.set_max_bytes(crate::project_cache::DEFAULT_MAX_CACHE_BYTES);
+            let events = run_until_end_within(&mut warmer, &workspace, Duration::from_secs(20));
+            let reuse = position(&events, reuse_progress);
+            let end = position(&events, is_end);
+            assert!(reuse < end, "{events:?}");
             warmer.shutdown();
             workspace.persistent_cache().shutdown();
         }

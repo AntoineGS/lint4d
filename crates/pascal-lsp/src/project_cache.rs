@@ -2102,6 +2102,117 @@ mod cache_tests {
         assert!(ready(&cache, "Other.pas"));
     }
 
+    fn as_role(role: ClaimRole, body: impl FnOnce()) {
+        set_claim_role_on_this_thread(role);
+        reset_crawl_admission_on_this_thread();
+        body();
+        set_claim_role_on_this_thread(ClaimRole::default());
+    }
+
+    fn request_role() -> ClaimRole {
+        ClaimRole::client(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn crawl_role() -> ClaimRole {
+        ClaimRole::crawl(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// D51: the crawl takes free budget and the room of its own unused
+    /// entries, never the entries a request stored or used.
+    #[test]
+    fn a_crawl_store_evicts_only_its_own_entries_no_request_used() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
+        as_role(crawl_role(), || {
+            fill(&cache, "C1.pas", &ctx, 1, 30);
+            fill(&cache, "C2.pas", &ctx, 1, 30);
+            // Full: C3 takes the room of C1, the crawl's oldest entry.
+            fill(&cache, "C3.pas", &ctx, 1, 30);
+            assert!(!crawl_admission_refused_on_this_thread());
+        });
+        assert!(ready(&cache, "Used.pas"), "a request's entry stays");
+        assert!(!ready(&cache, "C1.pas"));
+        assert!(ready(&cache, "C2.pas") && ready(&cache, "C3.pas"));
+
+        // A request uses C2: it is no longer the crawl's to evict.
+        as_role(request_role(), || {
+            assert!(matches!(
+                cache.imports(&uri("C2.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+                Lookup::Hit(_)
+            ));
+        });
+        as_role(crawl_role(), || {
+            fill(&cache, "C4.pas", &ctx, 1, 30);
+            assert!(!crawl_admission_refused_on_this_thread());
+            // Only C4 is the crawl's: 40 + 30 + 50 > 100 without C2.
+            match cache.imports(&uri("C5.pas"), &ctx, 1, &HashMap::new(), &no_cancel()) {
+                Lookup::Compute(claim) => {
+                    cache.store_imports(claim, import_value(vec![]), 50, &no_cancel());
+                }
+                _ => panic!("expected a miss for C5"),
+            }
+            assert!(
+                crawl_admission_refused_on_this_thread(),
+                "the crawl is told it ran out of room"
+            );
+            assert!(
+                matches!(
+                    cache.imports(&uri("C6.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+                    Lookup::Cancelled
+                ),
+                "a crawl out of room computes nothing more"
+            );
+        });
+        assert!(ready(&cache, "Used.pas") && ready(&cache, "C2.pas"));
+        assert!(!ready(&cache, "C5.pas"), "the crawl's store was refused");
+        assert!(cache.stats().bytes <= 100);
+    }
+
+    #[test]
+    fn a_crawl_interface_put_never_evicts_a_requests_entry() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 90));
+        as_role(crawl_role(), || {
+            let value = interface_value(&[("Base.pas", 1)], true);
+            let bytes = value.retained_bytes();
+            assert!(bytes > 10, "the put does not fit beside Used: {bytes}");
+            cache.put_interface_imports(&uri("Main.pas"), &ctx, 1, value, None);
+            assert!(crawl_admission_refused_on_this_thread());
+        });
+        assert!(ready(&cache, "Used.pas"));
+        assert!(!ready(&cache, "Main.pas"));
+    }
+
+    /// D51: a request's store still evicts the crawl's entries first by age.
+    #[test]
+    fn a_request_store_may_evict_the_crawls_entries() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 60));
+        as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
+        assert!(ready(&cache, "Used.pas"));
+        assert!(!ready(&cache, "C1.pas"));
+    }
+
+    /// D51: the fingerprints used since a configuration reset are the
+    /// current project's, which the sweep keeps.
+    #[test]
+    fn fingerprints_used_since_a_sweep_began_are_recorded() {
+        let cache = ProjectCache::new(1 << 20);
+        let old = context("Old.dproj");
+        let current = context("A.dproj");
+        fill(&cache, "Old.pas", &old, 1, 10);
+        cache.begin_fingerprint_sweep();
+        as_role(crawl_role(), || fill(&cache, "Main.pas", &current, 1, 10));
+        let used = cache.fingerprints_used_since_sweep_began();
+        assert_eq!(used, HashSet::from([project_context_fingerprint(&current)]));
+        cache.retain_fingerprints(&used);
+        assert!(ready(&cache, "Main.pas"));
+        assert!(!ready(&cache, "Old.pas"));
+    }
+
     #[test]
     fn pinning_a_ready_entry_counts_it_as_pinned_until_unpinned() {
         let cache = ProjectCache::new(10);
@@ -3902,6 +4013,9 @@ struct Entry {
     input_hash: u64,
     bytes: usize,
     last_used: u64,
+    /// Stored by the open-file crawl and used by no request since (D51):
+    /// the crawl may take its room back.
+    background: bool,
 }
 
 #[derive(Debug)]
@@ -3945,6 +4059,10 @@ pub(crate) struct ClaimRole {
     /// dependency walk runs after the resolution is stored), so they are
     /// waited for as long as they are held.
     roleless_claim_wait: Option<Duration>,
+    /// The open-file warm crawl (D51): what it stores is background work,
+    /// which may take only free budget or the room of entries the crawl
+    /// itself stored and no request has used since.
+    background_admission: bool,
 }
 
 impl ClaimRole {
@@ -3955,6 +4073,7 @@ impl ClaimRole {
             yields_to_interactive: false,
             preempts_yielding: false,
             roleless_claim_wait: Some(roleless_claim_wait),
+            background_admission: false,
         }
     }
 
@@ -3965,6 +4084,7 @@ impl ClaimRole {
             yields_to_interactive: false,
             preempts_yielding: false,
             roleless_claim_wait: None,
+            background_admission: false,
         }
     }
 
@@ -3988,6 +4108,15 @@ impl ClaimRole {
             yields_to_interactive: true,
             preempts_yielding: false,
             roleless_claim_wait: None,
+            background_admission: false,
+        }
+    }
+
+    /// The open-file warm crawl: yielding, under background admission (D51).
+    pub(crate) fn crawl(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            background_admission: true,
+            ..Self::yielding(cancel)
         }
     }
 
@@ -4015,6 +4144,13 @@ struct State {
     /// Unpinned ready entries by `last_used`, oldest first. Clock values are
     /// unique, so each entry has its own slot.
     lru: BTreeMap<u64, Key>,
+    /// The unpinned entries of `lru` that are `background`, and their bytes:
+    /// what the crawl may evict for its own stores (D51).
+    background_lru: BTreeMap<u64, Key>,
+    background_bytes: usize,
+    /// Fingerprints that lookups and stores used since the last
+    /// configuration reset, the current project's (D51).
+    used_fingerprints: HashSet<u64>,
     /// Shared provider interfaces (l4d-4nbs D29), charged as the
     /// `ProviderGraphs` reservation and evicted with unit entries by recency
     /// (review I2).
@@ -4083,6 +4219,9 @@ impl Default for State {
             pin_counts: HashMap::new(),
             pinned_bytes: 0,
             lru: BTreeMap::new(),
+            background_lru: BTreeMap::new(),
+            background_bytes: 0,
+            used_fingerprints: HashSet::new(),
             provider_graphs: ProviderGraphStore::default(),
             observed: HashMap::new(),
             exact: HashMap::new(),
@@ -4553,6 +4692,43 @@ fn make_room(state: &mut State, request: usize) -> bool {
     true
 }
 
+/// Makes room for `request` more bytes the crawl stores (D51), counting
+/// `credit` bytes it replaces as freed: only by evicting the crawl's own
+/// unpinned entries that no request used since, oldest first, and never
+/// `spare`, the entry being replaced. False when that is not enough.
+fn make_room_for_crawl(
+    state: &mut State,
+    request: usize,
+    spare: Option<&Key>,
+    credit: usize,
+) -> bool {
+    prune_dead_leases(state);
+    while !fits(state, state.bytes.saturating_sub(credit), request) {
+        let Some(key) = state
+            .background_lru
+            .values()
+            .find(|key| Some(*key) != spare)
+            .cloned()
+        else {
+            return false;
+        };
+        state.evicted_for_room = true;
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
+    }
+    true
+}
+
+/// Whether the work on the calling thread is the open-file crawl (D51).
+fn crawl_admission_on_this_thread() -> bool {
+    CLAIM_ROLE.with(|role| role.borrow().background_admission)
+}
+
+fn refuse_crawl_on_this_thread() {
+    CRAWL_REFUSED.with(|refused| refused.set(true));
+}
+
 /// Evicts the least recently used unpinned unit entry or shared provider
 /// interface, whichever is older. False when neither is left.
 fn evict_oldest(state: &mut State) -> bool {
@@ -4614,6 +4790,8 @@ fn recover_poisoned_state<'a>(
     }
     state.outstanding_bytes = state.outstanding_bytes.saturating_add(orphaned);
     state.lru.clear();
+    state.background_lru.clear();
+    state.background_bytes = 0;
     state.observed.clear();
     state.exact.clear();
     state.by_uri.clear();
@@ -4644,6 +4822,8 @@ thread_local! {
         std::cell::RefCell::new(ClaimRole::default());
     /// Claims this thread holds on slots, which other lookups may wait for.
     static HELD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A store of the crawl on this thread was refused for room (D51).
+    static CRAWL_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The number of slot claims the calling thread holds. Work that pauses for
@@ -4663,6 +4843,17 @@ pub(crate) fn claims_held_on_this_thread() -> usize {
 /// cycle of waits, or when an import slot outlasts the role's import wait.
 pub(crate) fn set_claim_role_on_this_thread(role: ClaimRole) {
     CLAIM_ROLE.with(|cell| *cell.borrow_mut() = role);
+}
+
+/// Clears the calling thread's record that a crawl ran out of room (D51).
+pub(crate) fn reset_crawl_admission_on_this_thread() {
+    CRAWL_REFUSED.with(|refused| refused.set(false));
+}
+
+/// Whether a store of the crawl on the calling thread was refused for room
+/// since `reset_crawl_admission_on_this_thread` (D51).
+pub(crate) fn crawl_admission_refused_on_this_thread() -> bool {
+    CRAWL_REFUSED.with(std::cell::Cell::get)
 }
 
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
@@ -4961,7 +5152,13 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         let lease = self.lease_locked(&mut state, parsed, bytes, require_cached);
         if lease.as_ref().is_some_and(|(_, charged)| *charged) {
-            evict_to_budget(&mut state);
+            if crawl_admission_on_this_thread() {
+                if !make_room_for_crawl(&mut state, 0, None, 0) {
+                    refuse_crawl_on_this_thread();
+                }
+            } else {
+                evict_to_budget(&mut state);
+            }
         }
         self.release(state);
         lease.map(|(lease, _)| lease)
@@ -5084,6 +5281,7 @@ impl ProjectCache {
             fingerprint: project_context_fingerprint(context),
         };
         let mut state = lock(&self.inner);
+        state.used_fingerprints.insert(key.fingerprint);
         if snapshot_epoch.is_some_and(|epoch| epoch != state.invalidation_epoch) {
             crate::trace::trace!(
                 "  cache rejected Interface {} from epoch {snapshot_epoch:?} at epoch {}",
@@ -5110,6 +5308,22 @@ impl ProjectCache {
                 && old.complete == value.complete
         );
         let bytes = value.retained_bytes();
+        let crawl = crawl_admission_on_this_thread();
+        if crawl {
+            let replaced = match state.slots.get(&key) {
+                Some(Slot::Ready(entry)) => entry.bytes,
+                _ => 0,
+            };
+            if !make_room_for_crawl(&mut state, bytes, Some(&key), replaced) {
+                crate::trace::trace!(
+                    "  cache refused Interface {}: no room for the crawl",
+                    uri.path().rsplit('/').next().unwrap_or_default()
+                );
+                refuse_crawl_on_this_thread();
+                self.release(state);
+                return false;
+            }
+        }
         state.clock += 1;
         let entry = Entry {
             value: Value::Interface(Arc::new(value)),
@@ -5117,10 +5331,13 @@ impl ProjectCache {
             input_hash: content_hash,
             bytes,
             last_used: state.clock,
+            background: crawl,
         };
         // Replace even an unchanged entry: its probes may be fresher.
         insert_ready(&mut state, key, entry);
-        evict_to_budget(&mut state);
+        if !crawl {
+            evict_to_budget(&mut state);
+        }
         self.release(state);
         !unchanged
     }
@@ -5140,7 +5357,8 @@ impl ProjectCache {
             fingerprint: project_context_fingerprint(context),
         };
         let value = {
-            let state = lock(&self.inner);
+            let mut state = lock(&self.inner);
+            state.used_fingerprints.insert(key.fingerprint);
             match state.slots.get(&key) {
                 Some(Slot::Ready(entry))
                     if *entry.context == *context && entry.input_hash == input_hash =>
@@ -5316,12 +5534,17 @@ impl ProjectCache {
             fingerprint: project_context_fingerprint(context),
         };
         let role = CLAIM_ROLE.with(|cell| cell.borrow().clone());
+        // A crawl out of room computes nothing more (D51).
+        if role.background_admission && crawl_admission_refused_on_this_thread() {
+            return Lookup::Cancelled;
+        }
         let thread = std::thread::current().id();
         let mut wait_started: Option<std::time::Instant> = None;
         let mut taking_over = false;
         #[cfg(feature = "test-support")]
         let mut wait_marked = false;
         let mut state = lock(&self.inner);
+        state.used_fingerprints.insert(key.fingerprint);
         loop {
             match state.slots.get(&key) {
                 Some(Slot::Computing {
@@ -5713,6 +5936,10 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
         state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
     } else {
         state.lru.insert(entry.last_used, key.clone());
+        if entry.background {
+            state.background_lru.insert(entry.last_used, key.clone());
+            state.background_bytes = state.background_bytes.saturating_add(entry.bytes);
+        }
     }
     for (observed, path) in indexed_paths(&key, &entry) {
         let map = if observed {
@@ -5860,6 +6087,9 @@ fn remove_ready(state: &mut State, key: &Key) -> bool {
         state.pinned_bytes = state.pinned_bytes.saturating_sub(entry.bytes);
     } else {
         state.lru.remove(&entry.last_used);
+        if state.background_lru.remove(&entry.last_used).is_some() {
+            state.background_bytes = state.background_bytes.saturating_sub(entry.bytes);
+        }
     }
     for (observed, path) in indexed_paths(key, &entry) {
         let map = if observed {
@@ -5879,8 +6109,10 @@ fn remove_ready(state: &mut State, key: &Key) -> bool {
     true
 }
 
-/// Marks a ready entry as the most recently used.
+/// Marks a ready entry as the most recently used. A use by anything but
+/// background work makes it no longer the crawl's to evict (D51).
 fn touch(state: &mut State, key: &Key) {
+    let by_request = CLAIM_ROLE.with(|role| !role.borrow().yields_to_interactive);
     state.clock += 1;
     let clock = state.clock;
     let pinned = is_pinned(state, key);
@@ -5888,9 +6120,22 @@ fn touch(state: &mut State, key: &Key) {
         return;
     };
     let previous = std::mem::replace(&mut entry.last_used, clock);
+    let was_background = entry.background;
+    if by_request {
+        entry.background = false;
+    }
+    let (bytes, background) = (entry.bytes, entry.background);
     if !pinned {
         state.lru.remove(&previous);
         state.lru.insert(clock, key.clone());
+        if was_background {
+            state.background_lru.remove(&previous);
+            if background {
+                state.background_lru.insert(clock, key.clone());
+            } else {
+                state.background_bytes = state.background_bytes.saturating_sub(bytes);
+            }
+        }
     }
 }
 
@@ -5906,11 +6151,18 @@ fn set_pinned(state: &mut State, uri: &Url, fingerprint: u64, pinned: bool) {
         let Some(Slot::Ready(entry)) = state.slots.get(&key) else {
             continue;
         };
-        let (bytes, last_used) = (entry.bytes, entry.last_used);
+        let (bytes, last_used, background) = (entry.bytes, entry.last_used, entry.background);
         if pinned {
             state.lru.remove(&last_used);
+            if state.background_lru.remove(&last_used).is_some() {
+                state.background_bytes = state.background_bytes.saturating_sub(bytes);
+            }
             state.pinned_bytes = state.pinned_bytes.saturating_add(bytes);
         } else {
+            if background {
+                state.background_lru.insert(last_used, key.clone());
+                state.background_bytes = state.background_bytes.saturating_add(bytes);
+            }
             state.lru.insert(last_used, key);
             state.pinned_bytes = state.pinned_bytes.saturating_sub(bytes);
         }
@@ -6025,9 +6277,21 @@ impl ProjectCache {
                 if *generation == claim.generation
                     && claim.generation == state.generation
                     && *id == claim.claim);
+        let crawl = crawl_admission_on_this_thread();
+        let refused = current && crawl && !make_room_for_crawl(&mut state, bytes, None, 0);
+        if refused {
+            refuse_crawl_on_this_thread();
+        }
+        let current = current && !refused;
         crate::trace::trace!(
             "  cache {} {:?} {} after {:.1} ms",
-            if current { "stored" } else { "discarded" },
+            if refused {
+                "refused (no room for the crawl)"
+            } else if current {
+                "stored"
+            } else {
+                "discarded"
+            },
             claim.key.layer,
             claim.key.uri.path().rsplit('/').next().unwrap_or_default(),
             claim.started.elapsed().as_secs_f64() * 1000.0
@@ -6045,6 +6309,7 @@ impl ProjectCache {
                 input_hash: claim.input_hash,
                 bytes,
                 last_used: state.clock,
+                background: crawl,
             };
             insert_ready(&mut state, claim.key.clone(), entry);
             // The entry holds the parse now, so the lease is not outstanding
@@ -6053,7 +6318,10 @@ impl ProjectCache {
                 self.lease_locked(&mut state, &parsed, bytes, true)
                     .map(|(lease, _)| lease)
             });
-            evict_to_budget(&mut state);
+            // The crawl's store was made room for before it went in.
+            if !crawl {
+                evict_to_budget(&mut state);
+            }
         }
         self.release(state);
         drop(claim); // Removes the slot only when it is still Computing.
@@ -6493,6 +6761,17 @@ impl ProjectCache {
         }
     }
 
+    /// Starts recording the fingerprints that lookups and stores use, at a
+    /// configuration reset: they are the current project's (D51).
+    pub(crate) fn begin_fingerprint_sweep(&self) {
+        lock(&self.inner).used_fingerprints.clear();
+    }
+
+    /// The fingerprints used since `begin_fingerprint_sweep`.
+    pub(crate) fn fingerprints_used_since_sweep_began(&self) -> HashSet<u64> {
+        lock(&self.inner).used_fingerprints.clone()
+    }
+
     pub(crate) fn retain_fingerprints(&self, keep: &HashSet<u64>) {
         let mut state = lock(&self.inner);
         crate::trace::trace!("cache retain fingerprints {keep:?}");
@@ -6533,6 +6812,19 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         prune_dead_leases(&mut state);
         committed_bytes(&state) < state.max_bytes
+    }
+
+    /// The room the crawl may take (D51): free budget plus its own unpinned
+    /// entries that no request used since.
+    pub(crate) fn crawl_room(&self) -> usize {
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        let held = state
+            .bytes
+            .saturating_sub(state.background_bytes)
+            .saturating_add(state.outstanding_bytes)
+            .saturating_add(budgeted_reserved_bytes(&state));
+        state.max_bytes.saturating_sub(held)
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {

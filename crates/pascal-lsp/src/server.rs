@@ -12694,10 +12694,11 @@ fn sweep_stale_fingerprints(
     sweep_pending: &mut bool,
     swept_fingerprints: &HashSet<u64>,
 ) {
-    if *sweep_pending && (warmer_idle || !cache.has_room()) {
-        let mut keep = cache.fingerprints_used_since_sweep_began();
-        keep.extend(swept_fingerprints.iter().copied());
-        cache.retain_fingerprints(&keep);
+    // Without a known current fingerprint it waits (D51).
+    if *sweep_pending
+        && (warmer_idle || !cache.has_room())
+        && cache.sweep_fingerprints(swept_fingerprints)
+    {
         *sweep_pending = false;
     }
 }

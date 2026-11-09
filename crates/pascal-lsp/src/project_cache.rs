@@ -2196,6 +2196,60 @@ mod cache_tests {
         assert!(!ready(&cache, "C1.pas"));
     }
 
+    /// D51 (review I1): every budget charge the crawl makes (reservations,
+    /// publications past their pool) is under its admission.
+    #[test]
+    fn a_crawl_reservation_never_evicts_a_requests_entry() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
+        as_role(crawl_role(), || {
+            fill(&cache, "C1.pas", &ctx, 1, 20);
+            let held = cache.reserve(ReservationKind::Facts, 30);
+            assert!(held.is_some(), "C1 gives way");
+            assert!(!crawl_admission_refused_on_this_thread());
+            assert!(cache.reserve(ReservationKind::Facts, 20).is_none());
+            assert!(crawl_admission_refused_on_this_thread());
+        });
+        assert!(ready(&cache, "Used.pas"));
+        assert!(!ready(&cache, "C1.pas"));
+    }
+
+    /// D51 (review I2): the crawl refreshing an interface a request used
+    /// does not make it the crawl's to evict again.
+    #[test]
+    fn a_crawl_refresh_keeps_a_requests_interface_protected() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let value = || interface_value(&[("Base.pas", 1)], true);
+        as_role(request_role(), || {
+            cache.put_interface_imports(&uri("Main.pas"), &ctx, 1, value(), None);
+        });
+        let bytes = value().retained_bytes();
+        cache.set_max_bytes(bytes + 10);
+        as_role(crawl_role(), || {
+            cache.put_interface_imports(&uri("Main.pas"), &ctx, 1, value(), None);
+            assert!(!crawl_admission_refused_on_this_thread());
+            fill(&cache, "C1.pas", &ctx, 1, 20);
+            assert!(crawl_admission_refused_on_this_thread());
+        });
+        assert!(ready(&cache, "Main.pas"), "the request's interface stays");
+    }
+
+    /// D51 (review I5): a sweep that knows no current fingerprint yet keeps
+    /// everything and stays pending.
+    #[test]
+    fn a_sweep_with_no_known_current_fingerprint_is_deferred() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        fill(&cache, "Main.pas", &ctx, 1, 10);
+        cache.begin_fingerprint_sweep();
+        assert!(!cache.sweep_fingerprints(&HashSet::new()));
+        assert!(ready(&cache, "Main.pas"));
+        assert!(cache.sweep_fingerprints(&HashSet::from([project_context_fingerprint(&ctx)])));
+        assert!(ready(&cache, "Main.pas"));
+    }
+
     /// D51 (multidev w1-gap: references re-parsed 45 units after an idle
     /// gap): the crawl's unused entries give way before a request's, even
     /// older ones.
@@ -4694,8 +4748,16 @@ fn fits_committed(state: &State, request: usize) -> bool {
 
 /// Evicts unpinned entries, least recently used first, until `request` more
 /// bytes fit. False when they cannot: pinned, outstanding and reserved bytes
-/// alone leave no room, or nothing is left to evict.
+/// alone leave no room, or nothing is left to evict. For the crawl, only its
+/// own unused entries give way, and a refusal stops it (D51).
 fn make_room(state: &mut State, request: usize) -> bool {
+    if crawl_admission_on_this_thread() {
+        let admitted = make_room_for_crawl(state, request, None, 0);
+        if !admitted {
+            refuse_crawl_on_this_thread();
+        }
+        return admitted;
+    }
     // The interfaces' charge is checked against `reserved`, not subtracted
     // from the request (13b-3, A2: a small request was refused before the
     // interfaces were evicted).
@@ -5178,13 +5240,7 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         let lease = self.lease_locked(&mut state, parsed, bytes, require_cached);
         if lease.as_ref().is_some_and(|(_, charged)| *charged) {
-            if crawl_admission_on_this_thread() {
-                if !make_room_for_crawl(&mut state, 0, None, 0) {
-                    refuse_crawl_on_this_thread();
-                }
-            } else {
-                evict_to_budget(&mut state);
-            }
+            evict_to_budget(&mut state);
         }
         self.release(state);
         lease.map(|(lease, _)| lease)
@@ -5335,6 +5391,11 @@ impl ProjectCache {
         );
         let bytes = value.retained_bytes();
         let crawl = crawl_admission_on_this_thread();
+        // A refresh keeps a request's use of the entry it replaces.
+        let replaces_requested = matches!(
+            state.slots.get(&key),
+            Some(Slot::Ready(entry)) if !entry.background
+        );
         if crawl {
             let replaced = match state.slots.get(&key) {
                 Some(Slot::Ready(entry)) => entry.bytes,
@@ -5357,7 +5418,7 @@ impl ProjectCache {
             input_hash: content_hash,
             bytes,
             last_used: state.clock,
-            background: crawl,
+            background: crawl && !replaces_requested,
         };
         // Replace even an unchanged entry: its probes may be fresher.
         insert_ready(&mut state, key, entry);
@@ -6239,7 +6300,32 @@ fn prune_dead_leases(state: &mut State) {
     state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
 }
 
+fn retain_fingerprints_locked(state: &mut State, keep: &HashSet<u64>) {
+    crate::trace::trace!("cache retain fingerprints {keep:?}");
+    state.generation = state.generation.wrapping_add(1);
+    let doomed = state
+        .slots
+        .keys()
+        .filter(|key| !keep.contains(&key.fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in doomed {
+        if !remove_ready(state, &key) {
+            state.slots.remove(&key);
+        }
+    }
+    state
+        .contexts
+        .retain(|fingerprint, _| keep.contains(fingerprint));
+}
+
 fn evict_to_budget(state: &mut State) {
+    if crawl_admission_on_this_thread() {
+        if !make_room_for_crawl(state, 0, None, 0) {
+            refuse_crawl_on_this_thread();
+        }
+        return;
+    }
     prune_dead_leases(state);
     while state
         .bytes
@@ -6794,28 +6880,33 @@ impl ProjectCache {
     }
 
     /// The fingerprints used since `begin_fingerprint_sweep`.
+    #[cfg(test)]
     pub(crate) fn fingerprints_used_since_sweep_began(&self) -> HashSet<u64> {
         lock(&self.inner).used_fingerprints.clone()
     }
 
+    /// The configuration sweep: keeps `swept` and the fingerprints used
+    /// since `begin_fingerprint_sweep`, dropping every other entry.
+    /// Under one lock, so a fingerprint used meanwhile is kept. With none
+    /// known yet it drops nothing and returns false: the current project's
+    /// entries are never swept for want of a lookup (D51).
+    pub(crate) fn sweep_fingerprints(&self, swept: &HashSet<u64>) -> bool {
+        let mut state = lock(&self.inner);
+        let mut keep = state.used_fingerprints.clone();
+        keep.extend(swept.iter().copied());
+        if keep.is_empty() {
+            crate::trace::trace!("cache sweep deferred: no current fingerprint yet");
+            return false;
+        }
+        retain_fingerprints_locked(&mut state, &keep);
+        self.release(state);
+        self.inner.changed.notify_all();
+        true
+    }
+
     pub(crate) fn retain_fingerprints(&self, keep: &HashSet<u64>) {
         let mut state = lock(&self.inner);
-        crate::trace::trace!("cache retain fingerprints {keep:?}");
-        state.generation = state.generation.wrapping_add(1);
-        let doomed = state
-            .slots
-            .keys()
-            .filter(|key| !keep.contains(&key.fingerprint))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in doomed {
-            if !remove_ready(&mut state, &key) {
-                state.slots.remove(&key);
-            }
-        }
-        state
-            .contexts
-            .retain(|fingerprint, _| keep.contains(fingerprint));
+        retain_fingerprints_locked(&mut state, keep);
         self.release(state);
         self.inner.changed.notify_all();
     }
@@ -8489,6 +8580,19 @@ impl ProjectCache {
                 }
                 recorded
             })
+    }
+
+    /// `index_member_is_proven` within the index of the context `key`.
+    pub(crate) fn index_member_is_proven_in(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        hash: u64,
+    ) -> bool {
+        self.index()
+            .contexts
+            .get(key)
+            .is_some_and(|stored| stored.index.proven_with_hash(path, hash))
     }
 
     pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {

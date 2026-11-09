@@ -8424,7 +8424,8 @@ impl Workspace {
     /// Whether a persisting crawl leaves `unit`'s imports unloaded: its facts
     /// are in the store, proven from the bytes it was loaded from, so
     /// requests read them there rather than from a parse of the program the
-    /// crawl would keep (D51 #4). The closure then does not grow past it.
+    /// crawl would keep (D51 #4). The closure then does not grow past it,
+    /// so the open file's snapshots bind only what requests have loaded.
     fn crawl_skips(&self, unit: &Url) -> bool {
         if !self.crawl_persists || !self.persistent_cache().is_enabled() {
             return false;
@@ -8435,7 +8436,13 @@ impl Workspace {
         let Ok(path) = unit.to_file_path().map(absolute_path) else {
             return false;
         };
-        let skipped = self.project_cache.index_member_is_proven(&path, hash);
+        let Some(key) = self.document_contexts.get(unit) else {
+            return false;
+        };
+        // Proven for the context the crawl loads it under, not another.
+        let skipped = self
+            .project_cache
+            .index_member_is_proven_in(key, &path, hash);
         if skipped {
             crate::trace::trace!(
                 "  warm skips {}: proven in the store",

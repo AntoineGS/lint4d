@@ -91,7 +91,7 @@ const CRAWL_SLICE: Duration = Duration::from_secs(2);
 
 /// A crawl stopped for room goes again once its room grew by this share of
 /// `maxCacheBytes` (D51), so it does not stop again at once.
-const CRAWL_RESUME_ROOM_SHARE: usize = 16;
+const CRAWL_RESUME_ROOM_SHARE: usize = 64;
 
 /// What `wait_index_turn` decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1462,15 +1462,9 @@ impl Warmer {
                     return false;
                 }
                 self.crawl_resume.remove(uri);
-                // Like an end: snapshots' closure misses do not ask for the
-                // crawl again until the cache is invalidated.
-                if let Some(epoch) = self.dispatched_epochs.remove(uri) {
-                    if epoch == cache.invalidation_epoch() {
-                        self.crawled_epochs.insert(uri.clone(), epoch);
-                    } else {
-                        cache.forget_closure_misses(uri);
-                    }
-                }
+                // Not crawled: a snapshot's new closure miss asks for it
+                // again (`report_closure_misses` asks once per new miss).
+                self.dispatched_epochs.remove(uri);
                 self.budget_stopped.insert(uri.clone(), cache.crawl_room());
                 true
             }
@@ -3959,6 +3953,41 @@ mod tests {
             "{resumed:?}"
         );
         assert_eq!(wide_units_ready(cache, &wide), WIDE_UNITS);
+    }
+
+    /// D51 (review I4): a crawl stopped for room is not taken as crawled: a
+    /// snapshot's new closure miss asks for it again.
+    #[test]
+    fn a_closure_miss_asks_again_for_a_crawl_stopped_for_room() {
+        let (_temp, workspace, main, wide) = request_and_wide_fixture();
+        let cache = workspace.project_cache();
+        request_parses(&workspace, &main);
+        let used = cache.stats().bytes;
+        cache.set_max_bytes(used + used / 2);
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(wide.clone());
+        let events = poll_until_crawl_stops(&mut warmer, &workspace);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::BudgetStopped { .. })),
+            "{:?}",
+            events.iter().map(event_kind).collect::<Vec<_>>()
+        );
+
+        warmer.request_closure_crawl(wide.clone(), cache);
+        let again = poll_until(&mut warmer, &workspace, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Begin { .. }))
+        });
+        assert!(
+            again
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Begin { .. })),
+            "the crawl was dispatched again: {again:?}"
+        );
+        warmer.shutdown();
     }
 
     /// Index scheduling with an enabled store (D33). Every test opens one.

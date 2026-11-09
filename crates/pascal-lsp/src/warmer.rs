@@ -4589,6 +4589,84 @@ mod tests {
             workspace.persistent_cache().shutdown();
         }
 
+        /// D51 #4 (multidev w1-gap: after a warm start the crawl parsed the
+        /// program again, RSS 1.8 -> 3.35 GiB): a crawl does not load the
+        /// imports of closure units whose facts the store proves.
+        #[test]
+        fn a_warm_crawl_skips_the_imports_of_units_the_store_proves() {
+            let gate = Arc::new(InteractiveGate::default());
+            let temp = tempfile::tempdir().unwrap();
+            write_project(temp.path(), 0);
+            write(
+                &temp.path().join("lib/Provider.pas"),
+                "unit Provider;\ninterface\nuses Base;\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+            );
+            write(
+                &temp.path().join("lib/Base.pas"),
+                "unit Base;\ninterface\nuses Deep;\nimplementation\nend.\n",
+            );
+            write(
+                &temp.path().join("lib/Deep.pas"),
+                "unit Deep;\ninterface\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(temp.path());
+            let store = crate::workspace::persist::tests::private_dir();
+            let main = Url::from_file_path(temp.path().join("lib/Main.pas")).unwrap();
+            let lib = |name: &str| Url::from_file_path(temp.path().join("lib").join(name)).unwrap();
+            let complete_project = |events: &[WarmEvent]| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WarmEvent::IndexProgress { anchor: IndexAnchor::Project(_), progress, .. }
+                            if progress.complete
+                    )
+                })
+            };
+
+            let mut first = persisting_workspace(temp.path(), store.path(), &gate);
+            first
+                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .unwrap();
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main.clone());
+            let events = poll_until(&mut warmer, &first, complete_project);
+            assert!(complete_project(&events), "{events:?}");
+            assert!(
+                first
+                    .project_cache()
+                    .ready_layers(&lib("Deep.pas"))
+                    .contains(&"Unit".to_string()),
+                "a cold crawl loads the closure"
+            );
+            warmer.shutdown();
+            first.persistent_cache().shutdown();
+            drop(first);
+
+            let mut second = persisting_workspace(temp.path(), store.path(), &gate);
+            second
+                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .unwrap();
+            let mut warmer = Warmer::start(gate);
+            warmer.open(main);
+            let events = run_until_end_within(&mut warmer, &second, Duration::from_secs(20));
+            let cache = second.project_cache();
+            assert!(
+                cache
+                    .ready_layers(&lib("Provider.pas"))
+                    .contains(&"Unit".to_string()),
+                "the open file's imports are loaded: {events:?}"
+            );
+            for name in ["Base.pas", "Deep.pas"] {
+                assert!(
+                    !cache.ready_layers(&lib(name)).contains(&"Unit".to_string()),
+                    "{name} is not parsed again: {:?}",
+                    events.iter().map(event_kind).collect::<Vec<_>>()
+                );
+            }
+            warmer.shutdown();
+            second.persistent_cache().shutdown();
+        }
+
         /// I-1: a disabled store keeps the sequence of a workspace without
         /// one (`a_disabled_cache_runs_no_reuse_pass_and_extracts_after_the_crawl`).
         #[test]

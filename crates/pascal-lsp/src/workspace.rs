@@ -8386,6 +8386,9 @@ impl Workspace {
                 hook(&unit, finished, finished + frontier.len() + 1)?;
             }
             done += 1;
+            if self.crawl_skips(&unit) {
+                continue;
+            }
             // Each load reports its own dependencies through the hook; keep
             // one progress sequence for the whole crawl.
             let hook = self.dependency_hook.take();
@@ -8416,6 +8419,30 @@ impl Workspace {
             }
         }
         Ok(closure)
+    }
+
+    /// Whether a persisting crawl leaves `unit`'s imports unloaded: its facts
+    /// are in the store, proven from the bytes it was loaded from, so
+    /// requests read them there rather than from a parse of the program the
+    /// crawl would keep (D51 #4). The closure then does not grow past it.
+    fn crawl_skips(&self, unit: &Url) -> bool {
+        if !self.crawl_persists || !self.persistent_cache().is_enabled() {
+            return false;
+        }
+        let Some(hash) = self.indexed_content_hashes.get(unit).copied() else {
+            return false;
+        };
+        let Ok(path) = unit.to_file_path().map(absolute_path) else {
+            return false;
+        };
+        let skipped = self.project_cache.index_member_is_proven(&path, hash);
+        if skipped {
+            crate::trace::trace!(
+                "  warm skips {}: proven in the store",
+                unit.path().rsplit('/').next().unwrap_or_default()
+            );
+        }
+        skipped
     }
 
     #[allow(dead_code)]

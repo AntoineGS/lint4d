@@ -2196,6 +2196,24 @@ mod cache_tests {
         assert!(!ready(&cache, "C1.pas"));
     }
 
+    /// D51 (multidev w1-gap: references re-parsed 45 units after an idle
+    /// gap): the crawl's unused entries give way before a request's, even
+    /// older ones.
+    #[test]
+    fn room_for_a_request_is_taken_from_the_crawls_entries_first() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
+        as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 50));
+        as_role(request_role(), || {
+            fill(&cache, "Next.pas", &ctx, 1, 40);
+            assert!(cache.reserve(ReservationKind::QueryTrees, 10).is_some());
+        });
+        assert!(ready(&cache, "Used.pas"), "the request's older entry stays");
+        assert!(ready(&cache, "Next.pas"));
+        assert!(!ready(&cache, "C1.pas"));
+    }
+
     /// D51: the fingerprints used since a configuration reset are the
     /// current project's, which the sweep keeps.
     #[test]
@@ -4729,10 +4747,18 @@ fn refuse_crawl_on_this_thread() {
     CRAWL_REFUSED.with(|refused| refused.set(true));
 }
 
-/// Evicts the least recently used unpinned unit entry or shared provider
-/// interface, whichever is older. False when neither is left.
+/// Evicts the crawl's oldest entry no request used, else the least recently
+/// used unpinned unit entry or shared provider interface, whichever is
+/// older. False when nothing is left.
 fn evict_oldest(state: &mut State) -> bool {
     state.evicted_for_room = true;
+    // The crawl's entries no request used give way first (D51).
+    if let Some(key) = state.background_lru.values().next().cloned() {
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
+        return true;
+    }
     let unit = state.lru.first_key_value().map(|(tick, _)| *tick);
     let graph = state
         .provider_graphs

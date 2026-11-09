@@ -3237,7 +3237,7 @@ fn indexed_workspace_symbols(
             })
             .collect()
     } else {
-        let snapshot = super::rename::build_indexed_snapshot(
+        let mut snapshot = super::rename::build_indexed_snapshot(
             input,
             &[],
             &[],
@@ -3246,6 +3246,13 @@ fn indexed_workspace_symbols(
             sources,
             cancel,
         )?;
+        let mut lists = HashMap::<_, Vec<_>>::new();
+        for (key, path, list) in std::mem::take(&mut snapshot.to_list) {
+            lists.entry(key).or_default().push((path, list));
+        }
+        for (key, lists) in lists {
+            input.project_cache.keep_listed_symbols(&key, lists);
+        }
         if !snapshot.complete {
             coverage.note(
                 None,
@@ -3258,13 +3265,7 @@ fn indexed_workspace_symbols(
         for gap in &snapshot.index_gaps {
             coverage.note(None, gap.as_str());
         }
-        found.extend(
-            snapshot
-                .index
-                .workspace_symbols_with_cancel(query, cancel)?
-                .into_iter()
-                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri)),
-        );
+        found.extend(snapshot_workspace_symbols(&snapshot, query, cancel)?);
         snapshot_records(&snapshot)
     };
     let fact_files = facts
@@ -3390,6 +3391,163 @@ fn fact_symbols(
     Ok(result)
 }
 
+/// The readable workspace symbols of `snapshot`. An open document held as
+/// its session's expanded parse reports each declaration in its file
+/// through the source map (D49), if that file is readable; if one has no
+/// physical position, that document is answered from a parse of its
+/// buffer instead.
+fn snapshot_workspace_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let found = snapshot
+        .index
+        .workspace_symbols_with_cancel(query, cancel)?;
+    let found = merge_listed_symbols(snapshot, query, found)?;
+    if snapshot.projected.is_empty() {
+        return Ok(found
+            .into_iter()
+            .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
+            .collect());
+    }
+    let mut result = Vec::with_capacity(found.len());
+    let mut held = HashMap::<Url, Vec<SymbolInformation>>::new();
+    let mut order = Vec::new();
+    for symbol in found {
+        let uri = &symbol.location.uri;
+        if !snapshot.readable.contains(uri) {
+            continue;
+        }
+        if snapshot.projected.contains_key(uri) {
+            if !held.contains_key(uri) {
+                order.push((result.len(), uri.clone()));
+            }
+            held.entry(uri.clone()).or_default().push(symbol);
+        } else {
+            result.push(symbol);
+        }
+    }
+    // Insert from the back so the recorded positions stay valid.
+    for (at, uri) in order.into_iter().rev() {
+        let symbols = held.remove(&uri).unwrap_or_default();
+        let document = &snapshot.projected[&uri];
+        let placed = match project_symbols(snapshot, &uri, document, symbols, cancel)? {
+            Some(placed) => placed,
+            None => buffer_symbols(snapshot, &uri, document, query, cancel)?,
+        };
+        result.splice(at..at, placed);
+    }
+    Ok(result)
+}
+
+/// The index's answer `found` (documents in URI order) with the symbols of
+/// the sources the snapshot answered from kept symbol lists (Task 8d), each
+/// placed where its document's would be had the index parsed it.
+fn merge_listed_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    query: &str,
+    mut found: Vec<SymbolInformation>,
+) -> Result<Vec<SymbolInformation>, String> {
+    if snapshot.listed.is_empty() {
+        return Ok(found);
+    }
+    let mut listed = snapshot.listed.values().collect::<Vec<_>>();
+    listed.sort_by(|left, right| left.list.uri().as_str().cmp(right.list.uri().as_str()));
+    // From the last document back, so earlier insertion points stay valid.
+    for listed in listed.into_iter().rev() {
+        let uri = listed.list.uri().as_str();
+        let at = found.partition_point(|symbol| symbol.location.uri.as_str() < uri);
+        let symbols = listed.list.matching(query)?;
+        found.splice(at..at, symbols);
+        if let Some(error) = crate::navigation::too_many_workspace_symbols(found.len()) {
+            return Err(error);
+        }
+    }
+    Ok(found)
+}
+
+/// `symbols` of the projected document `uri` at their physical positions,
+/// or `None` when one does not map to exactly one span of a known file.
+fn project_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    uri: &Url,
+    document: &super::rename::ProjectedDocument,
+    symbols: Vec<SymbolInformation>,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<SymbolInformation>>, String> {
+    let Some(parsed) = snapshot.index.parsed_document(uri) else {
+        return Ok(None);
+    };
+    let expanded = parsed.source_text();
+    let to_cancel = |()| CANCELLATION_MESSAGE.to_string();
+    let expanded_positions =
+        crate::text::PositionIndex::new_with_cancel(expanded, cancel).map_err(to_cancel)?;
+    let mut budget = crate::include_expansion::MappingBudget::new(cancel, usize::MAX);
+    let mut positions = HashMap::<Url, crate::text::PositionIndex>::new();
+    let mut placed = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        let range = symbol.location.range;
+        let (Some(start), Some(end)) = (
+            expanded_positions.position_to_offset(expanded, range.start),
+            expanded_positions.position_to_offset(expanded, range.end),
+        ) else {
+            return Ok(None);
+        };
+        let Some((span, text)) = document.projection.locate(start..end, &mut budget)? else {
+            return Ok(None);
+        };
+        // A declaration in a file the request may not read is not listed.
+        if !snapshot.readable.contains(&span.uri) {
+            continue;
+        }
+        if !positions.contains_key(&span.uri) {
+            let index =
+                crate::text::PositionIndex::new_with_cancel(text, cancel).map_err(to_cancel)?;
+            positions.insert(span.uri.clone(), index);
+        }
+        let index = &positions[&span.uri];
+        let (Some(start), Some(end)) = (
+            index.offset_to_position(text, span.range.start),
+            index.offset_to_position(text, span.range.end),
+        ) else {
+            return Ok(None);
+        };
+        symbol.location = Location {
+            uri: span.uri,
+            range: Range { start, end },
+        };
+        placed.push(symbol);
+    }
+    Ok(Some(placed))
+}
+
+/// The symbols of a parse of the buffer of `uri` alone, as a snapshot
+/// without the reused parse answers them.
+fn buffer_symbols(
+    snapshot: &super::rename::RenameSnapshot,
+    uri: &Url,
+    document: &super::rename::ProjectedDocument,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<SymbolInformation>, String> {
+    let Some(source) = snapshot.sources.get(uri) else {
+        return Ok(Vec::new());
+    };
+    let mut index = crate::navigation::NavigationIndex::new();
+    index
+        .update_with_session(
+            uri.clone(),
+            source.clone(),
+            &document.context,
+            None,
+            cancel,
+            None,
+        )
+        .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
+    index.workspace_symbols_with_cancel(query, cancel)
+}
+
 fn walked_workspace_symbols(
     input: WorkspaceInput,
     query: &str,
@@ -3425,16 +3583,8 @@ fn walked_workspace_symbols(
         );
     }
 
-    let value = snapshot
-        .index
-        .workspace_symbols_with_cancel(query, cancel)
-        .map(|symbols| Partial {
-            value: symbols
-                .into_iter()
-                .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
-                .collect(),
-            coverage,
-        });
+    let value = snapshot_workspace_symbols(&snapshot, query, cancel)
+        .map(|value| Partial { value, coverage });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -4176,6 +4326,1327 @@ mod tests {
         assert_eq!(bound, expected);
     }
 
+    /// AC1 with persisted facts (l4d-zf1b.9): a restarted view filled from
+    /// the store without parsing binds only the importers and the declaring
+    /// unit, with the answer of the same fixture indexed without a store.
+    #[test]
+    fn restarted_references_bind_only_the_importing_units() {
+        use crate::workspace::indexing::IndexMode;
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::{persisting_view, restarted_view};
+        let fixture = many_units(20, 479);
+        let root = fixture.shared.parent().unwrap().to_path_buf();
+        let shared = source_uri(&fixture.shared);
+        let anchor = IndexAnchor::Document(shared.clone());
+        let references = |input: WorkspaceInput| {
+            references_from_input(
+                input,
+                &shared,
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+
+        let uncached_input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+        build_index_for(&uncached_input, &shared);
+        let uncached = references(uncached_input);
+        assert!(uncached.coverage.is_complete(), "{:?}", uncached.coverage);
+
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut first, cache) = persisting_view(
+            &Workspace::from_analysis_input(&fixture.input),
+            store.path(),
+        );
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 500, "{progress:?}");
+        cache.shutdown();
+
+        let (mut second, cache) = restarted_view(&root, store.path());
+        crate::navigation::test_reset_document_parse_count();
+        let progress = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.reused, 500, "{progress:?}");
+
+        crate::navigation::test_reset_bound_documents();
+        crate::workspace::rename::test_take_indexed_sources();
+        let cached = references(second.analysis_input());
+        assert!(cached.coverage.is_complete(), "{:?}", cached.coverage);
+        assert_eq!(located(&cached.value), located(&uncached.value));
+        assert_eq!(cached.value.len(), 21);
+        let mut candidates = fixture.importers.clone();
+        candidates.push(fixture.shared.clone());
+        candidates.sort();
+        let mut indexed = crate::workspace::rename::test_take_indexed_sources();
+        indexed.sort();
+        indexed.dedup();
+        assert_eq!(
+            indexed, candidates,
+            "the snapshot holds only the candidates"
+        );
+        let mut expected = candidates.iter().map(|p| source_uri(p)).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(bound_documents(), expected);
+        cache.shutdown();
+    }
+
+    const SHADOWING_IMPORTER: &str = "unit Shadow;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nvar\n  SharedValue: Integer;\nbegin\n  SharedValue := 2;\n  Log(SharedValue);\nend;\nend.\n";
+
+    /// D48 (spec §8.2): `Shadow` imports `Shared` but spells `SharedValue`
+    /// only through a local that shadows it. Its posting selects it and
+    /// binding rejects it: it is no location and the answer is complete,
+    /// indexed in memory and through a warm restarted view.
+    #[test]
+    fn a_posting_without_a_binding_is_never_a_location() {
+        use crate::workspace::indexing::IndexMode;
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::{persisting_view, restarted_view};
+        let (_temp, root, workspace) =
+            lexical_workspace(&[("Shadow.pas", SHADOWING_IMPORTER.as_bytes().to_vec())]);
+        let shadow = root.join("Shadow.pas");
+        let expected = vec![
+            (source_uri(&root.join("Importer.pas")), 6, 6),
+            (source_uri(&root.join("Shared.pas")), 2, 6),
+        ];
+        let walked = lexical_references(workspace.analysis_input(), &root);
+        assert_eq!(located(&walked.value), expected, "the walk's answer");
+        let check = |input: WorkspaceInput, label: &str| {
+            crate::workspace::rename::test_take_indexed_sources();
+            crate::navigation::test_reset_bound_documents();
+            let found = lexical_references(input, &root);
+            let indexed = indexed_sources();
+            assert!(indexed.contains(&shadow), "{label}: selected {indexed:?}");
+            assert!(
+                bound_documents().contains(&source_uri(&shadow)),
+                "{label}: bound"
+            );
+            assert!(
+                found.coverage.is_complete(),
+                "{label}: {:?}",
+                found.coverage
+            );
+            assert_eq!(located(&found.value), expected, "{label}");
+        };
+
+        let indexed = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        build_index_for(
+            &indexed.analysis_input(),
+            &source_uri(&root.join("Shared.pas")),
+        );
+        check(indexed.analysis_input(), "indexed");
+
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut first, cache) = persisting_view(
+            &test_workspace(vec![root.clone()], WorkspaceOptions::default()),
+            store.path(),
+        );
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 4, "{progress:?}");
+        cache.shutdown();
+        let (mut second, cache) = restarted_view(&root, store.path());
+        let progress = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.reused, 4, "{progress:?}");
+        check(second.analysis_input(), "warm");
+        cache.shutdown();
+    }
+
+    /// D47 (LSP side), through the in-memory `l4d-33` selector (A1
+    /// import-name matching), the production selector under R9-1: the
+    /// store's `find_importers` has no caller until `l4d-u3if`, and its
+    /// rows are covered in `pascal-cache`. `lib1/Utils.pas` and
+    /// `lib2/Utils.pas` both declare `Helper`; `PA` finds `Utils` in `lib1`,
+    /// `PB` in `lib2` before `lib1`. Both importers spell `Utils`, so both
+    /// are candidates; binding proves only `A`'s call.
+    #[test]
+    fn an_ambiguous_unit_name_keeps_every_importer_a_candidate_and_proves_locations_by_binding() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = crate::workspace::absolute_path(temp.path().to_path_buf());
+        let utils = "unit Utils;\ninterface\nprocedure Helper;\nimplementation\nprocedure Helper;\nbegin\nend;\nend.\n";
+        for library in ["lib1", "lib2"] {
+            let path = root.join(library).join("Utils.pas");
+            fs::create_dir_all(path.parent().unwrap()).expect("library directory");
+            fs::write(&path, utils).expect("utils");
+        }
+        for (project, unit, search) in [("PA", "A", "..\\lib1"), ("PB", "B", "..\\lib2;..\\lib1")] {
+            let directory = root.join(project);
+            fs::create_dir_all(&directory).expect("project directory");
+            fs::write(
+                directory.join(format!("{project}.dproj")),
+                format!(
+                    "<Project><PropertyGroup><MainSource>{project}.dpr</MainSource><DCC_UnitSearchPath>{search}</DCC_UnitSearchPath></PropertyGroup></Project>"
+                ),
+            )
+            .expect("descriptor");
+            fs::write(
+                directory.join(format!("{project}.dpr")),
+                format!("program {project};\nuses {unit};\nbegin\nend.\n"),
+            )
+            .expect("main source");
+            fs::write(
+                directory.join(format!("{unit}.pas")),
+                format!(
+                    "unit {unit};\ninterface\nuses Utils;\nimplementation\nprocedure Run;\nbegin\n  Helper;\nend;\nend.\n"
+                ),
+            )
+            .expect("importer");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let declaring = root.join("lib1/Utils.pas");
+        let (a, b) = (root.join("PA/A.pas"), root.join("PB/B.pas"));
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        // The importers stay closed, so the selection, not the open
+        // buffers rule (A4), makes them candidates.
+        open_source(&mut workspace, &root.join("PA/PA.dpr"));
+        open_source(&mut workspace, &root.join("PB/PB.dpr"));
+        let input = workspace.analysis_input();
+        let references = |input: WorkspaceInput| {
+            references_from_input(
+                input,
+                &source_uri(&declaring),
+                Position::new(2, 10),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("references")
+        };
+        let walked = references(input.clone());
+        for project in ["PA", "PB"] {
+            build_index_at(
+                &input,
+                &IndexAnchor::Project(root.join(project).join(format!("{project}.dproj"))),
+            );
+        }
+        crate::workspace::rename::test_take_indexed_sources();
+        crate::navigation::test_reset_bound_documents();
+        let found = references(input);
+        let indexed = indexed_sources();
+        assert!(
+            indexed.contains(&a) && indexed.contains(&b),
+            "both importers are candidates: {indexed:?}"
+        );
+        assert!(
+            bound_documents().contains(&source_uri(&b)),
+            "B is excluded by its binding, not by selection"
+        );
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        let found_locations = located(&found.value);
+        assert!(
+            found_locations.contains(&(source_uri(&a), 6, 2)),
+            "{found_locations:?}"
+        );
+        assert!(
+            found_locations
+                .iter()
+                .all(|(uri, _, _)| *uri == source_uri(&a) || *uri == source_uri(&declaring)),
+            "only lib1's importer and the declaring unit: {found_locations:?}"
+        );
+        assert_eq!(found_locations, located(&walked.value));
+    }
+
+    /// Spec §7: rename and the code actions computing workspace edits keep
+    /// their strict walk with a built and persisted index: no snapshot over
+    /// index candidates, and the edits of an unindexed session.
+    #[test]
+    fn rename_and_code_actions_never_use_index_selection() {
+        use crate::workspace::codeactions::{
+            ClientActionFeatures, code_actions_from_input, resolve_from_input,
+        };
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::persisting_view;
+        use lsp_types::{CodeActionOrCommand, WorkspaceEdit};
+        type Edits = Vec<(String, u32, u32, u32, u32, String)>;
+        fn edits(edit: WorkspaceEdit) -> Edits {
+            let mut found = edit
+                .changes
+                .expect("plain changes")
+                .into_iter()
+                .flat_map(|(uri, edits)| {
+                    edits.into_iter().map(move |edit| {
+                        (
+                            uri.to_string(),
+                            edit.range.start.line,
+                            edit.range.start.character,
+                            edit.range.end.line,
+                            edit.range.end.character,
+                            edit.new_text,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join(".lint4d.toml"),
+            "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+        )
+        .expect("lint configuration");
+        let shared = root.join("Shared.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        for index in 0..3 {
+            fs::write(
+                root.join(format!("Importer{index}.pas")),
+                format!(
+                    "unit Importer{index};\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(badConst);\nend;\nend.\n"
+                ),
+            )
+            .expect("importer");
+        }
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("Other{index}.pas")),
+                format!(
+                    "unit Other{index};\ninterface\nconst\n  BAD_CONST = {index};\nimplementation\nend.\n"
+                ),
+            )
+            .expect("other");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let uri = source_uri(&shared);
+        let features = |resolve| ClientActionFeatures {
+            resolve,
+            document_changes: false,
+            disabled: false,
+        };
+        let params = || -> lsp_types::CodeActionParams {
+            serde_json::from_value(serde_json::json!({
+                "textDocument": {"uri": uri},
+                "range": {
+                    "start": {"line": 3, "character": 2},
+                    "end": {"line": 3, "character": 10}
+                },
+                "context": {"diagnostics": [], "only": ["quickfix"]}
+            }))
+            .expect("code action parameters")
+        };
+        let action_edit = |actions: Vec<CodeActionOrCommand>| match actions.into_iter().next() {
+            Some(CodeActionOrCommand::CodeAction(action)) => action,
+            other => panic!("expected a code action: {other:?}"),
+        };
+        // (rename, eager quick fix, resolved quick fix) edits of `input`.
+        let all_edits = |input: WorkspaceInput| {
+            let cancel = AtomicBool::new(false);
+            let renamed = crate::workspace::rename::rename_from_input(
+                input.clone(),
+                &uri,
+                Position::new(3, 2),
+                "BAD_CONST_RENAMED",
+                false,
+                &cancel,
+            )
+            .value
+            .expect("rename");
+            let eager = action_edit(
+                code_actions_from_input(input.clone(), params(), features(false), &cancel)
+                    .value
+                    .expect("eager actions"),
+            );
+            assert_eq!(eager.title, "Rename 'badConst' to 'BAD_CONST'");
+            let unresolved = action_edit(
+                code_actions_from_input(input.clone(), params(), features(true), &cancel)
+                    .value
+                    .expect("resolvable actions"),
+            );
+            let resolved = resolve_from_input(input, unresolved, features(true), &cancel)
+                .value
+                .expect("resolved action");
+            (
+                edits(renamed),
+                edits(eager.edit.expect("eager edit")),
+                edits(resolved.edit.expect("resolved edit")),
+            )
+        };
+        let unindexed = all_edits(
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input(),
+        );
+        assert_eq!(unindexed.0.len(), 4, "{:?}", unindexed.0);
+
+        let store = crate::workspace::persist::tests::private_dir();
+        let (mut view, cache) = persisting_view(
+            &test_workspace(vec![root.clone()], WorkspaceOptions::default()),
+            store.path(),
+        );
+        let progress = advance(
+            &mut view,
+            &IndexAnchor::Document(uri.clone()),
+            IndexBound::all(),
+        );
+        assert!(progress.complete, "{progress:?}");
+        assert_eq!(progress.persisted, 8, "{progress:?}");
+        let input = view.analysis_input();
+        crate::workspace::rename::test_reset_workspace_snapshots();
+        let indexed = all_edits(input.clone());
+        assert_eq!(
+            crate::workspace::rename::test_indexed_snapshots(),
+            0,
+            "no edit used index selection"
+        );
+        assert_eq!(indexed, unindexed);
+        references_from_input(
+            input,
+            &uri,
+            Position::new(3, 2),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references");
+        assert_eq!(
+            crate::workspace::rename::test_indexed_snapshots(),
+            1,
+            "the same session's references do use the index"
+        );
+        cache.shutdown();
+    }
+
+    /// R9-8 (`.7` AC3): candidate trees past the admitted bytes are one
+    /// gap, never a location; a refused declaring unit fails the request
+    /// with a retryable error; rename keeps its strict walk.
+    #[test]
+    fn hydration_beyond_the_budget_is_a_gap_and_rename_stays_strict() {
+        use crate::project_cache::RETAINED_BYTES_PER_SOURCE_BYTE;
+        use crate::workspace::hydration::{HYDRATION_REFUSED, hydration_gap, test_set_limit};
+        struct Unlimited;
+        impl Drop for Unlimited {
+            fn drop(&mut self) {
+                test_set_limit(None);
+            }
+        }
+        let _unlimited = Unlimited;
+        let fixture = many_units(20, 0);
+        let shared = source_uri(&fixture.shared);
+        build_index_for(&fixture.input, &shared);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &shared,
+                Position::new(2, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+        };
+        let query_trees = || {
+            fixture
+                .input
+                .project_cache
+                .stats()
+                .reserved_query_trees_bytes
+        };
+        let walked = references().expect("references");
+        assert_eq!(query_trees(), 0, "released with the snapshot");
+        assert!(walked.coverage.is_complete(), "{:?}", walked.coverage);
+        assert_eq!(walked.value.len(), 21);
+        let walked = located(&walked.value);
+
+        let len = |path: &Path| fs::metadata(path).expect("source").len() as usize;
+        let shared_bytes = len(&fixture.shared) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        let importer_bytes = len(&fixture.importers[0]) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        test_set_limit(Some(shared_bytes + 5 * importer_bytes));
+        let partial = references().expect("a partial answer, not a refusal");
+        assert_eq!(query_trees(), 0, "released with the snapshot");
+        let found = located(&partial.value);
+        assert_eq!(found.len(), 6, "the declaring unit and 5 importers");
+        assert!(
+            found.iter().all(|location| walked.contains(location)),
+            "{found:?}"
+        );
+        let gap = hydration_gap(15);
+        assert!(
+            partial.coverage.gaps.iter().any(|g| g.reason == gap),
+            "{:?}",
+            partial.coverage
+        );
+
+        let rename = crate::workspace::rename::rename_from_input(
+            fixture.input.clone(),
+            &shared,
+            Position::new(2, 6),
+            "Renamed",
+            false,
+            &AtomicBool::new(false),
+        );
+        let edit = rename.value.expect("rename is a walk, never admitted");
+        let changes = edit.changes.expect("plain changes");
+        assert_eq!(
+            changes.len(),
+            21,
+            "never a partial edit: {:?}",
+            changes.keys()
+        );
+
+        test_set_limit(Some(shared_bytes - 1));
+        assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
+        assert_eq!(query_trees(), 0, "released by the refused request");
+    }
+
+    /// R9-8: the declaring unit is a required source although the request
+    /// comes from an importer; refused by the budget, it fails the request
+    /// with the retryable error instead of becoming a gap.
+    #[test]
+    fn a_refused_declaring_unit_fails_references_from_an_importer() {
+        use crate::project_cache::RETAINED_BYTES_PER_SOURCE_BYTE;
+        use crate::workspace::hydration::{HYDRATION_REFUSED, test_set_limit};
+        struct Unlimited;
+        impl Drop for Unlimited {
+            fn drop(&mut self) {
+                test_set_limit(None);
+            }
+        }
+        let _unlimited = Unlimited;
+        let fixture = many_units(1, 0);
+        // Larger than the importer, so a limit can admit only the importer.
+        fs::write(
+            &fixture.shared,
+            format!(
+                "unit Shared;\n{{{}}}\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+                "x".repeat(512)
+            ),
+        )
+        .expect("shared");
+        pascal_project::backdate_tree_for_test(fixture.shared.parent().expect("root"));
+        let importer = source_uri(&fixture.importers[0]);
+        build_index_for(&fixture.input, &importer);
+        let references = || {
+            references_from_input(
+                fixture.input.clone(),
+                &importer,
+                Position::new(6, 6),
+                true,
+                &AtomicBool::new(false),
+            )
+            .value
+        };
+        let len = |path: &Path| fs::metadata(path).expect("source").len() as usize;
+        let shared_bytes = len(&fixture.shared) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        let importer_bytes = len(&fixture.importers[0]) * RETAINED_BYTES_PER_SOURCE_BYTE;
+        assert!(importer_bytes < shared_bytes);
+
+        test_set_limit(Some(shared_bytes + importer_bytes));
+        let found = references().expect("both admitted");
+        assert!(found.coverage.is_complete(), "{:?}", found.coverage);
+        assert_eq!(found.value.len(), 2, "{:?}", found.value);
+
+        test_set_limit(Some(importer_bytes));
+        assert_eq!(references().map(|_| ()), Err(HYDRATION_REFUSED.to_owned()));
+        assert_eq!(
+            fixture
+                .input
+                .project_cache
+                .stats()
+                .reserved_query_trees_bytes,
+            0,
+            "released by the refused request"
+        );
+    }
+
+    /// `Shared` declares `SharedValue`, `Importer` uses it, and `Broken`
+    /// spells the name outside an include that does not resolve.
+    struct UnresolvedFixture {
+        _temp: TempDir,
+        shared: PathBuf,
+        importer: PathBuf,
+        broken: PathBuf,
+        input: WorkspaceInput,
+    }
+
+    fn unresolved_fixture(broken_text: &str) -> UnresolvedFixture {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let shared = root.join("Shared.pas");
+        let importer = root.join("Importer.pas");
+        let broken = root.join("Broken.pas");
+        fs::write(
+            &shared,
+            "unit Shared;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("shared");
+        fs::write(
+            &importer,
+            "unit Importer;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n",
+        )
+        .expect("importer");
+        fs::write(&broken, broken_text).expect("broken");
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        UnresolvedFixture {
+            _temp: temp,
+            shared,
+            importer,
+            broken,
+            input: workspace.analysis_input(),
+        }
+    }
+
+    const BROKEN_SPELLING_SHARED_VALUE: &str = "unit Broken;\ninterface\n{$I Missing.inc}\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+
+    fn unresolved_references(
+        fixture: &UnresolvedFixture,
+    ) -> crate::coverage::Partial<Vec<lsp_types::Location>> {
+        references_from_input(
+            fixture.input.clone(),
+            &source_uri(&fixture.shared),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references")
+    }
+
+    fn indexed_sources() -> Vec<PathBuf> {
+        let mut sources = crate::workspace::rename::test_take_indexed_sources();
+        sources.sort();
+        sources.dedup();
+        sources
+    }
+
+    fn has_unresolved_gap(coverage: &crate::coverage::Coverage, count: usize) -> bool {
+        let suffix = crate::workspace::indexing::unresolved_gap(count, "\0");
+        let (prefix, suffix) = suffix.split_once('\0').expect("display marker");
+        coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.reason.starts_with(prefix) && gap.reason.ends_with(suffix))
+    }
+
+    /// Characterization (l4d-zf1b.9 Task 5): before R9-4 the unchanged
+    /// member whose include does not resolve was read directly, and its
+    /// spelling of `SharedValue` (it never imports `Shared`) was no
+    /// reference; R9-4 leaves it unread, so the answer is the same.
+    #[test]
+    fn an_unresolved_include_member_read_directly_today_contributes_no_location() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        let partial = unresolved_references(&fixture);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.importer), 6, 6),
+                (source_uri(&fixture.shared), 2, 6),
+            ],
+            "{:?}",
+            partial
+        );
+    }
+
+    #[test]
+    fn an_unchanged_member_with_an_unresolved_include_is_a_gap_and_is_not_read() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        crate::workspace::rename::test_take_indexed_sources();
+        let partial = unresolved_references(&fixture);
+        assert_eq!(
+            located(&partial.value),
+            vec![
+                (source_uri(&fixture.importer), 6, 6),
+                (source_uri(&fixture.shared), 2, 6),
+            ],
+        );
+        let indexed = indexed_sources();
+        assert!(!indexed.contains(&fixture.broken), "{indexed:?}");
+        assert!(!partial.coverage.is_complete());
+        assert!(
+            has_unresolved_gap(&partial.coverage, 1),
+            "{:?}",
+            partial.coverage
+        );
+    }
+
+    #[test]
+    fn a_changed_member_with_an_unresolved_include_is_still_read() {
+        let fixture = unresolved_fixture(BROKEN_SPELLING_SHARED_VALUE);
+        build_index_for(&fixture.input, &source_uri(&fixture.shared));
+        fs::write(
+            &fixture.broken,
+            BROKEN_SPELLING_SHARED_VALUE.replace("Log(", "Log( "),
+        )
+        .expect("rewritten broken");
+        crate::workspace::rename::test_take_indexed_sources();
+        let partial = unresolved_references(&fixture);
+        let indexed = indexed_sources();
+        assert!(indexed.contains(&fixture.broken), "{indexed:?}");
+        assert!(
+            !has_unresolved_gap(&partial.coverage, 1),
+            "{:?}",
+            partial.coverage
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_skip_unresolved_include_members_the_same_way() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n"),
+            ),
+            (
+                "Broken.pas",
+                "unit Broken;\ninterface\n{$I Missing.inc}\nconst SharedValueToo = 2;\nimplementation\nend.\n"
+                    .to_owned(),
+            ),
+            ("Opened.pas", unit_text("Opened", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Shared.pas")));
+        reset_symbol_counters();
+        crate::workspace::rename::test_take_indexed_sources();
+        let found = symbols(&input, "SharedValue");
+        assert_eq!(
+            symbol_names(&found.value),
+            [("SharedValue".to_owned(), "Shared.pas".to_owned())]
+        );
+        assert_eq!(super::test_take_fact_symbols(), 1);
+        let indexed = indexed_sources();
+        assert!(!indexed.contains(&root.join("Broken.pas")), "{indexed:?}");
+        assert!(!found.coverage.is_complete());
+        assert!(
+            has_unresolved_gap(&found.coverage, 1),
+            "{:?}",
+            found.coverage
+        );
+    }
+
+    const LEXICAL_IMPORTER: &str = "unit Importer;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  Log(SharedValue);\nend;\nend.\n";
+
+    /// `Shared` (declaring `SharedValue`), `Importer` (using it), `Plain`
+    /// (never spelling it) and `extra`, with settled stamps.
+    fn lexical_workspace(extra: &[(&str, Vec<u8>)]) -> (TempDir, PathBuf, Workspace) {
+        let mut files = vec![
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n").into_bytes(),
+            ),
+            ("Importer.pas", LEXICAL_IMPORTER.as_bytes().to_vec()),
+            ("Plain.pas", unit_text("Plain", "").into_bytes()),
+        ];
+        files.extend(extra.iter().cloned());
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        for (name, bytes) in &files {
+            fs::write(root.join(name), bytes).expect("source");
+        }
+        pascal_project::backdate_tree_for_test(&root);
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        (temp, root, workspace)
+    }
+
+    /// A view of `workspace` (with a store under `store` when given) whose
+    /// index of the context owning `Shared.pas` is built, then `limited`
+    /// members made Limited and `open` opened.
+    fn limited_view(
+        workspace: &Workspace,
+        root: &Path,
+        store: Option<&Path>,
+        limited: &[&str],
+        open: &[&str],
+    ) -> (Workspace, Option<crate::persistent_cache::PersistentCache>) {
+        use crate::workspace::indexing::tests::advance;
+        use crate::workspace::indexing::tests::persisting::persisting_view;
+        let (mut view, cache) = match store {
+            Some(store) => {
+                let (view, cache) = persisting_view(workspace, store);
+                (view, Some(cache))
+            }
+            None => (
+                Workspace::from_analysis_input(&workspace.analysis_input()),
+                None,
+            ),
+        };
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let progress = advance(&mut view, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        let key = view
+            .index_context_for(&anchor, &AtomicBool::new(false))
+            .expect("context");
+        for name in limited {
+            view.project_cache
+                .limit_index_member(&key, &root.join(name));
+        }
+        for name in open {
+            open_source(&mut view, &root.join(name));
+        }
+        (view, cache)
+    }
+
+    fn lexical_references(
+        input: WorkspaceInput,
+        root: &Path,
+    ) -> crate::coverage::Partial<Vec<lsp_types::Location>> {
+        references_from_input(
+            input,
+            &source_uri(&root.join("Shared.pas")),
+            Position::new(2, 6),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("references")
+    }
+
+    /// R9-5, both persistence modes: a Limited member whose bytes cannot
+    /// hold `SharedValue` is not bound, and the answer is complete and the
+    /// walk's.
+    #[test]
+    fn a_limited_member_without_the_name_is_excluded_lexically() {
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&[]);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Plain.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                !indexed.contains(&root.join("Plain.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert!(
+                found.coverage.is_complete(),
+                "persist {persist}: {:?}",
+                found.coverage
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            assert_eq!(found.value.len(), 2, "persist {persist}");
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_limited_member_spelling_the_name_is_still_bound() {
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&[]);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Importer.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            crate::navigation::test_reset_bound_documents();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                indexed.contains(&root.join("Importer.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert!(
+                bound_documents().contains(&source_uri(&root.join("Importer.pas"))),
+                "persist {persist}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// A member saved as UTF-16 LE spelling `SharedValue` is read, as the
+    /// walk reads it; a symbol query for `Ärger` reads its unverified
+    /// member.
+    #[test]
+    fn non_ascii_names_and_utf16_files_are_never_excluded_lexically() {
+        let mut wide = vec![0xff, 0xfe];
+        wide.extend(
+            LEXICAL_IMPORTER
+                .replace("unit Importer", "unit Wide")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let extra = [
+            ("Wide.pas", wide),
+            (
+                "Umlaut.pas",
+                unit_text("Umlaut", "const Ärger = 1;\n").into_bytes(),
+            ),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let walked_symbols = {
+                let mut open = lexical_workspace_closed(&root);
+                open_source(&mut open, &root.join("Opened.pas"));
+                symbols(&open.analysis_input(), "Ärger")
+            };
+            // The source store refuses UTF-16 (a coverage gap of the walk
+            // too), so what R9-5 must keep is the read, not a location.
+            let utf16_gap = |coverage: &crate::coverage::Coverage| {
+                coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.reason.contains("Wide.pas uses unsupported UTF-16LE"))
+            };
+            assert!(utf16_gap(&walked.coverage), "{:?}", walked.coverage);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Wide.pas", "Umlaut.pas"],
+                &["Opened.pas"],
+            );
+            let input = view.analysis_input();
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(input.clone(), &root);
+            assert!(
+                indexed_sources().contains(&root.join("Wide.pas")),
+                "persist {persist}"
+            );
+            assert!(
+                utf16_gap(&found.coverage),
+                "persist {persist}: {:?}",
+                found.coverage
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&input, "Ärger");
+            assert!(
+                indexed_sources().contains(&root.join("Umlaut.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked_symbols.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// `limited_view` whose `retrying` members retry a previous refusal.
+    fn retrying_view(
+        workspace: &Workspace,
+        root: &Path,
+        store: Option<&Path>,
+        retrying: &[&str],
+        open: &[&str],
+    ) -> (Workspace, Option<crate::persistent_cache::PersistentCache>) {
+        let (mut view, cache) = limited_view(workspace, root, store, &[], open);
+        let anchor = IndexAnchor::Document(source_uri(&root.join("Shared.pas")));
+        let key = view
+            .index_context_for(&anchor, &AtomicBool::new(false))
+            .expect("context");
+        for name in retrying {
+            let path = root.join(name);
+            view.project_cache.mark_index_stale(&key, &path);
+            view.project_cache.defer_index_member(
+                &key,
+                &path,
+                crate::workspace_index::RETRYING_REFUSAL,
+            );
+        }
+        (view, cache)
+    }
+
+    const GUARDED: &str = "unit Guarded;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n";
+
+    /// R9-5 amended, both persistence modes: a retrying member whose text
+    /// and resolved include cannot hold `SharedValue` is not bound, and the
+    /// answer is the walk's.
+    #[test]
+    fn a_retrying_member_whose_includes_cannot_hold_the_name_is_excluded() {
+        let extra = [
+            ("Guarded.pas", GUARDED.as_bytes().to_vec()),
+            (
+                "Defs.inc",
+                b"{$DEFINE GUARDED}\n// GetSharedValue\n".to_vec(),
+            ),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            let indexed = indexed_sources();
+            assert!(
+                !indexed.contains(&root.join("Guarded.pas")),
+                "persist {persist}: {indexed:?}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            assert_eq!(found.value.len(), 2, "persist {persist}");
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// The name is spelled only in the include: the member is bound and the
+    /// location in the include is the walk's.
+    #[test]
+    fn a_name_spelled_only_in_an_include_keeps_the_member_bound() {
+        let extra = [
+            (
+                "Spelled.pas",
+                b"unit Spelled;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n{$I Body.inc}\nend;\nend.\n"
+                    .to_vec(),
+            ),
+            ("Body.inc", b"  Log(SharedValue);\n".to_vec()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = lexical_references(workspace.analysis_input(), &root);
+            assert!(
+                walked
+                    .value
+                    .iter()
+                    .any(|location| location.uri == source_uri(&root.join("Body.inc"))),
+                "{:?}",
+                walked.value
+            );
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Spelled.pas"],
+                &[],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = lexical_references(view.analysis_input(), &root);
+            assert!(
+                indexed_sources().contains(&root.join("Spelled.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                located(&found.value),
+                located(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Workspace symbols read raw text without expanding includes, so a
+    /// retrying member with an include whose raw text lacks a query piece
+    /// is not read, and the answer is the walk's.
+    #[test]
+    fn workspace_symbols_exclude_a_member_with_includes_by_its_raw_text() {
+        let extra = [
+            ("Guarded.pas", GUARDED.as_bytes().to_vec()),
+            ("Defs.inc", b"const DialogsValue = 1;\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = symbols(&workspace.analysis_input(), "DialogsValue");
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&view.analysis_input(), "DialogsValue");
+            assert!(
+                !indexed_sources().contains(&root.join("Guarded.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Task 8d Part 3, both persistence modes: a retrying member the
+    /// symbol read parses keeps its symbol list with the context index;
+    /// the next request reads the member again but does not parse it, and
+    /// answers exactly as the parse did, for another query too. A same-size
+    /// rewrite keeping the modification time is parsed again (A7).
+    #[test]
+    fn a_read_members_symbol_list_is_reused_and_a_same_size_rewrite_is_parsed_again() {
+        use crate::workspace::persist::acceptance::rewrite_keeping_the_stamp;
+        let guarded = GUARDED.replace(
+            "interface\n",
+            "interface\nconst GuardedValue = 1;\ntype TGuardedThing = class procedure GuardedRun; end;\n",
+        );
+        let extra = [
+            ("Guarded.pas", guarded.clone().into_bytes()),
+            ("Defs.inc", b"{$DEFINE GUARDED}\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            let parsed = |query: &str| {
+                crate::navigation::test_reset_document_parse_count();
+                let found = symbols(&view.analysis_input(), query);
+                (found.value, crate::navigation::test_document_parse_count())
+            };
+            let (first, first_parses) = parsed("Guarded");
+            assert!(first.len() >= 3, "persist {persist}: {first:?}");
+            let (second, second_parses) = parsed("Guarded");
+            assert_eq!(second, first, "persist {persist}");
+            assert_eq!(second_parses + 1, first_parses, "persist {persist}");
+            let (run, run_parses) = parsed("GuardedRun");
+            assert_eq!(
+                symbol_names(&run),
+                [("GuardedRun".to_owned(), "Guarded.pas".to_owned())]
+            );
+            assert_eq!(run_parses, second_parses, "persist {persist}");
+
+            let path = root.join("Guarded.pas");
+            rewrite_keeping_the_stamp(
+                &path,
+                guarded.replace("GuardedRun", "GuardedRUX").as_bytes(),
+            );
+            let (edited, edited_parses) = parsed("GuardedRUX");
+            assert_eq!(
+                symbol_names(&edited),
+                [("GuardedRUX".to_owned(), "Guarded.pas".to_owned())],
+                "persist {persist}"
+            );
+            assert_eq!(edited_parses, first_parses, "persist {persist}");
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Task 8d fix round 1: a walk answering several sources from kept
+    /// symbol lists answers exactly as the direct read, order included.
+    #[test]
+    fn a_walk_answering_from_symbol_lists_keeps_the_direct_reads_order() {
+        let names = ["GuardA", "GuardB", "GuardC", "GuardD", "GuardE", "GuardF"];
+        let mut extra = names
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    unit_text(
+                        name,
+                        &format!("const {name}Value = 1;\nconst {name}Other = 2;\n"),
+                    )
+                    .into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        extra.push(("Opened", unit_text("Opened", "").into_bytes()));
+        let files = extra
+            .iter()
+            .map(|(name, bytes)| (format!("{name}.pas"), bytes.clone()))
+            .collect::<Vec<_>>();
+        let extra = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect::<Vec<_>>();
+        let (_temp, root, workspace) = lexical_workspace(&extra);
+        crate::navigation::test_reset_document_parse_count();
+        let walked = symbols(&workspace.analysis_input(), "Guard");
+        let walked_parses = crate::navigation::test_document_parse_count();
+        assert!(walked.value.len() >= 12, "{:?}", walked.value);
+        let retrying = files[..names.len()]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let (mut view, _) = retrying_view(&workspace, &root, None, &retrying, &["Opened.pas"]);
+        // The indexed read keeps the lists; the walk then answers from them.
+        symbols(&view.analysis_input(), "Guard");
+        view.close_document(&source_uri(&root.join("Opened.pas")));
+        crate::navigation::test_reset_document_parse_count();
+        let listed = symbols(&view.analysis_input(), "Guard");
+        assert!(
+            crate::navigation::test_document_parse_count() + names.len() <= walked_parses,
+            "the lists were not used"
+        );
+        assert_eq!(listed.value, walked.value);
+    }
+
+    #[test]
+    fn workspace_symbols_still_read_when_the_raw_text_holds_the_query_piece() {
+        let extra = [
+            (
+                "Guarded.pas",
+                GUARDED
+                    .replace("interface\n", "interface\nconst GuardedValue = 1;\n")
+                    .into_bytes(),
+            ),
+            ("Defs.inc", b"{$DEFINE GUARDED}\n".to_vec()),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, workspace) = lexical_workspace(&extra);
+            let walked = symbols(&workspace.analysis_input(), "GuardedValue");
+            assert_eq!(
+                symbol_names(&walked.value),
+                [("GuardedValue".to_owned(), "Guarded.pas".to_owned())]
+            );
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = retrying_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Guarded.pas"],
+                &["Opened.pas"],
+            );
+            crate::workspace::rename::test_take_indexed_sources();
+            let found = symbols(&view.analysis_input(), "GuardedValue");
+            assert!(
+                indexed_sources().contains(&root.join("Guarded.pas")),
+                "persist {persist}"
+            );
+            assert_eq!(
+                symbol_names(&found.value),
+                symbol_names(&walked.value),
+                "persist {persist}"
+            );
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    /// Workspace symbols match a substring of the display: a dotted unit
+    /// name and a method (display `Bar`, owner `TFoo`) held by Limited
+    /// members are found for every query the walk answers, while a member
+    /// lacking a query piece is not read.
+    #[test]
+    fn workspace_symbols_never_exclude_a_member_spelling_a_matching_display() {
+        let extra = [
+            (
+                "Vcl.Forms.pas",
+                "unit Vcl.Forms;\ninterface\nimplementation\nend.\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "Methods.pas",
+                unit_text(
+                    "Methods",
+                    "type\n  TFoo = class\n    procedure Bar;\n  end;\n",
+                )
+                .replace(
+                    "implementation\n",
+                    "implementation\nprocedure TFoo.Bar;\nbegin\nend;\n",
+                )
+                .into_bytes(),
+            ),
+            ("Opened.pas", unit_text("Opened", "").into_bytes()),
+        ];
+        for persist in [false, true] {
+            let (_temp, root, mut workspace) = lexical_workspace(&extra);
+            open_source(&mut workspace, &root.join("Opened.pas"));
+            let walk_input = workspace.analysis_input();
+            let queries = ["vcl.forms", "forms", "bar", "TFoo", "foo.bar"];
+            let walked = queries.map(|query| symbol_names(&symbols(&walk_input, query).value));
+            assert!(walked[0].contains(&("Vcl.Forms".to_owned(), "Vcl.Forms.pas".to_owned())));
+            assert!(walked[1].contains(&("Vcl.Forms".to_owned(), "Vcl.Forms.pas".to_owned())));
+            assert!(
+                walked[2]
+                    .iter()
+                    .any(|(name, file)| name == "Bar" && file == "Methods.pas")
+            );
+            let workspace = lexical_workspace_closed(&root);
+            let store = crate::workspace::persist::tests::private_dir();
+            let (view, cache) = limited_view(
+                &workspace,
+                &root,
+                persist.then(|| store.path()),
+                &["Vcl.Forms.pas", "Methods.pas", "Plain.pas"],
+                &["Opened.pas"],
+            );
+            let input = view.analysis_input();
+            for (query, walked) in queries.iter().zip(&walked) {
+                crate::workspace::rename::test_take_indexed_sources();
+                let found = symbols(&input, query);
+                let mut names = symbol_names(&found.value);
+                let mut walked = walked.clone();
+                names.sort();
+                walked.sort();
+                assert_eq!(names, walked, "persist {persist}: {query}");
+                assert!(
+                    !indexed_sources().contains(&root.join("Plain.pas")),
+                    "persist {persist}: {query}"
+                );
+            }
+            if let Some(cache) = cache {
+                cache.shutdown();
+            }
+        }
+    }
+
+    fn lexical_workspace_closed(root: &Path) -> Workspace {
+        test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default())
+    }
+
     #[test]
     fn references_on_an_unindexed_context_search_unverified_members_directly() {
         let fixture = query_fixture();
@@ -4248,8 +5719,8 @@ mod tests {
 
     /// l4d-jeh4: 300 unverified units that never mention the name sort
     /// before the 20 importers that do. References read at most the
-    /// interactive bound directly, the members that spell the name first,
-    /// and report the rest as a gap; rename keeps the complete walk.
+    /// interactive bound directly; since R9-5 the 300 are excluded by their
+    /// bytes, so every importer is read; rename keeps the complete walk.
     #[test]
     fn references_read_a_bounded_set_of_unverified_members_likely_ones_first() {
         let temp = tempfile::tempdir().expect("temporary workspace");
@@ -4295,17 +5766,9 @@ mod tests {
         );
         let partial = computed.value.expect("a partial result, not a refusal");
         assert_eq!(crate::workspace::rename::test_indexed_snapshots(), 1);
-        let bound = crate::workspace::indexing::MAX_INTERACTIVE_UNVERIFIED_CANDIDATES;
-        assert!(
-            partial.coverage.gaps.iter().any(|gap| gap.reason
-                == format!(
-                    "{} units of {} are not indexed yet; {bound} were searched directly",
-                    321 - bound,
-                    shared.display()
-                )),
-            "{:?}",
-            partial.coverage
-        );
+        // R9-5: the 300 never spell the name, so their bytes prove them
+        // absent and the bound reads every importer: no gap is left.
+        assert!(partial.coverage.is_complete(), "{:?}", partial.coverage);
         let mut expected = importers
             .iter()
             .map(|path| (source_uri(path), 6, 6))
@@ -5642,6 +7105,342 @@ mod tests {
         assert_eq!(symbol.location.range.start, Position::new(1, 2));
         assert_eq!(symbol.container_name.as_deref(), Some("Provider"));
         assert_eq!(super::test_take_fact_symbols(), 1);
+    }
+
+    /// D49: an open, unchanged document is answered from the session's
+    /// parse, include and all; the second request parses nothing.
+    #[test]
+    fn workspace_symbols_of_an_unchanged_open_document_reuse_its_parse() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Opened.pas",
+                "unit Opened;\ninterface\n{$I Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n"
+                    .to_owned(),
+            ),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            ("Closed.pas", unit_text("Closed", "const ClosedValue = 3;\n")),
+        ]);
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        let first = symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let second = symbols(&input, "Value");
+        assert_eq!(second.value, first.value);
+        assert!(
+            symbol_names(&second.value)
+                .contains(&("OpenedValue".to_owned(), "Opened.pas".to_owned())),
+            "{:?}",
+            second.value
+        );
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "the open document's parse is reused"
+        );
+        let included = second
+            .value
+            .iter()
+            .find(|symbol| symbol.name == "IncludedValue")
+            .expect("the include's declaration is listed");
+        assert_eq!(included.location.uri, source_uri(&root.join("Decls.inc")));
+        assert_eq!(included.location.range.start, Position::new(1, 2));
+        // The include text the answer used is recorded as read from disk.
+        let computed = workspace_symbols_from_input(input, "Value", &AtomicBool::new(false));
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == source_uri(&root.join("Decls.inc"))
+                    && !record.open
+                    && record.stamp.is_some()
+                    && record.content_hash.is_some()),
+            "{:?}",
+            computed.records
+        );
+    }
+
+    const OPENED_WITH_INCLUDE: &str =
+        "unit Opened;\ninterface\n{$I Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n";
+
+    fn include_files() -> Vec<(&'static str, String)> {
+        vec![
+            ("Opened.pas", OPENED_WITH_INCLUDE.to_owned()),
+            ("Decls.inc", "const\n  IncludedValue = 2;\n".to_owned()),
+            (
+                "Closed.pas",
+                unit_text("Closed", "const ClosedValue = 3;\n"),
+            ),
+        ]
+    }
+
+    /// D49: an open document lists its include's declarations at the
+    /// include file, exactly as the same unit closed lists them from facts.
+    #[test]
+    fn an_open_document_lists_its_include_declarations_as_when_closed() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Closed.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Opened.pas")));
+        reset_symbol_counters();
+        let closed = symbols(&input, "IncludedValue");
+        assert_eq!(super::test_take_fact_symbols(), 1, "{:?}", closed.value);
+
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        reset_symbol_counters();
+        let open = symbols(&input, "IncludedValue");
+        assert_eq!(super::test_take_fact_symbols(), 0);
+        assert_eq!(open.value.len(), 1, "{:?}", open.value);
+        let located = |found: &[lsp_types::SymbolInformation]| {
+            found
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.name.clone(),
+                        symbol.kind,
+                        symbol
+                            .location
+                            .uri
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .map(str::to_owned),
+                        symbol.location.range,
+                        symbol.container_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(located(&open.value), located(&closed.value));
+    }
+
+    /// A4: an open buffer that differs from disk is answered from its own
+    /// text; the reused parse answers only the buffer it was made from.
+    #[test]
+    fn workspace_symbols_of_an_edited_open_document_follow_its_buffer() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        let opened = root.join("Opened.pas");
+        let uri = source_uri(&opened);
+        let edited =
+            OPENED_WITH_INCLUDE.replace("interface\n", "interface\nconst BufferValue = 5;\n");
+        workspace
+            .open_document(uri.clone(), edited.clone(), 1)
+            .expect("open source");
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        let at = |found: &crate::coverage::Partial<Vec<lsp_types::SymbolInformation>>,
+                  name: &str| {
+            found
+                .value
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| (symbol.location.uri.clone(), symbol.location.range.start))
+        };
+        assert_eq!(
+            at(&found, "BufferValue"),
+            Some((uri.clone(), Position::new(2, 6)))
+        );
+        assert_eq!(
+            at(&found, "OpenedValue"),
+            Some((uri.clone(), Position::new(4, 6)))
+        );
+        assert_eq!(
+            at(&found, "IncludedValue"),
+            Some((source_uri(&root.join("Decls.inc")), Position::new(1, 2)))
+        );
+
+        // A buffer the parse was not made from is parsed as it is.
+        let mut changed = input.clone();
+        let renamed = edited.replace("BufferValue", "RenamedValue");
+        changed.overlays.get_mut(&uri).expect("overlay").text = renamed.into();
+        let found = symbols(&changed, "Value");
+        assert_eq!(at(&found, "BufferValue"), None, "{:?}", found.value);
+        assert_eq!(at(&found, "RenamedValue"), Some((uri, Position::new(2, 6))));
+    }
+
+    /// An include edited on disk since the session expanded the document
+    /// no longer proves the reused parse: the buffer is parsed as it is.
+    #[test]
+    fn an_include_changed_on_disk_refuses_the_reused_parse() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        fs::write(root.join("Decls.inc"), "const\n  ChangedValue = 2;\n").expect("include");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "the buffer is parsed"
+        );
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("ClosedValue".to_owned(), "Closed.pas".to_owned()),
+                ("OpenedValue".to_owned(), "Opened.pas".to_owned()),
+            ]
+        );
+    }
+
+    /// A declaration the reused parse maps into a file the request may not
+    /// read is not listed.
+    #[test]
+    fn a_reused_parse_lists_no_declaration_of_an_unreadable_include() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("ws");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(temp.path().join("outside")).expect("outside");
+        fs::write(
+            root.join("Opened.pas"),
+            "unit Opened;\ninterface\n{$I ../outside/Decls.inc}\nconst OpenedValue = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+        fs::write(
+            temp.path().join("outside/Decls.inc"),
+            "const\n  IncludedValue = 2;\n",
+        )
+        .expect("include");
+        fs::write(
+            root.join("Closed.pas"),
+            unit_text("Closed", "const ClosedValue = 3;\n"),
+        )
+        .expect("source");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let uri = open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        assert!(
+            input
+                .cached_documents
+                .get(&uri)
+                .is_some_and(|cached| cached.projection.is_some()),
+            "the fixture must reuse an expanded parse"
+        );
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        assert_eq!(
+            symbol_names(&found.value),
+            [
+                ("ClosedValue".to_owned(), "Closed.pas".to_owned()),
+                ("OpenedValue".to_owned(), "Opened.pas".to_owned()),
+            ]
+        );
+    }
+
+    /// An open include is proved by its buffer, and the answer records it
+    /// as open.
+    #[test]
+    fn an_open_include_is_proved_by_its_buffer() {
+        let (_temp, root, mut workspace) = symbol_workspace(&include_files());
+        let include = source_uri(&root.join("Decls.inc"));
+        workspace
+            .open_document(
+                include.clone(),
+                "const\n  BufferedValue = 2;\n".to_owned(),
+                1,
+            )
+            .expect("open include");
+        open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        symbols(&input, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let computed = workspace_symbols_from_input(input, "Value", &AtomicBool::new(false));
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        let found = computed.value.expect("workspace symbols");
+        assert!(
+            found
+                .value
+                .iter()
+                .any(|symbol| symbol.name == "BufferedValue"
+                    && symbol.location.uri == include
+                    && symbol.location.range.start == Position::new(1, 2)),
+            "{:?}",
+            found.value
+        );
+        assert!(
+            computed
+                .records
+                .iter()
+                .any(|record| record.uri == include && record.open),
+            "{:?}",
+            computed.records
+        );
+    }
+
+    /// A declaration of the reused parse that spans the include has no
+    /// single physical position: the document is answered from its buffer,
+    /// as without the reuse.
+    #[test]
+    fn an_unmapped_declaration_falls_back_to_the_buffer_parse() {
+        let opened_text =
+            "unit Opened;\ninterface\nconst SpanValue = {$I Val.inc};\nimplementation\nend.\n";
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            ("Opened.pas", opened_text.to_owned()),
+            ("Val.inc", "7".to_owned()),
+            (
+                "Closed.pas",
+                unit_text("Closed", "const ClosedValue = 3;\n"),
+            ),
+        ]);
+        let uri = open_source(&mut workspace, &root.join("Opened.pas"));
+        let input = workspace.analysis_input();
+        assert!(
+            input
+                .cached_documents
+                .get(&uri)
+                .is_some_and(|cached| cached.projection.is_some()),
+            "the fixture must reuse an expanded parse"
+        );
+        build_index_for(&input, &source_uri(&root.join("Closed.pas")));
+        let mut without = input.clone();
+        without.cached_documents.remove(&uri);
+        let expected = symbols(&without, "Value");
+        crate::navigation::test_reset_document_parse_count();
+        let found = symbols(&input, "Value");
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            1,
+            "the buffer is parsed"
+        );
+        assert_eq!(found.value, expected.value);
+    }
+
+    /// R9-11: a unit is listed from the facts as a module.
+    #[test]
+    fn workspace_symbols_list_units_from_facts() {
+        let (_temp, root, mut workspace) = symbol_workspace(&[
+            (
+                "Shared.pas",
+                unit_text("Shared", "const SharedValue = 1;\n"),
+            ),
+            ("Consumer.pas", unit_text("Consumer", "")),
+        ]);
+        open_source(&mut workspace, &root.join("Consumer.pas"));
+        let input = workspace.analysis_input();
+        build_index_for(&input, &source_uri(&root.join("Shared.pas")));
+        reset_symbol_counters();
+        let found = symbols(&input, "Shared");
+        assert!(
+            found.value.iter().any(|symbol| symbol.name == "Shared"
+                && symbol.kind == lsp_types::SymbolKind::MODULE
+                && symbol.location.uri == source_uri(&root.join("Shared.pas"))),
+            "{:?}",
+            found.value
+        );
+        assert!(super::test_take_fact_symbols() >= 1);
+        assert_eq!(walks(), 0);
     }
 
     #[test]

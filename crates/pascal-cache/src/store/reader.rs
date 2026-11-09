@@ -115,6 +115,9 @@ pub struct ArtifactReader<'a> {
     content_bytes: u64,
     hasher: FactHasher,
     state: State,
+    /// The last batch's query ran out of rows: it read every row at or
+    /// past its start in its transaction, so none lies past the count.
+    exhausted: bool,
 }
 
 impl Store {
@@ -126,6 +129,7 @@ impl Store {
             next_ordinal: 0,
             content_bytes: 0,
             state: State::Reading,
+            exhausted: false,
         }
     }
 
@@ -163,9 +167,10 @@ impl ArtifactReader<'_> {
         ensure_live(&transaction, scope)?;
         let found: Option<i64> = transaction
             .query_row(
-                "SELECT 1 FROM artifact_rows \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3 AND ordinal >= ?4 \
-                 LIMIT 1",
+                "SELECT 1 FROM artifacts a CROSS JOIN artifact_rows r \
+                 ON r.artifact_ref = a.artifact_ref \
+                 WHERE a.namespace_id = ?1 AND a.reset_epoch = ?2 AND a.artifact_id = ?3 \
+                 AND r.ordinal >= ?4 LIMIT 1",
                 params![
                     scope.namespace.as_bytes().as_slice(),
                     epoch(scope),
@@ -197,7 +202,9 @@ impl ArtifactReader<'_> {
             State::Reading => {}
         }
         if self.next_ordinal == self.header.row_count {
-            if let Some(miss) = self.trailing_rows()? {
+            if !self.exhausted
+                && let Some(miss) = self.trailing_rows()?
+            {
                 return self.fail(miss);
             }
             if self.content_bytes == self.header.content_bytes
@@ -221,37 +228,38 @@ impl ArtifactReader<'_> {
         let mut reader = store.reader()?;
         let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
         ensure_live(&transaction, scope)?;
-        // GC between batches is a miss, never a silent gap (spec §9).
-        let lifecycle: Option<i64> = transaction
+        // GC between batches is a miss, never a silent gap (spec §9). The
+        // rows are found through the header's surrogate, resolved in the
+        // batch's own transaction: surrogates are never reused, and the fact
+        // checksum binds the artifact ID and each ordinal, so rows of
+        // another artifact, or out of place, could not verify anyway.
+        let header: Option<(i64, i64)> = transaction
             .query_row(
-                "SELECT lifecycle FROM artifacts \
+                "SELECT artifact_ref, lifecycle FROM artifacts \
                  WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3",
                 params![
                     scope.namespace.as_bytes().as_slice(),
                     epoch(scope),
                     artifact_id.as_bytes().as_slice()
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| classify(&error))?;
-        match lifecycle {
+        let artifact_ref = match header {
             None => return self.fail(Miss::Vanished),
-            Some(1) => {}
+            Some((artifact_ref, 1)) => artifact_ref,
             Some(_) => return self.fail(Miss::Retired),
-        }
+        };
         let mut statement = transaction
             .prepare_cached(
-                "SELECT ordinal, row_kind, index_key, payload, row_checksum FROM artifact_rows \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND artifact_id = ?3 AND ordinal >= ?4 \
-                 ORDER BY ordinal LIMIT ?5",
+                "SELECT ordinal, row_kind, index_key, payload FROM artifact_rows \
+                 WHERE artifact_ref = ?1 AND ordinal >= ?2 ORDER BY ordinal LIMIT ?3",
             )
             .map_err(|error| classify(&error))?;
         let mut rows = statement
             .query(params![
-                scope.namespace.as_bytes().as_slice(),
-                epoch(scope),
-                artifact_id.as_bytes().as_slice(),
+                artifact_ref,
                 self.next_ordinal as i64,
                 MAX_ROW_BATCH_ROWS as i64
             ])
@@ -264,6 +272,7 @@ impl ArtifactReader<'_> {
         let mut content_bytes = self.content_bytes;
         let mut batch = Vec::new();
         let mut bytes = 0usize;
+        let mut exhausted = false;
         let fault = store.take_row_fault();
         loop {
             if fault == Some(batch.len()) {
@@ -273,7 +282,10 @@ impl ArtifactReader<'_> {
             }
             let row = match rows.next() {
                 Ok(Some(row)) => row,
-                Ok(None) => break,
+                Ok(None) => {
+                    exhausted = batch.len() < MAX_ROW_BATCH_ROWS;
+                    break;
+                }
                 Err(error) => return classify_read(&error).and_then(|miss| self.fail(miss)),
             };
             // Borrow the values in place, so an oversized row is refused
@@ -284,10 +296,9 @@ impl ArtifactReader<'_> {
                     row.get::<_, i64>(1)?,
                     row.get_ref(2)?.as_blob_or_null()?,
                     row.get_ref(3)?.as_blob()?,
-                    row.get_ref(4)?.as_blob()?,
                 ))
             })();
-            let (ordinal, row_kind, index_key, payload, checksum) = match decoded {
+            let (ordinal, row_kind, index_key, payload) = match decoded {
                 Ok(values) => values,
                 Err(error) => return classify_read(&error).and_then(|miss| self.fail(miss)),
             };
@@ -304,7 +315,7 @@ impl ArtifactReader<'_> {
             if bytes + size > MAX_ROW_BATCH_BYTES {
                 break;
             }
-            let computed = hash_row(
+            hash_row(
                 &mut hasher,
                 artifact_id,
                 next_ordinal,
@@ -312,9 +323,6 @@ impl ArtifactReader<'_> {
                 index_key,
                 payload,
             );
-            if computed.as_bytes().as_slice() != checksum {
-                return self.fail(Miss::ChecksumMismatch);
-            }
             bytes += size;
             content_bytes += size as u64;
             batch.push(StoredRow {
@@ -336,6 +344,7 @@ impl ArtifactReader<'_> {
         self.hasher = hasher;
         self.next_ordinal = next_ordinal;
         self.content_bytes = content_bytes;
+        self.exhausted = exhausted;
         Ok(Lookup::Hit(Some(RowBatch {
             rows: batch,
             _scratch: scratch,

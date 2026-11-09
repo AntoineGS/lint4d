@@ -14,7 +14,6 @@
 //! [`PersistentCache::reconfigure`], [`PersistentCache::readmit`] and
 //! [`PersistentCache::shutdown`] (the main loop) never hold a [`CacheJob`]:
 //! the wait would wait for itself, which is why every wait is bounded.
-#![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod counters;
 pub(crate) mod exclusion;
@@ -87,11 +86,37 @@ pub(super) struct Inner {
     /// `false` only in unit tests, which step maintenance by hand (Task 6
     /// honours it).
     schedule_maintenance: bool,
+    /// A wake is on its way to the worker (one at a time).
+    wake_pending: AtomicBool,
     /// Kept apart from `Shared` (which holds the command sender) so
     /// `shutdown` joins with no lock held.
     join: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     open_hook: Mutex<Option<OpenHook>>,
+    /// Jobs this handle admitted (a handle-local count of store work).
+    #[cfg(test)]
+    jobs_issued: std::sync::atomic::AtomicUsize,
+    /// Test seams for index batches under store pressure (Task 11).
+    #[cfg(test)]
+    seams: Mutex<IndexSeams>,
+}
+
+#[cfg(test)]
+pub(crate) type PublishFault = Box<dyn FnMut(&std::path::Path) -> Option<Bypass> + Send>;
+
+/// What an index batch sees instead of the store, in tests.
+#[cfg(test)]
+#[derive(Default)]
+struct IndexSeams {
+    /// The store's pressure, given the waits so far.
+    pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
+    /// A bypass for the publication of an extracted member.
+    publish: Option<PublishFault>,
+    /// A bypass for the publication of a member's record, after its
+    /// artifact was published or found.
+    record: Option<PublishFault>,
+    /// `await_maintenance` calls.
+    waits: u64,
 }
 
 /// Test seam: the worker sends on the first and blocks on the second after
@@ -121,6 +146,12 @@ pub(super) struct Shared {
     shut_down: bool,
     commands: Option<crossbeam_channel::Sender<worker::Command>>,
     worker_thread: Option<ThreadId>,
+    /// Maintenance steps the worker completed (any generation).
+    steps: u64,
+    /// Steps the worker began; each step is numbered by this count.
+    steps_begun: u64,
+    /// The number of the last step that completed.
+    last_step_done: u64,
     /// The last retry delay, doubled by each retried bypass.
     retry_delay: Option<Duration>,
     /// A retry due for the `Bypassed` state of this generation.
@@ -170,6 +201,9 @@ impl Shared {
             shut_down: false,
             commands: None,
             worker_thread: None,
+            steps: 0,
+            steps_begun: 0,
+            last_step_done: 0,
             retry_delay: None,
             retry: None,
             logged: [None; names::BYPASS_KINDS],
@@ -265,9 +299,14 @@ impl Inner {
             gate,
             namespace,
             schedule_maintenance,
+            wake_pending: AtomicBool::new(false),
             join: Mutex::new(None),
             #[cfg(test)]
             open_hook: Mutex::new(None),
+            #[cfg(test)]
+            jobs_issued: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            seams: Mutex::new(IndexSeams::default()),
         }
     }
 
@@ -383,6 +422,42 @@ impl Inner {
 
     /// Keep the worker's usage reading for the status, unless the
     /// generation moved on or left `Enabled` meanwhile.
+    /// Ask the worker for a scheduled step now: writes were refused for
+    /// room only maintenance makes (a checkpoint, reclaimed rows). Only
+    /// the cache's own schedule steps; without one this does nothing.
+    fn wake_maintenance(&self) {
+        if !self.schedule_maintenance || self.wake_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = self.lock();
+        // The worker's own step schedules its next one itself.
+        let sent = shared.worker_thread != Some(std::thread::current().id())
+            && shared
+                .commands
+                .as_ref()
+                .is_some_and(|commands| commands.send(worker::Command::Wake).is_ok());
+        drop(shared);
+        if !sent {
+            self.wake_pending.store(false, Ordering::Release);
+        }
+    }
+
+    /// A maintenance step begins; returns its number.
+    fn note_step_begun(&self) -> u64 {
+        let mut shared = self.lock();
+        shared.steps_begun += 1;
+        shared.steps_begun
+    }
+
+    /// Step `number` finished.
+    fn note_step(&self, number: u64) {
+        let mut shared = self.lock();
+        shared.steps += 1;
+        shared.last_step_done = shared.last_step_done.max(number);
+        drop(shared);
+        self.changed.notify_all();
+    }
+
     fn record_usage(&self, generation: u64, usage: status::UsageView) {
         let mut shared = self.lock();
         if shared.generation == generation && shared.state == CacheState::Enabled {
@@ -397,6 +472,8 @@ impl Inner {
         }
         let store = shared.store.clone()?;
         shared.active += 1;
+        #[cfg(test)]
+        self.jobs_issued.fetch_add(1, Ordering::Relaxed);
         Some(CacheJob {
             inner: Arc::clone(self),
             store: Some(store),
@@ -448,6 +525,9 @@ impl Inner {
         self.changed.notify_all();
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+const STEP_NOW_WAIT: Duration = Duration::from_secs(120);
 
 impl PersistentCache {
     pub(crate) fn start(
@@ -502,15 +582,108 @@ impl PersistentCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_pressure_for_test(
+        &self,
+        pressure: Option<Box<dyn FnMut(u64) -> pascal_cache::Pressure + Send>>,
+    ) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).pressure = pressure;
+        }
+    }
+
+    /// The pressure the seam reports, if one is set.
+    #[cfg(test)]
+    pub(crate) fn pressure_for_test(&self) -> Option<pascal_cache::Pressure> {
+        let inner = self.inner.as_ref()?;
+        let mut seams = lock(&inner.seams);
+        let waits = seams.waits;
+        seams.pressure.as_mut().map(|pressure| pressure(waits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_publish_fault_for_test(&self, fault: Option<PublishFault>) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).publish = fault;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_record_fault_for_test(&self, fault: Option<PublishFault>) {
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).record = fault;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
+        let inner = self.inner.as_ref()?;
+        lock(&inner.seams)
+            .record
+            .as_mut()
+            .and_then(|fault| fault(path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_fault_for_test(&self, path: &std::path::Path) -> Option<Bypass> {
+        let inner = self.inner.as_ref()?;
+        lock(&inner.seams)
+            .publish
+            .as_mut()
+            .and_then(|fault| fault(path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn room_waits_for_test(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| lock(&inner.seams).waits)
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_worker_for_test(&self) -> bool {
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.lock().commands.is_some())
     }
 
+    /// Wait at most `timeout` while the state is `Opening` or `Fencing`,
+    /// returning early once `cancel` is set; returns the state.
+    pub(crate) fn wait_settled(&self, timeout: Duration, cancel: &AtomicBool) -> CacheState {
+        const SLICE: Duration = Duration::from_millis(25);
+        let Some(inner) = &self.inner else {
+            return CacheState::Disabled;
+        };
+        let unsettled =
+            |shared: &Shared| matches!(shared.state, CacheState::Opening | CacheState::Fencing);
+        let deadline = Instant::now() + timeout;
+        let mut shared = inner.lock();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !unsettled(&shared) || left.is_zero() || cancel.load(Ordering::Relaxed) {
+                return shared.state.clone();
+            }
+            shared = inner.wait_while(shared, left.min(SLICE), unsettled);
+        }
+    }
+
     /// A job while `Enabled`; `None` otherwise (and always when inert).
     pub(crate) fn job(&self) -> Option<CacheJob> {
         self.inner.as_ref()?.job()
+    }
+
+    /// Whether `job` would admit one now; no job is taken.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.lock().state == CacheState::Enabled)
+    }
+
+    /// The jobs this handle has admitted since it started.
+    #[cfg(test)]
+    pub(crate) fn jobs_issued_for_test(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.jobs_issued.load(Ordering::Relaxed))
     }
 
     /// Apply runtime options, waiting at most [`MAX_OPEN_WAIT`] for a
@@ -702,12 +875,14 @@ impl PersistentCache {
             .map_or(CacheState::Disabled, |inner| inner.lock().state.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.inner
             .as_ref()
             .map_or(0, |inner| inner.lock().generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> Option<&Counters> {
         self.inner.as_ref().map(|inner| &inner.counters)
     }
@@ -728,6 +903,8 @@ impl PersistentCache {
                     pages: 0,
                     scratch: 0,
                     facts: 0,
+                    publication: 0,
+                    query_trees: 0,
                 },
                 usage: None,
                 lock_waits,
@@ -752,6 +929,8 @@ impl PersistentCache {
                 pages: stats.reserved_pages_bytes,
                 scratch: stats.reserved_scratch_bytes,
                 facts: stats.reserved_facts_bytes,
+                publication: stats.reserved_publication_bytes,
+                query_trees: stats.reserved_query_trees_bytes,
             },
             usage: shared.usage.filter(|_| enabled),
             lock_waits,
@@ -760,7 +939,8 @@ impl PersistentCache {
     }
 
     /// Run one maintenance step on the worker, gate ignored. `None` without
-    /// a worker, without a job, or when no reply comes within 5 s.
+    /// a worker or without a job. The wait is a backstop against a dead
+    /// worker, long enough that a loaded machine never reaches it.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn step_now(&self) -> Option<worker::StepResult> {
         let inner = self.inner.as_ref()?;
@@ -771,7 +951,7 @@ impl PersistentCache {
             .as_ref()?
             .send(worker::Command::StepNow(reply))
             .ok()?;
-        result.recv_timeout(Duration::from_secs(5)).ok().flatten()
+        result.recv_timeout(STEP_NOW_WAIT).ok().flatten()
     }
 
     /// The scheduled step's path (gate check included, never waiting) on
@@ -780,6 +960,48 @@ impl PersistentCache {
     pub(crate) fn scheduled_step_for_test(&self) -> Option<worker::StepResult> {
         let inner = self.inner.as_ref()?;
         worker::scheduled_step(inner, &mut worker::new_cursor(), Duration::ZERO)
+    }
+
+    /// Wake the scheduled maintenance and wait at most `timeout` for its
+    /// next step to finish, calling `check` between waits (an `Err` ends
+    /// the wait with it). `Ok(false)` without a schedule or when no step
+    /// finished in time. The caller then reads the store's pressure.
+    pub(crate) fn await_maintenance(
+        &self,
+        timeout: Duration,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        const SLICE: Duration = Duration::from_millis(25);
+        #[cfg(test)]
+        if let Some(inner) = &self.inner {
+            lock(&inner.seams).waits += 1;
+        }
+        let Some(inner) = self
+            .inner
+            .as_ref()
+            .filter(|inner| inner.schedule_maintenance)
+        else {
+            return Ok(false);
+        };
+        // A step already running may have read the pressure before the
+        // refusal: only one that begins after the wake counts.
+        let before = inner.lock().steps_begun;
+        inner.wake_maintenance();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let shared = inner.wait_while(inner.lock(), left.min(SLICE), |shared| {
+                shared.last_step_done <= before && !shared.shut_down
+            });
+            if shared.last_step_done > before {
+                return Ok(true);
+            }
+            if shared.shut_down || left.is_zero() {
+                return Ok(false);
+            }
+            drop(shared);
+            check()?;
+        }
     }
 
     /// Wait while the state is `Opening` or `Fencing`; returns the state.
@@ -795,7 +1017,7 @@ impl PersistentCache {
     }
 
     /// Wait up to `timeout` for `predicate` to hold for the state.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn wait_for(
         &self,
         mut predicate: impl FnMut(&CacheState) -> bool,
@@ -870,6 +1092,11 @@ impl CacheJob {
     pub(crate) fn observe(&self, bypass: &Bypass) {
         if *bypass != Bypass::Fenced {
             self.inner.counters.record_bypass(bypass);
+            // Only maintenance makes this room: step soon, not at the next
+            // idle interval.
+            if matches!(bypass, Bypass::WalPressure | Bypass::OverBudget) {
+                self.inner.wake_maintenance();
+            }
             return;
         }
         let mut shared = self.inner.lock();

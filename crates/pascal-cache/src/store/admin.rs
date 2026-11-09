@@ -15,6 +15,7 @@ use super::maintenance::{Maintenance, StepBudget, StepReport};
 use super::outcome::{Bypass, LocationIssue};
 use super::sqlite::{begin, check_sqlite_version, classify, open_connection};
 use super::{Store, StoreLimits, unix_seconds};
+use super::{namespaces, retention};
 use crate::Namespace;
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
@@ -104,9 +105,37 @@ pub struct StatusReport {
     pub retired_namespaces: u64,
     pub retired_scopes: u64,
     pub live_leases: u64,
+    /// The live namespaces, the most recently used first, at most
+    /// [`MAX_LISTED_NAMESPACES`] (l4d-1ypi).
+    pub namespaces: Vec<NamespaceStatus>,
+    /// More live namespaces than are listed.
+    pub namespaces_truncated: bool,
     /// [`RecoveryAdvice::None`] for a healthy container; [`RecoveryAdvice::Prune`]
     /// when writes are refused for space.
     pub advice: RecoveryAdvice,
+}
+
+/// Live namespaces a status report lists.
+pub const MAX_LISTED_NAMESPACES: usize = 16;
+
+/// One live namespace of a store: one build's facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceStatus {
+    /// The namespace identity, derived from the build fingerprint.
+    pub id: crate::Digest,
+    pub reset_epoch: u64,
+    /// When a process last opened it, closed it or, while open, recorded
+    /// its use (once a minute); a future time reads as now. `None` without
+    /// a lock file.
+    pub last_used_unix_seconds: Option<u64>,
+    /// The size maintenance last estimated for this epoch (rows' content
+    /// plus `ROW_OVERHEAD_BYTES` per row); `None` until maintenance of
+    /// another process estimates it: a namespace is estimated only while
+    /// no process holds it.
+    pub estimated_bytes: Option<u64>,
+    /// A live process holds its lock, as retirement sees it (probed
+    /// without waiting).
+    pub held: bool,
 }
 
 fn unreadable(bypass: Bypass) -> StoreStatus {
@@ -130,8 +159,10 @@ fn database_exists(directory: &Path) -> Result<bool, Bypass> {
 
 /// Report the store in `directory`. An absent database is reported, not
 /// created. Otherwise one connection reads the existing file: no namespace
-/// is registered, no namespace lock is taken and no row is written (SQLite
-/// itself may create the `-wal` and `-shm` side files of a WAL database).
+/// is registered, no row is written (SQLite itself may create the `-wal`
+/// and `-shm` side files of a WAL database), and no namespace lock is
+/// waited for: each listed namespace's lock is probed once without waiting
+/// (`held`), and no lock file is created.
 /// An unreadable container is reported with its advice and left in place.
 pub fn status(directory: &Path) -> StoreStatus {
     super::count_operation();
@@ -167,6 +198,27 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
     let usage = read_usage_at(&location, &transaction)?;
     let pressure = pressure_of(policy.policy, &usage);
     let live_since = live_since(unix_seconds());
+    let ranked = retention::ranked_live(&transaction, &location, None)?;
+    let namespaces = ranked
+        .iter()
+        .take(MAX_LISTED_NAMESPACES)
+        .map(|ranked| {
+            Ok(NamespaceStatus {
+                id: ranked.id,
+                reset_epoch: u64::try_from(ranked.epoch).map_err(|_| Bypass::Corrupt)?,
+                last_used_unix_seconds: ranked.last_used().and_then(retention::unix_seconds_of),
+                estimated_bytes: retention::read_recorded(&location, ranked.id)
+                    .filter(|recorded| recorded.epoch == ranked.epoch)
+                    .map(|recorded| recorded.bytes),
+                held: namespaces::held(&location.namespace_lock(ranked.id))?,
+            })
+        })
+        .collect::<Result<Vec<_>, Bypass>>()?;
+    let live_namespaces = count(
+        &transaction,
+        "SELECT count(*) FROM namespaces WHERE state = 1",
+        0,
+    )?;
     Ok(Some(StatusReport {
         container: ContainerInfo {
             version: CONTAINER_VERSION,
@@ -175,11 +227,9 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
         usage,
         policy,
         pressure,
-        live_namespaces: count(
-            &transaction,
-            "SELECT count(*) FROM namespaces WHERE state = 1",
-            0,
-        )?,
+        // Every live namespace but the listed ones, whatever their count.
+        namespaces_truncated: live_namespaces > namespaces.len() as u64,
+        live_namespaces,
         retired_namespaces: count(
             &transaction,
             "SELECT count(*) FROM namespaces WHERE state <> 1",
@@ -191,6 +241,7 @@ fn read_status(directory: &Path) -> Result<Option<StatusReport>, Bypass> {
             "SELECT count(*) FROM process_leases WHERE renewed_unix_seconds >= ?1",
             live_since,
         )?,
+        namespaces,
         advice: if pressure == Pressure::None {
             RecoveryAdvice::None
         } else {

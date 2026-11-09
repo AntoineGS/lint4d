@@ -1059,6 +1059,7 @@ pub(super) fn build_project_context(
             packages: package_list(&builder),
             installation_config_files,
             override_error: None,
+            exact_entries: Default::default(),
         }),
         observations: ProjectObservations {
             metadata_files,
@@ -1192,6 +1193,7 @@ fn build_standalone_context(
             packages: Vec::new(),
             installation_config_files: Vec::new(),
             override_error: None,
+            exact_entries: Default::default(),
         }),
         observations: ProjectObservations {
             metadata_files,

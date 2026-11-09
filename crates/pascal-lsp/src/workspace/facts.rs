@@ -1,6 +1,5 @@
 //! The workspace's adapter from an indexed source to its compact facts.
 //! Background indexing uses it from `l4d-zf1b.8` on.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::Workspace;
 use crate::navigation::{ExtractedFacts, extract_facts};
@@ -178,6 +177,28 @@ pub(in crate::workspace) mod tests {
             ],
             &["Main.pas"],
         )
+    }
+
+    #[test]
+    fn expanded_includes_name_the_file_they_read() {
+        let indexed = includes();
+        let facts = indexed.facts("Main.pas").extracted.facts;
+        let uri = indexed.uri("Main.pas");
+        let slots = indexed.workspace.source_slot_paths(&uri);
+        for include in &facts.includes {
+            let normalized = include.source.clone().map(crate::workspace::absolute_path);
+            assert_eq!(
+                normalized, slots[include.slot as usize],
+                "slot {}",
+                include.slot
+            );
+        }
+        assert!(
+            facts
+                .includes
+                .iter()
+                .any(|include| include.source.is_some())
+        );
     }
 
     #[test]
@@ -385,7 +406,16 @@ pub(in crate::workspace) mod tests {
         let observe = |keep: bool| {
             crate::workspace::compile_time::TEST_KEEP_DECLARATIONS.with(|k| k.set(keep));
             let indexed = index(files, &["Main.pas"]);
-            let source = indexed.facts("Main.pas");
+            let mut source = indexed.facts("Main.pas");
+            // Each observation indexes its own root: include sources are
+            // compared relative to it.
+            for include in &mut source.extracted.facts.includes {
+                if let Some(path) = include.source.as_mut()
+                    && let Ok(relative) = path.strip_prefix(&indexed.root)
+                {
+                    *path = relative.to_path_buf();
+                }
+            }
             let uri = indexed.uri("Main.pas");
             let evidence = indexed
                 .workspace

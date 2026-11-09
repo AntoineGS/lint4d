@@ -24,6 +24,10 @@ pub(crate) struct Reserved {
     pub(crate) pages: usize,
     pub(crate) scratch: usize,
     pub(crate) facts: usize,
+    /// Member publications' transient buffers (13b-3, A2).
+    pub(crate) publication: usize,
+    /// Candidate trees of indexed queries no cache lease charges (R9-8).
+    pub(crate) query_trees: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,12 +176,15 @@ impl CacheStatus {
                 "pageBytes": limits.page_cache_bytes,
                 "scratchBytes": limits.scratch_bytes,
                 "waitMs": limits.wait.as_millis() as u64,
+                "maxNamespaces": limits.max_namespaces,
             },
             "resetEpoch": self.reset_epoch,
             "reservedBytes": {
                 "pages": reserved.pages,
                 "scratch": reserved.scratch,
                 "facts": reserved.facts,
+                "publication": reserved.publication,
+                "queryTrees": reserved.query_trees,
             },
             "store": self.usage.as_ref().map(usage_json),
             "lockWaits": {
@@ -233,6 +240,8 @@ mod tests {
                 pages: usize::MAX,
                 scratch: usize::MAX,
                 facts: usize::MAX,
+                publication: usize::MAX,
+                query_trees: usize::MAX,
             },
             usage: Some(UsageView::maximal()),
             lock_waits: LockWaits {

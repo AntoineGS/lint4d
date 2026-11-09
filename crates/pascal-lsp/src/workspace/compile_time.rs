@@ -117,9 +117,99 @@ impl pascal_core::compile_time::SharedProviderGraphs for CachedProviderGraphs {
         if !shareable {
             return;
         }
-        let reads = self.capture.snapshot().restricted_to(&graph.observations);
+        let probes = crate::project_cache::dedup_probes(probes);
+        // The trace's directories too: a reusing session reports them
+        // (`replay_trace`), so its evidence needs their listings even when
+        // this session's report had deduplicated them away (rootcause2 U1).
+        let reads = self
+            .capture
+            .restricted_to(graph.observations.iter().chain(graph.trace.iter()));
         self.cache
             .put_provider_graph(self.configuration, key, graph, probes, reads);
+    }
+}
+
+/// Include lookups that found nothing, shared through the project cache
+/// (l4d-ig6b) by every analysis under one resolver configuration. A reuse
+/// replays into this session's capture what the lookup listed.
+struct CachedIncludeFailures {
+    cache: crate::project_cache::ProjectCache,
+    configuration: u64,
+    context: Arc<pascal_project::ProjectContext>,
+    capture: Arc<super::capture::ReadCapture>,
+    /// The lookup that missed and is searching, with whether the capture
+    /// had seen editor state or overflowed before it began: what it stores
+    /// is only its own (l4d-ig6b I2).
+    searching: std::sync::Mutex<Option<(pascal_core::IncludeFailureKey, bool)>>,
+}
+
+impl pascal_core::SharedIncludeFailures for CachedIncludeFailures {
+    fn get(
+        &self,
+        key: &pascal_core::IncludeFailureKey,
+    ) -> Option<Arc<pascal_core::IncludeFailure>> {
+        let hit = self
+            .cache
+            .include_failure(self.configuration, &self.context, key);
+        let Some(hit) = hit else {
+            let (overflowed, editor_state) = self.capture.flags();
+            *self
+                .searching
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                (!overflowed).then(|| (key.clone(), editor_state));
+            return None;
+        };
+        // Stored with no overflow, so the replay adds only the reads this
+        // session lacks (D29 dedup) and never copies an overflow.
+        self.capture.replay(&hit.reads);
+        Some(hit.failure)
+    }
+
+    fn put(&self, key: pascal_core::IncludeFailureKey, failure: Arc<pascal_core::IncludeFailure>) {
+        let Some((searched, editor_state_before)) = self
+            .searching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        if searched != key {
+            return;
+        }
+        let observations = failure
+            .observations
+            .iter()
+            .map(|(_, observation)| observation.clone())
+            .collect::<Vec<_>>();
+        // A miss reads no payload; one that did is not shared.
+        let mut shareable = true;
+        let (probes, _) = crate::project_cache::observation_probes(&observations, &mut |_, _| {
+            shareable = false;
+            None
+        });
+        let (overflowed, editor_state) = self.capture.flags();
+        // An overflowed capture may lack what the lookup listed.
+        if !shareable || overflowed {
+            return;
+        }
+        let mut reads = self.capture.restricted_to(&observations);
+        // A read the lookup named may be missing.
+        if reads.overflowed {
+            return;
+        }
+        // Session-wide flags are not the lookup's: only editor state it
+        // met itself carries over.
+        reads.editor_state = editor_state && !editor_state_before;
+        self.cache.put_include_failure(
+            self.configuration,
+            Arc::clone(&self.context),
+            key,
+            failure,
+            probes,
+            reads,
+        );
     }
 }
 
@@ -134,6 +224,16 @@ fn provider_graph_configuration(
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     crate::navigation::compiled_dcu::project_context_fingerprint(context).hash(&mut hasher);
+    // The fingerprint leaves out what only lookups read (l4d-ig6b C1): the
+    // include path, the main source and explicit `in` units (candidate
+    // provenance), packages and missing references.
+    context.include_path_entries().hash(&mut hasher);
+    context.main_source_entry().hash(&mut hasher);
+    let mut explicit = context.explicit_unit_entries().iter().collect::<Vec<_>>();
+    explicit.sort_by(|left, right| left.0.cmp(right.0));
+    explicit.hash(&mut hasher);
+    context.packages().hash(&mut hasher);
+    format!("{:?}", context.path_issues()).hash(&mut hasher);
     workspace.workspace_root_paths().hash(&mut hasher);
     format!("{limits:?}").hash(&mut hasher);
     // A buffer without a disk file joins its directory's listing, which a
@@ -160,6 +260,8 @@ fn provider_graph_configuration(
 struct Control<'a> {
     cancel: &'a AtomicBool,
     budget: Option<&'a ReconciliationBudget>,
+    /// An index member's extraction deadline (`Workspace::member_deadline`).
+    deadline: Option<std::time::Instant>,
 }
 
 #[cfg(test)]
@@ -191,6 +293,11 @@ impl Control<'_> {
         }
         if self.cancel.load(Ordering::Relaxed) {
             Err(super::CANCELLATION_MESSAGE.into())
+        } else if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            Err(super::indexing::MEMBER_DEADLINE_MESSAGE.into())
         } else {
             Ok(())
         }
@@ -577,6 +684,7 @@ pub(super) fn selected_import_header(
     let control = Control {
         cancel,
         budget: None,
+        deadline: None,
     };
     control.check()?;
     let input = workspace.analysis_input();
@@ -891,7 +999,11 @@ pub(super) fn expand_with_limits(
 ) -> Result<ExpansionResult, String> {
     let directory_limit = limits.directory_entries;
     let limits = limits.expansion;
-    let control = Control { cancel, budget };
+    let control = Control {
+        cancel,
+        budget,
+        deadline: workspace.member_deadline,
+    };
     control.check()?;
     #[cfg(test)]
     if TEST_EXPANSION_FAILURE.with(|value| {
@@ -932,7 +1044,7 @@ pub(super) fn expand_with_limits(
         .get(key)
         .ok_or("project context was not retained")?;
     let context = state.context.clone();
-    let input = workspace.analysis_input();
+    let input = workspace.session_source_input();
     let source_hash = if input.overlays.contains_key(uri) {
         crate::project_cache::overlay_content_hash(source)
     } else {
@@ -983,11 +1095,19 @@ pub(super) fn expand_with_limits(
         control: &control,
     };
     let configuration = provider_graph_configuration(workspace, &context, &input, &resolver_limits);
+    let overlays = workspace.overlay_inputs();
     let shared = Arc::new(CachedProviderGraphs {
         cache: workspace.project_cache.clone(),
         configuration,
-        overlays: workspace.overlay_inputs(),
+        overlays,
         capture: Arc::clone(&capture),
+    });
+    let include_failures = Arc::new(CachedIncludeFailures {
+        cache: workspace.project_cache.clone(),
+        configuration,
+        context: Arc::clone(&context),
+        capture: Arc::clone(&capture),
+        searching: std::sync::Mutex::new(None),
     });
     let mut resolver = UnitResolver::new(
         context,
@@ -996,7 +1116,8 @@ pub(super) fn expand_with_limits(
         resolver_limits,
     )
     .with_context_observations(&state.context_observations)
-    .with_shared_provider_graphs(shared);
+    .with_shared_provider_graphs(shared)
+    .with_shared_include_failures(include_failures);
     let root = control.finish(resolver.load_source(
         &path,
         route.as_ref(),
@@ -1419,6 +1540,87 @@ mod tests {
     use lsp_types::Position;
     use pascal_project::delphi_overrides::OverrideSession;
 
+    /// 13c-1 review: a read the capture bound dropped and only the graph's
+    /// trace names still makes the graph's reads overflowed (`put` stores
+    /// the reads of observations and trace), so `put_provider_graph`
+    /// refuses it; no later session reuses it and each compiles the
+    /// provider itself.
+    #[test]
+    fn a_read_dropped_by_the_capture_bound_and_named_by_the_trace_refuses_the_graph() {
+        use pascal_core::SourceId;
+        use pascal_core::compile_time::{ProviderGraphKey, SharedProviderGraph};
+        use pascal_core::resolver::{DirectoryListing, ResolutionObservation};
+        let directory = |path: &str| ResolutionObservation::Directory {
+            path: path.into(),
+            entry: pascal_project::ProjectPathEntry::configured(path.into()),
+            stamp: None,
+            complete: true,
+            listed: true,
+        };
+        let listing = DirectoryListing {
+            files: Vec::new(),
+            directories: Vec::new(),
+            stamp: None,
+            complete: true,
+        };
+        let key = ProviderGraphKey {
+            source: SourceId::new("/p/Prov.pas"),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        };
+        let graph = |trace: Vec<ResolutionObservation>| {
+            Arc::new(SharedProviderGraph {
+                occurrence: OccurrenceId(1),
+                graph: None,
+                observations: Arc::new(vec![directory("/w/obs")]),
+                warnings: Default::default(),
+                dependencies: Default::default(),
+                scanned: Default::default(),
+                children: Default::default(),
+                trace: Arc::new(trace),
+                revision: pascal_core::SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 1,
+                },
+                lookup: (0, 0),
+                names: None,
+                retained_bytes: 100,
+            })
+        };
+        let cache = crate::project_cache::ProjectCache::new(1 << 20);
+        let capture = Arc::new(crate::workspace::capture::ReadCapture::default());
+        crate::workspace::capture::set_capture_bound_for_test(Some(1));
+        // The first read fits; `/w/gen` is dropped.
+        capture.listed(std::path::Path::new("/w/obs"), &listing, false);
+        capture.listed(std::path::Path::new("/w/gen"), &listing, false);
+        crate::workspace::capture::set_capture_bound_for_test(None);
+        assert!(capture.snapshot().overflowed);
+        let graphs = CachedProviderGraphs {
+            cache: cache.clone(),
+            configuration: 3,
+            overlays: Default::default(),
+            capture: Arc::clone(&capture),
+        };
+        use pascal_core::compile_time::SharedProviderGraphs;
+        // Named by observations alone, the dropped read is not missing.
+        graphs.put(key.clone(), graph(Vec::new()));
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 0);
+        // Named by the trace, it is: the graph is refused and counted.
+        let traced = ProviderGraphKey {
+            source: SourceId::new("/p/Traced.pas"),
+            ..key.clone()
+        };
+        graphs.put(traced.clone(), graph(vec![directory("/w/gen")]));
+        assert_eq!(cache.index_process_counts().provider_graphs_refused, 1);
+        assert_eq!(cache.provider_graph_count(), 1);
+        assert!(graphs.get(&traced).is_none(), "the consumer compiles it");
+        assert!(graphs.get(&key).is_some());
+    }
+
     fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
         std::fs::write(root.join("Main.pas"), source).unwrap();
@@ -1462,6 +1664,460 @@ mod tests {
         result
     }
 
+    /// `count` units in `root/lib` that each include `Missing.inc`, which
+    /// is on no search path.
+    fn missing_include_workspace(
+        root: &std::path::Path,
+        count: usize,
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mut units = Vec::new();
+        for n in 0..count {
+            let source = format!(
+                "unit U{n}; interface {{$I Missing.inc}} const C{n} = {n}; implementation end."
+            );
+            std::fs::write(lib.join(format!("U{n}.pas")), &source).unwrap();
+            units.push((
+                Url::from_file_path(lib.join(format!("U{n}.pas"))).unwrap(),
+                source,
+            ));
+        }
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let units = units
+            .into_iter()
+            .map(|(uri, source)| {
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                (uri, source, key)
+            })
+            .collect();
+        (workspace, units)
+    }
+
+    fn expand_unit(
+        workspace: &Workspace,
+        uri: &Url,
+        source: &str,
+        key: &ContextKey,
+    ) -> ExpansionResult {
+        expand(
+            workspace,
+            uri,
+            source,
+            key,
+            workspace.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// What an expansion reports, for comparing two of them.
+    fn outcome(result: &ExpansionResult) -> impl PartialEq + std::fmt::Debug {
+        let session = result.expanded.session.as_ref().unwrap();
+        (
+            result.complete,
+            result.errors.clone(),
+            result.expanded.text().to_string(),
+            session.root.complete,
+            session.reasons.clone(),
+            session.observations.clone(),
+            result.expanded.reads.clone(),
+        )
+    }
+
+    /// l4d-ig6b: units of one directory that include a file missing from
+    /// their search path search for it once, not once per unit; the others
+    /// replay that failure and report exactly what a search reports.
+    #[test]
+    fn units_including_one_missing_file_search_for_it_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 5);
+        pascal_project::backdate_tree_for_test(temp.path());
+        pascal_core::take_include_searches();
+        let replayed = units
+            .iter()
+            .map(|(uri, source, key)| expand_unit(&workspace, uri, source, key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pascal_core::take_include_searches(),
+            1,
+            "one search for the directory and name"
+        );
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        // A workspace that shares nothing searches for each unit and must
+        // report the same.
+        for ((uri, source, _), replayed) in units.iter().zip(&replayed) {
+            let (mut fresh, _) = missing_include_workspace(temp.path(), 0);
+            let key = fresh.context_for_uri_with_cancel(uri, None).unwrap();
+            let searched = expand_unit(&fresh, uri, source, &key);
+            assert_eq!(outcome(&searched), outcome(replayed), "{uri}");
+        }
+    }
+
+    /// l4d-ig6b: a remembered failure does not hide an include file created
+    /// after it: the directory it would be found in changed.
+    #[test]
+    fn an_include_created_after_a_failed_lookup_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 2);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (uri, source, key) = &units[0];
+        let failed = expand_unit(&workspace, uri, source, key);
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        assert!(!failed.expanded.text().contains("FromInclude"));
+        std::fs::write(
+            temp.path().join("lib").join("Missing.inc"),
+            "const FromInclude = 1;",
+        )
+        .unwrap();
+        pascal_core::take_include_searches();
+        let (uri, source, key) = &units[1];
+        let found = expand_unit(&workspace, uri, source, key);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+        assert!(
+            found.expanded.text().contains("FromInclude"),
+            "{}",
+            found.expanded.text()
+        );
+    }
+
+    /// A workspace over `files` (written under `root`, then made settled),
+    /// with the contexts of `units`.
+    fn fixture_workspace(
+        root: &std::path::Path,
+        files: &[(&str, &str)],
+        units: &[&str],
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        pascal_project::backdate_tree_for_test(root);
+        fixture_contexts(root, units)
+    }
+
+    fn fixture_contexts(
+        root: &std::path::Path,
+        units: &[&str],
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let units = units
+            .iter()
+            .map(|unit| {
+                let path = root.join(unit);
+                let uri = Url::from_file_path(&path).unwrap();
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                (uri, std::fs::read_to_string(path).unwrap(), key)
+            })
+            .collect();
+        (workspace, units)
+    }
+
+    fn project_files<'a>(
+        include_path: &str,
+        units: &[(&'a str, &'a str)],
+    ) -> Vec<(String, String)> {
+        let uses = units
+            .iter()
+            .map(|(path, _)| {
+                let name = std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy();
+                format!("{name} in '{}'", path.replace('/', "\\"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut files = vec![
+            (
+                "App.dproj".to_string(),
+                format!(
+                    "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_IncludePath>{include_path}</DCC_IncludePath></PropertyGroup></Project>"
+                ),
+            ),
+            (
+                "App.dpr".to_string(),
+                format!("program App; uses {uses}; begin end."),
+            ),
+        ];
+        files.extend(
+            units
+                .iter()
+                .map(|(path, text)| ((*path).to_string(), (*text).to_string())),
+        );
+        files
+    }
+
+    fn as_refs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+        files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect()
+    }
+
+    /// l4d-ig6b I1: a failure whose directories are not settled is neither
+    /// stored nor reused: an entry created in the stamp's tick could hide.
+    #[test]
+    fn failures_in_unsettled_directories_are_searched_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 3);
+        pascal_core::take_include_searches();
+        for (uri, source, key) in &units {
+            expand_unit(&workspace, uri, source, key);
+        }
+        assert_eq!(pascal_core::take_include_searches(), 3);
+        assert_eq!(workspace.project_cache.include_failure_count(), 0);
+    }
+
+    /// l4d-ig6b I1: a watcher event under a directory a failure observed,
+    /// or a watcher overflow, drops it, whatever the stamps say.
+    #[test]
+    fn watched_changes_drop_the_failures_they_touch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 3);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let expand_at = |n: usize| {
+            let (uri, source, key) = &units[n];
+            expand_unit(&workspace, uri, source, key)
+        };
+        expand_at(0);
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        workspace
+            .project_cache
+            .invalidate_path(&temp.path().join("lib").join("Missing.inc"));
+        assert_eq!(workspace.project_cache.include_failure_count(), 0);
+        pascal_core::take_include_searches();
+        expand_at(1);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        workspace.project_cache.invalidate_after_overflow();
+        assert_eq!(workspace.project_cache.include_failure_count(), 0);
+        expand_at(2);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+    }
+
+    /// l4d-ig6b C1: a failure is not reused once the project's include path
+    /// names the directory holding the file; neither is a provider interface
+    /// compiled without it.
+    #[test]
+    fn a_new_include_path_finds_what_a_failure_missed() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
+        let units = [
+            (
+                "lib/U0.pas",
+                "unit U0; interface {$I X.inc} implementation end.",
+            ),
+            (
+                "lib/U1.pas",
+                "unit U1; interface {$I X.inc} implementation end.",
+            ),
+            (
+                "lib/A.pas",
+                "unit A; interface {$I Flag.inc} implementation end.",
+            ),
+            ("lib/Main.pas", main),
+        ];
+        let mut files = project_files("", &units);
+        files.push(("inc/X.inc".into(), "const FromInclude = 1;".into()));
+        files.push(("inc/Flag.inc".into(), "const Flag = 8;".into()));
+        let (before, contexts) = fixture_workspace(
+            temp.path(),
+            &as_refs(&files),
+            &["lib/U0.pas", "lib/Main.pas"],
+        );
+        for (uri, source, key) in &contexts {
+            expand_unit(&before, uri, source, key);
+        }
+        assert!(before.project_cache.include_failure_count() > 0);
+        std::fs::write(
+            temp.path().join("App.dproj"),
+            &project_files("inc", &units)[0].1,
+        )
+        .unwrap();
+        // Only the project file changed: every directory the failures
+        // observed keeps its stamp.
+        pascal_project::backdate_for_test(&temp.path().join("App.dproj"));
+        // The next request: new contexts, the same session cache.
+        let (mut after, contexts) = fixture_contexts(temp.path(), &["lib/U1.pas", "lib/Main.pas"]);
+        after.project_cache = before.project_cache.clone();
+        let (fresh, _) = fixture_contexts(temp.path(), &["lib/U1.pas", "lib/Main.pas"]);
+        for (uri, source, key) in &contexts {
+            let reused = expand_unit(&after, uri, source, key);
+            let searched = expand_unit(&fresh, uri, source, key);
+            assert_eq!(outcome(&reused), outcome(&searched), "{uri}");
+        }
+        let (uri, source, key) = &contexts[0];
+        assert!(
+            expand_unit(&after, uri, source, key)
+                .expanded
+                .text()
+                .contains("FromInclude")
+        );
+    }
+
+    /// l4d-ig6b I2, M1: a replayed failure reports, captures and charges what
+    /// a search in a session that shares nothing does: over several search
+    /// directories, with the storing unit open in the editor, and replayed
+    /// twice in one session.
+    #[test]
+    fn replayed_failures_match_a_search_in_every_respect() {
+        let temp = tempfile::tempdir().unwrap();
+        // U1's session looks Missing.inc up twice: once for each provider
+        // whose interface its conditions read.
+        let units = [
+            (
+                "lib/U0.pas",
+                "unit U0; interface {$I Missing.inc} implementation end.",
+            ),
+            (
+                "lib/U1.pas",
+                "unit U1; interface uses P0, P1; {$IF P0.X = 1} const A = 1; {$ENDIF} {$IF P1.X = 1} const B = 1; {$ENDIF} implementation end.",
+            ),
+            (
+                "lib/U2.pas",
+                "unit U2; interface {$I Missing.inc} implementation end.",
+            ),
+            (
+                "lib/P0.pas",
+                "unit P0; interface {$I Missing.inc} const X = 1; implementation end.",
+            ),
+            (
+                "lib/P1.pas",
+                "unit P1; interface {$I Missing.inc} const X = 1; implementation end.",
+            ),
+        ];
+        let mut files = project_files("inc1;inc2", &units);
+        files.push(("inc1/Other.inc".into(), "".into()));
+        files.push(("inc2/Other.inc".into(), "".into()));
+        let paths = ["lib/U0.pas", "lib/U1.pas", "lib/U2.pas"];
+        let (mut shared, contexts) = fixture_workspace(temp.path(), &as_refs(&files), &paths);
+        let (uri, source, _) = &contexts[0];
+        shared
+            .open_document(uri.clone(), format!("{source} "), 1)
+            .unwrap();
+        let open_text = format!("{source} ");
+        let (first, rest) = contexts.split_first().unwrap();
+        expand_unit(&shared, &first.0, &open_text, &first.2);
+        assert_eq!(shared.project_cache.include_failure_count(), 1);
+        pascal_core::take_include_searches();
+        for (uri, source, key) in rest {
+            let replayed = expand_unit(&shared, uri, source, key);
+            let searches = pascal_core::take_include_searches();
+            // The reference: a session that shares nothing; the storing
+            // unit's buffer does not shape this unit's lookups.
+            let (fresh, _) = fixture_contexts(temp.path(), &paths);
+            let searched = expand_unit(&fresh, uri, source, key);
+            assert!(pascal_core::take_include_searches() > 0);
+            assert_eq!(searches, 0, "{uri} replays");
+            // What evidence reads: each distinct listing and payload, and the
+            // session flags (a duplicate read means the same).
+            let distinct = |result: &ExpansionResult| {
+                let reads = result.expanded.reads.as_deref().cloned().unwrap();
+                let mut listings = reads
+                    .listings
+                    .iter()
+                    .map(|listing| format!("{listing:?}"))
+                    .collect::<Vec<_>>();
+                listings.sort();
+                listings.dedup();
+                let mut payloads = reads
+                    .payloads
+                    .iter()
+                    .map(|payload| format!("{payload:?}"))
+                    .collect::<Vec<_>>();
+                payloads.sort();
+                payloads.dedup();
+                (listings, payloads, reads.overflowed, reads.editor_state)
+            };
+            assert_eq!(
+                distinct(&replayed),
+                distinct(&searched),
+                "{uri} captures alike"
+            );
+            let duplicates = |result: &ExpansionResult| {
+                let all = result.expanded.reads.as_deref().unwrap().listings.len();
+                all - distinct(result).0.len()
+            };
+            assert!(
+                duplicates(&replayed) <= duplicates(&searched),
+                "{uri}: a replay adds no listing the session holds"
+            );
+            let session = |result: &ExpansionResult| {
+                let session = result.expanded.session.as_ref().unwrap();
+                (
+                    result.complete,
+                    result.errors.clone(),
+                    result.expanded.text().to_string(),
+                    session.root.complete,
+                    session.reasons.clone(),
+                    session.observations.clone(),
+                )
+            };
+            assert_eq!(session(&replayed), session(&searched), "{uri}");
+            let usage = |result: &ExpansionResult| {
+                let snapshot = result
+                    .expanded
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .budget
+                    .budget_snapshot();
+                (snapshot.work, snapshot.byte_work)
+            };
+            // A search is charged what its session's state makes it cost (a
+            // listing the session holds is reused): a replay charges what the
+            // storing search was charged, which for one lookup per session is
+            // that of a fresh search to within the bytes of its source name.
+            if source.contains("{$I ") {
+                let (replay, search) = (usage(&replayed), usage(&searched));
+                let close = |left: usize, right: usize| left.abs_diff(right) * 100 <= right;
+                assert!(
+                    close(replay.0, search.0) && close(replay.1, search.1),
+                    "{uri} is charged {replay:?}, a search {search:?}"
+                );
+            }
+            let reads = replayed.expanded.reads.as_ref().unwrap();
+            assert!(!reads.editor_state && !reads.overflowed, "{reads:?}");
+        }
+    }
+
+    /// l4d-ig6b M1: a replay that would pass the session's directory entry
+    /// limit searches instead, as a fresh search would have stopped there.
+    #[test]
+    fn a_replay_past_the_entry_limit_searches() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, units) = missing_include_workspace(temp.path(), 2);
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (uri, source, key) = &units[0];
+        expand_unit(&workspace, uri, source, key);
+        assert_eq!(workspace.project_cache.include_failure_count(), 1);
+        let charges = workspace.project_cache.include_failure_charges_for_tests();
+        assert!(
+            charges
+                .iter()
+                .all(|(scanned, work, _)| *scanned > 0 && *work > 0),
+            "the search's entries and work are recorded: {charges:?}"
+        );
+        workspace
+            .project_cache
+            .inflate_include_failures_for_tests(usize::MAX / 2);
+        pascal_core::take_include_searches();
+        let (uri, source, key) = &units[1];
+        expand_unit(&workspace, uri, source, key);
+        assert_eq!(pascal_core::take_include_searches(), 1);
+    }
+
     fn work(result: &ExpansionResult) -> usize {
         let session = result.expanded.session.as_ref().unwrap();
         session.budget.budget_snapshot().work
@@ -1492,6 +2148,86 @@ mod tests {
         assert_eq!(
             first.expanded.reads, second.expanded.reads,
             "the reuse replays what the compilation read"
+        );
+    }
+
+    /// Rootcause A1: a provider whose interface looks up many units over a
+    /// search path is replayed with one listing per directory, so a session
+    /// that reuses it captures every directory once.
+    #[test]
+    fn a_reused_provider_replays_one_listing_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>s1;s2;s3</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .unwrap();
+        for directory in ["s1", "s2", "s3"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let units: Vec<String> = (0..12).map(|n| format!("B{n}")).collect();
+        for unit in &units {
+            std::fs::write(
+                root.join("s3").join(format!("{unit}.pas")),
+                format!("unit {unit}; interface const {unit}Value = 1; implementation end."),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("s3/A.pas"),
+            format!(
+                "unit A; interface uses {}; const Flag = 8; implementation end.",
+                units.join(", ")
+            ),
+        )
+        .unwrap();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ENDIF} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let first = expand_main(&workspace, &uri, source, &key);
+        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        let second = expand_main(&workspace, &uri, source, &key);
+        for result in [&first, &second] {
+            let reads = result.expanded.reads.as_ref().unwrap();
+            assert!(!reads.overflowed);
+            for (n, listing) in reads.listings.iter().enumerate() {
+                assert!(
+                    !reads.listings[..n].contains(listing),
+                    "{listing:?} twice in {:?}",
+                    reads.listings
+                );
+            }
+            for (n, payload) in reads.payloads.iter().enumerate() {
+                assert!(!reads.payloads[..n].contains(payload), "{payload:?} twice");
+            }
+        }
+        let directories = |result: &ExpansionResult| {
+            let mut listed: Vec<_> = result
+                .expanded
+                .reads
+                .as_ref()
+                .unwrap()
+                .listings
+                .iter()
+                .map(|listing| listing.directory.clone())
+                .collect();
+            listed.sort();
+            listed
+        };
+        assert_eq!(directories(&first), directories(&second));
+        assert!(
+            directories(&first)
+                .iter()
+                .any(|directory| directory.ends_with("s1")),
+            "{:?}",
+            directories(&first)
         );
     }
 
@@ -1991,5 +2727,61 @@ mod tests {
                 .any(|gap| gap.reason.contains("include expansion is incomplete"))
         );
         assert!(partial.value.iter().all(|location| location.uri == main));
+    }
+
+    /// 13b-5 (A4): a passed member deadline stops the session as
+    /// cancellation does, under its own message; cancellation comes first,
+    /// so a cancelled member is never taken for one past its deadline.
+    #[test]
+    fn a_passed_member_deadline_stops_the_session_after_cancellation() {
+        let cancel = AtomicBool::new(false);
+        let passed = Control {
+            cancel: &cancel,
+            budget: None,
+            deadline: Some(std::time::Instant::now()),
+        };
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::indexing::MEMBER_DEADLINE_MESSAGE
+        );
+        assert!(passed.is_cancelled());
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            passed.check().unwrap_err(),
+            super::super::CANCELLATION_MESSAGE
+        );
+        let running = AtomicBool::new(false);
+        let ahead = Control {
+            cancel: &running,
+            budget: None,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3_600)),
+        };
+        assert!(ahead.check().is_ok());
+        assert!(!ahead.is_cancelled());
+    }
+
+    /// 13b-5 (A4): an expansion in a view with a passed member deadline
+    /// fails with the deadline's message; without a deadline it succeeds.
+    #[test]
+    fn an_expansion_past_the_member_deadline_fails_with_its_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("x.inc"), "const X = 1;\n").unwrap();
+        let source = "unit Main; interface {$I x.inc} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let limits = workspace.include_expansion_limits();
+        let cancel = AtomicBool::new(false);
+        workspace.member_deadline = Some(std::time::Instant::now());
+        let error = expand(&workspace, &uri, source, &key, limits, &cancel, None).unwrap_err();
+        assert_eq!(error, super::super::indexing::MEMBER_DEADLINE_MESSAGE);
+        workspace.member_deadline = None;
+        assert!(expand(&workspace, &uri, source, &key, limits, &cancel, None).is_ok());
     }
 }

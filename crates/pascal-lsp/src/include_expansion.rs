@@ -62,7 +62,7 @@ impl<'a> MappingBudget<'a> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExpandedSource {
     text: String,
-    map: SourceMap,
+    map: std::sync::Arc<SourceMap>,
     pub(crate) session: Option<std::sync::Arc<pascal_core::compile_time::CompileTimeAnalysis>>,
     /// What the session read from disk, with durable digests.
     pub(crate) reads: Option<std::sync::Arc<crate::workspace::capture::CapturedReads>>,
@@ -158,14 +158,16 @@ impl ExpandedSource {
     ) -> Range<usize> {
         let range = self.push_text(source);
         if !range.is_empty() {
-            self.map.segments.push(Segment {
-                virtual_range: range.clone(),
-                mapping: SegmentMapping::Physical {
-                    uri,
-                    source_start,
-                    occurrence,
-                },
-            });
+            std::sync::Arc::make_mut(&mut self.map)
+                .segments
+                .push(Segment {
+                    virtual_range: range.clone(),
+                    mapping: SegmentMapping::Physical {
+                        uri,
+                        source_start,
+                        occurrence,
+                    },
+                });
         }
         range
     }
@@ -173,10 +175,12 @@ impl ExpandedSource {
     pub(crate) fn push_synthetic(&mut self, source: &str) -> Range<usize> {
         let range = self.push_text(source);
         if !range.is_empty() {
-            self.map.segments.push(Segment {
-                virtual_range: range.clone(),
-                mapping: SegmentMapping::Synthetic,
-            });
+            std::sync::Arc::make_mut(&mut self.map)
+                .segments
+                .push(Segment {
+                    virtual_range: range.clone(),
+                    mapping: SegmentMapping::Synthetic,
+                });
         }
         range
     }
@@ -193,13 +197,99 @@ impl ExpandedSource {
         range: Range<usize>,
         budget: &mut MappingBudget<'_>,
     ) -> Result<VirtualMapping, String> {
-        if range.start >= range.end || range.end > self.text.len() {
+        self.map.map_range(self.text.len(), range, budget)
+    }
+
+    /// What a reuse of a parse of this text needs to report positions in
+    /// their physical files: the shared map and the `texts` the expansion
+    /// read (the root's under `root`), with content hashes of the root's
+    /// text and of this text to prove a parse and a buffer are the ones
+    /// it was made from and of.
+    pub(crate) fn projection(
+        &self,
+        root: Url,
+        texts: std::sync::Arc<std::collections::HashMap<Url, String>>,
+        entries: std::collections::HashMap<Url, pascal_project::ProjectPathEntry>,
+        hash: impl Fn(&str) -> u64,
+    ) -> Option<PhysicalProjection> {
+        let physical_hash = hash(texts.get(&root)?);
+        Some(PhysicalProjection {
+            root,
+            texts,
+            entries,
+            map: self.map.clone(),
+            len: self.text.len(),
+            physical_hash,
+            expanded_hash: hash(&self.text),
+        })
+    }
+}
+
+/// The source map of an expanded parse, with the physical texts it maps
+/// into, carried with the reusable parse of an open document (D49).
+#[derive(Debug)]
+pub(crate) struct PhysicalProjection {
+    root: Url,
+    texts: std::sync::Arc<std::collections::HashMap<Url, String>>,
+    entries: std::collections::HashMap<Url, pascal_project::ProjectPathEntry>,
+    map: std::sync::Arc<SourceMap>,
+    len: usize,
+    physical_hash: u64,
+    expanded_hash: u64,
+}
+
+impl PhysicalProjection {
+    /// The content hash of the root text the expansion read.
+    pub(crate) fn physical_hash(&self) -> u64 {
+        self.physical_hash
+    }
+
+    /// The content hash of the expanded text.
+    pub(crate) fn expanded_hash(&self) -> u64 {
+        self.expanded_hash
+    }
+
+    /// The files other than the root the expansion read, with the text it
+    /// read and the search-path entry that resolved them.
+    pub(crate) fn included(
+        &self,
+    ) -> impl Iterator<Item = (&Url, &str, Option<&pascal_project::ProjectPathEntry>)> {
+        self.texts
+            .iter()
+            .filter(|(uri, _)| **uri != self.root)
+            .map(|(uri, text)| (uri, text.as_str(), self.entries.get(uri)))
+    }
+
+    /// Where `range` of the expanded text lies: one physical span, with
+    /// the text of its file, or `None` when it is synthetic, spans files or
+    /// has no map entry.
+    pub(crate) fn locate(
+        &self,
+        range: Range<usize>,
+        budget: &mut MappingBudget<'_>,
+    ) -> Result<Option<(PhysicalSpan, &str)>, String> {
+        let VirtualMapping::Exact(span) = self.map.map_range(self.len, range, budget)? else {
+            return Ok(None);
+        };
+        let text = self.texts.get(&span.uri).map(String::as_str);
+        Ok(text.map(|text| (span, text)))
+    }
+}
+
+impl SourceMap {
+    fn map_range(
+        &self,
+        len: usize,
+        range: Range<usize>,
+        budget: &mut MappingBudget<'_>,
+    ) -> Result<VirtualMapping, String> {
+        if range.start >= range.end || range.end > len {
             return Ok(VirtualMapping::Unmapped);
         }
 
         let mut cursor = range.start;
         let mut spans = Vec::new();
-        for segment in &self.map.segments {
+        for segment in &self.segments {
             budget.charge()?;
             if segment.virtual_range.end <= range.start {
                 continue;
@@ -237,7 +327,9 @@ impl ExpandedSource {
             Ok(VirtualMapping::Many(spans))
         }
     }
+}
 
+impl ExpandedSource {
     pub(crate) fn reverse_range(&self, uri: &Url, range: Range<usize>) -> Vec<Range<usize>> {
         let cancel = AtomicBool::new(false);
         let mut budget = MappingBudget::new(&cancel, usize::MAX);
@@ -323,13 +415,13 @@ impl ExpandedSource {
     fn append(&mut self, child: &ExpandedSource) {
         let offset = self.text.len();
         self.text.push_str(&child.text);
-        self.map
-            .segments
-            .extend(child.map.segments.iter().cloned().map(|mut segment| {
+        std::sync::Arc::make_mut(&mut self.map).segments.extend(
+            child.map.segments.iter().cloned().map(|mut segment| {
                 segment.virtual_range.start += offset;
                 segment.virtual_range.end += offset;
                 segment
-            }));
+            }),
+        );
     }
 }
 

@@ -1499,6 +1499,10 @@ pub struct UnitResolver<S> {
     package_lookups: usize,
     package_catalogue_count: usize,
     scanned_entries: usize,
+    /// Entries of every directory listing a lookup consulted outside a
+    /// compile-time session, a cached listing included: what a resolver
+    /// without that cache would have scanned.
+    consulted_entries: usize,
     project_includes: Vec<ResolvedInclude>,
     include_seen: HashSet<SourceId>,
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
@@ -1509,6 +1513,14 @@ pub struct UnitResolver<S> {
     /// Directories unit lookups consulted while a session traces them
     /// (l4d-4nbs review C1), with their stamps when consulted.
     lookup_trace: Option<Vec<(PathBuf, ProjectPathEntry, Option<ProjectReadStamp>)>>,
+    /// Include lookups that found nothing, shared beyond this resolver's
+    /// sessions (l4d-ig6b), bound to this resolver's configuration.
+    shared_include_failures: Option<Arc<dyn SharedIncludeFailures>>,
+    /// Every observation an include lookup records while it runs, as built,
+    /// so a failure can be replayed into another report (l4d-ig6b).
+    include_failure_trace: Option<Vec<(usize, ResolutionObservation)>>,
+    /// Warnings and diagnostics this resolver formatted, kept or not.
+    report_messages: usize,
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
@@ -3021,12 +3033,16 @@ impl<S: SourceStore> UnitResolver<S> {
             package_lookups: 0,
             package_catalogue_count: 0,
             scanned_entries: 0,
+            consulted_entries: 0,
             project_includes: Vec::new(),
             include_seen: HashSet::new(),
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
             shared_provider_graphs: None,
             lookup_trace: None,
+            shared_include_failures: None,
+            include_failure_trace: None,
+            report_messages: 0,
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
@@ -3058,6 +3074,14 @@ impl<S: SourceStore> UnitResolver<S> {
         store: Arc<dyn crate::compile_time::SharedProviderGraphs>,
     ) -> Self {
         self.shared_provider_graphs = Some(store);
+        self
+    }
+
+    /// Share include lookups that found nothing through `store`, which must
+    /// be bound to this resolver's configuration and validate what it
+    /// returns (l4d-ig6b).
+    pub fn with_shared_include_failures(mut self, store: Arc<dyn SharedIncludeFailures>) -> Self {
+        self.shared_include_failures = Some(store);
         self
     }
 
@@ -3899,6 +3923,12 @@ impl<S: SourceStore> UnitResolver<S> {
         self.limits.max_include_directives = max_directives;
     }
 
+    /// Directory entries scanned (what `max_directory_entries` bounds), and
+    /// consulted, cached listings included, outside a compile-time session.
+    pub fn directory_entries(&self) -> (usize, usize) {
+        (self.scanned_entries, self.consulted_entries)
+    }
+
     pub fn include_usage(&self) -> (usize, usize, usize) {
         (
             self.include_files,
@@ -3909,6 +3939,11 @@ impl<S: SourceStore> UnitResolver<S> {
 
     pub fn report(&self) -> ResolutionReport {
         self.report.clone()
+    }
+
+    /// The observations `report` would hold, without copying it.
+    pub fn report_observations(&self) -> &[ResolutionObservation] {
+        &self.report.observations
     }
 
     fn outcome<T>(
@@ -4765,7 +4800,10 @@ impl<S: SourceStore> UnitResolver<S> {
             .map(|_| ProjectPathEntry::legacy(canonical_path(path)))
     }
 
-    fn legacy_route_for_source(
+    /// The legacy route `source`, loaded under `inherited`, passes to its own
+    /// includes: the one a compile-time session registers for a loaded
+    /// include (and derives for a disk root).
+    pub fn legacy_route_for_source(
         &self,
         source: &LoadedSource,
         inherited: Option<&LegacyRoute>,
@@ -5885,6 +5923,12 @@ impl<S: SourceStore> UnitResolver<S> {
         if self.compile_time_store.is_none()
             && let Some(listing) = self.directories.get(&cache_key).cloned()
         {
+            self.consulted_entries = self.consulted_entries.saturating_add(
+                listing
+                    .files
+                    .len()
+                    .saturating_add(listing.directories.len()),
+            );
             return Ok(DirectoryAccess::Legacy(listing));
         }
         let request = DirectoryRequest {
@@ -5905,6 +5949,12 @@ impl<S: SourceStore> UnitResolver<S> {
             Err(error) => return Err(root_store_error(error)),
         };
         self.scanned_entries = self.scanned_entries.saturating_add(
+            listing
+                .files
+                .len()
+                .saturating_add(listing.directories.len()),
+        );
+        self.consulted_entries = self.consulted_entries.saturating_add(
             listing
                 .files
                 .len()
@@ -6703,6 +6753,126 @@ impl<S: SourceStore> UnitResolver<S> {
                 candidates: Vec::new(),
             });
         }
+        let failure_key = self
+            .shared_include_failures
+            .as_ref()
+            .map(|_| IncludeFailureKey {
+                owner_directory: canonical_path(
+                    request
+                        .including_path
+                        .parent()
+                        .unwrap_or(request.including_path),
+                ),
+                requested_name: request.requested_name.to_string(),
+                legacy_route: request.legacy_route.map(LegacyRouteAuthority::of),
+            });
+        // A lookup that found nothing for this directory and name is replayed
+        // while its directories are unchanged (l4d-ig6b). Past an include
+        // limit the lookup would stop as incomplete instead: search then.
+        if let (Some(store), Some(key)) = (self.shared_include_failures.clone(), &failure_key)
+            && self.include_files < self.limits.max_include_files
+            && self.include_bytes < self.limits.max_include_bytes
+            && let Some(failure) = store.get(key)
+        {
+            // Charge what the search was charged, so a replay stops where a
+            // search would: past the entry limit it searches instead (M1).
+            let scanned = self.scanned_entries.saturating_add(failure.scanned_entries);
+            if scanned > self.limits.max_directory_entries {
+                return self.search_include_counted(request, cancel);
+            }
+            let usage = self.store_usage();
+            for (payload, observation) in &failure.observations {
+                self.record_observation_build(*payload, cancel, || observation.clone())?;
+            }
+            self.scanned_entries = scanned;
+            let replayed = self.store_usage();
+            if let Some(mut budget) = self.store_budget(cancel) {
+                budget
+                    .charge(
+                        failure
+                            .work
+                            .saturating_sub(replayed.work.saturating_sub(usage.work)),
+                        failure
+                            .byte_work
+                            .saturating_sub(replayed.byte_work.saturating_sub(usage.byte_work)),
+                        0,
+                    )
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            }
+            return Ok(Resolution::Unavailable {
+                reason: self.include_reason_build(
+                    request
+                        .requested_name
+                        .len()
+                        .checked_add(24)
+                        .ok_or_else(|| {
+                            ResolverError::InvalidRequest("include reason bound overflow".into())
+                        })?,
+                    cancel,
+                    format_args!("include {} was not found", request.requested_name),
+                )?,
+            });
+        }
+        INCLUDE_SEARCHES.with(|searches| searches.set(searches.get() + 1));
+        let Some(key) = failure_key else {
+            return self.search_include(request, cancel);
+        };
+        let outer_trace = self.include_failure_trace.replace(Vec::new());
+        let messages = self.report_messages;
+        let complete = self.report.complete;
+        let scanned = self.scanned_entries;
+        let usage = self.store_usage();
+        let result = self.search_include(request, cancel);
+        let usage_after = self.store_usage();
+        let trace =
+            std::mem::replace(&mut self.include_failure_trace, outer_trace).unwrap_or_default();
+        if let Some(outer) = self.include_failure_trace.as_mut() {
+            outer.extend(trace.iter().cloned());
+        }
+        // Only a clean miss is shared: no warning or diagnostic was formatted
+        // and nothing was found incomplete.
+        if matches!(&result, Ok(Resolution::Unavailable { .. }))
+            && messages == self.report_messages
+            && complete == self.report.complete
+            && let Some(store) = &self.shared_include_failures
+        {
+            store.put(
+                key,
+                Arc::new(IncludeFailure {
+                    observations: trace,
+                    scanned_entries: self.scanned_entries.saturating_sub(scanned),
+                    work: usage_after.work.saturating_sub(usage.work),
+                    byte_work: usage_after.byte_work.saturating_sub(usage.byte_work),
+                }),
+            );
+        }
+        result
+    }
+
+    /// A search that is not shared: counted for tests.
+    fn search_include_counted(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<ResolvedSource>, ResolverError> {
+        INCLUDE_SEARCHES.with(|searches| searches.set(searches.get() + 1));
+        self.search_include(request, cancel)
+    }
+
+    /// What the current compile-time root has been charged; zero outside
+    /// one.
+    fn store_usage(&self) -> crate::compile_time::BudgetSnapshot {
+        self.compile_time_store
+            .as_ref()
+            .map(|root| root.view.budget_snapshot())
+            .unwrap_or_default()
+    }
+
+    fn search_include(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         let mut entries = self.context.include_search_entries(request.including_path);
         if let Some(owner_directory) = request.including_path.parent()
             && let Some(owner_entry) =
@@ -8264,15 +8434,26 @@ impl<S: SourceStore> UnitResolver<S> {
         build: impl FnOnce() -> ResolutionObservation,
     ) -> Result<(), ResolverError> {
         if let Some(mut budget) = self.store_budget(cancel) {
+            let trace = &mut self.include_failure_trace;
             self.report_owners.observations.record(
                 &mut self.report.observations,
                 &mut budget,
                 payload,
-                || Ok(build()),
+                || {
+                    let observation = build();
+                    if let Some(trace) = trace {
+                        trace.push((payload, observation.clone()));
+                    }
+                    Ok(observation)
+                },
                 observation_action,
             )
         } else {
-            self.record_observation(build());
+            let observation = build();
+            if let Some(trace) = &mut self.include_failure_trace {
+                trace.push((payload, observation.clone()));
+            }
+            self.record_observation(observation);
             Ok(())
         }
     }
@@ -8284,6 +8465,7 @@ impl<S: SourceStore> UnitResolver<S> {
         args: fmt::Arguments<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<(), ResolverError> {
+        self.report_messages = self.report_messages.saturating_add(1);
         if diagnostic {
             self.report.complete = false;
         }
@@ -8309,6 +8491,7 @@ impl<S: SourceStore> UnitResolver<S> {
         args: fmt::Arguments<'_>,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), ResolverError> {
+        self.report_messages = self.report_messages.saturating_add(1);
         if diagnostic {
             self.report.complete = false;
         }
@@ -8373,6 +8556,7 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn warn(&mut self, warning: String) {
+        self.report_messages = self.report_messages.saturating_add(1);
         assert!(
             self.compile_time_store.is_none(),
             "typed warning must be admitted before formatting"
@@ -8385,6 +8569,7 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn mark_incomplete(&mut self, reason: String) {
+        self.report_messages = self.report_messages.saturating_add(1);
         assert!(
             self.compile_time_store.is_none(),
             "typed diagnostic must be admitted before formatting"
@@ -9008,6 +9193,72 @@ impl ResolverSessionCache {
             catalogues.entry(root).or_insert(catalogue);
         }
     }
+}
+
+/// An include lookup: the including source's directory (its first search
+/// entry), the name as written and the route that may add a legacy entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IncludeFailureKey {
+    pub owner_directory: PathBuf,
+    pub requested_name: String,
+    pub legacy_route: Option<LegacyRouteAuthority>,
+}
+
+/// What a legacy route authorizes: files in its sibling directory, when it
+/// is the directory of the route's source (`legacy_route_authorizes`). Units
+/// of one directory share it, though each route names its own source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LegacyRouteAuthority {
+    pub sibling_directory: PathBuf,
+    pub valid: bool,
+}
+
+impl LegacyRouteAuthority {
+    pub fn of(route: &LegacyRoute) -> Self {
+        let sibling_directory = canonical_path(&route.sibling_directory);
+        let valid = canonical_path(&route.source_path)
+            .parent()
+            .is_some_and(|parent| path_equivalent(parent, &sibling_directory));
+        Self {
+            sibling_directory,
+            valid,
+        }
+    }
+}
+
+/// An include lookup that found nothing, with every observation it recorded
+/// (and the payload bound each was admitted with), so a replay reports the
+/// same dependencies.
+#[derive(Debug)]
+pub struct IncludeFailure {
+    pub observations: Vec<(usize, ResolutionObservation)>,
+    /// Directory entries the search listed (`max_directory_entries`).
+    pub scanned_entries: usize,
+    /// Compile-time work and byte work the search was charged.
+    pub work: usize,
+    pub byte_work: usize,
+}
+
+/// Include lookups that found nothing, shared across sessions (l4d-ig6b):
+/// each unit of a library that includes a file missing from its search path
+/// otherwise searches every directory again. A store is bound to one
+/// resolver configuration (search paths, overrides, read policy, editor
+/// state) and returns an entry only while its observations still hold; it is
+/// never required for correctness.
+pub trait SharedIncludeFailures: Send + Sync {
+    fn get(&self, key: &IncludeFailureKey) -> Option<Arc<IncludeFailure>>;
+    fn put(&self, key: IncludeFailureKey, failure: Arc<IncludeFailure>);
+}
+
+thread_local! {
+    static INCLUDE_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many include lookups searched their directories on this thread since
+/// the last call; replays do not count. For tests.
+#[doc(hidden)]
+pub fn take_include_searches() -> usize {
+    INCLUDE_SEARCHES.with(|searches| searches.replace(0))
 }
 
 enum CaseInsensitiveLookup {

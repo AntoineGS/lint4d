@@ -63,9 +63,10 @@ impl CatalogueScope {
     }
 }
 
-/// Where a catalogue's build stands after a batch: the cursor
-/// `l4d-zf1b.8` resumes from (the pending directories live in the stored
-/// catalogue itself).
+/// Where a catalogue's build stands after a batch: the cursor a bounded
+/// batch resumes from (the pending directories live in the stored catalogue
+/// itself).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CatalogueProgress {
     pub(crate) complete: bool,
@@ -124,9 +125,8 @@ impl Workspace {
             .0)
     }
 
-    /// One bounded batch of `scope`'s catalogue, resumed from the stored one
-    /// (the batch API `l4d-zf1b.8` drives).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// One bounded batch of `scope`'s catalogue, resumed from the stored one.
+    #[cfg(test)]
     pub(super) fn advance_catalogue(
         &mut self,
         scope: &CatalogueScope,
@@ -593,7 +593,7 @@ mod tests {
         write(&root.join("Main.pas"));
         let store = root.join(".cache/lint4d/analysis");
         fs::create_dir_all(store.join("namespaces")).unwrap();
-        fs::write(store.join("analysis.sqlite3"), b"").unwrap();
+        fs::write(store.join("analysis-v7.sqlite3"), b"").unwrap();
         fs::write(store.join("namespaces/0123.lock"), b"").unwrap();
         let cache = crate::persistent_cache::CacheExclusion::new(&store);
 

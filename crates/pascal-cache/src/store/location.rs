@@ -3,7 +3,12 @@ use crate::Digest;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const DATABASE_FILE: &str = "analysis.sqlite3";
+/// The database of this container version. An incompatible container gets
+/// a new name, so a new build opens a fresh file beside the old one, which
+/// is left in place for an administrator to delete; a running server never
+/// deletes it (R9-3). Container 4 and earlier used `analysis.sqlite3`,
+/// container 5 `analysis-v5.sqlite3` and container 6 `analysis-v6.sqlite3`.
+pub const DATABASE_FILE: &str = "analysis-v7.sqlite3";
 const NAMESPACE_LOCKS: &str = "namespaces";
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
@@ -78,9 +83,22 @@ impl StoreLocation {
             .join(format!("{}.lock", namespace.to_hex()))
     }
 
+    /// The recorded size estimate of `namespace` (review I1), beside its
+    /// lock file.
+    pub fn namespace_size(&self, namespace: Digest) -> PathBuf {
+        self.directory
+            .join(NAMESPACE_LOCKS)
+            .join(format!("{}.size", namespace.to_hex()))
+    }
+
     /// The lock file one maintenance step holds exclusively; never removed.
     pub fn maintenance_lock(&self) -> PathBuf {
         self.directory.join(MAINTENANCE_LOCK)
+    }
+
+    /// The directory of the namespace lock files and size records.
+    pub(crate) fn namespace_locks(&self) -> PathBuf {
+        self.directory.join(NAMESPACE_LOCKS)
     }
 
     pub fn prepare_namespace_locks(&self) -> Result<(), Bypass> {
@@ -478,10 +496,21 @@ mod tests {
         assert_eq!(
             location.database_files(),
             [
-                root.path().join("cache/analysis.sqlite3"),
-                root.path().join("cache/analysis.sqlite3-wal"),
-                root.path().join("cache/analysis.sqlite3-shm"),
+                root.path().join("cache/analysis-v7.sqlite3"),
+                root.path().join("cache/analysis-v7.sqlite3-wal"),
+                root.path().join("cache/analysis-v7.sqlite3-shm"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_database_is_named_after_the_container_version() {
+        assert_eq!(
+            DATABASE_FILE,
+            format!(
+                "analysis-v{}.sqlite3",
+                super::super::container::CONTAINER_VERSION
+            )
         );
     }
 

@@ -118,19 +118,22 @@ fn warn_exclude_glob(message: String) {
 
 pub(crate) mod admitted;
 mod authorize;
+pub(crate) mod baseline;
 pub(crate) mod capture;
 mod catalogues;
 mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod compile_time;
-mod eligible;
+pub(crate) mod eligible;
 mod evidence;
 pub(crate) mod extract;
 mod facts;
+pub(crate) mod hydration;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
+pub(crate) mod lexical;
 #[cfg(test)]
 mod navigation_walk_tests;
 #[cfg(test)]
@@ -2274,6 +2277,45 @@ impl ContextKey {
         }
     }
 
+    /// `self` resolved under the runtime selection `scope` → `project`.
+    #[cfg(test)]
+    pub(crate) fn with_selection_for_test(mut self, scope: &Path, project: &Path) -> Self {
+        self.selection_scope = Some(scope.to_path_buf());
+        self.selection_project = Some(project.to_path_buf());
+        self
+    }
+
+    /// Whether `self` and `other` differ at most in the runtime selection
+    /// current when each was resolved (A8). That is provenance, not
+    /// context: a selection that changes the resolved context also changes
+    /// `project_file` or `context_fingerprint`.
+    pub(crate) fn differs_only_in_selection(&self, other: &Self) -> bool {
+        let Self {
+            project_file,
+            installation_id,
+            workspace_root,
+            project_scope,
+            selection_scope: _,
+            selection_project: _,
+            config,
+            platform,
+            build_selection_modes,
+            conditional_context,
+            context_fingerprint,
+            overrides,
+        } = self;
+        *project_file == other.project_file
+            && *installation_id == other.installation_id
+            && *workspace_root == other.workspace_root
+            && *project_scope == other.project_scope
+            && *config == other.config
+            && *platform == other.platform
+            && *build_selection_modes == other.build_selection_modes
+            && *context_fingerprint == other.context_fingerprint
+            && *conditional_context == other.conditional_context
+            && *overrides == other.overrides
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -3095,11 +3137,15 @@ pub(crate) struct ExpansionRecord {
     pub(crate) physical_source: String,
     pub(crate) context_key: ContextKey,
     pub(crate) expanded: ExpandedSource,
-    pub(crate) source_texts: HashMap<Url, String>,
+    pub(crate) source_texts: Arc<HashMap<Url, String>>,
     pub(crate) dependency_entries: HashMap<Url, ProjectPathEntry>,
     pub(crate) include_observations: Vec<crate::include_expansion::IncludeObservation>,
     pub(crate) dependencies: HashSet<Url>,
     pub(crate) complete: bool,
+    /// What workspace symbols need to reuse the parse of this expansion of
+    /// an open document (D49), built once on first use.
+    pub(crate) projection:
+        std::sync::OnceLock<Option<Arc<crate::include_expansion::PhysicalProjection>>>,
 }
 
 impl WorkspaceRoot {
@@ -3261,6 +3307,23 @@ pub struct Workspace {
     project_cache: crate::project_cache::ProjectCache,
     /// The process's persistent-cache handle; inert by default.
     persistent_cache: crate::persistent_cache::PersistentCache,
+    /// The disk-only producer view: no editor state (`WorkspaceInput::disk_baseline`).
+    baseline: bool,
+    /// `WorkspaceInput::session_private_paths`.
+    session_private_paths: Arc<HashSet<String>>,
+    /// The warm crawl publishes the disk-proven units it analyses
+    /// (R8-2/D42). Only the warmer sets it, while the store is enabled.
+    crawl_persists: bool,
+    /// Set when the crawl met a context built from unsaved project input:
+    /// it publishes nothing, and the warmer interleaves extraction.
+    crawl_private: Arc<AtomicBool>,
+    /// Whether each context the crawl met came from saved project files.
+    /// A job's input does not change, so one answer per context holds.
+    crawl_disk_contexts: HashMap<ContextKey, bool>,
+    /// The store's key of the context last proven against (13f).
+    cache_context_key: persist::SharedContextKey,
+    /// The units the crawl considered for publication.
+    crawl_considered: HashSet<Url>,
     /// The store directory as `persistent_cache` gives it (l4d-vrw0).
     cache_base: Option<CacheExclusion>,
     /// `cache_base` in every form a walk of the roots can reach it through
@@ -3285,6 +3348,10 @@ pub struct Workspace {
     /// `true` in an index build view: loads then drop their cache claim
     /// instead of publishing the parse (l4d-33 A13).
     pub(crate) index_build: bool,
+    /// While an index batch extracts one member, when its extraction is
+    /// over: compile-time sessions stop at it as at a cancellation (13b-5,
+    /// A4). `None` for every other analysis, the crawl's included.
+    pub(crate) member_deadline: Option<Instant>,
     /// The context an index build is working in: no prune drops it.
     pinned_context: Option<ContextKey>,
     /// Why the last load that returned `Ok(false)` skipped its file: a read
@@ -3301,23 +3368,47 @@ pub struct Workspace {
     interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
     /// Interface entries this workspace stored that were new or changed.
     interface_entries_stored: usize,
-    /// During a warm crawl, dependencies found by an import load that are
-    /// not indexed yet. The crawl indexes each when it reaches it and drops
-    /// its parse once its imports are stored, so it keeps one unit's parse at
-    /// a time instead of the whole closure's (l4d-10).
-    crawl_deferred: Option<HashMap<Url, DeferredSource>>,
+    /// During the warmer's crawl, the units it released. The crawl drops
+    /// each dependency's parse once it is indexed, stored and published, and
+    /// each walked unit's once its imports are stored, so it keeps one
+    /// unit's parse at a time instead of the whole closure's (l4d-10).
+    crawl_deferred: Option<CrawlRelease>,
 }
 
-/// A dependency the warm crawl found but has not indexed yet, with what its
-/// import load would have indexed it from.
+#[derive(Default)]
+struct CrawlRelease {
+    units: HashMap<Url, CrawlUnit>,
+    /// The distinct contexts of the released units: a key is large, and a
+    /// crawl's units share a few.
+    keys: Vec<Arc<ContextKey>>,
+}
+
+impl CrawlRelease {
+    fn key(&mut self, key: &ContextKey) -> Arc<ContextKey> {
+        if let Some(shared) = self.keys.iter().find(|shared| ***shared == *key) {
+            return shared.clone();
+        }
+        let shared = Arc::new(key.clone());
+        self.keys.push(shared.clone());
+        shared
+    }
+}
+
+/// A unit the warmer's crawl released.
+enum CrawlUnit {
+    /// Indexed, stored, published and dropped; walked from its text.
+    Released(DeferredSource),
+    /// Walked and dropped.
+    Walked,
+}
+
+/// A dependency the warm crawl released, with what its import load indexed
+/// it from.
 struct DeferredSource {
     text: String,
     disk_size: Option<usize>,
     raw_content_hash: Option<u64>,
-    context_key: ContextKey,
-    /// Indexed once already (and its parse released), so the crawl need not
-    /// index it again unless it walks it.
-    indexed_once: bool,
+    context_key: Arc<ContextKey>,
     /// Charges `text` to the cache budget while the crawl holds it. Absent
     /// when the budget had no room; the crawl keeps the text regardless.
     _charge: Option<crate::project_cache::Reservation>,
@@ -3907,8 +3998,45 @@ impl Workspace {
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
             request_generation: input.request_generation,
+            baseline: input.baseline,
+            session_private_paths: Arc::clone(&input.session_private_paths),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn is_baseline(&self) -> bool {
+        self.baseline
+    }
+
+    /// Whether every project metadata file `key`'s context consulted is
+    /// saved: none is deleted, or open with a buffer that differs from its
+    /// saved bytes, in this workspace or, for a baseline view, in the
+    /// session it was derived from (spec §4.4; an unedited open buffer is
+    /// no private input, controller ruling l4d-zf1b.8).
+    pub(crate) fn context_inputs_are_disk_only(&self, key: &ContextKey) -> bool {
+        let Some(state) = self.contexts.get(key) else {
+            return false;
+        };
+        let deleted = resolver::deletion_overrides_by_path(&self.deleted_overrides);
+        state
+            .context_observations
+            .metadata_files
+            .iter()
+            .map(|path| absolute_path(path.clone()))
+            .all(|path| {
+                let Ok(uri) = Url::from_file_path(&path) else {
+                    return false;
+                };
+                let edited = [&uri, &canonical_file_uri(&uri)]
+                    .into_iter()
+                    .filter_map(|uri| self.open_documents.get(uri)?.text.as_ref())
+                    .any(|text| rename::overlay_differs_from_disk(&path, text));
+                !self
+                    .session_private_paths
+                    .contains(&rename::path_key(&path))
+                    && !resolver::deletion_applies(&deleted, &path)
+                    && !edited
+            })
     }
 
     pub(crate) fn set_best_effort_navigation(&mut self, best_effort: bool) {
@@ -5616,7 +5744,7 @@ impl Workspace {
                 expansion
                     .expanded
                     .visit_recovery_payload(&mut charge_retained_payload)?;
-                for (uri, source) in &expansion.source_texts {
+                for (uri, source) in expansion.source_texts.iter() {
                     charge_retained_payload(uri.as_str().len())?;
                     charge_retained_payload(source.len())?;
                 }
@@ -7977,8 +8105,10 @@ impl Workspace {
             // Background work over a whole closure gives way to interactive
             // requests between units.
             #[cfg(feature = "test-support")]
-            if index == 1 && crate::warmer::has_background_gate_on_this_thread() {
-                wait_at_background_walk_test_barrier();
+            if crate::warmer::has_background_gate_on_this_thread() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER", index);
+            } else if self.dependency_hook.is_some() {
+                wait_at_walk_test_barrier("PASCAL_LSP_TEST_WARM_CRAWL_BARRIER", index);
             }
             if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
                 return Err(CANCELLATION_MESSAGE.to_string());
@@ -8014,24 +8144,18 @@ impl Workspace {
                         .index
                         .source_text(&dependency_uri)
                         .is_some_and(|source| source == dependency_text);
-                let deferred = !already_indexed
-                    && self.crawl_deferred.as_mut().is_some_and(|deferred| {
-                        deferred
-                            .entry(dependency_uri.clone())
-                            .or_insert_with(|| DeferredSource {
-                                _charge: self.project_cache.reserve(
-                                    crate::project_cache::ReservationKind::CrawlSources,
-                                    dependency_text.len(),
-                                ),
-                                text: dependency_text.clone(),
-                                disk_size,
-                                raw_content_hash,
-                                context_key: effective_context_key.clone(),
-                                indexed_once: false,
-                            });
-                        true
-                    });
-                let indexed = if already_indexed || deferred {
+                // A warm crawl indexed and released it already: its entries
+                // are stored and it was published (l4d-10).
+                let released = !already_indexed
+                    && self
+                        .crawl_deferred
+                        .as_ref()
+                        .is_some_and(|release| release.units.contains_key(&dependency_uri));
+                // A crawl keeps the text of a unit it releases, to index it
+                // again when its walk reaches it.
+                let release_text = (!already_indexed && !released && self.crawl_deferred.is_some())
+                    .then(|| dependency_text.clone());
+                let indexed = if already_indexed || released {
                     true
                 } else {
                     self.index_source_with_cancel(
@@ -8080,6 +8204,22 @@ impl Workspace {
                     )?;
                     if !dependencies.contains(&dependency_uri) {
                         dependencies.push(dependency_uri.clone());
+                    }
+                    if !released {
+                        self.publish_crawled_unit(
+                            &dependency_uri,
+                            &dependency.source.revision,
+                            cancel.unwrap_or(&no_cancel),
+                        );
+                    }
+                    if let Some(text) = release_text {
+                        self.release_crawled_dependency(
+                            &dependency_uri,
+                            text,
+                            disk_size,
+                            raw_content_hash,
+                            &effective_context_key,
+                        );
                     }
                 }
             }
@@ -8231,6 +8371,16 @@ impl Workspace {
         self.dependency_hook = Some(hook);
     }
 
+    /// The warm crawl publishes the disk-proven units it analyses (R8-2/D42).
+    pub(crate) fn set_crawl_persists(&mut self, persists: bool) {
+        self.crawl_persists = persists;
+    }
+
+    /// Set once the crawl meets a context built from unsaved project input.
+    pub(crate) fn crawl_private_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.crawl_private)
+    }
+
     /// Loads `uri` and every direct import into the shared cache, and keeps
     /// what it walked indexed in this workspace.
     #[cfg(test)]
@@ -8276,7 +8426,7 @@ impl Workspace {
         // A crawl's product is the shared cache: the source records of the
         // closure it walks and releases would only grow this workspace.
         let records = if release {
-            self.crawl_deferred = Some(HashMap::new());
+            self.crawl_deferred = Some(CrawlRelease::default());
             Some(self.analysis_records.take())
         } else {
             None
@@ -8342,10 +8492,10 @@ impl Workspace {
                 hook(&unit, finished, finished + frontier.len() + 1)?;
             }
             done += 1;
-            let indexed = self.index_deferred_source(&unit, context_key, pinned, cancel)?;
-            // A walked unit is never walked again.
-            if let Some(deferred) = self.crawl_deferred.as_mut() {
-                deferred.remove(&unit);
+            let indexed = self.index_released_unit(&unit, context_key, pinned, cancel)?;
+            // A walked unit is never walked again: drop its text.
+            if let Some(release) = self.crawl_deferred.as_mut() {
+                release.units.insert(unit.clone(), CrawlUnit::Walked);
             }
             if !indexed {
                 continue;
@@ -8377,27 +8527,24 @@ impl Workspace {
                     }
                 }
             }
-            self.index_unwalked_deferred_sources(root, &visited, context_key, pinned, cancel)?;
         }
-        let unwalked = HashSet::new();
-        self.index_unwalked_deferred_sources(root, &unwalked, context_key, pinned, cancel)?;
         Ok(closure)
     }
 
-    /// Indexes a dependency the crawl deferred, as its import load would
-    /// have. False when it could not be indexed; a unit that was not
-    /// deferred is indexed already.
-    fn index_deferred_source(
+    /// Indexes again, for its walk, a unit the crawl released (l4d-10).
+    /// False when it could not be indexed; a unit the crawl did not release
+    /// is indexed already.
+    fn index_released_unit(
         &mut self,
         uri: &Url,
         fallback_context: &ContextKey,
         pinned: &HashSet<Url>,
         cancel: &AtomicBool,
     ) -> Result<bool, String> {
-        let Some(source) = self
+        let Some(CrawlUnit::Released(source)) = self
             .crawl_deferred
             .as_ref()
-            .and_then(|deferred| deferred.get(uri))
+            .and_then(|release| release.units.get(uri))
         else {
             return Ok(self.index.contains(uri));
         };
@@ -8406,8 +8553,8 @@ impl Workspace {
         }
         let text = source.text.clone();
         let (disk_size, raw_content_hash) = (source.disk_size, source.raw_content_hash);
-        let context_key = if self.contexts.contains_key(&source.context_key) {
-            source.context_key.clone()
+        let context_key = if self.contexts.contains_key(&*source.context_key) {
+            (*source.context_key).clone()
         } else {
             fallback_context.clone()
         };
@@ -8424,14 +8571,39 @@ impl Workspace {
         if indexed && let Some(stamp) = stamp {
             self.disk_stamps.insert(uri.clone(), stamp);
         }
-        if let Some(source) = self
-            .crawl_deferred
-            .as_mut()
-            .and_then(|deferred| deferred.get_mut(uri))
-        {
-            source.indexed_once = true;
-        }
         Ok(indexed)
+    }
+
+    /// Drops a dependency the crawl just indexed, stored and published from
+    /// this workspace, keeping its text for its walk (l4d-10).
+    fn release_crawled_dependency(
+        &mut self,
+        uri: &Url,
+        text: String,
+        disk_size: Option<usize>,
+        raw_content_hash: Option<u64>,
+        context_key: &ContextKey,
+    ) {
+        if self.open_documents.contains_key(uri) {
+            return;
+        }
+        let Some(release) = self.crawl_deferred.as_mut() else {
+            return;
+        };
+        let source = DeferredSource {
+            _charge: self.project_cache.reserve(
+                crate::project_cache::ReservationKind::CrawlSources,
+                text.len(),
+            ),
+            text,
+            disk_size,
+            raw_content_hash,
+            context_key: release.key(context_key),
+        };
+        release
+            .units
+            .insert(uri.clone(), CrawlUnit::Released(source));
+        self.drop_crawled_parse(uri);
     }
 
     /// Drops a crawled unit's parse from this workspace; the shared cache
@@ -8440,41 +8612,19 @@ impl Workspace {
         if self.crawl_deferred.is_none() || uri == root || self.open_documents.contains_key(uri) {
             return;
         }
+        self.drop_crawled_parse(uri);
+    }
+
+    fn drop_crawled_parse(&mut self, uri: &Url) {
         let stamp = self.disk_stamps.get(uri).cloned();
         let _ = self.remove_indexed_with_control(uri, None, None, false);
+        // Its owner holds a copy of its context's key, kilobytes each; the
+        // crawl indexes it again under the key it released it with.
+        self.document_owners.remove(uri);
+        self.owner_last_used.remove(uri);
         if let Some(stamp) = stamp {
             self.disk_stamps.insert(uri.clone(), stamp);
         }
-    }
-
-    /// Indexes, one at a time, the deferred dependencies the crawl will not
-    /// walk (implementation imports, or past the walk's end), so the shared
-    /// cache gets their parses as before, and releases each.
-    fn index_unwalked_deferred_sources(
-        &mut self,
-        root: &Url,
-        walked: &HashSet<Url>,
-        context_key: &ContextKey,
-        pinned: &HashSet<Url>,
-        cancel: &AtomicBool,
-    ) -> Result<(), String> {
-        let pending = self
-            .crawl_deferred
-            .as_ref()
-            .map(|deferred| {
-                deferred
-                    .iter()
-                    .filter(|(uri, source)| !source.indexed_once && !walked.contains(*uri))
-                    .map(|(uri, _)| uri.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for uri in pending {
-            check_workspace_cancel(Some(cancel))?;
-            self.index_deferred_source(&uri, context_key, pinned, cancel)?;
-            self.release_crawled_unit(root, &uri);
-        }
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -9030,10 +9180,21 @@ impl Workspace {
             budget.check_cancelled()?;
         }
         if let (Some(claim), Some(parsed)) = (claim, self.index.parsed_document(uri)) {
-            let probes = cached_expansion
+            let mut probes = cached_expansion
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
+            // The expansion's root revision is the buffer's: a load of the
+            // closed file must not take it (its facts would never persist).
+            if cached_expansion.is_some()
+                && let Some(document) = self.open_documents.get(uri)
+            {
+                probes.push(crate::project_cache::Probe::Overlay {
+                    uri: canonical_file_uri(uri),
+                    version: document.version,
+                    content_hash: source_hash,
+                });
+            }
             let disk =
                 disk_origin.map(
                     |(stamp, raw_bytes, text)| crate::project_cache::DiskOrigin {
@@ -9319,11 +9480,12 @@ impl Workspace {
                 physical_source,
                 context_key: context_key.clone(),
                 expanded: result.expanded,
-                source_texts,
+                source_texts: Arc::new(source_texts),
                 dependency_entries,
                 include_observations,
                 dependencies,
                 complete: result.complete,
+                projection: std::sync::OnceLock::new(),
             },
         );
         check_workspace_cancel(cancel)?;
@@ -9387,8 +9549,9 @@ impl Workspace {
         let dependency_entries = expansion.dependency_entries.clone();
         let mut dependencies = expansion
             .source_texts
-            .into_iter()
-            .filter(|(uri, _)| uri != root_uri)
+            .iter()
+            .filter(|(uri, _)| *uri != root_uri)
+            .map(|(uri, source)| (uri.clone(), source.clone()))
             .collect::<Vec<_>>();
         dependencies.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         for (uri, source) in dependencies {
@@ -14521,7 +14684,6 @@ impl Workspace {
         &self.project_cache
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 publishes and reuses through it
     pub(crate) fn persistent_cache(&self) -> &crate::persistent_cache::PersistentCache {
         &self.persistent_cache
     }
@@ -16983,18 +17145,31 @@ fn wait_at_import_claim_test_barrier() {
     }
 }
 
-/// Holds background work (diagnostics) after the first unit of a closure
-/// walk, so protocol tests can issue interactive work while it runs.
+/// Holds a closure walk before its unit `index` when `variable` is
+/// `entered|release[|units]` and `index == units` (default 1): background
+/// work (diagnostics, `PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER`) so protocol
+/// tests can issue interactive work while it runs, or the warm crawl
+/// (`PASCAL_LSP_TEST_WARM_CRAWL_BARRIER`) once it has analysed and published
+/// exactly `units` units; a reuse batch
+/// (`PASCAL_LSP_TEST_REUSE_PASS_BARRIER`) once it has reused `units` members.
 #[cfg(feature = "test-support")]
-fn wait_at_background_walk_test_barrier() {
+fn wait_at_walk_test_barrier(variable: &str, index: usize) {
     use std::io::Write as _;
 
-    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_BACKGROUND_WALK_BARRIER") else {
+    let Ok(spec) = std::env::var(variable) else {
         return;
     };
-    let Some((entered, release)) = spec.split_once('|') else {
+    let mut fields = spec.split('|');
+    let (Some(entered), Some(release)) = (fields.next(), fields.next()) else {
         return;
     };
+    let units = fields
+        .next()
+        .and_then(|units| units.parse::<usize>().ok())
+        .unwrap_or(1);
+    if index != units {
+        return;
+    }
     if let Ok(mut marker) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -18247,11 +18422,12 @@ mod tests {
                     physical_source: String::new(),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
         }
@@ -18415,11 +18591,12 @@ mod tests {
                     physical_source: format!("unit Root{index};"),
                     context_key: budget_test_context_key(index),
                     expanded: crate::include_expansion::ExpandedSource::default(),
-                    source_texts: HashMap::new(),
+                    source_texts: Arc::default(),
                     dependency_entries: HashMap::new(),
                     include_observations: Vec::new(),
                     dependencies: HashSet::from([changed_uri.clone()]),
                     complete: true,
+                    projection: std::sync::OnceLock::new(),
                 },
             );
             workspace
@@ -18794,6 +18971,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: context.into(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18835,6 +19013,7 @@ mod tests {
             crate::workspace::rename::CachedDocument {
                 context: Arc::default(),
                 parsed,
+                projection: None,
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18865,11 +19044,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: key,
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -18900,11 +19080,12 @@ mod tests {
                 physical_source: String::new(),
                 context_key: budget_test_context_key(0),
                 expanded,
-                source_texts: HashMap::new(),
+                source_texts: Arc::default(),
                 dependency_entries: HashMap::new(),
                 include_observations: Vec::new(),
                 dependencies: HashSet::new(),
                 complete: true,
+                projection: std::sync::OnceLock::new(),
             },
         );
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -26026,13 +26207,14 @@ BDS = '/fake/37'
         assert_eq!(options.limits.max_cache_bytes, 1_048_576);
 
         let workspace = test_workspace(vec![temp.path().to_path_buf()], options);
-        // Past half of a 1 MiB budget, so its pin does not hold it (l4d-10);
-        // under the 2 GiB default it would.
-        store_pinned_test_import(&workspace, temp.path(), 768 * 1024);
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
+        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        let stats = workspace.project_cache.stats();
-        assert_eq!(stats.bytes, 768 * 1024);
-        assert_eq!(stats.pinned_bytes, 0);
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[test]
@@ -26119,13 +26301,14 @@ BDS = '/fake/37'
         .expect("prepared runtime options");
 
         assert!(workspace.apply_prepared_runtime_options(prepared));
-        // Past half of a 1 MiB budget, so its pin does not hold it (l4d-10);
-        // under the 2 GiB default it would.
-        store_pinned_test_import(&workspace, temp.path(), 768 * 1024);
+        assert_eq!(workspace.project_cache.max_bytes(), 1_048_576);
+        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
 
-        let stats = workspace.project_cache.stats();
-        assert_eq!(stats.bytes, 768 * 1024);
-        assert_eq!(stats.pinned_bytes, 0);
+        // Pins hold at most half the budget (l4d-axsn): the 2 MiB entry is
+        // left unpinned and evicted to fit the 1 MiB budget.
+        assert_eq!(workspace.project_cache.stats().bytes, 0);
+        assert_eq!(workspace.project_cache.stats().pinned_bytes, 0);
+        assert!(workspace.project_cache.has_room());
     }
 
     #[cfg(unix)]
@@ -26447,6 +26630,8 @@ BDS = '/fake/37'
             source_generation: 0,
             request_generation: 0,
             configuration_generation: 0,
+            baseline: false,
+            session_private_paths: Default::default(),
         };
         let entry = ProjectPathEntry {
             path: root.clone(),

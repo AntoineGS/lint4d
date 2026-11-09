@@ -4,8 +4,8 @@ mod common;
 use common::private_tempdir;
 
 use pascal_cache::{
-    Bypass, Digest, LimitsError, LocationIssue, MAX_WAIT, Namespace, Reclaimed, RetireReport,
-    Store, StoreLimits,
+    Bypass, DATABASE_FILE, Digest, LimitsError, LocationIssue, MAX_WAIT, Namespace, Reclaimed,
+    RetireReport, Store, StoreLimits,
 };
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -19,8 +19,18 @@ fn open(directory: &Path, byte: u8) -> Store {
     Store::open(directory, &namespace(byte), StoreLimits::default()).unwrap()
 }
 
+/// A store that keeps only its own namespace: it retires every other one
+/// no process holds (l4d-1ypi keeps three by default).
+fn open_alone(directory: &Path, byte: u8) -> Store {
+    let limits = StoreLimits {
+        max_namespaces: 1,
+        ..StoreLimits::default()
+    };
+    Store::open(directory, &namespace(byte), limits).unwrap()
+}
+
 fn raw(directory: &Path) -> Connection {
-    let connection = Connection::open(directory.join("analysis.sqlite3")).unwrap();
+    let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }
@@ -42,7 +52,7 @@ fn opening_creates_the_store_and_registers_the_namespace() {
     let store = open(&directory, 1);
     assert_eq!(store.scope().namespace, namespace(1).id());
     assert_eq!(store.scope().reset_epoch, 0);
-    assert!(directory.join("analysis.sqlite3").is_file());
+    assert!(directory.join(DATABASE_FILE).is_file());
     assert!(store.location().namespace_lock(namespace(1).id()).is_file());
     assert_eq!(state(&directory, 1), Some((0, 1)));
     assert_eq!(store.check_scope(), Ok(()));
@@ -66,20 +76,22 @@ fn invalid_limits_are_a_configuration_bypass() {
         Store::open(root.path(), &namespace(1), limits).err(),
         Some(Bypass::InvalidLimits(LimitsError::Readers))
     );
-    assert!(!root.path().join("analysis.sqlite3").exists());
+    assert!(!root.path().join(DATABASE_FILE).exists());
 }
 
 #[test]
 fn a_namespace_in_use_is_not_retired() {
     let root = private_tempdir();
     let old = open(root.path(), 1);
-    let new = open(root.path(), 2);
+    let new = open_alone(root.path(), 2);
     assert_eq!(state(root.path(), 1), Some((0, 1)));
     assert_eq!(
         new.retire_obsolete(),
         Ok(RetireReport {
             retired: 0,
-            in_use: 1
+            in_use: 1,
+            kept: 0,
+            unknown_size: 0,
         })
     );
     assert_eq!(old.check_scope(), Ok(()));
@@ -91,7 +103,7 @@ fn an_unused_namespace_is_retired_and_its_lock_removed() {
     let old = open(root.path(), 1);
     let lock = old.location().namespace_lock(namespace(1).id());
     drop(old);
-    let _new = open(root.path(), 2);
+    let _new = open_alone(root.path(), 2);
     assert_eq!(state(root.path(), 1), Some((0, 2)));
     assert!(!lock.exists());
     let retired: i64 = raw(root.path())
@@ -104,7 +116,7 @@ fn an_unused_namespace_is_retired_and_its_lock_removed() {
 fn a_retired_namespace_reopens_in_a_new_epoch() {
     let root = private_tempdir();
     drop(open(root.path(), 1));
-    let new = open(root.path(), 2);
+    let new = open_alone(root.path(), 2);
     let again = open(root.path(), 1);
     assert_eq!(again.scope().reset_epoch, 1);
     assert_eq!(state(root.path(), 1), Some((1, 1)));
@@ -112,7 +124,9 @@ fn a_retired_namespace_reopens_in_a_new_epoch() {
         new.retire_obsolete(),
         Ok(RetireReport {
             retired: 0,
-            in_use: 1
+            in_use: 1,
+            kept: 0,
+            unknown_size: 0,
         })
     );
 }
@@ -165,7 +179,7 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO artifacts VALUES (?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'', 1)",
+                "INSERT INTO artifacts VALUES (NULL, ?1, ?5, ?2, 2, NULL, 1, ?3, 0, ?4, x'', 1)",
                 params![
                     ns.as_bytes().as_slice(),
                     id.as_slice(),
@@ -175,17 +189,12 @@ fn plant_at(directory: &Path, byte: u8, epoch: i64, artifacts: u8, rows: i64) {
                 ],
             )
             .unwrap();
+        let artifact_ref = connection.last_insert_rowid();
         for ordinal in 0..rows {
             connection
                 .execute(
-                    "INSERT INTO artifact_rows VALUES (?1, ?5, ?2, ?3, 1, NULL, x'', ?4)",
-                    params![
-                        ns.as_bytes().as_slice(),
-                        id.as_slice(),
-                        ordinal,
-                        [0u8; 32].as_slice(),
-                        epoch
-                    ],
+                    "INSERT INTO artifact_rows VALUES (?1, ?2, 0, 1, NULL, x'')",
+                    params![artifact_ref, ordinal],
                 )
                 .unwrap();
         }
@@ -197,7 +206,7 @@ fn reclaim_deletes_retired_scopes_in_bounded_batches() {
     let root = private_tempdir();
     drop(open(root.path(), 1));
     plant(root.path(), 1, 3, 4); // 12 rows + 3 headers + 3 manifests
-    let store = open(root.path(), 2); // retires namespace 1
+    let store = open_alone(root.path(), 2); // retires namespace 1
     let mut total = 0;
     let mut passes = 0;
     loop {
@@ -239,7 +248,7 @@ fn reclaim_spares_a_namespace_that_is_live_again_at_a_later_epoch() {
     let root = private_tempdir();
     drop(open(root.path(), 1));
     plant(root.path(), 1, 2, 3); // epoch 0: 6 rows + 2 headers + 2 manifests
-    drop(open(root.path(), 2)); // retires namespace 1 at epoch 0
+    drop(open_alone(root.path(), 2)); // retires namespace 1 at epoch 0
     let store = open(root.path(), 1); // live again at epoch 1
     assert_eq!(store.scope().reset_epoch, 1);
     plant_at(root.path(), 1, 1, 1, 2);
@@ -251,9 +260,12 @@ fn reclaim_spares_a_namespace_that_is_live_again_at_a_later_epoch() {
     let connection = raw(root.path());
     let epochs = |table: &str| -> Vec<i64> {
         let mut statement = connection
-            .prepare(&format!(
-                "SELECT DISTINCT reset_epoch FROM {table} ORDER BY 1"
-            ))
+            .prepare(
+                &format!("SELECT DISTINCT reset_epoch FROM {table} ORDER BY 1").replace(
+                    "FROM artifact_rows",
+                    "FROM artifact_rows JOIN artifacts USING (artifact_ref)",
+                ),
+            )
             .unwrap();
         statement
             .query_map([], |row| row.get(0))
@@ -319,9 +331,8 @@ fn a_symlinked_database_is_bypassed() {
     let root = private_tempdir();
     let directory = root.path().join("cache");
     drop(open(&directory, 1));
-    std::fs::rename(directory.join("analysis.sqlite3"), root.path().join("real")).unwrap();
-    std::os::unix::fs::symlink(root.path().join("real"), directory.join("analysis.sqlite3"))
-        .unwrap();
+    std::fs::rename(directory.join(DATABASE_FILE), root.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(root.path().join("real"), directory.join(DATABASE_FILE)).unwrap();
     assert_eq!(
         Store::open(&directory, &namespace(1), StoreLimits::default()).err(),
         Some(Bypass::Location(LocationIssue::Symlink))
@@ -352,7 +363,7 @@ fn corrupt_and_unsupported_containers_are_bypassed() {
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(corrupt.join("analysis.sqlite3"), vec![0x5a; 8192]).unwrap();
+    std::fs::write(corrupt.join(DATABASE_FILE), vec![0x5a; 8192]).unwrap();
     assert_eq!(
         Store::open(&corrupt, &namespace(1), StoreLimits::default()).err(),
         Some(Bypass::Corrupt)
@@ -392,6 +403,7 @@ fn retirement_under_a_held_write_lock_ends_within_the_open_wait() {
     let wait = Duration::from_millis(200);
     let limits = StoreLimits {
         open_wait: wait,
+        max_namespaces: 1,
         ..StoreLimits::default()
     };
     let store = Store::open(root.path(), &namespace(1), limits).unwrap();
@@ -413,7 +425,9 @@ fn retirement_under_a_held_write_lock_ends_within_the_open_wait() {
         store.retire_obsolete(),
         Ok(RetireReport {
             retired: 8,
-            in_use: 0
+            in_use: 0,
+            kept: 0,
+            unknown_size: 8,
         })
     );
 }
@@ -454,7 +468,7 @@ fn a_lock_file_that_cannot_be_removed_does_not_undo_retirement() {
     }
     let root = private_tempdir();
     let directory = root.path().join("cache");
-    let store = open(&directory, 2);
+    let store = open_alone(&directory, 2);
     drop(open(&directory, 1)); // namespace 2 is held, so it stays live
     let locks = directory.join("namespaces");
     let mode = |mode| {
@@ -468,7 +482,9 @@ fn a_lock_file_that_cannot_be_removed_does_not_undo_retirement() {
         report,
         Ok(RetireReport {
             retired: 1,
-            in_use: 0
+            in_use: 0,
+            kept: 0,
+            unknown_size: 1,
         })
     );
     assert_eq!(state(&directory, 1), Some((0, 2)));

@@ -180,7 +180,21 @@ fn import_bytes(import: &ImportFact) -> usize {
     4 + LENGTH_BYTES + import.display.len() + 1 + location_bytes(&import.location) + 2
 }
 
-const INCLUDE_BYTES: usize = 17;
+/// The fixed part of an include row: slot, parent, range, expansion tag and
+/// the source's presence flag.
+const INCLUDE_BYTES: usize = 18;
+
+/// The canonical path encoding's size: its tag, `u64` length and bytes.
+#[cfg(unix)]
+fn path_bytes(path: &std::path::Path) -> usize {
+    1 + LENGTH_BYTES + path.as_os_str().len()
+}
+
+#[cfg(windows)]
+fn path_bytes(path: &std::path::Path) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    1 + LENGTH_BYTES + 2 * path.as_os_str().encode_wide().count()
+}
 
 fn segment_bytes(segment: &SegmentFact) -> usize {
     9 + match segment.target {
@@ -268,8 +282,11 @@ pub fn encoded_content_bytes(facts: &ArtifactFacts) -> Result<usize, TooLarge> {
             )?;
         }
     }
-    for _ in &facts.includes {
-        plan.row(None, INCLUDE_BYTES)?;
+    for include in &facts.includes {
+        plan.row(
+            None,
+            INCLUDE_BYTES + include.source.as_deref().map_or(0, path_bytes),
+        )?;
     }
     for segment in &facts.segments {
         plan.row(None, segment_bytes(segment))?;
@@ -372,6 +389,9 @@ pub fn encode_facts(facts: &ArtifactFacts) -> Result<EncodedFacts, TooLarge> {
             encoder.u32(include.parent);
             range(encoder, include.directive);
             encoder.u8(expansion_tag(include.expansion));
+            encoder.option(include.source.as_deref(), |encoder, path| {
+                crate::CanonicalEncode::encode(path, encoder)
+            });
         }));
     }
     for segment in &facts.segments {

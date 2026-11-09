@@ -11,6 +11,7 @@ use super::health::Access;
 use super::location::StoreLocation;
 use super::namespaces::open_lock_file;
 use super::outcome::Bypass;
+use super::retention::{Estimate, Ranked};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,9 @@ use std::time::{Duration, Instant};
 pub struct StepBudget {
     /// Real elapsed time; checked before every transaction.
     pub time: Duration,
-    /// Rows the step's transactions change at most (vacuum pages count as
-    /// rows; lease renewals and hint flushes do not).
+    /// Rows the step's transactions change at most (vacuum pages and the
+    /// entries a namespace size estimate reads count as rows; lease
+    /// renewals and hint flushes do not).
     pub rows: usize,
 }
 
@@ -33,7 +35,9 @@ pub enum Phase {
     Leases,
     /// A passive checkpoint (and truncation when complete).
     Checkpoint,
-    /// Retire namespaces no live process holds.
+    /// Retire the namespaces retention does not keep and no live process
+    /// holds (`Store::retire_obsolete`); under disk pressure, estimate the
+    /// size of the next kept one, bounded per cycle.
     ObsoleteNamespaces,
     AbandonedBuilds,
     UnusedSnapshots,
@@ -91,7 +95,17 @@ pub struct StepReport {
 pub struct Maintenance {
     limits: MaintenanceLimits,
     phase: Phase,
+    /// The kept namespace this cycle's `ObsoleteNamespaces` phase
+    /// estimates, if any (review I-new-1).
+    estimating: Option<Ranked>,
+    /// Estimate entries this cycle read, at most
+    /// [`MAX_ESTIMATE_ROWS_PER_CYCLE`].
+    estimated_rows: usize,
 }
+
+/// Estimate entries one cycle reads at most before it goes on to the
+/// phases that give disk back; the scan resumes in the next cycle.
+pub(crate) const MAX_ESTIMATE_ROWS_PER_CYCLE: usize = 4096;
 
 /// What one phase transaction did.
 enum Ran {
@@ -117,6 +131,8 @@ impl Maintenance {
         Ok(Self {
             limits,
             phase: Phase::Hints,
+            estimating: None,
+            estimated_rows: 0,
         })
     }
 
@@ -182,6 +198,8 @@ impl Maintenance {
         store.renew_lease()?;
         if self.phase == Phase::Done {
             self.phase = Phase::Hints;
+            self.estimating = None;
+            self.estimated_rows = 0;
         }
         loop {
             report.phase = self.phase;
@@ -217,7 +235,7 @@ impl Maintenance {
 
     /// One transaction of the current phase, changing at most `left` rows
     /// (`left >= 1`).
-    fn run_phase(&self, store: &Store, left: usize) -> Result<Ran, Bypass> {
+    fn run_phase(&mut self, store: &Store, left: usize) -> Result<Ran, Bypass> {
         let limits = MaintenanceLimits {
             batch_rows: self.limits.batch_rows.min(left),
             vacuum_pages: self.limits.vacuum_pages.min(left),
@@ -250,7 +268,7 @@ impl Maintenance {
             }),
             Phase::Checkpoint => Ran::of(store.checkpoint().map(|_| (0, true))),
             Phase::ObsoleteNamespaces => Ran::of(if unpressured()? {
-                store.retire_obsolete().map(|_| (0, true))
+                self.obsolete_namespaces(store, batch)
             } else {
                 Err(Bypass::WalPressure)
             }),
@@ -274,6 +292,47 @@ impl Maintenance {
             Phase::Evidence => retire(RetireStep::Evidence),
             Phase::Artifacts => retire(RetireStep::Artifacts),
         }
+    }
+}
+
+impl Maintenance {
+    /// One transaction of `ObsoleteNamespaces` (reviews I-new-1, M-r2-2):
+    /// the retirement pass first, which waits for no estimate. When it
+    /// stopped at a retirement of unknown size with the excess not covered,
+    /// the next kept namespace is estimated, one chunk of at most `batch`
+    /// entries per transaction and [`MAX_ESTIMATE_ROWS_PER_CYCLE`] per
+    /// cycle, so a later pass may retire past it; then the cycle goes on,
+    /// and the scan resumes in the next one.
+    fn obsolete_namespaces(
+        &mut self,
+        store: &Store,
+        batch: usize,
+    ) -> Result<(usize, bool), Bypass> {
+        let Some(target) = self.estimating else {
+            let (_, next) = store.retire_pass()?;
+            return Ok(match next {
+                Some(target) if self.estimated_rows < MAX_ESTIMATE_ROWS_PER_CYCLE => {
+                    self.estimating = Some(target);
+                    (1, false)
+                }
+                _ => (0, true),
+            });
+        };
+        let limit = batch.min(MAX_ESTIMATE_ROWS_PER_CYCLE - self.estimated_rows);
+        if limit == 0 {
+            self.estimating = None;
+            return Ok((0, true));
+        }
+        Ok(match store.estimate_for(&target, limit)? {
+            Estimate::Read(rows) => {
+                self.estimated_rows += rows;
+                (rows, false)
+            }
+            Estimate::Done | Estimate::Abandoned => {
+                self.estimating = None;
+                (0, true)
+            }
+        })
     }
 }
 

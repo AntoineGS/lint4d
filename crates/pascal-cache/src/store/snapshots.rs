@@ -41,6 +41,11 @@ impl SnapshotId {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// The right to add members to one building snapshot and seal it. A copy

@@ -124,6 +124,26 @@ pub fn member(path: &str, targets: &[&str], evidence: Digest) -> MemberRecord {
     }
 }
 
+/// A member at `path` whose one import is ambiguous between `candidates`.
+pub fn ambiguous(
+    path: &str,
+    candidates: &[&str],
+    overflow: bool,
+    evidence: Digest,
+) -> MemberRecord {
+    let mut record = member(path, &[], evidence);
+    record.bindings.push(Binding {
+        kind: BindingKind::Import,
+        occurrence: 0,
+        outcome: BindingOutcome::Ambiguous {
+            candidates: candidates.iter().map(|c| identity(c)).collect(),
+            overflow,
+        },
+        evidence: Some(evidence),
+    });
+    record
+}
+
 /// The whole record, read and verified, or the miss that ended the read.
 pub fn read_record(store: &Store, id: Digest) -> Result<MemberRecord, Miss> {
     let header = match store.open_member_record(id).unwrap() {

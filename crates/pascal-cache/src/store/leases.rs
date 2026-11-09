@@ -218,7 +218,9 @@ impl Store {
             }
             ensure_live(&transaction, self.scope)?;
             renew(&transaction, self.scope, &self.lease, now)?;
-            transaction.commit().map_err(|error| classify(&error))
+            transaction.commit().map_err(|error| classify(&error))?;
+            self.refresh_use(now);
+            Ok(())
         })
     }
 

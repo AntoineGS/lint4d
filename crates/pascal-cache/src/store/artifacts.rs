@@ -8,7 +8,7 @@ use super::limits::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ROWS, MAX_INDEX_KEY_BYTES, MAX_ROW_BATCH_BYTES,
     MAX_SUPPLEMENTAL_BYTES,
 };
-use super::namespaces::{LIVE, Scope, ensure_live, epoch};
+use super::namespaces::{LIVE, Scope, ensure_live, ensure_scope_ref, epoch};
 use super::outcome::{Bypass, Integrity, Lookup, Malformed, Miss, Published, TooLarge};
 use super::sequence::next_publication_seq;
 use super::sqlite::{begin, classify, classify_read};
@@ -18,8 +18,6 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 /// Domain of the whole-artifact fact checksum.
 pub const FACT_CHECKSUM_CONTEXT: &str =
     "lint4d persistent analysis cache 2026-10 artifact facts v1";
-/// Domain of each row checksum.
-pub const ROW_CHECKSUM_CONTEXT: &str = "lint4d persistent analysis cache 2026-10 artifact row v1";
 
 /// One fact row as a producer supplies it. The producer (`l4d-zf1b.4`)
 /// owns `row_kind` (1-255) and the payload encoding; `index_key` is the
@@ -69,9 +67,9 @@ impl ArtifactHeader {
 }
 
 /// Feed the canonical encoding of one row to `sink` in pieces, borrowing the
-/// payload and key: nothing is materialized. Its checksum is stored with the
-/// row, and the fact checksum covers it, so the artifact and position are
-/// bound into both. Field order and framing are those of [`Encoder`].
+/// payload and key: nothing is materialized. The fact checksum covers it,
+/// so the artifact and position are bound into it. Field order and framing
+/// are those of [`Encoder`].
 fn stream_row_encoding(
     artifact_id: Digest,
     ordinal: u64,
@@ -95,8 +93,8 @@ fn stream_row_encoding(
     sink(payload);
 }
 
-/// Hash one row into `fact` and return the row's own checksum, streaming
-/// the encoding straight from the borrowed slices.
+/// Hash one row into `fact`, streaming the encoding straight from the
+/// borrowed slices.
 pub(crate) fn hash_row(
     fact: &mut FactHasher,
     artifact_id: Digest,
@@ -104,8 +102,7 @@ pub(crate) fn hash_row(
     row_kind: u8,
     index_key: Option<&[u8]>,
     payload: &[u8],
-) -> Digest {
-    let mut row = blake3::Hasher::new_derive_key(ROW_CHECKSUM_CONTEXT);
+) {
     stream_row_encoding(
         artifact_id,
         ordinal,
@@ -113,11 +110,9 @@ pub(crate) fn hash_row(
         index_key,
         payload,
         &mut |piece| {
-            row.update(piece);
             fact.0.update(piece);
         },
     );
-    Digest::from_bytes(*row.finalize().as_bytes())
 }
 
 /// The fact checksum: the header fields, then every row in ordinal order.
@@ -226,7 +221,6 @@ fn read_header(
 pub(crate) struct PreparedArtifact {
     artifact_id: Digest,
     expected: StoredHeader,
-    checksums: Vec<Digest>,
 }
 
 impl PreparedArtifact {
@@ -250,16 +244,15 @@ pub(crate) fn prepare_artifact(write: &ArtifactWrite<'_>) -> Result<PreparedArti
     let content_bytes = admit_write(write)?;
     let artifact_id = write.key.digest();
     let mut hasher = FactHasher::new(artifact_id, write.rows.len() as u64, write.supplemental);
-    let mut checksums = Vec::with_capacity(write.rows.len());
     for (ordinal, row) in write.rows.iter().enumerate() {
-        checksums.push(hash_row(
+        hash_row(
             &mut hasher,
             artifact_id,
             ordinal as u64,
             row.row_kind,
             row.index_key,
             row.payload,
-        ));
+        );
     }
     let expected = StoredHeader {
         kind: i64::from(write.key.key().kind().tag()),
@@ -276,7 +269,6 @@ pub(crate) fn prepare_artifact(write: &ArtifactWrite<'_>) -> Result<PreparedArti
     Ok(PreparedArtifact {
         artifact_id,
         expected,
-        checksums,
     })
 }
 
@@ -292,7 +284,6 @@ pub(crate) fn insert_prepared(
     let PreparedArtifact {
         artifact_id,
         expected,
-        checksums,
     } = prepared;
     put_manifest(transaction, scope, write.key.key())?;
     if let Some(root) = write.key.root() {
@@ -342,24 +333,26 @@ pub(crate) fn insert_prepared(
             ],
         )
         .map_err(fail)?;
+    // The rows hang off the header's surrogate, which nothing outside this
+    // container ever sees.
+    let artifact_ref = transaction.last_insert_rowid();
+    let scope_ref = ensure_scope_ref(transaction, scope)?;
     let mut insert = transaction
         .prepare_cached(
-            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, \
-             row_kind, index_key, payload, row_checksum) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(fail)?;
-    for (ordinal, (row, checksum)) in write.rows.iter().zip(checksums).enumerate() {
+    for (ordinal, row) in write.rows.iter().enumerate() {
         insert
             .execute(params![
-                namespace,
-                reset_epoch,
-                artifact_id.as_bytes().as_slice(),
+                artifact_ref,
                 ordinal as i64,
+                scope_ref,
                 i64::from(row.row_kind),
                 row.index_key,
-                row.payload,
-                checksum.as_bytes().as_slice()
+                row.payload
             ])
             .map_err(fail)?;
     }
@@ -503,13 +496,13 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn encoder_checksums(
+    fn encoder_checksum(
         id: Digest,
         ordinal: u64,
         kind: u8,
         key: Option<&[u8]>,
         payload: &[u8],
-    ) -> (Digest, Digest) {
+    ) -> Digest {
         let mut encoder = Encoder::new();
         encoder.digest(&id);
         encoder.u64(ordinal);
@@ -518,14 +511,11 @@ mod tests {
         encoder.bytes(payload);
         let mut reference = FactHasher::new(id, 1, b"s");
         reference.0.update(encoder.as_bytes());
-        (
-            Digest::derive(ROW_CHECKSUM_CONTEXT, encoder.as_bytes()),
-            reference.finish(),
-        )
+        reference.finish()
     }
 
     #[test]
-    fn streamed_checksums_equal_the_encoder_framing() {
+    fn the_streamed_fact_checksum_equals_the_encoder_framing() {
         let id = Digest::from_bytes([7; 32]);
         let big = vec![9u8; 5000];
         type Case<'a> = (u64, u8, Option<&'a [u8]>, &'a [u8]);
@@ -538,10 +528,9 @@ mod tests {
         ];
         for (ordinal, kind, key, payload) in cases {
             let mut fact = FactHasher::new(id, 1, b"s");
-            let checksum = hash_row(&mut fact, id, ordinal, kind, key, payload);
-            let (expected_row, expected_fact) = encoder_checksums(id, ordinal, kind, key, payload);
-            assert_eq!(checksum, expected_row, "row {ordinal}");
-            assert_eq!(fact.finish(), expected_fact, "fact {ordinal}");
+            hash_row(&mut fact, id, ordinal, kind, key, payload);
+            let expected = encoder_checksum(id, ordinal, kind, key, payload);
+            assert_eq!(fact.finish(), expected, "fact {ordinal}");
         }
     }
 }

@@ -99,7 +99,7 @@ impl Bound {
     }
 
     /// At most `directories` listings (a background batch).
-    #[cfg_attr(not(test), allow(dead_code))] // l4d-zf1b.8 drives background batches
+    #[cfg(test)]
     pub(crate) const fn directories(directories: usize) -> Self {
         Self {
             counted_at_least: MAX_CATALOGUE_ENTRIES,
@@ -398,6 +398,7 @@ impl Catalogue {
         self.visits
     }
 
+    #[cfg(test)]
     pub(crate) fn frontier_len(&self) -> usize {
         self.frontier.len()
     }

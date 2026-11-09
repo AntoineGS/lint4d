@@ -3,7 +3,7 @@ use super::health::Access;
 use super::keys::ArtifactKeyRef;
 use super::outcome::{Bypass, Lookup, Malformed, Miss, Published};
 use crate::facts::{FactDecodeError, FactDecoder, encode_facts, encoded_content_bytes};
-use crate::{ArtifactHeader, ArtifactWrite, Digest};
+use crate::{ArtifactHeader, ArtifactReader, ArtifactWrite, Digest};
 use pascal_core::facts::{ArtifactFacts, FactBudget};
 
 impl Store {
@@ -69,7 +69,9 @@ impl Store {
             match reader.next_batch()? {
                 Lookup::Hit(Some(batch)) => {
                     if let Err(error) = decoder.push(batch.rows()) {
-                        return refused(error);
+                        drop(batch);
+                        drop(decoder);
+                        return refused_unless_corrupt(&mut reader, error);
                     }
                 }
                 Lookup::Hit(None) => break,
@@ -85,6 +87,22 @@ impl Store {
         };
         *budget = trial;
         Ok(Lookup::Hit(facts))
+    }
+}
+
+/// Rows reach the decoder before the fact checksum covers them, so a row
+/// the decoder refused may be a corrupted one: read the rest without
+/// decoding, and report a read that does not verify as its miss.
+fn refused_unless_corrupt(
+    reader: &mut ArtifactReader<'_>,
+    error: FactDecodeError,
+) -> Result<Lookup<ArtifactFacts>, Bypass> {
+    loop {
+        match reader.next_batch()? {
+            Lookup::Hit(Some(_)) => {}
+            Lookup::Hit(None) => return refused(error),
+            Lookup::Miss(miss) => return Ok(Lookup::Miss(miss)),
+        }
     }
 }
 

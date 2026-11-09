@@ -459,8 +459,8 @@ mod tests {
         store_import(&cache, &main, vec![probe(temp.path()), probe(&store)]);
         let (sender, events) = WatchEvents::channel();
         for event in [
-            WatchEvent::Changed(vec![store.join("analysis.sqlite3-wal")]),
-            WatchEvent::Modified(vec![store.join("analysis.sqlite3")]),
+            WatchEvent::Changed(vec![store.join("analysis-v7.sqlite3-wal")]),
+            WatchEvent::Modified(vec![store.join("analysis-v7.sqlite3")]),
             WatchEvent::Changed(vec![store.clone(), store.join("namespaces")]),
         ] {
             enqueue(&sender.sender, &sender.overflowed, event);
@@ -477,7 +477,7 @@ mod tests {
         enqueue(
             &sender.sender,
             &sender.overflowed,
-            WatchEvent::Changed(vec![store.join("analysis.sqlite3-wal")]),
+            WatchEvent::Changed(vec![store.join("analysis-v7.sqlite3-wal")]),
         );
         assert_eq!(
             events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false),

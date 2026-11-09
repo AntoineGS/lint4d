@@ -6,7 +6,7 @@
 //! route: an `Observation` does not record whether a route was used, and
 //! the strict form can only turn a hit into a miss.
 
-use crate::project_cache::{ProjectCache, Proven};
+use crate::project_cache::{Listed, ListedUnder, ProjectCache, Proven};
 use crate::workspace::DiskStamp;
 use crate::workspace::rename::OverlayInput;
 use crate::workspace::resolver::{deletion_applies, path_equivalent};
@@ -23,6 +23,7 @@ use pascal_project::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the current session sees, which evidence is checked against.
@@ -79,6 +80,8 @@ pub(crate) struct Validator<'a> {
     cancel: &'a AtomicBool,
     disk: FilesystemSourceStore,
     reads: usize,
+    listed: usize,
+    held: Vec<(PathBuf, crate::workspace::PathStamp)>,
 }
 
 fn legacy(entry: &ProjectPathEntry) -> bool {
@@ -101,12 +104,27 @@ impl<'a> Validator<'a> {
             cancel,
             disk,
             reads: 0,
+            listed: 0,
+            held: Vec::new(),
         }
+    }
+
+    /// The stamp taken before each payload that held (read or witnessed),
+    /// in check order.
+    pub(crate) fn held_payloads(&self) -> &[(PathBuf, crate::workspace::PathStamp)] {
+        &self.held
     }
 
     /// Payloads and listings read so far rather than witnessed.
     pub(crate) fn reads(&self) -> usize {
         self.reads
+    }
+
+    /// Directories read from the disk so far rather than taken from this
+    /// process's listing memo.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn listed(&self) -> usize {
+        self.listed
     }
 
     pub(crate) fn check(&mut self, observation: &Observation) -> Check {
@@ -178,6 +196,7 @@ impl<'a> Validator<'a> {
         };
         if let Some(Proven::Content(proven)) = self.inputs.cache.witness(path, &before) {
             return if proven == *content {
+                self.held.push((path.to_path_buf(), before));
                 Check::Holds
             } else {
                 stale(Stale::Content)
@@ -206,9 +225,10 @@ impl<'a> Validator<'a> {
         if path_stamp_result(path).ok().flatten().as_ref() == Some(&before) {
             self.inputs
                 .cache
-                .record_witness(path, before, Proven::Content(current));
+                .record_witness(path, before.clone(), Proven::Content(current));
         }
         if current == *content {
+            self.held.push((path.to_path_buf(), before));
             Check::Holds
         } else {
             stale(Stale::Content)
@@ -236,6 +256,40 @@ impl<'a> Validator<'a> {
         }
     }
 
+    /// List `path` from the disk; a complete listing read while its stamp
+    /// held is memoized for this process.
+    fn read_listing(
+        &mut self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        before: Option<&crate::workspace::PathStamp>,
+        under: ListedUnder,
+    ) -> Result<Arc<Listed>, Check> {
+        self.listed += 1;
+        let (files, directories) = match self.disk.list_directory(
+            DirectoryRequest {
+                directory: path,
+                entry,
+                read_policy: self.inputs.read_policy,
+            },
+            self.cancel,
+        ) {
+            Ok(disk) if disk.complete => (disk.files, disk.directories),
+            Err(SourceStoreError::NotFound { .. }) => (Vec::new(), Vec::new()),
+            Err(SourceStoreError::Cancelled) => return Err(self.limited()),
+            _ => return Err(Check::Stale(Stale::Listing(path.to_path_buf()))),
+        };
+        let listed = Arc::new(Listed { files, directories });
+        if let Some(before) = before
+            && path_stamp_result(path).ok().flatten().as_ref() == Some(before)
+        {
+            self.inputs
+                .cache
+                .record_listing(path, before.clone(), under, Arc::clone(&listed));
+        }
+        Ok(listed)
+    }
+
     fn listing(
         &mut self,
         path: &Path,
@@ -259,19 +313,23 @@ impl<'a> Validator<'a> {
         let Ok(before) = path_stamp_result(path) else {
             return stale(Stale::Listing);
         };
-        let (files, directories) = match self.disk.list_directory(
-            DirectoryRequest {
-                directory: path,
-                entry,
-                read_policy: policy,
-            },
-            self.cancel,
-        ) {
-            Ok(disk) if disk.complete => (disk.files, disk.directories),
-            Err(SourceStoreError::NotFound { .. }) => (Vec::new(), Vec::new()),
-            Err(SourceStoreError::Cancelled) => return self.limited(),
-            _ => return stale(Stale::Listing),
+        let under = ListedUnder {
+            legacy: legacy(entry),
+            entry_limit: self.inputs.directory_entries,
         };
+        // A listing this process read while the directory's stamp held
+        // spares the readdir (R8-1): a witness, like the digest's below.
+        let memoized = before
+            .as_ref()
+            .and_then(|before| self.inputs.cache.listing(path, before, under));
+        let listed = match memoized {
+            Some(listed) => listed,
+            None => match self.read_listing(path, entry, before.as_ref(), under) {
+                Ok(listed) => listed,
+                Err(check) => return check,
+            },
+        };
+        let (files, directories) = (&listed.files, &listed.directories);
         // A buffer for a file the disk lacks joins the session's listing,
         // and a file deleted in the editor is missing from it.
         if self.inputs.overlays.keys().any(|uri| {
@@ -280,7 +338,7 @@ impl<'a> Validator<'a> {
                     .is_some_and(|parent| path_equivalent(parent, path))
                     && !files.iter().any(|file| path_equivalent(file, &open))
             })
-        }) || files.iter().any(|file| self.deleted(file))
+        }) || (!self.inputs.deleted.is_empty() && files.iter().any(|file| self.deleted(file)))
         {
             return stale(Stale::Overlay);
         }
@@ -298,7 +356,7 @@ impl<'a> Validator<'a> {
                     return self.limited();
                 }
                 self.reads += 1;
-                let current = listing_digest(&files, &directories);
+                let current = listing_digest(files, directories);
                 if let Some(before) = before
                     && path_stamp_result(path).ok().flatten().as_ref() == Some(&before)
                 {
@@ -492,6 +550,48 @@ mod tests {
         assert_eq!(checks, vec![Check::Holds; 3]);
     }
 
+    /// A7: the stamp a held payload reports is the one taken before its
+    /// bytes were read, so a rewrite after validation does not match it.
+    #[test]
+    fn include_stamps_are_taken_before_the_read() {
+        let fixture = fixture();
+        let path = fixture.root.join("include/A.inc");
+        let payload = fixture.payload();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(Arc::clone(&cancel));
+        let mut validator = Validator::new(
+            CurrentInputs {
+                context: &fixture.context,
+                read_policy: &fixture.policy,
+                overlays: &fixture.overlays,
+                deleted: &fixture.deleted,
+                cache: &fixture.cache,
+                max_file_bytes: 1 << 20,
+                directory_entries: 1024,
+            },
+            &budget,
+            &cancel,
+        );
+        assert!(validator.held_payloads().is_empty());
+        assert_eq!(validator.check(&fixture.listing()), Check::Holds);
+        assert_eq!(validator.check(&payload), Check::Holds);
+        let held = validator.held_payloads().to_vec();
+        assert_eq!(held.len(), 1, "only payloads are reported");
+        assert_eq!(held[0].0, path);
+        assert_eq!(Some(&held[0].1), path_stamp_result(&path).unwrap().as_ref());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"{$DEFINE B}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(5))
+            .unwrap();
+        let now = path_stamp_result(&path).unwrap().unwrap();
+        assert!(!held[0].1.proves_unchanged(&now));
+        assert_ne!(held[0].1, now);
+    }
+
     #[test]
     fn a_same_size_same_mtime_rewrite_is_stale_without_a_witness() {
         let fixture = fixture();
@@ -678,6 +778,153 @@ mod tests {
         );
     }
 
+    impl Fixture {
+        /// The listing observation of `directory`, as the session saw it.
+        fn listing_of(&self, directory: &Path) -> Observation {
+            let mut files = Vec::new();
+            let mut directories = Vec::new();
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+            files.sort();
+            directories.sort();
+            Observation::Listing {
+                listing: listing_digest(&files, &directories),
+                entry: ProjectPathEntry::configured(directory.to_path_buf()),
+                path: directory.to_path_buf(),
+            }
+        }
+
+        /// Check `observations` with a fresh validator (one member's
+        /// evidence); returns the checks and the directories it listed.
+        fn check_listed(&self, observations: &[Observation]) -> (Vec<Check>, usize) {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let budget = ReconciliationBudget::new(Arc::clone(&cancel));
+            let mut validator = Validator::new(
+                CurrentInputs {
+                    context: &self.context,
+                    read_policy: &self.policy,
+                    overlays: &self.overlays,
+                    deleted: &self.deleted,
+                    cache: &self.cache,
+                    max_file_bytes: 1 << 20,
+                    directory_entries: 1024,
+                },
+                &budget,
+                &cancel,
+            );
+            let checks = observations
+                .iter()
+                .map(|observation| validator.check(observation))
+                .collect();
+            (checks, validator.listed())
+        }
+    }
+
+    /// R8-1: members whose evidence names the same directories list each
+    /// directory once in this process; a watcher event for a directory, or
+    /// an overflow, makes the next validation list it again (spec §7: the
+    /// memo is a witness of this process, never a stored stamp).
+    #[cfg(unix)]
+    #[test]
+    fn one_listing_per_distinct_directory_until_a_watcher_event() {
+        let fixture = fixture();
+        let other = fixture.root.join("other");
+        std::fs::create_dir_all(other.join("nested")).unwrap();
+        std::fs::write(other.join("B.inc"), b"{}").unwrap();
+        pascal_project::backdate_tree_for_test(&fixture.root);
+        let include = fixture.root.join("include");
+        let observations = [fixture.listing_of(&include), fixture.listing_of(&other)];
+        let listed: usize = (0..8)
+            .map(|_| {
+                let (checks, listed) = fixture.check_listed(&observations);
+                assert_eq!(checks, vec![Check::Holds; 2]);
+                listed
+            })
+            .sum();
+        assert_eq!(listed, 2, "one readdir per distinct directory");
+        crate::file_watch::apply_watch_event(
+            &fixture.cache,
+            crate::file_watch::WatchEvent::Changed(vec![include.join("C.inc")]),
+        );
+        assert_eq!(
+            fixture.check_listed(&observations),
+            (vec![Check::Holds; 2], 1),
+            "an event in a directory makes it listed again, and only it"
+        );
+        assert_eq!(fixture.check_listed(&observations).1, 0);
+        crate::file_watch::apply_watch_event(
+            &fixture.cache,
+            crate::file_watch::WatchEvent::Modified(vec![other.join("B.inc")]),
+        );
+        assert_eq!(
+            fixture.check_listed(&observations).1,
+            0,
+            "a content change keeps its directory's listing"
+        );
+        crate::file_watch::apply_watch_event(
+            &fixture.cache,
+            crate::file_watch::WatchEvent::Overflow,
+        );
+        assert_eq!(
+            fixture.check_listed(&observations).1,
+            2,
+            "overflow drops every listing"
+        );
+        // A real change is seen even without an event: the stamp moved.
+        std::fs::write(include.join("C.inc"), b"{}").unwrap();
+        let (checks, listed) = fixture.check_listed(&observations);
+        assert_eq!(listed, 1);
+        assert_eq!(checks[0], Check::Stale(Stale::Listing(include.clone())));
+        let restarted = Fixture {
+            cache: ProjectCache::default(),
+            ..fixture
+        };
+        assert_eq!(
+            restarted.check_listed(&observations).1,
+            2,
+            "a new process lists every directory again"
+        );
+    }
+
+    /// The memo keeps the names, so an editor buffer or deletion in a
+    /// memoized directory is still seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_memoized_listing_still_sees_buffers_and_deletions() {
+        let mut fixture = fixture();
+        let include = fixture.root.join("include");
+        let listing = fixture.listing_of(&include);
+        assert_eq!(
+            fixture.check_listed(std::slice::from_ref(&listing)),
+            (vec![Check::Holds], 1)
+        );
+        fixture.overlays.insert(
+            crate::workspace::canonical_file_uri(
+                &Url::from_file_path(include.join("B.inc")).unwrap(),
+            ),
+            OverlayInput {
+                text: "{}".into(),
+                version: 1,
+            },
+        );
+        assert_eq!(
+            fixture.check_listed(std::slice::from_ref(&listing)),
+            (vec![Check::Stale(Stale::Overlay(include.clone()))], 0)
+        );
+        fixture.overlays.clear();
+        fixture.delete_in_editor("include/A.inc");
+        assert_eq!(
+            fixture.check_listed(std::slice::from_ref(&listing)),
+            (vec![Check::Stale(Stale::Overlay(include))], 0)
+        );
+    }
+
     #[test]
     fn an_open_buffer_makes_disk_evidence_stale() {
         let mut fixture = fixture();
@@ -860,6 +1107,50 @@ mod tests {
             &cancel,
         );
         validate_evidence(store, header, &mut validator).unwrap()
+    }
+
+    /// 13b-2 fix round 1 (M4): a set stored before deduplication, which
+    /// repeats its observations, validates exactly as the deduplicated set
+    /// of the same inputs, unchanged or changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_set_with_duplicates_validates_as_its_deduplicated_set() {
+        use crate::workspace::persist::tests::{open_store, private_dir};
+        let fixture = fixture();
+        let directory = private_dir();
+        let store = open_store(directory.path());
+        let distinct = vec![
+            fixture.listing(),
+            fixture.absent("include/B.inc"),
+            fixture.payload(),
+        ];
+        let repeated: Vec<_> = (0..20).flat_map(|_| distinct.iter().cloned()).collect();
+        let old = stored_evidence(&store, &repeated);
+        let new = stored_evidence(&store, &distinct);
+        assert_ne!(old.evidence_id(), new.evidence_id());
+        let both = |fixture: &Fixture| {
+            (
+                validate_with(fixture, &store, &old, false),
+                validate_with(fixture, &store, &new, false),
+            )
+        };
+        let (old_check, new_check) = both(&fixture);
+        assert_eq!(old_check, EvidenceCheck::Holds);
+        assert_eq!(old_check, new_check);
+        std::fs::write(fixture.root.join("include/A.inc"), b"{$DEFINE CHANGED}").unwrap();
+        let (old_check, new_check) = both(&fixture);
+        assert!(
+            matches!(old_check, EvidenceCheck::Stale(_)),
+            "{old_check:?}"
+        );
+        assert_eq!(old_check, new_check);
+        std::fs::write(fixture.root.join("include/B.inc"), b"{}").unwrap();
+        let (old_check, new_check) = both(&fixture);
+        assert_eq!(
+            old_check,
+            EvidenceCheck::Stale(Stale::Listing(fixture.root.join("include")))
+        );
+        assert_eq!(old_check, new_check);
     }
 
     #[cfg(unix)]

@@ -219,12 +219,59 @@ macro_rules! unnamed_by {
     };
 }
 
+/// The rows of `child`, keyed `(ref, ordinal)` without a scope of their
+/// own, that hang off retired parent `p` through its surrogate `ref`.
+macro_rules! rows_of_retired {
+    ($child:literal, $parent:literal, $ref:literal) => {
+        concat!(
+            "DELETE FROM ",
+            $child,
+            " WHERE (",
+            $ref,
+            ", ordinal) IN (SELECT c.",
+            $ref,
+            ", c.ordinal FROM ",
+            $parent,
+            " p CROSS JOIN ",
+            $child,
+            " c ON c.",
+            $ref,
+            " = p.",
+            $ref,
+            " WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2 LIMIT ?3)"
+        )
+    };
+}
+
+/// No row of `table` lists `p` by its surrogate `ref`.
+macro_rules! unlisted_by {
+    ($table:literal, $ref:literal) => {
+        concat!(
+            " AND NOT EXISTS (SELECT 1 FROM ",
+            $table,
+            " x WHERE x.",
+            $ref,
+            " = p.",
+            $ref,
+            ")"
+        )
+    };
+}
+
 /// Deletion inside the live scope, children first (spec §10: retire from
 /// lookup, delete bounded row batches, then remove the header). A parent
 /// goes only once no row of any lifecycle references it, so the foreign
 /// keys hold after every batch. `?1` namespace, `?2` epoch, `?3` the rows
 /// left in the batch.
-pub(crate) const DELETE_STEPS: [&str; 10] = [
+///
+/// Observation content is shared by the evidence sets that list it, so it
+/// has no lifecycle: once no set (of any lifecycle) lists it, the sweep
+/// deletes it. The sweep visits the scope's content, which holds each
+/// distinct observation once, the way orphan manifests are found. A
+/// publisher finds or inserts content and lists it in one write
+/// transaction, and the sweep runs in another, so content is never deleted
+/// while a committed or committing set lists it.
+pub(crate) const DELETE_STEPS: [&str; 12] = [
     children_of_retired!("lease_holds", "snapshots", "state = 3", "snapshot_id"),
     children_of_retired!("snapshot_members", "snapshots", "state = 3", "snapshot_id"),
     concat!(
@@ -235,6 +282,12 @@ pub(crate) const DELETE_STEPS: [&str; 10] = [
         " LIMIT ?3)"
     ),
     children_of_retired!(
+        "binding_targets",
+        "member_records",
+        "lifecycle = 2",
+        "record_id"
+    ),
+    children_of_retired!(
         "member_bindings",
         "member_records",
         "lifecycle = 2",
@@ -243,30 +296,32 @@ pub(crate) const DELETE_STEPS: [&str; 10] = [
     concat!(
         "DELETE FROM member_records WHERE rowid IN (SELECT p.rowid FROM member_records p \
          WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
+        unnamed_by!("binding_targets", "record_id", "record_id"),
         unnamed_by!("member_bindings", "record_id", "record_id"),
         unnamed_by!("snapshot_members", "record_id", "record_id"),
         " LIMIT ?3)"
     ),
-    children_of_retired!(
-        "observations",
-        "evidence_sets",
-        "lifecycle = 2",
-        "evidence_id"
-    ),
+    rows_of_retired!("evidence_observations", "evidence_sets", "evidence_ref"),
     concat!(
         "DELETE FROM evidence_sets WHERE rowid IN (SELECT p.rowid FROM evidence_sets p \
          WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
-        unnamed_by!("observations", "evidence_id", "evidence_id"),
+        unlisted_by!("evidence_observations", "evidence_ref"),
         unnamed_by!("member_records", "member_evidence", "evidence_id"),
         unnamed_by!("member_bindings", "evidence_id", "evidence_id"),
         unnamed_by!("snapshots", "discovery_evidence", "evidence_id"),
         " LIMIT ?3)"
     ),
-    children_of_retired!("artifact_rows", "artifacts", "lifecycle = 2", "artifact_id"),
+    concat!(
+        "DELETE FROM observation_content WHERE observation IN (SELECT p.observation \
+         FROM observation_content p WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2",
+        unlisted_by!("evidence_observations", "observation"),
+        " LIMIT ?3)"
+    ),
+    rows_of_retired!("artifact_rows", "artifacts", "artifact_ref"),
     concat!(
         "DELETE FROM artifacts WHERE rowid IN (SELECT p.rowid FROM artifacts p \
          WHERE p.namespace_id = ?1 AND p.reset_epoch = ?2 AND p.lifecycle = 2",
-        unnamed_by!("artifact_rows", "artifact_id", "artifact_id"),
+        unlisted_by!("artifact_rows", "artifact_ref"),
         unnamed_by!("member_records", "artifact_id", "artifact_id"),
         unnamed_by!("evidence_sets", "artifact_id", "artifact_id"),
         " LIMIT ?3)"
@@ -501,7 +556,7 @@ mod tests {
         )
         .unwrap();
         let writer = store.writer().unwrap();
-        let expected: [(&str, &[&str]); 15] = [
+        let expected: [(&str, &[&str]); 17] = [
             (DELETE_STEPS[0], &["snapshot_id=?", "state=?"]),
             (DELETE_STEPS[1], &["snapshot_id=?", "state=?"]),
             (
@@ -509,34 +564,37 @@ mod tests {
                 &["snapshot_id=?", "snapshot_id=?", "state=?"],
             ),
             (DELETE_STEPS[3], &["lifecycle=?", "record_id=?"]),
+            (DELETE_STEPS[4], &["lifecycle=?", "record_id=?"]),
             (
-                DELETE_STEPS[4],
-                &["lifecycle=?", "record_id=?", "record_id=?"],
+                DELETE_STEPS[5],
+                &["lifecycle=?", "record_id=?", "record_id=?", "record_id=?"],
             ),
-            (DELETE_STEPS[5], &["evidence_id=?", "lifecycle=?"]),
+            (DELETE_STEPS[6], &["evidence_ref=?", "lifecycle=?"]),
             (
-                DELETE_STEPS[6],
+                DELETE_STEPS[7],
                 &[
                     "discovery_evidence=?",
                     "evidence_id=?",
-                    "evidence_id=?",
+                    "evidence_ref=?",
                     "lifecycle=?",
                     "member_evidence=?",
                 ],
             ),
-            (DELETE_STEPS[7], &["artifact_id=?", "lifecycle=?"]),
+            // Unlisted content is found by visiting the scope's content.
+            (DELETE_STEPS[8], &["observation=?", "reset_epoch=?"]),
+            (DELETE_STEPS[9], &["artifact_ref=?", "lifecycle=?"]),
             (
-                DELETE_STEPS[8],
+                DELETE_STEPS[10],
                 &[
                     "artifact_id=?",
                     "artifact_id=?",
-                    "artifact_id=?",
+                    "artifact_ref=?",
                     "lifecycle=?",
                 ],
             ),
             // Orphan manifests are found by visiting the scope's manifests.
             (
-                DELETE_STEPS[9],
+                DELETE_STEPS[11],
                 &[
                     "artifact_id=?",
                     "context_key=?",

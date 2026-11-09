@@ -43,6 +43,44 @@ impl Digest {
     }
 }
 
+/// Domain of [`RecordListDigest`].
+const RECORD_LIST_DIGEST_CONTEXT: &str = "lint4d persistent analysis cache 2026-11 record list v1";
+
+/// The digest of an ordered list of record IDs, so a session can compare a
+/// membership's records with a snapshot's without keeping either list. It
+/// is never stored.
+#[derive(Clone)]
+pub struct RecordListDigest {
+    hasher: blake3::Hasher,
+    count: u64,
+}
+
+impl RecordListDigest {
+    pub fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new_derive_key(RECORD_LIST_DIGEST_CONTEXT),
+            count: 0,
+        }
+    }
+
+    pub fn push(&mut self, record: &Digest) {
+        self.hasher.update(record.as_bytes());
+        self.count += 1;
+    }
+
+    pub fn finish(&self) -> Digest {
+        let mut hasher = self.hasher.clone();
+        hasher.update(&self.count.to_le_bytes());
+        Digest(*hasher.finalize().as_bytes())
+    }
+}
+
+impl Default for RecordListDigest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Debug for Digest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Digest({})", self.to_hex())
@@ -84,5 +122,20 @@ mod tests {
             blake3::derive_key(MANIFEST_DIGEST_CONTEXT, b"payload")
         );
         assert_ne!(manifest, source);
+    }
+
+    #[test]
+    fn a_record_list_digest_depends_on_order_and_count() {
+        let (a, b) = (Digest::from_bytes([1; 32]), Digest::from_bytes([2; 32]));
+        let digest = |records: &[Digest]| {
+            let mut list = RecordListDigest::new();
+            for record in records {
+                list.push(record);
+            }
+            list.finish()
+        };
+        assert_eq!(digest(&[a, b]), digest(&[a, b]));
+        assert_ne!(digest(&[a, b]), digest(&[b, a]));
+        assert_ne!(digest(&[]), digest(&[a]));
     }
 }

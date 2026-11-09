@@ -100,7 +100,9 @@ pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
 #[cfg(test)]
 pub(crate) use symbols::test_set_symbol_result_cap;
-pub(crate) use symbols::{lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap};
+pub(crate) use symbols::{
+    WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
+};
 mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
@@ -977,6 +979,15 @@ impl NavigationIndex {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<lsp_types::SymbolInformation>, String> {
         symbols::workspace_symbols_with_cancel(self, query, cancel)
+    }
+
+    /// `uri`'s workspace symbols for every query, when it is indexed.
+    pub(crate) fn workspace_symbol_list(
+        &self,
+        uri: &Url,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<WorkspaceSymbolList>, String> {
+        WorkspaceSymbolList::of(self, uri, cancel)
     }
 
     pub(crate) fn flatten_document_symbols(
@@ -19852,8 +19863,10 @@ fn conditional_unknown_symbols(
 /// - the values of a type nested in a class or record enter the scope that
 ///   declares the outer type, not the class (`TR.rB` is E2003, unqualified
 ///   `rB` and `Unit.rB` compile, also in the type's methods and importers).
-///   A nested type in a section other than public or published is not
-///   modelled: its values' binding is unknown;
+///   The class or record section does not matter: a type nested in a
+///   private, strict private, protected or strict protected section gives
+///   importers its values too (`1qta-r1/P1-P3`, `P5-P7`; l4d-qssj), though
+///   `TC.TE.pB` is E2361;
 /// - the values of an anonymous enumerated type (`set of (A, B)`,
 ///   `var X: (A, B)`) are unqualified names whatever the state.
 fn enum_value_scoping(
@@ -19871,8 +19884,7 @@ fn enum_value_scoping(
         return Ok(unscoped);
     }
     let states = conditional::ScopedEnums::new(&conditionals.directives);
-    // Value name start -> (state at the type's declaration, a named type,
-    // nested in a class or record).
+    // Value name start -> (state at the type's declaration, a named type).
     let mut values = HashMap::new();
     let mut visited = 0usize;
     let mut cancelled = false;
@@ -19903,15 +19915,12 @@ fn enum_value_scoping(
             }
             _ => false,
         };
-        let nested = ancestors
-            .iter()
-            .any(|ancestor| matches!(ancestor.kind(), "declClass" | "declIntf" | "declHelper"));
         let declared_at = if named {
             declaration.map_or(node.start_byte(), |declaration| declaration.start_byte())
         } else {
             enumeration.map_or(node.start_byte(), |enumeration| enumeration.start_byte())
         };
-        values.insert(name.start_byte(), (states.at(declared_at), named, nested));
+        values.insert(name.start_byte(), (states.at(declared_at), named));
     });
     if cancelled || cancel.load(Ordering::Relaxed) {
         return Err("request cancelled".to_string());
@@ -19920,22 +19929,15 @@ fn enum_value_scoping(
         if symbol.kind != SymbolKind::EnumValue || symbol.origin != Origin::Declaration {
             continue;
         }
-        let Some(&(state, named, nested)) = values.get(&symbol.span.start) else {
+        let Some(&(state, named)) = values.get(&symbol.span.start) else {
             continue;
         };
-        let hidden_section = nested
-            && !matches!(
-                symbol.visibility,
-                Visibility::Public | Visibility::Published
-            );
         let state = if named {
             state
         } else {
             conditional::Truth::False
         };
-        if state == conditional::Truth::Unknown
-            || (hidden_section && state == conditional::Truth::False)
-        {
+        if state == conditional::Truth::Unknown {
             conditional_unknown[index] = true;
         }
         unscoped[index] = symbol.owner_type.is_some() && state != conditional::Truth::True;

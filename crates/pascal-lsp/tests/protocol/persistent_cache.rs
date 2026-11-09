@@ -15,7 +15,7 @@ const UNSAVED_MAIN: &str = "unit Main;\ninterface\nuses Provider;\nprocedure Uns
 
 /// The store lands in `environment/cache`, which must not be inside the
 /// workspace root.
-fn launch(environment: &Path) -> TestServer {
+pub(super) fn launch(environment: &Path) -> TestServer {
     let cache_home = environment.join("cache");
     TestServer::launch_test_server_with_environment_path_and_variables(
         environment,
@@ -32,7 +32,7 @@ fn rand_suffix() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn settle(server: &mut TestServer, step: bool) -> Value {
+pub(super) fn settle(server: &mut TestServer, step: bool) -> Value {
     let id = RequestId::from(format!("settle-{step}-{}", rand_suffix()));
     server.send_request(id.clone(), "pascal/testCacheSettle", json!({"step": step}));
     let response = server.response(&id);
@@ -47,7 +47,7 @@ fn configure(server: &mut TestServer, settings: Value) {
     );
 }
 
-fn request(server: &mut TestServer, method: &str, params: Value) -> Value {
+pub(super) fn request(server: &mut TestServer, method: &str, params: Value) -> Value {
     let id = RequestId::from(format!("{method}-{}", rand_suffix()));
     server.send_request(id.clone(), method, params);
     let response = server.response(&id);
@@ -151,7 +151,7 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
         "{status}"
     );
     assert_eq!(status["directory"], directory.to_str().unwrap());
-    assert!(directory.join("analysis.sqlite3").is_file());
+    assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
     let mode = fs::metadata(&directory).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
     open(&mut server, &main, 1, &main_source);
@@ -160,6 +160,78 @@ fn cache_defaults_open_one_store_and_shutdown_releases_it() {
     assert_eq!(live_leases(&directory), 1);
     server.shutdown();
     assert_eq!(live_leases(&directory), 0);
+}
+
+/// An empty one-page SQLite database whose header says lint4d container 4.
+fn container_header(version: u32) -> Vec<u8> {
+    let mut page = vec![0u8; 4096];
+    page[..16].copy_from_slice(b"SQLite format 3\0");
+    page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    page[18..24].copy_from_slice(&[1, 1, 0, 64, 32, 32]);
+    page[24..28].copy_from_slice(&1u32.to_be_bytes());
+    page[28..32].copy_from_slice(&1u32.to_be_bytes());
+    page[44..48].copy_from_slice(&4u32.to_be_bytes());
+    page[56..60].copy_from_slice(&1u32.to_be_bytes());
+    page[60..64].copy_from_slice(&version.to_be_bytes());
+    page[68..72].copy_from_slice(&0x4C34_4443u32.to_be_bytes());
+    page[92..96].copy_from_slice(&1u32.to_be_bytes());
+    page[96..100].copy_from_slice(&3_051_003u32.to_be_bytes());
+    page[100] = 0x0D;
+    page[105..107].copy_from_slice(&4096u16.to_be_bytes());
+    page
+}
+
+/// R9-3 (l4d-zf1b.8, 13c-4, 13d-3; l4d-zf1b.9): containers of earlier versions keep
+/// their own file names. The server opens its versioned file beside it, with no
+/// user action, and never touches or deletes the old one.
+#[test]
+fn an_earlier_container_beside_is_left_and_the_versioned_store_opened() {
+    let (_temp, main, _provider, main_source, _provider_source) = standard_workspace();
+    let environment = tempfile::tempdir().unwrap();
+    let directory = store_directory(environment.path());
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(
+        environment.path().join("cache"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(
+        environment.path().join("cache/lint4d"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let olds = [
+        (directory.join("analysis.sqlite3"), 4),
+        (directory.join("analysis-v5.sqlite3"), 5),
+        (directory.join("analysis-v6.sqlite3"), 6),
+    ];
+    let stamp = |old: &std::path::Path| {
+        (
+            fs::read(old).unwrap(),
+            fs::metadata(old).unwrap().modified().unwrap(),
+        )
+    };
+    let mut before = Vec::new();
+    for (old, version) in &olds {
+        fs::write(old, container_header(*version)).unwrap();
+        before.push(stamp(old));
+    }
+    let mut server = launch(environment.path());
+    server.initialize(main.parent().unwrap(), Value::Null);
+    let settled = settle(&mut server, true);
+    assert_eq!(settled["status"]["state"], "enabled", "{settled}");
+    assert_eq!(pascal_cache::DATABASE_FILE, "analysis-v7.sqlite3");
+    assert!(directory.join(pascal_cache::DATABASE_FILE).is_file());
+    open(&mut server, &main, 1, &main_source);
+    hover(&mut server, &main, &main_source, "PublicRoutine");
+    server.shutdown();
+    for ((old, _), before) in olds.iter().zip(&before) {
+        assert_eq!(&stamp(old), before, "{}", old.display());
+        let mut wal = old.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(!std::path::Path::new(&wal).exists(), "{}", old.display());
+    }
 }
 
 #[test]
@@ -271,14 +343,28 @@ fn a_non_private_cache_directory_is_bypassed_and_left_untouched() {
 
 #[test]
 fn runtime_disable_is_acknowledged_then_performs_no_cache_io() {
-    let (_temp, main, provider, main_source, _provider_source) = standard_workspace();
+    let (_temp, _main, _provider, main_source, provider_source) = standard_workspace();
     let environment = tempfile::tempdir().unwrap();
     let directory = store_directory(environment.path());
+    // The 300-unit project, so that an index batch runs when the disable
+    // arrives; `Main` and `Provider` are members too.
+    let root = super::persistent_index::fixture(environment.path(), super::persistent_index::UNITS);
+    let main = root.join("lib/Main.pas");
+    let provider = root.join("lib/Provider.pas");
+    let app = root.join("App.dpr");
+    write_file(&main, &main_source);
+    write_file(&provider, &provider_source);
+    pascal_project::backdate_tree_for_test(&root);
     let mut server = launch(environment.path());
-    server.initialize(main.parent().unwrap(), Value::Null);
+    server.initialize(&root, Value::Null);
+    open(&mut server, &app, 1, &fs::read_to_string(&app).unwrap());
     open(&mut server, &main, 1, &main_source);
     change(&mut server, &main, 2, UNSAVED_MAIN);
     assert_eq!(settle(&mut server, false)["status"]["state"], "enabled");
+    let running = super::persistent_index::wait_index(&mut server, |context| {
+        context["members"].as_u64().unwrap() > 0
+    });
+    assert_eq!(running["complete"], false, "{running}");
     let hover_before = hover(&mut server, &main, UNSAVED_MAIN, "UnsavedRoutine");
 
     configure(&mut server, json!({"persistentCacheEnabled": false}));
@@ -295,6 +381,19 @@ fn runtime_disable_is_acknowledged_then_performs_no_cache_io() {
     assert_eq!(
         hover(&mut server, &main, UNSAVED_MAIN, "UnsavedRoutine"),
         hover_before
+    );
+    // The batch that was running completes memory-only.
+    let done =
+        super::persistent_index::wait_index(&mut server, |context| context["complete"] == true);
+    assert_eq!(done["reused"], 0, "{done}");
+    assert_eq!(
+        done["members"].as_u64().unwrap(),
+        super::persistent_index::MEMBERS + 2,
+        "{done}"
+    );
+    assert_eq!(
+        settle(&mut server, false)["operations"].as_u64().unwrap(),
+        operations
     );
     definition(&mut server, &main, UNSAVED_MAIN, "PublicRoutine");
     request(
@@ -397,9 +496,12 @@ fn an_administrative_reset_fences_the_server_which_reopens() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    // The step observes `Fenced`; the next settle sees the reopened store.
+    // A step observes `Fenced`: this one (`stepped` false) or the
+    // scheduled one, whose first step after the open may run before or
+    // after the reset (then this one steps the reopened store). Either way
+    // the next settle sees the reopened store, fenced once.
     let stepped = settle(&mut server, true);
-    assert_eq!(stepped["stepped"], true, "{stepped}");
+    assert!(stepped["stepped"].is_boolean(), "{stepped}");
     let after = settle(&mut server, false);
     let status = &after["status"];
     assert_eq!(status["state"], "enabled", "{after}");

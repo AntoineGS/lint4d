@@ -7,7 +7,6 @@
 //! One admitted store per process: each `Store` has its own page cache,
 //! scratch and connections, so a second one would be charged again.
 //! `crate::persistent_cache` owns the single production open (`l4d-zf1b.11`).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::project_cache::{ProjectCache, Reservation, ReservationKind};
 use pascal_cache::{Bypass, Namespace, Store, StoreLimits};

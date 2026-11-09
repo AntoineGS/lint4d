@@ -1844,6 +1844,13 @@ impl TestServer {
             "LSP server exited unsuccessfully: {status}"
         );
     }
+
+    /// Kills the server without a shutdown (SIGKILL on Unix) and reaps it,
+    /// so `Drop` has nothing left to do.
+    pub(super) fn kill(&mut self) {
+        self.child.kill().expect("kill LSP server");
+        self.child.wait().expect("wait for killed LSP server");
+    }
 }
 
 #[cfg(feature = "test-support")]

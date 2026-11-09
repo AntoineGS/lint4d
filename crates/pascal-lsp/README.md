@@ -1383,15 +1383,167 @@ default and never required: when it is off or unusable, every feature works
 from memory.
 
 **Current state.** The store is opened, kept within its disk budget and closed
-by this server. Nothing reads facts from it or writes facts to it yet; that
-arrives with `l4d-zf1b.8` and `l4d-zf1b.9`. Until then analysis results come
-only from memory and the cache makes no request faster.
+by this server, and the workspace index is persisted in it (see
+[Persistent indexing](#persistent-indexing)). Other features still read facts
+only from memory (`l4d-zf1b.9`).
 
 **Location.** One store per process, in `$XDG_CACHE_HOME/lint4d/analysis`
 (`~/.cache/lint4d/analysis` when `XDG_CACHE_HOME` is unset or not absolute) on
 Linux and `~/Library/Caches/lint4d/analysis` on macOS. On Windows persistence
 is bypassed until `l4d-x2ft`. Entries are keyed by content. Editor buffers are
 never stored.
+
+**Builds.** Each build of `pascal-lsp` keeps its entries in a namespace of
+its own, named by a fingerprint of the sources it was built from: a rebuild
+after any source change starts with an empty namespace. The store keeps the
+three most recently used namespaces (`persistentCacheMaxNamespaces`), so
+switching between two builds on one machine (an installed server and a
+development build, say) reopens each one's entries. A namespace is used when a
+server opens or closes it, and once a minute while it is open, so a server
+that crashed after a long session still counts as recently used; a time in
+the future (a clock that ran ahead, a copied directory) counts as now. A
+server retires the namespaces beyond that count when it opens the store and
+during maintenance, least recently used first. While the store needs space,
+over its disk budget or with less than 256 MiB free on its filesystem
+(whatever filled it: the cache gives disk back), it also retires the least
+recently used kept one at once, without waiting for its size. Its size is
+usually unknown, so the pass stops there, and later passes (at every open,
+maintenance cycle or prune) retire no further kept namespace until its rows
+are reclaimed and what it freed shows. Only a current size estimate lets one
+pass retire several, and a retired namespace with an estimate counts as
+freed until it is reclaimed (its record stays until then, for every
+process): background maintenance estimates the next kept namespace
+after such a stop, in short steps of at most 4,096 entries per cycle (the
+phases that give disk back run in every cycle), only while no server holds
+it, and records it beside the lock file (`namespaces/<hex>.size`). An
+estimate is current while the namespace's epoch and lock-file time are
+unchanged. Opening the store never reads one. An estimate leaves out index
+overhead and counts an observation shared by several evidence sets once per
+set. A retired scope still to reclaim counts as freed by the record kept
+from its retirement, which can no longer be checked against a lock file;
+only a record current at retirement is kept, so this is wrong only when the
+record was wrongly taken as current, and then a namespace that grew or
+shrank makes a pass retire one too many or too few. A record is wrongly
+taken as current when the lock-file time did not change although the
+namespace was used: recording a use is best effort, and an open and close
+within the filesystem's time granularity leave the same time. The next
+pass, which rereads usage, free pages and pending scopes, corrects each. It
+never retires a namespace a running server holds. `--cache-status` lists them.
+
+**Files.** The database is `analysis-v<N>.sqlite3` (with its `-wal` and `-shm`
+files), where `<N>` is the store's container version, currently
+`analysis-v7.sqlite3`. A build with an incompatible container opens a fresh
+file of its own version beside the old one, with no action needed. An old
+file (`analysis-v6.sqlite3`, `analysis-v5.sqlite3`; container 4 and earlier:
+`analysis.sqlite3`) is never opened, changed or deleted by a newer server,
+because an older `pascal-lsp` may still use it; delete it once no such server
+runs. The `namespaces/` lock files and `maintenance.lock` are shared by every
+version.
+
+#### Persistent indexing
+
+The workspace index (which unit is declared where, and the facts the other
+features need from each member) is built in the background and its per-member
+facts are stored. After a restart, members whose content and project context
+are unchanged are reused without parsing. The last index of a project is also
+kept as a snapshot. It lets a later process find each member's stored record
+directly instead of searching for candidates; the member's content is still
+validated, so the snapshot is never proof.
+
+- **What is still read at startup.** Every member is read and hashed again on
+  each start. A stored stamp (size, modification time) is never proof that a
+  file is unchanged; only the content is. A reused member costs a read and a
+  hash, not a parse.
+- **Unsaved buffers.** They are never persisted. Open documents are indexed
+  from the files on disk. An open file byte-identical to disk does not block
+  its project's publication; open member files themselves are never published
+  from the session, and a project file (`.dproj`, ...) or other context input
+  that differs from disk keeps that context from being published.
+- **Crawl.** The open-file warm crawl publishes the facts it proves from disk,
+  so a first run that is killed keeps what the crawl finished. When the crawl
+  cannot prove its inputs are on disk (an unsaved project file), index
+  batches are interleaved with it instead. The crawl pins at most half of
+  `maxCacheBytes`; entries over that are evictable and may be parsed again.
+- **Scheduling.** On every start with a populated store, the reuse passes run
+  before the crawl, waiting for the store to open (within its open bound); the
+  crawl goes first only while bulk work (such as workspace-wide requests)
+  runs. A reuse pass tries every member of its context, however few of them
+  the store holds, before extraction starts. Index batches run behind
+  interactive and bulk work and are bounded: a
+  reuse batch is 512 members or 200 ms, an extraction batch 64 members or 2 s.
+  A member whose write the store refuses under WAL pressure stays pending and
+  is retried later. One member's extraction may take at most 10 seconds:
+  past that it is stopped and counted as `limited` (and `overDeadline`), the
+  batch goes on, and the member is read directly by the requests that need
+  it until it changes. The open-file crawl has no such deadline.
+- **Refusals.** A member that was refused or exceeded the index limits is not
+  stored as a refusal. It is retried last in the background and reported as a
+  `retrying` gap rather than as an incomplete index.
+- **Persistence off.** The memory-only index is kept with the same results;
+  only the scheduling differs.
+
+Known limitation: an unsaved open `.dproj` gives the index a different
+context key, so its facts are not shared with the saved project.
+
+#### Indexed queries
+
+Once `pascal/indexStatus` reports a context `complete` (`pending` may equal
+`retrying`), warm `textDocument/references` and `workspace/symbol` select their
+candidate units from the persisted index instead of walking every member.
+Rename and code actions are unaffected: they always use the strict walk.
+
+- **Answers while the index is incomplete** are partial and carry notes, never
+  a silent drop. Gap texts: `N units of X are not indexed yet; M were searched
+  directly`, `N units of X failed to load for the index and are retried later`,
+  `N units of X have includes that do not resolve; they were not searched` and
+  `N candidate units were not searched: the analysis memory budget is
+  exhausted`.
+- **Exclusions are proven.** An unverified member is left out only when its raw
+  text (for references also its resolved include files; for symbols the raw
+  text only) cannot hold the name.
+- **Memory budget.** If a source a request requires is refused by the analysis
+  memory budget, the request fails with a retryable `ServerCancelled`.
+- **Open documents** are answered from their buffers, not from the index.
+  `workspace/symbol` reuses an open document's parse, including its include
+  declarations.
+- **Unit navigation.** `workspace/symbol` also lists units, as `SymbolKind`
+  `Module`, so a unit can be reached by name.
+
+`pascal/indexStatus` takes no parameters, performs no IO and returns at most
+8 KiB. It never contains member paths.
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `1` |
+| `crawlPublished`, `crawlDeferred`, `providerGraphsRefused` | Process-wide counts since the server started, not per context: |
+| `crawlPublished` | Units the open-file crawl published to the store in this process |
+| `crawlDeferred` | Crawl publications that found no room for their transient buffers; the units stay pending and the next index batch extracts and publishes them |
+| `providerGraphsRefused` | Compiled provider interfaces not shared between sessions because their reads overflowed the capture; each session compiles them again |
+| `contexts` | Up to 8 contexts, most recently used first |
+
+Each context has:
+
+| Field | Meaning |
+| --- | --- |
+| `anchor` | `{"document": uri}` or `{"project": uri}`, at most 512 bytes; `anchorTruncated` says if it was cut |
+| `members`, `fresh` | Members of the project and those whose index entry is current |
+| `reused`, `extracted` | Members reused from the store and parsed in this process |
+| `persisted` | Members whose artifact and record this process knows are published, each counted once: indexed members with a record it proved (reused members included), and members the open-file crawl published under this context's cache key from the current bytes (so it rises while the crawl runs, before any index batch reaches them). `overLimit` and `unprovable` members are not counted (their record has no artifact), nor are refused and limited members. Computed in memory, without reading the store |
+| `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
+| `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
+| `overLimit` | Fresh members whose facts are too large to store (more distinct reads than a capture holds, or a store size limit): indexed in this process, recorded without an artifact, and extracted again by the next start |
+| `unprovable` | Fresh members whose compile-time session read an input that no read capture recorded, so no evidence can prove it to another process: indexed in this process, recorded without an artifact (so the snapshot can still be sealed), not counted as `persisted`, and extracted again by the next start. A gap names the kind of the first such input, never its path |
+| `overDeadline` | Of `limited`, members whose extraction took longer than 10 seconds and was stopped: recorded without an artifact (not as a refusal), so the snapshot can still be sealed, and retried last by the next start |
+| `overAdmission` | Of `limited`, members whose compile-time session (or a provider interface it compiles) was refused by a fixed admission bound, such as `max_pending_bytes`, that refuses again with the same inputs: limited after one attempt instead of deferred, recorded without an artifact (not as a refusal), so the context completes and the snapshot can be sealed, and retried last by the next start. A gap names the bound of the first such member. A member limited by a provider's content stays limited until its own file changes or the next start, even if the provider is edited meanwhile |
+| `membershipComplete` | The member list is complete and current |
+| `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
+| `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |
+| `validationReads` | Files read and hashed to validate the baseline |
+| `publicationsRefused` | Extracted members whose publication found no memory for its transient buffers in this process: they stay memory-only, without a record, and the next start extracts them again |
+| `gaps` | At most 4 texts of at most 160 bytes explaining what is not indexed |
+
+When the document would exceed 8 KiB, gaps of the least recently used contexts
+are dropped first, then anchors are cut.
 
 #### Options
 
@@ -1402,6 +1554,7 @@ never stored.
 | `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
 | `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
 | `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
+| `persistentCacheMaxNamespaces` | 3 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries. Above 16 it is clamped here, while `--cache-max-namespaces` rejects it |
 | `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
 
 The limits can be lowered, not raised. In `initializationOptions`, a value
@@ -1416,9 +1569,10 @@ At runtime (`pascalLsp` settings), `persistentCacheEnabled`,
 `persistentCachePageBytes`, `persistentCacheScratchBytes` and
 `persistentCacheWaitMs` apply as in the table. A value above the maximum clamps
 silently, an invalid value is ignored with a warning and keeps the previous
-one, and `null` resets an option. `persistentCacheDirectory` is ignored with a
-warning, because runtime settings can come from workspace files and a project
-must not redirect where the server writes.
+one, and `null` resets an option. `persistentCacheDirectory` and
+`persistentCacheMaxNamespaces` are ignored with a warning, because runtime
+settings can come from workspace files and a project must not redirect where
+the server writes or retire other builds' entries.
 
 #### A store directory inside a workspace
 
@@ -1482,6 +1636,20 @@ or paths of projects. The one path they contain is the cache directory itself.
 
 #### Disk use
 
+Container 7 keeps artifact rows under a 64-bit surrogate of their artifact,
+with a name index led by a small integer surrogate of the row's scope that
+repeats no 32-byte key, and no per-row checksum (a read verifies every row
+against its artifact's checksum), and stores each distinct observation (a
+search-path listing, presence or payload) once, listed by every evidence set
+that made it; nothing is compressed. On a synthetic store shaped like a large
+workspace this is about 142 bytes per stored fact row (140 in container 6,
+178 in container 5, 409 in container 4) and 40 bytes per observation (442 in
+container 4).
+
+Container 7 adds a small integer scope to each artifact row and its name
+index (about 2 to 4 bytes per row) and the `binding_targets`
+reverse-dependency rows.
+
 The managed budget is 8 GiB for the database, WAL and shared-memory files
 together. The WAL is checkpointed once it passes 256 MiB. Both are targets for
 background maintenance, not quotas: the files can briefly exceed them. Writes
@@ -1506,9 +1674,9 @@ least every 2 minutes. Change the budget with `--cache-max-disk-bytes` and
 | `cause` | `null`, or `kind`, `advice` and (for `configuration`) a `message` of at most 1 KiB; `kind` is `configuration`, `memory` or a bypass name such as `location`, `lowDiskSpace` or `corrupt`; a `location` cause adds `location` (`notPrivate`, `notLocal`, `symlink`, ...) |
 | `advice` (in `cause`) | `none`, `retry`, `prune`, `resetNamespace` or `freshDirectory` |
 | `directory` | The store directory, cut at 4,096 escaped bytes |
-| `limits` | `pageBytes`, `scratchBytes`, `waitMs` in effect |
+| `limits` | `pageBytes`, `scratchBytes`, `waitMs`, `maxNamespaces` in effect |
 | `resetEpoch` | The namespace's reset counter while open |
-| `reservedBytes` | `pages`, `scratch`, `facts` charged to `maxCacheBytes` |
+| `reservedBytes` | `pages`, `scratch`, `facts` and `queryTrees` (the candidate parses of the running references and workspace-symbol requests) charged to `maxCacheBytes`, and `publication`: member publications' transient buffers, which draw on a pool of their own outside `maxCacheBytes` (the smaller of 64 MiB and a sixteenth of it) before asking the budget |
 | `store` | `null`, or the last maintenance reading: `databaseBytes`, `walBytes`, `shmBytes`, `freeBytes`, `filesystemFreeBytes`, `maxDiskBytes`, `walThresholdBytes`, `policyRevision`, `pressure` (`none`, `overHeadroom`, `walPressure`, `lowDiskSpace`) |
 | `lockWaits` | Process-wide `poolWaits`, `lockWaits`, their `*Micros` totals and `busy` outcomes. Waits inside a statement after `BEGIN` are not measured |
 | `counters` | `hits`, `decodedBytes`, `misses` by cause (`input`, `version`, `freshness`, `budget`, `authorization`, `integrity`), non-zero `bypasses` by name, and `maintenance` (`steps`, `cycles`, `rows`, `skipped`) |
@@ -1529,7 +1697,13 @@ pascal-lsp --cache-status         # report; does not create the store
 pascal-lsp --cache-prune          # bounded maintenance until within budget
 pascal-lsp --cache-reset          # drop this build's entries
 pascal-lsp --cache-max-disk-bytes 4294967296 --cache-wal-threshold-bytes 134217728
+pascal-lsp --cache-prune --cache-max-namespaces 1   # keep only this build's entries
 ```
+
+The modes that open the store (all but status) retire namespaces like a
+server, keeping `--cache-max-namespaces N` (1 to 16, default 3) of them. A
+value outside that range is a usage error, while the initialization option
+clamps one above 16.
 
 Exit codes: `0` done (an absent store, including an empty directory, is
 success), `1` refused or failed (the JSON has an `error` field with `bypass`,
@@ -1538,7 +1712,18 @@ directory longer than 2,048 escaped bytes is cut in the output and
 `directoryTruncated` is `true`.
 
 - **Status** reports container version and compatibility, usage, policy,
-  pressure, live and retired namespaces, live leases and advice. A store in
+  pressure, live and retired namespaces, live leases and advice.
+  `namespaces.list` has one entry per live namespace, most recently used
+  first: `id` (the namespace hex), `current` (this command's build),
+  `resetEpoch`, `lastUsed` (Unix seconds, `null` without a lock file),
+  `estimatedBytes` (the size maintenance last estimated for this epoch, its
+  rows' content plus 64 bytes per row; `null` unless disk pressure made
+  maintenance estimate it; it can be out of date once the namespace was
+  used again) and `held` (a
+  running process holds its lock, as retirement sees it: the lock is tried
+  once without waiting). At most 16 are listed, fewer if the line would pass
+  4 KiB; `listTruncated` says so. Of more than 256 live namespaces, the 256
+  most recently used are considered. A store in
   a directory that is not private is refused and left unchanged.
 - **Prune** repeats maintenance cycles until a full cycle leaves the store
   within its headroom (`withinBudget`), a full cycle changes nothing
@@ -1572,14 +1757,30 @@ A directory that fails the location checks is left untouched.
 
 #### What it does not solve
 
-- Processes do not share cold work: two servers indexing the same project both
-  read and parse every source until facts are reused (`l4d-zf1b.8`).
+- Processes do not share cold work in flight: two servers indexing the same
+  project at once both parse what neither has published yet.
 - It does not bound process memory. Only the pages, scratch and decoded facts
   are charged to `maxCacheBytes`; see the unaccounted list in
   `docs/shared-resolver-architecture.md`.
-- No speedup before `l4d-zf1b.8` and `l4d-zf1b.9`, no network or team-shared
-  cache, and no Windows support yet.
-- Cold indexing still reads every source file.
+- Only the workspace index is persisted; other features gain nothing before
+  `l4d-zf1b.9`. There is no network or team-shared cache and no Windows
+  support yet.
+- Every start still reads and hashes every member of an indexed project.
+
+#### Allocator arenas
+
+On glibc the server limits malloc to two arenas at startup
+(`mallopt(M_ARENA_MAX, 2)`), before it starts any thread. Index batches with
+persistence on extract on short-lived worker threads, and glibc's default
+(up to eight arenas per core) keeps each thread's freed memory resident in
+its own arena. On an 8,670-member project the post-crawl high water mark fell
+from 7,017 to 5,412 MiB at equal progress (measured with
+`MALLOC_ARENA_MAX=2`), below the persistence-off run, at a 5-10 % cost in
+extraction throughput. An explicit `MALLOC_ARENA_MAX`, or a
+`glibc.malloc.arena_max` entry in `GLIBC_TUNABLES`, wins: the server then
+leaves the setting alone. Other allocators and platforms are not changed.
+With `PASCAL_LSP_TRACE` set to a file, a startup line records the decision
+(`malloc arenas: 2`, or `malloc arenas: skipped: ...` with the reason).
 
 ## Symbols, References and Highlights
 

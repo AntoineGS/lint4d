@@ -4,8 +4,8 @@ mod common;
 use common::private_tempdir;
 
 use pascal_cache::{
-    ArtifactHeader, ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, Digest, IndexHit,
-    LocalArtifactKey, Lookup, Malformed, Miss, Namespace, RowBatch, SourceContent, Store,
+    ArtifactHeader, ArtifactKeyRef, ArtifactRow, ArtifactWrite, Bypass, DATABASE_FILE, Digest,
+    IndexHit, LocalArtifactKey, Lookup, Malformed, Miss, Namespace, RowBatch, SourceContent, Store,
     StoreLimits,
 };
 use pascal_project::{ConditionalContext, SourceOrigin};
@@ -31,7 +31,7 @@ fn key(text: &str) -> LocalArtifactKey {
 }
 
 fn raw(directory: &Path) -> Connection {
-    let connection = Connection::open(directory.join("analysis.sqlite3")).unwrap();
+    let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }
@@ -189,7 +189,8 @@ fn oversized_rows_are_misses_before_they_are_copied() {
             .unwrap();
         connection
             .execute(
-                "UPDATE artifact_rows SET payload = zeroblob(?1) WHERE artifact_id = ?2 AND ordinal = 1",
+                "UPDATE artifact_rows SET payload = zeroblob(?1) WHERE artifact_ref = \
+                 (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2) AND ordinal = 1",
                 params![bytes, header.artifact_id().as_bytes().as_slice()],
             )
             .unwrap();
@@ -298,10 +299,10 @@ fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
     let header = publish(&store, &key("unit A;"), &small(256));
     raw(root.path())
         .execute(
-            "INSERT INTO artifact_rows (namespace_id, reset_epoch, artifact_id, ordinal, row_kind, \
-             index_key, payload, row_checksum) \
-             SELECT namespace_id, reset_epoch, artifact_id, 256, 1, NULL, x'00', zeroblob(32) \
-             FROM artifact_rows WHERE ordinal = 0",
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             SELECT artifact_ref, 256, scope_ref, 1, NULL, x'00' FROM artifact_rows \
+             WHERE ordinal = 0",
             [],
         )
         .unwrap();
@@ -309,6 +310,26 @@ fn a_row_beyond_the_header_count_in_a_full_batch_is_malformed() {
         read_all(&store, &header),
         Err(Miss::Malformed(Malformed::Count))
     );
+}
+
+/// 13f: a batch whose query ran out of rows read every row at or past its
+/// start, so it already showed there is none past the count: the reader
+/// verifies without another transaction. A full batch still asks.
+#[test]
+fn a_last_batch_that_ran_out_of_rows_needs_no_trailing_query() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    for (count, leases) in [(10, 1), (256, 2), (300, 2)] {
+        let header = publish(&store, &key(&format!("unit A{count};")), &small(count));
+        let before = pascal_cache::store_operations_on_this_thread_for_test();
+        let sizes = read_all(&store, &header).unwrap();
+        assert_eq!(sizes.iter().sum::<usize>(), count);
+        assert_eq!(
+            pascal_cache::store_operations_on_this_thread_for_test() - before,
+            leases,
+            "{count} rows"
+        );
+    }
 }
 
 fn publish_named(store: &Store, text: &str, names: &[&[u8]]) -> Digest {
@@ -343,7 +364,7 @@ fn index_pages_are_stable_and_complete() {
             ordinal,
         }));
     }
-    expected.sort();
+    // Hits come in the store's publication order of their artifacts.
     let mut seen: Vec<IndexHit> = Vec::new();
     let mut after = None;
     let mut pages = 0;
@@ -357,8 +378,8 @@ fn index_pages_are_stable_and_complete() {
         }
         after = page.next;
         if pages == 1 {
-            // A new artifact published mid-scan appears once if its key sorts
-            // after the cursor and never duplicates earlier hits.
+            // A new artifact published mid-scan sorts after the cursor, so
+            // it appears once and never duplicates earlier hits.
             publish_named(&store, "unit Late;", &[b"tfoo"]);
         }
     }
@@ -369,6 +390,7 @@ fn index_pages_are_stable_and_complete() {
         .filter(|hit| hit.artifact_id != late)
         .collect();
     assert_eq!(seen_without_late, expected);
+    assert_eq!(seen.last().map(|hit| hit.artifact_id), Some(late));
     let mut sorted = seen.clone();
     sorted.sort();
     sorted.dedup();
@@ -423,9 +445,10 @@ fn index_lookup_uses_the_index_without_sorting() {
                 0i64,
                 1i64,
                 b"tfoo".as_slice(),
-                Vec::<u8>::new(),
+                0i64,
                 -1i64,
                 257i64,
+                1i64,
                 1i64
             ],
             |row| row.get::<_, String>(3),
@@ -434,8 +457,147 @@ fn index_lookup_uses_the_index_without_sorting() {
         .collect::<Result<_, _>>()
         .unwrap();
     let plan = plan.join("\n");
-    assert!(plan.contains("artifact_rows_by_index_key"), "{plan}");
+    assert!(
+        plan.contains("artifact_rows_by_index_key (scope_ref=? AND row_kind=? AND index_key=?"),
+        "{plan}"
+    );
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+}
+
+fn namespace_id(fingerprint: u8) -> [u8; 32] {
+    *Namespace::new(Digest::from_bytes([fingerprint; 32]))
+        .id()
+        .as_bytes()
+}
+
+/// l4d-rpfc: the name index is scope-led, so another scope's rows under the
+/// same key are never visited, and never returned.
+#[test]
+fn index_lookup_never_visits_another_scopes_rows() {
+    let root = private_tempdir();
+    let ours = open(root.path(), StoreLimits::default()); // Namespace [1; 32]
+    let theirs = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([8; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let mine = publish_named(&ours, "unit A;", &[b"tfoo"]);
+    let id = namespace_id(1);
+    let steps = |directory: &Path| -> i32 {
+        let connection = raw(directory);
+        let scope_ref: i64 = connection
+            .query_row(
+                "SELECT scope_ref FROM scopes WHERE namespace_id = ?1 AND reset_epoch = 0",
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(pascal_cache::INDEX_QUERY_FOR_TEST)
+            .unwrap();
+        let rows = statement
+            .query_map(
+                params![
+                    id.as_slice(),
+                    0i64,
+                    1i64,
+                    b"tfoo".as_slice(),
+                    0i64,
+                    -1i64,
+                    257i64,
+                    1i64,
+                    scope_ref
+                ],
+                |_| Ok(()),
+            )
+            .unwrap()
+            .count();
+        assert_eq!(rows, 1);
+        statement.get_status(rusqlite::StatementStatus::VmStep)
+    };
+    // One row of theirs already follows ours in the index, so both counts
+    // include the step that reads past the end of our range.
+    publish_named(&theirs, "unit B;", &[b"tfoo"]);
+    let before = steps(root.path());
+    let names: Vec<&[u8]> = vec![b"tfoo"; 20];
+    for index in 0..300 {
+        publish_named(&theirs, &format!("unit B{index};"), &names);
+    }
+    assert_eq!(
+        steps(root.path()),
+        before,
+        "6,000 rows of another scope were visited"
+    );
+    let page = ours.find_by_index(1, b"tfoo", None, 256).unwrap();
+    assert_eq!(
+        page.hits,
+        vec![IndexHit {
+            artifact_id: mine,
+            ordinal: 0
+        }]
+    );
+    assert_eq!(page.next, None);
+}
+
+/// l4d-rpfc: `scope_ref` has no foreign key. A row whose ref names another
+/// scope, or none, is hidden from both scopes, never returned to the wrong one.
+#[test]
+fn a_wrong_scope_ref_hides_a_row_and_never_leaks_it() {
+    let root = private_tempdir();
+    let ours = open(root.path(), StoreLimits::default());
+    let theirs = Store::open(
+        root.path(),
+        &Namespace::new(Digest::from_bytes([8; 32])),
+        StoreLimits::default(),
+    )
+    .unwrap();
+    let mine = publish_named(&ours, "unit A;", &[b"tfoo"]);
+    let other = publish_named(&theirs, "unit B;", &[b"tfoo"]);
+    let theirs_ref: i64 = raw(root.path())
+        .query_row(
+            "SELECT scope_ref FROM scopes WHERE namespace_id = ?1",
+            [namespace_id(8).as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let only = |id: Digest| {
+        vec![IndexHit {
+            artifact_id: id,
+            ordinal: 0,
+        }]
+    };
+    for wrong in [theirs_ref, 1_000_000] {
+        raw(root.path())
+            .execute(
+                "UPDATE artifact_rows SET scope_ref = ?1 WHERE artifact_ref = \
+                 (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2)",
+                params![wrong, mine.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(
+            ours.find_by_index(1, b"tfoo", None, 256)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            theirs.find_by_index(1, b"tfoo", None, 256).unwrap().hits,
+            only(other),
+            "{wrong}"
+        );
+    }
+}
+
+/// l4d-rpfc: a scope with no `scopes` row never published an artifact, so
+/// its lookup is the empty last page.
+#[test]
+fn index_lookup_in_a_scope_without_artifacts_is_an_empty_last_page() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let page = store.find_by_index(1, b"tfoo", None, 256).unwrap();
+    assert!(page.hits.is_empty());
+    assert_eq!(page.next, None);
 }
 
 #[test]
@@ -572,19 +734,27 @@ fn tampered_row_fields_are_misses() {
     }
 }
 
+/// Rows of `id`'s artifact, as `artifact_ref = …` SQL.
+const ROWS_OF: &str = "artifact_ref = (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?1)";
+
 #[test]
 fn a_row_copied_from_another_artifact_is_a_checksum_miss() {
     let root = private_tempdir();
     let store = open(root.path(), StoreLimits::default());
     let a = publish(&store, &key("unit A;"), &small(3));
-    let b = publish(&store, &key("unit B;"), &small(3));
-    // Same payloads in both, so only the checksum's artifact binding differs.
+    let other: Vec<Vec<u8>> = (0..3)
+        .map(|index| format!("B {index}").into_bytes())
+        .collect();
+    let b = publish(&store, &key("unit B;"), &other);
     raw(root.path())
         .execute(
-            "UPDATE artifact_rows SET (row_kind, index_key, payload, row_checksum) = \
-             (SELECT row_kind, index_key, payload, row_checksum FROM artifact_rows \
-              WHERE artifact_id = ?2 AND ordinal = 1) \
-             WHERE artifact_id = ?1 AND ordinal = 1",
+            &format!(
+                "UPDATE artifact_rows SET (row_kind, index_key, payload) = \
+                 (SELECT row_kind, index_key, payload FROM artifact_rows \
+                  WHERE {} AND ordinal = 1) \
+                 WHERE {ROWS_OF} AND ordinal = 1",
+                ROWS_OF.replace("?1", "?2")
+            ),
             params![
                 a.artifact_id().as_bytes().as_slice(),
                 b.artifact_id().as_bytes().as_slice()
@@ -593,6 +763,113 @@ fn a_row_copied_from_another_artifact_is_a_checksum_miss() {
         .unwrap();
     assert_eq!(read_all(&store, &a), Err(Miss::ChecksumMismatch));
     assert_eq!(read_all(&store, &b), Ok(vec![3]));
+}
+
+/// A row of another artifact moved under this one, at the ordinal of a
+/// deleted row, is not this artifact's row.
+#[test]
+fn a_row_moved_from_another_artifact_is_a_checksum_miss() {
+    let root = private_tempdir();
+    let store = open(root.path(), StoreLimits::default());
+    let a = publish(&store, &key("unit A;"), &small(3));
+    let other: Vec<Vec<u8>> = (0..3)
+        .map(|index| format!("B {index}").into_bytes())
+        .collect();
+    let b = publish(&store, &key("unit B;"), &other);
+    let connection = raw(root.path());
+    let a_id = a.artifact_id();
+    connection
+        .execute(
+            &format!("DELETE FROM artifact_rows WHERE {ROWS_OF} AND ordinal = 2"),
+            [a_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            &format!(
+                "UPDATE artifact_rows SET artifact_ref = \
+                 (SELECT artifact_ref FROM artifacts WHERE artifact_id = ?2) \
+                 WHERE {ROWS_OF} AND ordinal = 2"
+            ),
+            params![
+                b.artifact_id().as_bytes().as_slice(),
+                a_id.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    assert_eq!(read_all(&store, &a), Err(Miss::ChecksumMismatch));
+    assert_eq!(read_all(&store, &b), Err(Miss::Malformed(Malformed::Count)));
+}
+
+/// Rows swapped, duplicated or missing never verify: the fact checksum
+/// binds every row to its ordinal, and the ordinals and count are checked.
+#[test]
+fn reordered_duplicated_and_missing_rows_are_misses() {
+    let rows: Vec<Vec<u8>> = small(10);
+    let rows: Vec<ArtifactRow<'_>> = rows
+        .iter()
+        .map(|payload| ArtifactRow {
+            row_kind: 1,
+            index_key: Some(b"name"),
+            payload,
+        })
+        .collect();
+    assert_eq!(read_tampered(&rows, ""), Ok(vec![10]));
+    for (tamper, expected) in [
+        // Payloads swapped between two ordinals.
+        (
+            "CREATE TEMP TABLE kept AS SELECT ordinal, payload FROM artifact_rows \
+             WHERE ordinal IN (2, 5); \
+             UPDATE artifact_rows SET payload = \
+             (SELECT payload FROM kept WHERE kept.ordinal = 7 - artifact_rows.ordinal) \
+             WHERE ordinal IN (2, 5);",
+            Miss::ChecksumMismatch,
+        ),
+        // Ordinals swapped, rows otherwise intact.
+        (
+            "UPDATE artifact_rows SET ordinal = -1 WHERE ordinal = 2; \
+             UPDATE artifact_rows SET ordinal = 2 WHERE ordinal = 5; \
+             UPDATE artifact_rows SET ordinal = 5 WHERE ordinal = -1;",
+            Miss::ChecksumMismatch,
+        ),
+        // The last two rows in reverse order.
+        (
+            "UPDATE artifact_rows SET ordinal = -1 WHERE ordinal = 8; \
+             UPDATE artifact_rows SET ordinal = 8 WHERE ordinal = 9; \
+             UPDATE artifact_rows SET ordinal = 9 WHERE ordinal = -1;",
+            Miss::ChecksumMismatch,
+        ),
+        // One row duplicated over its neighbour.
+        (
+            "UPDATE artifact_rows SET (row_kind, index_key, payload) = \
+             (SELECT row_kind, index_key, payload FROM artifact_rows WHERE ordinal = 4) \
+             WHERE ordinal = 5",
+            Miss::ChecksumMismatch,
+        ),
+        // One row duplicated past the end.
+        (
+            "INSERT INTO artifact_rows \
+             (artifact_ref, ordinal, scope_ref, row_kind, index_key, payload) \
+             SELECT artifact_ref, 10, scope_ref, row_kind, index_key, payload \
+             FROM artifact_rows WHERE ordinal = 9",
+            Miss::Malformed(Malformed::Count),
+        ),
+        // A row in the middle, the first or the last missing.
+        (
+            "DELETE FROM artifact_rows WHERE ordinal = 4",
+            Miss::Malformed(Malformed::Ordinal),
+        ),
+        (
+            "DELETE FROM artifact_rows WHERE ordinal = 0",
+            Miss::Malformed(Malformed::Ordinal),
+        ),
+        (
+            "DELETE FROM artifact_rows WHERE ordinal = 9",
+            Miss::Malformed(Malformed::Count),
+        ),
+    ] {
+        assert_eq!(read_tampered(&rows, tamper), Err(expected), "{tamper}");
+    }
 }
 
 #[test]

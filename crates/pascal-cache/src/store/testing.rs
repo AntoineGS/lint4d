@@ -110,6 +110,126 @@ impl Store {
         self.writer().map(|lease| HeldConnection { _lease: lease })
     }
 
+    /// Every content row the store holds (manifests, artifacts and their
+    /// rows, evidence and observations, records and bindings), one line
+    /// each, sorted. Publication order (`publication_seq`) is left out, so
+    /// two stores given the same publications compare equal.
+    pub fn content_for_test(&self) -> Result<Vec<String>, Bypass> {
+        // `(label, rows, columns)`: rows keyed by a surrogate show the
+        // identity it stands for, and the surrogates themselves, which
+        // depend on publication order, are left out.
+        const TABLES: [(&str, &str, &[&str]); 8] = [
+            (
+                "key_manifests",
+                "key_manifests",
+                &["kind", "digest", "manifest"],
+            ),
+            (
+                "artifacts",
+                "artifacts",
+                &[
+                    "artifact_id",
+                    "kind",
+                    "root_key",
+                    "lifecycle",
+                    "row_count",
+                    "content_bytes",
+                    "fact_checksum",
+                    "supplemental",
+                ],
+            ),
+            (
+                "artifact_rows",
+                "artifact_rows r JOIN artifacts a ON a.artifact_ref = r.artifact_ref",
+                &[
+                    "a.artifact_id",
+                    "r.ordinal",
+                    "r.row_kind",
+                    "r.index_key",
+                    "r.payload",
+                ],
+            ),
+            (
+                "evidence_sets",
+                "evidence_sets",
+                &[
+                    "evidence_id",
+                    "purpose",
+                    "context_key",
+                    "subject_key",
+                    "artifact_id",
+                    "lifecycle",
+                    "observation_count",
+                    "content_bytes",
+                ],
+            ),
+            (
+                "observations",
+                "evidence_observations o JOIN evidence_sets e ON e.evidence_ref = o.evidence_ref \
+                 JOIN observation_content c ON c.observation = o.observation",
+                &[
+                    "e.evidence_id",
+                    "o.ordinal",
+                    "c.kind",
+                    "c.path_key",
+                    "c.payload",
+                ],
+            ),
+            (
+                "member_records",
+                "member_records",
+                &[
+                    "record_id",
+                    "lifecycle",
+                    "header",
+                    "source_key",
+                    "artifact_id",
+                    "member_evidence",
+                    "binding_count",
+                    "content_bytes",
+                ],
+            ),
+            (
+                "member_bindings",
+                "member_bindings",
+                &[
+                    "record_id",
+                    "ordinal",
+                    "kind",
+                    "outcome",
+                    "target_key",
+                    "evidence_id",
+                    "payload",
+                ],
+            ),
+            (
+                "binding_targets",
+                "binding_targets",
+                &["record_id", "ordinal", "target_key", "dependency"],
+            ),
+        ];
+        let reader = self.reader()?;
+        let mut lines = Vec::new();
+        for (table, rows, columns) in TABLES {
+            let row = columns
+                .iter()
+                .map(|column| format!("quote({column})"))
+                .collect::<Vec<_>>()
+                .join(" || ' ' || ");
+            let mut statement = reader
+                .prepare(&format!("SELECT '{table} ' || {row} FROM {rows}"))
+                .map_err(|error| classify(&error))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| classify(&error))?;
+            for line in rows {
+                lines.push(line.map_err(|error| classify(&error))?);
+            }
+        }
+        lines.sort();
+        Ok(lines)
+    }
+
     /// Run `hook` inside every write transaction, just before it commits.
     pub fn set_before_commit_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
         *self
@@ -177,10 +297,15 @@ pub enum FaultPoint {
     VacuumBeforeCommit,
     /// Inside a namespace reset, before commit.
     ResetBeforeCommit,
+    /// In a namespace retirement pass, after it ranked the namespaces and
+    /// before it retires any; no connection is held.
+    NamespacesRanked,
+    /// Inside a namespace size estimate's read transaction, on a reader.
+    EstimateChunk,
 }
 
 impl FaultPoint {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::EvidenceBeforeCommit,
         Self::RecordBeforeCommit,
         Self::BeginBeforeCommit,
@@ -195,6 +320,8 @@ impl FaultPoint {
         Self::CheckpointCompleted,
         Self::VacuumBeforeCommit,
         Self::ResetBeforeCommit,
+        Self::NamespacesRanked,
+        Self::EstimateChunk,
     ];
 
     /// The points inside maintenance batches.
@@ -222,6 +349,8 @@ impl FaultPoint {
             Self::CheckpointCompleted => "CheckpointCompleted",
             Self::VacuumBeforeCommit => "VacuumBeforeCommit",
             Self::ResetBeforeCommit => "ResetBeforeCommit",
+            Self::NamespacesRanked => "NamespacesRanked",
+            Self::EstimateChunk => "EstimateChunk",
         }
     }
 
@@ -292,14 +421,68 @@ impl Store {
     }
 }
 
+impl Store {
+    /// The snapshots (builds included) this store's lease holds, by ID.
+    pub fn held_snapshots_for_test(&self) -> Result<Vec<super::SnapshotId>, Bypass> {
+        let reader = self.reader()?;
+        let mut statement = reader
+            .prepare(
+                "SELECT snapshot_id FROM lease_holds WHERE namespace_id = ?1 \
+                 AND reset_epoch = ?2 AND lease_id = ?3 ORDER BY snapshot_id",
+            )
+            .map_err(|error| classify(&error))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    self.scope.namespace.as_bytes().as_slice(),
+                    super::namespaces::epoch(self.scope),
+                    self.lease.id.as_slice()
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| classify(&error))?;
+        let mut held = Vec::new();
+        for row in rows {
+            let id = row.map_err(|error| classify(&error))?;
+            held.push(super::SnapshotId::from_bytes(
+                <[u8; 16]>::try_from(id.as_slice()).map_err(|_| Bypass::Corrupt)?,
+            ));
+        }
+        Ok(held)
+    }
+}
+
 static STORE_OPERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn count_operation() {
     STORE_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_OPERATIONS.with(|operations| operations.set(operations.get() + 1));
+}
+
+thread_local! {
+    static THREAD_OPERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `store_operations_for_test` made on this thread.
+pub fn store_operations_on_this_thread_for_test() -> u64 {
+    THREAD_OPERATIONS.with(std::cell::Cell::get)
 }
 
 /// Store operations of this process: opens, connection leases, maintenance
 /// locks and administration calls.
 pub fn store_operations_for_test() -> u64 {
     STORE_OPERATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static RECORD_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn count_record_open() {
+    RECORD_OPENS.with(|opens| opens.set(opens.get() + 1));
+}
+
+/// `Store::open_member_record` calls made on this thread.
+pub fn record_opens_on_this_thread_for_test() -> u64 {
+    RECORD_OPENS.with(std::cell::Cell::get)
 }

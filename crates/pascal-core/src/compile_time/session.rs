@@ -5160,6 +5160,32 @@ mod tests {
     use super::*;
     use crate::resolver::edit_context;
 
+    /// pascal-lsp's index classifier
+    /// (`workspace::indexing::deterministic_admission_limit`) reads the
+    /// bound name out of this wording to limit a member instead of
+    /// deferring it: changing the shape breaks it.
+    #[test]
+    fn a_structural_admission_failure_names_its_bound_in_the_classified_shape() {
+        let budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let error = resolver_error(
+            IncompleteReason::Limit {
+                name: "max_pending_bytes",
+                maximum: 1_048_576,
+            },
+            &budget,
+        );
+        assert!(
+            matches!(&error, ResolverError::InvalidRequest(_)),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains(
+                "compile-time admission: Limit { name: \"max_pending_bytes\", maximum: 1048576 }"
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn normal_work_defaults_fit_actual_dense_processing_with_finite_retention() {
         // Work-profile proof only: keep the standalone 1 MiB retention default

@@ -175,6 +175,23 @@ pub(crate) fn pressure_of(policy: StorePolicy, usage: &Usage) -> Pressure {
     }
 }
 
+/// The bytes to free before neither the headroom nor the low-space margin
+/// keeps writes out, free pages counting as free (l4d-1ypi: what namespace
+/// retirement reclaims for). WAL pressure is not counted: only a
+/// checkpoint relieves it.
+pub(crate) fn excess_bytes(policy: StorePolicy, usage: &Usage) -> u64 {
+    let over = usage
+        .physical_bytes()
+        .saturating_add(policy.wal_threshold_bytes)
+        .saturating_sub(policy.max_disk_bytes);
+    let low = usage.filesystem_free_bytes.map_or(0, |free| {
+        LOW_SPACE_MARGIN_BYTES
+            .saturating_add(1)
+            .saturating_sub(free)
+    });
+    over.max(low).saturating_sub(usage.free_bytes())
+}
+
 pub(crate) fn read_policy(connection: &Connection) -> Result<PolicyState, Bypass> {
     connection
         .query_row(
@@ -291,6 +308,7 @@ impl Store {
         let now = self.clock.unix_seconds();
         if super::leases::due(&self.lease, now) {
             super::leases::renew(transaction, self.scope, &self.lease, now)?;
+            self.refresh_use(now);
         }
         Ok(())
     }
@@ -440,6 +458,17 @@ mod tests {
             decide(POLICY, &low, WriteEstimate { bytes: 1, rows: 0 }),
             Err(Bypass::LowDiskSpace)
         );
+    }
+
+    #[test]
+    fn the_excess_is_what_keeps_writes_out_less_free_pages() {
+        assert_eq!(excess_bytes(POLICY, &usage(40 * MIB, 0, 0)), 0);
+        assert_eq!(excess_bytes(POLICY, &usage(50 * MIB, 0, 0)), 2 * MIB);
+        assert_eq!(excess_bytes(POLICY, &usage(50 * MIB, 0, MIB)), MIB);
+        let mut low = usage(MIB, 0, 0);
+        low.filesystem_free_bytes = Some(LOW_SPACE_MARGIN_BYTES - MIB);
+        assert_eq!(excess_bytes(POLICY, &low), MIB + 1);
+        assert_eq!(pressure_of(POLICY, &low), Pressure::LowDiskSpace);
     }
 
     #[test]

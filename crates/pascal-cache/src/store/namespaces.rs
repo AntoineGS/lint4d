@@ -2,35 +2,58 @@ use super::gc;
 use super::location::StoreLocation;
 use super::outcome::{Bypass, Integrity};
 use super::pool::Deadline;
-use super::sqlite::{begin_within, classify, limit_wait};
+use super::sqlite::{begin_within, classify};
 use crate::{Digest, Namespace};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The `lifecycle` of every namespace, artifact, evidence set and member
 /// record: retiring one ends its read eligibility at once.
 pub(crate) const LIVE: i64 = 1;
 pub(crate) const RETIRED: i64 = 2;
-/// Namespaces examined per retirement pass; the rest wait for the next start.
-const MAX_RETIRED_PER_PASS: usize = 64;
 /// Retired scopes visited per reclamation transaction.
 const MAX_SCOPES_PER_RECLAIM: i64 = 16;
 /// Scoped tables, each before every table it references.
-const RECLAIM_TABLES: [&str; 11] = [
+const RECLAIM_TABLES: [&str; 14] = [
     "lease_holds",
     "process_leases",
     "snapshot_members",
     "snapshots",
+    "binding_targets",
     "member_bindings",
     "member_records",
-    "observations",
+    "evidence_observations",
     "evidence_sets",
+    "observation_content",
     "artifact_rows",
     "artifacts",
+    "scopes",
     "key_manifests",
 ];
+
+/// At most `?3` rows of `table` in scope `(?1, ?2)`. Rows keyed by a
+/// parent's surrogate are in the scope of that parent.
+fn reclaim_sql(table: &str) -> String {
+    match table {
+        "evidence_observations" => "DELETE FROM evidence_observations \
+             WHERE (evidence_ref, ordinal) IN (SELECT o.evidence_ref, o.ordinal \
+             FROM evidence_sets e CROSS JOIN evidence_observations o \
+             ON o.evidence_ref = e.evidence_ref \
+             WHERE e.namespace_id = ?1 AND e.reset_epoch = ?2 LIMIT ?3)"
+            .to_string(),
+        "artifact_rows" => "DELETE FROM artifact_rows \
+             WHERE (artifact_ref, ordinal) IN (SELECT r.artifact_ref, r.ordinal \
+             FROM artifacts a CROSS JOIN artifact_rows r ON r.artifact_ref = a.artifact_ref \
+             WHERE a.namespace_id = ?1 AND a.reset_epoch = ?2 LIMIT ?3)"
+            .to_string(),
+        table => format!(
+            "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 LIMIT ?3)"
+        ),
+    }
+}
 
 /// The scope every row of this store is published and read in (spec §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,8 +65,15 @@ pub struct Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetireReport {
     pub retired: usize,
-    /// Obsolete namespaces another live process still holds.
+    /// Namespaces the pass would have retired that a live process holds.
     pub in_use: usize,
+    /// Other namespaces left live by retention (l4d-1ypi).
+    pub kept: usize,
+    /// Namespaces retired with no current size estimate. One ends the
+    /// pass's pressure part, and until its scope is reclaimed it stops the
+    /// pressure part of every later pass: what it freed shows only after
+    /// reclamation (reviews I-r2-1, M-r2-2, I-r3-1).
+    pub unknown_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,7 +90,7 @@ pub(crate) fn epoch(scope: Scope) -> i64 {
     scope.reset_epoch as i64
 }
 
-fn digest_from(bytes: &[u8]) -> Result<Digest, Bypass> {
+pub(crate) fn digest_from(bytes: &[u8]) -> Result<Digest, Bypass> {
     <[u8; 32]>::try_from(bytes)
         .map(Digest::from_bytes)
         .map_err(|_| Bypass::Corrupt)
@@ -109,7 +139,11 @@ impl NamespaceLock {
         loop {
             let file = open_lock_file(&path)?;
             match file.try_lock_shared() {
-                Ok(()) if still_linked(&file, &path)? => return Ok(Self { _file: file, path }),
+                Ok(()) if still_linked(&file, &path)? => {
+                    let lock = Self { _file: file, path };
+                    lock.touch();
+                    return Ok(lock);
+                }
                 Ok(()) | Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(error)) => return Err(Bypass::Io(error.kind())),
             }
@@ -129,6 +163,21 @@ impl NamespaceLock {
             Ok(()) | Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(Bypass::Io(error.kind())),
         }
+    }
+
+    /// Record that this process uses the namespace now (spec §10
+    /// amendment 2026-11-08): retirement keeps the most recently used.
+    /// Best effort: a time that cannot be set leaves the namespace older.
+    pub(crate) fn touch(&self) {
+        let _ = self._file.set_modified(SystemTime::now());
+    }
+
+    /// The last use this lock file records.
+    fn used(&self) -> Option<SystemTime> {
+        self._file
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
     }
 
     /// Unlink the file before releasing it, so a process that opened it in
@@ -209,6 +258,36 @@ pub(crate) fn ensure_live(connection: &Connection, scope: Scope) -> Result<(), B
     live.map(|_| ()).ok_or(Bypass::Fenced)
 }
 
+/// The surrogate artifact rows of `scope` carry, or `None` while no
+/// artifact was ever published in it.
+pub(crate) fn scope_ref(connection: &Connection, scope: Scope) -> Result<Option<i64>, Bypass> {
+    connection
+        .prepare_cached("SELECT scope_ref FROM scopes WHERE namespace_id = ?1 AND reset_epoch = ?2")
+        .and_then(|mut statement| {
+            statement
+                .query_row(
+                    params![scope.namespace.as_bytes().as_slice(), epoch(scope)],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|error| classify(&error))
+}
+
+/// [`scope_ref`], registering the scope first in the caller's write
+/// transaction.
+pub(crate) fn ensure_scope_ref(transaction: &Connection, scope: Scope) -> Result<i64, Bypass> {
+    transaction
+        .prepare_cached(
+            "INSERT INTO scopes (namespace_id, reset_epoch) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![scope.namespace.as_bytes().as_slice(), epoch(scope)])
+        })
+        .map_err(|error| classify(&error))?;
+    scope_ref(transaction, scope)?.ok_or(Bypass::Corrupt)
+}
+
 /// Retire `scope` and move its namespace to the next epoch in one
 /// transaction (spec §11.2): every handle of `scope` is fenced from its
 /// next transaction; its rows are reclaimed in batches like any retired
@@ -233,69 +312,98 @@ pub(crate) fn reset(transaction: &Connection, scope: Scope) -> Result<(), Bypass
     Ok(())
 }
 
-/// Retire every other live namespace no process holds, one short
-/// transaction each.
-pub(crate) fn retire_obsolete(
+/// What [`retire_one`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retirement {
+    Done,
+    /// No longer live at that epoch.
+    Gone,
+    /// A live process holds it.
+    Held,
+    /// Used since it was ranked (review M1): its last use is newer than
+    /// `ranked_use`.
+    UsedSince,
+}
+
+/// Retire `namespace` at `reset_epoch` unless a live process holds it or
+/// it was used after `ranked_use`, the last use its ranking read. Under the
+/// exclusive lock nobody can record a use, so the time read there is final.
+pub(crate) fn retire_one(
     connection: &mut Connection,
     location: &StoreLocation,
-    current: Digest,
+    namespace: Digest,
+    reset_epoch: i64,
+    ranked_use: Option<SystemTime>,
     deadline: Deadline,
-) -> Result<RetireReport, Bypass> {
+) -> Result<Retirement, Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
-    limit_wait(connection, deadline)?;
-    let candidates: Vec<(Vec<u8>, i64)> = {
-        let mut statement = connection
-            .prepare(
-                "SELECT namespace_id, reset_epoch FROM namespaces \
-                 WHERE state = ?1 AND namespace_id <> ?2 ORDER BY namespace_id LIMIT ?3",
-            )
-            .map_err(fail)?;
-        statement
-            .query_map(
-                params![
-                    LIVE,
-                    current.as_bytes().as_slice(),
-                    MAX_RETIRED_PER_PASS as i64
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(fail)?
-            .collect::<Result<_, _>>()
-            .map_err(fail)?
-    };
-    let mut report = RetireReport::default();
-    for (id, reset_epoch) in candidates {
-        let namespace = digest_from(&id)?;
-        // Never hold the lock file across a SQLite wait: take the write
-        // lock first, then try the (non-blocking) exclusive lock.
-        let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
-        let Some(lock) = NamespaceLock::try_exclusive(location.namespace_lock(namespace))? else {
-            drop(transaction);
-            report.in_use += 1;
-            continue;
-        };
-        let changed = transaction
-            .execute(
-                "UPDATE namespaces SET state = ?3 \
-                 WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?4",
-                params![id, reset_epoch, RETIRED, LIVE],
-            )
-            .map_err(fail)?;
-        if changed == 1 {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
-                    params![id, reset_epoch],
-                )
-                .map_err(fail)?;
-        }
-        transaction.commit().map_err(fail)?;
-        // The scope is retired either way. A lock file that cannot be
-        // removed is reused if the namespace is registered again.
-        let _ = lock.remove();
-        report.retired += changed;
+    let id = namespace.as_bytes().as_slice();
+    // Never hold the lock file across a SQLite wait: take the write lock
+    // first, then try the (non-blocking) exclusive lock.
+    let transaction = begin_within(connection, TransactionBehavior::Immediate, deadline)?;
+    let path = location.namespace_lock(namespace);
+    // Ranked without a lock file: one there now was made by a process that
+    // opened the namespace since (review M-new-1).
+    if ranked_use.is_none() && fs::symlink_metadata(&path).is_ok() {
+        drop(transaction);
+        return Ok(Retirement::UsedSince);
     }
-    Ok(report)
+    let Some(lock) = NamespaceLock::try_exclusive(path)? else {
+        drop(transaction);
+        return Ok(Retirement::Held);
+    };
+    if ranked_use.is_some() && lock.used() > ranked_use {
+        drop(transaction);
+        return Ok(Retirement::UsedSince);
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE namespaces SET state = ?3 \
+             WHERE namespace_id = ?1 AND reset_epoch = ?2 AND state = ?4",
+            params![id, reset_epoch, RETIRED, LIVE],
+        )
+        .map_err(fail)?;
+    if changed == 1 {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO retired_scopes (namespace_id, reset_epoch) VALUES (?1, ?2)",
+                params![id, reset_epoch],
+            )
+            .map_err(fail)?;
+    }
+    transaction.commit().map_err(fail)?;
+    if changed == 0 {
+        // Live at another epoch: its lock file records its use.
+        return Ok(Retirement::Gone);
+    }
+    // A lock file that cannot be removed is reused if the namespace is
+    // registered again.
+    let _ = lock.remove();
+    Ok(Retirement::Done)
+}
+
+/// Whether a live process holds namespace lock `path` (what retirement
+/// sees), probed without waiting and without creating the file: the
+/// exclusive lock, if free, is released at once.
+pub(crate) fn held(path: &Path) -> Result<bool, Bypass> {
+    StoreLocation::check_file(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Bypass::Io(error.kind())),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(Bypass::Io(error.kind())),
+    }
 }
 
 /// Delete at most `max_rows` rows in the caller's write transaction (spec
@@ -307,7 +415,7 @@ pub(crate) fn reclaim(
     transaction: &Connection,
     max_rows: usize,
     live: Scope,
-) -> Result<Reclaimed, Bypass> {
+) -> Result<(Reclaimed, Vec<(Digest, i64)>), Bypass> {
     let fail = |error: rusqlite::Error| classify(&error);
     let scopes: Vec<(Vec<u8>, i64)> = {
         let mut statement = transaction
@@ -326,19 +434,14 @@ pub(crate) fn reclaim(
     };
     let mut budget = max_rows;
     let mut rows = 0;
+    let mut reclaimed = Vec::new();
     'scopes: for (id, reset_epoch) in &scopes {
         for table in RECLAIM_TABLES {
             if budget == 0 {
                 break 'scopes;
             }
             let deleted = transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} \
-                         WHERE namespace_id = ?1 AND reset_epoch = ?2 LIMIT ?3)"
-                    ),
-                    params![id, reset_epoch, budget as i64],
-                )
+                .execute(&reclaim_sql(table), params![id, reset_epoch, budget as i64])
                 .map_err(fail)?;
             rows += deleted;
             budget -= deleted;
@@ -353,6 +456,7 @@ pub(crate) fn reclaim(
                 params![id, reset_epoch],
             )
             .map_err(fail)?;
+        reclaimed.push((digest_from(id)?, *reset_epoch));
     }
     // With no rows left to spend, the live scope is not examined:
     // `complete` then speaks for the retired scopes only.
@@ -378,10 +482,13 @@ pub(crate) fn reclaim(
     let remaining: i64 = transaction
         .query_row("SELECT count(*) FROM retired_scopes", [], |row| row.get(0))
         .map_err(fail)?;
-    Ok(Reclaimed {
-        rows,
-        complete: remaining == 0 && drained,
-    })
+    Ok((
+        Reclaimed {
+            rows,
+            complete: remaining == 0 && drained,
+        },
+        reclaimed,
+    ))
 }
 
 #[cfg(all(test, unix))]
@@ -430,11 +537,13 @@ mod tests {
             Deadline::after(std::time::Duration::from_secs(2)),
         )
         .unwrap();
+        // Tables without a scope column are keyed by a scoped parent's
+        // surrogate.
         let scoped: std::collections::BTreeSet<String> = connection
             .prepare(
-                "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
-                 WHERE m.type = 'table' AND c.name = 'reset_epoch' \
-                 AND m.name NOT IN ('namespaces', 'retired_scopes', 'store_state')",
+                "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                 AND name NOT IN ('namespaces', 'retired_scopes', 'store_state', \
+                 'sqlite_sequence')",
             )
             .unwrap()
             .query_map([], |row| row.get(0))

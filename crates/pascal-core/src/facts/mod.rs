@@ -18,6 +18,7 @@ pub use slots::{
 use crate::ImportSection;
 use std::fmt;
 use std::ops::Range;
+use std::path::PathBuf;
 
 /// A byte range in 32-bit fact coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -215,7 +216,7 @@ pub enum IncludeExpansion {
     Unresolved,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IncludeFact {
     /// This occurrence's slot, at least 1.
     pub slot: u32,
@@ -224,6 +225,10 @@ pub struct IncludeFact {
     /// The directive in its parent's decoded text.
     pub directive: TextRange,
     pub expansion: IncludeExpansion,
+    /// The path the occurrence read, as the expanded artifact key names it:
+    /// present exactly when `expansion` is `Expanded`, so equal keys keep
+    /// equal facts (spec §5 amendment 2026-11-03, D35).
+    pub source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

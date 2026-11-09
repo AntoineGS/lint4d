@@ -919,6 +919,24 @@ pub(crate) fn resolver_for_context_with_limits(
     .with_context_observations(observations)
 }
 
+/// `resolver_for_context_with_limits` without the context's observations,
+/// for a references proof's include walk (`UnverifiedRanking`): no lookup's
+/// answer reads them, and each member's walk builds its own resolver.
+pub(crate) fn resolver_for_include_walk(
+    context: Arc<ProjectContext>,
+    roots: Vec<PathBuf>,
+    input: &WorkspaceInput,
+    mut limits: ResolverLimits,
+) -> UnitResolver<LspSourceStore> {
+    limits.max_compile_time_byte_work = byte_work_cap(limits.max_compile_time_byte_work);
+    UnitResolver::new(
+        context.clone(),
+        roots,
+        LspSourceStore::from_input(context, input),
+        limits,
+    )
+}
+
 pub(crate) fn resolver_for_context_with_session_cache(
     context: Arc<ProjectContext>,
     observations: &ProjectObservations,
@@ -1455,7 +1473,8 @@ fn source_id_for_path(path: &Path) -> SourceId {
     ))
 }
 
-fn path_key(path: &Path) -> String {
+/// What `path_equivalent` compares: equal keys name one path.
+pub(super) fn path_key(path: &Path) -> String {
     pascal_project::path_identity::path_key(&absolute_path(path.to_path_buf())).replace('\\', "/")
 }
 

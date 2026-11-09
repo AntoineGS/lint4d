@@ -1,21 +1,25 @@
 use super::Store;
 use super::health::Access;
 use super::limits::MAX_INDEX_PAGE;
-use super::namespaces::{LIVE, ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch, scope_ref};
 use super::outcome::Bypass;
 use super::sqlite::{begin, classify};
 use crate::Digest;
 use rusqlite::{TransactionBehavior, params};
 
 /// Keyset-paginated, binary-compared lookup over live artifacts. The partial
-/// index `artifact_rows_by_index_key` serves both the filter and the order.
-/// `pub` only so `test-support` can re-export it; the module is private.
-pub const INDEX_QUERY: &str = "SELECT r.artifact_id, r.ordinal FROM artifact_rows r \
-     JOIN artifacts a ON a.namespace_id = r.namespace_id AND a.reset_epoch = r.reset_epoch \
-         AND a.artifact_id = r.artifact_id \
-     WHERE r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.row_kind = ?3 AND r.index_key = ?4 \
-         AND (r.artifact_id, r.ordinal) > (?5, ?6) AND a.lifecycle = ?8 \
-     ORDER BY r.artifact_id, r.ordinal LIMIT ?7";
+/// index `artifact_rows_by_index_key` is led by the scope surrogate `?9`, so
+/// it serves both the filter and the order within one scope and never
+/// visits another scope's rows (`CROSS JOIN` keeps it outermost). The
+/// artifact's header still restricts the rows to the scope: a wrong
+/// surrogate can hide a row, never return another scope's. `pub` only so
+/// `test-support` can re-export it; the module is private.
+pub const INDEX_QUERY: &str = "SELECT a.artifact_id, r.artifact_ref, r.ordinal \
+     FROM artifact_rows r CROSS JOIN artifacts a ON a.artifact_ref = r.artifact_ref \
+     WHERE r.scope_ref = ?9 AND r.row_kind = ?3 AND r.index_key = ?4 \
+         AND (r.artifact_ref, r.ordinal) > (?5, ?6) \
+         AND a.namespace_id = ?1 AND a.reset_epoch = ?2 AND a.lifecycle = ?8 \
+     ORDER BY r.artifact_ref, r.ordinal LIMIT ?7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexHit {
@@ -23,16 +27,25 @@ pub struct IndexHit {
     pub ordinal: u64,
 }
 
+/// Where a page ended: the position of its last hit in the store's own
+/// order, meaningful only to the store that returned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexCursor {
+    artifact_ref: i64,
+    ordinal: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexPage {
     pub hits: Vec<IndexHit>,
     /// Pass back as `after` for the next page; `None` on the last page.
-    pub next: Option<IndexHit>,
+    pub next: Option<IndexCursor>,
 }
 
 impl Store {
     /// Rows of live artifacts whose kind and index key match exactly, in
-    /// `(artifact_id, ordinal)` order after `after`, at most `limit`
+    /// publication order of their artifacts and then ordinal, after
+    /// `after`, at most `limit`
     /// (clamped to 1..=256). A hit is a candidate only: not membership,
     /// authorization or freshness evidence, and its artifact's rows are
     /// unverified until read (spec §6.1, §7). Its result is charged to the
@@ -42,7 +55,7 @@ impl Store {
         &self,
         row_kind: u8,
         index_key: &[u8],
-        after: Option<IndexHit>,
+        after: Option<IndexCursor>,
         limit: usize,
     ) -> Result<IndexPage, Bypass> {
         self.guarded(Access::Read, || {
@@ -55,13 +68,21 @@ impl Store {
                 return Err(Bypass::ScratchExhausted);
             };
             let fail = |error: rusqlite::Error| classify(&error);
-            let (after_id, after_ordinal) = match after {
-                Some(hit) => (hit.artifact_id.as_bytes().to_vec(), hit.ordinal as i64),
-                None => (Vec::new(), -1),
-            };
+            let after = after.unwrap_or(IndexCursor {
+                artifact_ref: 0,
+                ordinal: -1,
+            });
             let mut reader = self.reader()?;
             let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
             ensure_live(&transaction, self.scope)?;
+            // The scope is registered with its first artifact: without it,
+            // no row of the scope exists.
+            let Some(scope_ref) = scope_ref(&transaction, self.scope)? else {
+                return Ok(IndexPage {
+                    hits: Vec::new(),
+                    next: None,
+                });
+            };
             let mut statement = transaction.prepare_cached(INDEX_QUERY).map_err(fail)?;
             let rows = statement
                 .query_map(
@@ -70,17 +91,29 @@ impl Store {
                         epoch(self.scope),
                         i64::from(row_kind),
                         index_key,
-                        after_id,
-                        after_ordinal,
+                        after.artifact_ref,
+                        after.ordinal,
                         (limit + 1) as i64,
-                        LIVE
+                        LIVE,
+                        scope_ref
                     ],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .map_err(fail)?;
             let mut hits = Vec::with_capacity(limit + 1);
+            let mut cursors = Vec::with_capacity(limit + 1);
             for row in rows {
-                let (id, ordinal) = row.map_err(fail)?;
+                let (id, artifact_ref, ordinal) = row.map_err(fail)?;
+                cursors.push(IndexCursor {
+                    artifact_ref,
+                    ordinal,
+                });
                 let artifact_id = <[u8; 32]>::try_from(id.as_slice())
                     .map(Digest::from_bytes)
                     .map_err(|_| Bypass::Corrupt)?;
@@ -92,7 +125,7 @@ impl Store {
             }
             let next = if hits.len() > limit {
                 hits.truncate(limit);
-                hits.last().copied()
+                cursors.get(limit - 1).copied()
             } else {
                 None
             };

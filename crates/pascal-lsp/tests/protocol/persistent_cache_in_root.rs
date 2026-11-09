@@ -153,13 +153,14 @@ fn workspace_symbol_request(server: &mut TestServer) -> RequestId {
 /// Watched-file events for the store's own files, as a client watching
 /// `**/*` reports them.
 fn store_file_events(server: &mut TestServer, store: &Path) {
+    let database = pascal_cache::DATABASE_FILE;
     let changes: Vec<_> = [
-        ("analysis.sqlite3", 2),
-        ("analysis.sqlite3-wal", 1),
-        ("analysis.sqlite3-shm", 1),
-        ("maintenance.lock", 1),
-        ("namespaces", 1),
-        ("namespaces/0123.lock", 3),
+        (database.to_string(), 2),
+        (format!("{database}-wal"), 1),
+        (format!("{database}-shm"), 1),
+        ("maintenance.lock".to_string(), 1),
+        ("namespaces".to_string(), 1),
+        ("namespaces/0123.lock".to_string(), 3),
     ]
     .iter()
     .map(|(name, kind)| json!({"uri": uri(&store.join(name)), "type": kind}))

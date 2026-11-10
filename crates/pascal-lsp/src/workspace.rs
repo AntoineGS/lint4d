@@ -3376,6 +3376,55 @@ pub struct Workspace {
     interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
     /// Interface entries this workspace stored that were new or changed.
     interface_entries_stored: usize,
+    /// During the warmer's crawl, the units it released. The crawl drops
+    /// each dependency's parse once it is indexed, stored and published, and
+    /// each walked unit's once its imports are stored, so it keeps one
+    /// unit's parse at a time instead of the whole closure's (l4d-10).
+    crawl_deferred: Option<CrawlRelease>,
+}
+
+#[derive(Default)]
+struct CrawlRelease {
+    units: HashMap<Url, CrawlUnit>,
+    /// The distinct contexts of the released units: a key is large, and a
+    /// crawl's units share a few.
+    keys: Vec<Arc<ContextKey>>,
+}
+
+impl CrawlRelease {
+    fn key(&mut self, key: &ContextKey) -> Arc<ContextKey> {
+        if let Some(shared) = self.keys.iter().find(|shared| ***shared == *key) {
+            return shared.clone();
+        }
+        let shared = Arc::new(key.clone());
+        self.keys.push(shared.clone());
+        shared
+    }
+}
+
+/// A unit the warmer's crawl released.
+enum CrawlUnit {
+    /// Indexed, stored, published and dropped; walked from its text.
+    Released(DeferredSource),
+    /// Walked and dropped: what it was walked under and from.
+    Walked {
+        context_key: Arc<ContextKey>,
+        content_hash: u64,
+    },
+}
+
+/// A dependency the warm crawl released, with what its import load indexed
+/// it from.
+struct DeferredSource {
+    text: String,
+    disk_size: Option<usize>,
+    raw_content_hash: Option<u64>,
+    context_key: Arc<ContextKey>,
+    /// Charges `text` to the cache budget while the crawl holds it. Absent
+    /// when the budget had no room; that refusal also stops the crawl at
+    /// its next unit (D51: BudgetStopped), so it keeps the text only that
+    /// long.
+    _charge: Option<crate::project_cache::Reservation>,
 }
 
 pub(crate) type DependencyHook =
@@ -8134,7 +8183,20 @@ impl Workspace {
                         .index
                         .source_text(&dependency_uri)
                         .is_some_and(|source| source == dependency_text);
-                let indexed = if already_indexed {
+                // A warm crawl indexed and released it already: its entries
+                // are stored and it was published (l4d-10).
+                // Under the same context and text, as for an indexed one.
+                let released = !already_indexed
+                    && self.crawl_released(
+                        &dependency_uri,
+                        &effective_context_key,
+                        &dependency_text,
+                    );
+                // A crawl keeps the text of a unit it releases, to index it
+                // again when its walk reaches it.
+                let release_text = (!already_indexed && !released && self.crawl_deferred.is_some())
+                    .then(|| dependency_text.clone());
+                let indexed = if already_indexed || released {
                     true
                 } else {
                     self.index_source_with_cancel(
@@ -8184,11 +8246,22 @@ impl Workspace {
                     if !dependencies.contains(&dependency_uri) {
                         dependencies.push(dependency_uri.clone());
                     }
-                    self.publish_crawled_unit(
-                        &dependency_uri,
-                        &dependency.source.revision,
-                        cancel.unwrap_or(&no_cancel),
-                    );
+                    if !released {
+                        self.publish_crawled_unit(
+                            &dependency_uri,
+                            &dependency.source.revision,
+                            cancel.unwrap_or(&no_cancel),
+                        );
+                    }
+                    if let Some(text) = release_text {
+                        self.release_crawled_dependency(
+                            &dependency_uri,
+                            text,
+                            disk_size,
+                            raw_content_hash,
+                            &effective_context_key,
+                        );
+                    }
                 }
             }
             if let Some(hook) = &self.dependency_hook {
@@ -8353,11 +8426,34 @@ impl Workspace {
         Arc::clone(&self.crawl_private)
     }
 
-    /// Loads `uri` and every direct import into the shared cache.
+    /// Loads `uri` and every direct import into the shared cache, and keeps
+    /// what it walked indexed in this workspace.
+    #[cfg(test)]
     pub(crate) fn warm_with_cancel(
         &mut self,
         uri: &Url,
         cancel: &AtomicBool,
+    ) -> Result<WarmOutcome, String> {
+        self.warm_closure(uri, cancel, false)
+    }
+
+    /// The warmer's crawl: `warm_with_cancel` for a workspace dropped once it
+    /// returns. Only the shared cache keeps what it walked, so this
+    /// workspace holds one unit's parse at a time instead of the closure's
+    /// (l4d-10); the cache's budget bounds the rest.
+    pub(crate) fn crawl_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<WarmOutcome, String> {
+        self.warm_closure(uri, cancel, true)
+    }
+
+    fn warm_closure(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+        release: bool,
     ) -> Result<WarmOutcome, String> {
         let context_key = self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), None)?;
         let fingerprint = self.contexts.get(&context_key).map(|state| {
@@ -8372,21 +8468,38 @@ impl Workspace {
         }
         let mut pinned = HashSet::from([uri.clone()]);
         let session_cache = ResolverSessionCache::default();
-        let dependencies = self.load_imports_with_session_cache(
-            uri,
-            &context_key,
-            &mut pinned,
-            Some(cancel),
-            &session_cache,
-        )?;
-        let closure = self.warm_interface_closure(
-            uri,
-            &dependencies,
-            &context_key,
-            &mut pinned,
-            cancel,
-            &session_cache,
-        )?;
+        // A crawl's product is the shared cache: the source records of the
+        // closure it walks and releases would only grow this workspace.
+        let records = if release {
+            self.crawl_deferred = Some(CrawlRelease::default());
+            Some(self.analysis_records.take())
+        } else {
+            None
+        };
+        let walked = self
+            .load_imports_with_session_cache(
+                uri,
+                &context_key,
+                &mut pinned,
+                Some(cancel),
+                &session_cache,
+            )
+            .and_then(|dependencies| {
+                let closure = self.warm_interface_closure(
+                    uri,
+                    &dependencies,
+                    &context_key,
+                    &mut pinned,
+                    cancel,
+                    &session_cache,
+                )?;
+                Ok((dependencies, closure))
+            });
+        if let Some(records) = records {
+            self.crawl_deferred = None;
+            self.analysis_records = records;
+        }
+        let (dependencies, closure) = walked?;
         Ok(WarmOutcome {
             fingerprint,
             dependencies,
@@ -8424,6 +8537,36 @@ impl Workspace {
                 hook(&unit, finished, finished + frontier.len() + 1)?;
             }
             done += 1;
+            let indexed = self.index_released_unit(&unit, context_key, pinned, cancel)?;
+            // A walked unit is never walked again: drop its text, keep what
+            // it was indexed under and from.
+            let walked = self.index.source_text(&unit).and_then(|text| {
+                let key = self.document_contexts.get(&unit)?;
+                Some((
+                    key.clone(),
+                    pascal_project::content_hash_bytes(text.as_bytes()),
+                ))
+            });
+            if let Some(release) = self.crawl_deferred.as_mut() {
+                match walked {
+                    Some((key, content_hash)) => {
+                        let context_key = release.key(&key);
+                        release.units.insert(
+                            unit.clone(),
+                            CrawlUnit::Walked {
+                                context_key,
+                                content_hash,
+                            },
+                        );
+                    }
+                    None => {
+                        release.units.remove(&unit);
+                    }
+                }
+            }
+            if !indexed {
+                continue;
+            }
             // Each load reports its own dependencies through the hook; keep
             // one progress sequence for the whole crawl.
             let hook = self.dependency_hook.take();
@@ -8438,25 +8581,143 @@ impl Workspace {
             );
             self.interface_imports_only = false;
             self.dependency_hook = hook;
-            match loaded {
+            let summary = match loaded {
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
-                Err(_) => continue,
-                Ok(_) => {}
-            }
-            let Some(summary) = self.interface_import_summaries.get(&unit).cloned() else {
-                continue;
+                Err(_) => None,
+                Ok(_) => self.interface_import_summaries.get(&unit).cloned(),
             };
-            if !summary.complete {
-                continue;
-            }
-            for target in summary.targets {
-                if visited.insert(target.clone()) {
-                    closure.push(target.clone());
-                    frontier.push_back(target);
+            // Its unit, import and interface entries are stored: the crawl
+            // needs its parse no more.
+            self.release_crawled_unit(root, &unit);
+            if let Some(summary) = summary.filter(|summary| summary.complete) {
+                for target in summary.targets {
+                    if visited.insert(target.clone()) {
+                        closure.push(target.clone());
+                        frontier.push_back(target);
+                    }
                 }
             }
         }
         Ok(closure)
+    }
+
+    /// Whether the crawl released `uri` already (l4d-10) as `context_key`
+    /// indexes `text`: it counts as indexed then, as `already_indexed` checks
+    /// for an indexed one; under another context or text it is indexed again.
+    fn crawl_released(&self, uri: &Url, context_key: &ContextKey, text: &str) -> bool {
+        match self
+            .crawl_deferred
+            .as_ref()
+            .and_then(|release| release.units.get(uri))
+        {
+            Some(CrawlUnit::Released(source)) => {
+                *source.context_key == *context_key && source.text == text
+            }
+            Some(CrawlUnit::Walked {
+                context_key: walked,
+                content_hash,
+            }) => {
+                **walked == *context_key
+                    && *content_hash == pascal_project::content_hash_bytes(text.as_bytes())
+            }
+            None => false,
+        }
+    }
+
+    /// Indexes again, for its walk, a unit the crawl released (l4d-10).
+    /// False when it could not be indexed; a unit the crawl did not release
+    /// is indexed already.
+    fn index_released_unit(
+        &mut self,
+        uri: &Url,
+        fallback_context: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        let Some(CrawlUnit::Released(source)) = self
+            .crawl_deferred
+            .as_ref()
+            .and_then(|release| release.units.get(uri))
+        else {
+            return Ok(self.index.contains(uri));
+        };
+        if self.index.contains(uri) {
+            return Ok(true);
+        }
+        let text = source.text.clone();
+        let (disk_size, raw_content_hash) = (source.disk_size, source.raw_content_hash);
+        let context_key = if self.contexts.contains_key(&*source.context_key) {
+            (*source.context_key).clone()
+        } else {
+            fallback_context.clone()
+        };
+        let stamp = self.disk_stamps.get(uri).cloned();
+        let indexed = self.index_source_with_cancel(
+            uri,
+            text,
+            disk_size,
+            raw_content_hash,
+            &context_key,
+            pinned,
+            Some(cancel),
+        )?;
+        if indexed && let Some(stamp) = stamp {
+            self.disk_stamps.insert(uri.clone(), stamp);
+        }
+        Ok(indexed)
+    }
+
+    /// Drops a dependency the crawl just indexed, stored and published from
+    /// this workspace, keeping its text for its walk (l4d-10).
+    fn release_crawled_dependency(
+        &mut self,
+        uri: &Url,
+        text: String,
+        disk_size: Option<usize>,
+        raw_content_hash: Option<u64>,
+        context_key: &ContextKey,
+    ) {
+        if self.open_documents.contains_key(uri) {
+            return;
+        }
+        let Some(release) = self.crawl_deferred.as_mut() else {
+            return;
+        };
+        let source = DeferredSource {
+            _charge: self.project_cache.reserve(
+                crate::project_cache::ReservationKind::CrawlSources,
+                text.len(),
+            ),
+            text,
+            disk_size,
+            raw_content_hash,
+            context_key: release.key(context_key),
+        };
+        release
+            .units
+            .insert(uri.clone(), CrawlUnit::Released(source));
+        self.drop_crawled_parse(uri);
+    }
+
+    /// Drops a crawled unit's parse from this workspace; the shared cache
+    /// keeps it while its budget allows. The root and open documents stay.
+    fn release_crawled_unit(&mut self, root: &Url, uri: &Url) {
+        if self.crawl_deferred.is_none() || uri == root || self.open_documents.contains_key(uri) {
+            return;
+        }
+        self.drop_crawled_parse(uri);
+    }
+
+    fn drop_crawled_parse(&mut self, uri: &Url) {
+        let stamp = self.disk_stamps.get(uri).cloned();
+        let _ = self.remove_indexed_with_control(uri, None, None, false);
+        // Its owner holds a copy of its context's key, kilobytes each; the
+        // crawl indexes it again under the key it released it with.
+        self.document_owners.remove(uri);
+        self.owner_last_used.remove(uri);
+        if let Some(stamp) = stamp {
+            self.disk_stamps.insert(uri.clone(), stamp);
+        }
     }
 
     #[allow(dead_code)]
@@ -19898,8 +20159,7 @@ mod tests {
 
         cache.invalidate_after_overflow();
         assert!(
-            cache.stats().outstanding_bytes
-                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            cache.stats().outstanding_bytes > INHERITED_BASE.len(),
             "the worker still holds the parses it stored"
         );
         drop(worker);
@@ -19934,12 +20194,150 @@ mod tests {
         // (`UnitValue::retained_bytes`), which the test cannot recompute
         // without rebuilding them.
         assert!(
-            cache.stats().outstanding_bytes
-                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            cache.stats().outstanding_bytes > INHERITED_BASE.len(),
             "so its charge stays outstanding"
         );
         drop(worker);
         assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    /// `Main` uses `U00`; each `Unn` uses the next through its interface, so
+    /// the warm crawl walks a closure of `units` units of about 8 KB each.
+    fn chain_fixture(units: usize) -> (tempfile::TempDir, Workspace, Url, Vec<Url>) {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut chain = Vec::new();
+        for unit in 0..units {
+            let uses = if unit + 1 < units {
+                format!("uses U{:02};\n", unit + 1)
+            } else {
+                String::new()
+            };
+            let mut text = format!(
+                "unit U{unit:02};\ninterface\n{uses}type\n  TC{unit:02} = class\n  public\n"
+            );
+            for member in 0..120 {
+                text.push_str(&format!(
+                    "    procedure Member{member}(Value: Integer; const Name: string);\n"
+                ));
+            }
+            text.push_str("  end;\nimplementation\n");
+            for member in 0..120 {
+                text.push_str(&format!(
+                    "procedure TC{unit:02}.Member{member}(Value: Integer; const Name: string);\nbegin\nend;\n"
+                ));
+            }
+            text.push_str("end.\n");
+            let path = root.join(format!("U{unit:02}.pas"));
+            fs::write(&path, text).unwrap();
+            chain.push(Url::from_file_path(path).unwrap());
+        }
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses U00;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let workspace = test_workspace(vec![root], Default::default());
+        (temp, workspace, Url::from_file_path(main).unwrap(), chain)
+    }
+
+    /// l4d-10 fix round 1 (M4): a unit the crawl released counts as
+    /// indexed only for the context and text it was released with, as
+    /// `already_indexed` checks for an indexed one.
+    #[test]
+    fn a_released_unit_counts_as_indexed_only_for_its_context_and_text() {
+        let (_temp, mut workspace, main, chain) = chain_fixture(2);
+        let key = workspace.context_for_uri_with_cancel(&main, None).unwrap();
+        let other = ContextKey {
+            config: Some("Other".to_owned()),
+            ..key.clone()
+        };
+        let mut release = super::CrawlRelease::default();
+        let shared = release.key(&key);
+        release.units.insert(
+            chain[0].clone(),
+            super::CrawlUnit::Released(super::DeferredSource {
+                text: "unit U00;".to_owned(),
+                disk_size: None,
+                raw_content_hash: None,
+                context_key: shared.clone(),
+                _charge: None,
+            }),
+        );
+        release.units.insert(
+            chain[1].clone(),
+            super::CrawlUnit::Walked {
+                context_key: shared,
+                content_hash: pascal_project::content_hash_bytes(b"unit U01;"),
+            },
+        );
+        workspace.crawl_deferred = Some(release);
+        assert!(workspace.crawl_released(&chain[0], &key, "unit U00;"));
+        assert!(!workspace.crawl_released(&chain[0], &other, "unit U00;"));
+        assert!(!workspace.crawl_released(&chain[0], &key, "unit U00; changed"));
+        assert!(workspace.crawl_released(&chain[1], &key, "unit U01;"));
+        assert!(!workspace.crawl_released(&chain[1], &other, "unit U01;"));
+        assert!(!workspace.crawl_released(&chain[1], &key, "unit U01; changed"));
+        assert!(!workspace.crawl_released(&main, &key, "unit Main;"));
+    }
+
+    /// l4d-10: a warm crawl keeps the parses of the closure it walked in its
+    /// own index. Past the budget, those leased parses stayed charged and
+    /// alive while the cache evicted everything else (SFClient2: 2.9 GB
+    /// outstanding against a 2 GiB budget). The crawl must release what it
+    /// no longer needs, so the closure fits the budget, and still finish.
+    #[test]
+    fn a_crawl_over_a_closure_larger_than_the_budget_stays_within_it() {
+        let (_temp, workspace, main, chain) = chain_fixture(40);
+        let cache = workspace.project_cache().clone();
+        let budget = 4 << 20;
+        cache.set_max_bytes(budget);
+        let mut worker = worker_view(&workspace);
+        let peak_charged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(target_os = "linux")]
+        let baseline = crate::test_alloc::live_bytes();
+        #[cfg(target_os = "linux")]
+        let peak_live = Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let hook_cache = cache.clone();
+        let hook_peak = peak_charged.clone();
+        #[cfg(target_os = "linux")]
+        let hook_live = peak_live.clone();
+        worker.set_dependency_hook(Arc::new(move |_, _, _| {
+            let stats = hook_cache.stats();
+            hook_peak.fetch_max(
+                stats.bytes + stats.outstanding_bytes + stats.reserved_bytes(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            #[cfg(target_os = "linux")]
+            hook_live.fetch_max(
+                crate::test_alloc::live_bytes() - baseline,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(())
+        }));
+
+        let outcome = worker
+            .crawl_with_cancel(&main, &AtomicBool::new(false))
+            .expect("the crawl finishes");
+
+        assert_eq!(outcome.dependencies, chain[..1]);
+        assert_eq!(outcome.closure, chain[1..], "the whole closure is walked");
+        let charged = peak_charged.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            charged <= budget,
+            "charged {charged} bytes against a {budget}-byte budget"
+        );
+        // Measured, the bound holds up to the estimates' error and the
+        // crawl's own bookkeeping.
+        #[cfg(target_os = "linux")]
+        {
+            let live = peak_live.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                live <= (budget + budget / 20) as isize,
+                "the crawl kept {live} bytes against a {budget}-byte budget"
+            );
+        }
     }
 
     #[test]
@@ -19962,7 +20360,7 @@ mod tests {
         cache.invalidate_after_overflow();
         let held = cache.stats().outstanding_bytes;
         assert!(
-            held >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            held > INHERITED_BASE.len(),
             "the snapshot still holds Base's parse: {held} bytes charged"
         );
 

@@ -18,6 +18,8 @@ pub mod navigation;
 pub(crate) mod persistent_cache;
 mod project_cache;
 pub mod server;
+#[cfg(test)]
+mod test_alloc;
 pub mod text;
 pub(crate) mod trace;
 pub(crate) mod warmer;

@@ -40,6 +40,9 @@ impl InterfaceNames {
     pub(super) fn new(mut names: Vec<Box<str>>) -> Self {
         names.sort_unstable();
         names.dedup();
+        // A scan pushes every occurrence: an interface spelling a few
+        // thousand names may have pushed ten times as many (l4d-10).
+        names.shrink_to_fit();
         Self { names }
     }
 

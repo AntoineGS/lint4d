@@ -18,9 +18,23 @@ static PEAK: AtomicIsize = AtomicIsize::new(0);
 thread_local! {
     /// Bytes this thread freed while counting.
     static FREED: Cell<usize> = const { Cell::new(0) };
+    /// Bytes this thread allocated and has not freed, counted always
+    /// (`test_alloc`, l4d-10).
+    static THREAD_LIVE: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Adds `bytes` to this thread's live count.
+pub(crate) fn add_thread_live(bytes: isize) {
+    let _ = THREAD_LIVE.try_with(|live| live.set(live.get() + bytes));
+}
+
+/// Bytes this thread allocated and has not freed.
+pub(crate) fn thread_live() -> isize {
+    THREAD_LIVE.with(Cell::get)
 }
 
 fn grow(bytes: usize) {
+    add_thread_live(bytes as isize);
     if COUNTING.load(Ordering::Relaxed) {
         let live = LIVE.fetch_add(bytes as isize, Ordering::Relaxed) + bytes as isize;
         PEAK.fetch_max(live, Ordering::Relaxed);
@@ -28,6 +42,7 @@ fn grow(bytes: usize) {
 }
 
 fn shrink(bytes: usize) {
+    add_thread_live(-(bytes as isize));
     if COUNTING.load(Ordering::Relaxed) {
         LIVE.fetch_sub(bytes as isize, Ordering::Relaxed);
         let _ = FREED.try_with(|freed| freed.set(freed.get() + bytes));

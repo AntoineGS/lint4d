@@ -3314,6 +3314,10 @@ pub struct Workspace {
     /// The warm crawl publishes the disk-proven units it analyses
     /// (R8-2/D42). Only the warmer sets it, while the store is enabled.
     crawl_persists: bool,
+    /// Set while the crawl walks the interface closure past the open file's
+    /// own imports: it loads only the units interface sections import,
+    /// which snapshots bind through (D51 #4).
+    interface_imports_only: bool,
     /// Set when the crawl met a context built from unsaved project input:
     /// it publishes nothing, and the warmer interleaves extraction.
     crawl_private: Arc<AtomicBool>,
@@ -8036,6 +8040,21 @@ impl Workspace {
             }
         }
         let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
+        if self.interface_imports_only {
+            // A unit only an implementation section imports is not in the
+            // interface closure: the crawl leaves it to the requests that
+            // need it rather than parse the program (D51 #4).
+            let interface_sources = resolved
+                .bindings
+                .iter()
+                .filter(|import| import.site.section != ImportSection::Implementation)
+                .filter_map(|import| match &import.target {
+                    ResolutionTarget::Found(source_id) => Some(source_id),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            dependency_units.retain(|unit| interface_sources.contains(&unit.source.id));
+        }
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
             // are where navigation usually lands.
@@ -8386,12 +8405,10 @@ impl Workspace {
                 hook(&unit, finished, finished + frontier.len() + 1)?;
             }
             done += 1;
-            if self.crawl_skips(&unit) {
-                continue;
-            }
             // Each load reports its own dependencies through the hook; keep
             // one progress sequence for the whole crawl.
             let hook = self.dependency_hook.take();
+            self.interface_imports_only = true;
             let loaded = self.load_imports_with_session_cache(
                 &unit,
                 context_key,
@@ -8399,6 +8416,7 @@ impl Workspace {
                 Some(cancel),
                 session_cache,
             );
+            self.interface_imports_only = false;
             self.dependency_hook = hook;
             match loaded {
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
@@ -8419,37 +8437,6 @@ impl Workspace {
             }
         }
         Ok(closure)
-    }
-
-    /// Whether a persisting crawl leaves `unit`'s imports unloaded: its facts
-    /// are in the store, proven from the bytes it was loaded from, so
-    /// requests read them there rather than from a parse of the program the
-    /// crawl would keep (D51 #4). The closure then does not grow past it,
-    /// so the open file's snapshots bind only what requests have loaded.
-    fn crawl_skips(&self, unit: &Url) -> bool {
-        if !self.crawl_persists || !self.persistent_cache().is_enabled() {
-            return false;
-        }
-        let Some(hash) = self.indexed_content_hashes.get(unit).copied() else {
-            return false;
-        };
-        let Ok(path) = unit.to_file_path().map(absolute_path) else {
-            return false;
-        };
-        let Some(key) = self.document_contexts.get(unit) else {
-            return false;
-        };
-        // Proven for the context the crawl loads it under, not another.
-        let skipped = self
-            .project_cache
-            .index_member_is_proven_in(key, &path, hash);
-        if skipped {
-            crate::trace::trace!(
-                "  warm skips {}: proven in the store",
-                unit.path().rsplit('/').next().unwrap_or_default()
-            );
-        }
-        skipped
     }
 
     #[allow(dead_code)]

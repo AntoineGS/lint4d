@@ -8582,19 +8582,6 @@ impl ProjectCache {
             })
     }
 
-    /// `index_member_is_proven` within the index of the context `key`.
-    pub(crate) fn index_member_is_proven_in(
-        &self,
-        key: &ContextKey,
-        path: &Path,
-        hash: u64,
-    ) -> bool {
-        self.index()
-            .contexts
-            .get(key)
-            .is_some_and(|stored| stored.index.proven_with_hash(path, hash))
-    }
-
     pub(crate) fn index_member_has_record(&self, key: &ContextKey, path: &Path) -> bool {
         self.index()
             .contexts

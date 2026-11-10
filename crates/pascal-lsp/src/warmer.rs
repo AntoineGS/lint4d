@@ -4619,25 +4619,33 @@ mod tests {
         }
 
         /// D51 #4 (multidev w1-gap: after a warm start the crawl parsed the
-        /// program again, RSS 1.8 -> 3.35 GiB): a crawl does not load the
-        /// imports of closure units whose facts the store proves.
+        /// program again, RSS 1.8 -> 3.35 GiB; review I3: skipping store-proven
+        /// units lost inherited members): a crawl over a store that proves
+        /// every unit still loads the interface closure snapshots bind
+        /// through, but not the units only implementation sections import.
         #[test]
-        fn a_warm_crawl_skips_the_imports_of_units_the_store_proves() {
+        fn a_warm_crawl_loads_the_interface_closure_but_not_implementation_imports() {
             let gate = Arc::new(InteractiveGate::default());
             let temp = tempfile::tempdir().unwrap();
             write_project(temp.path(), 0);
             write(
                 &temp.path().join("lib/Provider.pas"),
-                "unit Provider;\ninterface\nuses Base;\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+                "unit Provider;\ninterface\nuses Base;\nprocedure Hello;\nimplementation\nuses Helper;\nprocedure Hello; begin end;\nend.\n",
             );
             write(
                 &temp.path().join("lib/Base.pas"),
-                "unit Base;\ninterface\nuses Deep;\nimplementation\nend.\n",
+                "unit Base;\ninterface\nuses Deep;\nimplementation\nuses Impl;\nend.\n",
             );
             write(
                 &temp.path().join("lib/Deep.pas"),
                 "unit Deep;\ninterface\nimplementation\nend.\n",
             );
+            for name in ["Helper", "Impl"] {
+                write(
+                    &temp.path().join(format!("lib/{name}.pas")),
+                    &format!("unit {name};\ninterface\nimplementation\nend.\n"),
+                );
+            }
             pascal_project::backdate_tree_for_test(temp.path());
             let store = crate::workspace::persist::tests::private_dir();
             let main = Url::from_file_path(temp.path().join("lib/Main.pas")).unwrap();
@@ -4660,13 +4668,6 @@ mod tests {
             warmer.open(main.clone());
             let events = poll_until(&mut warmer, &first, complete_project);
             assert!(complete_project(&events), "{events:?}");
-            assert!(
-                first
-                    .project_cache()
-                    .ready_layers(&lib("Deep.pas"))
-                    .contains(&"Unit".to_string()),
-                "a cold crawl loads the closure"
-            );
             warmer.shutdown();
             first.persistent_cache().shutdown();
             drop(first);
@@ -4678,18 +4679,19 @@ mod tests {
             let mut warmer = Warmer::start(gate);
             warmer.open(main);
             let events = run_until_end_within(&mut warmer, &second, Duration::from_secs(20));
+            let kinds = events.iter().map(event_kind).collect::<Vec<_>>();
             let cache = second.project_cache();
-            assert!(
-                cache
-                    .ready_layers(&lib("Provider.pas"))
-                    .contains(&"Unit".to_string()),
-                "the open file's imports are loaded: {events:?}"
-            );
-            for name in ["Base.pas", "Deep.pas"] {
+            let parsed = |name: &str| cache.ready_layers(&lib(name)).contains(&"Unit".to_string());
+            for name in ["Provider.pas", "Base.pas", "Deep.pas"] {
                 assert!(
-                    !cache.ready_layers(&lib(name)).contains(&"Unit".to_string()),
-                    "{name} is not parsed again: {:?}",
-                    events.iter().map(event_kind).collect::<Vec<_>>()
+                    parsed(name),
+                    "{name} is in the interface closure: {kinds:?}"
+                );
+            }
+            for name in ["Helper.pas", "Impl.pas"] {
+                assert!(
+                    !parsed(name),
+                    "{name} is only an implementation import: {kinds:?}"
                 );
             }
             warmer.shutdown();

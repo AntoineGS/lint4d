@@ -1548,6 +1548,13 @@ pub struct UnitResolver<S> {
     compile_time_credits: HashMap<SourceId, Vec<(SourceRevision, SourceCredit)>>,
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
+    /// Set while a temporary import projection runs: its session stores are
+    /// superseded by the next top-level session instead of kept.
+    compile_time_temporary: bool,
+    /// What superseded temporary session stores still back after their
+    /// caches died (outputs the caller kept), charged for this resolver's
+    /// lifetime. Request rollbacks of `compile_time_accounting` never refund it.
+    retired_compile_time: crate::compile_time::BudgetSnapshot,
     callback_reports: Option<CallbackReports>,
     callback_include_reason: Option<AdmittedOwned<String>>,
     callback_unit_reason: Option<AdmittedOwned<String>>,
@@ -2142,6 +2149,9 @@ struct StoreRoot {
         >,
     >,
     limits: crate::compile_time::CompileTimeLimits,
+    /// Created for a temporary import projection, whose store the next
+    /// top-level session supersedes.
+    temporary: bool,
 }
 
 struct StoreCall<'a, S: SourceStore> {
@@ -2216,6 +2226,7 @@ impl<S: SourceStore> UnitResolver<S> {
             let root = StoreRoot {
                 view,
                 limits: budget.limits(),
+                temporary: self.compile_time_temporary,
             };
             let old = self.compile_time_caches.capacity();
             if self.compile_time_caches.len() == old {
@@ -2238,6 +2249,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .limits
             .max_compile_time_retained_bytes
             .saturating_sub(self.compile_time_accounting.retained_bytes)
+            .saturating_sub(self.retired_compile_time.retained_bytes)
             .saturating_sub(other);
         budget
             .constrain_retained(remaining)
@@ -2473,6 +2485,13 @@ impl<S: SourceStore> UnitResolver<S> {
     /// conservatively last for this resolver's request-local lifetime.
     pub fn compile_time_usage(&self) -> crate::compile_time::BudgetSnapshot {
         let mut usage = self.compile_time_accounting;
+        usage.work = usage.work.saturating_add(self.retired_compile_time.work);
+        usage.byte_work = usage
+            .byte_work
+            .saturating_add(self.retired_compile_time.byte_work);
+        usage.retained_bytes = usage
+            .retained_bytes
+            .saturating_add(self.retired_compile_time.retained_bytes);
         for root in &self.compile_time_caches {
             let live = root.view.budget_snapshot();
             let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -2585,6 +2604,45 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
+    /// A session with no enclosing session supersedes the finished temporary
+    /// projections' store roots: sessions only consult their own root.
+    /// Project and analysis roots stay, so their published outputs remain
+    /// charged for the resolver's lifetime. A superseded cache dies; what its
+    /// ledger still backs (outputs the caller kept) stays charged, as live
+    /// usage while a report receipt shares the ledger, otherwise as the
+    /// resolver-lifetime `retired_compile_time`.
+    fn retire_compile_time_stores(&mut self, cancel: &dyn CancellationToken) {
+        let mut index = 0;
+        while index < self.compile_time_caches.len() {
+            if !self.compile_time_caches[index].temporary {
+                index += 1;
+                continue;
+            }
+            let root = self.compile_time_caches.remove(index);
+            let reported = self
+                .report_owners
+                .credits()
+                .any(|credit| credit.shares_shared_root(&root.view));
+            let (recorded_work, recorded_byte_work) = {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                (cache.recorded_work, cache.recorded_byte_work)
+            };
+            let ledger = root.view.store_budget(root.limits, cancel);
+            drop(root);
+            if !reported {
+                let live = ledger.snapshot();
+                let retired = &mut self.retired_compile_time;
+                retired.work = retired
+                    .work
+                    .saturating_add(live.work.saturating_sub(recorded_work));
+                retired.byte_work = retired
+                    .byte_work
+                    .saturating_add(live.byte_work.saturating_sub(recorded_byte_work));
+                retired.retained_bytes = retired.retained_bytes.saturating_add(live.retained_bytes);
+            }
+        }
+    }
+
     fn release_compile_time(&mut self, bytes: usize) {
         self.compile_time_accounting.retained_bytes = self
             .compile_time_accounting
@@ -2635,6 +2693,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 .value_mut()
                 .include_seen
                 .clear();
+        }
+        if self.compile_time_root_path.is_none() {
+            self.retire_compile_time_stores(cancel);
         }
         self.directories.clear();
         let context = self.context.conditional_context_for(&root.path);
@@ -3066,6 +3127,8 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_credits: HashMap::new(),
             compile_time_store: None,
             compile_time_caches: Vec::new(),
+            compile_time_temporary: false,
+            retired_compile_time: Default::default(),
             callback_reports: None,
             callback_include_reason: None,
             callback_unit_reason: None,
@@ -3317,8 +3380,11 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<(ResolvedImports, Option<IncludeWalkResult>), ResolverError> {
         let before = self.compile_time_accounting.retained_bytes;
+        let temporary = std::mem::replace(&mut self.compile_time_temporary, !retain_includes);
         let projection =
-            self.source_order_analysis(&importer.source, text, retain_includes, cancel)?;
+            self.source_order_analysis(&importer.source, text, retain_includes, cancel);
+        self.compile_time_temporary = temporary;
+        let projection = projection?;
         let result = self.resolve_imports_admitted(
             importer,
             sites,
@@ -3905,7 +3971,9 @@ impl<S: SourceStore> UnitResolver<S> {
             .filter(|root| !root.view.is_admitted_by(budget))
             .map(|root| root.view.budget_snapshot().retained_bytes)
             .fold(
-                self.compile_time_accounting.retained_bytes,
+                self.compile_time_accounting
+                    .retained_bytes
+                    .saturating_add(self.retired_compile_time.retained_bytes),
                 usize::saturating_add,
             )
             .saturating_add(self.orphan_report_usage(Some(budget)).retained_bytes);

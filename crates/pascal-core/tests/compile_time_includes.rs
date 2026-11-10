@@ -1199,6 +1199,11 @@ fn fix_i3_versions_replace_temporary_projection_and_share_work() {
             ..Default::default()
         },
     );
+    // The live session store and the report receipts kept from earlier
+    // versions are legitimately retained. Version 2 is the first that
+    // supersedes another, so its retention is the steady state every later
+    // version must keep: superseded session stores do not accumulate.
+    let mut steady = None;
     let mut previous = 0;
     for version in 1..=10 {
         let text = format!("{base}{}", " ".repeat(version));
@@ -1221,10 +1226,17 @@ fn fix_i3_versions_replace_temporary_projection_and_share_work() {
             "work cannot reset or be bypassed by replay"
         );
         previous = usage.work;
-        assert!(
-            usage.retained_bytes <= version * std::mem::size_of::<ResolvedImports>(),
-            "obsolete analysis versions must not accumulate: {usage:?}"
-        );
+        if version == 2 {
+            steady = Some(usage.retained_bytes);
+        }
+        if let Some(steady) = steady {
+            assert!(
+                usage.retained_bytes
+                    <= steady + (version - 2) * std::mem::size_of::<ResolvedImports>(),
+                "obsolete analysis versions must not accumulate: version {version} {usage:?}, \
+                 steady state {steady}"
+            );
+        }
     }
 }
 

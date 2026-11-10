@@ -4640,7 +4640,10 @@ mod tests {
                 &temp.path().join("lib/Deep.pas"),
                 "unit Deep;\ninterface\nimplementation\nend.\n",
             );
-            for name in ["Helper", "Impl"] {
+            let main_text =
+                "unit Main;\ninterface\nuses Provider;\nimplementation\nuses Own;\nend.\n";
+            write(&temp.path().join("lib/Main.pas"), main_text);
+            for name in ["Helper", "Impl", "Own"] {
                 write(
                     &temp.path().join(format!("lib/{name}.pas")),
                     &format!("unit {name};\ninterface\nimplementation\nend.\n"),
@@ -4662,7 +4665,7 @@ mod tests {
 
             let mut first = persisting_workspace(temp.path(), store.path(), &gate);
             first
-                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .open_document(main.clone(), main_text.to_string(), 1)
                 .unwrap();
             let mut warmer = Warmer::start(gate.clone());
             warmer.open(main.clone());
@@ -4674,7 +4677,7 @@ mod tests {
 
             let mut second = persisting_workspace(temp.path(), store.path(), &gate);
             second
-                .open_document(main.clone(), MAIN_TEXT.to_string(), 1)
+                .open_document(main.clone(), main_text.to_string(), 1)
                 .unwrap();
             let mut warmer = Warmer::start(gate);
             warmer.open(main);
@@ -4688,6 +4691,10 @@ mod tests {
                     "{name} is in the interface closure: {kinds:?}"
                 );
             }
+            assert!(
+                parsed("Own.pas"),
+                "the open file's own implementation imports load: {kinds:?}"
+            );
             for name in ["Helper.pas", "Impl.pas"] {
                 assert!(
                     !parsed(name),

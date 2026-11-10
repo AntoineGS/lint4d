@@ -12036,6 +12036,11 @@ fn event_loop(
                 let jobs_idle = jobs.is_empty();
                 let diagnostics_due = workspace.next_diagnostic_timeout().is_some();
                 let (watch_paths, watch_overflows) = watch_events.applied();
+                let watch_path_applied = request
+                    .params
+                    .get("watchPath")
+                    .and_then(Value::as_str)
+                    .map(|path| watch_events.take_applied(Path::new(path)));
                 send_ok(
                     connection,
                     request.id,
@@ -12046,6 +12051,8 @@ fn event_loop(
                         "diagnosticsDue": diagnostics_due,
                         "watchPaths": watch_paths,
                         "watchOverflows": watch_overflows,
+                        "watchPending": watch_events.pending(),
+                        "watchPathApplied": watch_path_applied,
                     }),
                 )?;
             }
@@ -12619,6 +12626,9 @@ fn drain_watch_events(
     ));
     if let Some(source) = source.into_inner() {
         refuse_cache_directory(workspace, &source);
+    }
+    if watch_events.take_overflowed() {
+        rewarm.extend(workspace.open_document_uris());
     }
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lsp_types::Url;
@@ -123,6 +123,11 @@ pub(crate) struct WatchEvents {
     /// Paths applied and overflows applied, for `pascal/testBackgroundIdle`.
     applied: AtomicU64,
     overflows: AtomicU64,
+    /// Set when a drain applied an overflow, until `take_overflowed`.
+    overflowed: AtomicBool,
+    /// Every path applied, for `pascal/testBackgroundIdle`.
+    #[cfg(feature = "test-support")]
+    applied_paths: Mutex<HashSet<PathBuf>>,
 }
 
 impl WatchEvents {
@@ -136,6 +141,9 @@ impl WatchEvents {
                 queue,
                 applied: AtomicU64::new(0),
                 overflows: AtomicU64::new(0),
+                overflowed: AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                applied_paths: Mutex::default(),
             },
         )
     }
@@ -173,6 +181,7 @@ impl WatchEvents {
         if overflowed {
             apply_watch_event(cache, WatchEvent::Overflow);
             self.overflows.fetch_add(1, Ordering::Relaxed);
+            self.overflowed.store(true, Ordering::Relaxed);
         }
         let mut affected = Vec::new();
         let mut seen = HashSet::new();
@@ -181,6 +190,11 @@ impl WatchEvents {
                 continue;
             }
             self.applied.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "test-support")]
+            self.applied_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path.clone());
             let event = match change {
                 Change::Modified => WatchEvent::Modified(vec![path]),
                 Change::Changed => WatchEvent::Changed(vec![path]),
@@ -192,6 +206,30 @@ impl WatchEvents {
             }
         }
         affected
+    }
+
+    /// Whether a drain applied an overflow since the last call. The paths
+    /// pending at the overflow are not known any more, so the caller rewarms
+    /// every open document, as their events would have.
+    pub(crate) fn take_overflowed(&self) -> bool {
+        self.overflowed.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether changes wait for a drain.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pending(&self) -> bool {
+        let pending = self.queue.pending();
+        pending.overflowed || !pending.order.is_empty()
+    }
+
+    /// Whether `path` was applied since the last call that returned true
+    /// for it.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn take_applied(&self, path: &Path) -> bool {
+        self.applied_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path)
     }
 
     /// How many paths and how many overflows were applied so far.
@@ -305,7 +343,6 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
 mod tests {
     use super::*;
     use crate::project_cache::{ImportValue, Lookup, Probe, ProjectCache};
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     fn store_import(cache: &ProjectCache, main: &Url, probes: Vec<Probe>) {
@@ -570,6 +607,9 @@ mod tests {
             (0, 1),
             "the overflow covers what was pending"
         );
+        // The paths it covered are unknown: the caller rewarms open documents.
+        assert!(events.take_overflowed());
+        assert!(!events.take_overflowed());
         assert_eq!(cache.stats().imports, 0);
     }
 

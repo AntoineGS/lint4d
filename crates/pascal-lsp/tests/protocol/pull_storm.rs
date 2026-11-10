@@ -19,9 +19,31 @@ const SPEC: FixtureSpec = FixtureSpec {
     unresolved_includes: 0,
     shared_name: "TShared",
 };
-/// `file_watch::WATCH_EVENT_CAPACITY`.
+/// The watcher queue of 037e4f8, in events: a build reporting three times
+/// as many overflowed it.
 const WATCH_EVENT_QUEUE: usize = 1024;
 const OPENS: [&str; 2] = ["App.dpr", "lib/Shared.pas"];
+
+/// `query_fixture(SPEC)` with `lib/storm.marker`, which tests rewrite
+/// after a burst (`wait_for_watcher`): a rewrite changes no listing, so it
+/// stales no request in flight.
+fn fixture(environment: &Path) -> PathBuf {
+    let root = query_fixture(environment, &SPEC);
+    fs::write(marker(&root), b"marker").unwrap();
+    pascal_project::backdate_tree_for_test(&root);
+    root
+}
+
+fn marker(root: &Path) -> PathBuf {
+    root.join("lib/storm.marker")
+}
+
+/// Rewrites `marker` with new content.
+fn touch_marker(marker: &Path) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fs::write(marker, format!("marker {next}")).unwrap();
+}
 
 fn others(root: &Path) -> Vec<PathBuf> {
     (0..SPEC.units - SPEC.importers)
@@ -150,7 +172,7 @@ fn symbol_units(symbols: &Value, name: &str) -> Vec<String> {
 #[test]
 fn the_index_converges_while_a_workspace_wide_request_runs_through_a_burst() {
     let environment = tempfile::tempdir().unwrap();
-    let root = query_fixture(environment.path(), &SPEC);
+    let root = fixture(environment.path());
     let mut first = launch(environment.path(), "storm-first", &[]);
     first.initialize(&root, Value::Null);
     open_disk(&mut first, &root);
@@ -179,6 +201,7 @@ fn the_index_converges_while_a_workspace_wide_request_runs_through_a_burst() {
     assert_eq!(warm["extracted"], 0, "{warm}");
     settle_background(&mut server);
     let parses = parses_now(&mut server);
+    let (_, overflows) = watch_counts(&mut server);
 
     let changed = pull(&root);
     let held = RequestId::from("held-references".to_string());
@@ -188,6 +211,7 @@ fn the_index_converges_while_a_workspace_wide_request_runs_through_a_burst() {
         references_params(&root),
     );
     barrier.wait_until_entered();
+    wait_for_watcher(&mut server, &marker(&root), overflows);
     let deadline = Instant::now() + Duration::from_secs(120);
     let converged = loop {
         let context = the_context(&mut server);
@@ -233,6 +257,34 @@ fn watch_counts(server: &mut TestServer) -> (u64, u64) {
     )
 }
 
+/// Whether the server applied `marker`, rewritten after a burst, since the
+/// last call that said so, and no watcher change is pending: notify reports a directory's events in
+/// order, so every earlier write was applied too. After an overflow since
+/// `overflows` (base 037e4f8) the marker may be lost with the rest: then
+/// only nothing pending.
+fn watcher_settled(server: &mut TestServer, marker: &Path, overflows: u64) -> bool {
+    let state = request(
+        server,
+        "pascal/testBackgroundIdle",
+        json!({"watchPath": marker.display().to_string()}),
+    );
+    let overflowed = state["watchOverflows"].as_u64().expect("watch overflows") > overflows;
+    state["watchPending"] == false && (state["watchPathApplied"] == true || overflowed)
+}
+
+/// Rewrites `marker`, an existing file in a watched directory, and waits
+/// until `watcher_settled`.
+fn wait_for_watcher(server: &mut TestServer, marker: &Path, overflows: u64) {
+    touch_marker(marker);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !watcher_settled(server, marker, overflows) {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher did not apply the burst"
+        );
+    }
+}
+
 /// `environment/workspace` with `App.dproj` (installation 7.0), `App.dpr`
 /// and `Main.pas` declaring `Run`; the installation's IDE directory is
 /// `environment/ide`, outside the workspace (Headless-Delphi keeps it under
@@ -267,6 +319,7 @@ fn installation_fixture(environment: &Path) -> (PathBuf, PathBuf, PathBuf) {
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Platform>Win32</Platform></PropertyGroup></Project>",
     );
     write_file(&root.join("App.dpr"), "program App; uses Main; begin end.");
+    write_file(&root.join("storm.marker"), "marker");
     let main = root.join("Main.pas");
     write_file(
         &main,
@@ -349,10 +402,12 @@ fn a_same_content_rewrite_of_an_unwatched_metadata_file_does_not_stale_every_req
     // A build during the session writes its compiled units beside the
     // sources (on 037e4f8, more events than its watcher queue held: the
     // overflow lost which paths changed), then rewrites it again.
+    let (_, overflows) = watch_counts(&mut server);
     for index in 0..3 * WATCH_EVENT_QUEUE {
         fs::write(root.join(format!("Unit{index}.dcu")), b"dcu").unwrap();
     }
     rewrite();
+    wait_for_watcher(&mut server, &root.join("storm.marker"), overflows);
     symbols(&mut server, "after the build", &mut refused);
     assert!(refused.is_empty(), "{refused:?}");
     server.shutdown();
@@ -366,11 +421,11 @@ fn a_same_content_rewrite_of_an_unwatched_metadata_file_does_not_stale_every_req
 #[test]
 fn a_build_writing_compiled_units_beside_the_sources_stales_no_member() {
     let environment = tempfile::tempdir().unwrap();
-    let root = query_fixture(environment.path(), &SPEC);
+    let root = fixture(environment.path());
     let mut server = warm_server(environment.path(), &root, &OPENS);
     let warm = the_context(&mut server);
     let before = metrics(&mut server);
-    let (paths, overflows) = watch_counts(&mut server);
+    let (_, overflows) = watch_counts(&mut server);
     let written = 3 * WATCH_EVENT_QUEUE;
     for index in 0..written {
         let name = if index < SPEC.units - SPEC.importers {
@@ -380,17 +435,7 @@ fn a_build_writing_compiled_units_beside_the_sources_stales_no_member() {
         };
         fs::write(root.join(name), b"dcu").unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (now_paths, now_overflows) = watch_counts(&mut server);
-        if now_paths - paths >= written as u64 || now_overflows > overflows {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{now_paths} paths, {now_overflows} overflows"
-        );
-    }
+    wait_for_watcher(&mut server, &marker(&root), overflows);
     let used = delta(metrics(&mut server), before);
     let after = the_context(&mut server);
     assert_eq!(after["fresh"], after["members"], "{after}");
@@ -403,54 +448,54 @@ fn a_build_writing_compiled_units_beside_the_sources_stales_no_member() {
     server.shutdown();
 }
 
-/// l4d-zh7i: back-to-back references and workspace/symbol requests through
-/// a burst (each would stop an index batch at its first member, D50) are
-/// all answered, and the index converges meanwhile, every changed unit
-/// extracted once. Prints its numbers.
-#[test]
-fn the_index_converges_through_a_stream_of_workspace_wide_requests() {
-    let environment = tempfile::tempdir().unwrap();
-    let root = query_fixture(environment.path(), &SPEC);
-    let mut server = warm_server(environment.path(), &root, &OPENS);
-    let before = metrics(&mut server);
+/// Rewrites the `Other` units of a warm server, then sends `stream`
+/// requests back to back until the watcher applied the burst and the
+/// index converged; every request must answer. Prints its numbers and
+/// returns the converged context.
+fn converge_through(server: &mut TestServer, root: &Path, stream: &[(&str, Value)]) -> Value {
+    let before = metrics(server);
+    let (_, overflows) = watch_counts(server);
     let started = Instant::now();
-    let changed = pull(&root);
+    let changed = pull(root);
+    let marker = marker(root);
+    touch_marker(&marker);
     let written = started.elapsed();
-    let mut references = Probe::default();
-    let mut symbols = Probe::default();
+    let mut probes: Vec<Probe> = stream.iter().map(|_| Probe::default()).collect();
     let mut rounds = 0;
+    let mut settled = false;
     let converged = loop {
         rounds += 1;
-        probe(
-            &mut server,
-            "textDocument/references",
-            references_params(&root),
-            &mut references,
-        );
-        probe(
-            &mut server,
-            "workspace/symbol",
-            json!({"query": "TPulled7"}),
-            &mut symbols,
-        );
-        let context = the_context(&mut server);
-        if context["complete"] == true && context["fresh"] == context["members"] {
-            break context;
+        for ((method, params), probed) in stream.iter().zip(&mut probes) {
+            probe(server, method, params.clone(), probed);
+        }
+        settled = settled || watcher_settled(server, &marker, overflows);
+        if settled {
+            let context = the_context(server);
+            if context["complete"] == true && context["fresh"] == context["members"] {
+                break context;
+            }
         }
         assert!(
             started.elapsed() < Duration::from_secs(120),
-            "the index did not converge through {rounds} rounds of requests: {context}"
+            "the index did not converge through {rounds} rounds of requests: {}",
+            the_context(server)
         );
     };
     let elapsed = started.elapsed();
-    let used = delta(metrics(&mut server), before);
+    let used = delta(metrics(server), before);
     eprintln!(
         "pull storm: {changed} rewrites in {written:?}; converged after {elapsed:?}, {rounds} rounds; \
-         references {references:?}; symbols {symbols:?}; parses {}; status {converged}",
+         {:?}; parses {}; status {converged}",
+        stream
+            .iter()
+            .map(|(method, _)| method)
+            .zip(&probes)
+            .collect::<Vec<_>>(),
         used[5],
     );
-    assert!(references.errors.is_empty(), "{references:?}");
-    assert!(symbols.errors.is_empty(), "{symbols:?}");
+    for ((method, _), probed) in stream.iter().zip(&probes) {
+        assert!(probed.errors.is_empty(), "{method}: {probed:?}");
+    }
     // A unit staled again by the second event of its write, after its
     // extraction, is proven again from what that extraction published.
     let extracted = converged["extracted"].as_u64().unwrap();
@@ -460,11 +505,59 @@ fn the_index_converges_through_a_stream_of_workspace_wide_requests() {
         converged["members"].as_u64().unwrap(),
         "{converged}"
     );
+    converged
+}
+
+/// l4d-zh7i: back-to-back references and workspace/symbol requests through
+/// a burst (each would stop an index batch at its first member, D50) are
+/// all answered, and the index converges meanwhile (D52).
+#[test]
+fn the_index_converges_through_a_stream_of_workspace_wide_requests() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = fixture(environment.path());
+    let mut server = warm_server(environment.path(), &root, &OPENS);
+    converge_through(
+        &mut server,
+        &root,
+        &[
+            ("textDocument/references", references_params(&root)),
+            ("workspace/symbol", json!({"query": "TPulled7"})),
+        ],
+    );
     let found = request(
         &mut server,
         "workspace/symbol",
         json!({"query": "TPulled7"}),
     );
     assert_eq!(symbol_units(&found, "TPulled7"), ["Other7.pas"], "{found}");
+    server.shutdown();
+}
+
+/// D52: Bulk requests of one document (semantic tokens, inlay hints) hold
+/// index batches back too (D33), for at most `INDEX_HOLD_LIMIT` at a time:
+/// the index converges through a stream of them.
+#[test]
+fn the_index_converges_through_a_stream_of_bulk_requests() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = fixture(environment.path());
+    let mut server = warm_server(environment.path(), &root, &OPENS);
+    let shared = uri(&root.join("lib/Shared.pas"));
+    converge_through(
+        &mut server,
+        &root,
+        &[
+            (
+                "textDocument/semanticTokens/full",
+                json!({"textDocument": {"uri": shared}}),
+            ),
+            (
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": {"uri": shared},
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 0}},
+                }),
+            ),
+        ],
+    );
     server.shutdown();
 }

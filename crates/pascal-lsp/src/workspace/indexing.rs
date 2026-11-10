@@ -6081,6 +6081,50 @@ impl UnverifiedRanking {
     }
 }
 
+/// Proofs that an import a definition looks through cannot declare the
+/// names it looks up (l4d-ucux): the references proof (R9-5 as amended
+/// 2026-11-07) over the unit's bytes and every include they resolve. One
+/// ranking per name set, so include proofs are shared across the imports of
+/// one navigation walk.
+#[derive(Default)]
+pub(super) struct ImportAbsence {
+    rankings: HashMap<Vec<String>, UnverifiedRanking>,
+}
+
+impl ImportAbsence {
+    /// What proves that the unit at `path`, whose raw bytes the resolver read
+    /// as `text`, spells none of `names` as a whole identifier, in its text
+    /// or its includes resolved in context `key`: the includes it read, each
+    /// with the stamp taken before the read. `None` proves nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prove(
+        &mut self,
+        workspace: &Workspace,
+        input: &WorkspaceInput,
+        key: &ContextKey,
+        path: &Path,
+        text: &[u8],
+        names: Vec<String>,
+        cancel: &AtomicBool,
+    ) -> Option<Vec<(PathBuf, Option<PathStamp>)>> {
+        if !super::lexical::proves_absent(text, &names, false) {
+            return None;
+        }
+        let ranking = self
+            .rankings
+            .entry(names.clone())
+            .or_insert_with(|| UnverifiedRanking::with(names, Vec::new(), false));
+        let scope = IncludeScope {
+            workspace,
+            input,
+            key,
+        };
+        ranking
+            .includes_absent(&scope, path, text, cancel)
+            .map(|proof| proof.baseline)
+    }
+}
+
 pub(crate) fn unresolved_gap(count: usize, display: &str) -> String {
     format!("{count} units of {display} have includes that do not resolve; they were not searched")
 }

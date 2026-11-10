@@ -346,11 +346,11 @@ fn an_off_chain_dependency_that_fails_to_load_is_noted_and_the_answer_binds() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();
     inherited_member_fixture(root);
-    // Bad is loaded with Dep's imports and needs a compile-time session,
-    // which fails.
+    // Bad is loaded with Dep's imports, as it spells TBase, the name Dep's
+    // lookup needs (l4d-ucux), and needs a compile-time session, which fails.
     fs::write(
         root.join("Bad.pas"),
-        "unit Bad;\ninterface\nuses Root;\n{$IFDEF X}{$ENDIF}\nconst BadValue = 1;\nimplementation\nend.\n",
+        "unit Bad;\ninterface\nuses Root;\n{$IFDEF X}{$ENDIF}\nconst BadValue = 1; { not TBase }\nimplementation\nend.\n",
     )
     .expect("failing dependency");
     let mut workspace = workspace(root);
@@ -369,4 +369,166 @@ fn an_off_chain_dependency_that_fails_to_load_is_noted_and_the_answer_binds() {
         "the failed dependency must be noted: {:?}",
         workspace.warnings
     );
+}
+
+fn write_sources(root: &Path, files: &[(&str, &str)]) {
+    for (name, source) in files {
+        fs::write(root.join(name), source).expect("fixture source");
+    }
+}
+
+fn indexed(workspace: &Workspace, root: &Path, name: &str) -> bool {
+    workspace.index.contains(&uri(&root.join(name)))
+}
+
+/// `TTarget` in `Main`'s interface binds through `Target`; `Noise` and
+/// `Bulky` cannot declare it.
+fn lazy_import_fixture(root: &Path) {
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Noise, Target, Bulky;\ntype TUser = class\n  F: TTarget;\nend;\nimplementation\nuses Later;\nend.\n",
+            ),
+            (
+                "Noise.pas",
+                "unit Noise;\ninterface\ntype TNoise = class end;\nimplementation\nend.\n",
+            ),
+            (
+                "Target.pas",
+                "unit Target;\ninterface\ntype TTarget = class end;\nimplementation\nend.\n",
+            ),
+            (
+                "Bulky.pas",
+                "unit Bulky;\ninterface\n{$I Bulky.inc}\nimplementation\nend.\n",
+            ),
+            ("Bulky.inc", "const BulkyValue = 1;\n"),
+            (
+                "Later.pas",
+                "unit Later;\ninterface\nimplementation\nend.\n",
+            ),
+        ],
+    );
+}
+
+/// l4d-ucux: a definition parses only the imports that can declare the name
+/// it looks up. `Noise` never spells `TTarget`; `Bulky` spells it neither in
+/// its text nor in the include it resolves; `Later` is an implementation
+/// import an interface name never looks through.
+#[test]
+fn a_definition_parses_only_the_imports_that_can_declare_the_name() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    lazy_import_fixture(root);
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &root.join("Main.pas"), Position::new(4, 6));
+
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].uri, uri(&root.join("Target.pas")));
+    for unit in ["Noise.pas", "Bulky.pas", "Later.pas"] {
+        assert!(
+            !indexed(&workspace, root, unit),
+            "{unit} cannot declare TTarget and must not be parsed"
+        );
+    }
+}
+
+/// An include that spells the name keeps its unit a candidate: the unit is
+/// parsed, and its declaration answers beside `Target`'s, as when every
+/// import is parsed.
+#[test]
+fn an_import_whose_include_spells_the_name_is_parsed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    lazy_import_fixture(root);
+    fs::write(root.join("Bulky.inc"), "type TTarget = class end;\n").expect("include");
+    let main = root.join("Main.pas");
+    let expected = definition(&mut strict_workspace(root), &main, Position::new(4, 6));
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &main, Position::new(4, 6));
+
+    assert!(indexed(&workspace, root, "Bulky.pas"));
+    assert_eq!(locations, expected);
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.uri == uri(&root.join("Bulky.inc"))
+                || location.uri == uri(&root.join("Bulky.pas"))),
+        "{locations:?}"
+    );
+}
+
+/// A member of an imported class: the walk parses the ancestor chain and
+/// what can declare its names, never the unrelated imports along it.
+#[test]
+fn a_member_definition_parses_no_unrelated_import_along_the_chain() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    inherited_member_fixture(root);
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Noise, Dep;\nimplementation\nprocedure Run;\nvar X: TDep;\nbegin\n  X.RootMember;\nend;\nend.\n",
+            ),
+            (
+                "Noise.pas",
+                "unit Noise;\ninterface\ntype TNoise = class end;\nimplementation\nend.\n",
+            ),
+        ],
+    );
+    let main = root.join("Main.pas");
+    let expected = definition(&mut strict_workspace(root), &main, Position::new(7, 5));
+    let mut workspace = workspace(root);
+
+    let first = definition(&mut workspace, &main, Position::new(7, 5));
+    let second = definition(&mut workspace, &main, Position::new(7, 5));
+
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0].uri, uri(&root.join("Root.pas")));
+    for unit in ["Noise.pas", "Bad.pas"] {
+        assert!(
+            !indexed(&workspace, root, unit),
+            "{unit} is off the chain and must not be parsed"
+        );
+    }
+}
+
+/// A helper an import declares for an ancestor applies to the member: the
+/// unit holding it is parsed before the member answers, so the answer is
+/// the one a walk parsing every import gives.
+#[test]
+fn a_helper_in_an_import_that_spells_no_looked_up_type_still_answers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Base, Helps;\nimplementation\nprocedure Run;\nvar X: TThing;\nbegin\n  X.Member;\nend;\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TThing = class\n  procedure Member;\nend;\nimplementation\nprocedure TThing.Member; begin end;\nend.\n",
+            ),
+            (
+                "Helps.pas",
+                "unit Helps;\ninterface\ntype TObjectHelps = class helper for TObject\n  procedure Member;\nend;\nimplementation\nprocedure TObjectHelps.Member; begin end;\nend.\n",
+            ),
+        ],
+    );
+    let main = root.join("Main.pas");
+    let expected = definition(&mut strict_workspace(root), &main, Position::new(7, 5));
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &main, Position::new(7, 5));
+
+    assert_eq!(locations, expected);
 }

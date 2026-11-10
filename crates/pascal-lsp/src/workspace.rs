@@ -11972,6 +11972,25 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        // A state of this key that is no longer fresh is evicted, not merged
+        // into: its reads, watched paths and the memberships of other
+        // sources' directories may be stale, and a merge would keep them
+        // (l4d-z473). Its other owners find it again through rediscovery.
+        if let Some(state) = self.contexts.get(&key)
+            && !context_state_is_fresh_for_binding_with_cancel(
+                state,
+                self.request_generation,
+                cancel,
+                budget,
+            )?
+        {
+            self.contexts.remove(&key);
+            for owner in self.document_owners.values_mut() {
+                if owner.key == key {
+                    owner.needs_revalidation = true;
+                }
+            }
+        }
         let initial_metadata_count = context_observations.metadata_files.len()
             + usize::from(context.project_file().is_some())
             + usize::from(context.main_source().is_some());
@@ -16189,6 +16208,9 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     budget: Option<&ReconciliationBudget>,
     require_settled: bool,
 ) -> Result<bool, String> {
+    if !reads_agree_with_watched_stamps(state, ignored_paths) {
+        return Ok(false);
+    }
     for (path, stamp) in &state.watched_paths {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -16277,6 +16299,22 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
     Ok(true)
+}
+
+/// Whether every metadata read of `state` is of the file state its watched
+/// stamp names, in memory. A disagreement (a stale read kept beside a new
+/// watched stamp) would pass every stat below while each request's records,
+/// built from the read, are refused: the state is rebuilt instead (l4d-z473).
+/// The memberships need no such check: freshness recomputes each one.
+fn reads_agree_with_watched_stamps(state: &ContextState, ignored_paths: &[PathBuf]) -> bool {
+    state.project_read_observations.iter().all(|read| {
+        ignored_paths
+            .iter()
+            .any(|ignored| package_paths_equal(ignored, &read.path))
+            || state.watched_paths.get(&read.path).is_none_or(|watched| {
+                watched.as_ref() == Some(&path_stamp_from_project_read(&read.stamp))
+            })
+    })
 }
 
 /// The path and read limit of a metadata payload that a freshness pass
@@ -24918,6 +24956,163 @@ BDS = '/fake/37'
     /// merge while the watched stamp took the new one: the context then
     /// passed freshness, and every request's own records carried the old
     /// stamp, so strict revalidation refused every request after the build.
+    fn reinstall_key(root: &Path) -> ContextKey {
+        ContextKey {
+            installation_id: Some("7.0".to_owned()),
+            project_file: Some(root.join("App.dproj")),
+            workspace_root: Some(root.to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            build_selection_modes: None,
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
+    fn install_for(workspace: &mut Workspace, key: &ContextKey, metadata: &[PathBuf], file: &Path) {
+        let reads = metadata
+            .iter()
+            .map(|path| ProjectReadObservation {
+                path: path.clone(),
+                stamp: pascal_project::path_stamp_result(path)
+                    .expect("stamp")
+                    .expect("present"),
+                content_hash: 0,
+                content_bytes: None,
+            })
+            .collect();
+        workspace
+            .install_context(
+                key.clone(),
+                Arc::default(),
+                ProjectObservations {
+                    metadata_files: metadata.to_vec(),
+                    ..ProjectObservations::default()
+                },
+                reads,
+                HashMap::new(),
+                file,
+                None,
+                None,
+            )
+            .expect("install context");
+    }
+
+    /// l4d-z473 round 1 (the reviewer's scenario): sources A and B of one
+    /// context live in different directories; a project appears in B's
+    /// directory and no watcher event says so. A's owner is rediscovered and
+    /// installed over the state, which failed freshness: the state is
+    /// evicted, not merged, so B's stale membership does not refuse every
+    /// request on A.
+    #[test]
+    fn a_reinstall_over_a_stale_state_evicts_the_other_sources_memberships() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let project = root.join("App.dproj");
+        fs::write(&project, "<Project />").unwrap();
+        let (a, b) = (root.join("a/A.pas"), root.join("b/B.pas"));
+        fs::write(&a, "unit A; interface implementation end.").unwrap();
+        fs::write(&b, "unit B; interface implementation end.").unwrap();
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &a);
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &b);
+        assert!(
+            workspace.contexts[&key]
+                .project_candidate_memberships
+                .contains_key(&root.join("b"))
+        );
+
+        fs::write(root.join("b/Other.dproj"), "<Project />").unwrap();
+        let generation = workspace.request_generation;
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(
+                &workspace.contexts[&key],
+                generation,
+                None,
+                None
+            )
+            .unwrap(),
+            "B's directory changed"
+        );
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &a);
+
+        let state = &workspace.contexts[&key];
+        let cancel = AtomicBool::new(false);
+        // The membership records each request on A revalidates.
+        let records = super::rename::consumed_context_records(state, &cancel)
+            .expect("records")
+            .into_iter()
+            .filter(|record| record.candidate_membership.is_some())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        super::rename::revalidate_input(&workspace.analysis_input(), &records, &cancel)
+            .expect("a request on A answers");
+        assert!(
+            super::context_state_is_fresh_for_binding_with_cancel(state, generation, None, None)
+                .unwrap()
+        );
+    }
+
+    /// l4d-z473 round 1: a context reinstalled over its stale state watches
+    /// what the rediscovery read, not every path any earlier install did.
+    #[test]
+    fn a_reinstall_over_a_stale_state_drops_the_paths_it_no_longer_watches() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let (old, new) = (root.join("Old.optset"), root.join("New.optset"));
+        fs::write(&old, "<Project />").unwrap();
+        fs::write(&new, "<Project />").unwrap();
+        let source = root.join("Main.pas");
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(&mut workspace, &key, std::slice::from_ref(&old), &source);
+        fs::write(&old, "<Project><PropertyGroup /></Project>").unwrap();
+        install_for(&mut workspace, &key, std::slice::from_ref(&new), &source);
+        let watched = &workspace.contexts[&key].watched_paths;
+        assert!(watched.contains_key(&new));
+        assert!(!watched.contains_key(&old), "{watched:?}");
+    }
+
+    /// l4d-z473 round 1: a state whose read of a metadata file disagrees
+    /// with its watched stamp of that file is not fresh: it is rebuilt once
+    /// instead of serving records every request refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_whose_reads_disagree_with_its_watched_stamps_is_not_fresh() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let environment = root.join("environment.proj");
+        fs::write(&environment, "<Project />").unwrap();
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(
+            &mut workspace,
+            &key,
+            std::slice::from_ref(&environment),
+            &root.join("Main.pas"),
+        );
+        let replacement = root.join("environment.proj.tmp");
+        fs::write(&replacement, "<Project />").unwrap();
+        fs::rename(&replacement, &environment).unwrap();
+        let generation = workspace.request_generation;
+        let state = workspace.contexts.get_mut(&key).unwrap();
+        state
+            .watched_paths
+            .insert(environment.clone(), super::path_stamp(&environment));
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(state, generation, None, None)
+                .unwrap(),
+            "the read of environment.proj is older than its watched stamp"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_reinstalled_context_records_the_new_read_of_a_rewritten_metadata_file() {
